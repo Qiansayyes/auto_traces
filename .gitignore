@@ -1,0 +1,59 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Java / Kotlin / Android
+*.class
+*.jar
+*.war
+*.ear
+**/build/
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.keystore
+*.jks
+
+# Node / web
+node_modules/
+dist/
+build/
+coverage/
+.npm/
+*.log
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+
+# Browser / app runtime data
+chrome_profile_tiktok/
+
+# Misc generated artifacts
+*.sqlite
+*.db

@@ -1,0 +1,988 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auto Traces 控制台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="auth-shell" id="authShell">
+    <div class="auth-card">
+      <div class="brand" style="margin-bottom:18px;">
+        <div class="logo">AT</div>
+        <div>
+          <h1>Auto Traces</h1>
+          <p>登录或注册后继续</p>
+        </div>
+      </div>
+      <h2 style="margin:0 0 8px;">欢迎使用</h2>
+      <p class="hint">普通用户首次进入需要注册；管理员账号由系统预置，不在页面公开显示。</p>
+      <div class="field"><label>用户名</label><input id="authUsername" type="text" placeholder="请输入用户名" /></div>
+      <div class="field"><label>密码</label><input id="authPassword" type="password" placeholder="请输入密码" /></div>
+      <div class="auth-actions">
+        <button id="authLoginBtn" class="primary">登录</button>
+        <button id="authRegisterBtn" class="ghost">注册</button>
+      </div>
+      <div id="authMessage" class="status">请先登录</div>
+    </div>
+  </div>
+
+  <div class="app hidden" id="appShell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">AT</div>
+        <div>
+          <h1>Auto Traces</h1>
+          <p id="userRoleLabel">后台管理控制台</p>
+        </div>
+      </div>
+      <nav id="mainNav">
+        <div class="nav-group-title">设备管理模块</div>
+        <button class="nav-item active" data-section="overview">设备概览</button>
+        <button class="nav-item" data-section="config">运行配置</button>
+        <button class="nav-item" data-section="backup-section">TikTok账号备份档案</button>
+        <button class="nav-item admin-only" data-section="usernames">用户名队列</button>
+        <div class="nav-group-title admin-only">数据管理模块</div>
+        <button class="nav-item admin-only" data-section="tiktok-roots">根用户管理</button>
+        <button class="nav-item admin-only" data-section="live-customers">主播访问数据</button>
+        <button class="nav-item admin-only" data-section="cv-access-data">直客访问模式数据</button>
+        <button class="nav-item admin-only" data-section="tiktok-stats">TikTok数据查询</button>
+        <button class="nav-item admin-only" data-section="db-tables">数据库分页</button>
+        <button class="nav-item admin-only" data-section="docs">系统功能文档</button>
+      </nav>
+      <div class="sidebar-footer">
+        <label>API Base</label>
+        <input id="apiBase" type="text" value="http://192.168.100.249:8000" />
+        <button id="refreshAll" class="primary">刷新数据</button>
+        <button id="logoutBtn" class="ghost">退出登录</button>
+        <div id="status" class="status">等待操作</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <section id="overview" class="panel active">
+        <header>
+          <h2>设备概览</h2>
+          <p>实时查看已绑定设备、状态与待启动标记。</p>
+        </header>
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <label>
+              <input id="selectAll" type="checkbox" />
+              全选设备
+            </label>
+            <button id="growthModeBtn" class="primary">涨粉模式</button>
+            <button id="liveModeBtn" class="ghost">主播访问模式</button>
+            <button id="cvModeBtn" class="ghost">直客访问模式</button>
+            <button id="startSelected" class="primary">启动所选设备</button>
+            <button id="startAll" class="ghost">启动全部在线设备</button>
+            <button id="stopSelected" class="ghost">停止所选设备</button>
+            <button id="autoStartToggleBtn" type="button" class="ghost">自动开启程序：关</button>
+          </div>
+          <div class="toolbar-right">
+            <input id="aliasFilter" type="text" placeholder="按别名筛选" />
+            <div id="startHint" class="hint">请选择在线设备后再启动。开启「自动开启程序」后，已绑定且未暂停的设备会在 App 轮询到策略时自行拉起后台（无需每次点启动）。</div>
+          </div>
+        </div>
+        <div class="cards">
+          <div class="card">
+            <h3>在线设备</h3>
+            <div id="onlineCount" class="metric">0</div>
+          </div>
+          <div class="card">
+            <h3>运行中设备</h3>
+            <div id="runningCount" class="metric">0</div>
+          </div>
+          <div class="card">
+            <h3>异常设备</h3>
+            <div id="errorCount" class="metric">0</div>
+          </div>
+          <div class="card">
+            <h3>待启动设备</h3>
+            <div id="pendingCount" class="metric">0</div>
+          </div>
+          <div class="card">
+            <h3>follower 待处理</h3>
+            <div id="followerPending" class="metric">0</div>
+          </div>
+          <div class="card">
+            <h3>待下发用户名</h3>
+            <div id="mobilePending" class="metric">0</div>
+          </div>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>设备 ID</th>
+                <th>别名</th>
+                <th class="admin-only">归属客户</th>
+                <th>状态</th>
+                <th>待启动</th>
+                <th>自动开启</th>
+              </tr>
+            </thead>
+            <tbody id="deviceTable"></tbody>
+          </table>
+        </div>
+        <div class="panel-card" style="margin-top:14px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <h3 style="margin:0;">设备执行日志</h3>
+            <div style="display:flex;align-items:center;gap:10px;">
+              <label for="deviceLogDeviceSelect" style="font-size:12px;color:#666;">设备</label>
+              <select id="deviceLogDeviceSelect" style="padding:4px 8px;min-width:220px;">
+                <option value="">全部设备</option>
+              </select>
+              <small style="color:#666;">约每 4 秒拉取；手机上报有延迟，需 App 后台运行</small>
+            </div>
+          </div>
+          <pre id="deviceExecLogs" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin-top:10px;">暂无日志</pre>
+        </div>
+      </section>
+
+      <section id="usernames" class="panel">
+        <header>
+          <h2>用户名队列</h2>
+          <p>批量导入待下发用户名，直接写入数据库队列（mobile_pending_usernames）。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>导入用户名</h3>
+            <textarea id="usernameInput" placeholder="每行一个用户名"></textarea>
+            <button id="uploadUsernames" class="primary">加入待下发队列</button>
+          </div>
+          <div class="panel-card">
+            <h3>指定加入 mobile_pending_usernames</h3>
+            <textarea id="mobilePendingInput" placeholder="每行一个用户名，直接写入 mobile_pending_usernames"></textarea>
+            <button id="addMobilePendingUsernames" class="ghost">写入 mobile_pending_usernames</button>
+          </div>
+          <div class="panel-card">
+            <h3>待执行用户名</h3>
+            <ul id="pendingList" class="tag-list"></ul>
+          </div>
+          <div class="panel-card">
+            <h3>已拉取用户名</h3>
+            <ul id="pulledList" class="tag-list"></ul>
+          </div>
+        </div>
+      </section>
+
+
+      <section id="tiktok-roots" class="panel">
+        <header>
+          <h2>根用户管理</h2>
+          <p>手动添加根用户+博主类型，数据写入 tiktok_roots。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>添加到 tiktok_roots</h3>
+            <div class="field">
+              <label>博主类型</label>
+              <input id="rootTypeInput" type="text" placeholder="例如：beauty / sports" />
+            </div>
+            <textarea id="rootUserInput" placeholder="每行一个根用户"></textarea>
+            <button id="addTikTokRoots" class="primary">添加到 tiktok_roots</button>
+            <div class="field" style="margin-top:10px;">
+              <label>Excel/TXT 导入根用户（第1列用户名，第2列博主类型）</label>
+              <input id="tiktokRootsFile" type="file" accept=".txt,.xlsx" />
+            </div>
+            <button id="importTikTokRoots" class="ghost">导入到 tiktok_roots</button>
+          </div>
+          <div class="panel-card">
+            <h3>tiktok_roots 列表</h3>
+            <div class="hint" style="margin-bottom:8px;">按发现时间倒序分页展示，支持页级全选。</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
+              <button id="resetTikTokRootsUsage" class="danger">usage_count 归零</button>
+              <button id="tiktokRootsSelectPage" class="ghost">本页全选</button>
+              <button id="tiktokRootsClearSelection" class="ghost">取消本页选择</button>
+              <button id="addSelectedRootsToPending" class="primary">将选中根用户加入待下发队列</button>
+              <span id="tiktokRootsSelectionCount" class="hint">0 已选</span>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+              <label>每页条数</label>
+              <input id="tiktokRootsPageSize" type="number" min="1" max="500" value="100" style="width:110px;" />
+              <button id="tiktokRootsPrevPage" class="ghost">上一页</button>
+              <button id="tiktokRootsNextPage" class="ghost">下一页</button>
+              <span id="tiktokRootsPageInfo" class="hint">第 1 / 1 页</span>
+            </div>
+            <div class="table-mini-wrap">
+              <table class="mini-table" id="tiktokRootsTable">
+                <thead>
+                  <tr>
+                    <th>选</th>
+                    <th>#</th>
+                    <th>root_username</th>
+                    <th>roots_type</th>
+                    <th>usage_count</th>
+                  </tr>
+                </thead>
+                <tbody id="tiktokRootsTableBody">
+                  <tr><td colspan="5" style="padding:10px;color:#666;">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel-card">
+            <h3>定时任务控制</h3>
+            <p>点击即可立即触发对应任务。</p>
+            <label>环境ID（每行一个，可选）</label>
+            <textarea id="taskContainerIds" placeholder="每行一个环境ID"></textarea>
+            <label>并行数量（可选）</label>
+            <input id="taskParallel" type="number" min="1" value="1" />
+            <button id="triggerCollectRootsExcel" class="primary">立即抓取（仅本次，使用已上传Excel）</button>
+            <button id="stopCollectRootsExcel" class="danger">停止抓取（Excel）</button>
+            <button id="triggerCollectRootsDb" class="ghost">随机抽取一批（仅本次，来自tiktok_roots）</button>
+            <div style="margin:6px 0 0;color:#666;font-size:12px;line-height:1.6;max-width:760px;">
+              从 <code>tiktok_roots</code> 中随机抽取一批账号，仅执行本次处理；不影响长期队列策略，不会全量扫描全部根用户。
+            </div>
+            <button id="stopCollectRootsDb" class="danger">停止抓取（tiktok_roots）</button>
+            <button id="triggerAutoSearch" class="ghost">立即执行 autoSearch 一次</button>
+            <div style="height:10px"></div>
+            <button id="startSchedulers" class="primary">开始定时任务</button>
+            <button id="stopSchedulers" class="danger">停止定时任务</button>
+            <pre id="taskStatus" style="white-space:pre-wrap;max-height:220px;overflow:auto;"></pre>
+            <h4 style="margin-top:8px;">任务实时日志</h4>
+            <pre id="taskLogs" style="white-space:pre-wrap;max-height:260px;overflow:auto;">暂无日志</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="live-customers" class="panel">
+        <header>
+          <h2>主播访问数据</h2>
+          <p>导入 txt/xlsx 用户名到 live_customer，并展示 usage_count。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>导入文件</h3>
+            <input id="liveCustomerFile" type="file" accept=".txt,.xlsx" />
+            <button id="importLiveCustomers" class="primary">导入主播访问数据</button>
+          </div>
+          <div class="panel-card">
+            <h3>live_customer 列表</h3>
+            <ul id="liveCustomerList" class="tag-list"></ul>
+          </div>
+        </div>
+
+      </section>
+
+      <section id="cv-access-data" class="panel">
+        <header>
+          <h2>直客访问模式数据</h2>
+          <p>独立展示 follower_queue 的访问状态与推送状态，并支持筛选查询。</p>
+        </header>
+        <div class="panel-card">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+            <label>following_access_status</label>
+            <select id="cvAccessFilter">
+              <option value="">全部</option>
+              <option value="unknown">unknown</option>
+              <option value="pending">pending</option>
+              <option value="running">running</option>
+              <option value="success">success</option>
+              <option value="failed">failed</option>
+            </select>
+            <button id="queryCvAccessData" class="primary">查询直客访问模式数据</button>
+            <button id="triggerProcessQueueInline" class="ghost">立即处理 follower_queue</button>
+            <button id="stopProcessQueueInline" class="danger">停止处理 follower_queue</button>
+          </div>
+          <div class="field" style="margin-bottom:12px;max-width:520px;">
+            <label>follower_queue 单次处理条数（服务端 process_queue）</label>
+            <input name="process_queue_batch_size" type="number" min="1" max="1000" step="1" value="100" style="width:120px;" />
+            <div class="hint" style="margin-top:6px;">仅作用于上方「立即处理 follower_queue」请求的 <code>limit</code>；与设备 <code>/api/pull_username</code> 的 <code>pull_batch_size</code> 无关。保存「运行配置」时仍会一并写入当前模式配置。</div>
+          </div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-bottom:10px;border:1px solid #eee;border-radius:8px;padding:10px;background:#fcfcff;">
+            <div style="min-width:280px;flex:1;">
+              <label style="display:block;margin-bottom:6px;font-weight:600;">最低作品数（video_count &gt; 该值）</label>
+              <input id="cvFilterMinVideoCount" type="number" min="0" step="1" value="10" style="width:100%;" />
+            </div>
+            <div style="min-width:280px;flex:1;">
+              <label style="display:block;margin-bottom:6px;font-weight:600;">关注数上限（following_count &lt; 该值）</label>
+              <input id="cvFilterMaxFollowingCount" type="number" min="1" step="1" value="150" style="width:100%;" />
+            </div>
+            <div style="min-width:260px;display:flex;align-items:flex-end;">
+              <button id="saveCvQualityFilter" class="primary">保存筛选阈值</button>
+            </div>
+            <div style="width:100%;color:#666;font-size:12px;">
+              仅当 following 同时满足：作品数 &gt; 最低作品数，且关注数 &lt; 关注数上限，才会写入 tiktok_roots / mobile_pending_usernames。
+            </div>
+          </div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-bottom:10px;">
+            <div style="min-width:260px;flex:1;">
+              <label>环境ID（每行一个，可选）</label>
+              <textarea id="cvTaskContainerIds" placeholder="每行一个环境ID" style="height:80px;"></textarea>
+            </div>
+            <div style="min-width:180px;">
+              <label>并行数量（可选）</label>
+              <input id="cvTaskParallel" type="number" min="1" value="1" />
+            </div>
+            <div style="min-width:260px;flex:1;">
+              <label>分页</label>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <button id="cvPrevPage" class="ghost">上一页</button>
+                <button id="cvNextPage" class="ghost">下一页</button>
+                <span id="cvPageInfo">页码: 1</span>
+                <label style="display:flex;gap:6px;align-items:center;">
+                  每页
+                  <select id="cvPageSize">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="200">200</option>
+                    <option value="500">500</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;align-items:stretch;">
+            <div style="flex:2;min-width:520px;max-height:520px;overflow:auto;border:1px solid #eee;border-radius:8px;">
+              <table id="cvAccessTable" style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead>
+                  <tr>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">id</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">username</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">root_username</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">created_at</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">consume_status</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">consumed_at</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">consumed_by</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">consumed_mode</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">following_access_status</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">following_fetch_success</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">mobile_push_status</th>
+                  </tr>
+                </thead>
+                <tbody id="cvAccessTableBody">
+                  <tr><td colspan="11" style="padding:10px;color:#666;">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div style="flex:1;min-width:320px;max-height:520px;overflow:auto;border:1px solid #eee;border-radius:8px;padding:10px;background:#fafafa;">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;">
+                <h4 style="margin:0;">任务日志（follower_queue）</h4>
+                <small style="color:#666;">自动刷新</small>
+              </div>
+              <pre id="cvTaskLogs" style="white-space:pre-wrap;margin:0;max-height:460px;overflow:auto;">暂无日志</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tiktok-stats" class="panel">
+        <header>
+          <h2>TikTok数据查询</h2>
+          <p>输入用户名后，查询粉丝数、关注数、总赞数、作品数及最近 N 条视频播放量（仅返回结果，不写数据库）。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>查询参数</h3>
+            <div class="field">
+              <label>用户名</label>
+              <input id="statsUsername" type="text" placeholder="例如：therock" />
+            </div>
+            <div class="field">
+              <label>最近视频条数 N（1-50）</label>
+              <input id="statsRecentCount" type="number" min="1" max="50" value="10" />
+            </div>
+            <button id="fetchTiktokStats" class="primary">查询 TikTok 数据</button>
+          </div>
+          <div class="panel-card">
+            <h3>返回结果</h3>
+            <pre id="statsResult" style="white-space: pre-wrap;word-break: break-word;max-height: 420px;overflow:auto;">暂无查询结果</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="db-tables" class="panel">
+        <header>
+          <h2>数据库分页</h2>
+          <p>5张表分页展示（每页100条）。</p>
+        </header>
+        <div class="panel-card">
+          <div class="field">
+            <label>选择表</label>
+            <select id="dbTableSelect">
+              <option value="tiktok_roots">tiktok_roots</option>
+              <option value="follower_queue">follower_queue</option>
+              <option value="mobile_pending_usernames">mobile_pending_usernames</option>
+              <option value="live_customer">live_customer</option>
+              <option value="users">users</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <button id="dbPrevPage" class="ghost">上一页</button>
+            <button id="dbNextPage" class="ghost">下一页</button>
+            <button id="dbRefreshPage" class="primary">刷新当前页</button>
+            <span id="dbPageInfo">页码: 1</span>
+          </div>
+          <div style="max-height:500px;overflow:auto;border:1px solid #eee;border-radius:8px;">
+            <table id="dbTableGrid" style="width:100%;border-collapse:collapse;font-size:12px;">
+              <thead id="dbTableHead"></thead>
+              <tbody id="dbTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="backup-section" class="panel">
+        <header>
+          <h2>TikTok 账号备份档案</h2>
+          <p>设备选择、清理、备份、恢复与档案记录统一管理。</p>
+        </header>
+        <div class="panel-card" style="line-height:1.7;">
+          <p>这里分成三个明确动作：① 只清理 TikTok 数据；② 先备份再清理；③ 从已有备份恢复。每个动作都会先弹出确认框，避免误点。</p>
+          <div class="split" style="align-items:flex-start;margin:0 0 14px 0;">
+            <div class="panel-card" style="margin:0;flex:1;min-width:280px;background:#fafafa;">
+              <h4>设备选择</h4>
+              <div class="field">
+                <label>目标设备</label>
+                <select id="deviceOpsSelect">
+                  <option value="">请先刷新设备列表</option>
+                </select>
+              </div>
+              <div class="hint" style="line-height:1.6;">先选择要操作的设备，再执行清理、备份或恢复。</div>
+            </div>
+            <div class="panel-card" style="margin:0;flex:1;min-width:280px;background:#fafafa;">
+              <h4>三按钮工作流</h4>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                <button id="clearTikTokBtn" class="ghost">1. 单独清理 TikTok 数据</button>
+                <button id="backupClearTikTokBtn" class="primary">2. 备份并清理 TikTok</button>
+                <button id="restoreTikTokBtn" class="ghost">3. 从备份恢复 TikTok</button>
+              </div>
+              <div class="hint" style="margin-top:8px;line-height:1.6;">
+                清理：删除设备端 TikTok 应用数据；
+                备份并清理：先做备份再清理，并在云端记录备份信息；
+                恢复：将选中的备份恢复回设备。
+              </div>
+            </div>
+          </div>
+          <div class="split" style="align-items:flex-start;">
+            <div class="panel-card" style="margin:0;flex:1;min-width:320px;">
+              <h4>提交备份信息</h4>
+              <div class="field"><label>用户名</label><input id="backupUsernameInput" type="text" placeholder="例如：therock" /></div>
+              <div class="field"><label>TikTok 密码</label><input id="backupTiktokPasswordInput" type="text" placeholder="请输入 TikTok 密码" /></div>
+              <div class="field"><label>手机别名</label><select id="backupMobileAliasInput"><option value="">请先刷新备份档案</option></select></div>
+              <div class="field"><label>API 地址</label><input id="backupApiAddressInput" type="text" placeholder="例如：https://api.example.com" /></div>
+              <div class="field"><label>邮箱</label><input id="backupEmailInput" type="text" placeholder="例如：name@example.com" /></div>
+              <div class="field"><label>邮箱密码</label><input id="backupEmailPasswordInput" type="password" placeholder="请输入邮箱密码" /></div>
+              <div class="hint" id="backupRecordHint" style="margin-top:8px;">用户名和手机别名必填；TikTok 密码、API 地址、邮箱和邮箱密码可留空。</div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                <button id="submitBackupRecordBtn" class="primary">提交 TikTok 账号信息</button>
+                <button id="queryAndFillBackupBtn" class="ghost">查询并回填</button>
+              </div>
+            </div>
+            <div class="panel-card" style="margin:0;flex:1;min-width:280px;">
+              <h4>查询条件</h4>
+              <div class="field">
+                <label>用户名</label>
+                <input id="backupSearchUsernameInput" type="text" placeholder="输入用户名或部分用户名" />
+              </div>
+              <div class="field">
+                <label>手机别名</label>
+                <select id="backupDeviceAliasSelect">
+                  <option value="">全部设备</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                <button id="queryBackupRecordsBtn" class="primary">查询</button>
+                <button id="resetBackupQueryBtn" class="ghost">重置</button>
+              </div>
+              <div class="hint" id="backupQueryHint" style="margin-top:8px;">支持按用户名、手机别名筛选，设备别名默认显示全部。</div>
+            </div>
+            <div class="panel-card" style="margin:0;flex:1;min-width:280px;">
+              <h4>恢复 & 记录列表</h4>
+              <div class="field">
+                <label>可恢复备份</label>
+                <select id="restoreBackupSelect">
+                  <option value="">请先加载备份列表</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                <button id="refreshBackupsBtn" class="ghost">刷新可恢复备份</button>
+                <button id="restoreTikTokExecBtn" class="primary">执行恢复</button>
+              </div>
+              <pre id="backupCloudInfo" style="white-space:pre-wrap;max-height:180px;overflow:auto;margin-top:10px;">暂无云端记录信息</pre>
+            </div>
+          </div>
+          <div class="panel-card" style="margin-top:14px;">
+            <h4>备份档案列表</h4>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+              <button id="backupPrevPage" class="ghost">上一页</button>
+              <button id="backupNextPage" class="ghost">下一页</button>
+              <button id="backupRefreshPage" class="primary">刷新当前页</button>
+              <span id="backupPageInfo">页码: 1</span>
+            </div>
+            <div style="max-height:260px;overflow:auto;border:1px solid #eee;border-radius:8px;">
+              <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead>
+                  <tr>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">username</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">mobile_alias</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">video_count</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">follower_count</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">new_follower_count</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">backup_path</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">backup_name</th>
+                    <th style="position:sticky;top:0;background:#fafafa;border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;">updated_at</th>
+                  </tr>
+                </thead>
+                <tbody id="backupRecordTableBody"></tbody>
+              </table>
+            </div>
+            <div class="hint" style="margin-top:8px;">点击任意行可查看该条记录详情。</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="docs" class="panel">
+        <header>
+          <h2>系统功能文档</h2>
+          <p>详细说明各模块的职责、数据流、触发逻辑、过滤规则与排错建议。</p>
+        </header>
+        <div class="panel-card" style="line-height:1.7;">
+          <h3>1. trigger_process_queue 是什么</h3>
+          <p>
+            <strong>trigger_process_queue</strong> 是“立即处理 follower_queue”的手动触发任务。
+            触发后执行 <code>tiktok_follow_scraper.py --mode process_queue</code>。
+            其目的：把 <code>follower_queue</code> 中待处理 follower 的 following 关系转化为新的 root 候选，并回流到业务队列。
+            单次处理条数由页面「直客访问模式数据」中的 <code>process_queue_batch_size</code> 输入框作为查询参数 <code>limit</code> 传给 <code>/api/admin/tasks/trigger_process_queue</code>（与设备 <code>/api/pull_username</code> 的 <code>pull_batch_size</code> 无关）。
+          </p>
+          <ul>
+            <li>业务队列：<code>mobile_pending_usernames</code>（增长模式下发池）。</li>
+            <li>root 候选：<code>tiktok_roots</code>（新发现根用户池）。</li>
+          </ul>
+
+          <h3>2. 随机抽取一批（来自 tiktok_roots）的标准流程（严格版）</h3>
+          <ol>
+            <li><strong>读取批次</strong>：从 <code>follower_queue</code> 按创建时间读取待处理记录（支持 limit）。</li>
+            <li><strong>进入主页</strong>：优先直接访问 <code>https://www.tiktok.com/@用户名</code>，失败再走搜索页兜底。</li>
+            <li><strong>主页可用性判断</strong>：若主页打不开，标记 <code>following_access_status=not_found</code>，并标记 <code>mobile_push_status=not_eligible</code>。</li>
+            <li><strong>粉丝账号私密拦截</strong>：若 follower 主页是私密账号，标记 <code>following_access_status=private_account</code>，并标记 <code>mobile_push_status=not_eligible</code>。</li>
+            <li><strong>采集 following</strong>：打开关注列表，滚动采集前 N 个用户名。</li>
+            <li><strong>following 列表不可见判定</strong>：命中“关注列表私密/隐藏”文案或空列表容器（多语言关键词），视为不可见；该 follower 标记 <code>following_access_status=following_private</code>，<code>mobile_push_status=not_eligible</code>。</li>
+            <li><strong>入库前单次评估（一次查询）</strong>：每个 following 仅调用一次 autoSearch，完成：
+              <ul>
+                <li>私密判断：<code>private_account_guess=true</code> 直接拦截；</li>
+                <li>质量阈值：<code>video_count &gt; following_filter_min_video_count</code> 且 <code>following_count &lt; following_filter_max_following_count</code>；</li>
+                <li>字段不全/查询失败也拦截（fail-closed）。</li>
+              </ul>
+            </li>
+            <li><strong>落库</strong>：仅对通过评估且原本不在 <code>tiktok_roots</code> 的 following，写入 <code>tiktok_roots</code> + <code>mobile_pending_usernames</code>。</li>
+            <li><strong>状态回写与清理</strong>：
+              <ul>
+                <li>有 following 入库尝试时：follower 标记 <code>following_access_status=available</code>，<code>mobile_push_status=pending</code>；</li>
+                <li>本轮处理过的 follower 最终会从 <code>follower_queue</code> 删除。</li>
+              </ul>
+            </li>
+          </ol>
+
+          <h3>3. 落库前过滤规则（来源于 tiktok_roots / follower_queue 两条链路）</h3>
+          <ol>
+            <li><strong>tiktok_roots -&gt; follower_queue（collect_roots）</strong>
+              <ul>
+                <li>root 入库前先做私密判定；判定失败或私密则不写 <code>tiktok_roots</code>。</li>
+                <li>每个 follower 入队前再做一次私密判定；私密/判定失败直接拦截，不写 <code>follower_queue</code>。</li>
+              </ul>
+            </li>
+            <li><strong>follower_queue -&gt; following 回流（process_queue）</strong>
+              <ul>
+                <li>following 先过私密判定，再过质量阈值判定；</li>
+                <li>仅通过者写入 <code>tiktok_roots</code> 与 <code>mobile_pending_usernames</code>；</li>
+                <li>已存在于 <code>tiktok_roots</code> 的 following 不重复写入下发池。</li>
+              </ul>
+            </li>
+          </ol>
+
+          <h3>4. 设备端三种模式：详细步骤、页面流转与判定逻辑</h3>
+          <p style="margin:0.6em 0 1em;">
+            <strong>关于无障碍</strong>：主流程以 root <code>input tap</code> / <code>screencap</code> + OCR 为主。<strong>无障碍未连接时任务仍可执行</strong>（使用 Application 上下文取分辨率与缓存目录）。无障碍服务仅在少数能力上有用（例如可选的贝塞尔滑动 <code>dispatchGesture</code>、未连接时 <code>scrollFeed</code> 会回退为 root <code>input swipe</code>）。建议仍可在系统设置中开启，以便将来扩展依赖无障碍节点的步骤。
+          </p>
+
+          <h4>4.1 growth 模式（涨粉模式）</h4>
+          <ol>
+            <li>设备端调用 <code>/api/pull_username</code> 拉取用户名；服务端数据源为 <code>mobile_pending_usernames</code>。</li>
+            <li>首次打开 TikTok（非复用 Users 路径）：<code>delay(500)</code> 后执行 <code>runForYouWarmupIfNeeded</code>（见 <strong>4.7</strong>），再点击放大镜进入搜索。</li>
+            <li>页面流转（客户端）：<code>搜索结果页 -&gt; Users 列表 -&gt; 目标用户主页 -&gt; Followers 列表</code>。</li>
+            <li>进入 Users 列表（含完整验收）：先执行 <code>OCR Fast</code> 查找 “Users” 标签并点击；若首次未命中或点击后页面无变化，再执行 <code>OCR Fallback</code> 二次识别。验收标准：顶部标签区出现 Users 激活态，且列表中可见多个用户结果（如昵称/Follow 文案）；未通过则回到搜索结果页重新触发一次。</li>
+            <li>进入目标主页（避免误点）：在 Users 列表对 OCR 文本做统一归一化（去空格/大小写/符号）后，与目标 <code>username</code> 做相似度匹配，按“最高分且超过阈值”选择唯一候选并点击。验收标准：主页出现目标用户名（或高置信度变体）且头像/作品区加载完成；若进入他人主页或未加载成功，则返回 Users 列表重试，超过重试上限记失败并换下一个任务。</li>
+            <li>进入 Followers 列表（点击 + 校验闭环）：当前实现为<strong>固定比例坐标</strong>点击（见下文「4.4 固定坐标表」Followers 行）+ 帧差校验；点击后通过 <code>帧差阈值</code> 判断是否进入列表页。若未进入则重试；连续失败则结束该用户名流程并上报失败原因。</li>
+            <li>进入作品页判定策略（growth）：在粉丝主页随机点击左/中/右作品位（日志带 <code>post_slot=left|middle|right</code>）。若命中左列，直接视为进入成功并开始互动；若命中中/右列，则使用“点击前基准帧 vs 点击后帧”的前后帧差判定（点击后等待 <code>growth_post_check_after_tap_delay_ms</code>，默认 1000ms），失败后再按 <code>growth_post_second_check_delay_ms</code>（默认 650ms）进行二次判定；中/右列路径下帧差判定不启用评论框 OCR 兜底（与早期文档表述不一致者以代码为准）。</li>
+            <li>进入作品页后的等待：<code>video_stay_min</code> / <code>video_stay_max</code> 随机停留（秒）在 **growth** 与 **live/direct** 下均生效——growth 在粉丝作品互动开始前等待；live/direct 在首条作品判定通过后、互动开始前等待。</li>
+            <li>涨粉模式评论：不再使用 OCR 定位「Add comment...」点开评论框，改为固定比例点击 <code>(0.92 × 屏宽, 0.68 × 屏高)</code>；输入文案后发送按钮策略与 live 文本评论一致（见下文「评论发送」）。</li>
+            <li>下发与去重：<code>mobile_pending_usernames</code> 仅 <code>pending</code> 可被拉取；拉取后变 <code>sent</code>；设备上报**成功**时删除对应队列行，失败则标记 <code>failed</code> 保留。历史数据不会在正常运行中批量清除（除一次性 DB 迁移或运维脚本外）。</li>
+            <li>设备随后在 Followers 列表内按 <code>processFollowersList</code> 执行访问/互动：外层最多 <strong>8</strong> 轮（<code>rounds &lt; 8</code>），每轮 OCR 取行、逐条处理后可下滑；到底则提前结束。单条粉丝上若配置 <code>skip_post_click_prob</code> 且随机命中，则<strong>不再进入点作品流程</strong>（先尝试与无作品/私密相同的 OCR 回退；否则强制 <code>back</code> 离开主页）。帧差类日志带 <code>username</code> 与 <code>post_slot</code> 便于绑定主任务用户与所点作品列。</li>
+          </ol>
+
+          <h4>4.2 live 模式（主播访问模式）</h4>
+          <ol>
+            <li>设备端调用同一拉取接口；服务端数据源：<code>live_customer</code>；按批大小返回并可累计使用计数。</li>
+            <li>页面流转（客户端）：<code>搜索结果页 -&gt; Users 列表 -&gt; 目标用户主页 -&gt; 首条作品详情页</code>。</li>
+            <li>进入 Users 后增加验收：通过 OCR 统计 Follow 文案数量，目标阈值 <code>&gt;= 3</code>；不足时补点 Users 并重验。</li>
+            <li>进入作品页：固定点击左侧第一条作品，采用“两次判定”策略；判定方式为 <code>帧差</code> + <code>评论输入区 OCR</code>。</li>
+            <li>互动阶段：执行评论/点赞/收藏/转发（受日限控制），完成后返回到 Users 选择界面并清空搜索框。</li>
+          </ol>
+
+          <h4>4.3 direct 模式（直客访问模式，run_mode=direct）</h4>
+          <ol>
+            <li>设备端调用拉取接口；服务端数据源：<code>follower_queue</code>。</li>
+            <li>页面流转（客户端）：<code>搜索结果页 -&gt; Users 列表 -&gt; 目标用户主页 -&gt; 首条作品详情页</code>。</li>
+            <li>进入作品页：固定点击左侧第一条作品（坐标比例同 live，见「4.4」）；<strong>不做</strong> Search/评论区 OCR 判定，点击成功与否仅依赖 root tap 返回值。</li>
+            <li>互动触发时机：点击首条作品后等待 <code>direct_post_action_delay_ms</code>（默认 1500ms，范围 300~8000ms）后直接开始互动。</li>
+            <li>互动阶段：严格遵循后台互动配置（权重、action_single、每日上限、互动间隔范围），不再默认全部执行。direct 下收藏、转发、评论框入口均为固定坐标点击。</li>
+            <li>后续可由后台执行 <code>trigger_process_queue</code>，将队列关系扩展后回流到 <code>tiktok_roots</code> 与下发池。</li>
+          </ol>
+
+          <h4>4.4 设备端固定比例坐标一览（<code>TraceExecutor.kt</code>，root <code>input</code>）</h4>
+          <p>像素坐标一般为 <code>round(比例 × widthPixels)</code> 或 <code>round(比例 × heightPixels)</code>，并会做边界钳制。带「±抖动」的点击在基准上再加随机像素。</p>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;margin:0.5em 0 1em;">
+            <thead>
+              <tr style="background:#f5f5f5;">
+                <th style="border:1px solid #ddd;padding:6px;text-align:left;">步骤 / 控件</th>
+                <th style="border:1px solid #ddd;padding:6px;text-align:left;">比例 (X, Y)</th>
+                <th style="border:1px solid #ddd;padding:6px;text-align:left;">适用模式</th>
+                <th style="border:1px solid #ddd;padding:6px;text-align:left;">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">搜索 / 放大镜区域 <code>tap</code></td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.92×W, 0.09×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">共用</td>
+                <td style="border:1px solid #ddd;padding:6px;">进入搜索后还会 <code>tap (0.38×W, 0.09×H)</code> 聚焦搜索框</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">Followers 入口 <code>tap</code></td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.505×W, 0.341×H)</code> ± <code>(14, 12)</code> 像素抖动</td>
+                <td style="border:1px solid #ddd;padding:6px;">仅 growth</td>
+                <td style="border:1px solid #ddd;padding:6px;">进入后用帧差 ≥ 0.035 校验</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">粉丝列表向下滑动 <code>swipe</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">X=<code>0.5×W</code>；起点 Y=<code>0.8×H</code>，终点 Y=<code>max(0.2×H, startY−distance)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">仅 growth</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>distance</code> 由 OCR 估算行高 ×7</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">作品网格（growth 随机一列）</td>
+                <td style="border:1px solid #ddd;padding:6px;">Y=<code>0.75×H</code>；X=<code>0.17×W</code> / <code>0.5×W</code> / <code>0.83×W</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">growth</td>
+                <td style="border:1px solid #ddd;padding:6px;">左列不跑帧差判定；中/右列帧差裁剪区见代码（约竖直 10%~40% 屏）</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">首条作品（左列）</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.17×W, 0.70×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">live、direct</td>
+                <td style="border:1px solid #ddd;padding:6px;">对应 <code>leftPostPoint</code>；live 有帧差+评论 OCR 判定；direct 无 OCR，仅延时后进互动（growth 随机三列作品为 <code>Y=0.75×H</code>，与此行不同）</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">点赞 <code>tap</code>（两次）</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.5×W, 0.5×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">三种模式</td>
+                <td style="border:1px solid #ddd;padding:6px;">互动阶段共用</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">收藏 <code>tap</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">主点 <code>(0.92×W, 0.75×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">growth、direct</td>
+                <td style="border:1px solid #ddd;padding:6px;">固定锚点</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">收藏 <code>tap</code>（live，带 OCR）</td>
+                <td style="border:1px solid #ddd;padding:6px;">X=<code>0.92×W</code>；Y=<code>Search锚点Y − max(0.055×H, 48px)</code>；无锚点时同左行固定点</td>
+                <td style="border:1px solid #ddd;padding:6px;">live</td>
+                <td style="border:1px solid #ddd;padding:6px;">Search 来自作品页底部区域 OCR</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">转发：打开分享面板</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.92×W, 0.82×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">三种模式</td>
+                <td style="border:1px solid #ddd;padding:6px;">先点此再选 Repost</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">转发：点 Repost</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.1111×W, 0.80×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">growth、direct</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>useOcrRepost=false</code> 时固定第二击</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">转发：点 Repost</td>
+                <td style="border:1px solid #ddd;padding:6px;">OCR 命中 “repost” 文本框中心</td>
+                <td style="border:1px solid #ddd;padding:6px;">live</td>
+                <td style="border:1px solid #ddd;padding:6px;">失败则跳过第二击</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">评论：点开输入框</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.92×W, 0.68×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">growth</td>
+                <td style="border:1px solid #ddd;padding:6px;">固定比例</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">评论：点开输入框</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.5×W, 0.98×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">direct</td>
+                <td style="border:1px solid #ddd;padding:6px;">底部评论条</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">评论：点开输入框</td>
+                <td style="border:1px solid #ddd;padding:6px;">OCR「Add comment…」命中框中心 + 偏移</td>
+                <td style="border:1px solid #ddd;padding:6px;">live</td>
+                <td style="border:1px solid #ddd;padding:6px;">非固定比例</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ddd;padding:6px;">评论：发送按钮</td>
+                <td style="border:1px solid #ddd;padding:6px;"><code>(0.91×W, 0.57×H)</code></td>
+                <td style="border:1px solid #ddd;padding:6px;">三种模式</td>
+                <td style="border:1px solid #ddd;padding:6px;">失败兜底 <code>keyevent 66</code></td>
+              </tr>
+            </tbody>
+          </table>
+          <p style="font-size:13px;color:#444;margin-top:0;">Users 标签、用户列表行、粉丝列表行等大量为 <strong>OCR 后点识别框中心</strong>，无统一固定比例，故不列入上表。</p>
+
+          <h4>4.5 三种模式：输入评论文案后点击「发送」的方式</h4>
+          <ul>
+            <li><strong>相同点</strong>：三种模式在输入 <code>input text</code> 后，均使用同一组发送区坐标：<code>tap (0.91 × 屏宽, 0.57 × 屏高)</code>；若 root <code>input tap</code> 失败则兜底 <code>input keyevent 66</code>（ENTER）。</li>
+            <li><strong>差异在「如何点开输入框」</strong>：直客 <code>(0.5×W, 0.98×H)</code>；涨粉 <code>(0.92×W, 0.68×H)</code>；主播为 OCR 定位「Add comment...」后再输入。</li>
+          </ul>
+
+          <h4>4.6 页面进入链路日志（STEP_FLOW）</h4>
+          <p>
+            设备端已新增统一链路日志，格式为 <code>STEP_FLOW</code> JSON，核心字段包括：
+            <code>step</code>、<code>from_page</code>、<code>locate_method</code>、<code>locate_evidence</code>、
+            <code>action</code>、<code>verify_method</code>、<code>verify_evidence</code>、<code>to_page</code>、<code>result</code>、<code>ts</code>。
+            用于复盘“如何定位、点击了哪里、如何判定进入成功、失败在哪一步”。
+          </p>
+
+          <h4>4.7 延时与「用户资料主页」停留（Android <code>TraceExecutor.kt</code>，以当前代码为准）</h4>
+          <p style="margin:0.5em 0;">下列为<strong>硬编码或可配置 delay</strong> 与 OCR 耗时叠加后的行为说明；OCR/截屏耗时随设备性能变化，文档不量化。</p>
+          <p style="margin:0.5em 0;"><strong>For You 预滑</strong>（<code>runForYouWarmupIfNeeded</code>）：仅当 <code>for_you_swipe_total_sec × 1000 ≥ 500</code> 时执行。总时长内循环：每段随机观看 <code>for_you_watch_min_sec</code>～<code>for_you_watch_max_sec</code>（换算为毫秒且各自下限钳制为 500ms），每段不超过剩余总时长；若命中 <code>for_you_like_prob</code>，点赞双击发生在<strong>该观看段内的随机时刻</strong>（段足够长时 <code>preDelay ∈ [40, watchMs−280)</code> 毫秒；较短段另有分支）；段末执行上滑 <code>swipe</code> 后 <code>delay(450)</code>。</p>
+          <p style="margin:0.5em 0;"><strong>从 Users 列表进入「当前任务用户名」对应主页</strong>（根用户，三种模式共用一段）：列表行点击后 <code>delay(400)</code>（失败会再点一次）；随后 <code>delay(Random.nextLong(1200, 1800))</code>；再执行一次 <code>checkNoVideosAndGoBack</code>（无作品/私密则 <code>back</code> 并结束本任务）。此处<strong>没有</strong>调用 <code>checkNoVideosAndGoBackWithRetry</code>。</p>
+          <ul>
+            <li><strong>growth</strong>：通过后立即进入 <code>clickFollowersAndVerify</code>，不在主页额外插入随机停留。该函数每次点击 Followers 后：第 1 次 OCR 轮询前 <code>delay(2500)</code>，第 2～4 次轮询间隔 <code>Random.nextLong(500, 850)</code>；最多 4 次轮询、最多 3 轮点击尝试。通过后进入粉丝列表，再 <code>delay(Random.nextLong(1000, 2000))</code> 后执行 <code>processFollowersList</code>。</li>
+            <li><strong>live / direct</strong>：通过后进入 <code>runLiveVisitModeForCurrentProfile</code>，很快对首条作品执行 <code>tap</code>（坐标见 4.4「首条作品」行）。<strong>live</strong>：点击后 <code>delay(1500)</code> 做首次帧差/OCR 判定，再 <code>delay(secondCheckDelayMs)</code>（默认 <code>1100</code>）二次判定。<strong>direct</strong>：点击后 <code>delay(direct_post_action_delay_ms)</code>（配置 300～8000ms），再 <code>delay(900)</code> 做第二次帧差判定。上述较长 delay 发生在<strong>已点击作品之后</strong>，用于判定/进入作品态；主页上除前述 1.2～1.8s 与无作品/私密 OCR 外无额外「资料页随机停留」。</li>
+          </ul>
+          <p style="margin:0.5em 0;"><strong>粉丝列表 <code>processFollowersList</code>（growth）</strong>：每条 OCR 行点击后 <code>delay(Random.nextLong(1200, 1600))</code> 再分支。若命中 <code>skip_post_click_prob</code>：先 <code>checkNoVideosAndGoBackWithRetry</code>（内部最多两次检测，中间 <code>delay(420)</code>）；成功回列表后 <code>delay(Random.nextLong(500, 800))</code>；否则 <code>clickProfileBack</code> + <code>delay(Random.nextLong(600, 900))</code> + <code>delay(Random.nextLong(500, 800))</code>，<strong>不</strong>执行点作品。未命中概率时：若 <code>checkNoVideosAndGoBackWithRetry</code> 为真则同样跳过。否则进入 <code>enterPostAndRunInteractionsWithSecondCheck</code>（先截屏再随机点左/中/右列作品，无额外「仅在主页」的随机等待）。单条处理结束后 <code>delay(Random.nextLong(450, 750))</code>。每轮列表向下滑动后 <code>delay(Random.nextLong(900, 1200))</code>。</p>
+          <p style="margin:0.5em 0;font-size:13px;color:#444;"><strong>配置说明</strong>：<code>video_stay_min</code> / <code>video_stay_max</code> 作用于<strong>已进入作品页之后</strong>的互动前等待，不是资料主页停留。<code>visit_delay_min</code> / <code>visit_delay_max</code> 虽在服务端与 App 配置模型中存在，当前 Android 客户端执行路径<strong>未读取</strong>该字段。</p>
+
+          <h3>5. TikTok 数据查询模块（调试与验证）</h3>
+          <ul>
+            <li>查询入口：<code>/api/admin/tiktok_profile_stats</code>。</li>
+            <li>私密判断来源：结构化 universal 字段（privateAccount/secret）。</li>
+            <li><code>raw_response.text</code> 已做展示过滤：去除大段 script/style，便于人工判断。</li>
+            <li>调试字段：<code>debug.private_flags_from_universal</code> 可直接看到命中的私密标记。</li>
+          </ul>
+
+          <h3>6. 关键表职责（数据流视角）</h3>
+          <ul>
+            <li><code>tiktok_roots</code>：根用户池（关系发现与增长基础数据）。</li>
+            <li><code>follower_queue</code>：待处理 follower 队列（直客 run_mode=direct 下发源；process_queue 等消费源）。</li>
+            <li><code>mobile_pending_usernames</code>：growth 下发池（设备端优先消费）。</li>
+            <li><code>live_customer</code>：live 下发池。</li>
+          </ul>
+
+          <h3>7. 常见问题排查</h3>
+          <ul>
+            <li><strong>明明私密却未拦截</strong>：先看 <code>debug.private_flags_from_universal</code> 是否拿到目标 uniqueId 的 privateAccount/secret。</li>
+            <li><strong>入库数量异常少</strong>：区分是“私密拦截”还是“阈值不通过”，看日志分类计数。</li>
+            <li><strong>页面 Failed to fetch</strong>：检查 API Base、服务进程与网络连通性。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="config" class="panel">
+        <header>
+          <h2>运行配置</h2>
+          <p>先切换模式，再编辑该模式的独立配置；保存后只影响当前模式，不会覆盖其他模式。</p>
+        </header>
+        <div class="field full" style="margin: 0 0 12px;">
+          <label>当前配置模式</label>
+          <select id="configModeSelect" name="config_mode">
+            <option value="growth">涨粉模式</option>
+            <option value="live">主播访问模式</option>
+            <option value="direct">直客访问模式</option>
+          </select>
+          <div class="hint">切换后会自动加载该模式自己的配置。你在这里保存的内容，只会写入当前模式那一套参数。</div>
+        </div>
+        <form id="configForm" class="form-grid">
+          <div class="field">
+            <label>休息前粉丝数</label>
+            <input name="fans_per_break" type="number" min="1" />
+          </div>
+          <div class="field">
+            <label>休息最短(分钟)</label>
+            <input name="break_min" type="number" min="1" />
+            <div class="hint">表示“每处理到一定数量账号后，系统会进入休息”时，休息时长的下限。真正休息多久，会在 <strong>休息最短</strong> 和 <strong>休息最长</strong> 之间随机取一个值。比如 10~20 分钟，命中后可能休息 10 分钟、13 分钟，也可能是 19 分钟。</div>
+          </div>
+          <div class="field">
+            <label>休息最长(分钟)</label>
+            <input name="break_max" type="number" min="1" />
+          </div>
+          <div class="field">
+            <label>访问延迟最小(秒)</label>
+            <input name="visit_delay_min" type="number" step="0.1" min="0" />
+            <div class="hint">每次访问一个用户之前，程序都会先等待一段随机时间。这里是这个随机区间的下限。</div>
+          </div>
+          <div class="field">
+            <label>访问延迟最大(秒)</label>
+            <input name="visit_delay_max" type="number" step="0.1" min="0" />
+            <div class="hint">和“访问延迟最小”一起组成随机区间的上限。真正等待时长会在这两个值之间随机取出一个数；例如 0.5~2 秒，可能等 0.8 秒，也可能等 1.7 秒。这个值越大，单次访问前的等待通常越久，整体节奏也会更慢。</div>
+          </div>
+          <div class="field">
+            <label>作品停留最小(秒，随机区间下限)</label>
+            <input name="video_stay_min" type="number" step="0.1" min="0" />
+            <div class="hint">进入作品页后、开始互动动作前的随机等待下限；<strong>growth / live / direct</strong> 均会消费该区间（日志会打印本次随机毫秒与 post_slot）。</div>
+          </div>
+          <div class="field">
+            <label>作品停留最大(秒，随机区间上限)</label>
+            <input name="video_stay_max" type="number" step="0.1" min="0" />
+            <div class="hint">与「作品停留最小」组成闭区间随机延迟；若感觉未生效，请确认已拉取最新配置且当前模式会进入作品互动流程。</div>
+          </div>
+          <div class="field">
+            <label>涨粉作品判定-点击后等待(ms)</label>
+            <input name="growth_post_check_after_tap_delay_ms" type="number" min="100" max="5000" step="1" value="1000" />
+            <div class="hint">仅用于 growth 中/右列：点击作品后等待该时长，再做“点击前后帧差”判定。</div>
+          </div>
+          <div class="field">
+            <label>涨粉作品判定-二次间隔(ms)</label>
+            <input name="growth_post_second_check_delay_ms" type="number" min="0" max="5000" step="1" value="650" />
+            <div class="hint">仅用于 growth 中/右列：第一次失败后，等待该时长再做第二次判定。</div>
+          </div>
+
+          <div class="field full">
+            <label>互动配置</label>
+            <div class="hint">点赞/评论/收藏/转发按权重随机（默认 0.4/0.3/0.3/0.3）。若开启“仅执行一个动作”，一次只会执行其中一个。</div>
+          </div>
+          <div class="field">
+            <label>互动间隔最小(秒)</label>
+            <input name="action_delay_min" type="number" step="0.1" min="0" value="0.7" />
+          </div>
+          <div class="field">
+            <label>互动间隔最大(秒)</label>
+            <input name="action_delay_max" type="number" step="0.1" min="0" value="1.2" />
+          </div>
+          <div class="field">
+            <label>TikTok强停后等待(ms)</label>
+            <input name="tiktok_force_stop_wait_ms" type="number" min="100" max="8000" step="1" value="800" />
+            <div class="hint">用于异常恢复重启流程：执行 am force-stop 后固定等待时长。</div>
+          </div>
+          <div class="field">
+            <label>TikTok拉起后等待(ms)</label>
+            <input name="tiktok_launch_wait_ms" type="number" min="800" max="10000" step="1" value="2600" />
+            <div class="hint">用于异常恢复重启流程：startActivity/monkey 拉起后固定等待时长，再判定前台包名。</div>
+          </div>
+          <div class="field">
+            <label>For You预滑总时长(秒)</label>
+            <input name="for_you_swipe_total_sec" type="number" min="0" max="600" step="0.1" value="0" />
+            <div class="hint">每次打开 TikTok 后，先在 For You 流中按该总时长执行滑动；为 0 时关闭该步骤。</div>
+          </div>
+          <div class="field">
+            <label>For You点赞概率</label>
+            <input name="for_you_like_prob" type="number" step="0.01" min="0" max="1" value="0" />
+            <div class="hint">For You 预滑阶段每条视频触发点赞的概率，点赞方式为双击屏幕。</div>
+          </div>
+          <div class="field">
+            <label>For You观看最短(秒)</label>
+            <input name="for_you_watch_min_sec" type="number" min="0.5" max="120" step="0.1" value="2" />
+          </div>
+          <div class="field">
+            <label>For You观看最长(秒)</label>
+            <input name="for_you_watch_max_sec" type="number" min="0.5" max="120" step="0.1" value="5" />
+            <div class="hint">每次滑动前先随机观看一段时间，时长在最短/最长区间内。</div>
+          </div>
+          <div class="field">
+            <label>点赞概率</label>
+            <input name="like_prob" type="number" step="0.01" min="0" max="1" value="0.4" />
+          </div>
+          <div class="field">
+            <label>评论概率</label>
+            <input name="comment_prob" type="number" step="0.01" min="0" max="1" value="0.3" />
+          </div>
+          <div class="field">
+            <label>收藏概率</label>
+            <input name="favorite_prob" type="number" step="0.01" min="0" max="1" value="0.3" />
+          </div>
+          <div class="field">
+            <label>转发概率</label>
+            <input name="share_prob" type="number" step="0.01" min="0" max="1" value="0.3" />
+          </div>
+          <div class="field">
+            <label>评论文字概率</label>
+            <input name="comment_text_prob" type="number" step="0.01" min="0" max="1" value="0.7" />
+          </div>
+          <div class="field">
+            <label>跳过作品点击概率</label>
+            <input name="skip_post_click_prob" type="number" step="0.01" min="0" max="1" value="0" />
+            <div class="hint">三套模式（growth/live/direct）都会<strong>各自</strong>在“进入用户主页后”做一次独立判定：按该概率决定本次是否<strong>跳过作品点击</strong>，直接走“无作品/私密账号”同样的跳过流程。它是互斥分支（命中则不点作品，未命中才会进入点作品流程），并非三套模式同时叠加执行。比如 0.1 表示约 10% 概率跳过作品点击。</div>
+          </div>
+          <div class="field">
+            <label>仅执行一个动作</label>
+            <input name="action_single" type="checkbox" />
+          </div>
+          <div class="field full">
+            <label>每日上限（每个动作单独计数）</label>
+            <div class="hint">默认每个动作每天最多 800 次；达到上限后该动作当天不再执行。</div>
+          </div>
+          <div class="field">
+            <label>点赞每日上限</label>
+            <input name="like_daily_limit" type="number" min="0" step="1" value="800" />
+          </div>
+          <div class="field">
+            <label>评论每日上限</label>
+            <input name="comment_daily_limit" type="number" min="0" step="1" value="800" />
+          </div>
+          <div class="field">
+            <label>收藏每日上限</label>
+            <input name="favorite_daily_limit" type="number" min="0" step="1" value="800" />
+          </div>
+          <div class="field">
+            <label>转发每日上限</label>
+            <input name="share_daily_limit" type="number" min="0" step="1" value="800" />
+          </div>
+          <div class="field full">
+            <label>评论文本（多条用逗号或换行）</label>
+            <textarea name="comment_texts" rows="8">hi
+moring
+so cute</textarea>
+          </div>
+          <!-- <div class="field full" style="margin-top: 12px;">
+            <label>TikTok 设备操作测试（一个方案一个按钮）</label>
+            <div class="hint">每个按钮只执行单一方案，不做多级兜底，便于你单独验证每一种实现。</div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="forceStopTikTokBtn1" type="button" class="ghost">强制关闭方案1</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案1：am force-stop</span>
+            </div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="forceStopTikTokBtn2" type="button" class="ghost">强制关闭方案2</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案2：pkill / killall</span>
+            </div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="forceStopTikTokBtn3" type="button" class="ghost">强制关闭方案3</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案3：pidof + kill -9</span>
+            </div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="launchTikTokBtn1" type="button" class="primary">打开/拉起方案1</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案1：startActivity / launch intent</span>
+            </div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="launchTikTokBtn2" type="button" class="primary">打开/拉起方案2</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案2：monkey</span>
+            </div>
+            <div class="action-group" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:flex-start;">
+              <button id="launchTikTokBtn3" type="button" class="primary">打开/拉起方案3</button>
+              <span class="hint" style="max-width:520px;line-height:1.6;display:block;">方案3：resolve-activity + monkey</span>
+            </div>
+          </div> -->
+        </form>
+        <div class="actions config-actions">
+          <button id="saveConfig" class="primary">保存并下发</button>
+        </div>
+
+
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
