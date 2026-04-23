@@ -55,6 +55,7 @@ coverage/
 chrome_profile_tiktok/
 
 # Local tool / cache directories
+tools/gradle-8.7-all.zip
 /tools/gradle-8.7-all/
 
 # Misc generated artifacts
