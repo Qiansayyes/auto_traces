@@ -3,7 +3,6 @@ const appShell = document.getElementById("appShell");
 const authUsernameInput = document.getElementById("authUsername");
 const authPasswordInput = document.getElementById("authPassword");
 const authLoginBtn = document.getElementById("authLoginBtn");
-const authRegisterBtn = document.getElementById("authRegisterBtn");
 const authMessageEl = document.getElementById("authMessage");
 const logoutBtn = document.getElementById("logoutBtn");
 const userRoleLabel = document.getElementById("userRoleLabel");
@@ -78,6 +77,13 @@ const dbPageInfoEl = document.getElementById("dbPageInfo");
 const dbTableGridEl = document.getElementById("dbTableGrid");
 const dbTableHeadEl = document.getElementById("dbTableHead");
 const dbTableBodyEl = document.getElementById("dbTableBody");
+const adminCreateUsernameInput = document.getElementById("adminCreateUsername");
+const adminCreatePasswordInput = document.getElementById("adminCreatePassword");
+const adminCreateRoleSelect = document.getElementById("adminCreateRole");
+const adminCreateUserBtn = document.getElementById("adminCreateUserBtn");
+const adminReloadUsersBtn = document.getElementById("adminReloadUsersBtn");
+const adminUsersMsgEl = document.getElementById("adminUsersMsg");
+const adminUsersTableBodyEl = document.getElementById("adminUsersTableBody");
 
 
 const statsUsernameInput = document.getElementById("statsUsername");
@@ -1915,24 +1921,66 @@ async function authCheck() {
   return true;
 }
 
-async function doLogin(register = false) {
+function renderAdminUsers(items = []) {
+  if (!adminUsersTableBodyEl) return;
+  if (!Array.isArray(items) || !items.length) {
+    adminUsersTableBodyEl.innerHTML = `<tr><td colspan="6" style="padding:10px;color:#666;">暂无数据</td></tr>`;
+    return;
+  }
+  adminUsersTableBodyEl.innerHTML = items
+    .map((item) => {
+      const active = item?.is_active ? "启用" : "停用";
+      return `<tr>
+        <td>${item?.id ?? ""}</td>
+        <td>${item?.username ?? ""}</td>
+        <td>${item?.role ?? ""}</td>
+        <td>${active}</td>
+        <td>${item?.last_login_at || "-"}</td>
+        <td>${item?.created_at || "-"}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+async function loadAdminUsers() {
+  if (currentUser?.role !== "admin") return;
+  const data = await request("/api/admin/users");
+  renderAdminUsers(Array.isArray(data.items) ? data.items : []);
+}
+
+async function createAdminUser() {
+  if (currentUser?.role !== "admin") return;
+  const username = (adminCreateUsernameInput?.value || "").trim();
+  const password = adminCreatePasswordInput?.value || "";
+  const role = (adminCreateRoleSelect?.value || "customer").trim() || "customer";
+  if (!username || !password) {
+    if (adminUsersMsgEl) adminUsersMsgEl.textContent = "用户名和密码不能为空";
+    return;
+  }
+  await request("/api/admin/users", {
+    method: "POST",
+    body: JSON.stringify({ username, password, role, is_active: true }),
+  });
+  if (adminUsersMsgEl) adminUsersMsgEl.textContent = `创建成功：${username}`;
+  if (adminCreateUsernameInput) adminCreateUsernameInput.value = "";
+  if (adminCreatePasswordInput) adminCreatePasswordInput.value = "";
+  await loadAdminUsers();
+}
+
+async function doLogin() {
   const username = (authUsernameInput?.value || "").trim();
   const password = authPasswordInput?.value || "";
-  const endpoint = register ? "/api/auth/register" : "/api/auth/login";
-  const data = await request(endpoint, { method: "POST", body: JSON.stringify({ username, password }) });
-  if (!register) {
-    setAuthToken(data.token);
-    currentUser = { username: data.username, role: data.role };
-    authShell?.classList.add("hidden");
-    appShell?.classList.remove("hidden");
-    applyRolePermissions();
-    await loadUserRuntimeConfig();
-    if (authMessageEl) authMessageEl.textContent = `欢迎，${data.username}`;
-    await refreshBackupRecords();
-    await refreshTikTokBackups();
-  } else if (authMessageEl) {
-    authMessageEl.textContent = "注册成功，请继续登录";
-  }
+  const data = await request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+  setAuthToken(data.token);
+  currentUser = { username: data.username, role: data.role };
+  authShell?.classList.add("hidden");
+  appShell?.classList.remove("hidden");
+  applyRolePermissions();
+  await loadUserRuntimeConfig();
+  if (authMessageEl) authMessageEl.textContent = `欢迎，${data.username}`;
+  await refreshBackupRecords();
+  await refreshTikTokBackups();
+  await loadAdminUsers();
 }
 
 refreshAllBtn.addEventListener("click", async () => {
@@ -2298,9 +2346,22 @@ if (deviceOpsSelect) {
   deviceOpsSelect.addEventListener("change", toggleDeviceOpsButtons);
 }
 
-if (authLoginBtn) authLoginBtn.addEventListener("click", () => doLogin(false).catch((e) => { if (authMessageEl) authMessageEl.textContent = e.message || "登录失败"; }));
-if (authRegisterBtn) authRegisterBtn.addEventListener("click", () => doLogin(true).catch((e) => { if (authMessageEl) authMessageEl.textContent = e.message || "注册失败"; }));
+if (authLoginBtn) authLoginBtn.addEventListener("click", () => doLogin().catch((e) => { if (authMessageEl) authMessageEl.textContent = e.message || "登录失败"; }));
 if (logoutBtn) logoutBtn.addEventListener("click", () => { setAuthToken(""); currentUser = null; appShell?.classList.add("hidden"); authShell?.classList.remove("hidden"); if (authMessageEl) authMessageEl.textContent = "请先登录"; });
+if (adminCreateUserBtn) {
+  adminCreateUserBtn.addEventListener("click", () => {
+    createAdminUser().catch((e) => {
+      if (adminUsersMsgEl) adminUsersMsgEl.textContent = e.message || "创建失败";
+    });
+  });
+}
+if (adminReloadUsersBtn) {
+  adminReloadUsersBtn.addEventListener("click", () => {
+    loadAdminUsers().catch((e) => {
+      if (adminUsersMsgEl) adminUsersMsgEl.textContent = e.message || "加载失败";
+    });
+  });
+}
 
 toggleDeviceOpsButtons();
 
@@ -2310,6 +2371,7 @@ toggleDeviceOpsButtons();
     handleRefresh();
     loadAccounts();
     loadDbTablePage();
+    loadAdminUsers();
     refreshBackupRecords();
     refreshTikTokBackups();
     setInterval(refreshTaskStatus, 2000);

@@ -1084,6 +1084,13 @@ class StopTaskByPrefixRequest(BaseModel):
     prefix: str = Field(..., min_length=1, max_length=120)
 
 
+class AdminCreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+    role: Literal["customer", "admin"] = "customer"
+    is_active: bool = True
+
+
 class ReportResultRequest(DeviceAuthModel):
     result: str = Field(..., min_length=1)
     run_mode: Literal["growth", "live", "direct"] | None = None
@@ -2129,23 +2136,61 @@ def root():
 
 @app.post("/api/auth/register")
 def auth_register(payload: dict):
-    username = str(payload.get('username') or '').strip()
-    password = str(payload.get('password') or '')
-    if not username or not password:
-        return {"code": 1, "msg": "用户名和密码不能为空"}
-    if len(username) > 64 or len(password) < 6:
-        return {"code": 1, "msg": "用户名或密码不合法"}
+    return {"code": 403, "msg": "已关闭自助注册，请联系管理员创建账号"}
+
+
+@app.get("/api/admin/users")
+def admin_list_users(authorization: str | None = Header(default=None)):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, username, role, created_at, last_login_at, is_active
+            FROM auth_users
+            ORDER BY id DESC
+            """
+        ).fetchall()
+        items = [
+            {
+                "id": int(r[0]),
+                "username": str(r[1] or ""),
+                "role": str(r[2] or "customer"),
+                "created_at": str(r[3] or ""),
+                "last_login_at": str(r[4] or ""),
+                "is_active": bool(int(r[5] or 0)),
+            }
+            for r in rows
+        ]
+        return {"code": 0, "items": items}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/users")
+def admin_create_user(payload: AdminCreateUserRequest, authorization: str | None = Header(default=None)):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    username = str(payload.username or "").strip()
+    if not username or len(username) > 64 or not re.match(r"^[A-Za-z0-9_.-]+$", username):
+        return {"code": 1, "msg": "用户名不合法，仅支持字母数字和 ._-"}
     conn = _get_db()
     try:
         exists = conn.execute("SELECT 1 FROM auth_users WHERE username = ?", (username,)).fetchone()
         if exists:
             return {"code": 1, "msg": "用户名已存在"}
         conn.execute(
-            "INSERT INTO auth_users (username, password_hash, role, created_at, is_active) VALUES (?, ?, 'customer', ?, 1)",
-            (username, _hash_password(password), now_text()),
+            """
+            INSERT INTO auth_users (username, password_hash, role, created_at, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (username, _hash_password(payload.password), payload.role, now_text(), 1 if payload.is_active else 0),
         )
         conn.commit()
-        return {"code": 0, "msg": "注册成功"}
+        return {"code": 0, "msg": "创建成功"}
     finally:
         conn.close()
 

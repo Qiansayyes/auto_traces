@@ -13,16 +13,15 @@
         <div class="logo">AT</div>
         <div>
           <h1>Auto Traces</h1>
-          <p>登录或注册后继续</p>
+          <p>登录后继续</p>
         </div>
       </div>
       <h2 style="margin:0 0 8px;">欢迎使用</h2>
-      <p class="hint">普通用户首次进入需要注册；管理员账号由系统预置，不在页面公开显示。</p>
+      <p class="hint">账号由管理员统一创建。</p>
       <div class="field"><label>用户名</label><input id="authUsername" type="text" placeholder="请输入用户名" /></div>
       <div class="field"><label>密码</label><input id="authPassword" type="password" placeholder="请输入密码" /></div>
       <div class="auth-actions">
         <button id="authLoginBtn" class="primary">登录</button>
-        <button id="authRegisterBtn" class="ghost">注册</button>
       </div>
       <div id="authMessage" class="status">请先登录</div>
     </div>
@@ -49,6 +48,7 @@
         <button class="nav-item admin-only" data-section="cv-access-data">直客访问模式数据</button>
         <button class="nav-item admin-only" data-section="tiktok-stats">TikTok数据查询</button>
         <button class="nav-item admin-only" data-section="db-tables">数据库分页</button>
+        <button class="nav-item admin-only" data-section="admin-users">用户管理</button>
         <button class="nav-item admin-only" data-section="docs">系统功能文档</button>
       </nav>
       <div class="sidebar-footer">
@@ -422,6 +422,58 @@
               <thead id="dbTableHead"></thead>
               <tbody id="dbTableBody"></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="admin-users" class="panel">
+        <header>
+          <h2>用户管理</h2>
+          <p>仅管理员可创建新账号，登录页不提供自助注册。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>创建用户</h3>
+            <div class="field">
+              <label>用户名</label>
+              <input id="adminCreateUsername" type="text" placeholder="例如：customer_01" />
+            </div>
+            <div class="field">
+              <label>密码</label>
+              <input id="adminCreatePassword" type="password" placeholder="至少 6 位" />
+            </div>
+            <div class="field">
+              <label>角色</label>
+              <select id="adminCreateRole">
+                <option value="customer">customer</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            <button id="adminCreateUserBtn" class="primary">创建用户</button>
+            <div id="adminUsersMsg" class="status">等待操作</div>
+          </div>
+          <div class="panel-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+              <h3 style="margin:0;">账号列表</h3>
+              <button id="adminReloadUsersBtn" class="ghost">刷新</button>
+            </div>
+            <div class="table-mini-wrap" style="margin-top:10px;">
+              <table class="mini-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>用户名</th>
+                    <th>角色</th>
+                    <th>状态</th>
+                    <th>最近登录</th>
+                    <th>创建时间</th>
+                  </tr>
+                </thead>
+                <tbody id="adminUsersTableBody">
+                  <tr><td colspan="6" style="padding:10px;color:#666;">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </section>
