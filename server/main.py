@@ -3628,8 +3628,30 @@ def update_config(payload: UpdateConfigRequest, authorization: str | None = Head
     data["configs_by_mode"] = configs_by_mode
     data["default_config"] = dict(configs_by_mode.get("growth", MODE_DEFAULT_CONFIGS["growth"]))
     _save_user_runtime_state(session["username"], data)
-    print(f"[{now_text()}] 用户 {session['username']} | {mode} 配置已更新：{incoming}")
-    return {"code": 0, "msg": "配置更新成功", "config": current, "configs_by_mode": configs_by_mode}
+
+    allowed = _session_device_ids(session)
+    refresh_count = 0
+    with store.lock:
+        for device_id, device in store.devices.items():
+            if device_id not in allowed:
+                continue
+            _enqueue_device_op(
+                device_id,
+                {
+                    "op_id": f"cfg_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}",
+                    "op_type": "refresh_runtime_config",
+                    "payload": {
+                        "device_id": device_id,
+                        "alias": device.alias,
+                        "run_mode": mode,
+                    },
+                    "created_at": now_text(),
+                },
+            )
+            refresh_count += 1
+
+    print(f"[{now_text()}] 用户 {session['username']} | {mode} 配置已更新：{incoming} | 已通知设备={refresh_count}")
+    return {"code": 0, "msg": "配置更新成功", "config": current, "configs_by_mode": configs_by_mode, "refresh_count": refresh_count}
 
 
 @app.post("/api/admin/config/default")

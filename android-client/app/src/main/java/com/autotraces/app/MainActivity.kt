@@ -70,9 +70,9 @@ class MainActivity : AppCompatActivity() {
                     append(if (item.success) "成功" else "失败")
                     append(" · ")
                     append(item.message)
-                    if (!item.exitCode.isNullOrBlank()) {
+                    item.exitCode?.let {
                         append(" · exit=")
-                        append(item.exitCode)
+                        append(it)
                     }
                     if (!item.cloudTaskId.isNullOrBlank()) {
                         append(" · task=")
@@ -274,7 +274,6 @@ class MainActivity : AppCompatActivity() {
         val pickBackupFileButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.pickBackupFileButton)
         val restoreLatestButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.restoreLatestButton)
         val reportButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.reportBackupButton)
-        val pollTaskButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.pollTaskButton)
         val showAllHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showAllHistoryButton)
         val showLocalHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showLocalHistoryButton)
         val showCloudHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showCloudHistoryButton)
@@ -309,22 +308,6 @@ class MainActivity : AppCompatActivity() {
                 backupStatusText.text = "正在上报..."
                 val ok = runCatching { backupReporter.reportRestoreResult(deviceId, latest.accountName, latest) }.getOrDefault(false)
                 backupStatusText.text = if (ok) "上报成功" else "上报失败，请检查服务端接口"
-            }
-        }
-        pollTaskButton.setOnClickListener {
-            lifecycleScope.launch {
-                val record = selectedCloudTaskRecord ?: withContext(Dispatchers.IO) {
-                    backupRepository.cloudHistory().firstOrNull { !it.cloudTaskId.isNullOrBlank() }
-                }
-                if (record == null || record.cloudTaskId.isNullOrBlank()) {
-                    cloudTaskStatusText.text = "没有可轮询的云端任务"
-                    return@launch
-                }
-                cloudTaskStatusText.text = "正在轮询任务 ${record.cloudTaskId} ..."
-                val refreshed = withContext(Dispatchers.IO) { backupRepository.refreshCloudTaskStatus(record) }
-                selectedCloudTaskRecord = refreshed
-                cloudTaskStatusText.text = buildCloudTaskStatusText(refreshed)
-                refreshBackupRecords()
             }
         }
 
@@ -589,6 +572,7 @@ class MainActivity : AppCompatActivity() {
                     binding.bindStatusText.text = "绑定成功"
                     WorkerService.start(this@MainActivity)
                     AppCoordinator.startIfNeeded()
+                    lifecycleScope.launch { AppCoordinator.fetchConfig(PrefsStore.getDeviceRunMode()) }
                 } else {
                     binding.bindStatusText.text = response.msg
                 }

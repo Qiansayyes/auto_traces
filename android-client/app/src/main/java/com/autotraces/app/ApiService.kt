@@ -34,12 +34,31 @@ object ApiService {
             ?: defaultBaseUrl
     }
 
-    suspend fun login(username: String, password: String): AuthLoginResponse = post(
-        path = "/api/auth/login",
-        body = AuthLoginRequest(username, password),
-        clazz = AuthLoginResponse::class.java,
-        includeAuth = false,
-    )
+    suspend fun login(username: String, password: String): AuthLoginResponse {
+        val request = AuthLoginRequest(username, password)
+        val candidates = listOf(
+            "/api/auth/login",
+            "/api/login",
+            "/auth/login",
+            "/login",
+            "/api/user/login",
+            "/user/login",
+        )
+        var lastError: Exception? = null
+        for (path in candidates) {
+            try {
+                return post(
+                    path = path,
+                    body = request,
+                    clazz = AuthLoginResponse::class.java,
+                    includeAuth = false,
+                )
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("login failed")
+    }
 
     suspend fun bindDevice(alias: String, fingerprint: String): BindDeviceResponse = post(
         path = "/api/bind_device",

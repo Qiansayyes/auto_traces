@@ -149,11 +149,12 @@ object AppCoordinator {
         }
     }
 
-    suspend fun fetchConfig() {
+    suspend fun fetchConfig(forceRunMode: String? = null) {
         val deviceId = PrefsStore.getDeviceId() ?: return
         val alias = PrefsStore.getAlias() ?: return
+        val runMode = forceRunMode?.takeIf { it.isNotBlank() } ?: PrefsStore.getDeviceRunMode()
         runCatching {
-            ApiService.getConfig(deviceId, alias, PrefsStore.getDeviceRunMode())
+            ApiService.getConfig(deviceId, alias, runMode)
         }.onSuccess { response ->
             if (response.code == 0 && response.config != null) {
                 val merged = response.config.copy(
@@ -393,7 +394,14 @@ object AppCoordinator {
                 }.onSuccess { resp ->
                     if (resp.code == 0 && resp.op != null) {
                         idleRounds = 0
-                        handleDeviceOp(alias, deviceId, resp.op)
+                        when (resp.op.op_type) {
+                            "refresh_runtime_config" -> {
+                                val runMode = resp.op.payload?.run_mode?.takeIf { it.isNotBlank() }
+                                fetchConfig(runMode)
+                                LogCenter.op(alias, "收到云端配置刷新指令，已立即同步")
+                            }
+                            else -> handleDeviceOp(alias, deviceId, resp.op)
+                        }
                     }
                 }.isSuccess
 

@@ -9,8 +9,8 @@ object AppConstants {
     /**
      * 当前应用包名。
      *
-     * 优先使用 BuildConfig.APPLICATION_ID，避免写死字符串后，
-     * 以后改 applicationId 时需要全局手工搜替换。
+     * 这里直接使用当前工程的 applicationId 对应值。
+     * 如果你以后改包名，只需要改这一处。
      */
-    const val APP_PACKAGE_NAME: String = BuildConfig.APPLICATION_ID
+    const val APP_PACKAGE_NAME: String = "com.autotraces.app"
 }
