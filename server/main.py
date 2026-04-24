@@ -1010,6 +1010,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=False,
+        log_level="info",
+    )
+
 @app.middleware("http")
 async def log_request_timing(request: Request, call_next):
     started = time.perf_counter()
