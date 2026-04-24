@@ -15,8 +15,6 @@ import java.util.concurrent.TimeUnit
  */
 object BackupRetrofitClient {
 
-    private const val BASE_URL = "http://192.168.100.249:8000/"
-
     private val gson = GsonBuilder().setLenient().create()
 
     private val client = OkHttpClient.Builder()
@@ -27,7 +25,7 @@ object BackupRetrofitClient {
 
     val service: BackupApiService by lazy {
         Retrofit.Builder()
-            .baseUrl(BASE_URL)
+            .baseUrl("https://your-server.example.com/")
             .client(client)
             .addConverterFactory(GsonConverterFactory.create(gson))
             .build()

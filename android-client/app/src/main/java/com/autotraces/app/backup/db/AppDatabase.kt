@@ -18,7 +18,7 @@ import com.autotraces.app.backup.model.BackupRecordDao
  */
 @Database(
     entities = [BackupRecord::class],
-    version = 2,
+    version = 1,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -29,13 +29,20 @@ abstract class AppDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
+        /**
+         * 单例数据库实例。
+         *
+         * 说明：
+         * - 使用 applicationContext 避免 Activity 泄漏
+         * - Room 自带线程检查，所以数据库访问必须放在协程 IO 线程里
+         */
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
                     "autotraces_backup.db",
-                ).fallbackToDestructiveMigration().build().also { INSTANCE = it }
+                ).build().also { INSTANCE = it }
             }
         }
     }

@@ -27,11 +27,12 @@ class BackupRepository(private val context: Context) {
             deviceAlias = PrefsStore.getAlias().orEmpty(),
             deviceId = PrefsStore.getDeviceId().orEmpty(),
             appAccount = PrefsStore.getAuthUsername().orEmpty(),
+            username = PrefsStore.getAuthUsername().orEmpty(),
         )
     }
 
     suspend fun backupLocal(accountName: String, packageName: String): BackupRecord {
-        val result = manager.backupAppData(accountName, packageName)
+        val result = manager.backupAppData(accountName)
         val meta = currentMeta()
         val record = BackupRecord(
             accountName = accountName,
@@ -55,7 +56,7 @@ class BackupRepository(private val context: Context) {
     }
 
     suspend fun backupCloud(accountName: String, packageName: String): BackupRecord {
-        val result = manager.backupAppData(accountName, packageName)
+        val result = manager.backupAppData(accountName)
         val meta = currentMeta()
         val initialRecord = BackupRecord(
             accountName = accountName,
@@ -97,7 +98,7 @@ class BackupRepository(private val context: Context) {
     }
 
     suspend fun restore(accountName: String, zipPath: String, packageName: String): BackupRecord {
-        val result = manager.restoreAppData(zipPath, packageName)
+        val result = manager.restoreAppData(zipPath)
         val meta = currentMeta()
         val record = BackupRecord(
             accountName = accountName,
@@ -143,5 +144,6 @@ class BackupRepository(private val context: Context) {
         val deviceAlias: String,
         val deviceId: String,
         val appAccount: String,
+        val username: String,
     )
 }

@@ -70,6 +70,10 @@ class MainActivity : AppCompatActivity() {
                     append(if (item.success) "成功" else "失败")
                     append(" · ")
                     append(item.message)
+                    if (!item.exitCode.isNullOrBlank()) {
+                        append(" · exit=")
+                        append(item.exitCode)
+                    }
                     if (!item.cloudTaskId.isNullOrBlank()) {
                         append(" · task=")
                         append(item.cloudTaskId)
@@ -154,7 +158,6 @@ class MainActivity : AppCompatActivity() {
 
         AppCoordinator.startIfNeeded()
         if (PrefsStore.isBound() && !WorkerServiceTracker.isRunning) WorkerService.start(this)
-        handleIntent(intent)
     }
 
     override fun onResume() {
@@ -436,22 +439,7 @@ class MainActivity : AppCompatActivity() {
         statusText.text = if (record.success) {
             if (record.backupScope == "cloud") "云端备份成功：${record.filename} · task=${record.cloudTaskId ?: "-"}" else "本地备份成功：${record.filename}"
         } else {
-            buildString {
-                append("备份失败：")
-                append(record.message)
-                if (!record.command.isNullOrBlank()) {
-                    append("\nCMD: ")
-                    append(record.command)
-                }
-                if (!record.output.isNullOrBlank()) {
-                    append("\nOUT: ")
-                    append(record.output)
-                }
-                if (record.exitCode != null) {
-                    append("\nEXIT: ")
-                    append(record.exitCode)
-                }
-            }
+            "备份失败：${record.message}"
         }
 
         LogCenter.op(accountName, "备份任务完成：${record.message}")
@@ -461,26 +449,7 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun restoreAndReportLatest(record: BackupRecord, statusText: TextView) {
         val restored = withContext(Dispatchers.IO) { backupRepository.restoreFromRecord(record) }
-        statusText.text = if (restored.success) {
-            "恢复成功：${restored.filename}"
-        } else {
-            buildString {
-                append("恢复失败：")
-                append(restored.message)
-                if (!restored.command.isNullOrBlank()) {
-                    append("\nCMD: ")
-                    append(restored.command)
-                }
-                if (!restored.output.isNullOrBlank()) {
-                    append("\nOUT: ")
-                    append(restored.output)
-                }
-                if (restored.exitCode != null) {
-                    append("\nEXIT: ")
-                    append(restored.exitCode)
-                }
-            }
-        }
+        statusText.text = if (restored.success) "恢复成功：${restored.filename}" else "恢复失败：${restored.message}"
 
         val deviceId = PrefsStore.getDeviceId().orEmpty()
         if (deviceId.isNotBlank()) {
@@ -518,26 +487,7 @@ class MainActivity : AppCompatActivity() {
 
         backupStatusText.text = "正在恢复选择的文件..."
         val restored = withContext(Dispatchers.IO) { backupRepository.restoreFromRecord(record.copy(path = localCopy.absolutePath)) }
-        backupStatusText.text = if (restored.success) {
-            "恢复成功：${restored.filename}"
-        } else {
-            buildString {
-                append("恢复失败：")
-                append(restored.message)
-                if (!restored.command.isNullOrBlank()) {
-                    append("\nCMD: ")
-                    append(restored.command)
-                }
-                if (!restored.output.isNullOrBlank()) {
-                    append("\nOUT: ")
-                    append(restored.output)
-                }
-                if (restored.exitCode != null) {
-                    append("\nEXIT: ")
-                    append(restored.exitCode)
-                }
-            }
-        }
+        backupStatusText.text = if (restored.success) "恢复成功：${restored.filename}" else "恢复失败：${restored.message}"
 
         val deviceId = PrefsStore.getDeviceId().orEmpty()
         if (deviceId.isNotBlank()) {
@@ -651,30 +601,4 @@ class MainActivity : AppCompatActivity() {
     }
 
     private enum class HistoryFilter { ALL, LOCAL, CLOUD }
-
-    private fun handleIntent(intent: Intent?) {
-    if (intent == null) return
-    val action = intent.getStringExtra("action") ?: return
-    when (action) {
-        "backup" -> {
-            val accountName = intent.getStringExtra("accountName") ?: "adb_test"
-            val packageName = intent.getStringExtra("packageName") ?: "com.zhiliao.tiktok"
-            lifecycleScope.launch {
-                val record = backupRepository.backupLocal(accountName, packageName)
-                Log.d("ADB_Backup", "success=${record.success}, path=${record.path}, msg=${record.message}")
-                runOnUiThread { Toast.makeText(this@MainActivity, "Backup: ${record.success}", Toast.LENGTH_LONG).show() }
-            }
-        }
-        "restore" -> {
-            val filePath = intent.getStringExtra("filePath") ?: return
-            val accountName = intent.getStringExtra("accountName") ?: "adb_restore"
-            val packageName = intent.getStringExtra("packageName") ?: "com.zhiliao.tiktok"
-            lifecycleScope.launch {
-                val record = backupRepository.restore(accountName, filePath, packageName)
-                Log.d("ADB_Restore", "success=${record.success}, msg=${record.message}")
-                runOnUiThread { Toast.makeText(this@MainActivity, "Restore: ${record.success}", Toast.LENGTH_LONG).show() }
-            }
-        }
-    }
-}
 }

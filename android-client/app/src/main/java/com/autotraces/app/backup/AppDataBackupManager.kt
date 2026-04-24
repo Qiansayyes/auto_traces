@@ -7,41 +7,30 @@ import java.io.File
 import java.security.MessageDigest
 
 /**
- * 通用的 Root + tar 备份/恢复工具
+ * 你自己的应用数据备份/恢复工具。
  *
- * 支持任意包名（需目标应用已安装且有数据目录）
- * 备份范围：/data/data/<packageName>，排除 cache/code_cache/no_backup 等目录
+ * 这个版本统一改成 Root + tar 的实现：
+ * - 备份时通过 su 调用 tar 打包当前 App 私有目录
+ * - 恢复时通过 su 调用 tar 解包回当前 App 私有目录
+ * - 备份范围统一排除 cache
+ *
+ * 说明：
+ * - 这里只适用于你自己拥有或明确授权的 App
+ * - 需要设备已 Root，并且 su 可用
  */
 class AppDataBackupManager(private val context: Context) {
 
-    /**
-     * 备份指定包名的应用数据
-     * @param accountName 业务账号名（用于文件名）
-     * @param targetPackageName 要备份的应用包名（如 com.zhiliao.tiktok）
-     */
-    fun backupAppData(accountName: String, targetPackageName: String): BackupResult {
+    fun backupAppData(accountName: String): BackupResult {
         return try {
             val backupDir = File(context.getExternalFilesDir(null), "backups")
             if (!backupDir.exists()) backupDir.mkdirs()
 
-            val dataDir = File("/data/data/$targetPackageName")
-            if (!dataDir.exists()) {
-                return BackupResult(
-                    success = false,
-                    path = "",
-                    filename = "",
-                    message = "Target package data directory not found: $dataDir"
-                )
-            }
-
-            val parentDir = dataDir.parentFile ?: return BackupResult(
-                success = false, path = "", filename = "",
-                message = "Cannot get parent dir of $dataDir"
-            )
+            val dataDir = File(context.applicationInfo.dataDir)
+            val parentDir = dataDir.parentFile ?: throw IllegalStateException("Missing parent dir for ${dataDir.absolutePath}")
             val packageName = dataDir.name
-
             val filename = "app_${accountName}_${System.currentTimeMillis()}.tar.gz"
             val outFile = File(backupDir, filename)
+
             if (outFile.exists()) outFile.delete()
 
             val command = buildString {
@@ -79,7 +68,6 @@ class AppDataBackupManager(private val context: Context) {
                 checksum = sha256(outFile),
                 command = command,
                 output = result.output,
-                exitCode = result.exitCode,
                 message = "backup completed",
             )
         } catch (e: Exception) {
@@ -93,12 +81,7 @@ class AppDataBackupManager(private val context: Context) {
         }
     }
 
-    /**
-     * 恢复指定包名的应用数据
-     * @param zipPath 备份文件路径
-     * @param targetPackageName 目标应用包名（用于校验和 chown）
-     */
-    fun restoreAppData(zipPath: String, targetPackageName: String): BackupResult {
+    fun restoreAppData(zipPath: String): BackupResult {
         return try {
             val backupFile = File(zipPath)
             if (!backupFile.exists()) {
@@ -110,35 +93,17 @@ class AppDataBackupManager(private val context: Context) {
                 )
             }
 
-            val dataDir = File("/data/data/$targetPackageName")
-            if (!dataDir.exists()) {
-                return BackupResult(
-                    success = false,
-                    path = zipPath,
-                    filename = backupFile.name,
-                    message = "Target package data directory not found: $dataDir"
-                )
-            }
-
-            val parentDir = dataDir.parentFile ?: return BackupResult(
-                success = false, path = zipPath, filename = backupFile.name,
-                message = "Cannot get parent dir of $dataDir"
-            )
+            val dataDir = File(context.applicationInfo.dataDir)
+            val parentDir = dataDir.parentFile ?: throw IllegalStateException("Missing parent dir for ${dataDir.absolutePath}")
             val packageName = dataDir.name
 
-            // 1. 强制停止目标应用
-            runAsRoot("am force-stop $targetPackageName")
-
-            // 2. 删除现有数据目录（可选，使用 tar 的 --overwrite 也可，但建议清空）
-            runAsRoot("rm -rf ${shellQuote(dataDir.absolutePath)}")
-
-            // 3. 解压备份包
             val command = buildString {
                 append("tar -xzf ")
                 append(shellQuote(backupFile.absolutePath))
                 append(" -C ")
                 append(shellQuote(parentDir.absolutePath))
             }
+
             val result = runAsRoot(command)
             if (result.exitCode != 0) {
                 return BackupResult(
@@ -152,14 +117,19 @@ class AppDataBackupManager(private val context: Context) {
                 )
             }
 
-            // 4. 获取目标应用的 UID 并修复权限
-            val uidResult = runAsRoot("grep '$targetPackageName' /data/system/packages.list | cut -d' ' -f2")
-            val uid = uidResult.output.trim()
-            if (uid.isNotEmpty()) {
-                runAsRoot("chown -R $uid:$uid ${shellQuote(dataDir.absolutePath)}")
+            val chmodCommand = "chmod -R 700 ${shellQuote(dataDir.absolutePath)}"
+            val chmodResult = runAsRoot(chmodCommand)
+            if (chmodResult.exitCode != 0) {
+                return BackupResult(
+                    success = false,
+                    path = backupFile.absolutePath,
+                    filename = backupFile.name,
+                    exitCode = chmodResult.exitCode,
+                    command = "$command && $chmodCommand",
+                    output = chmodResult.output,
+                    message = "restore completed but chmod failed: exit=${chmodResult.exitCode}; ${chmodResult.output.ifBlank { "no output" }}",
+                )
             }
-            runAsRoot("chmod -R 755 ${shellQuote(dataDir.absolutePath)}")
-            runAsRoot("restorecon -R ${shellQuote(dataDir.absolutePath)}")
 
             BackupResult(
                 success = true,
@@ -168,8 +138,7 @@ class AppDataBackupManager(private val context: Context) {
                 checksum = sha256(backupFile),
                 command = command,
                 output = result.output,
-                exitCode = result.exitCode,
-                message = "restore completed for $targetPackageName",
+                message = "restore completed for $packageName",
             )
         } catch (e: Exception) {
             Log.e("AppDataBackupManager", "restore failed", e)
@@ -186,15 +155,20 @@ class AppDataBackupManager(private val context: Context) {
         val process = ProcessBuilder("su", "-c", command)
             .redirectErrorStream(true)
             .start()
+
         val output = ByteArrayOutputStream()
-        process.inputStream.use { input -> input.copyTo(output) }
+        process.inputStream.use { input ->
+            input.copyTo(output)
+        }
         return RootCommandResult(
             exitCode = process.waitFor(),
             output = output.toString().trim(),
         )
     }
 
-    private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
+    private fun shellQuote(value: String): String {
+        return "'${value.replace("'", "'\\''")}'"
+    }
 
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -210,7 +184,11 @@ class AppDataBackupManager(private val context: Context) {
     }
 }
 
-data class RootCommandResult(val exitCode: Int, val output: String)
+data class RootCommandResult(
+    val exitCode: Int,
+    val output: String,
+)
+
 data class BackupResult(
     val success: Boolean,
     val path: String,

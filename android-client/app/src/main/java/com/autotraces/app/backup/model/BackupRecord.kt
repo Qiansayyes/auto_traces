@@ -20,7 +20,7 @@ import androidx.room.PrimaryKey
  * - path / filename：生成的备份文件路径和文件名
  * - checksum：备份包校验值，便于上传后校验完整性
  * - message：详细结果描述，方便排查失败原因
- * - command / output / exitCode：Root + tar 执行细节，用于完整错误日志保存
+ * - command / output / exitCode：Root tar 命令、命令输出、退出码，用于完整追踪失败原因
  */
 @Entity(tableName = "backup_records")
 data class BackupRecord(
