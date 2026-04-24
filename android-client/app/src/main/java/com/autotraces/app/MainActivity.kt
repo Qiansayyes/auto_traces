@@ -572,7 +572,6 @@ class MainActivity : AppCompatActivity() {
                     binding.bindStatusText.text = "绑定成功"
                     WorkerService.start(this@MainActivity)
                     AppCoordinator.startIfNeeded()
-                    lifecycleScope.launch { AppCoordinator.fetchConfig(PrefsStore.getDeviceRunMode()) }
                 } else {
                     binding.bindStatusText.text = response.msg
                 }
