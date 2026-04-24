@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="/opt/auto_traces"
 VENV_DIR="$PROJECT_DIR/.venv"
-DOMAIN="your-domain.com"
+DOMAIN="43.165.168.45"
 
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip nginx
@@ -12,7 +12,7 @@ cd "$PROJECT_DIR"
 python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install fastapi uvicorn requests pydantic openpyxl selenium requests python-multipart
+pip install fastapi uvicorn[standard] requests pydantic openpyxl selenium python-multipart
 
 sudo tee /etc/systemd/system/auto-traces-backend.service >/dev/null <<EOF
 [Unit]
@@ -44,7 +44,7 @@ server {
     }
 
     location /api/ {
-        proxy_pass http://127.0.0.1:8000/;
+        proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;

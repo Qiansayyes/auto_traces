@@ -322,10 +322,16 @@ function renderDeviceLogDeviceSelect(devices = {}, deviceLogs = {}) {
   }
 }
 
+function defaultApiBase() {
+  const { protocol, hostname, port } = window.location;
+  if (port === "8000") return window.location.origin;
+  return `${protocol}//${hostname}:8000`;
+}
+
 function apiBase() {
   const manual = (apiBaseInput?.value || "").trim().replace(/\/$/, "");
   if (manual) return manual;
-  return window.location.origin;
+  return defaultApiBase();
 }
 
 function authToken() {
@@ -1912,14 +1918,23 @@ async function loadDbTablePage() {
 async function authCheck() {
   const token = authToken();
   if (!token) return false;
-  const data = await request("/api/auth/me");
-  currentUser = data.user;
-  authShell?.classList.add("hidden");
-  appShell?.classList.remove("hidden");
-  applyRolePermissions();
-  await loadUserRuntimeConfig();
-  return true;
+  try {
+    const data = await request("/api/auth/me");
+    currentUser = data.user;
+    authShell?.classList.add("hidden");
+    appShell?.classList.remove("hidden");
+    applyRolePermissions();
+    return true;
+  } catch (error) {
+    setAuthToken("");
+    currentUser = null;
+    authShell?.classList.remove("hidden");
+    appShell?.classList.add("hidden");
+    if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
+    return false;
+  }
 }
+
 
 function renderAdminUsers(items = []) {
   if (!adminUsersTableBodyEl) return;
@@ -2364,6 +2379,10 @@ if (adminReloadUsersBtn) {
 }
 
 toggleDeviceOpsButtons();
+
+if (apiBaseInput && !apiBaseInput.value.trim()) {
+  apiBaseInput.value = defaultApiBase();
+}
 
 (async () => {
   const ok = await authCheck().catch(() => false);
