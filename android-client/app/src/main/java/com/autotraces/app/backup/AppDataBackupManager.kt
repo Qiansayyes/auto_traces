@@ -7,7 +7,7 @@ import java.io.File
 import java.security.MessageDigest
 
 /**
- * 你自己的应用数据备份/恢复工具。
+ * 应用数据本地备份/恢复工具。
  *
  * 这个版本统一改成 Root + tar 的实现：
  * - 备份时通过 su 调用 tar 打包当前 App 私有目录
@@ -28,24 +28,19 @@ class AppDataBackupManager(private val context: Context) {
             val dataDir = File(context.applicationInfo.dataDir)
             val parentDir = dataDir.parentFile ?: throw IllegalStateException("Missing parent dir for ${dataDir.absolutePath}")
             val packageName = dataDir.name
-            val filename = "app_${accountName}_${System.currentTimeMillis()}.tar.gz"
+            val filename = "backup_${accountName}_${System.currentTimeMillis()}.tar.gz"
             val outFile = File(backupDir, filename)
 
             if (outFile.exists()) outFile.delete()
 
             val command = buildString {
-                append("tar -czf ")
-                append(shellQuote(outFile.absolutePath))
-                append(" -C ")
+                append("cd ")
                 append(shellQuote(parentDir.absolutePath))
-                append(" --exclude=")
-                append(shellQuote("$packageName/cache"))
-                append(" --exclude=")
-                append(shellQuote("$packageName/code_cache"))
-                append(" --exclude=")
-                append(shellQuote("$packageName/no_backup"))
-                append(" ")
+                append(" && find ")
                 append(shellQuote(packageName))
+                append(" \\( -type f -o -type l \\) ! -path '*/cache/*' ! -path '*/code_cache/*' ! -path '*/no_backup/*' -print0 | tar -czf ")
+                append(shellQuote(outFile.absolutePath))
+                append(" --null -T -")
             }
 
             val result = runAsRoot(command)
@@ -98,7 +93,9 @@ class AppDataBackupManager(private val context: Context) {
             val packageName = dataDir.name
 
             val command = buildString {
-                append("tar -xzf ")
+                append("am force-stop ")
+                append(shellQuote(packageName))
+                append(" && tar -xzf ")
                 append(shellQuote(backupFile.absolutePath))
                 append(" -C ")
                 append(shellQuote(parentDir.absolutePath))

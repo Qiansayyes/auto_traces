@@ -125,16 +125,18 @@ class MainActivity : AppCompatActivity() {
         binding.stopServiceButton.setOnClickListener {
             lifecycleScope.launch {
                 val alias = PrefsStore.getAlias()
-                val deviceId = PrefsStore.getDeviceId()
-                if (!deviceId.isNullOrBlank()) {
-                    runCatching { ApiService.setDeviceAutoStartOptOut(deviceId, true) }.onSuccess { response ->
-                        if (response.code == 0) LogCenter.op(alias, "已关闭云端自动开启程序")
-                        else LogCenter.op(alias, "关闭云端自动开启程序失败：${response.msg}")
-                    }.onFailure { error ->
-                        LogCenter.op(alias, "关闭云端自动开启程序异常：${error.message}")
-                    }
-                }
+                PrefsStore.setHardStopRequested(true)
+                AppCoordinator.refreshRuntimeSnapshot()
+                LogCenter.op(alias, "已请求停止后台服务（硬停）")
                 WorkerService.stop(this@MainActivity)
+                delay(1200)
+                AppCoordinator.refreshRuntimeSnapshot()
+                if (WorkerServiceTracker.isRunning) {
+                    LogCenter.op(alias, "后台服务仍在运行，已再次请求停止")
+                } else {
+                    LogCenter.op(alias, "后台服务已停止")
+                }
+                AppCoordinator.refreshRuntimeSnapshot()
             }
         }
 
@@ -223,6 +225,7 @@ class MainActivity : AppCompatActivity() {
                     appendLine("本地状态: ${state.localStatus}")
                     appendLine("配置状态: ${if (state.configLoaded) "已拉取" else "默认配置"}")
                     appendLine("服务端: ${state.currentServerUrl}")
+                    appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
                     append("最近状态: ${state.lastMessage}")
                 }
                 renderDeviceInfo()

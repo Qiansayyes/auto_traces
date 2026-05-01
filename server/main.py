@@ -302,6 +302,12 @@ def init_follow_db():
                 new_follower_count INTEGER,
                 backup_path TEXT NOT NULL DEFAULT '',
                 backup_name TEXT,
+                backup_status TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                ip TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                device_alias TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(username, mobile_alias, owner_username)
@@ -311,6 +317,41 @@ def init_follow_db():
                 ON follower_queue(root_username);
             CREATE INDEX IF NOT EXISTS idx_tiktok_account_backup_username
                 ON tiktok_account_backup_records(username);
+
+            CREATE TABLE IF NOT EXISTS account_editor_rows (
+                owner_username TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                password TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                email_password TEXT NOT NULL DEFAULT '',
+                api TEXT NOT NULL DEFAULT '',
+                is_login INTEGER NOT NULL DEFAULT 0,
+                login_time TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '',
+                video_count TEXT NOT NULL DEFAULT '',
+                follower_count TEXT NOT NULL DEFAULT '',
+                follower_growth TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, row_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS device_editor_rows (
+                owner_username TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                device_alias TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                ip TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                backup_path TEXT NOT NULL DEFAULT '',
+                backup_name TEXT NOT NULL DEFAULT '',
+                backup_time TEXT NOT NULL DEFAULT '',
+                backup_status TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, row_index)
+            );
             """
         )
 
@@ -494,6 +535,12 @@ def init_autosearch_db():
             "ALTER TABLE tiktok_account_backup_records ADD COLUMN video_count INTEGER",
             "ALTER TABLE tiktok_account_backup_records ADD COLUMN follower_count INTEGER",
             "ALTER TABLE tiktok_account_backup_records ADD COLUMN new_follower_count INTEGER",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN backup_status TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN ip TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN region TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN device_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tiktok_account_backup_records ADD COLUMN device_alias TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 conn.execute(ddl)
@@ -1137,6 +1184,8 @@ class LiveCustomerImportResponse(BaseModel):
 class DeviceTikTokBackupClearRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
+    package_name: str = Field(..., min_length=1, max_length=255)
+    backup_record_id: int | None = Field(default=None, ge=1)
     # 可选：与档案一致时写入 backup_path；设备回传时会带回，便于服务端精确更新
     username: str | None = Field(default=None, max_length=64)
 
@@ -1169,6 +1218,35 @@ class TikTokBackupRecordSubmitRequest(BaseModel):
     follower_count: int | None = Field(default=None, ge=0)
     backup_path: str = Field(..., min_length=1, max_length=500)
     backup_name: str | None = Field(default=None, max_length=255)
+
+
+class AccountEditorRowUpsertRequest(BaseModel):
+    row_index: int = Field(..., ge=0)
+    username: str = ""
+    password: str = ""
+    email: str = ""
+    email_password: str = ""
+    api: str = ""
+    is_login: bool = False
+    login_time: str = ""
+    region: str = ""
+    video_count: str = ""
+    follower_count: str = ""
+    follower_growth: str = ""
+
+
+class DeviceEditorRowUpsertRequest(BaseModel):
+    row_index: int = Field(..., ge=0)
+    device_alias: str = ""
+    device_id: str = ""
+    ip: str = ""
+    region: str = ""
+    username: str = ""
+    backup_path: str = ""
+    backup_name: str = ""
+    backup_time: str = ""
+    backup_status: str = ""
+    remark: str = ""
 
 
 class DeviceOpPollRequest(BaseModel):
@@ -1669,6 +1747,13 @@ def _next_device_op(device_id: str) -> Dict[str, Any] | None:
 def _save_device_op_result(op_id: str, result: Dict[str, Any]) -> None:
     with store.lock:
         store.device_op_results[op_id] = result
+        # 设备操作结果仅用于短期查询，避免内存无限增长。
+        max_results = 2000
+        while len(store.device_op_results) > max_results:
+            oldest_key = next(iter(store.device_op_results), None)
+            if not oldest_key:
+                break
+            store.device_op_results.pop(oldest_key, None)
 
 
 def _get_device_op_result(op_id: str) -> Dict[str, Any] | None:
@@ -2414,7 +2499,7 @@ def admin_set_auto_start(payload: AutoStartRequest, authorization: str | None = 
                     device.pending_start = False
                     cleared_pending_count += 1
                     touched = True
-                if device.status in {"running", "error"}:
+                if device.status in {"running", "error"} or not device.paused:
                     device.status = "paused"
                     device.paused = True
                     paused_count += 1
@@ -2489,29 +2574,34 @@ def stop_task(payload: StartTaskRequest, authorization: str | None = Header(defa
     for device_id in payload.device_ids:
         if device_id not in allowed:
             return {"code": 403, "msg": "包含无权操作的设备"}
-    paused_count = 0
+
+    stopped_count = 0
     touched: list[str] = []
     with store.lock:
         for device_id in payload.device_ids:
             device = store.devices.get(device_id)
-            if device and device.status in {"running", "error"}:
-                device.status = "paused"
-                device.paused = True
-                device.pending_start = False
-                paused_count += 1
-                touched.append(device_id)
-                logs = store.device_logs.setdefault(device_id, [])
-                logs.append(
-                    f"[{now_text()}] 云端后台 | 已下发暂停指令（alias={device.alias}）",
-                )
-                if len(logs) > 400:
-                    store.device_logs[device_id] = logs[-400:]
+            if not device:
+                continue
+
+            # 停止指令的语义：立刻清空待启动状态，并将设备标记为暂停，禁止继续自动拉起。
+            # 这样无论指令从哪里发出，都不会再被 pending_start / auto_start 继续顶起来。
+            device.status = "paused"
+            device.paused = True
+            device.pending_start = False
+            stopped_count += 1
+            touched.append(device_id)
+            logs = store.device_logs.setdefault(device_id, [])
+            logs.append(
+                f"[{now_text()}] 云端后台 | 已强制停止并清空启动指令（alias={device.alias}）",
+            )
+            if len(logs) > 400:
+                store.device_logs[device_id] = logs[-400:]
 
     for did in touched:
         _persist_client_device_to_db(did)
-    if paused_count == 0:
-        return {"code": 1, "msg": "无可暂停设备/设备未绑定"}
-    return {"code": 0, "msg": "暂停指令已下发", "count": paused_count}
+    if stopped_count == 0:
+        return {"code": 1, "msg": "无可停止设备/设备未绑定"}
+    return {"code": 0, "msg": "停止指令已下发", "count": stopped_count}
 
 
 @app.get("/api/check_start")
@@ -2687,6 +2777,42 @@ def device_ops_report(payload: DeviceOpReportRequest):
         "reported_at": now_text(),
     }
     _save_device_op_result(payload.op_id, result)
+    if payload.status == "success" and data.get("op_type") == "tiktok_backup_and_clear":
+        backup_record_id = data.get("backup_record_id")
+        username = str(data.get("username") or "").strip().lstrip("@")
+        mobile_alias = str(data.get("mobile_alias") or "").strip()
+        backup_path = str(data.get("backup_path") or "").strip()
+        backup_name = str(data.get("backup_name") or "").strip() or None
+        if backup_record_id:
+            try:
+                rid = int(backup_record_id)
+            except (TypeError, ValueError):
+                rid = 0
+            if rid > 0:
+                conn = _get_db()
+                try:
+                    now = now_text()
+                    conn.execute(
+                        """
+                        UPDATE tiktok_account_backup_records
+                        SET backup_path = ?, backup_name = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (backup_path, backup_name or "", now, rid),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        elif username and mobile_alias and backup_path:
+            _patch_backup_record_device_result(
+                username,
+                mobile_alias,
+                backup_path=backup_path,
+                backup_name=backup_name,
+                video_count=None,
+                follower_count=None,
+                new_follower_count=None,
+            )
 
     op_logs = data.get("operation_logs") if isinstance(data, dict) else None
     if isinstance(op_logs, list) and op_logs:
@@ -2801,43 +2927,74 @@ def submit_tiktok_backup(payload: TikTokBackupSubmitRequest, authorization: str 
         conn = _get_db()
         try:
             now = now_text()
-            conn.execute(
+            owner = session["username"]
+            existing = conn.execute(
                 """
-                INSERT INTO tiktok_account_backup_records
-                    (username, owner_username, tiktok_password, mobile_alias, api_address, email, email_password, login_date, video_count, follower_count, new_follower_count, backup_path, backup_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username, mobile_alias, owner_username) DO UPDATE SET
-                    tiktok_password = excluded.tiktok_password,
-                    api_address = excluded.api_address,
-                    email = excluded.email,
-                    email_password = excluded.email_password,
-                    login_date = COALESCE(excluded.login_date, tiktok_account_backup_records.login_date),
-                    video_count = excluded.video_count,
-                    follower_count = excluded.follower_count,
-                    new_follower_count = excluded.new_follower_count,
-                    backup_path = excluded.backup_path,
-                    backup_name = excluded.backup_name,
-                    owner_username = excluded.owner_username,
-                    updated_at = excluded.updated_at
+                SELECT id
+                FROM tiktok_account_backup_records
+                WHERE username = ? AND mobile_alias = ? AND owner_username = ?
+                LIMIT 1
                 """,
-                (
-                    username,
-                    session["username"],
-                    tiktok_password,
-                    mobile_alias,
-                    api_address,
-                    email,
-                    email_password,
-                    payload.login_date,
-                    payload.video_count,
-                    payload.follower_count,
-                    None,
-                    backup_path,
-                    backup_name,
-                    now,
-                    now,
-                ),
-            )
+                (username, mobile_alias, owner),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE tiktok_account_backup_records
+                    SET
+                        tiktok_password = ?,
+                        api_address = ?,
+                        email = ?,
+                        email_password = ?,
+                        login_date = COALESCE(?, login_date),
+                        video_count = ?,
+                        follower_count = ?,
+                        new_follower_count = ?,
+                        backup_path = ?,
+                        backup_name = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        tiktok_password,
+                        api_address,
+                        email,
+                        email_password,
+                        payload.login_date,
+                        payload.video_count,
+                        payload.follower_count,
+                        None,
+                        backup_path,
+                        backup_name,
+                        now,
+                        int(existing["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO tiktok_account_backup_records
+                        (username, owner_username, tiktok_password, mobile_alias, api_address, email, email_password, login_date, video_count, follower_count, new_follower_count, backup_path, backup_name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        username,
+                        owner,
+                        tiktok_password,
+                        mobile_alias,
+                        api_address,
+                        email,
+                        email_password,
+                        payload.login_date,
+                        payload.video_count,
+                        payload.follower_count,
+                        None,
+                        backup_path,
+                        backup_name,
+                        now,
+                        now,
+                    ),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -2882,7 +3039,7 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -2903,8 +3060,10 @@ def admin_device_tiktok_backup_and_clear(payload: DeviceTikTokBackupClearRequest
     op_payload: dict[str, Any] = {
         "device_id": payload.device_id,
         "alias": payload.alias,
-        "package_name": TIKTOK_PACKAGE_NAME,
+        "package_name": payload.package_name.strip(),
     }
+    if payload.backup_record_id:
+        op_payload["backup_record_id"] = int(payload.backup_record_id)
     if hint:
         op_payload["username"] = hint
 
@@ -2933,7 +3092,7 @@ def admin_device_tiktok_force_stop_1(payload: DeviceTikTokBackupClearRequest, au
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -2956,7 +3115,7 @@ def admin_device_tiktok_force_stop_2(payload: DeviceTikTokBackupClearRequest, au
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -2979,7 +3138,7 @@ def admin_device_tiktok_force_stop_3(payload: DeviceTikTokBackupClearRequest, au
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -3002,7 +3161,7 @@ def admin_device_tiktok_launch_1(payload: DeviceTikTokBackupClearRequest, author
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -3025,7 +3184,7 @@ def admin_device_tiktok_launch_2(payload: DeviceTikTokBackupClearRequest, author
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -3048,7 +3207,7 @@ def admin_device_tiktok_launch_3(payload: DeviceTikTokBackupClearRequest, author
         {
             "device_id": payload.device_id,
             "alias": payload.alias,
-            "package_name": TIKTOK_PACKAGE_NAME,
+            "package_name": payload.package_name.strip(),
         },
     )
 
@@ -3077,6 +3236,59 @@ def admin_device_tiktok_backups(authorization: str | None = Header(default=None)
         return err
     items = _list_available_backups()
     return {"code": 0, "items": items}
+
+
+@app.get("/api/admin/device_tiktok/accounts")
+def admin_device_tiktok_accounts(authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    conn = _get_db()
+    try:
+        owner_sql, owner_params = _backup_owner_scope(session)
+        rows = conn.execute(
+            f"""
+            SELECT
+                mobile_alias,
+                COUNT(1) AS account_count,
+                MAX(updated_at) AS latest_updated_at,
+                GROUP_CONCAT(username, '||') AS usernames
+            FROM tiktok_account_backup_records
+            WHERE 1=1{owner_sql}
+            GROUP BY mobile_alias
+            ORDER BY latest_updated_at DESC, mobile_alias ASC
+            """,
+            (*owner_params,),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        return {"code": 0, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/device_tiktok/accounts/{mobile_alias}")
+def admin_device_tiktok_accounts_by_alias(mobile_alias: str, authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    alias = (mobile_alias or "").strip()
+    if not alias:
+        return {"code": 1, "msg": "mobile_alias 不能为空"}
+    conn = _get_db()
+    try:
+        owner_sql, owner_params = _backup_owner_scope(session)
+        rows = conn.execute(
+            f"""
+            SELECT id, username, tiktok_password, mobile_alias, api_address, email, email_password, login_date, video_count, follower_count, new_follower_count, backup_path, backup_name, created_at, updated_at
+            FROM tiktok_account_backup_records
+            WHERE mobile_alias = ?{owner_sql}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (alias, *owner_params),
+        ).fetchall()
+        return {"code": 0, "items": [dict(r) for r in rows]}
+    finally:
+        conn.close()
 
 
 @app.get("/api/admin/tiktok_backup/records")
@@ -3229,6 +3441,146 @@ def list_device_aliases(authorization: str | None = Header(default=None)):
             }
         )
     return {"code": 0, "items": aliases}
+
+
+@app.get("/api/admin/editor/account_rows")
+def list_account_editor_rows(authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, video_count, follower_count, follower_growth
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            ORDER BY row_index ASC
+            """,
+            (session["username"],),
+        ).fetchall()
+        return {"code": 0, "items": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/editor/account_rows/upsert")
+def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    conn = _get_db()
+    try:
+        now = now_text()
+        conn.execute(
+            """
+            INSERT INTO account_editor_rows
+                (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, video_count, follower_count, follower_growth, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_username, row_index) DO UPDATE SET
+                username = excluded.username,
+                password = excluded.password,
+                email = excluded.email,
+                email_password = excluded.email_password,
+                api = excluded.api,
+                is_login = excluded.is_login,
+                login_time = excluded.login_time,
+                region = excluded.region,
+                video_count = excluded.video_count,
+                follower_count = excluded.follower_count,
+                follower_growth = excluded.follower_growth,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session["username"],
+                int(payload.row_index),
+                payload.username.strip(),
+                payload.password.strip(),
+                payload.email.strip(),
+                payload.email_password.strip(),
+                payload.api.strip(),
+                1 if payload.is_login else 0,
+                payload.login_time.strip(),
+                payload.region.strip(),
+                payload.video_count.strip(),
+                payload.follower_count.strip(),
+                payload.follower_growth.strip(),
+                now,
+            ),
+        )
+        conn.commit()
+        return {"code": 0, "msg": "账号记录已保存", "row_index": payload.row_index}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/editor/device_rows")
+def list_device_editor_rows(authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, device_alias, device_id, ip, region, username, backup_path, backup_name, backup_time, backup_status, remark
+            FROM device_editor_rows
+            WHERE owner_username = ?
+            ORDER BY row_index ASC
+            """,
+            (session["username"],),
+        ).fetchall()
+        return {"code": 0, "items": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/editor/device_rows/upsert")
+def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    conn = _get_db()
+    try:
+        now = now_text()
+        conn.execute(
+            """
+            INSERT INTO device_editor_rows
+                (owner_username, row_index, device_alias, device_id, ip, region, username, backup_path, backup_name, backup_time, backup_status, remark, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_username, row_index) DO UPDATE SET
+                device_alias = excluded.device_alias,
+                device_id = excluded.device_id,
+                ip = excluded.ip,
+                region = excluded.region,
+                username = excluded.username,
+                backup_path = excluded.backup_path,
+                backup_name = excluded.backup_name,
+                backup_time = excluded.backup_time,
+                backup_status = excluded.backup_status,
+                remark = excluded.remark,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session["username"],
+                int(payload.row_index),
+                payload.device_alias.strip(),
+                payload.device_id.strip(),
+                payload.ip.strip(),
+                payload.region.strip(),
+                payload.username.strip(),
+                payload.backup_path.strip(),
+                payload.backup_name.strip(),
+                payload.backup_time.strip(),
+                payload.backup_status.strip(),
+                payload.remark.strip(),
+                now,
+            ),
+        )
+        conn.commit()
+        return {"code": 0, "msg": "设备记录已保存", "row_index": payload.row_index}
+    finally:
+        conn.close()
 
 
 @app.post("/api/admin/device_tiktok/restore")
@@ -3535,7 +3887,7 @@ def list_follower_queue(limit: int = 500):
             """
             SELECT username, root_username, created_at, consume_status, consumed_at, consumed_by, consumed_mode, following_access_status, following_fetch_success, mobile_push_status
             FROM follower_queue
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, username ASC
             LIMIT ?
             """,
             (limit,),
@@ -3821,8 +4173,8 @@ def admin_table_page(table: str, page: int = 1, page_size: int = 100):
 
     order_map = {
         "tiktok_roots": "ORDER BY discovered_at DESC, root_username ASC",
-        "follower_queue": "ORDER BY created_at ASC, username ASC",
-        "mobile_pending_usernames": "ORDER BY id ASC",
+        "follower_queue": "ORDER BY created_at DESC, username DESC",
+        "mobile_pending_usernames": "ORDER BY id DESC",
         "live_customer": "ORDER BY created_at DESC, username ASC",
         "users": "ORDER BY id DESC",
     }

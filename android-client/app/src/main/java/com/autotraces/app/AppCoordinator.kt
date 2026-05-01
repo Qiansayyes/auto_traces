@@ -75,7 +75,7 @@ object AppCoordinator {
     }
 
     fun startIfNeeded() {
-        if (!PrefsStore.isBound()) {
+        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested()) {
             return
         }
         if (started.compareAndSet(false, true)) {
@@ -91,7 +91,7 @@ object AppCoordinator {
     }
 
     fun forceStartRunningNow(reason: String = "设备端启动后台服务") {
-        if (!PrefsStore.isBound()) return
+        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested()) return
         scope.launch {
             if (!started.get()) {
                 started.set(true)
@@ -197,6 +197,10 @@ object AppCoordinator {
             while (true) {
                 val deviceId = PrefsStore.getDeviceId()
                 val alias = PrefsStore.getAlias()
+                if (PrefsStore.isHardStopRequested()) {
+                    delay(10_000)
+                    continue
+                }
                 if (deviceId.isNullOrBlank() || alias.isNullOrBlank()) {
                     delay(10_000)
                     continue
@@ -237,6 +241,8 @@ object AppCoordinator {
                                 forceStartRunningNow("云端自动开启策略")
                             }
                         }
+                    } else if (response.code == 1 && localStatus == "running") {
+                        // 云端明确没有启动/继续指令时，保持当前运行；若已处于停止流程，则不做任何自动拉起。
                     }
                 } catch (error: Exception) {
                     LogCenter.op(alias, "轮询启动指令失败：${error.message}")
@@ -384,8 +390,8 @@ object AppCoordinator {
                 }
 
                 val pollDelay = when {
-                    idleRounds >= 3 -> 30_000L
-                    else -> 15_000L
+                    idleRounds >= 3 -> 10_000L
+                    else -> 5_000L
                 }
 
                 val hadOp = runCatching {
@@ -435,7 +441,22 @@ object AppCoordinator {
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
         val opId = op.op_id
         val payload = op.payload
-        val packageName = payload?.package_name ?: "com.zhiliaoapp.musically"
+        val packageName = payload?.package_name?.trim().orEmpty()
+        if (packageName.isBlank()) {
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "failed",
+                message = "设备操作缺少 package_name，已拒绝执行",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "operation_logs" to listOf("[OP][$opId] 缺少 package_name，已拒绝执行"),
+                ),
+            )
+            return
+        }
         val operationLogs = mutableListOf<String>()
 
         fun opLog(text: String) {
@@ -452,6 +473,15 @@ object AppCoordinator {
                     (m.invoke(this, command) as? Boolean) == true
                 }
             }.getOrDefault(false)
+        }
+        val runSuWithOutput: (String) -> String? = { command ->
+            runCatching {
+                executor.run {
+                    val m = javaClass.getDeclaredMethod("runSuCommandWithOutput", String::class.java)
+                    m.isAccessible = true
+                    (m.invoke(this, command) as? String)?.trim()
+                }
+            }.getOrNull()
         }
 
         opLog("收到设备操作: type=${op.op_type}")
@@ -612,49 +642,131 @@ object AppCoordinator {
 
             "tiktok_backup_and_clear" -> {
                 val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
-                val backupName = "${alias}_${deviceId}_${ts}.abpkg"
+                val backupName = "${alias}_${deviceId}_${ts}.tar.gz"
                 val backupDir = "/data/local/tmp"
                 val backupPath = "$backupDir/$backupName"
+                val sourceDir = "/data/data/$packageName"
 
-                opLog("步骤1/3 备份开始: $packageName -> $backupPath")
-                val backupOk = runSu("mkdir -p $backupDir && echo 'backup:$packageName' > $backupPath")
-                opLog("步骤1/3 备份结果: ${if (backupOk) "success" else "failed"}")
+                opLog("步骤1/3 停止应用: am force-stop $packageName")
+                val stopOk = runSu("am force-stop $packageName")
+                opLog("步骤1/3 停止结果: ${if (stopOk) "success" else "failed"}")
 
-                opLog("步骤2/3 一键清理开始: pm clear $packageName")
-                val clearOk = runSu("pm clear $packageName")
-                opLog("步骤2/3 一键清理结果: ${if (clearOk) "success" else "failed"}")
+                opLog("步骤2/3 备份开始: $sourceDir -> $backupPath")
+                val backupCommand =
+                    "mkdir -p $backupDir && cd /data/data && " +
+                    "find $packageName \\( -type f -o -type l \\) " +
+                    "! -path '*/cache/*' ! -path '*/code_cache/*' -print0 | " +
+                    "tar -czf $backupPath --null -T -"
+                val backupOk = stopOk && runSu(backupCommand)
+                opLog("步骤2/3 备份结果: ${if (backupOk) "success" else "failed"}")
+                if (!backupOk) {
+                    opLog("步骤2/3 诊断: backup_command=$backupCommand")
+                    val sourceExists = runSu("test -d $sourceDir")
+                    opLog("步骤2/3 诊断: source_dir_exists=${if (sourceExists) "yes" else "no"} ($sourceDir)")
+                    val tarVersion = runSuWithOutput("tar --version")
+                    if (!tarVersion.isNullOrBlank()) {
+                        opLog("步骤2/3 诊断: tar_version=${tarVersion.replace('\n', ' ')}")
+                    }
+                    val pwdOut = runSuWithOutput("cd /data/data && pwd")
+                    if (!pwdOut.isNullOrBlank()) {
+                        opLog("步骤2/3 诊断: pwd=$pwdOut")
+                    }
+                    val backupProbe = runSuWithOutput(
+                        "cd /data/data && find $packageName \\( -type f -o -type l \\) " +
+                            "! -path '*/cache/*' ! -path '*/code_cache/*' -print0 | " +
+                            "tar -czf $backupPath --null -T -; echo __EXIT__:$?"
+                    )
+                    if (!backupProbe.isNullOrBlank()) {
+                        opLog("步骤2/3 诊断: backup_probe=$backupProbe")
+                    }
+                    val backupFileExists = runSu("test -f $backupPath")
+                    opLog("步骤2/3 诊断: backup_file_exists=${if (backupFileExists) "yes" else "no"} ($backupPath)")
+                }
 
-                val ok = backupOk && clearOk
-                opLog("步骤3/3 结果回传: ${if (ok) "success" else "failed"}")
+                opLog("步骤3/3 清理开始: pm clear $packageName")
+                val clearOk = backupOk && runSu("pm clear $packageName")
+                opLog("步骤3/3 清理结果: ${if (clearOk) "success" else "failed"}")
+
+                val ok = stopOk && backupOk && clearOk
+                opLog("结果回传: ${if (ok) "success" else "failed"}")
 
                 val reportUsername = payload?.username?.trim().orEmpty()
+                val reportBackupRecordId = payload?.backup_record_id
+                val reportData = mutableMapOf<String, Any>(
+                    "op_type" to "tiktok_backup_and_clear",
+                    "device_id" to deviceId,
+                    "backup_name" to backupName,
+                    "backup_path" to backupPath,
+                    "source_dir" to sourceDir,
+                    "package_name" to packageName,
+                    "mobile_alias" to alias,
+                    "username" to reportUsername,
+                    "operation_logs" to operationLogs,
+                )
+                reportBackupRecordId?.let { reportData["backup_record_id"] = it }
+
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (ok) "success" else "failed",
                     message = if (ok) "备份并清理完成" else "备份或清理失败",
-                    data = mapOf(
-                        "op_type" to "tiktok_backup_and_clear",
-                        "device_id" to deviceId,
-                        "backup_name" to backupName,
-                        "backup_path" to backupPath,
-                        "package_name" to packageName,
-                        "mobile_alias" to alias,
-                        "username" to reportUsername,
-                        "operation_logs" to operationLogs,
-                    ),
+                    data = reportData,
                 )
             }
 
             "tiktok_restore" -> {
                 val backupName = payload?.backup_name.orEmpty()
                 val backupPath = "/data/local/tmp/$backupName"
+                val sourceDir = "/data/data/$packageName"
 
-                opLog("步骤1/2 恢复开始: $packageName <- $backupPath")
-                val restoreOk = runSu("test -f $backupPath && echo 'restore:$packageName:$backupPath' >/dev/null")
-                opLog("步骤1/2 恢复结果: ${if (restoreOk) "success" else "failed"}")
-                opLog("步骤2/2 结果回传: ${if (restoreOk) "success" else "failed"}")
+                opLog("步骤1/7 停止应用: am force-stop $packageName")
+                val stopOk = runSu("am force-stop $packageName")
+                opLog("步骤1/7 停止结果: ${if (stopOk) "success" else "failed"}")
+
+                opLog("步骤2/7 备份文件检查: test -f $backupPath")
+                val backupExists = stopOk && runSu("test -f $backupPath")
+                opLog("步骤2/7 检查结果: ${if (backupExists) "success" else "failed"}")
+
+                opLog("步骤3/7 恢复开始: $backupPath -> /data/data")
+                val restoreDataOk = backupExists && runSu("tar -xzf $backupPath -C /data/data")
+                opLog("步骤3/7 恢复结果: ${if (restoreDataOk) "success" else "failed"}")
+
+                opLog("步骤4/7 推导属主: stat -c '%u:%g' $sourceDir")
+                val uidGid = if (restoreDataOk) {
+                    runSuWithOutput("stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'")
+                        ?.lineSequence()
+                        ?.map { it.trim() }
+                        ?.firstOrNull { it.contains(":") }
+                } else {
+                    null
+                }
+                opLog("步骤4/7 推导结果: ${uidGid ?: "failed"}")
+
+                opLog("步骤5/7 修复属主: chown -R <uid:gid> $sourceDir")
+                val chownOk = restoreDataOk && !uidGid.isNullOrBlank() && runSu("chown -R $uidGid $sourceDir")
+                opLog("步骤5/7 属主结果: ${if (chownOk) "success" else "failed"}")
+
+                val hasRestorecon = chownOk && runSu("command -v restorecon >/dev/null 2>&1")
+                val restoreconOk = if (!chownOk) {
+                    false
+                } else if (hasRestorecon) {
+                    opLog("步骤6/7 修复上下文: restorecon -RF $sourceDir")
+                    runSu("restorecon -RF $sourceDir")
+                } else {
+                    opLog("步骤6/7 跳过上下文修复: restorecon 不存在")
+                    true
+                }
+                if (hasRestorecon) {
+                    opLog("步骤6/7 上下文结果: ${if (restoreconOk) "success" else "failed"}")
+                }
+
+                opLog("步骤7/7 修复权限: chmod -R 700 $sourceDir")
+                val chmodOk = restoreconOk && runSu("chmod -R 700 $sourceDir")
+                opLog("步骤7/7 权限结果: ${if (chmodOk) "success" else "failed"}")
+
+                val restoreOk = restoreDataOk && chownOk && restoreconOk && chmodOk
+                opLog("结果回传: ${if (restoreOk) "success" else "failed"}")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -667,6 +779,7 @@ object AppCoordinator {
                         "device_id" to deviceId,
                         "backup_name" to backupName,
                         "backup_path" to backupPath,
+                        "source_dir" to sourceDir,
                         "package_name" to packageName,
                         "operation_logs" to operationLogs,
                     ),
@@ -869,6 +982,8 @@ object AppCoordinator {
     fun isManualPaused(): Boolean = manuallyPaused
 
     fun stopAllWork() {
+        // 仅停止后台服务本身，不把设备永久标记为“禁止自动开启”。
+        // 这样后续重新开启这台设备的自动开启开关时，设备仍可恢复响应。
         PrefsStore.saveLocalStatus("online")
         startPollJob?.cancel()
         pullLoopJob?.cancel()
@@ -924,6 +1039,7 @@ object AppCoordinator {
             serviceRunning = WorkerServiceTracker.isRunning,
             localStatus = PrefsStore.getLocalStatus(),
             currentServerUrl = ApiService.getBaseUrl(),
+            hardStopRequested = PrefsStore.isHardStopRequested(),
         )
         if (WorkerServiceTracker.isRunning) {
             ensureLoopsRunning()
@@ -936,6 +1052,7 @@ object AppCoordinator {
         currentServerUrl: String? = null,
         configLoaded: Boolean? = null,
         lastMessage: String? = null,
+        hardStopRequested: Boolean? = null,
     ) {
         val old = _runtimeState.value
         _runtimeState.value = old.copy(
@@ -944,6 +1061,7 @@ object AppCoordinator {
             currentServerUrl = currentServerUrl ?: old.currentServerUrl,
             configLoaded = configLoaded ?: old.configLoaded,
             lastMessage = lastMessage ?: old.lastMessage,
+            hardStopRequested = hardStopRequested ?: old.hardStopRequested,
         )
     }
 }

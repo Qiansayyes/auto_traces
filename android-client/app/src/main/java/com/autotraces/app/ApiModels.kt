@@ -144,6 +144,7 @@ data class DeviceOpPayload(
     val package_name: String? = null,
     val backup_name: String? = null,
     val backup_path: String? = null,
+    val backup_record_id: Int? = null,
     val username: String? = null,
 )
 
@@ -194,4 +195,5 @@ data class RuntimeState(
     val currentServerUrl: String = "",
     val configLoaded: Boolean = false,
     val lastMessage: String = "等待初始化",
+    val hardStopRequested: Boolean = false,
 )

@@ -16,6 +16,7 @@ const startSelectedBtn = document.getElementById("startSelected");
 const startAllBtn = document.getElementById("startAll");
 const stopSelectedBtn = document.getElementById("stopSelected");
 const autoStartToggleBtn = document.getElementById("autoStartToggleBtn");
+const refreshOverviewBtn = document.getElementById("refreshOverviewBtn");
 const growthModeBtn = document.getElementById("growthModeBtn");
 const liveModeBtn = document.getElementById("liveModeBtn");
 const cvModeBtn = document.getElementById("cvModeBtn");
@@ -105,42 +106,26 @@ const cvFilterMinVideoCountEl = document.getElementById("cvFilterMinVideoCount")
 const cvFilterMaxFollowingCountEl = document.getElementById("cvFilterMaxFollowingCount");
 const saveCvQualityFilterBtn = document.getElementById("saveCvQualityFilter");
 const processQueueBatchSizeInput = document.querySelector("input[name='process_queue_batch_size']");
-const backupUsernameInput = document.getElementById("backupUsernameInput");
-const backupTiktokPasswordInput = document.getElementById("backupTiktokPasswordInput");
-const backupMobileAliasInput = document.getElementById("backupMobileAliasInput");
-const backupApiAddressInput = document.getElementById("backupApiAddressInput");
-const backupEmailInput = document.getElementById("backupEmailInput");
-const backupEmailPasswordInput = document.getElementById("backupEmailPasswordInput");
-const backupVideoCountInput = document.getElementById("backupVideoCountInput");
-const backupFollowerCountInput = document.getElementById("backupFollowerCountInput");
-const backupNewFollowerCountInput = document.getElementById("backupNewFollowerCountInput");
-const submitBackupRecordBtn = document.getElementById("submitBackupRecordBtn");
-const queryAndFillBackupBtn = document.getElementById("queryAndFillBackupBtn");
-const backupRecordHintEl = document.getElementById("backupRecordHint");
-const backupRecordTableBodyEl = document.getElementById("backupRecordTableBody");
+const backupPackageNameInput = document.getElementById("backupPackageNameInput");
+const accountEditorListEl = document.getElementById("accountEditorList");
+const deviceAliasGroupsEl = document.getElementById("deviceAliasGroups");
+const deviceAliasPresetSelect = document.getElementById("deviceAliasPresetSelect");
+const deviceRegionPresetSelect = document.getElementById("deviceRegionPresetSelect");
 const deviceOpsSelect = document.getElementById("deviceOpsSelect");
-const deviceAliasSelect = document.getElementById("backupDeviceAliasSelect");
 const deviceLogDeviceSelect = document.getElementById("deviceLogDeviceSelect");
-const backupSearchUsernameInput = document.getElementById("backupSearchUsernameInput");
-const queryBackupRecordsBtn = document.getElementById("queryBackupRecordsBtn");
-const resetBackupQueryBtn = document.getElementById("resetBackupQueryBtn");
-const backupQueryHintEl = document.getElementById("backupQueryHint");
 const deviceExecLogsEl = document.getElementById("deviceExecLogs");
-const clearTikTokBtn = document.getElementById("clearTikTokBtn");
-const backupClearTikTokBtn = document.getElementById("backupClearTikTokBtn");
-const refreshBackupsBtn = document.getElementById("refreshBackupsBtn");
-const restoreTikTokBtn = document.getElementById("restoreTikTokBtn");
-const restoreTikTokExecBtn = document.getElementById("restoreTikTokExecBtn");
-const restoreBackupSelect = document.getElementById("restoreBackupSelect");
 const backupCloudInfoEl = document.getElementById("backupCloudInfo");
-const forceStopTikTokBtn1 = document.getElementById("forceStopTikTokBtn1");
-const forceStopTikTokBtn2 = document.getElementById("forceStopTikTokBtn2");
-const forceStopTikTokBtn3 = document.getElementById("forceStopTikTokBtn3");
-const launchTikTokBtn1 = document.getElementById("launchTikTokBtn1");
-const launchTikTokBtn2 = document.getElementById("launchTikTokBtn2");
-const launchTikTokBtn3 = document.getElementById("launchTikTokBtn3");
+const refreshBackupsBtn = document.getElementById("refreshBackupsBtn");
+const addBlankRecordBtn = document.getElementById("addBlankRecordBtn");
+const addDeviceBlankRecordBtn = document.getElementById("addDeviceBlankRecordBtn");
+const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
+const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
+const DEVICE_EDITOR_STORAGE_KEY = "auto_traces_device_editor_rows_v1";
+const ACCOUNT_ROWS_API = "/api/admin/editor/account_rows";
+const DEVICE_ROWS_API = "/api/admin/editor/device_rows";
 
 const COMMENT_TEXTS_LS_KEY = "auto_traces_admin_comment_texts_v1";
+const API_BASE_LS_KEY = "auto_traces_api_base_v1";
 
 let latestDevices = {};
 let latestDeviceLogs = {};
@@ -158,11 +143,13 @@ let tiktokRootsTotal = 0;
 let tiktokRootsTotalPages = 1;
 let selectedTiktokRootIds = new Set();
 let tiktokRootsUseServerPaging = false;
+let overviewAutoRefreshInFlight = false;
 
 const sections = document.querySelectorAll(".panel");
 const navItems = document.querySelectorAll(".nav-item");
 let currentUser = null;
 const TOKEN_KEY = "auto_traces_auth_token_v1";
+const RUN_MODE_KEY = "auto_traces_run_mode_v1";
 
 function setStatus(text, type = "info") {
   statusEl.textContent = text;
@@ -178,8 +165,8 @@ function summarizeDeviceOpResult(result) {
   if (result.message) lines.push(`消息: ${result.message}`);
   if (result.op_type) lines.push(`操作: ${result.op_type}`);
   if (result.device_id) lines.push(`设备: ${result.device_id}`);
-  if (result.backup_name) lines.push(`备份名: ${result.backup_name}`);
-  if (result.backup_path) lines.push(`备份路径: ${result.backup_path}`);
+  if (result.backup_name) lines.push(`备份档案名: ${result.backup_name}`);
+  if (result.backup_path) lines.push(`备份档案路径: ${result.backup_path}`);
   const logs = result?.data?.operation_logs;
   if (Array.isArray(logs) && logs.length) {
     lines.push("执行日志:");
@@ -324,14 +311,27 @@ function renderDeviceLogDeviceSelect(devices = {}, deviceLogs = {}) {
 
 function defaultApiBase() {
   const { protocol, hostname, port } = window.location;
+  if (protocol === "file:") {
+    return "http://127.0.0.1:8000";
+  }
   if (port === "8000") return window.location.origin;
   return `${protocol}//${hostname}:8000`;
 }
 
 function apiBase() {
   const manual = (apiBaseInput?.value || "").trim().replace(/\/$/, "");
-  if (manual) return manual;
+  if (manual) {
+    localStorage.setItem(API_BASE_LS_KEY, manual);
+    return manual;
+  }
+  const saved = (localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, "");
+  if (saved) return saved;
   return defaultApiBase();
+}
+
+function isAuthExpiredError(error) {
+  const message = String(error?.message || "");
+  return /HTTP\s*(401|403)\b/.test(message);
 }
 
 function authToken() {
@@ -360,17 +360,41 @@ function applyRolePermissions() {
   }
 }
 
-function switchSection(id) {
+async function switchSection(id) {
   sections.forEach((section) => {
     section.classList.toggle("active", section.id === id);
   });
   navItems.forEach((item) => {
     item.classList.toggle("active", item.dataset.section === id);
   });
+  // 切回设备概览时主动拉取一次完整数据，避免必须手动点“刷新数据”。
+  if (id === "overview") {
+    try {
+      await loadOverview();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
+  // 进入 follower_queue 页面时主动刷新表格与日志，避免必须翻页后才看到数据。
+  if (id === "cv-access-data") {
+    try {
+      currentCvPage = 1;
+      await loadCvAccessData();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+    try {
+      await refreshTaskStatus();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
 }
 
 navItems.forEach((item) => {
-  item.addEventListener("click", () => switchSection(item.dataset.section));
+  item.addEventListener("click", () => {
+    void switchSection(item.dataset.section);
+  });
 });
 
 async function request(path, options = {}) {
@@ -433,17 +457,24 @@ function renderDevices(devices) {
       const rowStyle = info.status === "offline" ? ' style="opacity:.55;"' : "";
       const ownerCell = isAdmin ? `<td>${String(info?.owner_username || "")}</td>` : "";
       const optOut = Boolean(info?.auto_start_opt_out);
+      const effectiveEnabled = adminAutoStartEnabled && !optOut;
+      const autoStartLabel = effectiveEnabled
+        ? "开启"
+        : adminAutoStartEnabled
+          ? "关闭"
+          : "总开关关";
       const autoStartCell = `
         <td>
           <button
             type="button"
-            class="${optOut ? "ghost" : "primary"}"
+            class="${effectiveEnabled ? "primary" : "ghost"}"
             style="padding:6px 10px;font-size:12px;"
             data-action="toggle-device-auto-start"
             data-device="${deviceId}"
             data-optout="${optOut ? "1" : "0"}"
+            title="${adminAutoStartEnabled ? "点击切换该设备是否参与自动开启" : "当前总开关关闭，设备自动开启不会生效"}"
           >
-            ${optOut ? "已关闭" : "允许"}
+            ${autoStartLabel}
           </button>
         </td>
       `;
@@ -535,6 +566,7 @@ function fillConfigForm(config, mode = currentRunMode) {
     }
     input.value = value;
   });
+  syncCvQualityFilterInputsFromConfig(config);
 }
 
 function persistCommentTextsToLocal() {
@@ -617,13 +649,13 @@ async function stopDevices(deviceIds) {
     return;
   }
   try {
-    setStatus("停止指令下发中...", "info");
+    setStatus("正在停止设备后台服务...", "info");
     const data = await request("/api/stop_task", {
       method: "POST",
       body: JSON.stringify({ device_ids: deviceIds }),
     });
     await loadOverview();
-    setStatus(`停止指令已下发 ${data.count} 台设备`, "success");
+    setStatus(`已停止 ${data.count} 台设备后台服务`, "success");
   } catch (error) {
     setStatus(error.message || "停止失败", "error");
   }
@@ -786,12 +818,18 @@ function renderDeviceOpsSelect(devices = {}) {
 }
 
 /** 更新设备卡片、表格、别名筛选下表格、运维下拉与日志区（由 overview 或 logs_snapshot 共用） */
-function applyDevicesAndLogsPayload(data) {
+function applyDevicesAndLogsPayload(data, options = {}) {
+  const shouldSyncRunMode = options.syncRunMode !== false;
+  const shouldSyncConfigForm = options.syncConfigForm === true;
   const devices = data.devices || {};
   const deviceLogs = data.device_logs || {};
   latestDevices = devices;
   latestDeviceLogs = deviceLogs;
-  currentRunMode = data.run_mode || currentRunMode || "growth";
+  const nextMode = data.run_mode || currentRunMode || "growth";
+  if (shouldSyncRunMode) {
+    currentRunMode = nextMode;
+    localStorage.setItem(RUN_MODE_KEY, currentRunMode);
+  }
   if (Object.prototype.hasOwnProperty.call(data, "auto_start_enabled")) {
     adminAutoStartEnabled = Boolean(data.auto_start_enabled);
     updateAutoStartToggleUi();
@@ -808,7 +846,13 @@ function applyDevicesAndLogsPayload(data) {
   pendingCountEl.textContent = pending;
 
   updateModeButtons();
+  if (shouldSyncConfigForm && data?.config && typeof data.config === "object") {
+    fillConfigForm(data.config, nextMode);
+    syncCvQualityFilterInputsFromConfig(data.config);
+    persistCommentTextsToLocal();
+  }
   renderDevices(devices);
+  renderDeviceAliasPresetOptions();
   renderDeviceOpsSelect(devices);
   renderDeviceLogDeviceSelect(devices, deviceLogs);
   renderDeviceExecLogs(deviceLogs);
@@ -817,22 +861,55 @@ function applyDevicesAndLogsPayload(data) {
 
 async function loadOverview() {
   const data = await request("/api/admin/overview");
-  applyDevicesAndLogsPayload(data);
+  applyDevicesAndLogsPayload(data, { syncRunMode: true, syncConfigForm: true });
+  const queueStats = data?.queue_stats || {};
+  const followerPendingCount =
+    queueStats?.follower?.pending ??
+    queueStats?.follower_pending ??
+    data?.follower_pending ??
+    0;
+  const mobilePendingCount =
+    queueStats?.mobile_pending ??
+    queueStats?.mobile?.pending ??
+    data?.mobile_pending ??
+    data?.mobile_pending_usernames ??
+    0;
   if (followerPendingEl) {
-    followerPendingEl.textContent = data.queue_stats?.follower?.pending ?? 0;
+    followerPendingEl.textContent = Number(followerPendingCount) || 0;
   }
   if (mobilePendingEl) {
-    mobilePendingEl.textContent = data.queue_stats?.mobile_pending ?? 0;
+    mobilePendingEl.textContent = Number(mobilePendingCount) || 0;
   }
 
   renderTagList(pendingList, data.pending_usernames || []);
   renderTagList(pulledList, data.pulled_usernames || []);
 }
 
+function isOverviewActive() {
+  const active = document.querySelector(".panel.active");
+  return active?.id === "overview";
+}
+
+async function pollOverviewSnapshot() {
+  if (overviewAutoRefreshInFlight) return;
+  if (!authToken()) return;
+  if (document.visibilityState === "hidden") return;
+  if (!isOverviewActive()) return;
+  overviewAutoRefreshInFlight = true;
+  try {
+    await loadOverview();
+  } catch (_) {
+    // 静默失败，避免频繁提示；用户可手动刷新查看错误信息。
+  } finally {
+    overviewAutoRefreshInFlight = false;
+  }
+}
+
 async function pollDeviceLogsSnapshot() {
   try {
     const data = await request("/api/admin/logs_snapshot");
-    applyDevicesAndLogsPayload(data);
+    // 轮询仅更新设备/日志，不覆盖用户当前正在查看或编辑的运行配置表单。
+    applyDevicesAndLogsPayload(data, { syncRunMode: false, syncConfigForm: false });
   } catch (_) {
     /* 轮询失败静默，避免刷屏；用户可手动点刷新数据 */
   }
@@ -912,13 +989,20 @@ async function saveConfig() {
   }
   try {
     setStatus(`保存账号独立配置（${currentRunMode}）中...`, "info");
-    const data = await request("/api/admin/update_config", {
+    await request("/api/admin/update_config", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+
+    // 强制回显：先立即把刚保存的值写回表单，避免接口延迟或返回旧快照导致页面看起来没变。
+    fillConfigForm({ ...collectConfig(), ...payload }, currentRunMode);
+    syncCvQualityFilterInputsFromConfig({ ...collectConfig(), ...payload });
+    persistCommentTextsToLocal();
+
     const cfg = await loadUserRuntimeConfig();
-    fillConfigForm(cfg?.configs_by_mode?.[currentRunMode] || data.config || {}, currentRunMode);
-    syncCvQualityFilterInputsFromConfig(cfg?.configs_by_mode?.[currentRunMode] || data.config || {});
+    const echoed = cfg?.configs_by_mode?.[currentRunMode] || payload;
+    fillConfigForm(echoed, currentRunMode);
+    syncCvQualityFilterInputsFromConfig(echoed);
     persistCommentTextsToLocal();
     setStatus(`已保存当前账号的 ${currentRunMode} 模式配置`, "success");
   } catch (error) {
@@ -1081,14 +1165,31 @@ async function loadCvAccessData() {
 }
 
 async function loadAccounts() {
-  const [liveData, rootsData] = await Promise.all([
+  const [liveRes, rootsRes] = await Promise.allSettled([
     request("/api/admin/live_customers"),
     loadTiktokRootsData(),
   ]);
-  renderTagList(liveCustomerList, liveData.items || [], {
-    formatter: (item) => `${item.username} | usage:${item.usage_count} | ${item.created_at}`,
-  });
-  renderTikTokRootsTable(rootsData.items || []);
+
+  if (liveRes.status === "fulfilled") {
+    renderTagList(liveCustomerList, liveRes.value.items || [], {
+      formatter: (item) => `${item.username} | usage:${item.usage_count} | ${item.created_at}`,
+    });
+  } else {
+    renderTagList(liveCustomerList, []);
+  }
+
+  if (rootsRes.status === "fulfilled") {
+    renderTikTokRootsTable(rootsRes.value.items || []);
+  } else {
+    renderTikTokRootsTable([]);
+  }
+
+  if (liveRes.status === "rejected" || rootsRes.status === "rejected") {
+    const messages = [];
+    if (liveRes.status === "rejected") messages.push(`live_customers 加载失败：${liveRes.reason?.message || "unknown"}`);
+    if (rootsRes.status === "rejected") messages.push(`tiktok_roots 加载失败：${rootsRes.reason?.message || "unknown"}`);
+    setStatus(messages.join(" | "), "warning");
+  }
 
   await loadCvAccessData();
 }
@@ -1183,8 +1284,13 @@ async function addSelectedRootsToPending() {
 
 async function loadTiktokRootsData() {
   const pageSize = Number(tiktokRootsPageSizeEl?.value || 100);
-  const data = await request(`/api/admin/tiktok_roots?page=${currentTiktokRootsPage}&page_size=${pageSize}`);
-  const items = Array.isArray(data.items) ? data.items : [];
+  // 与“数据库分页”保持同源，避免不同后端版本的专用接口行为差异。
+  const data = await request(
+    `/api/admin/table_page?table=tiktok_roots&page=${currentTiktokRootsPage}&page_size=${pageSize}`
+  );
+  const items = Array.isArray(data.items)
+    ? data.items
+    : (Array.isArray(data.rows) ? data.rows : (Array.isArray(data.data) ? data.data : []));
   tiktokRootsItems = items;
   tiktokRootsUseServerPaging = true;
   tiktokRootsTotal = Number(data.total || 0);
@@ -1341,6 +1447,10 @@ async function triggerTaskWithOptions(path, successText, options = {}) {
 async function refreshTaskStatus() {
   try {
     const data = await request("/api/admin/tasks/status");
+    const taskLogs = data.task_logs || {};
+    const noLogsText = data?.scheduler_enabled
+      ? "暂无日志"
+      : "暂无日志（定时任务已停止，process_queue 不会启动）";
     if (taskStatusEl) {
       const taskStatusLines = [
         `scheduler_enabled: ${data.scheduler_enabled}`,
@@ -1352,34 +1462,19 @@ async function refreshTaskStatus() {
       }
       taskStatusEl.textContent = taskStatusLines.join("\n");
     }
+    const names = Object.keys(taskLogs);
+    const matchedName = names.find((name) => /process_queue|trigger_process_queue|follower_queue/i.test(String(name)));
+    const matchedList = matchedName ? taskLogs[matchedName] : null;
+    const renderedLogs = Array.isArray(matchedList) && matchedList.length
+      ? `### ${matchedName}\n${matchedList.join("\n")}`
+      : (names.length
+        ? names.map((name) => `### ${name}\n${(taskLogs[name] || []).join("\n")}`).join("\n\n")
+        : noLogsText);
     if (taskLogsEl) {
-      const logs = data.task_logs || {};
-      const names = Object.keys(logs);
-      if (!names.length) {
-        taskLogsEl.textContent = "暂无日志";
-      } else {
-        const text = names
-          .map((name) => `### ${name}\n${(logs[name] || []).join("\n")}`)
-          .join("\n\n");
-        taskLogsEl.textContent = text;
-      }
+      taskLogsEl.textContent = renderedLogs;
     }
     if (cvTaskLogsEl) {
-      const logs = data.task_logs || {};
-      const list = logs?.process_queue || logs?.trigger_process_queue || logs?.follower_queue || null;
-      if (Array.isArray(list) && list.length) {
-        cvTaskLogsEl.textContent = list.join("\n");
-      } else {
-        const names = Object.keys(logs || {});
-        if (!names.length) {
-          cvTaskLogsEl.textContent = "暂无日志";
-        } else {
-          const text = names
-            .map((name) => `### ${name}\n${(logs[name] || []).join("\n")}`)
-            .join("\n\n");
-          cvTaskLogsEl.textContent = text;
-        }
-      }
+      cvTaskLogsEl.textContent = renderedLogs;
     }
   } catch (error) {
     if (taskStatusEl) {
@@ -1418,10 +1513,13 @@ async function loadUserRuntimeConfig() {
   try {
     const data = await request("/api/admin/runtime_config");
     const cfg = data.data || {};
-    currentRunMode = cfg.run_mode || currentRunMode || "growth";
+    const savedMode = cfg.run_mode || localStorage.getItem(RUN_MODE_KEY) || currentRunMode || "growth";
+    currentRunMode = savedMode;
+    localStorage.setItem(RUN_MODE_KEY, savedMode);
     updateModeButtons();
-    fillConfigForm(cfg.configs_by_mode?.[currentRunMode] || {}, currentRunMode);
-    syncCvQualityFilterInputsFromConfig(cfg.configs_by_mode?.[currentRunMode] || {});
+    const modeConfig = cfg.configs_by_mode?.[savedMode] || {};
+    fillConfigForm(modeConfig, savedMode);
+    syncCvQualityFilterInputsFromConfig(modeConfig);
     return cfg;
   } catch (error) {
     setStatus(error.message || "加载用户配置失败", "error");
@@ -1436,12 +1534,12 @@ async function switchRunMode(mode) {
       body: JSON.stringify({ mode }),
     });
     currentRunMode = data.mode || mode;
+    localStorage.setItem(RUN_MODE_KEY, currentRunMode);
     updateModeButtons();
     const cfg = await loadUserRuntimeConfig();
-    if (cfg?.configs_by_mode?.[currentRunMode]) {
-      fillConfigForm(cfg.configs_by_mode[currentRunMode] || {}, currentRunMode);
-      syncCvQualityFilterInputsFromConfig(cfg.configs_by_mode[currentRunMode] || {});
-    }
+    const echoed = cfg?.configs_by_mode?.[currentRunMode] || {};
+    fillConfigForm(echoed, currentRunMode);
+    syncCvQualityFilterInputsFromConfig(echoed);
     const modeText =
       currentRunMode === "live"
         ? "主播访问模式"
@@ -1525,123 +1623,59 @@ function collectDeviceOpsIdentity() {
     setStatus("设备选择无效，请重新选择", "warning");
     return null;
   }
-  return { device_id, alias };
-}
-
-function renderBackupSelect(items = []) {
-  if (!restoreBackupSelect) return;
-  if (!items.length) {
-    restoreBackupSelect.innerHTML = '<option value="">暂无可恢复备份</option>';
-    return;
+  const package_name = String(backupPackageNameInput?.value || "").trim();
+  if (!package_name) {
+    setStatus("请先填写包名", "warning");
+    return null;
   }
-  restoreBackupSelect.innerHTML = items
-    .map((x) => `<option value="${x.backup_name}">${x.backup_name} | ${x.mtime} | ${x.local_path}</option>`)
-    .join("");
+  return { device_id, alias, package_name };
 }
 
-function renderBackupAliasOptions(items = []) {
-  if (!backupMobileAliasInput) return;
-  const recordAliases = Array.from(new Set((items || []).map((item) => String(item.mobile_alias || "").trim()).filter(Boolean)));
-  const onlineAliases = Array.from(new Set(Object.values(latestDevices || {}).map((device) => String(device?.alias || "").trim()).filter(Boolean)));
-  const aliases = Array.from(new Set([...onlineAliases, ...recordAliases]));
-  if (!aliases.length) {
-    backupMobileAliasInput.innerHTML = '<option value="">暂无可选手机别名</option>';
-    return;
+function collectDeviceIdentityByAlias(alias, options = {}) {
+  const normalizedAlias = String(alias || "").trim();
+  if (!normalizedAlias) {
+    setStatus("未提供设备别名", "warning");
+    return null;
   }
-  backupMobileAliasInput.innerHTML = ['<option value="">请选择手机别名</option>', ...aliases.map((alias) => `<option value="${alias}">${alias}</option>`)].join("");
-}
-
-function renderBackupRecords(items = []) {
-  if (!backupRecordTableBodyEl) return;
-  const isAdmin = currentUser?.role === "admin";
-  const emptyText = isAdmin ? "暂无数据" : "暂无你名下的备份数据";
-  const colSpan = isAdmin ? 8 : 7;
-  if (!items.length) {
-    backupRecordTableBodyEl.innerHTML = `<tr><td colspan="${colSpan}" style="padding:10px;color:#666;">${emptyText}</td></tr>`;
-    renderBackupAliasOptions([]);
-    return;
+  const package_name = String(options.package_name || backupPackageNameInput?.value || "").trim();
+  if (!package_name && options.requirePackageName !== false) {
+    setStatus("请先填写包名", "warning");
+    return null;
   }
-  renderBackupAliasOptions(items);
-  backupRecordTableBodyEl.innerHTML = items.map((item) => `
-    <tr data-backup-username="${item.username ?? ""}" data-backup-tiktok-password="${item.tiktok_password ?? ""}" data-backup-mobile-alias="${item.mobile_alias ?? ""}" data-backup-path="${item.backup_path ?? ""}" data-backup-name="${item.backup_name ?? ""}">
-      ${isAdmin ? `<td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.owner_username ?? ""}</td>` : ""}
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.username ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.mobile_alias ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.video_count ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.follower_count ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.new_follower_count ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;word-break:break-all;">${item.backup_path ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;word-break:break-all;">${item.backup_name ?? ""}</td>
-      <td style="border-bottom:1px solid #f0f0f0;padding:8px;">${item.updated_at ?? ""}</td>
-    </tr>
-  `).join("");
-}
-
-function refreshBackupQueryHint(count = 0) {
-  if (!backupQueryHintEl) return;
-  backupQueryHintEl.textContent = `当前共有 ${count} 条展示记录。`;
-}
-
-function logBackupAction(action, detail) {
-  appendDebugLog(action, detail);
-}
-
-async function refreshTikTokBackups() {
-  try {
-    setStatus("正在加载可恢复备份...", "info");
-    appendDebugLog("CLICK", "刷新可恢复备份");
-    const data = await request("/api/admin/device_tiktok/backups");
-    renderBackupSelect(data.items || []);
-    if (backupQueryHintEl) {
-      backupQueryHintEl.textContent = currentUser?.role === "admin" ? "可恢复备份仅显示当前设备导出的记录。" : "普通用户可查看自己名下的备份记录。";
-    }
-    setStatus("可恢复备份已刷新", "success");
-  } catch (error) {
-    setStatus(error.message || "加载备份失败", "error");
+  const matched = Object.entries(latestDevices || {}).find(([, info]) => String(info?.alias || "").trim() === normalizedAlias);
+  if (!matched) {
+    setStatus(`未找到别名为 ${normalizedAlias} 的在线设备`, "warning");
+    return null;
   }
+  const [device_id] = matched;
+  return { device_id, alias: normalizedAlias, package_name };
 }
 
-async function refreshBackupRecords() {
-  try {
-    const query = new URLSearchParams();
-    query.set("page", "1");
-    query.set("page_size", "500");
-    const isAdmin = currentUser?.role === "admin";
-    const username = (backupSearchUsernameInput?.value || "").trim();
-    const mobileAlias = (deviceAliasSelect?.value || "").trim();
-    if (isAdmin && username) query.set("username", username);
-    if (mobileAlias) query.set("mobile_alias", mobileAlias);
-    const data = await request(`/api/admin/tiktok_backup/records?${query.toString()}`);
-    renderBackupRecords(data.items || []);
-    refreshBackupQueryHint(Array.isArray(data.items) ? data.items.length : 0);
-    renderBackupAliasOptions(data.items || []);
-    if (backupRecordHintEl) {
-      backupRecordHintEl.textContent = isAdmin ? "管理员可查看全部备份档案，并可按用户名/手机别名筛选。" : "普通用户仅可查看自己名下的备份档案。";
-    }
-    setStatus("备份档案已刷新", "success");
-  } catch (error) {
-    setStatus(error.message || "加载备份档案失败", "error");
+function collectDeviceIdentityByDeviceAndAlias(deviceId, alias, options = {}) {
+  const normalizedDeviceId = String(deviceId || "").trim();
+  const normalizedAlias = String(alias || "").trim();
+  if (!normalizedDeviceId || !normalizedAlias) {
+    setStatus("设备信息不完整（缺少 device_id 或 alias）", "warning");
+    return null;
   }
+  const package_name = String(options.package_name || backupPackageNameInput?.value || "").trim();
+  if (!package_name && options.requirePackageName !== false) {
+    setStatus("请先填写包名", "warning");
+    return null;
+  }
+  const device = latestDevices?.[normalizedDeviceId];
+  if (!device) {
+    setStatus(`设备不在线或不存在：${normalizedDeviceId}`, "warning");
+    return null;
+  }
+  const currentAlias = String(device?.alias || "").trim();
+  if (currentAlias && currentAlias !== normalizedAlias) {
+    setStatus(`设备别名已变化（当前: ${currentAlias}），请刷新后重试`, "warning");
+    return null;
+  }
+  return { device_id: normalizedDeviceId, alias: normalizedAlias, package_name };
 }
 
-function getBackupSelectionRow() {
-  const selected = backupRecordTableBodyEl?.querySelector("tr.selected");
-  if (!selected) return null;
-  return {
-    username: selected.dataset.backupUsername || "",
-    tiktok_password: selected.dataset.backupTiktokPassword || "",
-    mobile_alias: selected.dataset.backupMobileAlias || "",
-    backup_path: selected.dataset.backupPath || "",
-    backup_name: selected.dataset.backupName || "",
-  };
-}
-
-function syncBackupFormFromSelection(row) {
-  if (!row) return;
-  if (backupUsernameInput && row.username) backupUsernameInput.value = row.username;
-  if (backupTiktokPasswordInput && row.tiktok_password) backupTiktokPasswordInput.value = row.tiktok_password;
-  if (backupMobileAliasInput && row.mobile_alias) backupMobileAliasInput.value = row.mobile_alias;
-}
 
 async function waitForDeviceOpResult(opId, timeoutMs = 120000) {
   const start = Date.now();
@@ -1665,21 +1699,13 @@ async function waitForDeviceOpResult(opId, timeoutMs = 120000) {
 }
 
 async function runTikTokDeviceOp(path, successText) {
-  const device = deviceOpsSelect?.value || "";
-  if (!device) {
-    setStatus("请先选择在线设备", "warning");
-    return;
-  }
-  const [deviceId, alias] = device.split("|");
-  if (!deviceId || !alias) {
-    setStatus("设备信息不完整", "warning");
-    return;
-  }
+  const identity = collectDeviceOpsIdentity();
+  if (!identity) return;
   try {
     setStatus("设备操作下发中...", "info");
     const submit = await request(path, {
       method: "POST",
-      body: JSON.stringify({ device_id: deviceId, alias }),
+      body: JSON.stringify(identity),
     });
     const opId = submit.op_id;
     if (!opId) throw new Error("未拿到任务ID");
@@ -1697,183 +1723,102 @@ async function runTikTokDeviceOp(path, successText) {
   }
 }
 
-async function submitBackupRecord() {
-  appendDebugLog("CLICK", "提交备份档案");
-  const identity = collectDeviceOpsIdentity();
+async function submitAndWaitTikTokDeviceOp(path, body, options = {}) {
+  const pendingText = options.pendingText || "设备操作下发中...";
+  const successText = options.successText || "设备操作完成";
+  const errorText = options.errorText || "设备操作失败";
+  const shouldRefresh = options.refreshAfter !== false;
+  try {
+    setStatus(pendingText, "info");
+    const submit = await request(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const opId = submit.op_id;
+    if (!opId) {
+      if (submit?.code === 0) {
+        setStatus(successText, "success");
+        return submit;
+      }
+      throw new Error(submit?.msg || "未拿到任务ID");
+    }
+    const result = await waitForDeviceOpResult(opId);
+    if (backupCloudInfoEl) {
+      backupCloudInfoEl.textContent = JSON.stringify(result, null, 2);
+    }
+    if (result?.status === "success") {
+      setStatus(successText, "success");
+    } else {
+      setStatus(result?.message || errorText, "error");
+    }
+    if (shouldRefresh) {
+      renderDeviceEditorRows();
+    }
+    return result;
+  } catch (error) {
+    setStatus(error.message || errorText, "error");
+    throw error;
+  }
+}
+
+async function handleBackupAndClearClick(alias, backupRecordId, username = "", deviceId = "") {
+  const identity = deviceId
+    ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
+    : collectDeviceIdentityByAlias(alias);
   if (!identity) return;
-  const username = (backupUsernameInput?.value || "").trim();
-  const tiktok_password = (backupTiktokPasswordInput?.value || "").trim();
-  const mobile_alias = (backupMobileAliasInput?.value || "").trim();
-  const api_address = (backupApiAddressInput?.value || "").trim();
-  const email = (backupEmailInput?.value || "").trim();
-  const email_password = (backupEmailPasswordInput?.value || "").trim();
-  if (!username || !mobile_alias) {
-    setStatus("请至少填写用户名和手机别名", "warning");
-    appendDebugLog("VALIDATION_ERROR", { action: "submitBackupRecord", message: "username or mobile_alias missing" });
-    return;
-  }
+  const detailText = [`设备别名：${alias}`, username ? `账号：${username}` : null].filter(Boolean).join("\n");
+  if (!confirmTikTokAction("备份并清理设备", detailText)) return;
   const payload = {
-    username,
-    tiktok_password,
-    mobile_alias,
-    api_address,
-    email,
-    email_password,
+    ...identity,
+    backup_record_id: backupRecordId ? Number(backupRecordId) : undefined,
+    username: String(username || "").trim() || undefined,
   };
-  try {
-    setStatus("正在提交 TikTok 账号信息（仅入库）...", "info");
-    appendDebugLog("REQUEST_PAYLOAD", { url: "/api/admin/tiktok_backup/submit", payload });
-    const submit = await request("/api/admin/tiktok_backup/submit", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    appendDebugLog("SUBMIT_RESPONSE", submit);
-    if (backupCloudInfoEl) {
-      backupCloudInfoEl.textContent = JSON.stringify(submit, null, 2);
-    }
-    await refreshBackupRecords();
-    await refreshTikTokBackups();
-    setStatus("备份信息已入库", "success");
-  } catch (error) {
-    appendDebugLog("SUBMIT_ERROR", { message: error.message || String(error) });
-    setStatus(error.message || "提交备份失败", "error");
-  }
+  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/backup_and_clear", payload, {
+    pendingText: "正在下发备份并清理任务...",
+    successText: "备份并清理任务已完成",
+    errorText: "备份并清理失败",
+  });
 }
 
-async function clearTikTokData() {
-  appendDebugLog("CLICK", "单独清理 TikTok 数据");
-  const identity = collectDeviceOpsIdentity();
-  if (!identity) {
-    appendDebugLog("VALIDATION_ERROR", { action: "clearTikTokData", message: "missing device" });
-    return;
-  }
-  const confirmed = confirmTikTokAction("单独清理 TikTok 数据", "仅执行设备端 TikTok 应用数据清理，不会创建新的备份。\n适用场景：清缓存/清应用数据后重新登录。");
-  if (!confirmed) {
-    setStatus("已取消清理", "warning");
-    return;
-  }
-  try {
-    setStatus("正在下发任务：单独清理 TikTok 数据...", "info");
-    appendDebugLog("REQUEST_PAYLOAD", { url: "/api/admin/device_tiktok/clear", payload: identity });
-    const submit = await request("/api/admin/device_tiktok/clear", {
-      method: "POST",
-      body: JSON.stringify(identity),
-    });
-    appendDebugLog("CLEAR_RESPONSE", submit);
-    const opId = submit.op_id;
-    if (!opId) throw new Error("未拿到任务ID");
-
-    setStatus("设备执行中，请稍候...", "info");
-    const result = await waitForDeviceOpResult(opId);
-    if (backupCloudInfoEl) {
-      backupCloudInfoEl.textContent = JSON.stringify(result, null, 2);
-    }
-    updateTaskStatusFromDeviceResult(result, "单独清理 TikTok 数据已完成");
-    if (result?.status === "success") {
-      setStatus("TikTok 数据已清理", "success");
-    } else {
-      setStatus(result?.message || "清理失败", "error");
-    }
-  } catch (error) {
-    appendDebugLog("CLEAR_ERROR", { message: error.message || String(error) });
-    setStatus(error.message || "清理失败", "error");
-  }
+async function handleAliasClearClick(alias, deviceId = "") {
+  const identity = deviceId
+    ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
+    : collectDeviceIdentityByAlias(alias);
+  if (!identity) return;
+  if (!confirmTikTokAction("清理 TikTok 数据", `设备别名：${alias}`)) return;
+  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/clear", identity, {
+    pendingText: "正在下发清理任务...",
+    successText: "TikTok 数据已清理",
+    errorText: "清理 TikTok 数据失败",
+  });
 }
 
-async function backupAndClearTikTok() {
-  appendDebugLog("CLICK", "备份并清理 TikTok");
-  const identity = collectDeviceOpsIdentity();
-  if (!identity) {
-    appendDebugLog("VALIDATION_ERROR", { action: "backupAndClearTikTok", message: "missing device" });
+async function handleRestoreClick(alias, backupName, deviceId = "") {
+  const normalizedBackupName = String(backupName || "").trim();
+  if (!normalizedBackupName) {
+    setStatus("缺少备份名称，无法执行还原", "warning");
     return;
   }
-  const confirmed = confirmTikTokAction("备份并清理 TikTok", "先执行设备端备份，再执行 TikTok 应用数据清理。\n系统会保留云端备份记录，方便后续恢复。");
-  if (!confirmed) {
-    setStatus("已取消备份并清理", "warning");
-    return;
-  }
-  try {
-    setStatus("正在下发任务：备份→一键清理→云端记录...", "info");
-    const usernameHint = (backupUsernameInput?.value || "").trim().replace(/^@/, "")
-      || (getBackupSelectionRow()?.username || "").trim().replace(/^@/, "");
-    const payload = { ...identity };
-    if (usernameHint) payload.username = usernameHint;
-    appendDebugLog("REQUEST_PAYLOAD", { url: "/api/admin/device_tiktok/backup_and_clear", payload });
-    const submit = await request("/api/admin/device_tiktok/backup_and_clear", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    appendDebugLog("BACKUP_CLEAR_RESPONSE", submit);
-    const opId = submit.op_id;
-    if (!opId) throw new Error("未拿到任务ID");
-
-    setStatus("设备执行中，请稍候...", "info");
-    const result = await waitForDeviceOpResult(opId);
-    if (backupCloudInfoEl) {
-      backupCloudInfoEl.textContent = JSON.stringify(result, null, 2);
-    }
-    updateTaskStatusFromDeviceResult(result, "备份并一键清理已完成");
-    await refreshTikTokBackups();
-    if (result?.status === "success") {
-      setStatus("备份并一键清理完成（已记录云端包路径与名称）", "success");
-    } else {
-      setStatus(result?.message || "备份并清理失败", "error");
-    }
-  } catch (error) {
-    appendDebugLog("BACKUP_CLEAR_ERROR", { message: error.message || String(error) });
-    setStatus(error.message || "备份并清理失败", "error");
-  }
+  const identity = deviceId
+    ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias, { requirePackageName: false })
+    : collectDeviceIdentityByAlias(alias, { requirePackageName: false });
+  if (!identity) return;
+  const payload = {
+    device_id: identity.device_id,
+    alias: identity.alias,
+    backup_name: normalizedBackupName,
+  };
+  if (!confirmTikTokAction("还原该备份", `设备别名：${alias}\n备份：${normalizedBackupName}`)) return;
+  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/restore", payload, {
+    pendingText: "正在下发还原任务...",
+    successText: "备份还原任务已完成",
+    errorText: "还原备份失败",
+  });
 }
 
-async function restoreTikTokFromBackup() {
-  appendDebugLog("CLICK", "执行恢复");
-  const identity = collectDeviceOpsIdentity();
-  if (!identity) {
-    appendDebugLog("VALIDATION_ERROR", { action: "restoreTikTokFromBackup", message: "missing device" });
-    return;
-  }
-  const selectedRow = getBackupSelectionRow();
-  const backup_name = (restoreBackupSelect?.value || selectedRow?.backup_name || "").trim();
-  const backup_path = (selectedRow?.backup_path || "").trim();
-  if (!backup_name) {
-    setStatus("请先选择一个可恢复备份", "warning");
-    appendDebugLog("VALIDATION_ERROR", { action: "restoreTikTokFromBackup", message: "missing backup_name" });
-    return;
-  }
-  const confirmed = confirmTikTokAction("恢复 TikTok", `将恢复备份：${backup_name}\n${backup_path ? `路径：${backup_path}\n` : ""}恢复会覆盖设备当前 TikTok 数据状态。`);
-  if (!confirmed) return;
 
-  try {
-    setStatus("正在下发 TikTok 数据恢复任务...", "info");
-    appendDebugLog("REQUEST_PAYLOAD", { url: "/api/admin/device_tiktok/restore", payload: { ...identity, backup_name } });
-    const submit = await request("/api/admin/device_tiktok/restore", {
-      method: "POST",
-      body: JSON.stringify({ ...identity, backup_name }),
-    });
-    appendDebugLog("RESTORE_RESPONSE", submit);
-    const opId = submit.op_id;
-    if (!opId) throw new Error("未拿到任务ID");
-    if (submit.backup_path) {
-      setStatus(`恢复路径已锁定：${submit.backup_path}`, "info");
-    }
 
-    setStatus("设备恢复执行中，请稍候...", "info");
-    const result = await waitForDeviceOpResult(opId);
 
-    if (backupCloudInfoEl) {
-      backupCloudInfoEl.textContent = JSON.stringify(result, null, 2);
-    }
-    updateTaskStatusFromDeviceResult(result, "TikTok 数据恢复已完成");
-    if (result?.status === "success") {
-      setStatus("TikTok 数据恢复成功", "success");
-    } else {
-      setStatus(result?.message || "恢复失败", "error");
-    }
-  } catch (error) {
-    appendDebugLog("RESTORE_ERROR", { message: error.message || String(error) });
-    setStatus(error.message || "恢复失败", "error");
-  }
-}
 
 async function loadDbTablePage() {
   const table = dbTableSelect?.value || "tiktok_roots";
@@ -1926,11 +1871,16 @@ async function authCheck() {
     applyRolePermissions();
     return true;
   } catch (error) {
-    setAuthToken("");
-    currentUser = null;
-    authShell?.classList.remove("hidden");
-    appShell?.classList.add("hidden");
-    if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
+    // 仅在登录态真实失效时清 token；网络错误/服务未就绪时保留登录态，避免刷新后反复要求重登。
+    if (isAuthExpiredError(error)) {
+      setAuthToken("");
+      currentUser = null;
+      authShell?.classList.remove("hidden");
+      appShell?.classList.add("hidden");
+      if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
+    } else {
+      if (authMessageEl) authMessageEl.textContent = "服务连接失败，已保留登录态，请检查 API Base 后重试";
+    }
     return false;
   }
 }
@@ -1985,23 +1935,36 @@ async function createAdminUser() {
 async function doLogin() {
   const username = (authUsernameInput?.value || "").trim();
   const password = authPasswordInput?.value || "";
-  const data = await request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
-  setAuthToken(data.token);
-  currentUser = { username: data.username, role: data.role };
-  authShell?.classList.add("hidden");
-  appShell?.classList.remove("hidden");
-  applyRolePermissions();
-  await loadUserRuntimeConfig();
-  if (authMessageEl) authMessageEl.textContent = `欢迎，${data.username}`;
-  await refreshBackupRecords();
-  await refreshTikTokBackups();
-  await loadAdminUsers();
+  try {
+    const data = await request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+    setAuthToken(data.token);
+    currentUser = { username: data.username, role: data.role };
+    authShell?.classList.add("hidden");
+    appShell?.classList.remove("hidden");
+    if (authMessageEl) authMessageEl.textContent = `欢迎，${data.username}`;
+    try { applyRolePermissions(); } catch (_) {}
+    try { await loadUserRuntimeConfig(); } catch (_) {}
+    try { await loadAdminUsers(); } catch (_) {}
+  } catch (error) {
+    if (authMessageEl) authMessageEl.textContent = error.message || "登录失败";
+    throw error;
+  }
 }
 
-refreshAllBtn.addEventListener("click", async () => {
-  await handleRefresh();
-  await loadAccounts();
-});
+if (authLoginBtn) authLoginBtn.addEventListener("click", () => doLogin().catch(() => {}));
+if (authPasswordInput) authPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter") authLoginBtn?.click(); });
+if (authUsernameInput) authUsernameInput.addEventListener("keydown", (event) => { if (event.key === "Enter") authLoginBtn?.click(); });
+if (refreshAllBtn) {
+  refreshAllBtn.addEventListener("click", async () => {
+    await handleRefresh();
+    await loadAccounts();
+  });
+}
+if (refreshOverviewBtn) {
+  refreshOverviewBtn.addEventListener("click", async () => {
+    await handleRefresh();
+  });
+}
 {
   let commentTextsDraftTimer = null;
   const commentTextsTa = configForm?.querySelector("[name='comment_texts']");
@@ -2012,15 +1975,15 @@ refreshAllBtn.addEventListener("click", async () => {
     });
   }
 }
-uploadBtn.addEventListener("click", uploadUsernames);
-saveConfigBtn.addEventListener("click", saveConfig);
-selectAllCheckbox.addEventListener("change", syncSelectAll);
-startSelectedBtn.addEventListener("click", () => startDevices(selectedDeviceIds()));
-startAllBtn.addEventListener("click", () => {
+if (uploadBtn) uploadBtn.addEventListener("click", uploadUsernames);
+if (saveConfigBtn) saveConfigBtn.addEventListener("click", saveConfig);
+if (selectAllCheckbox) selectAllCheckbox.addEventListener("change", syncSelectAll);
+if (startSelectedBtn) startSelectedBtn.addEventListener("click", () => startDevices(selectedDeviceIds()));
+if (startAllBtn) startAllBtn.addEventListener("click", () => {
   const allDevices = Object.keys(latestDevices || {});
   startDevices(allDevices);
 });
-stopSelectedBtn.addEventListener("click", () => stopDevices(selectedDeviceIdsByStatus(["running", "error", "paused"])));
+if (stopSelectedBtn) stopSelectedBtn.addEventListener("click", () => stopDevices(selectedDeviceIdsByStatus(["running", "error", "paused"])));
 if (autoStartToggleBtn) {
   autoStartToggleBtn.addEventListener("click", async () => {
     try {
@@ -2032,6 +1995,9 @@ if (autoStartToggleBtn) {
       });
       adminAutoStartEnabled = Boolean(data.auto_start_enabled);
       updateAutoStartToggleUi();
+      // 顶部总开关切换后，单设备按钮显示需立即与生效状态同步。
+      renderDevices(latestDevices);
+      bindDeviceSelection();
       setStatus(
         next
           ? "已开启：已绑定设备在轮询到策略后将自行拉起程序（本机未暂停时）"
@@ -2111,14 +2077,19 @@ if (triggerProcessQueueInlineBtn) {
       const parallel = Math.max(1, Number.isFinite(parallelRaw) ? parallelRaw : 1);
       const query = `?limit=${limit}&container_ids=${encodeURIComponent(container_ids)}&parallel=${parallel}`;
       const data = await request(`/api/admin/tasks/trigger_process_queue${query}`, { method: "POST" });
-      await refreshTaskStatus();
       if (data.workers) {
         setStatus(`已触发：follower_queue处理（workers=${data.workers}）`, "success");
       } else {
         setStatus(`已触发：follower_queue处理（pid=${data.pid ?? "-"}）`, "success");
       }
     } catch (error) {
-      setStatus(error.message || "任务触发失败", "error");
+      const msg = error.message || "任务触发失败";
+      setStatus(msg, "error");
+      // 触发失败时右侧日志区先给出明确错误，避免用户误以为“没有任何响应”。
+      if (cvTaskLogsEl) cvTaskLogsEl.textContent = msg;
+    } finally {
+      // 触发失败/被拦截时也刷新一次，至少让用户看到 scheduler 开关状态或已有日志。
+      await refreshTaskStatus();
     }
   });
 }
@@ -2189,6 +2160,15 @@ if (liveModeBtn) {
 if (cvModeBtn) {
   cvModeBtn.addEventListener("click", () => switchRunMode("direct"));
 }
+const configModeSelect = document.getElementById("configModeSelect");
+if (configModeSelect) {
+  configModeSelect.addEventListener("change", (event) => {
+    const mode = event.target.value || "growth";
+    if (mode !== currentRunMode) {
+      switchRunMode(mode);
+    }
+  });
+}
 if (importLiveCustomersBtn) {
   importLiveCustomersBtn.addEventListener("click", importLiveCustomers);
 }
@@ -2218,143 +2198,505 @@ if (dbNextPageBtn) {
 if (dbRefreshPageBtn) {
   dbRefreshPageBtn.addEventListener("click", loadDbTablePage);
 }
-if (submitBackupRecordBtn) {
-  submitBackupRecordBtn.addEventListener("click", submitBackupRecord);
+if (backupPackageNameInput) {
+  backupPackageNameInput.value = (backupPackageNameInput.value || "").trim() || "com.zhiliaoapp.musically";
 }
-if (queryBackupRecordsBtn) {
-  queryBackupRecordsBtn.addEventListener("click", refreshBackupRecords);
+
+async function loadEditorState() {
+  const [accountsResp, devicesResp] = await Promise.all([
+    request(ACCOUNT_ROWS_API),
+    request(DEVICE_ROWS_API),
+  ]);
+  accountEditorRows = Array.isArray(accountsResp.items)
+    ? accountsResp.items.map((item) => getAccountRowTemplate(item))
+    : [];
+  deviceEditorRows = Array.isArray(devicesResp.items)
+    ? devicesResp.items.map((item) => getDeviceRowTemplate(item))
+    : [];
 }
-if (queryAndFillBackupBtn) {
-  queryAndFillBackupBtn.addEventListener("click", async () => {
-    const username = (backupUsernameInput?.value || "").trim();
-    if (!username) {
-      setStatus("请先输入用户名", "warning");
-      return;
-    }
-    try {
-      setStatus("正在查询并回填 TikTok 统计数据...", "info");
-      const data = await request(`/api/admin/tiktok_backup/fill?username=${encodeURIComponent(username)}`, { method: "POST" });
-      if (backupVideoCountInput && data.video_count !== undefined) backupVideoCountInput.value = data.video_count ?? "";
-      if (backupFollowerCountInput && data.follower_count !== undefined) backupFollowerCountInput.value = data.follower_count ?? "";
-      if (backupNewFollowerCountInput && data.new_follower_count !== undefined) backupNewFollowerCountInput.value = data.new_follower_count ?? "";
-      await refreshBackupRecords();
-      if (backupRecordHintEl) backupRecordHintEl.textContent = `查询完成：${data.msg || "已回填"}`;
-      setStatus("查询并回填完成", "success");
-    } catch (error) {
-      setStatus(error.message || "查询并回填失败", "error");
-    }
+
+async function saveAccountRow(index) {
+  const row = accountEditorRows[index];
+  if (!row) return;
+  await request(`${ACCOUNT_ROWS_API}/upsert`, {
+    method: "POST",
+    body: JSON.stringify({ row_index: index, ...row }),
   });
 }
-if (resetBackupQueryBtn) {
-  resetBackupQueryBtn.addEventListener("click", async () => {
-    if (backupSearchUsernameInput) backupSearchUsernameInput.value = "";
-    if (deviceAliasSelect) deviceAliasSelect.value = "";
-    await refreshBackupRecords();
-    setStatus("备份档案筛选已重置", "success");
+
+async function saveDeviceRow(index) {
+  const row = deviceEditorRows[index];
+  if (!row) return;
+  await request(`${DEVICE_ROWS_API}/upsert`, {
+    method: "POST",
+    body: JSON.stringify({ row_index: index, ...row }),
   });
 }
-if (backupSearchUsernameInput) {
-  backupSearchUsernameInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      refreshBackupRecords();
+
+function getAccountRowTemplate(source = {}) {
+  return {
+    username: source.username || "",
+    password: source.password || "",
+    email: source.email || "",
+    email_password: source.email_password || "",
+    api: source.api || "",
+    is_login: source.is_login ?? false,
+    login_time: source.login_time || "",
+    region: source.region || "",
+    video_count: source.video_count || "",
+    follower_count: source.follower_count || "",
+    follower_growth: source.follower_growth || "",
+  };
+}
+
+function getDeviceRowTemplate(source = {}) {
+  return {
+    device_alias: source.device_alias || "",
+    device_id: source.device_id || "",
+    ip: source.ip || "",
+    region: source.region || "",
+    username: source.username || "",
+    backup_path: source.backup_path || "",
+    backup_name: source.backup_name || "",
+    backup_time: source.backup_time || "",
+    backup_status: source.backup_status || "",
+    remark: source.remark || "",
+  };
+}
+
+function buildAliasDevicePairs() {
+  const pairs = Object.entries(latestDevices || {})
+    .map(([deviceId, info]) => ({
+      device_alias: String(info?.alias || "").trim(),
+      device_id: String(deviceId || "").trim(),
+    }))
+    .filter((item) => item.device_alias && item.device_id);
+  const dedup = new Map();
+  pairs.forEach((item) => {
+    if (!dedup.has(item.device_alias)) {
+      dedup.set(item.device_alias, item.device_id);
     }
   });
+  return Array.from(dedup.entries())
+    .map(([device_alias, device_id]) => ({ device_alias, device_id }))
+    .sort((a, b) => a.device_alias.localeCompare(b.device_alias));
 }
-if (deviceAliasSelect) {
-  deviceAliasSelect.addEventListener("change", () => refreshBackupRecords());
+
+function resolveDeviceIdByAlias(alias) {
+  const normalized = String(alias || "").trim();
+  if (!normalized) return "";
+  const pairs = buildAliasDevicePairs();
+  const hit = pairs.find((item) => item.device_alias === normalized);
+  return hit?.device_id || "";
+}
+
+function renderDeviceAliasPresetOptions() {
+  const options = buildAliasDevicePairs();
+  const aliasOptionsDatalist = document.getElementById("deviceAliasOptions");
+  if (aliasOptionsDatalist) {
+    aliasOptionsDatalist.innerHTML = options
+      .map((item) => `<option value="${item.device_alias}">${item.device_alias} | ${item.device_id}</option>`)
+      .join("");
+  }
+  if (!deviceAliasPresetSelect) return;
+  const previous = String(deviceAliasPresetSelect.value || "").trim();
+  const html = [
+    '<option value="">手动填写（不自动带入）</option>',
+    ...options.map((item) => `<option value="${item.device_alias}">${item.device_alias} | ${item.device_id}</option>`),
+  ];
+  deviceAliasPresetSelect.innerHTML = html.join("");
+  if (previous && options.some((item) => item.device_alias === previous)) {
+    deviceAliasPresetSelect.value = previous;
+  }
+}
+
+function renderDeviceRegionPresetOptions() {
+  if (!deviceRegionPresetSelect) return;
+  const previous = String(deviceRegionPresetSelect.value || "").trim();
+  const regions = Array.from(
+    new Set(
+      (accountEditorRows || [])
+        .map((row) => String(row?.region || "").trim())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+  const html = [
+    '<option value="">请选择国家地区</option>',
+    ...regions.map((region) => `<option value="${region}">${region}</option>`),
+  ];
+  deviceRegionPresetSelect.innerHTML = html.join("");
+  if (previous && regions.includes(previous)) {
+    deviceRegionPresetSelect.value = previous;
+  }
+}
+
+function renderAccountEditorRows() {
+  if (!accountEditorListEl) return;
+  if (!accountEditorRows.length) {
+    accountEditorListEl.innerHTML = '<div class="hint">暂无记录，点击“新增空白记录”开始</div>';
+    return;
+  }
+  accountEditorListEl.innerHTML = accountEditorRows.map((row, idx) => `
+    <div class="panel-card" style="margin:0 0 12px 0;background:#fff;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <strong>账号记录 #${idx + 1}</strong>
+        <button class="ghost" data-editor-delete="account" data-editor-index="${idx}">删除</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;">
+        <div class="field"><label>username</label><input data-editor-scope="account" data-editor-field="username" data-editor-index="${idx}" value="${row.username}" /></div>
+        <div class="field"><label>password</label><input data-editor-scope="account" data-editor-field="password" data-editor-index="${idx}" value="${row.password}" /></div>
+        <div class="field"><label>Email</label><input data-editor-scope="account" data-editor-field="email" data-editor-index="${idx}" value="${row.email}" /></div>
+        <div class="field"><label>email_password</label><input data-editor-scope="account" data-editor-field="email_password" data-editor-index="${idx}" value="${row.email_password}" /></div>
+        <div class="field"><label>API</label><input data-editor-scope="account" data-editor-field="api" data-editor-index="${idx}" value="${row.api}" /></div>
+        <div class="field"><label>是否登录</label><input data-editor-scope="account" data-editor-field="is_login" data-editor-index="${idx}" type="checkbox" ${row.is_login ? "checked" : ""} /></div>
+        <div class="field"><label>登录时间</label><input data-editor-scope="account" data-editor-field="login_time" data-editor-index="${idx}" value="${row.login_time}" /></div>
+        <div class="field"><label>国家地区</label><input data-editor-scope="account" data-editor-field="region" data-editor-index="${idx}" value="${row.region}" /></div>
+        <div class="field"><label>video_count</label><input data-editor-scope="account" data-editor-field="video_count" data-editor-index="${idx}" value="${row.video_count}" /></div>
+        <div class="field"><label>粉丝数量</label><input data-editor-scope="account" data-editor-field="follower_count" data-editor-index="${idx}" value="${row.follower_count}" /></div>
+        <div class="field"><label>较上次粉丝增长数量</label><input data-editor-scope="account" data-editor-field="follower_growth" data-editor-index="${idx}" value="${row.follower_growth}" /></div>
+      </div>
+    </div>
+  `).join("");
+  renderDeviceRegionPresetOptions();
+}
+
+function renderDeviceEditorRows() {
+  if (!deviceAliasGroupsEl) return;
+  renderDeviceAliasPresetOptions();
+  if (!deviceEditorRows.length) {
+    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无设备记录</div>';
+    return;
+  }
+  const groups = new Map();
+  deviceEditorRows.forEach((row, idx) => {
+    const aliasKey = String(row.device_alias || "").trim() || "__EMPTY_ALIAS__";
+    if (!groups.has(aliasKey)) {
+      groups.set(aliasKey, []);
+    }
+    groups.get(aliasKey).push({ row, idx });
+  });
+
+  const orderedGroups = Array.from(groups.entries()).sort((a, b) => {
+    const aLabel = a[0] === "__EMPTY_ALIAS__" ? "zzz" : String(a[0]).toLowerCase();
+    const bLabel = b[0] === "__EMPTY_ALIAS__" ? "zzz" : String(b[0]).toLowerCase();
+    return aLabel.localeCompare(bLabel);
+  });
+
+  deviceAliasGroupsEl.innerHTML = orderedGroups.map(([aliasKey, items], groupIdx) => {
+    const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未设置别名" : aliasKey;
+    const firstDeviceId = String(items[0]?.row?.device_id || "").trim() || "-";
+    const rowsHtml = items.map(({ row, idx }) => `
+      <div class="panel-card" style="margin:0 0 10px 0;background:#fff;border:1px solid #eef2ff;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+          <strong>记录 #${idx + 1}</strong>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            <span class="hint">device_id：${row.device_id || "-"}</span>
+            <button class="ghost" data-action="alias-clear" data-device-alias="${row.device_alias || ""}" data-device-id="${row.device_id || ""}">清理</button>
+            <button class="ghost" data-account-backup="${row.device_alias || ""}" data-device-id="${row.device_id || ""}" data-account-username="${row.username || ""}" data-account-id="">备份</button>
+            <button class="ghost" data-account-restore="${row.device_alias || ""}" data-device-id="${row.device_id || ""}" data-account-backup-name="${row.backup_name || ""}" data-account-id="">恢复</button>
+            <button class="ghost" data-editor-delete="device" data-editor-index="${idx}">删除</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;">
+          <div class="field"><label>device_alias</label><input list="deviceAliasOptions" data-editor-scope="device" data-editor-field="device_alias" data-editor-index="${idx}" value="${row.device_alias}" /></div>
+          <div class="field"><label>device_id</label><input data-editor-scope="device" data-editor-field="device_id" data-editor-index="${idx}" value="${row.device_id}" /></div>
+          <div class="field"><label>username</label><input data-editor-scope="device" data-editor-field="username" data-editor-index="${idx}" value="${row.username}" /></div>
+          <div class="field"><label>IP</label><input data-editor-scope="device" data-editor-field="ip" data-editor-index="${idx}" value="${row.ip}" /></div>
+          <div class="field"><label>国家地区</label><input data-editor-scope="device" data-editor-field="region" data-editor-index="${idx}" value="${row.region}" /></div>
+          <div class="field"><label>backup_path</label><input data-editor-scope="device" data-editor-field="backup_path" data-editor-index="${idx}" value="${row.backup_path}" /></div>
+          <div class="field"><label>backup_name</label><input data-editor-scope="device" data-editor-field="backup_name" data-editor-index="${idx}" value="${row.backup_name}" /></div>
+          <div class="field"><label>backup_time</label><input data-editor-scope="device" data-editor-field="backup_time" data-editor-index="${idx}" value="${row.backup_time}" /></div>
+          <div class="field"><label>backup_status</label><input data-editor-scope="device" data-editor-field="backup_status" data-editor-index="${idx}" value="${row.backup_status}" /></div>
+          <div class="field" style="grid-column:1/-1;"><label>remark</label><input data-editor-scope="device" data-editor-field="remark" data-editor-index="${idx}" value="${row.remark}" /></div>
+        </div>
+      </div>
+    `).join("");
+
+    return `
+      <details class="panel-card" data-device-alias-group="1" style="margin:0 0 12px 0;background:#f8faff;" ${groupIdx < 2 ? "open" : ""}>
+        <summary style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;list-style:none;">
+          <span><strong>${aliasLabel}</strong> <span class="hint">(${items.length} 条记录)</span></span>
+          <span class="hint">device_id示例：${firstDeviceId}</span>
+        </summary>
+        <div style="margin-top:10px;">
+          ${rowsHtml}
+        </div>
+      </details>
+    `;
+  }).join("");
+}
+
+function collapseDeviceAliasGroupsExcept(activeDetails) {
+  if (!deviceAliasGroupsEl || !(activeDetails instanceof HTMLDetailsElement)) return;
+  const allGroups = deviceAliasGroupsEl.querySelectorAll("details[data-device-alias-group='1']");
+  allGroups.forEach((detailsEl) => {
+    if (!(detailsEl instanceof HTMLDetailsElement)) return;
+    detailsEl.open = detailsEl === activeDetails;
+  });
+}
+
+async function syncEditorField(scope, index, field, value, checked = false) {
+  if (scope === "account") {
+    const row = accountEditorRows[index];
+    if (!row) return;
+    row[field] = field === "is_login" ? checked : value;
+    await saveAccountRow(index);
+    if (field === "region" || field === "is_login" || field === "username") {
+      renderDeviceRegionPresetOptions();
+    }
+  } else if (scope === "device") {
+    const row = deviceEditorRows[index];
+    if (!row) return;
+    row[field] = value;
+    await saveDeviceRow(index);
+  }
+}
+
+async function addBlankEditorRow() {
+  accountEditorRows.push(getAccountRowTemplate());
+  const index = accountEditorRows.length - 1;
+  await saveAccountRow(index);
+  renderAccountEditorRows();
+}
+
+function isAccountLoggedIn(row = {}) {
+  const raw = row?.is_login;
+  return raw === true || raw === 1 || raw === "1" || raw === "true";
+}
+
+function pickUnloggedAccountByRegion(region) {
+  const normalizedRegion = String(region || "").trim();
+  if (!normalizedRegion) return null;
+  return (accountEditorRows || []).find((row) => {
+    const accountRegion = String(row?.region || "").trim();
+    const username = String(row?.username || "").trim();
+    if (!username) return false;
+    return accountRegion === normalizedRegion && !isAccountLoggedIn(row);
+  }) || null;
+}
+
+async function addDeviceBlankEditorRow(aliasOverride = "") {
+  const selectedRegion = String(deviceRegionPresetSelect?.value || "").trim();
+  if (!selectedRegion) {
+    throw new Error("请先选择国家地区后再新增记录");
+  }
+  const matchedAccount = pickUnloggedAccountByRegion(selectedRegion);
+  if (!matchedAccount) {
+    throw new Error(`新增失败：账号表单中没有地区为「${selectedRegion}」且未登录的账号`);
+  }
+  const selectedAlias = String(aliasOverride || deviceAliasPresetSelect?.value || "").trim();
+  const inferredDeviceId = resolveDeviceIdByAlias(selectedAlias);
+  deviceEditorRows.push(getDeviceRowTemplate({
+    device_alias: selectedAlias,
+    device_id: inferredDeviceId,
+    region: selectedRegion,
+    username: String(matchedAccount.username || "").trim(),
+  }));
+  const index = deviceEditorRows.length - 1;
+  await saveDeviceRow(index);
+  renderDeviceEditorRows();
+}
+
+async function deleteEditorRow(scope, index) {
+  if (scope === "account") {
+    accountEditorRows.splice(index, 1);
+    renderAccountEditorRows();
+    for (let i = index; i < accountEditorRows.length; i += 1) {
+      await saveAccountRow(i);
+    }
+  } else {
+    deviceEditorRows.splice(index, 1);
+    renderDeviceEditorRows();
+    for (let i = index; i < deviceEditorRows.length; i += 1) {
+      await saveDeviceRow(i);
+    }
+  }
+}
+
+function renderDeviceAliasGroups(groups = [], recordsByAlias = {}) {
+  if (!deviceAliasGroupsEl) return;
+  if (!groups.length) {
+    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无设备别名数据</div>';
+    return;
+  }
+  deviceAliasGroupsEl.innerHTML = groups.map((group) => {
+    const alias = String(group.mobile_alias || "").trim();
+    const count = Number(group.account_count || 0);
+    const rows = recordsByAlias[alias] || [];
+    const tableRows = rows.map((row) => `
+      <tr data-account-id="${row.id ?? ""}" data-account-username="${row.username ?? ""}" data-account-backup-name="${row.backup_name ?? ""}">
+        <td style="padding:8px;border-bottom:1px solid #eee;vertical-align:middle;">
+          <div title="${row.username ?? ""}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${row.username ?? ""}</div>
+        </td>
+        <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;vertical-align:middle;">${row.video_count ?? ""}</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;vertical-align:middle;">${row.follower_count ?? ""}</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;vertical-align:middle;">${row.new_follower_count ?? ""}</td>
+        <td style="padding:8px;border-bottom:1px solid #eee;vertical-align:middle;">
+          <div title="${row.backup_path ?? ""}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${row.backup_path ?? ""}</div>
+        </td>
+        <td style="padding:8px;border-bottom:1px solid #eee;vertical-align:middle;">
+          <div title="${row.backup_name ?? ""}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${row.backup_name ?? ""}</div>
+        </td>
+        <td style="padding:8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:middle;">
+          <button class="ghost" data-account-backup="${alias}" data-account-username="${row.username ?? ""}" data-account-id="${row.id ?? ""}">备份并清理设备</button>
+          <button class="ghost" data-account-restore="${alias}" data-account-backup-name="${row.backup_name ?? ""}" data-account-id="${row.id ?? ""}">还原该备份</button>
+        </td>
+      </tr>
+    `).join("");
+    return `
+      <div class="panel-card" style="margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
+          <div>
+            <strong>${alias}</strong>
+            <div class="hint">关联账号数：${count}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="ghost" data-alias-add-row="${alias}">新增空白记录</button>
+            <button class="ghost" data-action="alias-clear" data-device-alias="${alias}">清理 TikTok 数据</button>
+          </div>
+        </div>
+        <div style="overflow:auto;margin-top:10px;border:1px solid #eee;border-radius:8px;max-width:100%;">
+          <table style="width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;">
+            <thead>
+              <tr>
+                <th style="padding:8px;text-align:left;width:16%;">username</th>
+                <th style="padding:8px;text-align:center;width:9%;">video_count</th>
+                <th style="padding:8px;text-align:center;width:9%;">follower_count</th>
+                <th style="padding:8px;text-align:center;width:12%;">new_follower_count</th>
+                <th style="padding:8px;text-align:left;width:28%;">backup_path</th>
+                <th style="padding:8px;text-align:left;width:14%;">backup_name</th>
+                <th style="padding:8px;text-align:left;width:12%;">actions</th>
+              </tr>
+            </thead>
+            <tbody>${tableRows || '<tr><td colspan="7" style="padding:10px;color:#666;">暂无账号数据</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }).join("");
 }
 if (deviceLogDeviceSelect) {
   deviceLogDeviceSelect.addEventListener("change", () => {
     renderDeviceExecLogs(latestDeviceLogs || {});
   });
 }
-if (backupRecordTableBodyEl) {
-  backupRecordTableBodyEl.addEventListener("click", (event) => {
-    const row = event.target.closest("tr[data-backup-username]");
-    if (!row) return;
-    backupRecordTableBodyEl.querySelectorAll("tr.selected").forEach((el) => el.classList.remove("selected"));
-    row.classList.add("selected");
-    syncBackupFormFromSelection({
-      username: row.dataset.backupUsername || "",
-      tiktok_password: row.dataset.backupTiktokPassword || "",
-      mobile_alias: row.dataset.backupMobileAlias || "",
-    });
-    if (restoreBackupSelect) restoreBackupSelect.value = row.dataset.backupName || "";
-    setStatus(`已选中档案：${row.dataset.backupUsername || ""} / ${row.dataset.backupMobileAlias || ""}`, "info");
-  });
-}
-if (clearTikTokBtn) {
-  clearTikTokBtn.addEventListener("click", clearTikTokData);
-}
-if (backupClearTikTokBtn) {
-  backupClearTikTokBtn.addEventListener("click", backupAndClearTikTok);
-}
 if (refreshBackupsBtn) {
   refreshBackupsBtn.addEventListener("click", async () => {
     appendDebugLog("CLICK", "刷新可恢复备份");
-    await refreshTikTokBackups();
-    await refreshBackupRecords();
+    renderDeviceEditorRows();
   });
 }
-if (restoreTikTokBtn) {
-  restoreTikTokBtn.addEventListener("click", restoreTikTokFromBackup);
+if (addBlankRecordBtn) {
+  addBlankRecordBtn.addEventListener("click", () => addBlankEditorRow().catch((e) => setStatus(e.message || "新增失败", "error")));
 }
-if (restoreTikTokExecBtn) {
-  restoreTikTokExecBtn.addEventListener("click", restoreTikTokFromBackup);
+if (addDeviceBlankRecordBtn) {
+  addDeviceBlankRecordBtn.addEventListener("click", () => addDeviceBlankEditorRow().catch((e) => setStatus(e.message || "新增失败", "error")));
 }
-if (forceStopTikTokBtn1) {
-  forceStopTikTokBtn1.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/force_stop_1", "TikTok 已强制关闭（方案1）");
+if (accountEditorListEl) {
+  accountEditorListEl.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    const scope = String(target.dataset.editorScope || "account");
+    const index = Number(target.dataset.editorIndex);
+    const field = String(target.dataset.editorField || "");
+    if (!field || Number.isNaN(index)) return;
+    syncEditorField(scope, index, field, target.value, target.checked).catch((e) => setStatus(e.message || "保存失败", "error"));
+  });
+  accountEditorListEl.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const delBtn = target.closest("[data-editor-delete]");
+    if (delBtn) {
+      const scope = String(delBtn.getAttribute("data-editor-delete") || "account");
+      const index = Number(delBtn.getAttribute("data-editor-index"));
+      if (!Number.isNaN(index)) deleteEditorRow(scope, index).catch((e) => setStatus(e.message || "删除失败", "error"));
+    }
   });
 }
-if (forceStopTikTokBtn2) {
-  forceStopTikTokBtn2.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/force_stop_2", "TikTok 已强制关闭（方案2）");
+if (deviceAliasGroupsEl) {
+  deviceAliasGroupsEl.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    const activeDetails = target.closest("details[data-device-alias-group='1']");
+    if (activeDetails instanceof HTMLDetailsElement) {
+      activeDetails.open = true;
+      collapseDeviceAliasGroupsExcept(activeDetails);
+    }
+    const scope = String(target.dataset.editorScope || "device");
+    const index = Number(target.dataset.editorIndex);
+    const field = String(target.dataset.editorField || "");
+    if (!field || Number.isNaN(index)) return;
+    if (scope === "device" && field === "device_alias") {
+      const normalizedAlias = String(target.value || "").trim();
+      const inferredDeviceId = resolveDeviceIdByAlias(normalizedAlias);
+      if (inferredDeviceId) {
+        const idInput = deviceAliasGroupsEl.querySelector(
+          `input[data-editor-scope="device"][data-editor-field="device_id"][data-editor-index="${index}"]`
+        );
+        if (idInput instanceof HTMLInputElement) {
+          idInput.value = inferredDeviceId;
+        }
+        const row = deviceEditorRows[index];
+        if (row) {
+          row.device_id = inferredDeviceId;
+        }
+      }
+    }
+    syncEditorField(scope, index, field, target.value, target.checked).catch((e) => setStatus(e.message || "保存失败", "error"));
+  });
+  deviceAliasGroupsEl.addEventListener("click", async (event) => {
+    const targetEl = event.target;
+    if (!(targetEl instanceof Element)) return;
+    const target = targetEl.closest("button");
+    if (!target) return;
+    if (target.hasAttribute("data-alias-add-row")) {
+      event.preventDefault();
+      const alias = String(target.getAttribute("data-alias-add-row") || "").trim();
+      await addDeviceBlankEditorRow(alias);
+      return;
+    }
+    const delBtn = target.closest("[data-editor-delete]");
+    if (delBtn) {
+      const scope = String(delBtn.getAttribute("data-editor-delete") || "device");
+      const index = Number(delBtn.getAttribute("data-editor-index"));
+      if (!Number.isNaN(index)) deleteEditorRow(scope, index).catch((e) => setStatus(e.message || "删除失败", "error"));
+      return;
+    }
+    const action = target.getAttribute("data-action") || target.getAttribute("data-alias-action") || "";
+    const alias =
+      target.getAttribute("data-device-alias") ||
+      target.getAttribute("data-alias") ||
+      target.getAttribute("data-alias-clear") ||
+      target.getAttribute("data-account-backup") ||
+      target.getAttribute("data-account-restore") ||
+      "";
+    const deviceId = target.getAttribute("data-device-id") || "";
+    if (!alias) return;
+    if (action === "alias-clear" || target.hasAttribute("data-alias-clear")) {
+      event.preventDefault();
+      await handleAliasClearClick(alias, deviceId);
+      return;
+    }
+    if (target.hasAttribute("data-account-backup")) {
+      event.preventDefault();
+      await handleBackupAndClearClick(
+        alias,
+        target.getAttribute("data-account-id") || "",
+        target.getAttribute("data-account-username") || "",
+        deviceId,
+      );
+      return;
+    }
+    if (target.hasAttribute("data-account-restore")) {
+      event.preventDefault();
+      await handleRestoreClick(alias, target.getAttribute("data-account-backup-name") || "", deviceId);
+      return;
+    }
   });
 }
-if (forceStopTikTokBtn3) {
-  forceStopTikTokBtn3.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/force_stop_3", "TikTok 已强制关闭（方案3）");
-  });
-}
-if (launchTikTokBtn1) {
-  launchTikTokBtn1.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/launch_1", "TikTok 已拉起（方案1）");
-  });
-}
-if (launchTikTokBtn2) {
-  launchTikTokBtn2.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/launch_2", "TikTok 已拉起（方案2）");
-  });
-}
-if (launchTikTokBtn3) {
-  launchTikTokBtn3.addEventListener("click", (event) => {
-    event.preventDefault();
-    runTikTokDeviceOp("/api/admin/device_tiktok/launch_3", "TikTok 已拉起（方案3）");
-  });
-}
-
 function toggleDeviceOpsButtons() {
   const hasDevice = Boolean((deviceOpsSelect?.value || "").trim());
-  [
-    backupClearTikTokBtn,
-    restoreTikTokBtn,
-    restoreTikTokExecBtn,
-    forceStopTikTokBtn1,
-    forceStopTikTokBtn2,
-    forceStopTikTokBtn3,
-    launchTikTokBtn1,
-    launchTikTokBtn2,
-    launchTikTokBtn3,
-  ].forEach((btn) => {
-    if (btn) btn.disabled = !hasDevice;
-  });
-  if (clearTikTokBtn) clearTikTokBtn.disabled = false;
+  if (deviceOpsSelect) deviceOpsSelect.disabled = !hasDevice;
 }
 
 if (deviceOpsSelect) {
@@ -2362,6 +2704,8 @@ if (deviceOpsSelect) {
 }
 
 if (authLoginBtn) authLoginBtn.addEventListener("click", () => doLogin().catch((e) => { if (authMessageEl) authMessageEl.textContent = e.message || "登录失败"; }));
+if (authPasswordInput) authPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter") authLoginBtn?.click(); });
+if (authUsernameInput) authUsernameInput.addEventListener("keydown", (event) => { if (event.key === "Enter") authLoginBtn?.click(); });
 if (logoutBtn) logoutBtn.addEventListener("click", () => { setAuthToken(""); currentUser = null; appShell?.classList.add("hidden"); authShell?.classList.remove("hidden"); if (authMessageEl) authMessageEl.textContent = "请先登录"; });
 if (adminCreateUserBtn) {
   adminCreateUserBtn.addEventListener("click", () => {
@@ -2381,7 +2725,17 @@ if (adminReloadUsersBtn) {
 toggleDeviceOpsButtons();
 
 if (apiBaseInput && !apiBaseInput.value.trim()) {
-  apiBaseInput.value = defaultApiBase();
+  apiBaseInput.value = (localStorage.getItem(API_BASE_LS_KEY) || "").trim() || defaultApiBase();
+}
+if (apiBaseInput) {
+  apiBaseInput.addEventListener("change", () => {
+    const normalized = (apiBaseInput.value || "").trim().replace(/\/$/, "");
+    if (normalized) {
+      localStorage.setItem(API_BASE_LS_KEY, normalized);
+    } else {
+      localStorage.removeItem(API_BASE_LS_KEY);
+    }
+  });
 }
 
 (async () => {
@@ -2391,14 +2745,24 @@ if (apiBaseInput && !apiBaseInput.value.trim()) {
     loadAccounts();
     loadDbTablePage();
     loadAdminUsers();
-    refreshBackupRecords();
-    refreshTikTokBackups();
+    loadEditorState().then(() => {
+      renderAccountEditorRows();
+      renderDeviceEditorRows();
+    }).catch(() => {});
     setInterval(refreshTaskStatus, 2000);
     refreshTaskStatus();
     setInterval(pollDeviceLogsSnapshot, 4000);
     pollDeviceLogsSnapshot();
+    setInterval(pollOverviewSnapshot, 6000);
+    pollOverviewSnapshot();
   } else {
     authShell?.classList.remove("hidden");
     appShell?.classList.add("hidden");
   }
 })();
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    void pollOverviewSnapshot();
+  }
+});

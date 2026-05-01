@@ -1,7 +1,7 @@
 package com.autotraces.app.backup.network
 
 /**
- * 本地/云端备份上报请求。
+ * 本地/云端备份档案上报请求。
  *
  * 说明：
  * - local 备份仅生成记录，不必调用上传接口

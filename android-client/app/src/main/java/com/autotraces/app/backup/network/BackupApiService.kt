@@ -5,7 +5,7 @@ import retrofit2.http.Body
 import retrofit2.http.POST
 
 /**
- * 备份结果上报接口。
+ * 备份档案上报接口。
  *
  * 这是一个独立的 Retrofit service，避免和你现有的通用业务 ApiService 混在一起。
  */

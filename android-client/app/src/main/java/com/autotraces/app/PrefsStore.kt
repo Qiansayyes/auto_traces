@@ -24,6 +24,7 @@ object PrefsStore {
     private const val KEY_DEVICE_RUN_MODE = "device_run_mode"
     private const val KEY_AUTH_TOKEN = "auth_token"
     private const val KEY_AUTH_USERNAME = "auth_username"
+    private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
 
     private lateinit var prefs: SharedPreferences
 
@@ -60,6 +61,12 @@ object PrefsStore {
             .remove(KEY_AUTH_USERNAME)
             .apply()
     }
+
+    fun setHardStopRequested(requested: Boolean) {
+        prefs.edit().putBoolean(KEY_HARD_STOP_REQUESTED, requested).apply()
+    }
+
+    fun isHardStopRequested(): Boolean = prefs.getBoolean(KEY_HARD_STOP_REQUESTED, false)
 
     fun getAuthToken(): String? = prefs.getString(KEY_AUTH_TOKEN, null)?.trim()?.takeIf { it.isNotEmpty() }
 
