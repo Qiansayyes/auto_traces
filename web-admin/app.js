@@ -200,6 +200,7 @@ const sections = document.querySelectorAll(".panel");
 const navItems = document.querySelectorAll(".nav-item");
 let currentUser = null;
 const TOKEN_KEY = "auto_traces_auth_token_v1";
+const USER_CACHE_KEY = "auto_traces_auth_user_v1";
 const RUN_MODE_KEY = "auto_traces_run_mode_v1";
 const LAST_TEMPLATE_KEY = "auto_traces_last_template_v1";
 
@@ -402,7 +403,7 @@ function apiBase() {
 
 function isAuthExpiredError(error) {
   const message = String(error?.message || "");
-  return /HTTP\s*(401|403)\b/.test(message);
+  return /HTTP\s*(401|403)\b/.test(message) || /未登录|login required|invalid token/i.test(message);
 }
 
 function authToken() {
@@ -412,6 +413,29 @@ function authToken() {
 function setAuthToken(token) {
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
+}
+
+function setCachedUser(user) {
+  if (user && typeof user === "object") {
+    localStorage.setItem(USER_CACHE_KEY, JSON.stringify(user));
+  } else {
+    localStorage.removeItem(USER_CACHE_KEY);
+  }
+}
+
+function getCachedUser() {
+  try {
+    const raw = localStorage.getItem(USER_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const username = String(parsed.username || "").trim();
+    const role = String(parsed.role || "customer").trim() || "customer";
+    if (!username) return null;
+    return { username, role };
+  } catch (_) {
+    return null;
+  }
 }
 
 function applyRolePermissions() {
@@ -2924,6 +2948,7 @@ async function authCheck() {
   try {
     const data = await request("/api/auth/me");
     currentUser = data.user;
+    setCachedUser(currentUser);
     configTargetUsersLoaded = false;
     authShell?.classList.add("hidden");
     appShell?.classList.remove("hidden");
@@ -2933,11 +2958,22 @@ async function authCheck() {
     // 仅在登录态真实失效时清 token；网络错误/服务未就绪时保留登录态，避免刷新后反复要求重登。
     if (isAuthExpiredError(error)) {
       setAuthToken("");
+      setCachedUser(null);
       currentUser = null;
       authShell?.classList.remove("hidden");
       appShell?.classList.add("hidden");
       if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
     } else {
+      const cachedUser = getCachedUser();
+      if (cachedUser) {
+        currentUser = cachedUser;
+        configTargetUsersLoaded = false;
+        authShell?.classList.add("hidden");
+        appShell?.classList.remove("hidden");
+        applyRolePermissions();
+        if (authMessageEl) authMessageEl.textContent = "服务连接异常，已使用本地登录态";
+        return true;
+      }
       if (authMessageEl) authMessageEl.textContent = "服务连接失败，已保留登录态，请检查 API Base 后重试";
     }
     return false;
@@ -3010,6 +3046,7 @@ async function doLogin() {
     const data = await request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
     setAuthToken(data.token);
     currentUser = { username: data.username, role: data.role };
+    setCachedUser(currentUser);
     configTargetUsersLoaded = false;
     authShell?.classList.add("hidden");
     appShell?.classList.remove("hidden");
@@ -4034,6 +4071,7 @@ if (authPasswordInput) authPasswordInput.addEventListener("keydown", (event) => 
 if (authUsernameInput) authUsernameInput.addEventListener("keydown", (event) => { if (event.key === "Enter") authLoginBtn?.click(); });
 if (logoutBtn) logoutBtn.addEventListener("click", () => {
   setAuthToken("");
+  setCachedUser(null);
   currentUser = null;
   configTargetUsersLoaded = false;
   appShell?.classList.add("hidden");
