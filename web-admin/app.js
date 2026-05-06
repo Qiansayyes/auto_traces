@@ -469,7 +469,13 @@ navItems.forEach((item) => {
 });
 
 async function request(path, options = {}) {
-  const url = `${apiBase()}${path}`;
+  const base = String(apiBase() || "").replace(/\/$/, "");
+  const rawPath = String(path || "").trim();
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const dedupedPath = base.endsWith("/api") && normalizedPath.startsWith("/api/")
+    ? normalizedPath.slice(4)
+    : normalizedPath;
+  const url = `${base}${dedupedPath}`;
   appendDebugLog("REQUEST", { url, options: { ...options, body: options.body || undefined } });
   try {
     const method = String(options.method || "GET").toUpperCase();
