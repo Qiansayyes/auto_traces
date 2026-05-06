@@ -380,12 +380,12 @@ function renderDeviceLogDeviceSelect(devices = {}, deviceLogs = {}) {
 }
 
 function defaultApiBase() {
-  const { protocol, hostname, port } = window.location;
+  const { protocol } = window.location;
   if (protocol === "file:") {
     return "/api";
   }
-  if (port === "8000") return `${window.location.origin}/api`;
-  return `${protocol}//${hostname}:8000/api`;
+  // Always use same-origin API behind Nginx reverse proxy.
+  return "/api";
 }
 
 function apiBase() {
@@ -4053,8 +4053,9 @@ toggleDeviceOpsButtons();
 if (apiBaseInput) {
   const stored = (localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, "");
   const legacyBases = new Set(["http://127.0.0.1:8000", "http://localhost:8000"]);
+  const hasLegacy8000Port = /:8000(\/api)?$/i.test(stored);
   const normalizedDefault = defaultApiBase();
-  const nextValue = !stored || legacyBases.has(stored) ? normalizedDefault : stored;
+  const nextValue = !stored || legacyBases.has(stored) || hasLegacy8000Port ? normalizedDefault : stored;
   apiBaseInput.value = nextValue;
   localStorage.setItem(API_BASE_LS_KEY, nextValue);
   apiBaseInput.addEventListener("change", () => {
