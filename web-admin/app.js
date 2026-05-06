@@ -382,10 +382,10 @@ function renderDeviceLogDeviceSelect(devices = {}, deviceLogs = {}) {
 function defaultApiBase() {
   const { protocol, hostname, port } = window.location;
   if (protocol === "file:") {
-    return "http://127.0.0.1:8000";
+    return "/api";
   }
-  if (port === "8000") return window.location.origin;
-  return `${protocol}//${hostname}:8000`;
+  if (port === "8000") return `${window.location.origin}/api`;
+  return `${protocol}//${hostname}:8000/api`;
 }
 
 function apiBase() {
