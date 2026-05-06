@@ -198,6 +198,7 @@ function appendGalleryDispatchLog(line, reset = false) {
 
 const sections = document.querySelectorAll(".panel");
 const navItems = document.querySelectorAll(".nav-item");
+const contentShell = document.querySelector(".content");
 let currentUser = null;
 const TOKEN_KEY = "auto_traces_auth_token_v1";
 const USER_CACHE_KEY = "auto_traces_auth_user_v1";
@@ -462,6 +463,12 @@ async function switchSection(id) {
   navItems.forEach((item) => {
     item.classList.toggle("active", item.dataset.section === id);
   });
+  // 切换菜单后将主内容滚动到顶部，避免短面板看起来“空白”。
+  if (contentShell && typeof contentShell.scrollTo === "function") {
+    contentShell.scrollTo({ top: 0, behavior: "auto" });
+  } else {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
   // 切回设备概览时主动拉取一次完整数据，避免必须手动点“刷新数据”。
   if (id === "overview") {
     try {
