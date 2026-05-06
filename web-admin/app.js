@@ -457,11 +457,16 @@ function applyRolePermissions() {
 }
 
 async function switchSection(id) {
+  const hasTargetSection = Array.from(sections).some((section) => section.id === id);
+  const nextSectionId = hasTargetSection ? id : "overview";
+  if (!hasTargetSection && id) {
+    setStatus(`页面不存在：${id}，已自动跳回设备概览`, "warning");
+  }
   sections.forEach((section) => {
-    section.classList.toggle("active", section.id === id);
+    section.classList.toggle("active", section.id === nextSectionId);
   });
   navItems.forEach((item) => {
-    item.classList.toggle("active", item.dataset.section === id);
+    item.classList.toggle("active", item.dataset.section === nextSectionId);
   });
   // 切换菜单后将主内容滚动到顶部，避免短面板看起来“空白”。
   if (contentShell && typeof contentShell.scrollTo === "function") {
@@ -470,7 +475,7 @@ async function switchSection(id) {
     window.scrollTo({ top: 0, behavior: "auto" });
   }
   // 切回设备概览时主动拉取一次完整数据，避免必须手动点“刷新数据”。
-  if (id === "overview") {
+  if (nextSectionId === "overview") {
     try {
       await loadOverview();
     } catch (_) {
@@ -478,7 +483,7 @@ async function switchSection(id) {
     }
   }
   // 进入 follower_queue 页面时主动刷新表格与日志，避免必须翻页后才看到数据。
-  if (id === "cv-access-data") {
+  if (nextSectionId === "cv-access-data") {
     try {
       currentCvPage = 1;
       await loadCvAccessData();
