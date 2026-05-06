@@ -1,6 +1,12 @@
 package com.autotraces.app
 
 import android.content.Intent
+import android.content.ContentValues
+import android.os.Environment
+import android.provider.MediaStore
+import android.util.Base64
+import java.io.File
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineScope
@@ -13,6 +19,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 object AppCoordinator {
+    private fun prettyTemplateName(raw: String?): String {
+        val text = raw?.trim().orEmpty()
+        if (text.isBlank()) return ""
+        val parts = text.split("::")
+        if (parts.size == 3 && parts[0] == "shared") {
+            val owner = parts[1].trim()
+            val tpl = parts[2].trim()
+            if (owner.isNotBlank() && tpl.isNotBlank()) return "$tpl（共享自 $owner）"
+        }
+        return text
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var appContext: android.content.Context
     private val executor: TraceExecutor by lazy {
@@ -54,7 +72,19 @@ object AppCoordinator {
             currentServerUrl = ApiService.getBaseUrl(),
             lastMessage = "应用已初始化",
         )
+        // 素材下发等设备任务不应依赖“业务运行状态”，只要已绑定就保持轮询能力。
+        ensureDeviceOpsLoopIfBound()
         startIfNeeded()
+    }
+
+    private fun ensureDeviceOpsLoopIfBound() {
+        if (!PrefsStore.isBound()) return
+        if (deviceOpsJob?.isActive != true) {
+            startDeviceOpsLoop()
+        }
+        if (deviceLogSyncJob?.isActive != true) {
+            startDeviceLogSyncLoop()
+        }
     }
 
     suspend fun bootstrapAfterBinding() {
@@ -75,7 +105,9 @@ object AppCoordinator {
     }
 
     fun startIfNeeded() {
-        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested()) {
+        // 即使硬停/暂停业务流程，也保持设备任务轮询（如素材下发）可用。
+        ensureDeviceOpsLoopIfBound()
+        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested() || manuallyPaused) {
             return
         }
         if (started.compareAndSet(false, true)) {
@@ -91,8 +123,13 @@ object AppCoordinator {
     }
 
     fun forceStartRunningNow(reason: String = "设备端启动后台服务") {
-        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested()) return
+        if (!PrefsStore.isBound()) return
         scope.launch {
+            // 显式启动（本机按钮/云端自动拉起）时，解除本地硬停与手动暂停闸门。
+            if (PrefsStore.isHardStopRequested()) {
+                PrefsStore.setHardStopRequested(false)
+            }
+            manuallyPaused = false
             if (!started.get()) {
                 started.set(true)
             }
@@ -120,6 +157,16 @@ object AppCoordinator {
         if (PrefsStore.getLocalStatus() == "running" && pullLoopJob?.isActive != true) {
             startPullLoop()
         }
+    }
+
+    private fun runExecutorSu(command: String): Boolean {
+        return runCatching {
+            executor.run {
+                val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
+                m.isAccessible = true
+                (m.invoke(this, command) as? Boolean) == true
+            }
+        }.getOrDefault(false)
     }
 
     suspend fun syncOnline(retries: Int = 1) {
@@ -152,16 +199,25 @@ object AppCoordinator {
     suspend fun fetchConfig() {
         val deviceId = PrefsStore.getDeviceId() ?: return
         val alias = PrefsStore.getAlias() ?: return
+        val mode = PrefsStore.getDeviceRunMode()
         runCatching {
-            ApiService.getConfig(deviceId, alias, PrefsStore.getDeviceRunMode())
+            ApiService.getConfig(deviceId, alias, mode)
         }.onSuccess { response ->
             if (response.code == 0 && response.config != null) {
                 val merged = response.config.copy(
                     run_mode = response.run_mode ?: response.config.run_mode,
                 )
                 _config.value = merged
-                LogCenter.op(alias, "拉取配置成功，模式=${merged.run_mode}")
-                updateRuntime(configLoaded = true, lastMessage = "配置拉取成功")
+                LogCenter.op(
+                    alias,
+                    "拉取配置成功，alias=$alias mode=$mode 命中模板=${prettyTemplateName(response.active_template)} 实际模式=${merged.run_mode}",
+                )
+                updateRuntime(
+                    configLoaded = true,
+                    effectiveRunMode = merged.run_mode,
+                    effectiveTemplate = prettyTemplateName(response.active_template),
+                    lastMessage = "配置拉取成功：alias=$alias mode=$mode template=${prettyTemplateName(response.active_template)}",
+                )
             } else {
                 LogCenter.op(
                     alias,
@@ -218,6 +274,10 @@ object AppCoordinator {
                             LogCenter.op(alias, "收到暂停指令")
                             updateRuntime(localStatus = "paused", lastMessage = "已暂停，等待继续")
                         } else {
+                            if (PrefsStore.isHardStopRequested()) {
+                                PrefsStore.setHardStopRequested(false)
+                            }
+                            manuallyPaused = false
                             PrefsStore.saveLocalStatus("running")
                             ApiService.syncStatus(deviceId, alias, "running")
                             LogCenter.op(alias, "收到启动/继续指令，开始运行")
@@ -233,7 +293,7 @@ object AppCoordinator {
                         }
                     } else if (response.code == 1 && response.auto_start == true) {
                         val ls = PrefsStore.getLocalStatus()
-                        if (ls != "paused") {
+                        if (ls != "paused" && !PrefsStore.isHardStopRequested() && !manuallyPaused) {
                             val needWake =
                                 !WorkerServiceTracker.isRunning || ls != "running"
                             if (needWake) {
@@ -331,6 +391,29 @@ object AppCoordinator {
                 PrefsStore.getPullCount(),
                 PrefsStore.getDeviceRunMode(),
             )
+            if (response.code == 2) {
+                val minutes = (response.rest_minutes ?: 0).coerceAtLeast(1)
+                val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+                LogCenter.op(alias, "收到休息指令：休息 ${minutes} 分钟；关闭 TikTok 后台（am force-stop $pkg）")
+                updateRuntime(lastMessage = "休息 ${minutes} 分钟（已关闭 TikTok 后台）")
+
+                val runSu: (String) -> Boolean = { command ->
+                    runCatching {
+                        executor.run {
+                            val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
+                            m.isAccessible = true
+                            (m.invoke(this, command) as? Boolean) == true
+                        }
+                    }.getOrDefault(false)
+                }
+                val stopOk = runSu("am force-stop $pkg")
+                LogCenter.op(alias, "休息前关闭 TikTok 后台结果：${if (stopOk) "success" else "failed"}")
+                delay(minutes.toLong() * 60_000L)
+                LogCenter.op(alias, "休息结束：准备继续拉取用户名")
+                updateRuntime(lastMessage = "休息结束，继续拉取")
+                forceImmediatePull = true
+                return
+            }
             val incoming = response.usernames.orEmpty()
             if (response.code == 0 && incoming.isNotEmpty()) {
                 val pendingFromBatch = PrefsStore.filterPendingFromLastBatch(incoming)
@@ -441,6 +524,10 @@ object AppCoordinator {
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
         val opId = op.op_id
         val payload = op.payload
+        if (op.op_type == "gallery_import_media" || op.op_type == "gallery_import_images") {
+            handleGalleryImportOp(alias, deviceId, op)
+            return
+        }
         val packageName = payload?.package_name?.trim().orEmpty()
         if (packageName.isBlank()) {
             ApiService.reportDeviceOp(
@@ -465,15 +552,7 @@ object AppCoordinator {
             LogCenter.op(alias, line)
         }
 
-        val runSu: (String) -> Boolean = { command ->
-            runCatching {
-                executor.run {
-                    val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
-                    m.isAccessible = true
-                    (m.invoke(this, command) as? Boolean) == true
-                }
-            }.getOrDefault(false)
-        }
+        val runSu: (String) -> Boolean = ::runExecutorSu
         val runSuWithOutput: (String) -> String? = { command ->
             runCatching {
                 executor.run {
@@ -800,6 +879,118 @@ object AppCoordinator {
         }
     }
 
+    private suspend fun handleGalleryImportOp(alias: String, deviceId: String, op: DeviceOp) {
+        val opId = op.op_id
+        val operationLogs = mutableListOf<String>()
+        fun opLog(text: String) {
+            val line = "[OP][$opId] $text"
+            operationLogs.add(line)
+            LogCenter.op(alias, line)
+        }
+
+        val mediaList = op.payload?.media_items.orEmpty().ifEmpty { op.payload?.image_items.orEmpty() }
+        if (mediaList.isEmpty()) {
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "failed",
+                message = "未收到素材数据",
+                data = mapOf(
+                    "op_type" to "gallery_import_media",
+                    "device_id" to deviceId,
+                    "operation_logs" to listOf("[OP][$opId] 未收到素材数据"),
+                ),
+            )
+            return
+        }
+
+        var successCount = 0
+        var failedCount = 0
+        opLog("开始导入图库：共 ${mediaList.size} 个素材")
+        mediaList.forEachIndexed { index, item ->
+            val fileName = item.filename?.trim().takeUnless { it.isNullOrBlank() } ?: "image_${index + 1}.jpg"
+            val mime = item.content_type?.trim().takeUnless { it.isNullOrBlank() } ?: "image/jpeg"
+            val explicitType = item.media_type?.trim()?.lowercase().orEmpty()
+            val isVideo = explicitType == "video" || mime.lowercase().startsWith("video/")
+            val b64 = item.content_b64?.trim().orEmpty()
+            if (b64.isBlank()) {
+                failedCount += 1
+                opLog("第 ${index + 1} 张失败：$fileName（base64 为空）")
+                return@forEachIndexed
+            }
+            val raw = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull()
+            if (raw == null || raw.isEmpty()) {
+                failedCount += 1
+                opLog("第 ${index + 1} 张失败：$fileName（base64 无法解码）")
+                return@forEachIndexed
+            }
+
+            val ok = runCatching {
+                val resolver = appContext.contentResolver
+                val values = ContentValues().apply {
+                    if (isVideo) {
+                        put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                        put(MediaStore.Video.Media.MIME_TYPE, mime)
+                        put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/AutoTraces")
+                        put(MediaStore.Video.Media.IS_PENDING, 1)
+                    } else {
+                        put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                        put(MediaStore.Images.Media.MIME_TYPE, mime)
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/AutoTraces")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+                val uri = resolver.insert(
+                    if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+                    ?: throw IOException("MediaStore insert failed")
+                resolver.openOutputStream(uri)?.use { out ->
+                    out.write(raw)
+                    out.flush()
+                } ?: throw IOException("openOutputStream failed")
+                values.clear()
+                if (isVideo) {
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                } else {
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                }
+                resolver.update(uri, values, null, null)
+                true
+            }.getOrDefault(false)
+
+            if (ok) {
+                successCount += 1
+                opLog("第 ${index + 1} 张成功：$fileName")
+            } else {
+                failedCount += 1
+                opLog("第 ${index + 1} 张失败：$fileName（写入图库失败）")
+            }
+        }
+
+        val allOk = failedCount == 0
+        val message = if (allOk) {
+            "素材已写入图库（共 $successCount 个）"
+        } else {
+            "素材导入完成：成功 $successCount 个，失败 $failedCount 个"
+        }
+        ApiService.reportDeviceOp(
+            deviceId = deviceId,
+            alias = alias,
+            opId = opId,
+            status = if (allOk) "success" else "failed",
+            message = message,
+            data = mapOf(
+                "op_type" to "gallery_import_media",
+                "device_id" to deviceId,
+                "success_count" to successCount,
+                "failed_count" to failedCount,
+                "operation_logs" to operationLogs,
+            ),
+        )
+    }
+
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {
         fetchConfig()
         val runMode = _config.value.run_mode.trim().lowercase()
@@ -944,7 +1135,7 @@ object AppCoordinator {
 
     fun onWorkerServiceChanged(isRunning: Boolean) {
         updateRuntime(serviceRunning = isRunning)
-        if (isRunning) {
+        if (isRunning && !PrefsStore.isHardStopRequested()) {
             ensureLoopsRunning()
         }
         // 停止服务时的 online 同步已在 stopAllWork() 内统一处理（含重试），此处不再重复请求。
@@ -981,10 +1172,13 @@ object AppCoordinator {
 
     fun isManualPaused(): Boolean = manuallyPaused
 
-    fun stopAllWork() {
-        // 仅停止后台服务本身，不把设备永久标记为“禁止自动开启”。
-        // 这样后续重新开启这台设备的自动开启开关时，设备仍可恢复响应。
-        PrefsStore.saveLocalStatus("online")
+    fun stopAllWork(requestHardStop: Boolean = true) {
+        // 注意：服务销毁(onDestroy)也会走到这里；避免在“正在重启服务”场景把硬停标记回写为 true。
+        if (requestHardStop) {
+            PrefsStore.setHardStopRequested(true)
+        }
+        val hardStopped = PrefsStore.isHardStopRequested()
+        PrefsStore.saveLocalStatus("paused")
         startPollJob?.cancel()
         pullLoopJob?.cancel()
         deviceOpsJob?.cancel()
@@ -993,14 +1187,14 @@ object AppCoordinator {
         pullLoopJob = null
         deviceOpsJob = null
         deviceLogSyncJob = null
-        manuallyPaused = false
+        manuallyPaused = true
         started.set(false)
         updateRuntime(
             serviceRunning = false,
-            localStatus = "online",
-            lastMessage = "后台轮询已停止",
+            localStatus = "paused",
+            hardStopRequested = hardStopped,
+            lastMessage = "后台服务已停止",
         )
-        // 停止前台服务后必须把服务端从 running 拉回 online，否则管理台仍显示运行中；带重试避免单次网络失败。
         scope.launch {
             syncOnline(retries = 4)
         }
@@ -1010,22 +1204,24 @@ object AppCoordinator {
      * 仅停止执行相关循环，保留 check_start 轮询，继续监听云端启动/暂停指令。
      */
     fun stopExecutionOnly(keepListenerReason: String = "后台服务已停止，保留云端指令监听") {
-        PrefsStore.saveLocalStatus("online")
+        PrefsStore.setHardStopRequested(true)
+        PrefsStore.saveLocalStatus("paused")
         pullLoopJob?.cancel()
         deviceOpsJob?.cancel()
         deviceLogSyncJob?.cancel()
         pullLoopJob = null
         deviceOpsJob = null
         deviceLogSyncJob = null
-        manuallyPaused = false
+        manuallyPaused = true
 
         updateRuntime(
             serviceRunning = false,
-            localStatus = "online",
+            localStatus = "paused",
+            hardStopRequested = true,
             lastMessage = keepListenerReason,
         )
 
-        if (startPollJob?.isActive != true) {
+        if (startPollJob?.isActive != true && !PrefsStore.isHardStopRequested()) {
             startCheckLoop()
         }
 
@@ -1041,7 +1237,7 @@ object AppCoordinator {
             currentServerUrl = ApiService.getBaseUrl(),
             hardStopRequested = PrefsStore.isHardStopRequested(),
         )
-        if (WorkerServiceTracker.isRunning) {
+        if (WorkerServiceTracker.isRunning && !PrefsStore.isHardStopRequested() && !manuallyPaused) {
             ensureLoopsRunning()
         }
     }
@@ -1051,6 +1247,8 @@ object AppCoordinator {
         localStatus: String? = null,
         currentServerUrl: String? = null,
         configLoaded: Boolean? = null,
+        effectiveRunMode: String? = null,
+        effectiveTemplate: String? = null,
         lastMessage: String? = null,
         hardStopRequested: Boolean? = null,
     ) {
@@ -1060,6 +1258,8 @@ object AppCoordinator {
             localStatus = localStatus ?: old.localStatus,
             currentServerUrl = currentServerUrl ?: old.currentServerUrl,
             configLoaded = configLoaded ?: old.configLoaded,
+            effectiveRunMode = effectiveRunMode ?: old.effectiveRunMode,
+            effectiveTemplate = effectiveTemplate ?: old.effectiveTemplate,
             lastMessage = lastMessage ?: old.lastMessage,
             hardStopRequested = hardStopRequested ?: old.hardStopRequested,
         )

@@ -100,6 +100,7 @@ data class ConfigResponse(
     val code: Int,
     val config: AppConfig? = null,
     val run_mode: String? = null,
+    val active_template: String? = null,
     val msg: String? = null,
 )
 
@@ -115,6 +116,8 @@ data class PullUsernameResponse(
     val code: Int,
     val usernames: List<String>? = null,
     val msg: String? = null,
+    val rest_minutes: Int? = null,
+    val force_stop_tiktok: Boolean? = null,
 )
 
 data class ReportResultRequest(
@@ -146,6 +149,20 @@ data class DeviceOpPayload(
     val backup_path: String? = null,
     val backup_record_id: Int? = null,
     val username: String? = null,
+    val text: String? = null,
+    val key_code: Int? = null,
+    /** 图库导入：素材数组（图片/视频，base64 + 文件名 + mime） */
+    val media_items: List<DeviceGalleryMediaPayload>? = null,
+    /** 兼容旧字段（仅图片） */
+    val image_items: List<DeviceGalleryMediaPayload>? = null,
+)
+
+data class DeviceGalleryMediaPayload(
+    val filename: String? = null,
+    val content_type: String? = null,
+    val content_b64: String? = null,
+    val size: Int? = null,
+    val media_type: String? = null,
 )
 
 data class DeviceOp(
@@ -189,11 +206,78 @@ data class DeviceAutoStartOptOutResponse(
     val auto_start_opt_out: Boolean? = null,
 )
 
+data class DeviceTikTokAccountRecord(
+    val id: Int? = null,
+    val username: String? = null,
+    val tiktok_password: String? = null,
+    val mobile_alias: String? = null,
+    val api_address: String? = null,
+    val email: String? = null,
+    val email_password: String? = null,
+    val login_date: String? = null,
+    val video_count: Int? = null,
+    val follower_count: Int? = null,
+    val new_follower_count: Int? = null,
+    val backup_path: String? = null,
+    val backup_name: String? = null,
+    val created_at: String? = null,
+    val updated_at: String? = null,
+)
+
+data class DeviceTikTokAccountsByAliasResponse(
+    val code: Int,
+    val msg: String? = null,
+    val items: List<DeviceTikTokAccountRecord>? = null,
+)
+
+data class DeviceEditorRowRecord(
+    val row_index: Int? = null,
+    val device_alias: String? = null,
+    val device_id: String? = null,
+    val ip: String? = null,
+    val region: String? = null,
+    val username: String? = null,
+    val backup_path: String? = null,
+    val backup_name: String? = null,
+    val backup_time: String? = null,
+    val backup_status: String? = null,
+    val remark: String? = null,
+)
+
+data class DeviceEditorRowsResponse(
+    val code: Int,
+    val msg: String? = null,
+    val items: List<DeviceEditorRowRecord>? = null,
+)
+
+data class AccountEditorRowRecord(
+    val row_index: Int? = null,
+    val username: String? = null,
+    val password: String? = null,
+    val email: String? = null,
+    val email_password: String? = null,
+    val api: String? = null,
+    val is_login: Int? = null,
+    val login_time: String? = null,
+    val region: String? = null,
+    val video_count: String? = null,
+    val follower_count: String? = null,
+    val follower_growth: String? = null,
+)
+
+data class AccountEditorRowsResponse(
+    val code: Int,
+    val msg: String? = null,
+    val items: List<AccountEditorRowRecord>? = null,
+)
+
 data class RuntimeState(
     val serviceRunning: Boolean = false,
     val localStatus: String = "online",
     val currentServerUrl: String = "",
     val configLoaded: Boolean = false,
+    val effectiveRunMode: String = "",
+    val effectiveTemplate: String = "",
     val lastMessage: String = "等待初始化",
     val hardStopRequested: Boolean = false,
 )

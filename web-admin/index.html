@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Auto Traces 控制台</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=20260504-1" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -40,7 +40,9 @@
         <div class="nav-group-title">设备管理模块</div>
         <button class="nav-item active" data-section="overview">设备概览</button>
         <button class="nav-item" data-section="config">运行配置</button>
-        <button class="nav-item" data-section="backup-section">TikTok账号备份档案</button>
+        <div class="nav-group-title">账号管理模块</div>
+        <button class="nav-item" data-section="account-manager">账号表单与账号记录</button>
+        <button class="nav-item" data-section="backup-section">TikTok设备备份档案</button>
         <button class="nav-item admin-only" data-section="usernames">用户名队列</button>
         <div class="nav-group-title admin-only">数据管理模块</div>
         <button class="nav-item admin-only" data-section="tiktok-roots">根用户管理</button>
@@ -78,8 +80,11 @@
             <button id="startSelected" class="primary">启动所选设备</button>
             <button id="startAll" class="ghost">启动全部在线设备</button>
             <button id="stopSelected" class="ghost">停止所选设备</button>
+            <select id="batchTemplateSelect" style="min-width:140px;">
+              <option value="default">default</option>
+            </select>
+            <button id="applyTemplateSelected" class="ghost">批量修改模板</button>
             <button id="autoStartToggleBtn" type="button" class="ghost">自动开启程序：关</button>
-            <button id="refreshOverviewBtn" class="ghost">刷新设备</button>
           </div>
           <div class="toolbar-right">
             <input id="aliasFilter" type="text" placeholder="按别名筛选" />
@@ -120,6 +125,7 @@
                 <th>设备 ID</th>
                 <th>别名</th>
                 <th class="admin-only">归属客户</th>
+                <th>模板（当前模式）</th>
                 <th>状态</th>
                 <th>待启动</th>
                 <th>自动开启</th>
@@ -199,6 +205,7 @@
               <button id="tiktokRootsSelectPage" class="ghost">本页全选</button>
               <button id="tiktokRootsClearSelection" class="ghost">取消本页选择</button>
               <button id="addSelectedRootsToPending" class="primary">将选中根用户加入待下发队列</button>
+              <button id="addAllRootsToPending" class="primary">将所有根用户加入待下发队列</button>
               <span id="tiktokRootsSelectionCount" class="hint">0 已选</span>
             </div>
             <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
@@ -232,11 +239,17 @@
             <textarea id="taskContainerIds" placeholder="每行一个环境ID"></textarea>
             <label>并行数量（可选）</label>
             <input id="taskParallel" type="number" min="1" value="1" />
+            <label>全量执行优先级（可选）</label>
+            <select id="collectRootsDbPriority">
+              <option value="high" selected>高（优先久未执行）</option>
+              <option value="medium">中（按发现时间）</option>
+              <option value="low">低（优先最近执行）</option>
+            </select>
             <button id="triggerCollectRootsExcel" class="primary">立即抓取（仅本次，使用已上传Excel）</button>
             <button id="stopCollectRootsExcel" class="danger">停止抓取（Excel）</button>
-            <button id="triggerCollectRootsDb" class="ghost">随机抽取一批（仅本次，来自tiktok_roots）</button>
+            <button id="triggerCollectRootsDb" class="ghost">全量执行（仅本次，来自tiktok_roots）</button>
             <div style="margin:6px 0 0;color:#666;font-size:12px;line-height:1.6;max-width:760px;">
-              从 <code>tiktok_roots</code> 中随机抽取一批账号，仅执行本次处理；不影响长期队列策略，不会全量扫描全部根用户。
+              从 <code>tiktok_roots</code> 中按优先级执行全量账号；不影响长期队列策略。
             </div>
             <button id="stopCollectRootsDb" class="danger">停止抓取（tiktok_roots）</button>
             <button id="triggerAutoSearch" class="ghost">立即执行 autoSearch 一次</button>
@@ -479,52 +492,42 @@
         </div>
       </section>
 
-      <section id="backup-section" class="panel">
+      <section id="account-manager" class="panel">
         <header>
-          <h2>账号与设备备份管理</h2>
-          <p>左侧编辑 TikTok 账号主数据，右侧编辑设备备份数据。新增记录只保留空白新增。</p>
+          <h2>账号表单与账号记录管理</h2>
+          <p>支持单条编辑与文本批量导入，统一维护 TikTok 账号主数据。</p>
         </header>
         <div class="panel-card" style="margin-top:14px;">
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
             <div>
               <h3 style="margin:0 0 6px;">账号表单</h3>
-              <div class="hint">表一保存账号信息；表二保存设备与备份信息。</div>
+              <div class="hint">保存账号基础字段（username、password、email、email_password、api）。</div>
             </div>
             <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
               <button id="addBlankRecordBtn" class="primary">新增空白记录</button>
             </div>
           </div>
+          <div class="panel-card" style="margin-top:12px;background:#f8faff;">
+            <h4 style="margin:0 0 8px;">账号文本批量导入</h4>
+            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 分隔。列顺序：username、password、email、email_password、(忽略)、(忽略)、api。</div>
+            <div class="field" style="max-width:280px;margin-bottom:8px;">
+              <label>统一国家地区（可选）</label>
+              <input id="accountBatchRegionInput" type="text" placeholder="例如：MX / US" />
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;color:#333;">
+              <input id="accountBatchRejectEmptyToggle" type="checkbox" checked />
+              空值时阻止导入（username、password、email、email_password、api）
+            </label>
+            <textarea id="accountBatchInput" placeholder="支持两种格式：1) username[TAB]password[TAB]email[TAB]email_password[TAB]ignore[TAB]ignore[TAB]api  2) username----password----email----email_password----ignore----ignore----api"></textarea>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
+              <button id="importAccountBatchBtn" class="primary">批量导入账号</button>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;">
+            <h3 style="margin:0;">账号记录</h3>
+            <div class="hint">支持直接编辑、删除。</div>
+          </div>
           <div id="accountEditorList" style="margin-top:14px;"></div>
-        </div>
-        <div class="panel-card" style="margin-top:14px;">
-          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
-            <div>
-              <h3 style="margin:0 0 6px;">设备表格</h3>
-              <div class="hint">表二保存设备别名、唯一标识、IP、地区、备份状态和备注。</div>
-            </div>
-            <div class="field" style="min-width:260px;flex:1;max-width:360px;">
-              <label>包名</label>
-              <input id="backupPackageNameInput" type="text" value="com.zhiliaoapp.musically" placeholder="例如：com.zhiliaoapp.musically" />
-            </div>
-          </div>
-          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;">
-            <button id="refreshBackupsBtn" class="ghost">刷新设备表格</button>
-            <div class="field" style="min-width:320px;flex:1;max-width:460px;margin:0;">
-              <label>新增时选择设备别名（自动带入 device_id）</label>
-              <select id="deviceAliasPresetSelect">
-                <option value="">手动填写（不自动带入）</option>
-              </select>
-            </div>
-            <div class="field" style="min-width:220px;flex:1;max-width:320px;margin:0;">
-              <label>新增时选择国家地区（必选）</label>
-              <select id="deviceRegionPresetSelect">
-                <option value="">请选择国家地区</option>
-              </select>
-            </div>
-            <button id="addDeviceBlankRecordBtn" class="primary">新增空白记录</button>
-          </div>
-          <datalist id="deviceAliasOptions"></datalist>
-          <div id="deviceAliasGroups" style="margin-top:14px;"></div>
         </div>
       </section>
 
@@ -796,6 +799,36 @@
           </select>
           <div class="hint">切换后会自动加载该模式自己的配置。你在这里保存的内容，只会写入当前模式那一套参数。</div>
         </div>
+        <div class="panel-card" style="margin: 0 0 14px;">
+          <h3 style="margin:0 0 8px;">模板板块</h3>
+          <div class="hint" style="margin-bottom:10px;">复制模板为新模板（比新建后再改更快）。管理员可以配置给哪些用户使用。</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+            <div class="field" style="min-width:240px;flex:1;margin:0;">
+              <label>当前模板</label>
+              <select id="activeConfigTemplateSelect" style="min-width:180px;">
+                <option value="default">default</option>
+              </select>
+            </div>
+            <button id="copyConfigTemplateBtn" type="button" class="ghost">复制模板为新模板</button>
+            <button id="renameConfigTemplateBtn" type="button" class="ghost">模板重命名</button>
+            <button id="deleteConfigTemplateBtn" type="button" class="ghost">删除模板</button>
+          </div>
+          <div class="admin-only" style="margin-top:12px;padding-top:12px;border-top:1px dashed #dbe3ff;">
+            <h3 style="margin:0 0 8px;">配置模板共用</h3>
+            <div class="hint" style="margin-bottom:10px;">先切换模板，再编辑给该模板的共享权限；保存后仅影响当前模板。</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+              <div class="field" style="min-width:240px;flex:1;margin:0;">
+                <label>授权给用户</label>
+                <select id="configTargetUserSelect">
+                  <option value="">请选择用户</option>
+                </select>
+              </div>
+              <button id="grantConfigTemplateBtn" type="button" class="primary">授权使用当前模板</button>
+              <button id="revokeConfigTemplateBtn" type="button" class="ghost">取消授权</button>
+            </div>
+            <div id="templateGrantStatus" class="hint" style="margin-top:8px;"></div>
+          </div>
+        </div>
         <form id="configForm" class="form-grid">
           <div class="field">
             <label>休息前粉丝数</label>
@@ -967,7 +1000,7 @@ so cute</textarea>
           </div> -->
         </form>
         <div class="actions config-actions">
-          <button id="saveConfig" class="primary">保存并下发</button>
+          <button id="saveConfig" class="primary">保存当前模板并下发</button>
         </div>
 
 
@@ -975,6 +1008,6 @@ so cute</textarea>
     </main>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=20260505-2"></script>
 </body>
 </html>

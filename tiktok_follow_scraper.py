@@ -2375,19 +2375,29 @@ def run_collect_roots(cfg: dict, root_username_data: List[Tuple[str, str, str]] 
     )
 
 
-def fetch_root_batch_for_collect(limit: int = 100) -> List[Tuple[str, str, str]]:
+def fetch_root_batch_for_collect(limit: int = 100, priority: str = "high") -> List[Tuple[str, str, str]]:
     """
     从 tiktok_roots 取待采集根用户。
-    当前条件：按 usage_count 升序、discovered_at 升序，取最久未优先的一批。
+    priority:
+      - high: 按 usage_count 升序、discovered_at 升序（久未执行优先）
+      - medium: 按 discovered_at 升序、usage_count 升序（老根优先）
+      - low: 按 usage_count 降序、discovered_at 降序（最近执行优先）
     返回: [(root_username, "", roots_type)]
     """
+    p = str(priority or "high").strip().lower()
+    if p == "low":
+        order_sql = "usage_count DESC, discovered_at DESC"
+    elif p == "medium":
+        order_sql = "discovered_at ASC, usage_count ASC"
+    else:
+        order_sql = "usage_count ASC, discovered_at ASC"
     conn = _get_db()
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT root_username, roots_type
             FROM tiktok_roots
-            ORDER BY usage_count ASC, discovered_at ASC
+            ORDER BY {order_sql}
             LIMIT ?
             """,
             (limit,),
@@ -2397,19 +2407,30 @@ def fetch_root_batch_for_collect(limit: int = 100) -> List[Tuple[str, str, str]]
         conn.close()
 
 
-def run_collect_roots_from_db_once(cfg: dict, limit: int = 100, container_id: str | None = None):
-    batch = fetch_root_batch_for_collect(limit=limit)
-    print(f"从 tiktok_roots 读取到 {len(batch)} 个根用户用于采集")
+def run_collect_roots_from_db_once(
+    cfg: dict,
+    limit: int = 100,
+    container_id: str | None = None,
+    priority: str = "high",
+):
+    batch = fetch_root_batch_for_collect(limit=limit, priority=priority)
+    print(f"从 tiktok_roots 读取到 {len(batch)} 个根用户用于采集 | priority={priority}")
     run_collect_roots(cfg, root_username_data=batch, source_label="tiktok_roots", container_id=container_id)
 
 
-def run_collect_roots_from_db_loop(cfg: dict, limit: int = 100, interval_seconds: int = 300, container_id: str | None = None):
+def run_collect_roots_from_db_loop(
+    cfg: dict,
+    limit: int = 100,
+    interval_seconds: int = 300,
+    container_id: str | None = None,
+    priority: str = "high",
+):
     print("=== TikTok 关系采集脚本启动（DB定时抓 root 粉丝） ===")
-    print(f"根用户来源: tiktok_roots | 每轮上限: {limit} | 间隔: {interval_seconds}s")
+    print(f"根用户来源: tiktok_roots | 每轮上限: {limit} | 间隔: {interval_seconds}s | priority={priority}")
     init_db_for_follow_graph(cfg["db_path"])
 
     while True:
-        run_collect_roots_from_db_once(cfg, limit=limit, container_id=container_id)
+        run_collect_roots_from_db_once(cfg, limit=limit, container_id=container_id, priority=priority)
         print(f"等待 {interval_seconds} 秒后继续 DB 根用户采集...")
         time.sleep(interval_seconds)
 
@@ -2623,6 +2644,7 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=100, help="每次处理的 follower 数量")
     parser.add_argument("--interval", type=int, default=300, help="定时处理间隔（秒）")
+    parser.add_argument("--priority", type=str, default="high", choices=["high", "medium", "low"], help="DB根用户抓取优先级")
     parser.add_argument("--container-id", type=str, default="", help="Hubstudio环境ID（传入后不再需要手动登录）")
     parser.add_argument("--excel-input-path", type=str, default="", help="Excel 输入文件路径")
     parser.add_argument("--excel-output-path", type=str, default="", help="Excel 输出文件路径")
@@ -2651,9 +2673,9 @@ def main():
     if args.mode == "collect_roots":
         run_collect_roots(cfg, container_id=container_id)
     elif args.mode == "collect_roots_db":
-        run_collect_roots_from_db_once(cfg, limit=args.limit, container_id=container_id)
+        run_collect_roots_from_db_once(cfg, limit=args.limit, container_id=container_id, priority=args.priority)
     elif args.mode == "collect_roots_db_loop":
-        run_collect_roots_from_db_loop(cfg, limit=args.limit, interval_seconds=args.interval, container_id=container_id)
+        run_collect_roots_from_db_loop(cfg, limit=args.limit, interval_seconds=args.interval, container_id=container_id, priority=args.priority)
     elif args.mode == "process_queue":
         run_process_queue_once(cfg, limit=args.limit, container_id=container_id)
     else:

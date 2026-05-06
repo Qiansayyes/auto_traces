@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import random
@@ -21,7 +22,7 @@ from typing import Any, Dict, List, Literal
 
 import requests
 
-from fastapi import FastAPI, File, UploadFile, Header, Request
+from fastapi import FastAPI, File, Form, UploadFile, Header, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -611,6 +612,30 @@ def _ensure_user_runtime_configs():
         conn.close()
 
 
+def _ensure_template_permissions():
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS template_permissions (
+                source_username TEXT NOT NULL,
+                template_name TEXT NOT NULL,
+                target_username TEXT NOT NULL,
+                granted_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source_username, template_name, target_username)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_template_permissions_target ON template_permissions(target_username)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def migrate_backup_owner_history():
     _ensure_backup_owner_columns()
     conn = _get_db()
@@ -627,6 +652,7 @@ def init_databases():
     init_auth_db()
     _ensure_backup_owner_columns()
     _ensure_user_runtime_configs()
+    _ensure_template_permissions()
     migrate_backup_owner_history()
 
 
@@ -681,6 +707,8 @@ class MemoryStore:
     device_logs: Dict[str, List[str]] = field(default_factory=dict)
     pending_usernames: List[str] = field(default_factory=list)
     pulled_usernames: List[str] = field(default_factory=list)
+    # 每台设备已完成的“拉取批次”计数（用于按批次触发休息指令）。仅内存态，服务重启后会清零。
+    device_pull_rounds: Dict[str, int] = field(default_factory=dict)
     default_config: Dict[str, object] = field(default_factory=lambda: dict(MODE_DEFAULT_CONFIGS["growth"]))
     configs_by_mode: Dict[str, Dict[str, object]] = field(
         default_factory=lambda: {mode: dict(cfg) for mode, cfg in MODE_DEFAULT_CONFIGS.items()}
@@ -707,6 +735,8 @@ class MemoryStore:
 
 
 store = MemoryStore()
+
+
 
 
 def _load_client_devices_from_db() -> None:
@@ -859,9 +889,69 @@ def _save_user_runtime_state(username: str, payload: dict):
         conn.close()
 
 
+def _load_raw_configs_by_template_blob(username: str) -> object | None:
+    """直接从 DB 读取 configs_by_template 原始 JSON，不经 normalize 过滤。"""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT config_json FROM user_runtime_configs WHERE username = ? AND config_key = ?",
+            (username, "configs_by_template"),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0] or "{}")
+        except Exception:
+            return None
+    finally:
+        conn.close()
+
+
+def _parse_raw_template_keys(blob: object) -> tuple[list[str], list[str]]:
+    """返回 (所有键名, 值非 dict 的键名)。根不是对象时键名为 ['<invalid_root>']。"""
+    if blob is None:
+        return [], []
+    if not isinstance(blob, dict):
+        return ["<invalid_root>"], ["<invalid_root>"]
+    keys: list[str] = []
+    bad: list[str] = []
+    for k, v in blob.items():
+        name = str(k or "").strip()
+        if not name:
+            continue
+        keys.append(name)
+        if not isinstance(v, dict):
+            bad.append(name)
+    keys.sort(key=lambda x: x.lower())
+    bad.sort(key=lambda x: x.lower())
+    return keys, bad
+
+
+def _collect_orphan_alias_template_refs(data: dict, effective_keys: set[str]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    alias_map_all = data.get("alias_template_by_mode")
+    if not isinstance(alias_map_all, dict):
+        return out
+    for mode_key in ("growth", "live", "direct"):
+        mode_map = alias_map_all.get(mode_key)
+        if not isinstance(mode_map, dict):
+            continue
+        for raw_alias, raw_template in mode_map.items():
+            alias = _normalize_alias_key(raw_alias)
+            ref = str(raw_template or "").strip()
+            if not alias or not ref:
+                continue
+            if ref not in effective_keys:
+                out.append({"mode": mode_key, "alias": alias, "ref": ref})
+    return out
+
+
 def _default_user_config_state() -> dict:
+    default_template = "default"
     return {
         "run_mode": "growth",
+        "active_template": default_template,
+        "configs_by_template": {default_template: dict(MODE_DEFAULT_CONFIGS["growth"])},
         "configs_by_mode": {mode: dict(cfg) for mode, cfg in MODE_DEFAULT_CONFIGS.items()},
         "default_config": dict(MODE_DEFAULT_CONFIGS["growth"]),
         # 是否开启「设备端自动启动」策略（按用户）
@@ -869,8 +959,207 @@ def _default_user_config_state() -> dict:
     }
 
 
+def _sanitize_template_name(raw: object, fallback: str = "default") -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return fallback
+    return text[:64]
+
+
+def _shared_template_key(source_username: str, template_name: str) -> str:
+    return f"shared::{source_username}::{template_name}"
+
+
+def _normalize_alias_key(raw: object) -> str:
+    text = str(raw or "").strip()
+    return text.lower()
+
+
+def _parse_template_ref(template_ref: object) -> tuple[str, str, bool]:
+    text = str(template_ref or "").strip()
+    if text.startswith("shared::"):
+        parts = text.split("::", 2)
+        if len(parts) == 3:
+            owner = _sanitize_template_name(parts[1], "admin")
+            name = _sanitize_template_name(parts[2], "default")
+            return owner, name, True
+    return "", _sanitize_template_name(text, "default"), False
+
+
+def _load_template_grants_for_user(target_username: str) -> List[Dict[str, str]]:
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT source_username, template_name
+            FROM template_permissions
+            WHERE target_username = ?
+            ORDER BY source_username, template_name
+            """,
+            (target_username,),
+        ).fetchall()
+        return [
+            {
+                "source_username": str(r[0] or "").strip(),
+                "template_name": str(r[1] or "").strip(),
+            }
+            for r in rows
+            if str(r[0] or "").strip() and str(r[1] or "").strip()
+        ]
+    finally:
+        conn.close()
+
+
+def _build_effective_template_bundle(username: str, data: dict) -> tuple[Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
+    own_templates = data.get("configs_by_template", {})
+    merged_templates: Dict[str, Dict[str, object]] = {}
+    template_meta: Dict[str, Dict[str, object]] = {}
+    if isinstance(own_templates, dict):
+        for key, cfg in own_templates.items():
+            name = _sanitize_template_name(key, "default")
+            if not isinstance(cfg, dict):
+                continue
+            merged_templates[name] = dict(cfg)
+            template_meta[name] = {
+                "source_username": username,
+                "template_name": name,
+                "editable": True,
+                "shared": False,
+            }
+
+    grants = _load_template_grants_for_user(username)
+    for grant in grants:
+        source_username = grant["source_username"]
+        template_name = grant["template_name"]
+        owner_state = _normalize_user_runtime_state(_load_user_runtime_state(source_username))
+        owner_templates = owner_state.get("configs_by_template", {})
+        owner_cfg = owner_templates.get(template_name) if isinstance(owner_templates, dict) else None
+        if not isinstance(owner_cfg, dict):
+            continue
+        key = _shared_template_key(source_username, template_name)
+        merged_templates[key] = dict(owner_cfg)
+        template_meta[key] = {
+            "source_username": source_username,
+            "template_name": template_name,
+            "editable": False,
+            "shared": True,
+        }
+    return merged_templates, template_meta
+
+
+def _normalize_user_runtime_state(raw_state: dict | None) -> dict:
+    data = dict(raw_state or {})
+    result = _default_user_config_state()
+    run_mode = data.get("run_mode")
+    if run_mode in ("growth", "live", "direct"):
+        result["run_mode"] = run_mode
+    auto_start_enabled = data.get("auto_start_enabled")
+    if isinstance(auto_start_enabled, bool):
+        result["auto_start_enabled"] = auto_start_enabled
+
+    alias_template_by_mode: Dict[str, Dict[str, str]] = {"growth": {}, "live": {}, "direct": {}}
+    incoming_alias_template_by_mode = data.get("alias_template_by_mode")
+    if isinstance(incoming_alias_template_by_mode, dict):
+        for mode_key in ("growth", "live", "direct"):
+            mode_map = incoming_alias_template_by_mode.get(mode_key)
+            if not isinstance(mode_map, dict):
+                continue
+            for raw_alias, raw_template in mode_map.items():
+                alias = _normalize_alias_key(raw_alias)
+                template_ref = str(raw_template or "").strip()
+                if not alias or not template_ref:
+                    continue
+                alias_template_by_mode[mode_key][alias] = template_ref
+
+    templates: Dict[str, Dict[str, object]] = {}
+    incoming_templates = data.get("configs_by_template")
+    if isinstance(incoming_templates, dict):
+        for key, value in incoming_templates.items():
+            if not isinstance(value, dict):
+                continue
+            name = _sanitize_template_name(key, "default")
+            merged = dict(MODE_DEFAULT_CONFIGS["growth"])
+            merged.update(value)
+            templates[name] = merged
+
+    # 兼容旧结构：仅存在 configs_by_mode 时，迁移到 default 模板。
+    if not templates:
+        legacy = data.get("configs_by_mode")
+        if isinstance(legacy, dict):
+            mode = result["run_mode"]
+            seed = legacy.get(mode) if isinstance(legacy.get(mode), dict) else None
+            if seed is None and isinstance(legacy.get("growth"), dict):
+                seed = legacy.get("growth")
+            merged = dict(MODE_DEFAULT_CONFIGS["growth"])
+            merged.update(seed or {})
+            templates["default"] = merged
+    if not templates:
+        templates["default"] = dict(MODE_DEFAULT_CONFIGS["growth"])
+
+    active_template = _sanitize_template_name(data.get("active_template"), "default")
+    if active_template not in templates:
+        active_template = "default" if "default" in templates else sorted(templates.keys())[0]
+
+    active_config = dict(templates.get(active_template, MODE_DEFAULT_CONFIGS["growth"]))
+    result["active_template"] = active_template
+    result["configs_by_template"] = templates
+    # 老字段继续回填，兼容现有旧逻辑/旧客户端。
+    result["configs_by_mode"] = {mode: dict(active_config) for mode in ("growth", "live", "direct")}
+    result["default_config"] = dict(active_config)
+    result["alias_template_by_mode"] = alias_template_by_mode
+    return result
+
+
+def _resolve_template_for_mode_alias(
+    owner_username: str,
+    data: dict,
+    mode: str,
+    alias: str,
+) -> tuple[str, Dict[str, object], Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
+    templates, template_meta = _build_effective_template_bundle(owner_username, data)
+    if not templates:
+        fallback_name = "default"
+        return (
+            fallback_name,
+            dict(MODE_DEFAULT_CONFIGS["growth"]),
+            {fallback_name: dict(MODE_DEFAULT_CONFIGS["growth"])},
+            {},
+        )
+    mode_key = mode if mode in ("growth", "live", "direct") else str(data.get("run_mode") or "growth")
+    alias_clean = _normalize_alias_key(alias)
+    alias_map_all = data.get("alias_template_by_mode", {})
+    mode_map = alias_map_all.get(mode_key) if isinstance(alias_map_all, dict) else {}
+    raw_ref = str(mode_map.get(alias_clean) or "").strip() if isinstance(mode_map, dict) else ""
+    cross_mode_hit = ""
+    # 兜底：若当前模式未配置该 alias，尝试复用其它模式同 alias 的模板，避免误回退到 active_template。
+    if not raw_ref and isinstance(alias_map_all, dict) and alias_clean:
+        for probe_mode in ("growth", "live", "direct"):
+            if probe_mode == mode_key:
+                continue
+            probe_map = alias_map_all.get(probe_mode)
+            if not isinstance(probe_map, dict):
+                continue
+            probe_ref = str(probe_map.get(alias_clean) or "").strip()
+            if probe_ref in templates:
+                raw_ref = probe_ref
+                cross_mode_hit = probe_mode
+                break
+
+    stored_active = str(data.get("active_template") or "").strip()
+    fallback_name = stored_active if stored_active in templates else ""
+    if not fallback_name:
+        fallback_name = sorted(templates.keys())[0]
+
+    selected_name = raw_ref if raw_ref in templates else fallback_name
+    config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
+    print(
+        f"[{now_text()}] 模板解析 | owner={owner_username} mode={mode_key} alias={alias_clean} raw_ref={raw_ref or '-'} cross_mode_hit={cross_mode_hit or '-'} selected={selected_name} fallback={fallback_name} templates={','.join(sorted(templates.keys()))}"
+    )
+    return selected_name, config, templates, template_meta
+
+
 def _user_auto_start_enabled(username: str) -> bool:
-    data = _load_user_runtime_state(username) or _default_user_config_state()
+    data = _normalize_user_runtime_state(_load_user_runtime_state(username))
     raw = data.get("auto_start_enabled")
     return bool(raw) if isinstance(raw, bool) else False
 
@@ -1051,7 +1340,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "http://127.0.0.1:5501",
+        "http://localhost:5501",
+        "http://127.0.0.1:5502",
+        "http://localhost:5502",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1118,6 +1414,38 @@ class RunModeRequest(BaseModel):
     mode: Literal["growth", "live", "direct"]
 
 
+class ConfigTemplateSelectRequest(BaseModel):
+    template_name: str = Field(..., min_length=1, max_length=64)
+
+
+class ConfigTemplateRenameRequest(BaseModel):
+    old_template_name: str = Field(..., min_length=1, max_length=64)
+    new_template_name: str = Field(..., min_length=1, max_length=64)
+
+
+class ConfigTemplateDeleteRequest(BaseModel):
+    template_name: str = Field(..., min_length=1, max_length=64)
+
+
+class ConfigTemplateCopyRequest(BaseModel):
+    source_template_name: str = Field(..., min_length=1, max_length=128)
+    new_template_name: str = Field(..., min_length=1, max_length=64)
+
+
+class AliasTemplateSelectRequest(BaseModel):
+    alias: str = Field(..., min_length=1, max_length=64)
+    template_name: str = Field(..., min_length=1, max_length=128)
+    mode: Literal["growth", "live", "direct"] | None = None
+    owner_username: str | None = Field(default=None, max_length=64)
+
+
+class TemplateGrantUpsertRequest(BaseModel):
+    target_username: str = Field(..., min_length=1, max_length=64)
+    source_username: str = Field(default="", max_length=64)
+    template_name: str = Field(..., min_length=1, max_length=64)
+    enabled: bool = True
+
+
 class AutoStartRequest(BaseModel):
     enabled: bool
 
@@ -1179,6 +1507,10 @@ class TikTokProfileStatsRequest(BaseModel):
 class LiveCustomerImportResponse(BaseModel):
     inserted: int
     total_rows: int
+
+
+class AddLatestRootsToPendingRequest(BaseModel):
+    count: int = Field(default=100, ge=1, le=5000)
 
 
 class DeviceTikTokBackupClearRequest(BaseModel):
@@ -1249,6 +1581,15 @@ class DeviceEditorRowUpsertRequest(BaseModel):
     remark: str = ""
 
 
+class DeviceEditorRowDeleteRequest(BaseModel):
+    row_index: int = Field(..., ge=0)
+
+
+class DeviceIdAliasRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(default="", max_length=64)
+
+
 class DeviceOpPollRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
@@ -1270,6 +1611,7 @@ class DeviceLogSyncRequest(BaseModel):
 
 
 class UpdateConfigRequest(BaseModel):
+    template_name: str | None = None
     fans_per_break: int | None = None
     break_min: int | None = None
     break_max: int | None = None
@@ -2296,6 +2638,121 @@ def admin_create_user(payload: AdminCreateUserRequest, authorization: str | None
         conn.close()
 
 
+@app.get("/api/admin/template_grants")
+def admin_list_template_grants(
+    target_username: str = "",
+    source_username: str = "",
+    authorization: str | None = Header(default=None),
+):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    target = str(target_username or "").strip()
+    source = str(source_username or "").strip()
+    conn = _get_db()
+    try:
+        sql = """
+            SELECT source_username, template_name, target_username, granted_by, updated_at
+            FROM template_permissions
+            WHERE 1=1
+        """
+        args: list[object] = []
+        if target:
+            sql += " AND target_username = ?"
+            args.append(target)
+        if source:
+            sql += " AND source_username = ?"
+            args.append(source)
+        sql += " ORDER BY target_username, source_username, template_name"
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        items = [
+            {
+                "source_username": str(r[0] or ""),
+                "template_name": str(r[1] or ""),
+                "target_username": str(r[2] or ""),
+                "granted_by": str(r[3] or ""),
+                "updated_at": str(r[4] or ""),
+            }
+            for r in rows
+        ]
+        return {"code": 0, "items": items}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/user_templates")
+def admin_user_templates(username: str, authorization: str | None = Header(default=None)):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    target = str(username or "").strip()
+    if not target:
+        return {"code": 1, "msg": "username 不能为空"}
+    state = _normalize_user_runtime_state(_load_user_runtime_state(target))
+    templates = state.get("configs_by_template", {})
+    names = sorted([str(k) for k in templates.keys()]) if isinstance(templates, dict) else []
+    return {"code": 0, "username": target, "templates": names}
+
+
+@app.post("/api/admin/template_grants/upsert")
+def admin_upsert_template_grant(payload: TemplateGrantUpsertRequest, authorization: str | None = Header(default=None)):
+    err, session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    target = str(payload.target_username or "").strip()
+    source = str(payload.source_username or "").strip() or session["username"]
+    template_name = _sanitize_template_name(payload.template_name, "default")
+    if target == source:
+        return {"code": 1, "msg": "无需给自己授权模板"}
+    conn = _get_db()
+    try:
+        target_row = conn.execute("SELECT 1 FROM auth_users WHERE username = ?", (target,)).fetchone()
+        source_row = conn.execute("SELECT 1 FROM auth_users WHERE username = ?", (source,)).fetchone()
+        if not target_row:
+            return {"code": 1, "msg": "目标用户不存在"}
+        if not source_row:
+            return {"code": 1, "msg": "来源用户不存在"}
+    finally:
+        conn.close()
+    source_state = _normalize_user_runtime_state(_load_user_runtime_state(source))
+    source_templates = source_state.get("configs_by_template", {})
+    if not isinstance(source_templates, dict) or template_name not in source_templates:
+        return {"code": 1, "msg": "来源模板不存在"}
+    conn = _get_db()
+    try:
+        if payload.enabled:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO template_permissions
+                (source_username, template_name, target_username, granted_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM template_permissions
+                    WHERE source_username = ? AND template_name = ? AND target_username = ?), ?), ?)
+                """,
+                (
+                    source,
+                    template_name,
+                    target,
+                    session["username"],
+                    source,
+                    template_name,
+                    target,
+                    now_text(),
+                    now_text(),
+                ),
+            )
+            msg = "授权成功"
+        else:
+            conn.execute(
+                "DELETE FROM template_permissions WHERE source_username = ? AND template_name = ? AND target_username = ?",
+                (source, template_name, target),
+            )
+            msg = "已取消授权"
+        conn.commit()
+    finally:
+        conn.close()
+    return {"code": 0, "msg": msg}
+
+
 @app.post("/api/auth/login")
 def auth_login(payload: dict):
     username = str(payload.get('username') or '').strip()
@@ -2383,7 +2840,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 return {"code": 1, "msg": "您已使用过该设备别名，请更换别名"}
             if row_owner != owner:
                 conn.execute(
-                    "UPDATE client_devices SET owner_username = ?, alias = ?, updated_at = ? WHERE device_id = ?",
+                    "UPDATE client_devices SET owner_username = ?, alias = ?, auto_start_opt_out = 1, updated_at = ? WHERE device_id = ?",
                     (owner, alias, now_text(), existing_id),
                 )
                 conn.commit()
@@ -2392,7 +2849,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 return {"code": 0, "msg": "绑定成功", "device_id": existing_id}
             if old_alias != alias:
                 conn.execute(
-                    "UPDATE client_devices SET alias = ?, updated_at = ? WHERE device_id = ?",
+                    "UPDATE client_devices SET alias = ?, auto_start_opt_out = 1, updated_at = ? WHERE device_id = ?",
                     (alias, now_text(), existing_id),
                 )
             conn.commit()
@@ -2413,8 +2870,8 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
         t = now_text()
         conn.execute(
             """
-            INSERT INTO client_devices (device_id, owner_username, alias, fingerprint, status, pending_start, paused, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'offline', 0, 0, ?, ?)
+            INSERT INTO client_devices (device_id, owner_username, alias, fingerprint, status, pending_start, paused, auto_start_opt_out, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'offline', 0, 0, 1, ?, ?)
             """,
             (device_id, owner, alias, fp, t, t),
         )
@@ -2443,23 +2900,197 @@ def sync_status(payload: SyncStatusRequest):
 
 @app.get("/api/get_config")
 def get_config(device_id: str, alias: str, run_mode: str | None = None):
-    error, _device = auth_or_error(device_id, alias)
+    error, device = auth_or_error(device_id, alias)
     if error:
         return error
-    mode = run_mode if run_mode in ("growth", "live", "direct") else store.run_mode
-    config = store.configs_by_mode.get(mode, store.config)
-    return {"code": 0, "config": config, "run_mode": mode, "configs_by_mode": store.configs_by_mode}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(device.owner_username))
+    mode = run_mode if run_mode in ("growth", "live", "direct") else data.get("run_mode", "growth")
+    mode = mode if mode in ("growth", "live", "direct") else "growth"
+    active_template, config, templates, template_meta = _resolve_template_for_mode_alias(
+        device.owner_username,
+        data,
+        mode,
+        alias,
+    )
+    alias_clean = _normalize_alias_key(alias)
+    alias_map_all = data.get("alias_template_by_mode", {})
+    mode_map = alias_map_all.get(mode) if isinstance(alias_map_all, dict) else {}
+    mode_raw_ref = str(mode_map.get(alias_clean) or "").strip() if isinstance(mode_map, dict) else ""
+    cross_mode_hit = ""
+    cross_mode_ref = ""
+    if not mode_raw_ref and isinstance(alias_map_all, dict):
+        for probe_mode in ("growth", "live", "direct"):
+            if probe_mode == mode:
+                continue
+            probe_map = alias_map_all.get(probe_mode)
+            if not isinstance(probe_map, dict):
+                continue
+            probe_ref = str(probe_map.get(alias_clean) or "").strip()
+            if probe_ref in templates:
+                cross_mode_hit = probe_mode
+                cross_mode_ref = probe_ref
+                break
+    stored_active_template = str(data.get("active_template") or "").strip()
+    if mode_raw_ref and mode_raw_ref in templates:
+        template_source = "mode_alias"
+    elif cross_mode_ref:
+        template_source = f"cross_mode_alias:{cross_mode_hit}"
+    else:
+        template_source = "active_template_fallback"
+    return {
+        "code": 0,
+        "config": config,
+        "run_mode": mode,
+        "active_template": active_template,
+        "configs_by_template": templates,
+        "template_meta": template_meta,
+        "debug_template_resolution": {
+            "db_path": str(DB_PATH),
+            "owner_username": device.owner_username,
+            "device_id": device_id,
+            "alias_raw": alias,
+            "alias_normalized": alias_clean,
+            "run_mode_requested": run_mode,
+            "run_mode_effective": mode,
+            "run_mode_stored": str(data.get("run_mode") or "").strip(),
+            "stored_active_template": stored_active_template,
+            "mode_alias_ref": mode_raw_ref,
+            "cross_mode_hit": cross_mode_hit,
+            "cross_mode_ref": cross_mode_ref,
+            "selected_template": active_template,
+            "selected_source": template_source,
+        },
+    }
 
 
 @app.get("/api/admin/runtime_config")
-def get_runtime_config(authorization: str | None = Header(default=None)):
+def get_runtime_config(response: Response, authorization: str | None = Header(default=None)):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     session = _current_session({"authorization": authorization} if authorization else {})
     if not session:
         return {"code": 401, "msg": "请先登录"}
-    data = _load_user_runtime_state(session["username"])
-    if not data:
-        data = _default_user_config_state()
-    return {"code": 0, "data": data}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    templates, template_meta = _build_effective_template_bundle(session["username"], data)
+    active_template = str(data.get("active_template") or "default")
+    if active_template not in templates:
+        active_template = "default" if "default" in templates else sorted(templates.keys())[0]
+        owner, name, is_shared = _parse_template_ref(active_template)
+        if not is_shared or owner == session["username"]:
+            data["active_template"] = name if is_shared else active_template
+            _save_user_runtime_state(session["username"], data)
+    resp = dict(data)
+    resp["active_template"] = active_template
+    resp["configs_by_template"] = templates
+    resp["template_meta"] = template_meta
+    resp["alias_template_by_mode"] = data.get("alias_template_by_mode", {"growth": {}, "live": {}, "direct": {}})
+    return {"code": 0, "data": resp}
+
+
+@app.get("/api/admin/template_inventory")
+def get_template_inventory(
+    response: Response,
+    all_users: int = Query(0, ge=0, le=1),
+    authorization: str | None = Header(default=None),
+):
+    """列出模板相关键：数据库原始 configs_by_template 键 + 合并后可见键 + 别名引用但缺失的 ref（不过滤为「可编辑」子集）。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    username = session["username"]
+    data = _normalize_user_runtime_state(_load_user_runtime_state(username))
+    eff_templates, _eff_meta = _build_effective_template_bundle(username, data)
+    effective_keys = sorted(eff_templates.keys(), key=lambda x: x.lower())
+    raw_blob = _load_raw_configs_by_template_blob(username)
+    raw_keys, raw_invalid_keys = _parse_raw_template_keys(raw_blob)
+    orphans = _collect_orphan_alias_template_refs(data, set(effective_keys))
+
+    payload: dict[str, object] = {
+        "username": username,
+        "raw_own_keys": raw_keys,
+        "raw_invalid_value_keys": raw_invalid_keys,
+        "effective_keys": effective_keys,
+        "orphan_alias_refs": orphans,
+        "stored_active_template": str(data.get("active_template") or "").strip(),
+        "all_users_rows": None,
+    }
+
+    if all_users:
+        if session.get("role") != "admin":
+            return {"code": 1, "msg": "仅管理员可查看全站模板清单"}
+        conn = _get_db()
+        try:
+            rows = conn.execute(
+                "SELECT username, config_json FROM user_runtime_configs WHERE config_key = ? ORDER BY username",
+                ("configs_by_template",),
+            ).fetchall()
+            all_rows: list[dict[str, object]] = []
+            for row_username, raw_json in rows:
+                u = str(row_username or "").strip()
+                if not u:
+                    continue
+                try:
+                    blob = json.loads(raw_json or "{}")
+                except Exception:
+                    blob = None
+                rk, inv = _parse_raw_template_keys(blob)
+                all_rows.append({"username": u, "raw_keys": rk, "invalid_keys": inv})
+            payload["all_users_rows"] = all_rows
+        finally:
+            conn.close()
+
+    return {"code": 0, "data": payload}
+
+
+@app.post("/api/admin/alias_template/select")
+def set_alias_template(payload: AliasTemplateSelectRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    target_username = session["username"]
+    requested_owner = str(payload.owner_username or "").strip()
+    if requested_owner:
+        if session.get("role") != "admin" and requested_owner != session["username"]:
+            return {"code": 1, "msg": "无权限修改其他用户模板映射"}
+        target_username = requested_owner
+    alias_raw = str(payload.alias or "").strip()
+    alias = _normalize_alias_key(alias_raw)
+    if not alias:
+        return {"code": 1, "msg": "alias不能为空"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(target_username))
+    mode = payload.mode if payload.mode in ("growth", "live", "direct") else str(data.get("run_mode") or "growth")
+    templates, _template_meta = _build_effective_template_bundle(target_username, data)
+    if not templates:
+        return {"code": 1, "msg": "暂无可用模板"}
+    requested = str(payload.template_name or "").strip()
+    if requested not in templates:
+        return {"code": 1, "msg": "模板不存在或当前用户无权限"}
+    alias_map_all = data.get("alias_template_by_mode", {})
+    if not isinstance(alias_map_all, dict):
+        alias_map_all = {}
+    mode_map = alias_map_all.get(mode, {})
+    if not isinstance(mode_map, dict):
+        mode_map = {}
+    mode_map[alias] = requested
+    alias_map_all[mode] = mode_map
+    data["alias_template_by_mode"] = alias_map_all
+    _save_user_runtime_state(target_username, data)
+    print(
+        f"[{now_text()}] 模板映射 | operator={session['username']} user={target_username} mode={mode} alias={alias} raw_alias={alias_raw} template={requested}"
+    )
+    return {
+        "code": 0,
+        "msg": "别名模板已更新",
+        "owner_username": target_username,
+        "mode": mode,
+        "alias": alias,
+        "template_name": requested,
+        "alias_template_by_mode": alias_map_all,
+    }
 
 
 @app.post("/api/admin/run_mode")
@@ -2467,10 +3098,176 @@ def set_run_mode(payload: RunModeRequest, authorization: str | None = Header(def
     session = _current_session({"authorization": authorization} if authorization else {})
     if not session:
         return {"code": 401, "msg": "请先登录"}
-    data = _load_user_runtime_state(session["username"]) or _default_user_config_state()
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
     data["run_mode"] = payload.mode
     _save_user_runtime_state(session["username"], data)
-    return {"code": 0, "mode": payload.mode, "config": data.get("configs_by_mode", {}).get(payload.mode, MODE_DEFAULT_CONFIGS[payload.mode])}
+    templates, _meta = _build_effective_template_bundle(session["username"], data)
+    active_template = str(data.get("active_template") or "default")
+    if active_template not in templates:
+        active_template = "default" if "default" in templates else sorted(templates.keys())[0]
+    config = dict(templates.get(active_template, MODE_DEFAULT_CONFIGS["growth"]))
+    return {"code": 0, "mode": payload.mode, "config": config, "active_template": active_template}
+
+
+@app.post("/api/admin/config_template/select")
+def set_config_template(payload: ConfigTemplateSelectRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    own_templates = data.get("configs_by_template", {})
+    all_templates, meta = _build_effective_template_bundle(session["username"], data)
+    active = str(data.get("active_template") or "default")
+    next_template = str(payload.template_name or "").strip()
+    if not next_template:
+        return {"code": 1, "msg": "模板名称不能为空"}
+    if next_template not in all_templates:
+        own_next = _sanitize_template_name(next_template, "default")
+        own_templates[own_next] = dict(all_templates.get(active, MODE_DEFAULT_CONFIGS["growth"]))
+        data["configs_by_template"] = own_templates
+        next_template = own_next
+        all_templates, meta = _build_effective_template_bundle(session["username"], data)
+    data["active_template"] = next_template
+    data["default_config"] = dict(all_templates[next_template])
+    _save_user_runtime_state(session["username"], data)
+    return {
+        "code": 0,
+        "active_template": next_template,
+        "config": all_templates[next_template],
+        "configs_by_template": all_templates,
+        "template_meta": meta,
+    }
+
+
+@app.post("/api/admin/config_template/rename")
+def rename_config_template(payload: ConfigTemplateRenameRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    old_name = _sanitize_template_name(payload.old_template_name, "default")
+    new_name = _sanitize_template_name(payload.new_template_name, "default")
+    if old_name == new_name:
+        return {"code": 1, "msg": "新旧模板名相同"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    templates = data.get("configs_by_template", {})
+    if old_name not in templates:
+        return {"code": 1, "msg": "原模板不存在或无编辑权限"}
+    if new_name in templates:
+        return {"code": 1, "msg": "新模板名已存在"}
+    templates[new_name] = dict(templates.pop(old_name))
+    if str(data.get("active_template") or "") == old_name:
+        data["active_template"] = new_name
+    alias_map_all = data.get("alias_template_by_mode", {})
+    if isinstance(alias_map_all, dict):
+        for mode_key in ("growth", "live", "direct"):
+            mode_map = alias_map_all.get(mode_key)
+            if not isinstance(mode_map, dict):
+                continue
+            for alias_key, mapped in list(mode_map.items()):
+                if str(mapped or "").strip() == old_name:
+                    mode_map[alias_key] = new_name
+            alias_map_all[mode_key] = mode_map
+        data["alias_template_by_mode"] = alias_map_all
+    data["configs_by_template"] = templates
+    data["default_config"] = dict(templates.get(str(data.get("active_template")), MODE_DEFAULT_CONFIGS["growth"]))
+    _save_user_runtime_state(session["username"], data)
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            UPDATE template_permissions
+            SET template_name = ?, updated_at = ?
+            WHERE source_username = ? AND template_name = ?
+            """,
+            (new_name, now_text(), session["username"], old_name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    eff, meta = _build_effective_template_bundle(session["username"], data)
+    return {"code": 0, "msg": "模板重命名成功", "active_template": data.get("active_template"), "configs_by_template": eff, "template_meta": meta}
+
+
+@app.post("/api/admin/config_template/delete")
+def delete_config_template(payload: ConfigTemplateDeleteRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    name = _sanitize_template_name(payload.template_name, "default")
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    templates = data.get("configs_by_template", {})
+    if name not in templates:
+        return {"code": 1, "msg": "模板不存在或无编辑权限"}
+    if len(templates) <= 1:
+        return {"code": 1, "msg": "至少保留一个模板，不能全部删除"}
+    del templates[name]
+    active = str(data.get("active_template") or "default")
+    if active == name:
+        data["active_template"] = "default" if "default" in templates else sorted(templates.keys())[0]
+    alias_map_all = data.get("alias_template_by_mode", {})
+    if isinstance(alias_map_all, dict):
+        for mode_key in ("growth", "live", "direct"):
+            mode_map = alias_map_all.get(mode_key)
+            if not isinstance(mode_map, dict):
+                continue
+            stale_aliases = [k for k, v in mode_map.items() if str(v or "").strip() == name]
+            for alias_key in stale_aliases:
+                mode_map.pop(alias_key, None)
+            alias_map_all[mode_key] = mode_map
+        data["alias_template_by_mode"] = alias_map_all
+    data["configs_by_template"] = templates
+    data["default_config"] = dict(templates.get(str(data.get("active_template")), MODE_DEFAULT_CONFIGS["growth"]))
+    _save_user_runtime_state(session["username"], data)
+    conn = _get_db()
+    try:
+        conn.execute(
+            "DELETE FROM template_permissions WHERE source_username = ? AND template_name = ?",
+            (session["username"], name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    eff, meta = _build_effective_template_bundle(session["username"], data)
+    return {"code": 0, "msg": "模板已删除", "active_template": data.get("active_template"), "configs_by_template": eff, "template_meta": meta}
+
+
+@app.post("/api/admin/config_template/copy")
+def copy_config_template(payload: ConfigTemplateCopyRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    templates = data.get("configs_by_template", {})
+    new_name = _sanitize_template_name(payload.new_template_name, "default")
+    if new_name in templates:
+        return {"code": 1, "msg": "目标模板名已存在"}
+    source_owner, source_name, is_shared_ref = _parse_template_ref(payload.source_template_name)
+    source_cfg: Dict[str, object] | None = None
+    if is_shared_ref and source_owner != session["username"]:
+        owner_state = _normalize_user_runtime_state(_load_user_runtime_state(source_owner))
+        owner_templates = owner_state.get("configs_by_template", {})
+        got = owner_templates.get(source_name) if isinstance(owner_templates, dict) else None
+        if isinstance(got, dict):
+            source_cfg = dict(got)
+        if source_cfg is None:
+            return {"code": 1, "msg": "来源共享模板不存在"}
+        grants = _load_template_grants_for_user(session["username"])
+        if not any(g["source_username"] == source_owner and g["template_name"] == source_name for g in grants):
+            return {"code": 403, "msg": "你没有该共享模板使用权限"}
+    else:
+        src_key = _sanitize_template_name(source_name if is_shared_ref else payload.source_template_name, "default")
+        got = templates.get(src_key)
+        if isinstance(got, dict):
+            source_cfg = dict(got)
+        if source_cfg is None:
+            return {"code": 1, "msg": "来源模板不存在"}
+    templates[new_name] = source_cfg
+    data["configs_by_template"] = templates
+    data["active_template"] = new_name
+    data["default_config"] = dict(source_cfg)
+    _save_user_runtime_state(session["username"], data)
+    eff, meta = _build_effective_template_bundle(session["username"], data)
+    return {"code": 0, "msg": "模板复制成功", "active_template": new_name, "config": source_cfg, "configs_by_template": eff, "template_meta": meta}
 
 
 @app.post("/api/admin/auto_start")
@@ -2485,7 +3282,7 @@ def admin_set_auto_start(payload: AutoStartRequest, authorization: str | None = 
     allowed = _session_device_ids(session)
     next_enabled = bool(payload.enabled)
     # 写入用户配置（按用户名持久化）
-    data = _load_user_runtime_state(session["username"]) or _default_user_config_state()
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
     data["auto_start_enabled"] = next_enabled
     _save_user_runtime_state(session["username"], data)
     with store.lock:
@@ -2634,10 +3431,6 @@ def pull_username(device_id: str, alias: str, count: int | None = None, run_mode
     if error:
         return error
 
-    cfg_default = int(store.config.get("pull_batch_size", 3) or 3)
-    req_count = cfg_default if count is None else int(count)
-    safe_count = max(1, min(req_count, 100))
-
     promoted = False
     with store.lock:
         if device.status != "running":
@@ -2651,10 +3444,57 @@ def pull_username(device_id: str, alias: str, count: int | None = None, run_mode
     if promoted:
         _persist_client_device_to_db(device_id)
 
+    # 设备 owner 的运行配置（含模板合并/共享模板）应与 get_config 一致；
+    # pull_username 用它来决定 pull_batch_size 与休息策略。
+    data = _normalize_user_runtime_state(_load_user_runtime_state(device.owner_username))
+    mode = run_mode if run_mode in ("growth", "live", "direct") else data.get("run_mode", "growth")
+    active_template, eff_config, templates, _template_meta = _resolve_template_for_mode_alias(
+        device.owner_username,
+        data,
+        mode,
+        alias,
+    )
+
+    # 约定：pull_batch_size 既作为“单次拉取用户名数量”的默认值，
+    # 也作为“每拉取 N 批后，下一次拉取触发休息”的阈值。
+    cfg_default = int(eff_config.get("pull_batch_size", 3) or 3)
+    req_count = cfg_default if count is None else int(count)
+    safe_count = max(1, min(req_count, 100))
+
+    # ——按“拉取批次”触发休息（第 N+1 次拉取返回休息指令）——
+    with store.lock:
+        rounds = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
+        store.device_pull_rounds[device_id] = rounds
+        should_rest = rounds > max(1, cfg_default)
+        if should_rest:
+            store.device_pull_rounds[device_id] = 0
+
+    if should_rest:
+        try:
+            bmin = int(eff_config.get("break_min", 10) or 10)
+        except Exception:
+            bmin = 10
+        try:
+            bmax = int(eff_config.get("break_max", 20) or 20)
+        except Exception:
+            bmax = 20
+        bmin = max(1, min(bmin, 24 * 60))
+        bmax = max(1, min(bmax, 24 * 60))
+        lo = min(bmin, bmax)
+        hi = max(bmin, bmax)
+        rest_minutes = random.randint(lo, hi)
+        return {
+            "code": 2,
+            "msg": f"触发休息：{rest_minutes} 分钟（强制关闭 TikTok 后台）",
+            "rest_minutes": rest_minutes,
+            "force_stop_tiktok": True,
+        }
+
     conn = _get_db()
     try:
         with store.lock:
-            mode = run_mode if run_mode in ("growth", "live", "direct") else store.run_mode
+            # 兼容旧逻辑：mode 已在上方由用户配置/请求参数决定，这里仅防并发读写。
+            mode = mode if mode in ("growth", "live", "direct") else store.run_mode
 
         if mode == "live":
             rows = conn.execute(
@@ -3286,6 +4126,23 @@ def admin_device_tiktok_accounts_by_alias(mobile_alias: str, authorization: str 
             """,
             (alias, *owner_params),
         ).fetchall()
+        trimmed_rows = conn.execute(
+            f"""
+            SELECT id, username, tiktok_password, mobile_alias, api_address, email, email_password, login_date, video_count, follower_count, new_follower_count, backup_path, backup_name, created_at, updated_at
+            FROM tiktok_account_backup_records
+            WHERE TRIM(mobile_alias) = TRIM(?){owner_sql}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (alias, *owner_params),
+        ).fetchall()
+        print(
+            f"[{now_text()}] 设备别名查询 | alias={alias} | role={(session.get('role') if session else '')} | rows={len(rows)} | trimmed_rows={len(trimmed_rows)}"
+        )
+        if not rows and trimmed_rows:
+            print(
+                f"[{now_text()}] 设备别名查询 | 命中仅因空格差异，返回 trimmed 结果 | alias={alias}"
+            )
+            rows = trimmed_rows
         return {"code": 0, "items": [dict(r) for r in rows]}
     finally:
         conn.close()
@@ -3472,11 +4329,17 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
     conn = _get_db()
     try:
         now = now_text()
+
+        def _blank_if_none(text: object | None) -> str:
+            if text is None:
+                return ""
+            return str(text).strip()
+
         conn.execute(
             """
             INSERT INTO account_editor_rows
                 (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, video_count, follower_count, follower_growth, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?)
             ON CONFLICT(owner_username, row_index) DO UPDATE SET
                 username = excluded.username,
                 password = excluded.password,
@@ -3486,9 +4349,9 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 is_login = excluded.is_login,
                 login_time = excluded.login_time,
                 region = excluded.region,
-                video_count = excluded.video_count,
-                follower_count = excluded.follower_count,
-                follower_growth = excluded.follower_growth,
+                video_count = COALESCE(excluded.video_count, ''),
+                follower_count = COALESCE(excluded.follower_count, ''),
+                follower_growth = COALESCE(excluded.follower_growth, ''),
                 updated_at = excluded.updated_at
             """,
             (
@@ -3502,9 +4365,9 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 1 if payload.is_login else 0,
                 payload.login_time.strip(),
                 payload.region.strip(),
-                payload.video_count.strip(),
-                payload.follower_count.strip(),
-                payload.follower_growth.strip(),
+                _blank_if_none(payload.video_count),
+                _blank_if_none(payload.follower_count),
+                _blank_if_none(payload.follower_growth),
                 now,
             ),
         )
@@ -3583,6 +4446,82 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
         conn.close()
 
 
+@app.post("/api/admin/editor/device_rows/delete")
+def delete_device_editor_row(payload: DeviceEditorRowDeleteRequest, authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            DELETE FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (session["username"], int(payload.row_index)),
+        )
+        conn.commit()
+        return {"code": 0, "msg": "设备记录已删除", "row_index": payload.row_index}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/device/delete")
+def admin_device_delete(payload: DeviceIdAliasRequest, authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+
+    device_id = (payload.device_id or "").strip()
+    alias = (payload.alias or "").strip()
+    if not device_id:
+        return {"code": 1, "msg": "device_id不能为空"}
+
+    conn = _get_db()
+    row = None
+    try:
+        row = conn.execute(
+            "SELECT device_id, owner_username, alias, fingerprint FROM client_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if not row:
+            return {"code": 1, "msg": "设备不存在"}
+        device = DeviceInfo(
+            alias=str(row[2] or ""),
+            fingerprint=str(row[3] or ""),
+            owner_username=str(row[1] or ""),
+        )
+        if not _device_session_allowed(device, session):
+            return {"code": 403, "msg": "无权删除该设备"}
+        if alias and str(row[2] or "").strip() and str(row[2]).strip() != alias:
+            return {"code": 1, "msg": "device_id与别名不匹配"}
+
+        conn.execute("DELETE FROM client_devices WHERE device_id = ?", (device_id,))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[{now_text()}] 系统 | 删除设备失败：{device_id} / {alias} / {exc}")
+        return {"code": 1, "msg": f"删除设备失败：{exc}"}
+    finally:
+        conn.close()
+
+    try:
+        with store.lock:
+            store.devices.pop(device_id, None)
+            fp = str(row[3] or "").strip() if row else ""
+            if fp:
+                store.fingerprint_to_device.pop(fp, None)
+            store.pending_device_ops.pop(device_id, None)
+    except Exception as exc:
+        print(f"[{now_text()}] 系统 | 删除设备后清理内存状态失败：{device_id} / {alias} / {exc}")
+
+    print(f"[{now_text()}] 系统 | 设备已删除：{alias or str(row[2] or '')}/{device_id}")
+    return {"code": 0, "msg": "设备已删除", "device_id": device_id}
+
+
 @app.post("/api/admin/device_tiktok/restore")
 def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorization: str | None = Header(default=None)):
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
@@ -3643,6 +4582,75 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
         "backup_path": backup_path or backup_name,
         "record_username": record_username,
         "record_mobile_alias": record_mobile_alias,
+    }
+
+
+@app.post("/api/admin/device_gallery/upload")
+def admin_device_gallery_upload(
+    device_id: str = Form(...),
+    alias: str = Form(...),
+    files: List[UploadFile] = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """上传素材并下发给设备端写入系统图库（支持图片/视频）。"""
+    did = (device_id or "").strip()
+    al = (alias or "").strip()
+    if not did or not al:
+        return {"code": 1, "msg": "device_id 与 alias 不能为空"}
+    err, _device = _require_login_and_owning_device(did, al, authorization)
+    if err:
+        return err
+    if not files:
+        return {"code": 1, "msg": "请至少上传 1 个素材文件"}
+    if len(files) > 20:
+        return {"code": 1, "msg": "单次最多上传 20 张图片"}
+
+    media_items: list[dict[str, Any]] = []
+    max_single_image_size = 15 * 1024 * 1024
+    max_single_video_size = 80 * 1024 * 1024
+    total_size = 0
+    total_limit = 200 * 1024 * 1024
+    for idx, f in enumerate(files):
+        content_type = (f.content_type or "").lower().strip()
+        is_image = content_type.startswith("image/")
+        is_video = content_type.startswith("video/")
+        if content_type and not (is_image or is_video):
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件不是图片/视频：{f.filename or '-'}"}
+        raw = f.file.read()
+        if not raw:
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件为空：{f.filename or '-'}"}
+        max_single_size = max_single_video_size if is_video else max_single_image_size
+        if len(raw) > max_single_size:
+            limit_mb = max_single_size // (1024 * 1024)
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件超过 {limit_mb}MB：{f.filename or '-'}"}
+        total_size += len(raw)
+        if total_size > total_limit:
+            return {"code": 1, "msg": "本次上传总大小超过 200MB"}
+        safe_name = (f.filename or f"image_{idx + 1}.jpg").replace("\x00", "").strip() or f"image_{idx + 1}.jpg"
+        media_items.append(
+            {
+                "filename": safe_name,
+                "content_type": content_type or ("video/mp4" if is_video else "image/jpeg"),
+                "content_b64": base64.b64encode(raw).decode("ascii"),
+                "size": len(raw),
+                "media_type": "video" if is_video else "image",
+            }
+        )
+
+    op_id = _enqueue_tiktok_device_op(
+        did,
+        "gallery_import_media",
+        {
+            "device_id": did,
+            "alias": al,
+            "media_items": media_items,
+        },
+    )
+    return {
+        "code": 0,
+        "msg": f"已下发图库导入任务（{len(media_items)} 个素材）",
+        "op_id": op_id,
+        "count": len(media_items),
     }
 
 
@@ -3711,6 +4719,26 @@ def add_mobile_pending_usernames(payload: AddUsernamesRequest):
 def add_mobile_pending_from_roots_selection(payload: AddUsernamesRequest):
     """后台「将选中根用户加入待下发队列」专用入口：不调用 fetch_tiktok_profile_stats / 私密判定，直接写入 mobile_pending_usernames。"""
     return _insert_mobile_pending_usernames(payload.usernames, skip_privacy_filter=True)
+
+
+@app.post("/api/admin/mobile_pending_usernames/add_latest_roots")
+def add_mobile_pending_from_latest_roots(payload: AddLatestRootsToPendingRequest):
+    """后台「将最新 N 条 tiktok_roots 加入待下发队列」：按 discovered_at 倒序取最新 N 条，不做私密判定，直接写入 mobile_pending_usernames。"""
+    safe_count = max(1, min(int(payload.count or 0), 5000))
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT root_username FROM tiktok_roots ORDER BY discovered_at DESC, root_username ASC LIMIT ?",
+            (safe_count,),
+        ).fetchall()
+        usernames = [str(r["root_username"] or "").strip() for r in rows]
+    finally:
+        conn.close()
+    usernames = [u for u in usernames if u]
+    result = _insert_mobile_pending_usernames(usernames, skip_privacy_filter=True)
+    result["requested"] = safe_count
+    result["selected"] = len(usernames)
+    return result
 
 
 @app.post("/api/admin/tiktok_profile_stats")
@@ -3968,20 +4996,45 @@ def update_config(payload: UpdateConfigRequest, authorization: str | None = Head
     if not session:
         return {"code": 401, "msg": "请先登录"}
     incoming = payload.model_dump(exclude_none=True)
+    template_name = incoming.pop("template_name", None)
     if not incoming:
         return {"code": 1, "msg": "未提供配置项"}
 
-    data = _load_user_runtime_state(session["username"]) or _default_user_config_state()
-    mode = data.get("run_mode", "growth")
-    configs_by_mode = data.get("configs_by_mode", {})
-    current = dict(configs_by_mode.get(mode, MODE_DEFAULT_CONFIGS[mode]))
+    print(
+        f"[{now_text()}] 配置保存入口 | user={session['username']} template_name={template_name or '-'} fields={sorted(incoming.keys())}"
+    )
+
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    raw_ref = str(template_name or data.get("active_template") or "default").strip()
+    source_owner, parsed_name, is_shared_ref = _parse_template_ref(raw_ref)
+    if is_shared_ref and source_owner != session["username"]:
+        return {"code": 1, "msg": "共享模板不可直接修改，请先复制为新模板"}
+    active_template = parsed_name if is_shared_ref else _sanitize_template_name(raw_ref, "default")
+    print(
+        f"[{now_text()}] 配置更新 | user={session['username']} template_name={template_name or '-'} raw_ref={raw_ref} active_template={active_template} shared={is_shared_ref}"
+    )
+    templates = data.get("configs_by_template", {})
+    if active_template not in templates:
+        seed = dict(templates.get(data.get("active_template", "default"), MODE_DEFAULT_CONFIGS["growth"]))
+        templates[active_template] = seed
+    current = dict(templates.get(active_template, MODE_DEFAULT_CONFIGS["growth"]))
     current.update(incoming)
-    configs_by_mode[mode] = current
-    data["configs_by_mode"] = configs_by_mode
-    data["default_config"] = dict(configs_by_mode.get("growth", MODE_DEFAULT_CONFIGS["growth"]))
+    templates[active_template] = current
+    data["active_template"] = active_template
+    data["configs_by_template"] = templates
+    data["configs_by_mode"] = {mode: dict(current) for mode in ("growth", "live", "direct")}
+    data["default_config"] = dict(current)
     _save_user_runtime_state(session["username"], data)
-    print(f"[{now_text()}] 用户 {session['username']} | {mode} 配置已更新：{incoming}")
-    return {"code": 0, "msg": "配置更新成功", "config": current, "configs_by_mode": configs_by_mode}
+    print(f"[{now_text()}] 用户 {session['username']} | 模板 {active_template} 配置已更新：{incoming}")
+    eff, meta = _build_effective_template_bundle(session["username"], data)
+    return {
+        "code": 0,
+        "msg": "配置更新成功",
+        "config": current,
+        "active_template": active_template,
+        "configs_by_template": eff,
+        "template_meta": meta,
+    }
 
 
 @app.post("/api/admin/config/default")
@@ -3990,20 +5043,31 @@ def set_default_config(payload: UpdateConfigRequest, authorization: str | None =
     if not session:
         return {"code": 401, "msg": "请先登录"}
     incoming = payload.model_dump(exclude_none=True)
+    incoming.pop("template_name", None)
     if not incoming:
         return {"code": 1, "msg": "未提供配置项"}
 
-    data = _load_user_runtime_state(session["username"]) or _default_user_config_state()
-    configs_by_mode = data.get("configs_by_mode", {})
-    for mode in ("growth", "live", "direct"):
-        current = dict(configs_by_mode.get(mode, MODE_DEFAULT_CONFIGS[mode]))
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    templates = data.get("configs_by_template", {})
+    for name, cfg in list(templates.items()):
+        current = dict(cfg)
         current.update(incoming)
-        configs_by_mode[mode] = current
-    data["configs_by_mode"] = configs_by_mode
-    data["default_config"] = dict(configs_by_mode["growth"])
+        templates[name] = current
+    active_template = _sanitize_template_name(data.get("active_template"), "default")
+    active_config = dict(templates.get(active_template, MODE_DEFAULT_CONFIGS["growth"]))
+    data["configs_by_template"] = templates
+    data["configs_by_mode"] = {mode: dict(active_config) for mode in ("growth", "live", "direct")}
+    data["default_config"] = dict(active_config)
     _save_user_runtime_state(session["username"], data)
     print(f"[{now_text()}] 用户 {session['username']} | 默认配置已更新：{incoming}")
-    return {"code": 0, "msg": "默认配置更新成功", "config": configs_by_mode.get(data.get("run_mode", "growth"), MODE_DEFAULT_CONFIGS["growth"]), "default_config": data["default_config"], "configs_by_mode": configs_by_mode}
+    return {
+        "code": 0,
+        "msg": "默认配置更新成功",
+        "config": active_config,
+        "default_config": data["default_config"],
+        "active_template": active_template,
+        "configs_by_template": templates,
+    }
 
 
 @app.get("/api/cv_template")
@@ -4053,8 +5117,29 @@ def trigger_collect_roots_excel(container_ids: str = "", parallel: int = 1):
 
 
 @app.post("/api/admin/tasks/trigger_collect_roots_db")
-def trigger_collect_roots_db(limit: int = 100, container_ids: str = "", parallel: int = 1):
+def trigger_collect_roots_db(
+    limit: int = 100,
+    container_ids: str = "",
+    parallel: int = 1,
+    full: bool = True,
+    priority: str = "high",
+):
     env_ids = [x.strip() for x in (container_ids or "").splitlines() if x.strip()]
+    normalized_priority = (priority or "high").strip().lower()
+    if normalized_priority not in {"high", "medium", "low"}:
+        normalized_priority = "high"
+    safe_limit = max(1, min(int(limit), 100000))
+    effective_limit = safe_limit
+    if full:
+        conn = _get_db()
+        try:
+            total_roots = int(conn.execute("SELECT COUNT(1) FROM tiktok_roots").fetchone()[0] or 0)
+        finally:
+            conn.close()
+        effective_limit = max(1, total_roots)
+    else:
+        total_roots = None
+
     if env_ids:
         jobs = []
         p = max(1, min(parallel, len(env_ids)))
@@ -4066,18 +5151,45 @@ def trigger_collect_roots_db(limit: int = 100, container_ids: str = "", parallel
         results = []
         for idx, group in enumerate(jobs, start=1):
             first = group[0]
-            worker_limit = max(1, limit // len(jobs))
+            worker_limit = max(1, (effective_limit + len(jobs) - 1) // len(jobs))
             cmd = [
                 sys.executable, str(FOLLOW_SCRAPER_PATH),
                 "--mode", "collect_roots_db",
                 "--limit", str(worker_limit),
+                "--priority", normalized_priority,
                 "--container-id", first,
             ]
-            results.append(_start_task_process(f"collect_roots_db_worker_{idx}", cmd))
-        return {"code": 0, "msg": "DB抓取任务已按环境ID并行触发", "workers": len(jobs), "results": results}
+            task_name = f"collect_roots_db_worker_{idx}"
+            results.append(_start_task_process(task_name, cmd))
+        return {
+            "code": 0,
+            "msg": "DB抓取任务已按环境ID并行触发",
+            "workers": len(jobs),
+            "full": bool(full),
+            "priority": normalized_priority,
+            "limit": effective_limit,
+            "total_roots": total_roots,
+            "results": results,
+        }
 
-    cmd = [sys.executable, str(FOLLOW_SCRAPER_PATH), "--mode", "collect_roots_db", "--limit", str(limit)]
-    return _start_task_process("collect_roots_db_once", cmd)
+    cmd = [
+        sys.executable,
+        str(FOLLOW_SCRAPER_PATH),
+        "--mode",
+        "collect_roots_db",
+        "--limit",
+        str(effective_limit),
+        "--priority",
+        normalized_priority,
+    ]
+    result = _start_task_process("collect_roots_db_once", cmd)
+    if isinstance(result, dict):
+        result["full"] = bool(full)
+        result["priority"] = normalized_priority
+        result["limit"] = effective_limit
+        if total_roots is not None:
+            result["total_roots"] = total_roots
+    return result
 
 
 @app.post("/api/admin/tasks/trigger_process_queue")

@@ -51,6 +51,7 @@ class SettingsActivity : AppCompatActivity() {
                     .onSuccess { resp ->
                         if (resp.code == 0 && !resp.token.isNullOrBlank()) {
                             PrefsStore.saveAuthToken(resp.token!!, resp.username ?: u)
+                            PrefsStore.saveAuthPassword(p)
                             binding.statusText.text = "登录成功"
                         } else {
                             binding.statusText.text = resp.msg

@@ -24,6 +24,7 @@ object PrefsStore {
     private const val KEY_DEVICE_RUN_MODE = "device_run_mode"
     private const val KEY_AUTH_TOKEN = "auth_token"
     private const val KEY_AUTH_USERNAME = "auth_username"
+    private const val KEY_AUTH_PASSWORD = "auth_password"
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
 
     private lateinit var prefs: SharedPreferences
@@ -55,10 +56,17 @@ object PrefsStore {
             .apply()
     }
 
+    fun saveAuthPassword(password: String) {
+        prefs.edit()
+            .putString(KEY_AUTH_PASSWORD, password)
+            .apply()
+    }
+
     fun clearAuth() {
         prefs.edit()
             .remove(KEY_AUTH_TOKEN)
             .remove(KEY_AUTH_USERNAME)
+            .remove(KEY_AUTH_PASSWORD)
             .apply()
     }
 
@@ -71,6 +79,8 @@ object PrefsStore {
     fun getAuthToken(): String? = prefs.getString(KEY_AUTH_TOKEN, null)?.trim()?.takeIf { it.isNotEmpty() }
 
     fun getAuthUsername(): String? = prefs.getString(KEY_AUTH_USERNAME, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAuthPassword(): String? = prefs.getString(KEY_AUTH_PASSWORD, null)?.takeIf { it.isNotEmpty() }
 
     fun getDeviceId(): String? = prefs.getString(KEY_DEVICE_ID, null)
 

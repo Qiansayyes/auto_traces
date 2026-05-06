@@ -21,6 +21,12 @@ object ApiService {
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    private val longTimeoutClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .build()
+
     private lateinit var defaultBaseUrl: String
 
     fun init(context: Context) {
@@ -137,8 +143,40 @@ object ApiService {
         includeAuth = true,
     )
 
-    private suspend fun <T> get(path: String, clazz: Class<T>): T = withContext(Dispatchers.IO) {
-        val request = Request.Builder().url(getBaseUrl() + path).get().build()
+    suspend fun getDeviceTikTokAccountsByAlias(mobileAlias: String): DeviceTikTokAccountsByAliasResponse {
+        val alias = mobileAlias.trim()
+        return get(
+            path = "/api/admin/device_tiktok/accounts/${encode(alias)}",
+            clazz = DeviceTikTokAccountsByAliasResponse::class.java,
+            includeAuth = true,
+        )
+    }
+
+    suspend fun getDeviceEditorRows(): DeviceEditorRowsResponse = get(
+        path = "/api/admin/editor/device_rows",
+        clazz = DeviceEditorRowsResponse::class.java,
+        includeAuth = true,
+    )
+
+    suspend fun getAccountEditorRows(): AccountEditorRowsResponse = get(
+        path = "/api/admin/editor/account_rows",
+        clazz = AccountEditorRowsResponse::class.java,
+        includeAuth = true,
+    )
+
+    private suspend fun <T> get(
+        path: String,
+        clazz: Class<T>,
+        includeAuth: Boolean = false,
+    ): T = withContext(Dispatchers.IO) {
+        val builder = Request.Builder().url(getBaseUrl() + path).get()
+        if (includeAuth) {
+            val t = PrefsStore.getAuthToken()
+            if (!t.isNullOrBlank()) {
+                builder.addHeader("Authorization", "Bearer $t")
+            }
+        }
+        val request = builder.build()
         client.newCall(request).execute().use { response ->
             val bodyText = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
@@ -149,6 +187,14 @@ object ApiService {
     }
 
     private suspend fun <T> post(
+        path: String,
+        body: Any,
+        clazz: Class<T>,
+        includeAuth: Boolean = false,
+    ): T = postWithClient(client, path, body, clazz, includeAuth)
+
+    private suspend fun <T> postWithClient(
+        httpClient: OkHttpClient,
         path: String,
         body: Any,
         clazz: Class<T>,
@@ -166,7 +212,7 @@ object ApiService {
             }
         }
         val request = builder.build()
-        client.newCall(request).execute().use { response ->
+        httpClient.newCall(request).execute().use { response ->
             val bodyText = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IOException("HTTP ${response.code}: $bodyText")

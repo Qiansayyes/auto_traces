@@ -36,6 +36,19 @@ class RealTraceExecutor(
     private val appContextProvider: () -> Context,
 ) : TraceExecutor {
 
+    private fun isHardStopActive(): Boolean = PrefsStore.isHardStopRequested()
+
+    private fun hardStopOrNull(alias: String, action: String): Boolean {
+        if (!isHardStopActive()) return false
+        devOp(alias, "$action：检测到硬停，直接跳过")
+        return true
+    }
+
+    private inline fun <T> withTikTokGuard(alias: String, action: String, block: () -> T): T? {
+        if (hardStopOrNull(alias, action)) return null
+        return block()
+    }
+
     private data class SuCommand(val path: String, val useShell: Boolean)
 
     private var cachedSuCommand: SuCommand? = null
@@ -100,6 +113,7 @@ class RealTraceExecutor(
     override suspend fun restartTikTokForRecovery(): Boolean {
         val ctx: Context = appContextProvider()
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "重启 TikTok 恢复")) return false
         val pkg = Config.TIKTOK_PACKAGE_NAME
         val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
@@ -238,6 +252,9 @@ class RealTraceExecutor(
 
 
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "执行用户名流程 $username")) {
+            return "已硬停，跳过 $username"
+        }
         didRestartTikTokInCurrentRun = false
         currentRootUsernameForLogs = username
         val runMode = config.run_mode.trim().lowercase()
@@ -368,31 +385,38 @@ class RealTraceExecutor(
     }
 
     private suspend fun clickMagnifier(service: Context) {
-        val metrics = service.resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val ratioX = 0.92f
-        val ratioY = 0.09f
-        val clickX = width * ratioX
-        val clickY = height * ratioY
-        runSuCommand("input tap ${clickX.toInt()} ${clickY.toInt()}")
-        delay(Random.nextLong(800, 1200))
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        withTikTokGuard(alias, "点击放大镜") {
+            val metrics = service.resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            val ratioX = 0.92f
+            val ratioY = 0.09f
+            val clickX = width * ratioX
+            val clickY = height * ratioY
+            runSuCommand("input tap ${clickX.toInt()} ${clickY.toInt()}")
+            delay(Random.nextLong(800, 1200))
+        }
     }
 
     private suspend fun clickSearchButtonAndWait(service: Context) {
-        val metrics = service.resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val searchRatioX = 0.92f
-        val searchRatioY = 0.09f
-        val searchX = width * searchRatioX
-        val searchY = height * searchRatioY
-        runSuCommand("input tap ${searchX.toInt()} ${searchY.toInt()}")
-        delay(2500)
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        withTikTokGuard(alias, "点击 Search") {
+            val metrics = service.resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            val searchRatioX = 0.92f
+            val searchRatioY = 0.09f
+            val searchX = width * searchRatioX
+            val searchY = height * searchRatioY
+            runSuCommand("input tap ${searchX.toInt()} ${searchY.toInt()}")
+            delay(2500)
+        }
     }
 
     private suspend fun ensureUsersTabClicked(service: Context): Point? {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "查找 Users 标签")) return null
         // 简化版本：只做一次（最多两次）OCR，不做稳定性多轮复核
         // 1) 先尝试快速顶部区域 OCR
         val fastAnchor = findUsersAnchorByOcrFast(service)
@@ -979,6 +1003,7 @@ class RealTraceExecutor(
 
     private suspend fun checkNoVideosAndGoBack(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "检查无作品或私密账号")) return false
         val screenshotFile = File(service.cacheDir, "profile_novideos.png")
         if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return false
         val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
@@ -1459,6 +1484,8 @@ class RealTraceExecutor(
 
     private suspend fun recoverFollowersListAfterPostCheckFailure(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "恢复 Followers 列表")) return false
+        if (hardStopOrNull(alias, "恢复 Followers 列表")) return false
         // 这里的 OCR 只负责“数 Follow”，不参与滚动。
         // 规则：返回后 Follow 数量 < 4 => 页面错乱；>= 4 => 认为回到了正常 Followers 列表。
         navBack(alias, "二次判定失败后回到 Followers 列表进行 OCR 复核")
@@ -1951,6 +1978,7 @@ class RealTraceExecutor(
 
     private suspend fun processFollowersList(service: Context, config: AppConfig) {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "处理粉丝列表")) return
         var reachedEnd = false
         var rounds = 0
         // 主循环：固定最多 7 轮；若中途判定到底则提前结束
@@ -2080,6 +2108,8 @@ class RealTraceExecutor(
         verificationOnly: Boolean = false,
     ): List<FollowerEntry> {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "识别粉丝列表")) return emptyList()
+        if (hardStopOrNull(alias, "识别粉丝列表")) return emptyList()
         val screenshotFile = File(service.cacheDir, "followers_ocr.png")
         if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return emptyList()
         val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {

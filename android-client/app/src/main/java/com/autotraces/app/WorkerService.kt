@@ -22,6 +22,7 @@ class WorkerService : Service() {
             AppCoordinator.onWorkerServiceChanged(false)
             AppCoordinator.refreshRuntimeSnapshot()
             LogCenter.op(PrefsStore.getAlias(), "检测到硬停止标记，拒绝启动后台服务")
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             runCatching { stopSelf() }
             return
         }
@@ -43,7 +44,8 @@ class WorkerService : Service() {
         }
         if (PrefsStore.isHardStopRequested()) {
             LogCenter.op(PrefsStore.getAlias(), "硬停止态中，忽略启动意图")
-            stopImmediate()
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            runCatching { stopSelf() }
             return START_NOT_STICKY
         }
         AppCoordinator.startIfNeeded()
@@ -52,7 +54,7 @@ class WorkerService : Service() {
 
     override fun onDestroy() {
         WorkerServiceTracker.isRunning = false
-        AppCoordinator.stopAllWork()
+        AppCoordinator.stopAllWork(requestHardStop = false)
         AppCoordinator.onWorkerServiceChanged(false)
         LogCenter.op(PrefsStore.getAlias(), "后台服务已停止")
         super.onDestroy()
@@ -61,7 +63,7 @@ class WorkerService : Service() {
     private fun stopImmediate() {
         PrefsStore.setHardStopRequested(true)
         WorkerServiceTracker.isRunning = false
-        AppCoordinator.stopAllWork()
+        AppCoordinator.stopAllWork(requestHardStop = true)
         AppCoordinator.onWorkerServiceChanged(false)
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         runCatching { stopSelf() }

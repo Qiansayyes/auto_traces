@@ -2,6 +2,8 @@ package com.autotraces.app
 
 import android.Manifest
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -17,9 +19,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.autotraces.app.backup.BackupRepository
-import com.autotraces.app.backup.model.BackupRecord
-import com.autotraces.app.backup.network.BackupReporter
 import com.autotraces.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -32,59 +31,10 @@ import java.io.FileOutputStream
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
 
-    private val backupRepository by lazy { BackupRepository(this) }
-    private val backupReporter by lazy { BackupReporter() }
-
-    private var selectedCloudTaskRecord: BackupRecord? = null
-    private var currentHistoryFilter: HistoryFilter = HistoryFilter.ALL
-
-    private val pickBackupFileLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri == null) return@registerForActivityResult
-        lifecycleScope.launch { handlePickedBackupFile(uri) }
-    }
-
-    private val backupRecordAdapter by lazy {
-        object : android.widget.BaseAdapter() {
-            private val items = mutableListOf<BackupRecord>()
-
-            fun submitList(list: List<BackupRecord>) {
-                items.clear()
-                items.addAll(list)
-                notifyDataSetChanged()
-            }
-
-            fun getItemAt(position: Int): BackupRecord = items[position]
-
-            override fun getCount(): Int = items.size
-            override fun getItem(position: Int): Any = items[position]
-            override fun getItemId(position: Int): Long = items[position].id
-            override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View {
-                val view = convertView ?: layoutInflater.inflate(android.R.layout.simple_list_item_2, parent, false)
-                val title = view.findViewById<TextView>(android.R.id.text1)
-                val subtitle = view.findViewById<TextView>(android.R.id.text2)
-                val item = items[position]
-                title.text = "[${item.backupScope}/${item.backupType}] ${item.accountName} / ${item.filename}"
-                subtitle.text = buildString {
-                    append(if (item.success) "成功" else "失败")
-                    append(" · ")
-                    append(item.message)
-                    item.exitCode?.let {
-                        append(" · exit=")
-                        append(it)
-                    }
-                    if (!item.cloudTaskId.isNullOrBlank()) {
-                        append(" · task=")
-                        append(item.cloudTaskId)
-                        append(" · ")
-                        append(item.uploadStatus ?: "-")
-                    }
-                }
-                return view
-            }
-        }
-    }
+    // 备份/恢复 UI 已从「操作」页移除
+    private var assignedAccountRows: List<AccountEditorRowRecord> = emptyList()
+    private var assignedUsernameAdapter: ArrayAdapter<String>? = null
+    private var suppressAssignedUsernameSelectCallback: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,11 +45,9 @@ class MainActivity : AppCompatActivity() {
         requestNotificationPermissionIfNeeded()
         setupBindingSection()
         setupRunModeSpinner()
-        setupBackupSection()
-        setupBackupRecordList()
+        setupAssignedAccountSection()
         renderDeviceInfo()
         observeLogs()
-        refreshBackupRecords()
 
         binding.startServiceButton.setOnClickListener {
             lifecycleScope.launch {
@@ -158,8 +106,12 @@ class MainActivity : AppCompatActivity() {
         if (requireCloudLoginIfNeeded()) return
         applyInitialPanelFromIntent()
 
-        AppCoordinator.startIfNeeded()
-        if (PrefsStore.isBound() && !WorkerServiceTracker.isRunning) WorkerService.start(this)
+        if (!PrefsStore.isHardStopRequested()) {
+            AppCoordinator.refreshRuntimeSnapshot()
+        } else {
+            AppCoordinator.refreshRuntimeSnapshot()
+            LogCenter.op(PrefsStore.getAlias(), "当前处于停止状态，打开应用不自动拉起后台服务")
+        }
     }
 
     override fun onResume() {
@@ -168,9 +120,119 @@ class MainActivity : AppCompatActivity() {
             renderDeviceInfo()
             return
         }
-        ensureBoundIfNeeded()
+        if (!PrefsStore.isHardStopRequested()) {
+            ensureBoundIfNeeded()
+        }
         renderDeviceInfo()
-        refreshBackupRecords()
+        refreshAssignedAccountFields()
+    }
+
+    private fun refreshAssignedAccountFields() {
+        val alias = PrefsStore.getAlias().orEmpty().trim()
+        if (alias.isBlank() || PrefsStore.getAuthToken().isNullOrBlank()) {
+            assignedAccountRows = emptyList()
+            assignedUsernameAdapter?.clear()
+            binding.assignedUsernameInput.setText("")
+            binding.assignedPasswordInput.setText("")
+            binding.assignedApiInput.setText("")
+            binding.assignedEmailInput.setText("")
+            binding.assignedCopyStatusText.text = "未登录或未绑定，无法拉取分配账号"
+            return
+        }
+        binding.assignedCopyStatusText.text = "正在拉取账号表单..."
+        lifecycleScope.launch {
+            val accountRowsResp = runCatching { ApiService.getAccountEditorRows() }.getOrNull()
+            val editorRowsResp = runCatching { ApiService.getDeviceEditorRows() }.getOrNull()
+
+            val accountRows = accountRowsResp?.items.orEmpty()
+            val editorRows = editorRowsResp?.items.orEmpty()
+
+            assignedAccountRows = accountRows.filter { !it.username.isNullOrBlank() }
+            val usernames = editorRows
+                .asSequence()
+                .filter { (it.device_alias ?: "").trim() == alias }
+                .mapNotNull { it.username?.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .toList()
+
+            suppressAssignedUsernameSelectCallback = true
+            assignedUsernameAdapter?.clear()
+            assignedUsernameAdapter?.addAll(usernames)
+            assignedUsernameAdapter?.notifyDataSetChanged()
+            binding.assignedUsernameSelect.isEnabled = usernames.isNotEmpty()
+
+            if (usernames.isNotEmpty()) {
+                binding.assignedUsernameSelect.setSelection(0)
+                applyAssignedAccountByUsername(usernames.first())
+            } else {
+                applyAssignedAccountByUsername("")
+                binding.assignedCopyStatusText.text = "该别名暂无分配账号：$alias"
+            }
+            suppressAssignedUsernameSelectCallback = false
+        }
+    }
+
+    private fun applyAssignedAccountByUsername(username: String) {
+        val u = username.trim().lowercase()
+        val account = assignedAccountRows.firstOrNull {
+            it.username.orEmpty().trim().lowercase() == u
+        }
+        if (account == null) {
+            binding.assignedUsernameInput.setText("")
+            binding.assignedPasswordInput.setText("")
+            binding.assignedApiInput.setText("")
+            binding.assignedEmailInput.setText("")
+            binding.assignedCopyStatusText.text = "未找到该 username 对应的账号表单数据：$username"
+            return
+        }
+        binding.assignedUsernameInput.setText(account.username.orEmpty())
+        binding.assignedPasswordInput.setText(account.password.orEmpty())
+        binding.assignedApiInput.setText(account.api.orEmpty())
+        binding.assignedEmailInput.setText(account.email.orEmpty())
+        binding.assignedCopyStatusText.text = "已加载：${account.username.orEmpty()}"
+    }
+
+    private fun setupAssignedAccountSection() {
+        fun copy(label: String, value: String) {
+            val text = value.trim()
+            if (text.isBlank()) {
+                binding.assignedCopyStatusText.text = "$label 为空，未复制"
+                return
+            }
+            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText(label, text))
+            binding.assignedCopyStatusText.text = "$label 已复制"
+        }
+
+        binding.copyAssignedUsernameButton.setOnClickListener {
+            copy("Username", binding.assignedUsernameInput.text?.toString().orEmpty())
+        }
+        binding.copyAssignedPasswordButton.setOnClickListener {
+            copy("Password", binding.assignedPasswordInput.text?.toString().orEmpty())
+        }
+        binding.copyAssignedApiButton.setOnClickListener {
+            copy("API", binding.assignedApiInput.text?.toString().orEmpty())
+        }
+        binding.copyAssignedEmailButton.setOnClickListener {
+            copy("Email", binding.assignedEmailInput.text?.toString().orEmpty())
+        }
+
+        assignedUsernameAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf())
+        binding.assignedUsernameSelect.adapter = assignedUsernameAdapter
+        binding.assignedUsernameSelect.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (suppressAssignedUsernameSelectCallback) return
+                val uname = assignedUsernameAdapter?.getItem(position).orEmpty()
+                applyAssignedAccountByUsername(uname)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {
+                if (suppressAssignedUsernameSelectCallback) return
+                applyAssignedAccountByUsername("")
+            }
+        }
+        refreshAssignedAccountFields()
     }
 
     private fun requireCloudLoginIfNeeded(): Boolean {
@@ -224,6 +286,12 @@ class MainActivity : AppCompatActivity() {
                     appendLine("后台服务: ${if (state.serviceRunning) "运行中" else "未启动"}")
                     appendLine("本地状态: ${state.localStatus}")
                     appendLine("配置状态: ${if (state.configLoaded) "已拉取" else "默认配置"}")
+                    if (state.effectiveRunMode.isNotBlank()) {
+                        appendLine("当前生效模式: ${state.effectiveRunMode}")
+                    }
+                    if (state.effectiveTemplate.isNotBlank()) {
+                        appendLine("当前生效模板: ${state.effectiveTemplate}")
+                    }
                     appendLine("服务端: ${state.currentServerUrl}")
                     appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
                     append("最近状态: ${state.lastMessage}")
@@ -271,218 +339,7 @@ class MainActivity : AppCompatActivity() {
         updateBindSectionState()
     }
 
-    private fun setupBackupSection() {
-        val localBackupButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.localBackupButton)
-        val cloudBackupButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.cloudBackupButton)
-        val pickBackupFileButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.pickBackupFileButton)
-        val restoreLatestButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.restoreLatestButton)
-        val reportButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.reportBackupButton)
-        val showAllHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showAllHistoryButton)
-        val showLocalHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showLocalHistoryButton)
-        val showCloudHistoryButton = binding.root.findViewById<com.google.android.material.button.MaterialButton>(R.id.showCloudHistoryButton)
-        val backupStatusText = binding.root.findViewById<TextView>(R.id.backupStatusText)
-        val cloudTaskStatusText = binding.root.findViewById<TextView>(R.id.cloudTaskStatusText)
-
-        localBackupButton.setOnClickListener { lifecycleScope.launch { doBackup(scope = "local", statusText = backupStatusText) } }
-        cloudBackupButton.setOnClickListener { lifecycleScope.launch { doBackup(scope = "cloud", statusText = backupStatusText) } }
-        pickBackupFileButton.setOnClickListener { pickBackupFileLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) }
-        restoreLatestButton.setOnClickListener {
-            lifecycleScope.launch {
-                val latest = withContext(Dispatchers.IO) { backupRepository.latest() }
-                if (latest == null) {
-                    backupStatusText.text = "没有可恢复的备份记录"
-                    return@launch
-                }
-                restoreAndReportLatest(latest, backupStatusText)
-            }
-        }
-        reportButton.setOnClickListener {
-            lifecycleScope.launch {
-                val deviceId = PrefsStore.getDeviceId().orEmpty()
-                if (deviceId.isBlank()) {
-                    backupStatusText.text = "请先完成设备绑定"
-                    return@launch
-                }
-                val latest = withContext(Dispatchers.IO) { backupRepository.latest() }
-                if (latest == null) {
-                    backupStatusText.text = "没有可上报的备份记录"
-                    return@launch
-                }
-                backupStatusText.text = "正在上报..."
-                val ok = runCatching { backupReporter.reportRestoreResult(deviceId, latest.accountName, latest) }.getOrDefault(false)
-                backupStatusText.text = if (ok) "上报成功" else "上报失败，请检查服务端接口"
-            }
-        }
-
-        showAllHistoryButton.setOnClickListener {
-            currentHistoryFilter = HistoryFilter.ALL
-            refreshBackupRecords()
-            refreshFilterButtonState(showAllHistoryButton, showLocalHistoryButton, showCloudHistoryButton)
-        }
-        showLocalHistoryButton.setOnClickListener {
-            currentHistoryFilter = HistoryFilter.LOCAL
-            refreshBackupRecords()
-            refreshFilterButtonState(showAllHistoryButton, showLocalHistoryButton, showCloudHistoryButton)
-        }
-        showCloudHistoryButton.setOnClickListener {
-            currentHistoryFilter = HistoryFilter.CLOUD
-            refreshBackupRecords()
-            refreshFilterButtonState(showAllHistoryButton, showLocalHistoryButton, showCloudHistoryButton)
-        }
-        refreshFilterButtonState(showAllHistoryButton, showLocalHistoryButton, showCloudHistoryButton)
-    }
-
-    private fun refreshFilterButtonState(
-        allButton: com.google.android.material.button.MaterialButton,
-        localButton: com.google.android.material.button.MaterialButton,
-        cloudButton: com.google.android.material.button.MaterialButton,
-    ) {
-        allButton.isChecked = currentHistoryFilter == HistoryFilter.ALL
-        localButton.isChecked = currentHistoryFilter == HistoryFilter.LOCAL
-        cloudButton.isChecked = currentHistoryFilter == HistoryFilter.CLOUD
-    }
-
-    private fun setupBackupRecordList() {
-        val listView = binding.root.findViewById<ListView>(R.id.backupRecordList)
-        val statusText = binding.root.findViewById<TextView>(R.id.backupStatusText)
-        val detailText = binding.root.findViewById<TextView>(R.id.backupDetailText)
-        val cloudTaskStatusText = binding.root.findViewById<TextView>(R.id.cloudTaskStatusText)
-
-        listView.adapter = backupRecordAdapter
-        listView.setOnItemClickListener { _, _, position, _ ->
-            lifecycleScope.launch {
-                val record = backupRecordAdapter.getItemAt(position)
-                selectedCloudTaskRecord = if (!record.cloudTaskId.isNullOrBlank()) record else selectedCloudTaskRecord
-                detailText.text = buildBackupDetailText(record)
-                cloudTaskStatusText.text = if (!record.cloudTaskId.isNullOrBlank()) buildCloudTaskStatusText(record) else "当前记录没有云端任务 ID"
-                statusText.text = "正在恢复：${record.filename}"
-
-                val restored = withContext(Dispatchers.IO) { backupRepository.restoreFromRecord(record) }
-                statusText.text = if (restored.success) "恢复成功：${restored.filename}" else "恢复失败：${restored.message}"
-
-                LogCenter.op(record.accountName, "点击记录恢复完成：${restored.message}")
-                refreshBackupRecords()
-
-                val deviceId = PrefsStore.getDeviceId().orEmpty()
-                if (deviceId.isNotBlank()) {
-                    val ok = runCatching { backupReporter.reportRestoreResult(deviceId, record.accountName, restored) }.getOrDefault(false)
-                    statusText.text = statusText.text.toString() + if (ok) "，上报成功" else "，上报失败"
-                }
-            }
-        }
-    }
-
-    private fun refreshBackupRecords() {
-        lifecycleScope.launch {
-            val records = withContext(Dispatchers.IO) {
-                when (currentHistoryFilter) {
-                    HistoryFilter.ALL -> backupRepository.history()
-                    HistoryFilter.LOCAL -> backupRepository.localHistory()
-                    HistoryFilter.CLOUD -> backupRepository.cloudHistory()
-                }
-            }
-            backupRecordAdapter.submitList(records)
-            binding.root.findViewById<TextView>(R.id.backupDetailText).text = if (records.isNotEmpty()) buildBackupDetailText(records.first()) else "当前筛选下没有备份记录"
-            binding.root.findViewById<TextView>(R.id.cloudTaskStatusText).text = records.firstOrNull { !it.cloudTaskId.isNullOrBlank() }?.let { buildCloudTaskStatusText(it) } ?: "暂无云端任务"
-        }
-    }
-
-    private fun buildBackupDetailText(record: BackupRecord): String = buildString {
-        appendLine("ID: ${record.id}")
-        appendLine("DeviceAlias: ${record.deviceAlias}")
-        appendLine("DeviceId: ${record.deviceId}")
-        appendLine("AppAccount: ${record.appAccount}")
-        appendLine("Account: ${record.accountName}")
-        appendLine("Package: ${record.packageName}")
-        appendLine("Type: ${record.backupType}")
-        appendLine("Scope: ${record.backupScope}")
-        appendLine("Success: ${record.success}")
-        appendLine("File: ${record.filename}")
-        appendLine("Path: ${record.path}")
-        appendLine("Checksum: ${record.checksum ?: "-"}")
-        appendLine("UploadStatus: ${record.uploadStatus ?: "-"}")
-        appendLine("CloudTaskId: ${record.cloudTaskId ?: "-"}")
-        appendLine("ExitCode: ${record.exitCode?.toString() ?: "-"}")
-        appendLine("Command: ${record.command ?: "-"}")
-        appendLine("Output: ${record.output ?: "-"}")
-        appendLine("Message: ${record.message}")
-        append("CreatedAt: ${record.createdAt}")
-    }
-
-    private fun buildCloudTaskStatusText(record: BackupRecord): String {
-        return "CloudTaskId=${record.cloudTaskId ?: "-"} | UploadStatus=${record.uploadStatus ?: "-"} | Scope=${record.backupScope}"
-    }
-
-    private suspend fun doBackup(scope: String, statusText: TextView) {
-        val accountName = PrefsStore.getAlias().orEmpty().ifBlank { "default" }
-        val packageName = AppConstants.APP_PACKAGE_NAME
-        statusText.text = if (scope == "cloud") "正在云端备份..." else "正在本地备份..."
-
-        val record = withContext(Dispatchers.IO) {
-            if (scope == "cloud") backupRepository.backupCloud(accountName, packageName) else backupRepository.backupLocal(accountName, packageName)
-        }
-
-        statusText.text = if (record.success) {
-            if (record.backupScope == "cloud") "云端备份成功：${record.filename} · task=${record.cloudTaskId ?: "-"}" else "本地备份成功：${record.filename}"
-        } else {
-            "备份失败：${record.message}"
-        }
-
-        LogCenter.op(accountName, "备份任务完成：${record.message}")
-        refreshBackupRecords()
-        Toast.makeText(this@MainActivity, statusText.text, Toast.LENGTH_SHORT).show()
-    }
-
-    private suspend fun restoreAndReportLatest(record: BackupRecord, statusText: TextView) {
-        val restored = withContext(Dispatchers.IO) { backupRepository.restoreFromRecord(record) }
-        statusText.text = if (restored.success) "恢复成功：${restored.filename}" else "恢复失败：${restored.message}"
-
-        val deviceId = PrefsStore.getDeviceId().orEmpty()
-        if (deviceId.isNotBlank()) {
-            val ok = runCatching { backupReporter.reportRestoreResult(deviceId, record.accountName, restored) }.getOrDefault(false)
-            statusText.text = statusText.text.toString() + if (ok) "，上报成功" else "，上报失败"
-        }
-
-        refreshBackupRecords()
-    }
-
-    private suspend fun handlePickedBackupFile(uri: Uri) {
-        val backupStatusText = binding.root.findViewById<TextView>(R.id.backupStatusText)
-        backupStatusText.text = "正在读取选择的备份文件..."
-
-        val localCopy = withContext(Dispatchers.IO) { copyUriToCache(uri) }
-        if (localCopy == null) {
-            backupStatusText.text = "文件复制失败，无法恢复"
-            return
-        }
-
-        val record = BackupRecord(
-            accountName = PrefsStore.getAlias().orEmpty().ifBlank { "default" },
-            packageName = AppConstants.APP_PACKAGE_NAME,
-            deviceAlias = PrefsStore.getAlias().orEmpty(),
-            deviceId = PrefsStore.getDeviceId().orEmpty(),
-            appAccount = PrefsStore.getAuthUsername().orEmpty(),
-            backupType = "restore",
-            backupScope = "local",
-            success = false,
-            path = localCopy.absolutePath,
-            filename = localCopy.name,
-            checksum = null,
-            message = "selected by file picker",
-        )
-
-        backupStatusText.text = "正在恢复选择的文件..."
-        val restored = withContext(Dispatchers.IO) { backupRepository.restoreFromRecord(record.copy(path = localCopy.absolutePath)) }
-        backupStatusText.text = if (restored.success) "恢复成功：${restored.filename}" else "恢复失败：${restored.message}"
-
-        val deviceId = PrefsStore.getDeviceId().orEmpty()
-        if (deviceId.isNotBlank()) {
-            val ok = runCatching { backupReporter.reportRestoreResult(deviceId, record.accountName, restored) }.getOrDefault(false)
-            backupStatusText.text = backupStatusText.text.toString() + if (ok) "，上报成功" else "，上报失败"
-        }
-
-        refreshBackupRecords()
-    }
+    // 备份/恢复相关 UI 与逻辑已从该 Activity 移除
 
     private fun copyUriToCache(uri: Uri): File? {
         return try {
