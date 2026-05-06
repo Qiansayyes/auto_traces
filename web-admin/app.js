@@ -9,6 +9,7 @@ const userRoleLabel = document.getElementById("userRoleLabel");
 const statusEl = document.getElementById("status");
 const apiBaseInput = document.getElementById("apiBase");
 const refreshAllBtn = document.getElementById("refreshAll");
+const refreshOverviewBtn = document.getElementById("refreshOverview");
 const uploadBtn = document.getElementById("uploadUsernames");
 const saveConfigBtn = document.getElementById("saveConfig");
 const selectAllCheckbox = document.getElementById("selectAll");
