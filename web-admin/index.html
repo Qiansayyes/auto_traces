@@ -540,6 +540,19 @@
           <div class="panel-card">
             <h3>设备操作</h3>
             <div class="field">
+              <label>账号分配给别名（先选地区再新增）</label>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <select id="deviceRegionPresetSelect" style="min-width:150px;">
+                  <option value="">选择国家地区</option>
+                </select>
+                <select id="deviceAliasPresetSelect" style="min-width:220px;">
+                  <option value="">选择设备别名（可选）</option>
+                </select>
+                <button id="addDeviceBlankRecordBtn" class="primary" type="button">新增并分配记录</button>
+              </div>
+              <div class="hint" style="margin-top:6px;">会从账号表单里自动挑选该地区“未登录且未分配”的账号，写入设备档案。</div>
+            </div>
+            <div class="field">
               <label>设备选择</label>
               <select id="deviceOpsSelect">
                 <option value="">暂无可用设备</option>
@@ -1052,6 +1065,6 @@ so cute</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260507-1"></script>
+  <script src="app.js?v=20260507-2"></script>
 </body>
 </html>
