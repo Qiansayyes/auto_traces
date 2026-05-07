@@ -1140,6 +1140,12 @@ function updateModeButtons() {
   }
 }
 
+function toggleDeviceOpsButtons() {
+  // 兼容旧页面/不同部署：设备操作相关按钮可能不存在。
+  // 该函数仅用于避免调用处抛出 ReferenceError，必要时可在未来扩展禁用逻辑。
+  // 当前实现保持为安全 no-op。
+}
+
 function renderDeviceOpsSelect(devices = {}) {
   if (!deviceOpsSelect) return;
   const rows = Object.entries(devices || {}).filter(([, info]) => {
