@@ -531,6 +531,50 @@
         </div>
       </section>
 
+      <section id="backup-section" class="panel">
+        <header>
+          <h2>TikTok设备备份档案</h2>
+          <p>按设备别名管理账号备份与恢复任务，可查看云端任务回执与素材下发日志。</p>
+        </header>
+        <div class="split">
+          <div class="panel-card">
+            <h3>设备操作</h3>
+            <div class="field">
+              <label>设备选择</label>
+              <select id="deviceOpsSelect">
+                <option value="">暂无可用设备</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>TikTok 包名</label>
+              <input id="backupPackageNameInput" type="text" value="com.zhiliaoapp.musically" />
+            </div>
+            <div class="hint">可在下方设备档案中直接点击「备份」「恢复」「清理」执行动作。</div>
+          </div>
+          <div class="panel-card">
+            <h3>图库素材下发</h3>
+            <div class="field">
+              <label>目标设备别名（可多选）</label>
+              <select id="galleryTargetAliasesSelect" multiple style="min-height:120px;"></select>
+            </div>
+            <div class="field">
+              <label>选择图片（最多 20 张）</label>
+              <input id="galleryImageFilesInput" type="file" accept="image/*" multiple />
+            </div>
+            <button id="uploadGalleryBtn" class="primary" type="button">上传并一对一下发</button>
+            <pre id="galleryDispatchLogs" style="white-space:pre-wrap;max-height:220px;overflow:auto;margin-top:10px;">暂无日志</pre>
+          </div>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <h3>设备备份档案</h3>
+          <div id="deviceAliasGroups" class="hint">加载中...</div>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <h3>云端回执</h3>
+          <pre id="backupCloudInfo" style="white-space:pre-wrap;max-height:220px;overflow:auto;">暂无结果</pre>
+        </div>
+      </section>
+
       <section id="docs" class="panel">
         <header>
           <h2>系统功能文档</h2>
@@ -1008,6 +1052,6 @@ so cute</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260505-2"></script>
+  <script src="app.js?v=20260507-0"></script>
 </body>
 </html>

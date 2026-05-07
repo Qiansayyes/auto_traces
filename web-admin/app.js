@@ -130,6 +130,11 @@ const deviceAliasGroupsEl = document.getElementById("deviceAliasGroups");
 const deviceAliasPresetSelect = document.getElementById("deviceAliasPresetSelect");
 const deviceRegionPresetSelect = document.getElementById("deviceRegionPresetSelect");
 const deviceOpsSelect = document.getElementById("deviceOpsSelect");
+const backupPackageNameInput = document.getElementById("backupPackageNameInput");
+const galleryTargetAliasesSelect = document.getElementById("galleryTargetAliasesSelect");
+const galleryImageFilesInput = document.getElementById("galleryImageFilesInput");
+const uploadGalleryBtn = document.getElementById("uploadGalleryBtn");
+const galleryDispatchLogsEl = document.getElementById("galleryDispatchLogs");
 const deviceLogDeviceSelect = document.getElementById("deviceLogDeviceSelect");
 const deviceExecLogsEl = document.getElementById("deviceExecLogs");
 const backupCloudInfoEl = document.getElementById("backupCloudInfo");
@@ -2593,7 +2598,10 @@ function collectDeviceOpsIdentity() {
     setStatus("设备选择无效，请重新选择", "warning");
     return null;
   }
-  const package_name = String(backupPackageNameInput?.value || "").trim();
+  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
+  const package_name = String(
+    (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput ? backupPackageNameInput.value : "") || "",
+  ).trim();
   if (!package_name) {
     setStatus("请先填写包名", "warning");
     return null;
@@ -2607,7 +2615,12 @@ function collectDeviceIdentityByAlias(alias, options = {}) {
     setStatus("未提供设备别名", "warning");
     return null;
   }
-  const package_name = String(options.package_name || backupPackageNameInput?.value || "").trim();
+  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
+  const package_name = String(
+    options.package_name
+      || (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput ? backupPackageNameInput.value : "")
+      || ""
+  ).trim();
   if (!package_name && options.requirePackageName !== false) {
     setStatus("请先填写包名", "warning");
     return null;
@@ -2628,7 +2641,12 @@ function collectDeviceIdentityByDeviceAndAlias(deviceId, alias, options = {}) {
     setStatus("设备信息不完整（缺少 device_id 或 alias）", "warning");
     return null;
   }
-  const package_name = String(options.package_name || backupPackageNameInput?.value || "").trim();
+  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
+  const package_name = String(
+    options.package_name
+      || (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput ? backupPackageNameInput.value : "")
+      || ""
+  ).trim();
   if (!package_name && options.requirePackageName !== false) {
     setStatus("请先填写包名", "warning");
     return null;
@@ -3394,7 +3412,14 @@ if (dbNextPageBtn) {
 if (dbRefreshPageBtn) {
   dbRefreshPageBtn.addEventListener("click", loadDbTablePage);
 }
-if (backupPackageNameInput) {
+if (uploadGalleryBtn) {
+  uploadGalleryBtn.addEventListener("click", () => {
+    uploadGalleryImagesToDevice().catch((error) => {
+      setStatus(error?.message || "上传并下发图库失败", "error");
+    });
+  });
+}
+if (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput) {
   backupPackageNameInput.value = (backupPackageNameInput.value || "").trim() || "com.zhiliaoapp.musically";
 }
 
