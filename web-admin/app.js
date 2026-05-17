@@ -212,6 +212,10 @@ const API_BASE_LS_KEY = "auto_traces_api_base_v1";
 
 let latestDevices = {};
 let latestDeviceLogs = {};
+/** 全量已绑定设备别名（来自 /api/admin/devices/aliases，不受概览分页影响） */
+let boundDeviceAliasPairs = [];
+let boundDeviceAliasesSignature = "";
+let boundDeviceAliasesSyncInFlight = false;
 let runtimeApiBaseOverride = "";
 let currentRunMode = "growth";
 let currentConfigTemplate = "default";
@@ -898,8 +902,18 @@ async function switchSection(id, options = {}) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
+  if (nextSectionId === "account-manager") {
+    try {
+      await loadBoundDeviceAliases();
+      await loadEditorState();
+      renderAccountEditorRows();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
   if (nextSectionId === "backup-section") {
     try {
+      await loadBoundDeviceAliases();
       await loadEditorState();
       await loadBackupArchiveRecords();
     } catch (_) {
@@ -2081,6 +2095,7 @@ function applyDevicesAndLogsPayload(data, options = {}) {
   renderDeviceLogDeviceSelect(devices, deviceLogs);
   renderDeviceExecLogs(deviceLogs);
   bindDeviceSelection();
+  void syncAssignableAliasOptionsIfNeeded();
 }
 
 async function loadOverview() {
@@ -4468,6 +4483,10 @@ if (refreshAllBtn) {
   refreshAllBtn.addEventListener("click", async () => {
     await handleRefresh();
     await loadAccounts();
+    await loadBoundDeviceAliases().catch(() => {});
+    await loadEditorState().catch(() => {});
+    renderAccountEditorRows();
+    renderDeviceAliasPresetOptions();
   });
 }
 if (refreshOverviewBtn) {
@@ -4965,11 +4984,93 @@ if (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput) {
   backupPackageNameInput.value = (backupPackageNameInput.value || "").trim() || "com.zhiliaoapp.musically";
 }
 
+async function loadBoundDeviceAliases() {
+  const data = await request("/api/admin/devices/aliases");
+  const pairs = [];
+  const seen = new Set();
+  const rawPairs = Array.isArray(data?.pairs) ? data.pairs : [];
+  if (rawPairs.length) {
+    rawPairs.forEach((item) => {
+      const device_alias = normalizeAliasValue(item?.alias);
+      const device_id = String(item?.device_id || "").trim();
+      if (!device_alias || !device_id || seen.has(device_alias)) return;
+      seen.add(device_alias);
+      pairs.push({ device_alias, device_id });
+    });
+  } else {
+    (Array.isArray(data?.items) ? data.items : []).forEach((alias) => {
+      const device_alias = normalizeAliasValue(alias);
+      if (!device_alias || seen.has(device_alias)) return;
+      seen.add(device_alias);
+      pairs.push({ device_alias, device_id: "" });
+    });
+  }
+  pairs.sort((a, b) => a.device_alias.localeCompare(b.device_alias));
+  boundDeviceAliasPairs = pairs;
+  boundDeviceAliasesSignature = pairs.map((item) => `${item.device_alias}\0${item.device_id}`).join("\n");
+  return pairs;
+}
+
+function isAccountManagerActive() {
+  return document.querySelector(".panel.active")?.id === "account-manager";
+}
+
+function collectAssignableAliases(currentValue = "") {
+  const current = normalizeAliasValue(currentValue);
+  const aliasCandidates = new Set();
+  (backupArchiveRows || []).forEach((row) => {
+    const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
+    if (alias) aliasCandidates.add(alias);
+  });
+  (deviceEditorRows || []).forEach((row) => {
+    const alias = normalizeAliasValue(row?.device_alias);
+    if (alias) aliasCandidates.add(alias);
+  });
+  buildAliasDevicePairs().forEach((item) => {
+    const alias = normalizeAliasValue(item?.device_alias);
+    if (alias) aliasCandidates.add(alias);
+  });
+  const aliases = Array.from(aliasCandidates).sort((a, b) => a.localeCompare(b));
+  if (current && !aliases.includes(current)) return [current, ...aliases];
+  return aliases;
+}
+
+function refreshAssignableAliasDropdowns() {
+  if (!accountEditorListEl) return;
+  accountEditorListEl.querySelectorAll('select[data-editor-field="assigned_alias"]').forEach((selectEl) => {
+    const index = Number(selectEl.dataset.editorIndex);
+    const row = accountEditorRows[index];
+    if (!row || isAccountAliasLocked(row)) return;
+    const current = normalizeAliasValue(selectEl.value || row.assigned_alias);
+    selectEl.innerHTML = getAssignableAliasOptions(current);
+    if (current) selectEl.value = current;
+  });
+}
+
+async function syncAssignableAliasOptionsIfNeeded() {
+  if (boundDeviceAliasesSyncInFlight || !authToken()) return;
+  boundDeviceAliasesSyncInFlight = true;
+  try {
+    const previousSignature = boundDeviceAliasesSignature;
+    await loadBoundDeviceAliases();
+    if (boundDeviceAliasesSignature === previousSignature) return;
+    renderDeviceAliasPresetOptions();
+    if (isAccountManagerActive()) {
+      refreshAssignableAliasDropdowns();
+    }
+  } catch (_) {
+    /* 静默：轮询或概览刷新失败时不打断当前编辑 */
+  } finally {
+    boundDeviceAliasesSyncInFlight = false;
+  }
+}
+
 async function loadEditorState() {
   const [accountsResp, devicesResp, backupResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
     request(DEVICE_ROWS_API),
     request("/api/admin/tiktok_backup/search?limit=100"),
+    loadBoundDeviceAliases().catch(() => []),
   ]);
   accountEditorRows = Array.isArray(accountsResp.items)
     ? accountsResp.items.map((item) => getAccountRowTemplate(item))
@@ -5343,6 +5444,9 @@ function getDeviceRowTemplate(source = {}) {
 }
 
 function buildAliasDevicePairs() {
+  if (boundDeviceAliasPairs.length) {
+    return boundDeviceAliasPairs.slice();
+  }
   const pairs = Object.entries(latestDevices || {})
     .map(([deviceId, info]) => ({
       device_alias: String(info?.alias || "").trim(),
@@ -5466,23 +5570,7 @@ function renderDeviceRegionPresetOptions() {
 
 function getAssignableAliasOptions(currentValue = "") {
   const current = normalizeAliasValue(currentValue);
-  const aliasCandidates = new Set();
-  (backupArchiveRows || []).forEach((row) => {
-    const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
-    if (alias) aliasCandidates.add(alias);
-  });
-  (deviceEditorRows || []).forEach((row) => {
-    const alias = normalizeAliasValue(row?.device_alias);
-    if (alias) aliasCandidates.add(alias);
-  });
-  buildAliasDevicePairs().forEach((item) => {
-    const alias = normalizeAliasValue(item?.device_alias);
-    if (alias) aliasCandidates.add(alias);
-  });
-  const aliases = Array.from(aliasCandidates).sort((a, b) => a.localeCompare(b));
-  const merged = current && !aliases.includes(current)
-    ? [current, ...aliases]
-    : aliases;
+  const merged = collectAssignableAliases(current);
   return [
     '<option value="">无</option>',
     ...merged.map((alias) => `<option value="${escapeHtml(alias)}" ${alias === current ? "selected" : ""}>${escapeHtml(alias)}</option>`),
@@ -6263,6 +6351,7 @@ if (apiBaseInput) {
     loadAdminUsers();
     loadEditorState().then(() => {
       renderAccountEditorRows();
+      void syncAssignableAliasOptionsIfNeeded();
       loadBackupArchiveRecords();
     }).catch((error) => {
       // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因
@@ -6287,5 +6376,6 @@ if (apiBaseInput) {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     void pollOverviewSnapshot();
+    void syncAssignableAliasOptionsIfNeeded();
   }
 });

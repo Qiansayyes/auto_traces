@@ -5408,19 +5408,31 @@ def set_device_group(payload: SetDeviceGroupRequest, authorization: str | None =
 
 @app.get("/api/admin/devices/aliases")
 def list_device_aliases(authorization: str | None = Header(default=None)):
+    """返回当前用户可见的全部已绑定设备别名（不受概览分页影响）。"""
     err, session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
     allowed = _session_device_ids(session)
-    with store.lock:
-        aliases = sorted(
-            {
-                (device.alias or "").strip()
-                for did, device in store.devices.items()
-                if did in allowed and (device.alias or "").strip()
-            }
-        )
-    return {"code": 0, "items": aliases}
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT device_id, alias FROM client_devices WHERE TRIM(COALESCE(alias, '')) <> ''"
+        ).fetchall()
+        pairs: list[dict[str, str]] = []
+        seen_aliases: set[str] = set()
+        for row in rows:
+            device_id = str(row["device_id"])
+            if device_id not in allowed:
+                continue
+            alias = str(row["alias"] or "").strip()
+            if not alias or alias in seen_aliases:
+                continue
+            seen_aliases.add(alias)
+            pairs.append({"alias": alias, "device_id": device_id})
+    finally:
+        conn.close()
+    pairs.sort(key=lambda item: item["alias"].lower())
+    return {"code": 0, "items": [item["alias"] for item in pairs], "pairs": pairs}
 
 
 @app.get("/api/admin/editor/account_rows")
