@@ -9,6 +9,8 @@ import java.util.Locale
 object LogCenter {
     private const val REALTIME_LOG_ENABLED = true
     private const val MAX_LOCAL_LOGS = 500
+    /** 已暂停但当前仍有执行中的自动化（收尾阶段） */
+    private const val PAUSED_WRAP_UP_TAG = "[暂停后收尾] "
     private val formatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs = _logs.asStateFlow()
@@ -16,9 +18,19 @@ object LogCenter {
     @Volatile
     private var syncedCount = 0
 
+    private fun withPausedWrapUpTag(content: String): String {
+        if (!ExecutionScope.isActive()) return content
+        if (PrefsStore.getLocalStatus() != "paused") return content
+        if (content.startsWith(PAUSED_WRAP_UP_TAG)) return content
+        return PAUSED_WRAP_UP_TAG + content
+    }
+
     fun append(alias: String?, content: String) {
         if (!REALTIME_LOG_ENABLED) return
-        val line = "[${formatter.format(Date())}] ${alias ?: "未绑定设备"} | $content"
+        val now = Date()
+        val body = withPausedWrapUpTag(content)
+        val line = "[${formatter.format(now)}] ${alias ?: "未绑定设备"} | $body"
+        LocalDeviceLogWriter.append(alias, body, now.time)
         val merged = (_logs.value + line)
         _logs.value = if (merged.size > MAX_LOCAL_LOGS) merged.takeLast(MAX_LOCAL_LOGS) else merged
         if (syncedCount > _logs.value.size) {

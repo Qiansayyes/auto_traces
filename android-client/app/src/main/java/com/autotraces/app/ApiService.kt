@@ -21,10 +21,23 @@ object ApiService {
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    private val pollClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .build()
+
     private val longTimeoutClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    /** 绑定接口应快速返回；过长读超时会导致界面长期停在「正在绑定...」。 */
+    private val bindClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
+        .writeTimeout(35, TimeUnit.SECONDS)
         .build()
 
     private lateinit var defaultBaseUrl: String
@@ -66,12 +79,14 @@ object ApiService {
         throw lastError ?: IOException("login failed")
     }
 
-    suspend fun bindDevice(alias: String, fingerprint: String): BindDeviceResponse = post(
-        path = "/api/bind_device",
-        body = BindDeviceRequest(alias, fingerprint),
-        clazz = BindDeviceResponse::class.java,
-        includeAuth = true,
-    )
+    suspend fun bindDevice(alias: String, fingerprint: String): BindDeviceResponse =
+        postWithClient(
+            bindClient,
+            "/api/bind_device",
+            BindDeviceRequest(alias, fingerprint),
+            BindDeviceResponse::class.java,
+            includeAuth = true,
+        )
 
     suspend fun syncStatus(deviceId: String, alias: String, status: String): BaseResponse = post(
         path = "/api/sync_status",
@@ -87,14 +102,16 @@ object ApiService {
         )
     }
 
-    suspend fun checkStart(deviceId: String, alias: String): CheckStartResponse = get(
+    suspend fun checkStart(deviceId: String, alias: String): CheckStartResponse = getWithClient(
+        pollClient,
         path = "/api/check_start?device_id=${encode(deviceId)}&alias=${encode(alias)}",
         clazz = CheckStartResponse::class.java,
     )
 
     suspend fun pullUsername(deviceId: String, alias: String, count: Int, runMode: String? = null): PullUsernameResponse {
         val modeQ = runMode?.takeIf { it.isNotBlank() }?.let { "&run_mode=${encode(it)}" }.orEmpty()
-        return get(
+        return getWithClient(
+            pollClient,
             path = "/api/pull_username?device_id=${encode(deviceId)}&alias=${encode(alias)}&count=${count}$modeQ",
             clazz = PullUsernameResponse::class.java,
         )
@@ -106,12 +123,31 @@ object ApiService {
         clazz = BaseResponse::class.java,
     )
 
+    suspend fun reportMutualCopiedUsername(deviceId: String, alias: String, username: String): ReportMutualCopiedUsernameResponse =
+        post(
+            path = "/api/report_mutual_copied_username",
+            body = ReportMutualCopiedUsernameRequest(deviceId, alias, username),
+            clazz = ReportMutualCopiedUsernameResponse::class.java,
+        )
+
     suspend fun getCvTemplate(deviceId: String, alias: String): CvTemplateResponse = get(
         path = "/api/cv_template?device_id=${encode(deviceId)}&alias=${encode(alias)}",
         clazz = CvTemplateResponse::class.java,
     )
 
-    suspend fun pollDeviceOps(deviceId: String, alias: String): DeviceOpPollResponse = post(
+    suspend fun getTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): TikTokEmailCodeResponse = post(
+        path = "/api/admin/device_tiktok/email_code",
+        body = mapOf(
+            "device_id" to deviceId,
+            "alias" to alias,
+            "api_url" to apiUrl,
+        ),
+        clazz = TikTokEmailCodeResponse::class.java,
+        includeAuth = true,
+    )
+
+    suspend fun pollDeviceOps(deviceId: String, alias: String): DeviceOpPollResponse = postWithClient(
+        pollClient,
         path = "/api/device_ops/poll",
         body = DeviceOpPollRequest(deviceId, alias),
         clazz = DeviceOpPollResponse::class.java,
@@ -130,6 +166,13 @@ object ApiService {
         clazz = BaseResponse::class.java,
     )
 
+    suspend fun requestMutualCommentOnlyClick(deviceId: String, alias: String, packageName: String): BaseResponse = post(
+        path = "/api/admin/device_tiktok/mutual_click_comment_only_start",
+        body = MutualClickRequest(device_id = deviceId, alias = alias, package_name = packageName),
+        clazz = BaseResponse::class.java,
+        includeAuth = true,
+    )
+
     suspend fun syncDeviceLogs(deviceId: String, alias: String, logs: List<String>): BaseResponse = post(
         path = "/api/device_logs/sync",
         body = DeviceLogsSyncRequest(deviceId, alias, logs),
@@ -141,6 +184,14 @@ object ApiService {
         body = DeviceAutoStartOptOutRequest(device_id = deviceId, opt_out = optOut),
         clazz = DeviceAutoStartOptOutResponse::class.java,
         includeAuth = true,
+    )
+
+    /** 设备鉴权：互点/互点评论会话收尾时恢复云端「自动开启程序」。 */
+    suspend fun reportDeviceAutoStartOptOut(deviceId: String, alias: String, optOut: Boolean): BaseResponse = post(
+        path = "/api/report_device_auto_start_opt_out",
+        body = ReportDeviceAutoStartOptOutRequest(device_id = deviceId, alias = alias, opt_out = optOut),
+        clazz = BaseResponse::class.java,
+        includeAuth = false,
     )
 
     suspend fun getDeviceTikTokAccountsByAlias(mobileAlias: String): DeviceTikTokAccountsByAliasResponse {
@@ -168,6 +219,13 @@ object ApiService {
         path: String,
         clazz: Class<T>,
         includeAuth: Boolean = false,
+    ): T = getWithClient(client, path, clazz, includeAuth)
+
+    private suspend fun <T> getWithClient(
+        httpClient: OkHttpClient,
+        path: String,
+        clazz: Class<T>,
+        includeAuth: Boolean = false,
     ): T = withContext(Dispatchers.IO) {
         val builder = Request.Builder().url(getBaseUrl() + path).get()
         if (includeAuth) {
@@ -177,7 +235,7 @@ object ApiService {
             }
         }
         val request = builder.build()
-        client.newCall(request).execute().use { response ->
+        httpClient.newCall(request).execute().use { response ->
             val bodyText = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IOException("HTTP ${response.code}: $bodyText")

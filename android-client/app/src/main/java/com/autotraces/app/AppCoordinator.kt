@@ -17,6 +17,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.autotraces.app.backup.DeviceBackupShell
+import com.autotraces.app.backup.UnifiedBackupPaths
 
 object AppCoordinator {
     private fun prettyTemplateName(raw: String?): String {
@@ -29,6 +32,26 @@ object AppCoordinator {
             if (owner.isNotBlank() && tpl.isNotBlank()) return "$tpl（共享自 $owner）"
         }
         return text
+    }
+
+    private fun prettyRunMode(mode: String?): String {
+        return when (mode?.trim()?.lowercase()) {
+            ServerRunMode.GROWTH -> "涨粉"
+            ServerRunMode.LIVE -> "主播"
+            ServerRunMode.DIRECT -> "直客"
+            ServerRunMode.MUTUAL -> "互点"
+            null, "" -> "未设置"
+            else -> mode!!.trim()
+        }
+    }
+
+    private fun configSummaryLine(runMode: String, templateName: String): String {
+        val tpl = templateName.trim()
+        return if (tpl.isNotBlank()) {
+            "${prettyRunMode(runMode)} · 模板「$tpl」"
+        } else {
+            prettyRunMode(runMode)
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -54,6 +77,8 @@ object AppCoordinator {
     private var pullLoopJob: Job? = null
     private var deviceOpsJob: Job? = null
     private var deviceLogSyncJob: Job? = null
+    private var mutualSwitchJob: Job? = null
+    private var publishPostSwitchJob: Job? = null
     @Volatile
     private var manuallyPaused: Boolean = false
     private val pendingUsernames = mutableListOf<String>()
@@ -63,6 +88,9 @@ object AppCoordinator {
     @Volatile
     private var forceImmediatePull: Boolean = false
 
+    /** 服务端下发休息（pullUsername code=2）期间正在 `delay`，与「自动启动」语义冲突，此窗口内不触发自动恢复、不打误导日志。 */
+    @Volatile
+    private var inPullUsernameRestSleep: Boolean = false
 
     fun init(application: android.content.Context) {
         appContext = application.applicationContext
@@ -94,12 +122,12 @@ object AppCoordinator {
         } catch (error: Exception) {
             LogCenter.op(alias, "上线同步失败：${error.message}")
         }
-        fetchConfig()
-        LogCenter.op(alias, "初始化完成，等待云端启动")
+        fetchConfig(logToUser = true)
+        LogCenter.op(alias, "设备已就绪，请在管理台点击「启动设备」开始涨粉/任务")
         updateRuntime(
             localStatus = PrefsStore.getLocalStatus(),
             currentServerUrl = ApiService.getBaseUrl(),
-            lastMessage = "初始化完成，等待云端启动指令",
+            lastMessage = "已就绪，等待管理台启动",
         )
         enqueuePendingReports()
     }
@@ -107,14 +135,23 @@ object AppCoordinator {
     fun startIfNeeded() {
         // 即使硬停/暂停业务流程，也保持设备任务轮询（如素材下发）可用。
         ensureDeviceOpsLoopIfBound()
-        if (!PrefsStore.isBound() || PrefsStore.isHardStopRequested() || manuallyPaused) {
+        if (!PrefsStore.isBound()) {
+            return
+        }
+        if (manuallyPaused) {
+            return
+        }
+        if (PrefsStore.isHardStopRequested()) {
+            if (startPollJob?.isActive != true) {
+                startCheckLoop()
+            }
             return
         }
         if (started.compareAndSet(false, true)) {
             scope.launch {
                 bootstrapAfterBinding()
                 PrefsStore.saveLocalStatus("online")
-                updateRuntime(localStatus = "online", lastMessage = "已上线，等待云端启动指令")
+                updateRuntime(localStatus = "online", lastMessage = "在线，等待管理台启动")
                 startCheckLoop()
             }
             return
@@ -125,6 +162,7 @@ object AppCoordinator {
     fun forceStartRunningNow(reason: String = "设备端启动后台服务") {
         if (!PrefsStore.isBound()) return
         scope.launch {
+            val alias = PrefsStore.getAlias()
             // 显式启动（本机按钮/云端自动拉起）时，解除本地硬停与手动暂停闸门。
             if (PrefsStore.isHardStopRequested()) {
                 PrefsStore.setHardStopRequested(false)
@@ -133,13 +171,21 @@ object AppCoordinator {
             if (!started.get()) {
                 started.set(true)
             }
-            bootstrapAfterBinding()
+            fetchConfig()
+            enqueuePendingReports()
             PrefsStore.saveLocalStatus("running")
             updateRuntime(localStatus = "running", lastMessage = reason)
+            if (!WorkerServiceTracker.isRunning) {
+                runCatching { WorkerService.start(appContext) }
+                    .onFailure {
+                        if (!alias.isNullOrBlank()) {
+                            LogCenter.op(alias, "自动拉起后台服务失败：${it.message}")
+                        }
+                    }
+            }
             startCheckLoop()
             ensureLoopsRunning()
-            runCatching { syncOnline() }
-            fetchConfig()
+            runCatching { syncRunningToCloud() }
             startPullLoop()
         }
     }
@@ -170,16 +216,28 @@ object AppCoordinator {
     }
 
     suspend fun syncOnline(retries: Int = 1) {
+        syncStatusToCloud("online", retries)
+    }
+
+    /** 启动/恢复运行后向云端同步 running，不把本地状态降回 online。 */
+    private suspend fun syncRunningToCloud(retries: Int = 1) {
+        syncStatusToCloud("running", retries)
+    }
+
+    private suspend fun syncStatusToCloud(status: String, retries: Int = 1) {
         val deviceId = PrefsStore.getDeviceId() ?: return
         val alias = PrefsStore.getAlias() ?: return
         val attempts = retries.coerceAtLeast(1)
         repeat(attempts) { attempt ->
             runCatching {
-                val response = ApiService.syncStatus(deviceId, alias, "online")
-                PrefsStore.saveLocalStatus("online")
-                LogCenter.op(alias, "同步状态：${response.msg}")
+                val response = ApiService.syncStatus(deviceId, alias, status)
+                PrefsStore.saveLocalStatus(status)
+                LogCenter.op(
+                    alias,
+                    if (status == "running") "已与云端同步：任务运行中" else "已与云端同步：设备在线",
+                )
                 updateRuntime(
-                    localStatus = "online",
+                    localStatus = status,
                     lastMessage = response.msg,
                     currentServerUrl = ApiService.getBaseUrl(),
                 )
@@ -187,7 +245,7 @@ object AppCoordinator {
             }.onFailure { error ->
                 LogCenter.op(
                     alias,
-                    "同步 online 失败 (${attempt + 1}/$attempts)：${error.message}",
+                    "同步 $status 失败 (${attempt + 1}/$attempts)：${error.message}",
                 )
                 if (attempt < attempts - 1) {
                     delay(800L * (attempt + 1))
@@ -196,45 +254,60 @@ object AppCoordinator {
         }
     }
 
-    suspend fun fetchConfig() {
-        val deviceId = PrefsStore.getDeviceId() ?: return
-        val alias = PrefsStore.getAlias() ?: return
-        val mode = PrefsStore.getDeviceRunMode()
-        runCatching {
-            ApiService.getConfig(deviceId, alias, mode)
-        }.onSuccess { response ->
-            if (response.code == 0 && response.config != null) {
-                val merged = response.config.copy(
-                    run_mode = response.run_mode ?: response.config.run_mode,
-                )
-                _config.value = merged
-                LogCenter.op(
-                    alias,
-                    "拉取配置成功，alias=$alias mode=$mode 命中模板=${prettyTemplateName(response.active_template)} 实际模式=${merged.run_mode}",
-                )
+    suspend fun fetchConfig(configQueryRunMode: String? = null, logToUser: Boolean = false): Boolean {
+        val deviceId = PrefsStore.getDeviceId() ?: return false
+        val alias = PrefsStore.getAlias() ?: return false
+        val deviceQueueMode = PrefsStore.getDeviceRunMode()
+        val modeForRequest =
+            configQueryRunMode?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: deviceQueueMode
+        return runCatching {
+            ApiService.getConfig(deviceId, alias, modeForRequest)
+        }.fold(
+            onSuccess = { response ->
+                if (response.code == 0 && response.config != null) {
+                    val merged = response.config.copy(
+                        run_mode = response.run_mode ?: response.config.run_mode,
+                    )
+                    val effective =
+                        if (modeForRequest != deviceQueueMode) {
+                            merged.copy(run_mode = deviceQueueMode)
+                        } else {
+                            merged
+                        }
+                    _config.value = effective
+                    val templateLabel = prettyTemplateName(response.active_template)
+                    if (logToUser) {
+                        LogCenter.op(
+                            alias,
+                            "任务设置已更新：${configSummaryLine(effective.run_mode, templateLabel)}",
+                        )
+                    }
+                    updateRuntime(
+                        configLoaded = true,
+                        effectiveRunMode = effective.run_mode,
+                        effectiveTemplate = templateLabel,
+                        lastMessage = "任务设置：${configSummaryLine(effective.run_mode, templateLabel)}",
+                    )
+                    true
+                } else {
+                    if (logToUser) {
+                        LogCenter.op(alias, "任务设置同步失败，继续使用上次的 ${prettyRunMode(_config.value.run_mode)} 设置")
+                    }
+                    updateRuntime(configLoaded = false, lastMessage = "配置拉取失败，已保留上次配置")
+                    false
+                }
+            },
+            onFailure = { err ->
+                if (logToUser) {
+                    LogCenter.op(alias, "任务设置同步异常，继续使用上次设置：${err.message}")
+                }
                 updateRuntime(
-                    configLoaded = true,
-                    effectiveRunMode = merged.run_mode,
-                    effectiveTemplate = prettyTemplateName(response.active_template),
-                    lastMessage = "配置拉取成功：alias=$alias mode=$mode template=${prettyTemplateName(response.active_template)}",
+                    configLoaded = false,
+                    lastMessage = "配置拉取异常，已保留上次配置",
                 )
-            } else {
-                LogCenter.op(
-                    alias,
-                    "拉取配置失败(code=${response.code})，沿用上次模式=${_config.value.run_mode}",
-                )
-                updateRuntime(configLoaded = false, lastMessage = "配置拉取失败，已保留上次配置")
-            }
-        }.onFailure {
-            LogCenter.op(
-                alias,
-                "拉取配置异常，沿用上次模式=${_config.value.run_mode}：${it.message}",
-            )
-            updateRuntime(
-                configLoaded = false,
-                lastMessage = "配置拉取异常，已保留上次配置",
-            )
-        }
+                false
+            },
+        )
     }
 
     fun startCheckLoop() {
@@ -253,34 +326,65 @@ object AppCoordinator {
             while (true) {
                 val deviceId = PrefsStore.getDeviceId()
                 val alias = PrefsStore.getAlias()
-                if (PrefsStore.isHardStopRequested()) {
-                    delay(10_000)
-                    continue
-                }
                 if (deviceId.isNullOrBlank() || alias.isNullOrBlank()) {
                     delay(10_000)
                     continue
                 }
 
                 val localStatus = PrefsStore.getLocalStatus()
-                val intervalMs = if (localStatus == "running") 15_000L else 10_000L
+                // 降低 check_start 轮询频率，避免和后端锁竞争叠加。
+                val intervalMs = if (localStatus == "running") 30_000L else 20_000L
 
                 try {
                     val response = ApiService.checkStart(deviceId, alias)
+                    val pushRev = response.config_push_revision
+                    if (pushRev != null && pushRev > PrefsStore.getLastAppliedConfigPushRevision()) {
+                        LogCenter.op(alias, "管理台更新了任务设置，正在同步…")
+                        val ok = fetchConfig(logToUser = true)
+                        if (ok) {
+                            PrefsStore.saveLastAppliedConfigPushRevision(pushRev)
+                        }
+                    }
                     if (response.code == 0) {
+                        val cloudAutoStart = response.auto_start == true
                         if (response.status == "paused") {
-                            PrefsStore.saveLocalStatus("paused")
-                            ApiService.syncStatus(deviceId, alias, "paused")
-                            LogCenter.op(alias, "收到暂停指令")
-                            updateRuntime(localStatus = "paused", lastMessage = "已暂停，等待继续")
+                            /* 用户硬停后服务端仍为 paused，但管理员已重新允许自动开启：视为新指令，解除硬停并恢复。 */
+                            if (PrefsStore.isHardStopRequested() && cloudAutoStart && !inPullUsernameRestSleep) {
+                                LogCenter.op(
+                                    alias,
+                                    "云端已重新允许自动开启（check_start 仍为 paused），解除硬停并恢复运行",
+                                )
+                                forceStartRunningNow("云端已重新允许自动开启，解除硬停")
+                            } else if (
+                                PrefsStore.isPublishPostPending() ||
+                                PrefsStore.isMutualClickPending() ||
+                                ExecutionScope.isActive()
+                            ) {
+                                /* 发作品/互点等设备指令执行中：不因 check_start 的 paused 覆盖 running */
+                                if (PrefsStore.getLocalStatus() != "running") {
+                                    PrefsStore.saveLocalStatus("running")
+                                    updateRuntime(localStatus = "running", lastMessage = "云端任务执行中")
+                                }
+                            } else {
+                                val alreadyPaused = PrefsStore.getLocalStatus() == "paused"
+                                PrefsStore.saveLocalStatus("paused")
+                                ApiService.syncStatus(deviceId, alias, "paused")
+                                if (!alreadyPaused) {
+                                    LogCenter.op(alias, "收到暂停指令")
+                                    updateRuntime(localStatus = "paused", lastMessage = "已暂停，等待继续")
+                                }
+                            }
                         } else {
                             if (PrefsStore.isHardStopRequested()) {
                                 PrefsStore.setHardStopRequested(false)
                             }
                             manuallyPaused = false
+                            if (!started.get()) {
+                                started.set(true)
+                            }
                             PrefsStore.saveLocalStatus("running")
                             ApiService.syncStatus(deviceId, alias, "running")
-                            LogCenter.op(alias, "收到启动/继续指令，开始运行")
+                            LogCenter.op(alias, "管理台已下发「开始运行」，涨粉/任务即将启动")
                             updateRuntime(localStatus = "running", lastMessage = "收到启动/继续指令")
                             if (!WorkerServiceTracker.isRunning) {
                                 runCatching { WorkerService.start(appContext) }
@@ -288,17 +392,41 @@ object AppCoordinator {
                                         LogCenter.op(alias, "收到启动指令后恢复后台服务失败：${it.message}")
                                     }
                             }
-                            fetchConfig()
+                            fetchConfig(logToUser = true)
                             startPullLoop()
                         }
                     } else if (response.code == 1 && response.auto_start == true) {
-                        val ls = PrefsStore.getLocalStatus()
-                        if (ls != "paused" && !PrefsStore.isHardStopRequested() && !manuallyPaused) {
-                            val needWake =
-                                !WorkerServiceTracker.isRunning || ls != "running"
-                            if (needWake) {
-                                LogCenter.op(alias, "云端已开启「自动启动」：检测到未在运行，正在拉起")
-                                forceStartRunningNow("云端自动开启策略")
+                        if (manuallyPaused) {
+                            // 悬浮硬暂停：不响应云端自动拉起
+                        } else if (inPullUsernameRestSleep) {
+                            // 休息窗口内不触发自动恢复，避免与休息意图矛盾
+                        } else {
+                            val ls = PrefsStore.getLocalStatus()
+                            val hardStop = PrefsStore.isHardStopRequested()
+                            /* 本地硬停时：只要云端 auto_start 为真即视为管理员重新开启自动开启，解除硬停；否则仅在非云端暂停态下沿用原逻辑 */
+                            if (!hardStop && ls == "paused") {
+                                // 云端暂停且非硬停：不自动拉起
+                            } else {
+                                val needWake =
+                                    hardStop ||
+                                        !WorkerServiceTracker.isRunning ||
+                                        ls != "running"
+                                if (needWake) {
+                                    val why = when {
+                                        hardStop -> "已解除暂停"
+                                        !WorkerServiceTracker.isRunning -> "后台服务未运行"
+                                        ls != "running" -> "任务未在运行中"
+                                        else -> "需要恢复"
+                                    }
+                                    LogCenter.op(alias, "自动运行已开启，正在恢复任务（$why）")
+                                    forceStartRunningNow(
+                                        if (hardStop) {
+                                            "云端已重新允许自动开启，解除硬停"
+                                        } else {
+                                            "云端自动开启策略"
+                                        },
+                                    )
+                                }
                             }
                         }
                     } else if (response.code == 1 && localStatus == "running") {
@@ -328,6 +456,17 @@ object AppCoordinator {
                     continue
                 }
 
+                if (PrefsStore.isHardStopRequested()) {
+                    updateRuntime(lastMessage = "硬停中：自动任务已暂停，仍监听云端指令")
+                    delay(2_000)
+                    continue
+                }
+                if (PrefsStore.getLocalStatus() != "running") {
+                    /* 与云端「暂停」或用户硬停后的状态一致：不继续拉取/执行用户名队列 */
+                    delay(2_000)
+                    continue
+                }
+
                 val deviceId = PrefsStore.getDeviceId() ?: break
                 val alias = PrefsStore.getAlias() ?: break
 
@@ -340,15 +479,8 @@ object AppCoordinator {
                 val username = pendingUsernames.firstOrNull()
                 if (username != null) {
                     pendingUsernames.removeAt(0)
-                    LogCenter.op(
-                        alias,
-                        "开始执行用户名：$username，执行前队列剩余=${queueBeforeTake}，取出后剩余=${pendingUsernames.size}",
-                    )
+                    LogCenter.op(alias, "执行：$username（余 ${pendingUsernames.size}）")
                     handleUsername(alias, deviceId, username)
-                    LogCenter.op(
-                        alias,
-                        "用户名执行结束：$username，当前队列剩余=${pendingUsernames.size}",
-                    )
                 } else {
                     updateRuntime(lastMessage = "暂无待执行用户名")
                     LogCenter.op(alias, "队列为空，进入等待/补拉分支")
@@ -356,10 +488,9 @@ object AppCoordinator {
                 }
 
                 if (pendingUsernames.size <= 1) {
-                    LogCenter.op(alias, "队列剩余=${pendingUsernames.size}，触发补拉下一批用户名")
                     reportOnlineBeforePull(alias, deviceId)
                     fetchUsernamesOnce(alias, deviceId)
-                    LogCenter.op(alias, "补拉后队列剩余=${pendingUsernames.size}")
+                    LogCenter.op(alias, "补拉用户名后队列剩余 ${pendingUsernames.size}")
                 }
 
                 // 同一批用户名连续执行：队列里有任务时不做任何间隔
@@ -369,7 +500,7 @@ object AppCoordinator {
                 }
 
                 // 仅当队列为空时，等待后再拉下一批
-                val interval = Random.nextLong(10_000L, 30_000L)
+                val interval = Random.nextLong(30_000L, 60_000L)
                 if (forceImmediatePull) {
                     forceImmediatePull = false
                     LogCenter.op(alias, "强制立即拉取已触发，跳过等待")
@@ -385,17 +516,23 @@ object AppCoordinator {
 
     private suspend fun fetchUsernamesOnce(alias: String, deviceId: String) {
         try {
+            // 配置与批次拉取绑定：每次拉一批用户名前先拉一次最新配置。
+            fetchConfig()
+            val pullN = _config.value.pull_batch_size.let { if (it < 1) 5 else it }.coerceIn(1, 100)
             val response = ApiService.pullUsername(
                 deviceId,
                 alias,
-                PrefsStore.getPullCount(),
+                pullN,
                 PrefsStore.getDeviceRunMode(),
             )
             if (response.code == 2) {
                 val minutes = (response.rest_minutes ?: 0).coerceAtLeast(1)
                 val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
-                LogCenter.op(alias, "收到休息指令：休息 ${minutes} 分钟；关闭 TikTok 后台（am force-stop $pkg）")
-                updateRuntime(lastMessage = "休息 ${minutes} 分钟（已关闭 TikTok 后台）")
+                LogCenter.op(
+                    alias,
+                    "云端让设备休息 ${minutes} 分钟：涨粉/任务暂停，已关闭 TikTok，到点后会自动继续",
+                )
+                updateRuntime(lastMessage = "休息中 ${minutes} 分钟，涨粉暂停")
 
                 val runSu: (String) -> Boolean = { command ->
                     runCatching {
@@ -406,11 +543,15 @@ object AppCoordinator {
                         }
                     }.getOrDefault(false)
                 }
-                val stopOk = runSu("am force-stop $pkg")
-                LogCenter.op(alias, "休息前关闭 TikTok 后台结果：${if (stopOk) "success" else "failed"}")
-                delay(minutes.toLong() * 60_000L)
-                LogCenter.op(alias, "休息结束：准备继续拉取用户名")
-                updateRuntime(lastMessage = "休息结束，继续拉取")
+                runSu("am force-stop $pkg")
+                inPullUsernameRestSleep = true
+                try {
+                    delay(minutes.toLong() * 60_000L)
+                } finally {
+                    inPullUsernameRestSleep = false
+                }
+                LogCenter.op(alias, "休息结束，继续涨粉：即将拉取新用户")
+                updateRuntime(lastMessage = "休息结束，继续涨粉")
                 forceImmediatePull = true
                 return
             }
@@ -422,18 +563,16 @@ object AppCoordinator {
                 pulledTracker.addAll(incoming)
                 LogCenter.op(
                     alias,
-                    "拉取用户名成功：code=${response.code}，原始 ${incoming.size} 条，过滤后待执行 ${pendingFromBatch.size} 条，队列总剩余=${pendingUsernames.size}",
+                    "已拉到 ${pendingFromBatch.size} 个待执行用户（本批 ${incoming.size} 个，队列共 ${pendingUsernames.size} 个）",
                 )
                 if (pendingFromBatch.isEmpty()) {
-                    LogCenter.op(
-                        alias,
-                        "拉取结果被本地过滤为空：可能已执行过、重复、或不满足待执行条件",
-                    )
+                    LogCenter.op(alias, "本批用户都已做过或重复，没有新的可执行用户")
                 }
             } else {
                 LogCenter.op(
                     alias,
-                    "拉取用户名无可执行结果：code=${response.code}，原始 ${incoming.size} 条，msg=${response.msg ?: "<empty>"}",
+                    response.msg?.takeIf { it.isNotBlank() }
+                        ?: "暂时没有新的用户可执行，稍后再试",
                 )
                 updateRuntime(lastMessage = response.msg ?: "暂无待执行用户名")
             }
@@ -521,14 +660,147 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * 管理台下发设备指令（发作品 / 互点 / 图库导入等）时：必须解除本地暂停与硬停，并同步云端为 running，
+     * 避免 check_start 仍返回 paused 把任务打回「暂停后收尾」。
+     */
+    private suspend fun resumeExecutionForCloudDeviceOp(
+        alias: String,
+        deviceId: String,
+        reason: String,
+    ) {
+        val wasHardStop = PrefsStore.isHardStopRequested()
+        val wasPaused = PrefsStore.getLocalStatus() == "paused"
+        PrefsStore.setHardStopRequested(false)
+        manuallyPaused = false
+        if (!started.get()) {
+            started.set(true)
+        }
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(
+            localStatus = "running",
+            hardStopRequested = false,
+            lastMessage = reason,
+        )
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "running")
+        }.onFailure { err ->
+            LogCenter.op(alias, "云端指令：同步 running 到服务端失败：${err.message}")
+        }
+        if (wasHardStop || wasPaused) {
+            LogCenter.op(
+                alias,
+                "云端指令已解除暂停/硬停并进入执行（原 paused=$wasPaused hardStop=$wasHardStop）",
+            )
+        }
+        if (!WorkerServiceTracker.isRunning) {
+            runCatching { WorkerService.start(appContext) }
+                .onFailure { LogCenter.op(alias, "云端指令：拉起后台服务失败：${it.message}") }
+        }
+    }
+
+    /** 分段 delay，硬停时尽快返回 false（修改基本资料外轮等长等待可中断）。 */
+    private suspend fun delayUnlessHardStop(ms: Long): Boolean {
+        var left = ms
+        while (left > 0) {
+            if (PrefsStore.isHardStopRequested()) return false
+            val chunk = minOf(left, 200L)
+            delay(chunk)
+            left -= chunk
+        }
+        return true
+    }
+
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
         val opId = op.op_id
         val payload = op.payload
+        resumeExecutionForCloudDeviceOp(alias, deviceId, "云端设备指令：${op.op_type}")
         if (op.op_type == "gallery_import_media" || op.op_type == "gallery_import_images") {
             handleGalleryImportOp(alias, deviceId, op)
             return
         }
         val packageName = payload?.package_name?.trim().orEmpty()
+        if (op.op_type == "mutual_click_start" || op.op_type == "mutual_click_comment_only_start") {
+            val commentOnly = op.op_type == "mutual_click_comment_only_start"
+            PrefsStore.setMutualCommentOnlySession(commentOnly)
+            val mutualLogLine =
+                "[OP][$opId] 收到互点切换指令（${if (commentOnly) "仅评论" else "完整"}），开始请求设备进入互点模式"
+            LogCenter.op(alias, mutualLogLine)
+            PrefsStore.setMutualClickRequested(true)
+            PrefsStore.setMutualClickPending(true)
+            triggerMutualSwitchNow(alias, pauseCloudAutoStartForMutual = false)
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "success",
+                message = "已收到互点切换请求",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "operation_logs" to listOf(mutualLogLine),
+                ),
+            )
+            return
+        }
+        if (op.op_type == "publish_post_start") {
+            val pubPkg = payload?.package_name?.trim().orEmpty()
+            if (pubPkg.isBlank()) {
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = "failed",
+                    message = "设备操作缺少 package_name，已拒绝执行发作品任务",
+                    data = mapOf(
+                        "op_type" to op.op_type,
+                        "device_id" to deviceId,
+                        "operation_logs" to listOf("[OP][$opId] publish_post_start 缺少 package_name"),
+                    ),
+                )
+                return
+            }
+            PrefsStore.setPublishPostPackageName(pubPkg)
+            PrefsStore.setPublishPostRequested(true)
+            PrefsStore.setPublishPostPending(true)
+            val lineQueued = "[OP][$opId] 发作品指令：互点切换任务执行中，发作品需排队在互点模式结束之后执行"
+            val lineStart = "[OP][$opId] 发作品指令已收到，准备切入发作品入口流程"
+            if (mutualSwitchJob?.isActive == true) {
+                PrefsStore.setPublishPostQueuedAfterMutual(true)
+                LogCenter.op(alias, lineQueued)
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = "success",
+                    message = "已排队：互点会话结束后将执行发作品入口",
+                    data = mapOf(
+                        "op_type" to op.op_type,
+                        "device_id" to deviceId,
+                        "publish_queued_after_mutual" to true,
+                        "operation_logs" to listOf(lineQueued),
+                    ),
+                )
+                return
+            }
+            PrefsStore.setPublishPostQueuedAfterMutual(false)
+            LogCenter.op(alias, lineStart)
+            triggerPublishPostNow(alias)
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "success",
+                message = "已收到并发作品入口任务",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "publish_queued_after_mutual" to false,
+                    "operation_logs" to listOf(lineStart),
+                ),
+            )
+            return
+        }
         if (packageName.isBlank()) {
             ApiService.reportDeviceOp(
                 deviceId = deviceId,
@@ -545,11 +817,20 @@ object AppCoordinator {
             return
         }
         val operationLogs = mutableListOf<String>()
+        ExecutionScope.enter()
+        try {
 
         fun opLog(text: String) {
             val line = "[OP][$opId] $text"
             operationLogs.add(line)
             LogCenter.op(alias, line)
+        }
+
+        /** 备份/还原/清理/切号：步骤细节不上报、不写设备日志，仅 [opDone] 记结果 */
+        fun opStep(@Suppress("UNUSED_PARAMETER") text: String) = Unit
+
+        fun opDone(ok: Boolean, successText: String, failText: String) {
+            opLog(if (ok) successText else failText)
         }
 
         val runSu: (String) -> Boolean = ::runExecutorSu
@@ -563,13 +844,15 @@ object AppCoordinator {
             }.getOrNull()
         }
 
-        opLog("收到设备操作: type=${op.op_type}")
+        if (op.op_type !in setOf("tiktok_clear", "tiktok_backup_and_clear", "tiktok_restore")) {
+            opLog("收到设备操作: type=${op.op_type}")
+        }
 
         when (op.op_type) {
             "tiktok_force_stop_1", "tiktok_force_stop" -> {
-                opLog("强停方案1 开始: am force-stop $packageName")
+                opStep("强停 TikTok（方案1）")
                 val stopOk = runSu("am force-stop $packageName")
-                opLog("强停方案1 结果: ${if (stopOk) "success" else "failed"}")
+                opDone(stopOk, "强停完成", "强停失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -589,9 +872,9 @@ object AppCoordinator {
             }
 
             "tiktok_force_stop_2" -> {
-                opLog("强停方案2 开始: pkill -f $packageName || killall $packageName")
+                opStep("强停 TikTok（方案2）")
                 val stopOk = runSu("pkill -f $packageName || killall $packageName")
-                opLog("强停方案2 结果: ${if (stopOk) "success" else "failed"}")
+                opDone(stopOk, "强停完成", "强停失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -611,9 +894,9 @@ object AppCoordinator {
             }
 
             "tiktok_force_stop_3" -> {
-                opLog("强停方案3 开始: pidof + kill -9")
+                opStep("强停 TikTok（方案3）")
                 val stopOk = runSu("for p in \$(pidof $packageName); do kill -9 \$p; done")
-                opLog("强停方案3 结果: ${if (stopOk) "success" else "failed"}")
+                opDone(stopOk, "强停完成", "强停失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -633,20 +916,27 @@ object AppCoordinator {
             }
 
             "tiktok_launch_1", "tiktok_launch" -> {
-                opLog("拉起方案1 开始: am start -n $packageName/com.ss.android.ugc.aweme.splash.SplashActivity")
-                val launchOk = runSu("am start -n $packageName/com.ss.android.ugc.aweme.splash.SplashActivity")
-                opLog("拉起方案1 结果: ${if (launchOk) "success" else "failed"}")
+                opStep("拉起 TikTok（方案1）")
+                fetchConfig()
+                val launchOk = executor.launchTikTokWithForegroundVerification(
+                    ctx = appContext,
+                    alias = alias,
+                    tag = "远控_launch_1",
+                    forceStopBeforeLaunch = false,
+                    timingConfig = _config.value,
+                )
+                opDone(launchOk, "拉起成功", "拉起失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (launchOk) "success" else "failed",
-                    message = if (launchOk) "TikTok 启动完成（方案1）" else "TikTok 启动失败（方案1）",
+                    message = if (launchOk) "TikTok 已在前台（dumpsys 校验）" else "TikTok 拉起失败或前台校验未通过",
                     data = mapOf(
                         "op_type" to "tiktok_launch_1",
                         "scheme" to "launch_1",
-                        "command" to "am start -n $packageName/com.ss.android.ugc.aweme.splash.SplashActivity",
+                        "command" to "TraceExecutor.launchTikTokWithForegroundVerification（intent→root→dumpsys）",
                         "device_id" to deviceId,
                         "package_name" to packageName,
                         "operation_logs" to operationLogs,
@@ -655,20 +945,27 @@ object AppCoordinator {
             }
 
             "tiktok_launch_2" -> {
-                opLog("拉起方案2 开始: monkey -p $packageName -c android.intent.category.LAUNCHER 1")
-                val launchOk = runSu("monkey -p $packageName -c android.intent.category.LAUNCHER 1")
-                opLog("拉起方案2 结果: ${if (launchOk) "success" else "failed"}")
+                opStep("拉起 TikTok（方案2）")
+                fetchConfig()
+                val launchOk = executor.launchTikTokWithForegroundVerification(
+                    ctx = appContext,
+                    alias = alias,
+                    tag = "远控_launch_2",
+                    forceStopBeforeLaunch = false,
+                    timingConfig = _config.value,
+                )
+                opDone(launchOk, "拉起成功", "拉起失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (launchOk) "success" else "failed",
-                    message = if (launchOk) "TikTok 启动完成（方案2）" else "TikTok 启动失败（方案2）",
+                    message = if (launchOk) "TikTok 已在前台（dumpsys 校验）" else "TikTok 拉起失败或前台校验未通过",
                     data = mapOf(
                         "op_type" to "tiktok_launch_2",
                         "scheme" to "launch_2",
-                        "command" to "monkey -p $packageName -c android.intent.category.LAUNCHER 1",
+                        "command" to "TraceExecutor.launchTikTokWithForegroundVerification（intent→root→dumpsys）",
                         "device_id" to deviceId,
                         "package_name" to packageName,
                         "operation_logs" to operationLogs,
@@ -677,20 +974,27 @@ object AppCoordinator {
             }
 
             "tiktok_launch_3" -> {
-                opLog("拉起方案3 开始: cmd package resolve-activity --brief $packageName && monkey -p $packageName -c android.intent.category.LAUNCHER 1")
-                val launchOk = runSu("cmd package resolve-activity --brief $packageName && monkey -p $packageName -c android.intent.category.LAUNCHER 1")
-                opLog("拉起方案3 结果: ${if (launchOk) "success" else "failed"}")
+                opStep("拉起 TikTok（方案3）")
+                fetchConfig()
+                val launchOk = executor.launchTikTokWithForegroundVerification(
+                    ctx = appContext,
+                    alias = alias,
+                    tag = "远控_launch_3",
+                    forceStopBeforeLaunch = false,
+                    timingConfig = _config.value,
+                )
+                opDone(launchOk, "拉起成功", "拉起失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (launchOk) "success" else "failed",
-                    message = if (launchOk) "TikTok 启动完成（方案3）" else "TikTok 启动失败（方案3）",
+                    message = if (launchOk) "TikTok 已在前台（dumpsys 校验）" else "TikTok 拉起失败或前台校验未通过",
                     data = mapOf(
                         "op_type" to "tiktok_launch_3",
                         "scheme" to "launch_3",
-                        "command" to "cmd package resolve-activity --brief $packageName && monkey -p $packageName -c android.intent.category.LAUNCHER 1",
+                        "command" to "TraceExecutor.launchTikTokWithForegroundVerification（intent→root→dumpsys）",
                         "device_id" to deviceId,
                         "package_name" to packageName,
                         "operation_logs" to operationLogs,
@@ -698,11 +1002,202 @@ object AppCoordinator {
                 )
             }
 
+            "tiktok_edit_basic_profile" -> {
+                opStep("修改基本资料：拉取配置")
+                val cfgOk = fetchConfig()
+                if (!cfgOk) opLog("配置拉取失败，沿用上一版")
+
+                val galleryImageCount = executor.countPicturesGalleryImageFiles()
+                if (galleryImageCount < 1) {
+                    opLog(
+                        if (galleryImageCount == 0) {
+                            "不满足修改资料条件：图库无图片"
+                        } else {
+                            "不满足修改资料条件：图库检测失败"
+                        },
+                    )
+                    ApiService.reportDeviceOp(
+                        deviceId = deviceId,
+                        alias = alias,
+                        opId = opId,
+                        status = "failed",
+                        message = "不满足修改资料条件，图库图片为0",
+                        data = mapOf(
+                            "op_type" to "tiktok_edit_basic_profile",
+                            "device_id" to deviceId,
+                            "package_name" to packageName,
+                            "gallery_image_count" to galleryImageCount.coerceAtLeast(0),
+                            "gallery_image_count_raw" to galleryImageCount,
+                            "profile_edit_skipped" to true,
+                            "profile_edit_skip_reason" to "gallery_images_empty",
+                            "operation_logs" to operationLogs,
+                        ),
+                    )
+                    return@handleDeviceOp
+                }
+
+                val ratioTapX = 0.97f
+                val ratioTapY = 0.95f
+                val maxOuter = 3
+                var lastW = 0
+                var lastH = 0
+                var lastRatioTapPx = Pair(0, 0)
+                var lastRatioTapOk = false
+                var lastStopOk = false
+                var lastLaunchOk = false
+                var lastChain: ProfileEditChainResult? = null
+                var successOverall = false
+                var stopAfterProfileEditOk = false
+
+                for (outer in 1..maxOuter) {
+                    if (PrefsStore.isHardStopRequested()) {
+                        opLog("修改基本资料：检测到硬停，中止外轮（不再重试 OCR）")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    opLog("修改基本资料：第 $outer/$maxOuter 轮")
+                    lastStopOk = runSu("am force-stop $packageName")
+                    if (!delayUnlessHardStop(1200)) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+
+                    lastLaunchOk = executor.launchTikTokWithForegroundVerification(
+                        ctx = appContext,
+                        alias = alias,
+                        tag = "修改基本资料_外轮${outer}",
+                        forceStopBeforeLaunch = false,
+                        timingConfig = _config.value,
+                    )
+
+                    val dm = appContext.resources.displayMetrics
+                    lastW = dm.widthPixels
+                    lastH = dm.heightPixels
+                    val rtx = (lastW * ratioTapX).toInt().coerceIn(1, (lastW - 1).coerceAtLeast(1))
+                    val rty = (lastH * ratioTapY).toInt().coerceIn(1, (lastH - 1).coerceAtLeast(1))
+                    lastRatioTapPx = rtx to rty
+                    lastRatioTapOk = false
+                    if (!delayUnlessHardStop(if (lastLaunchOk) 1600 else 1200)) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    if (PrefsStore.isHardStopRequested()) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    lastRatioTapOk = runSu("input tap $rtx $rty")
+
+                    if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
+                        opLog("外轮$outer：准备阶段未就绪，重试")
+                        lastChain = ProfileEditChainResult(
+                            success = false,
+                            failureStep = "warmup_outer_$outer",
+                            editOcrPreviews = listOf("stop=$lastStopOk launch=$lastLaunchOk ratioTap=$lastRatioTapOk"),
+                        )
+                        continue
+                    }
+
+                    val chain = try {
+                        executor.profileEditRunOcrChain(appContext, _config.value)
+                    } catch (e: Exception) {
+                        opLog("外轮$outer：OCR链异常 ${e.message}")
+                        ProfileEditChainResult(
+                            success = false,
+                            failureStep = "ocr_chain_exception",
+                            editOcrPreviews = listOf(e.message ?: "unknown"),
+                        )
+                    }
+                    lastChain = chain
+                    if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
+                        opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    val bioPartsOk = chain.bioAfterPart1Ok && chain.bioAfterPart2Ok
+                    if (chain.success && bioPartsOk) {
+                        successOverall = true
+                        opLog("修改基本资料完成（外轮 $outer/$maxOuter）")
+                        stopAfterProfileEditOk = runSu("am force-stop $packageName")
+                        delay(1200)
+                        break
+                    }
+                    if (chain.bioAfterPart1Ok && !chain.bioAfterPart2Ok) {
+                        opLog("外轮$outer：Bio ① 完成、② 未完成（${chain.failureStep}）")
+                    } else {
+                        opLog("外轮$outer：失败（${chain.failureStep}）")
+                    }
+                }
+
+                val chain = lastChain
+                val previewsJoin = { xs: List<String> ->
+                    xs.joinToString("\n---\n").take(6000)
+                }
+                opDone(successOverall, "修改基本资料成功", "修改基本资料失败")
+
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = if (successOverall) "success" else "failed",
+                    message = if (successOverall) {
+                        "已完成：Bio 后①② 均成功，已关闭 TikTok 后台；云端将「基本资料已修改」标为「是」"
+                    } else if (chain?.failureStep == "hard_stop") {
+                        "已硬停：修改基本资料流程被用户中止，未标「基本资料已修改」"
+                    } else if (chain?.bioAfterPart1Ok == true && chain.bioAfterPart2Ok != true) {
+                        "未完成：Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
+                    } else {
+                        "未完成：${chain?.failureStep ?: "outer_or_unknown"}（已最多外轮 $maxOuter 次）"
+                    },
+                    data = mutableMapOf<String, Any>(
+                        "op_type" to "tiktok_edit_basic_profile",
+                        "device_id" to deviceId,
+                        "package_name" to packageName,
+                        "screen_width_px" to lastW,
+                        "screen_height_px" to lastH,
+                        "tap_ratio_xy" to listOf(ratioTapX, ratioTapY),
+                        "tap_px_xy" to listOf(lastRatioTapPx.first, lastRatioTapPx.second),
+                        "stop_ok" to lastStopOk,
+                        "launch_ok" to lastLaunchOk,
+                        "ratio_tap_ok" to lastRatioTapOk,
+                        "profile_edit_outer_max" to maxOuter,
+                        "profile_edit_success" to successOverall,
+                        "profile_edit_bio_after_part1_ok" to (chain?.bioAfterPart1Ok ?: false),
+                        "profile_edit_bio_after_part2_ok" to (chain?.bioAfterPart2Ok ?: false),
+                        "profile_edit_failure_step" to (chain?.failureStep ?: ""),
+                        "profile_edit_edit_ocr_attempts" to (chain?.editOcrAttempts ?: 0),
+                        "profile_edit_change_ocr_attempts" to (chain?.changeOcrAttempts ?: 0),
+                        "profile_edit_edit_ocr_previews" to previewsJoin(chain?.editOcrPreviews ?: emptyList()),
+                        "profile_edit_change_ocr_previews" to previewsJoin(chain?.changeOcrPreviews ?: emptyList()),
+                        "profile_edit_edit_tap_px" to (chain?.editTapPx?.let { listOf(it.first, it.second) } ?: emptyList()),
+                        "profile_edit_change_tap_px" to (chain?.changeTapPx?.let { listOf(it.first, it.second) } ?: emptyList()),
+                        "profile_edit_menu_change_photo_px" to (chain?.changeMenuChangePhotoPx?.let { listOf(it.first, it.second) } ?: emptyList()),
+                        "profile_edit_menu_name_px" to (chain?.changeMenuNamePx?.let { listOf(it.first, it.second) } ?: emptyList()),
+                        "profile_edit_menu_bio_px" to (chain?.changeMenuBioPx?.let { listOf(it.first, it.second) } ?: emptyList()),
+                        "profile_edit_bio_verify_attempts" to (chain?.bioVerifyOcrAttempts ?: 0),
+                        "profile_edit_post_confirm_change_photo_attempts" to (chain?.postConfirmChangePhotoOcrAttempts ?: 0),
+                        "profile_edit_bio_applied" to (chain?.profileEditBioApplied ?: ""),
+                        "profile_edit_avatar_verify_attempts" to (chain?.avatarVerifyOcrAttempts ?: 0),
+                        "profile_edit_display_name_applied" to (chain?.displayNameRandomApplied ?: ""),
+                        "profile_edit_edit_tap_ok" to (chain?.editTapOk ?: false),
+                        "profile_edit_change_tap_ok" to (chain?.changeTapOk ?: false),
+                        "tiktok_stopped_after_profile_edit" to stopAfterProfileEditOk,
+                        "operation_logs" to operationLogs,
+                    ),
+                )
+            }
+
             "tiktok_clear" -> {
-                opLog("步骤1/2 清理开始: pm clear $packageName")
+                opStep("开始清理 TikTok 数据")
+                opStep("正在清空 TikTok 应用数据")
                 val clearOk = runSu("pm clear $packageName")
-                opLog("步骤1/2 清理结果: ${if (clearOk) "success" else "failed"}")
-                opLog("步骤2/2 结果回传: ${if (clearOk) "success" else "failed"}")
+                opDone(clearOk, "TikTok 数据清理完成", "TikTok 数据清理失败")
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -720,54 +1215,83 @@ object AppCoordinator {
             }
 
             "tiktok_backup_and_clear" -> {
+                val backupRoot = UnifiedBackupPaths.ensureBackupsDir(appContext)
+                val backupDir = backupRoot.absolutePath
+                val qBackupDir = DeviceBackupShell.shellQuote(backupDir)
                 val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
                 val backupName = "${alias}_${deviceId}_${ts}.tar.gz"
-                val backupDir = "/data/local/tmp"
-                val backupPath = "$backupDir/$backupName"
+                val backupPath = File(backupRoot, backupName).absolutePath
+                val qBackupPath = DeviceBackupShell.shellQuote(backupPath)
                 val sourceDir = "/data/data/$packageName"
 
-                opLog("步骤1/3 停止应用: am force-stop $packageName")
-                val stopOk = runSu("am force-stop $packageName")
-                opLog("步骤1/3 停止结果: ${if (stopOk) "success" else "failed"}")
+                val isCutSwitch = !payload?.cut_switch_after_backup.isNullOrBlank()
+                opStep(if (isCutSwitch) "切号：开始备份当前账号" else "开始备份并清理")
 
-                opLog("步骤2/3 备份开始: $sourceDir -> $backupPath")
-                val backupCommand =
-                    "mkdir -p $backupDir && cd /data/data && " +
-                    "find $packageName \\( -type f -o -type l \\) " +
-                    "! -path '*/cache/*' ! -path '*/code_cache/*' -print0 | " +
-                    "tar -czf $backupPath --null -T -"
-                val backupOk = stopOk && runSu(backupCommand)
-                opLog("步骤2/3 备份结果: ${if (backupOk) "success" else "failed"}")
-                if (!backupOk) {
-                    opLog("步骤2/3 诊断: backup_command=$backupCommand")
-                    val sourceExists = runSu("test -d $sourceDir")
-                    opLog("步骤2/3 诊断: source_dir_exists=${if (sourceExists) "yes" else "no"} ($sourceDir)")
-                    val tarVersion = runSuWithOutput("tar --version")
-                    if (!tarVersion.isNullOrBlank()) {
-                        opLog("步骤2/3 诊断: tar_version=${tarVersion.replace('\n', ' ')}")
-                    }
-                    val pwdOut = runSuWithOutput("cd /data/data && pwd")
-                    if (!pwdOut.isNullOrBlank()) {
-                        opLog("步骤2/3 诊断: pwd=$pwdOut")
-                    }
-                    val backupProbe = runSuWithOutput(
-                        "cd /data/data && find $packageName \\( -type f -o -type l \\) " +
-                            "! -path '*/cache/*' ! -path '*/code_cache/*' -print0 | " +
-                            "tar -czf $backupPath --null -T -; echo __EXIT__:$?"
+                opStep("第1步：关闭 TikTok")
+                val stopOk = runSu("am force-stop $packageName")
+
+                opStep("第2步：检测数据目录大小")
+                val dataDirKb = if (stopOk) {
+                    runSuWithOutput(DeviceBackupShell.measureDataDirKbCommand(sourceDir))
+                        ?.lineSequence()
+                        ?.map { it.trim() }
+                        ?.firstOrNull { it.isNotEmpty() }
+                        ?.toLongOrNull()
+                } else {
+                    null
+                }
+                val backupSkipped = stopOk &&
+                    (dataDirKb == null || dataDirKb < DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP)
+
+                val backupOk = if (!stopOk) {
+                    false
+                } else if (backupSkipped) {
+                    opStep(
+                        "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份",
                     )
-                    if (!backupProbe.isNullOrBlank()) {
-                        opLog("步骤2/3 诊断: backup_probe=$backupProbe")
-                    }
-                    val backupFileExists = runSu("test -f $backupPath")
-                    opLog("步骤2/3 诊断: backup_file_exists=${if (backupFileExists) "yes" else "no"} ($backupPath)")
+                    true
+                } else {
+                    opStep("第3步：备份账号数据")
+                    runSu(
+                        DeviceBackupShell.tiktokStyleDataTarCommand(
+                            dataPackageName = packageName,
+                            quotedBackupDir = qBackupDir,
+                            quotedOutputTarPath = qBackupPath,
+                        ),
+                    )
                 }
 
-                opLog("步骤3/3 清理开始: pm clear $packageName")
-                val clearOk = backupOk && runSu("pm clear $packageName")
-                opLog("步骤3/3 清理结果: ${if (clearOk) "success" else "failed"}")
+                val clearOk = if (backupOk) {
+                    opStep(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据")
+                    runSu("pm clear $packageName")
+                } else {
+                    opStep("备份未成功，已跳过清理以免误删数据")
+                    false
+                }
 
                 val ok = stopOk && backupOk && clearOk
-                opLog("结果回传: ${if (ok) "success" else "failed"}")
+
+                if (ok && !backupSkipped) {
+                    val prevRaw = payload?.previous_backup_path?.trim().orEmpty()
+                    if (prevRaw.isNotEmpty() && prevRaw != backupPath &&
+                        UnifiedBackupPaths.isSafeToDeleteOldBackup(appContext, prevRaw, backupPath)
+                    ) {
+                        opStep("正在删除旧备份文件")
+                        val qPrev = DeviceBackupShell.shellQuote(prevRaw)
+                        runSu("rm -f $qPrev")
+                    }
+                }
+                opDone(
+                    ok,
+                    when {
+                        !ok -> if (isCutSwitch) "切号：当前账号备份或清理失败" else "备份或清理失败"
+                        backupSkipped && isCutSwitch -> "切号：数据过小已跳过备份，清理完成"
+                        backupSkipped -> "数据过小已跳过备份，清理完成"
+                        isCutSwitch -> "切号：当前账号备份并清理完成"
+                        else -> "备份并清理完成"
+                    },
+                    if (isCutSwitch) "切号：当前账号备份或清理失败" else "备份或清理失败",
+                )
 
                 val reportUsername = payload?.username?.trim().orEmpty()
                 val reportBackupRecordId = payload?.backup_record_id
@@ -781,37 +1305,57 @@ object AppCoordinator {
                     "mobile_alias" to alias,
                     "username" to reportUsername,
                     "operation_logs" to operationLogs,
+                    "backup_skipped" to backupSkipped,
                 )
+                dataDirKb?.let { reportData["source_dir_kb"] = it }
                 reportBackupRecordId?.let { reportData["backup_record_id"] = it }
+                payload?.cut_switch_after_backup?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                    reportData["cut_switch_after_backup"] = it
+                }
+                payload?.cut_switch_target_row_index?.let { reportData["cut_switch_target_row_index"] = it }
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (ok) "success" else "failed",
-                    message = if (ok) "备份并清理完成" else "备份或清理失败",
+                    message = when {
+                        !ok -> "备份或清理失败"
+                        backupSkipped -> "数据过小已跳过备份，清理完成"
+                        else -> "备份并清理完成"
+                    },
                     data = reportData,
                 )
             }
 
             "tiktok_restore" -> {
                 val backupName = payload?.backup_name.orEmpty()
-                val backupPath = "/data/local/tmp/$backupName"
+                val backupRoot = UnifiedBackupPaths.ensureBackupsDir(appContext)
+                val backupPath = File(backupRoot, backupName).absolutePath
+                val qBackupPath = DeviceBackupShell.shellQuote(backupPath)
                 val sourceDir = "/data/data/$packageName"
+                val qPkg = DeviceBackupShell.shellQuote(packageName)
+                val skipPmClear = payload?.skip_pm_clear == true
 
-                opLog("步骤1/7 停止应用: am force-stop $packageName")
+                opStep(if (skipPmClear) "切号：开始还原目标账号" else "开始还原备份")
+
+                opStep("第1步：关闭 TikTok")
                 val stopOk = runSu("am force-stop $packageName")
-                opLog("步骤1/7 停止结果: ${if (stopOk) "success" else "failed"}")
 
-                opLog("步骤2/7 备份文件检查: test -f $backupPath")
-                val backupExists = stopOk && runSu("test -f $backupPath")
-                opLog("步骤2/7 检查结果: ${if (backupExists) "success" else "failed"}")
+                val clearOk = if (skipPmClear) {
+                    stopOk
+                } else {
+                    opStep("第2步：清空 TikTok 旧数据")
+                    stopOk && runSu("pm clear $qPkg")
+                }
 
-                opLog("步骤3/7 恢复开始: $backupPath -> /data/data")
-                val restoreDataOk = backupExists && runSu("tar -xzf $backupPath -C /data/data")
-                opLog("步骤3/7 恢复结果: ${if (restoreDataOk) "success" else "failed"}")
+                opStep(if (skipPmClear) "第2步：检查备份文件" else "第3步：检查备份文件")
+                val backupExists = clearOk && runSu("test -f $qBackupPath")
 
-                opLog("步骤4/7 推导属主: stat -c '%u:%g' $sourceDir")
+                opStep(if (skipPmClear) "第3步：恢复账号数据" else "第4步：恢复账号数据")
+                val restoreDataOk = backupExists && runSu("tar -xzf $qBackupPath -C /data/data")
+
+                opStep(if (skipPmClear) "第4步：修复文件权限" else "第5步：修复文件权限")
                 val uidGid = if (restoreDataOk) {
                     runSuWithOutput("stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'")
                         ?.lineSequence()
@@ -820,48 +1364,42 @@ object AppCoordinator {
                 } else {
                     null
                 }
-                opLog("步骤4/7 推导结果: ${uidGid ?: "failed"}")
-
-                opLog("步骤5/7 修复属主: chown -R <uid:gid> $sourceDir")
                 val chownOk = restoreDataOk && !uidGid.isNullOrBlank() && runSu("chown -R $uidGid $sourceDir")
-                opLog("步骤5/7 属主结果: ${if (chownOk) "success" else "failed"}")
-
                 val hasRestorecon = chownOk && runSu("command -v restorecon >/dev/null 2>&1")
                 val restoreconOk = if (!chownOk) {
                     false
                 } else if (hasRestorecon) {
-                    opLog("步骤6/7 修复上下文: restorecon -RF $sourceDir")
                     runSu("restorecon -RF $sourceDir")
                 } else {
-                    opLog("步骤6/7 跳过上下文修复: restorecon 不存在")
                     true
                 }
-                if (hasRestorecon) {
-                    opLog("步骤6/7 上下文结果: ${if (restoreconOk) "success" else "failed"}")
-                }
-
-                opLog("步骤7/7 修复权限: chmod -R 700 $sourceDir")
                 val chmodOk = restoreconOk && runSu("chmod -R 700 $sourceDir")
-                opLog("步骤7/7 权限结果: ${if (chmodOk) "success" else "failed"}")
 
                 val restoreOk = restoreDataOk && chownOk && restoreconOk && chmodOk
-                opLog("结果回传: ${if (restoreOk) "success" else "failed"}")
+                opDone(
+                    restoreOk,
+                    if (skipPmClear) "切号：目标账号还原完成" else "还原完成",
+                    if (skipPmClear) "切号：目标账号还原失败" else "还原失败",
+                )
+
+                val restoreReport = mutableMapOf<String, Any>(
+                    "op_type" to "tiktok_restore",
+                    "device_id" to deviceId,
+                    "backup_name" to backupName,
+                    "backup_path" to backupPath,
+                    "source_dir" to sourceDir,
+                    "package_name" to packageName,
+                    "operation_logs" to operationLogs,
+                )
+                payload?.restore_highlight_row_index?.let { restoreReport["restore_highlight_row_index"] = it }
 
                 ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (restoreOk) "success" else "failed",
-                    message = if (restoreOk) "恢复完成" else "恢复失败",
-                    data = mapOf(
-                        "op_type" to "tiktok_restore",
-                        "device_id" to deviceId,
-                        "backup_name" to backupName,
-                        "backup_path" to backupPath,
-                        "source_dir" to sourceDir,
-                        "package_name" to packageName,
-                        "operation_logs" to operationLogs,
-                    ),
+                    message = if (restoreOk) "清理并还原完成" else "清理或还原失败",
+                    data = restoreReport,
                 )
             }
 
@@ -875,6 +1413,124 @@ object AppCoordinator {
                     message = "未知操作类型: ${op.op_type}",
                     data = mapOf("operation_logs" to operationLogs),
                 )
+            }
+        }
+        } finally {
+            ExecutionScope.exit()
+        }
+    }
+
+    private fun triggerMutualSwitchNow(alias: String, pauseCloudAutoStartForMutual: Boolean = false) {
+        if (mutualSwitchJob?.isActive == true) {
+            LogCenter.op(alias, "互点切换任务已在执行中，忽略重复触发")
+            return
+        }
+        mutualSwitchJob = scope.launch {
+            ExecutionScope.enter()
+            try {
+                if (pauseCloudAutoStartForMutual) {
+                    val did = PrefsStore.getDeviceId()
+                    val aid = PrefsStore.getAlias()
+                    if (!did.isNullOrBlank() && !aid.isNullOrBlank()) {
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                ApiService.reportDeviceAutoStartOptOut(deviceId = did, alias = aid, optOut = true)
+                            }
+                        }
+                        LogCenter.op(
+                            alias,
+                            "互点切换：已向服务端上报关闭本设备「自动开启程序」（opt_out=true）；互点会话结束后会再上报恢复",
+                        )
+                    }
+                }
+                val beforeRequested = PrefsStore.isMutualClickRequested()
+                val beforePending = PrefsStore.isMutualClickPending()
+                val beforeHardStop = PrefsStore.isHardStopRequested()
+                val beforeStatus = PrefsStore.getLocalStatus()
+                LogCenter.op(
+                    alias,
+                    "互点切换任务启动：requested=$beforeRequested pending=$beforePending hardStop=$beforeHardStop localStatus=$beforeStatus",
+                )
+                // 先打断当前用户名执行，避免与互点切换流程并发操作 TikTok
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                delay(120)
+                LogCenter.op(
+                    alias,
+                    "互点切换任务准备执行特殊用户名：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
+                )
+                val deviceId = PrefsStore.getDeviceId()
+                if (!deviceId.isNullOrBlank()) {
+                    fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL)
+                }
+                val switchResult = runCatching {
+                    executor.executeForUsername("__mutual_switch__", _config.value)
+                }.getOrElse {
+                    "互点流程切换异常：${it.message ?: "unknown"}"
+                }
+                if (!deviceId.isNullOrBlank()) {
+                    fetchConfig()
+                }
+                LogCenter.op(alias, switchResult)
+                updateRuntime(lastMessage = switchResult)
+                LogCenter.op(
+                    alias,
+                    "互点切换任务结束：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
+                )
+                if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
+                    LogCenter.op(alias, "互点切换结束后恢复拉取循环")
+                    startPullLoop()
+                }
+            } finally {
+                val wasQueued = PrefsStore.isPublishPostQueuedAfterMutual()
+                PrefsStore.setPublishPostQueuedAfterMutual(false)
+                if (wasQueued && PrefsStore.isPublishPostRequested() && PrefsStore.isPublishPostPending()) {
+                    LogCenter.op(alias, "互点会话已结束，开始执行此前排队的发作品入口任务")
+                    triggerPublishPostNow(alias)
+                }
+                ExecutionScope.exit()
+            }
+        }
+    }
+
+    private fun triggerPublishPostNow(alias: String) {
+        if (publishPostSwitchJob?.isActive == true) {
+            LogCenter.op(alias, "发作品切换任务已在执行中，忽略重复触发")
+            return
+        }
+        publishPostSwitchJob = scope.launch {
+            ExecutionScope.enter()
+            try {
+            val beforeRequested = PrefsStore.isPublishPostRequested()
+            val beforePending = PrefsStore.isPublishPostPending()
+            LogCenter.op(
+                alias,
+                "发作品切换任务启动：requested=$beforeRequested pending=$beforePending hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
+            )
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            delay(120)
+            LogCenter.op(
+                alias,
+                "发作品切换任务准备执行特殊用户名 __publish_post__：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}",
+            )
+            val switchResult = runCatching {
+                executor.executeForUsername("__publish_post__", _config.value)
+            }.getOrElse {
+                "发作品入口流程异常：${it.message ?: "unknown"}"
+            }
+            LogCenter.op(alias, switchResult)
+            updateRuntime(lastMessage = switchResult)
+            LogCenter.op(
+                alias,
+                "发作品切换任务结束：hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
+            )
+            if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
+                LogCenter.op(alias, "发作品切换结束后恢复拉取循环")
+                startPullLoop()
+            }
+            } finally {
+                ExecutionScope.exit()
             }
         }
     }
@@ -907,6 +1563,8 @@ object AppCoordinator {
 
         var successCount = 0
         var failedCount = 0
+        ExecutionScope.enter()
+        try {
         opLog("开始导入图库：共 ${mediaList.size} 个素材")
         mediaList.forEachIndexed { index, item ->
             val fileName = item.filename?.trim().takeUnless { it.isNullOrBlank() } ?: "image_${index + 1}.jpg"
@@ -989,14 +1647,45 @@ object AppCoordinator {
                 "operation_logs" to operationLogs,
             ),
         )
+        } finally {
+            ExecutionScope.exit()
+        }
+    }
+
+    /**
+     * 涨粉：模板 [AppConfig.growth_pull_batches_before_auto_mutual] ≥1 时，
+     * 每完成一整批「服务端拉取清单」内全部用户名（均已 [PrefsStore.markUsernameCompleted]）计 1；
+     * 累计达到阈值则等价于管理台「启动所选设备互点」：先上报云端关闭本机自动开启 → 互点会话 → 收尾再恢复自动开启。
+     */
+    private suspend fun evaluateGrowthAutoMutualAfterBatchIfNeeded(alias: String, deviceId: String) {
+        val threshold = _config.value.growth_pull_batches_before_auto_mutual
+        if (threshold < 1) return
+        if (PrefsStore.getDeviceRunMode() != ServerRunMode.GROWTH) return
+        if (mutualSwitchJob?.isActive == true) return
+        if (!PrefsStore.tryConsumeCompletedPullBatchForAutoMutualStat()) return
+        val n = PrefsStore.incrementGrowthBatchesTowardAutoMutual()
+        LogCenter.op(alias, "涨粉：本拉取清单已全部执行完毕 → 自动互点批计数 $n / $threshold")
+        if (n < threshold) return
+        PrefsStore.resetGrowthBatchesTowardAutoMutual()
+        LogCenter.op(
+            alias,
+            "涨粉：已连续 $threshold 批拉取清单全部执行完毕，自动进入互点（关云端自动开启 → 互点 → 结束后恢复）",
+        )
+        PrefsStore.setMutualCommentOnlySession(false)
+        PrefsStore.setMutualClickRequested(true)
+        PrefsStore.setMutualClickPending(true)
+        PrefsStore.setHardStopRequested(false)
+        updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = "涨粉批阈值已达，自动互点即将开始")
+        triggerMutualSwitchNow(alias, pauseCloudAutoStartForMutual = true)
     }
 
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {
-        fetchConfig()
+        ExecutionScope.enter()
+        try {
         val runMode = _config.value.run_mode.trim().lowercase()
         // 涨粉、直客：失败后不重试；主播 live：保留重试。
         val maxAttempts =
-            if (runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.DIRECT) 1 else 3
+            if (runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL || runMode == ServerRunMode.DIRECT) 1 else 3
         var lastMessage = ""
         var success = false
 
@@ -1009,18 +1698,17 @@ object AppCoordinator {
                 lastMessage = result.getOrNull().orEmpty()
                 val isNoVideosCompleted = lastMessage.contains("目标用户无作品")
                 if (isNoVideosCompleted) {
-                    LogCenter.op(alias, "任务完成（无作品）：$username")
-                    LogCenter.op(alias, lastMessage)
+                    LogCenter.op(alias, "任务完成（无作品）：$username — $lastMessage")
                     PrefsStore.markUsernameCompleted(username)
                     completedTracker.add(username)
                     success = true
+                    evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
                     break
                 }
 
                 val isFailedResult = lastMessage.startsWith("失败：") || lastMessage.contains("执行失败") || lastMessage.contains("异常")
                 if (isFailedResult) {
-                    LogCenter.op(alias, "任务失败：$username（第 $attempt/$maxAttempts 次）")
-                    LogCenter.op(alias, lastMessage)
+                    LogCenter.op(alias, "任务失败：$username（第 $attempt/$maxAttempts 次）— $lastMessage")
                     failedTracker.add("$username | $lastMessage")
                     if (attempt == maxAttempts) {
                         break
@@ -1028,11 +1716,11 @@ object AppCoordinator {
                     continue
                 }
 
-                LogCenter.op(alias, "任务成功：$username")
-                LogCenter.op(alias, lastMessage)
+                LogCenter.op(alias, "任务成功：$username — $lastMessage")
                 PrefsStore.markUsernameCompleted(username)
                 completedTracker.add(username)
                 success = true
+                evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
                 if (runMode == ServerRunMode.LIVE || runMode == ServerRunMode.DIRECT) {
                     LogCenter.op(alias, "已回 Users，继续下一名用户")
                 }
@@ -1079,21 +1767,25 @@ object AppCoordinator {
         if (success) {
             updateRuntime(lastMessage = "用户名 $username 已完成")
             // 涨粉模式：队列在拉取时已从服务端删除，无需再上报每条执行结果。
-            if (runMode != ServerRunMode.GROWTH) {
+            if (runMode != ServerRunMode.GROWTH && runMode != ServerRunMode.MUTUAL) {
                 reportWithRetry(lastMessage)
             }
             return
         }
 
         updateRuntime(lastMessage = "用户名 $username 执行异常")
-        if (runMode != ServerRunMode.GROWTH) {
+        if (runMode != ServerRunMode.GROWTH && runMode != ServerRunMode.MUTUAL) {
             reportWithRetry(lastMessage)
         }
 
-        if (runMode == ServerRunMode.GROWTH) {
-            LogCenter.op(alias, "涨粉：跳过失败用户，继续下一个")
+        if (runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) {
+            val qLabel = if (runMode == ServerRunMode.MUTUAL) "互点（mobile 队列）" else "涨粉"
+            LogCenter.op(alias, "$qLabel：跳过失败用户，继续下一个")
         } else {
             LogCenter.op(alias, "主播/直客：本用户失败，将按策略重试或跳过")
+        }
+        } finally {
+            ExecutionScope.exit()
         }
     }
 
@@ -1172,6 +1864,68 @@ object AppCoordinator {
 
     fun isManualPaused(): Boolean = manuallyPaused
 
+    fun requestMutualClickSwitch() {
+        PrefsStore.setMutualCommentOnlySession(false)
+        PrefsStore.setMutualClickRequested(true)
+        PrefsStore.setMutualClickPending(true)
+        PrefsStore.setHardStopRequested(false)
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(
+            localStatus = "running",
+            hardStopRequested = false,
+            lastMessage = "已收到互点切换指令，等待当前任务到达合适停止点",
+        )
+        LogCenter.op(
+            PrefsStore.getAlias() ?: "unknown",
+            "互点请求已登记：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
+        )
+    }
+
+    fun shouldSwitchToMutualClick(): Boolean = PrefsStore.isMutualClickRequested() && PrefsStore.isMutualClickPending()
+
+    fun markMutualClickSwitched() {
+        PrefsStore.clearMutualClickState()
+        PrefsStore.setMutualCommentOnlySession(false)
+    }
+
+    /**
+     * 用户从主界面请求「硬停」：不在协程安全点外杀进程；通过 [TraceExecutor] 内硬停检查在合适位置结束；
+     * 暂停用户名拉取；保留 [startCheckLoop] 与设备指令轮询；并向云端同步 paused + 关闭本机「自动开启程序」。
+     */
+    fun requestUserGracefulHardStop() {
+        val deviceId = PrefsStore.getDeviceId()
+        val alias = PrefsStore.getAlias()
+        PrefsStore.setHardStopRequested(true)
+        manuallyPaused = false
+        started.set(false)
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(
+            localStatus = "paused",
+            hardStopRequested = true,
+            lastMessage = "已请求硬停：当前步骤结束后停止自动任务，仍监听云端",
+            serviceRunning = WorkerServiceTracker.isRunning,
+        )
+        if (startPollJob?.isActive != true) {
+            startCheckLoop()
+        }
+        ensureDeviceOpsLoopIfBound()
+        scope.launch {
+            if (deviceId.isNullOrBlank() || alias.isNullOrBlank()) return@launch
+            runCatching {
+                ApiService.syncStatus(deviceId, alias, "paused")
+            }.onFailure { err ->
+                LogCenter.op(alias, "硬停：同步 paused 到云端失败：${err.message}")
+            }
+            runCatching {
+                ApiService.reportDeviceAutoStartOptOut(deviceId, alias, true)
+            }.onFailure { err ->
+                LogCenter.op(alias, "硬停：上报云端关闭自动开启失败：${err.message}")
+            }.onSuccess {
+                LogCenter.op(alias, "硬停：已向云端上报关闭本设备自动开启程序（opt_out=true）")
+            }
+        }
+    }
+
     fun stopAllWork(requestHardStop: Boolean = true) {
         // 注意：服务销毁(onDestroy)也会走到这里；避免在“正在重启服务”场景把硬停标记回写为 true。
         if (requestHardStop) {
@@ -1237,6 +1991,12 @@ object AppCoordinator {
             currentServerUrl = ApiService.getBaseUrl(),
             hardStopRequested = PrefsStore.isHardStopRequested(),
         )
+        if (WorkerServiceTracker.isRunning && PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.isBound()) {
+            if (startPollJob?.isActive != true) {
+                startCheckLoop()
+            }
+            ensureDeviceOpsLoopIfBound()
+        }
         if (WorkerServiceTracker.isRunning && !PrefsStore.isHardStopRequested() && !manuallyPaused) {
             ensureLoopsRunning()
         }

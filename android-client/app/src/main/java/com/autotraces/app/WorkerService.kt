@@ -18,20 +18,23 @@ class WorkerService : Service() {
     override fun onCreate() {
         super.onCreate()
         NotificationHelper.ensureChannel(this)
-        if (PrefsStore.isHardStopRequested()) {
-            AppCoordinator.onWorkerServiceChanged(false)
+        if (PrefsStore.isMutualClickRequested()) {
+            PrefsStore.setMutualClickPending(true)
             AppCoordinator.refreshRuntimeSnapshot()
-            LogCenter.op(PrefsStore.getAlias(), "检测到硬停止标记，拒绝启动后台服务")
-            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-            runCatching { stopSelf() }
-            return
+            LogCenter.op(PrefsStore.getAlias(), "检测到互点待执行标记，等待任务进入合适的停止点")
         }
         WorkerServiceTracker.isRunning = true
         AppCoordinator.onWorkerServiceChanged(true)
         AppCoordinator.startIfNeeded()
+        val notifyText =
+            if (PrefsStore.isHardStopRequested()) {
+                "硬停中：已暂停自动任务，仍监听云端指令"
+            } else {
+                "后台轮询与状态同步中"
+            }
         startForeground(
             NotificationHelper.NOTIFICATION_ID,
-            NotificationHelper.buildForegroundNotification(this, "后台轮询与状态同步中"),
+            NotificationHelper.buildForegroundNotification(this, notifyText),
         )
         LogCenter.op(PrefsStore.getAlias(), "后台服务已启动")
     }
@@ -42,13 +45,17 @@ class WorkerService : Service() {
             stopImmediate()
             return START_NOT_STICKY
         }
-        if (PrefsStore.isHardStopRequested()) {
-            LogCenter.op(PrefsStore.getAlias(), "硬停止态中，忽略启动意图")
-            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-            runCatching { stopSelf() }
-            return START_NOT_STICKY
-        }
         AppCoordinator.startIfNeeded()
+        val notifyText =
+            if (PrefsStore.isHardStopRequested()) {
+                "硬停中：已暂停自动任务，仍监听云端指令"
+            } else {
+                "后台轮询与状态同步中"
+            }
+        startForeground(
+            NotificationHelper.NOTIFICATION_ID,
+            NotificationHelper.buildForegroundNotification(this, notifyText),
+        )
         return START_STICKY
     }
 
@@ -72,10 +79,16 @@ class WorkerService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        /** 仅拉起前台服务，不修改硬停标记。硬停期间仍需轮询时请用此方法。 */
         fun start(context: Context) {
-            PrefsStore.setHardStopRequested(false)
             val intent = Intent(context, WorkerService::class.java)
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        /** 用户主动恢复自动化：解除硬停并启动后台服务。 */
+        fun startResumingAutomation(context: Context) {
+            PrefsStore.setHardStopRequested(false)
+            start(context)
         }
 
         fun stop(context: Context) {

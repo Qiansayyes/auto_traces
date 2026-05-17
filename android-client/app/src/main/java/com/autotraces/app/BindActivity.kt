@@ -6,6 +6,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.autotraces.app.databinding.ActivityBindBinding
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class BindActivity : AppCompatActivity() {
     private lateinit var binding: ActivityBindBinding
@@ -31,23 +32,38 @@ class BindActivity : AppCompatActivity() {
         binding.statusText.text = "正在绑定..."
 
         lifecycleScope.launch {
-            runCatching {
-                ApiService.bindDevice(alias, DeviceFingerprint.fromContext(this@BindActivity))
-            }.onSuccess { response ->
-                if (response.code == 0 && !response.device_id.isNullOrBlank()) {
-                    PrefsStore.saveBinding(response.device_id, alias)
-                    PrefsStore.markBindingRefreshedNow()
-                    LogCenter.op(alias, "绑定成功：${response.device_id}")
-                    AppCoordinator.syncOnline()
-                    WorkerService.start(this@BindActivity)
-                    AppCoordinator.startIfNeeded()
-                    startActivity(Intent(this@BindActivity, MainActivity::class.java))
-                    finish()
-                } else {
-                    binding.statusText.text = response.msg
+            binding.bindButton.isEnabled = false
+            try {
+                val cappedMs = 40_000L
+                val boxed = withTimeoutOrNull(cappedMs) {
+                    runCatching {
+                        ApiService.bindDevice(alias, DeviceFingerprint.fromContext(this@BindActivity))
+                    }
                 }
-            }.onFailure {
-                binding.statusText.text = "绑定失败：${it.message}"
+                when {
+                    boxed == null ->
+                        binding.statusText.text =
+                            "绑定超时（${cappedMs / 1000}秒内无响应）。请在服务端确认是否有 POST /api/bind_device。"
+                    boxed.isFailure ->
+                        binding.statusText.text = "绑定失败：${boxed.exceptionOrNull()?.message}"
+                    else -> {
+                        val response = boxed.getOrThrow()
+                        if (response.code == 0 && !response.device_id.isNullOrBlank()) {
+                            PrefsStore.saveBinding(response.device_id, alias)
+                            PrefsStore.markBindingRefreshedNow()
+                            LogCenter.op(alias, "绑定成功：${response.device_id}")
+                            AppCoordinator.syncOnline()
+                            WorkerService.startResumingAutomation(this@BindActivity)
+                            AppCoordinator.startIfNeeded()
+                            startActivity(Intent(this@BindActivity, MainActivity::class.java))
+                            finish()
+                        } else {
+                            binding.statusText.text = response.msg
+                        }
+                    }
+                }
+            } finally {
+                binding.bindButton.isEnabled = true
             }
         }
     }

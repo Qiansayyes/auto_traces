@@ -1,8 +1,8 @@
 package com.autotraces.app.backup
 
 import android.content.Context
-import com.autotraces.app.AppConstants
 import com.autotraces.app.PrefsStore
+import com.autotraces.app.util.Config
 import com.autotraces.app.backup.db.AppDatabase
 import com.autotraces.app.backup.model.BackupRecord
 import com.autotraces.app.backup.network.BackupReporter
@@ -22,6 +22,10 @@ class BackupRepository(private val context: Context) {
     private val manager = AppDataBackupManager(context)
     private val reporter = BackupReporter()
 
+    /** 与远控下发 `package_name` 对齐；未传时用客户端 TikTok 常量（与后端默认一致）。 */
+    private fun resolvedDataPackage(packageName: String): String =
+        packageName.trim().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+
     private fun currentMeta(): RecordMeta {
         return RecordMeta(
             deviceAlias = PrefsStore.getAlias().orEmpty(),
@@ -32,11 +36,12 @@ class BackupRepository(private val context: Context) {
     }
 
     suspend fun backupLocal(accountName: String, packageName: String): BackupRecord {
-        val result = manager.backupAppData(accountName)
+        val pkg = resolvedDataPackage(packageName)
+        val result = manager.backupAppData(accountName, pkg)
         val meta = currentMeta()
         val record = BackupRecord(
             accountName = accountName,
-            packageName = packageName.ifBlank { AppConstants.APP_PACKAGE_NAME },
+            packageName = pkg,
             deviceAlias = meta.deviceAlias,
             deviceId = meta.deviceId,
             appAccount = meta.appAccount,
@@ -56,11 +61,12 @@ class BackupRepository(private val context: Context) {
     }
 
     suspend fun backupCloud(accountName: String, packageName: String): BackupRecord {
-        val result = manager.backupAppData(accountName)
+        val pkg = resolvedDataPackage(packageName)
+        val result = manager.backupAppData(accountName, pkg)
         val meta = currentMeta()
         val initialRecord = BackupRecord(
             accountName = accountName,
-            packageName = packageName.ifBlank { AppConstants.APP_PACKAGE_NAME },
+            packageName = pkg,
             deviceAlias = meta.deviceAlias,
             deviceId = meta.deviceId,
             appAccount = meta.appAccount,
@@ -98,11 +104,12 @@ class BackupRepository(private val context: Context) {
     }
 
     suspend fun restore(accountName: String, zipPath: String, packageName: String): BackupRecord {
-        val result = manager.restoreAppData(zipPath)
+        val pkg = resolvedDataPackage(packageName)
+        val result = manager.restoreAppData(zipPath, pkg)
         val meta = currentMeta()
         val record = BackupRecord(
             accountName = accountName,
-            packageName = packageName.ifBlank { AppConstants.APP_PACKAGE_NAME },
+            packageName = pkg,
             deviceAlias = meta.deviceAlias,
             deviceId = meta.deviceId,
             appAccount = meta.appAccount,

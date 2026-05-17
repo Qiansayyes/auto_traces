@@ -40,11 +40,19 @@ data class BaseResponse(
     val msg: String,
 )
 
+data class TikTokEmailCodeResponse(
+    val code: Int,
+    val msg: String,
+    val email_code: String? = null,
+)
+
 /** 与 web-admin `switchRunMode` / 服务端 `RunModeRequest` 一致，仅使用精确字面量比较，禁止 contains 模糊匹配。 */
 object ServerRunMode {
     const val GROWTH = "growth"
     const val LIVE = "live"
     const val DIRECT = "direct"
+    /** 互点：与 growth 同为 mobile 待下发队列；后台单独切模式并可在设备上由指令进入互点流程 */
+    const val MUTUAL = "mutual"
 }
 
 data class AppConfig(
@@ -70,7 +78,8 @@ data class AppConfig(
     val growth_post_check_after_tap_delay_ms: Long = 1000L,
     // growth 模式：第一次失败后，二次判定前等待多久（毫秒）
     val growth_post_second_check_delay_ms: Long = 650L,
-    val fans_per_break: Int = 5,
+    /** 单次拉取用户名数量，与模板键 pull_batch_size 一致，由云端运行配置下发 */
+    val pull_batch_size: Int = 5,
     val break_min: Int = 10,
     val break_max: Int = 20,
     val visit_delay_min: Double = 0.5,
@@ -81,6 +90,16 @@ data class AppConfig(
     val comment_prob: Double = 0.3,
     val favorite_prob: Double = 0.3,
     val share_prob: Double = 0.3,
+    // 互点 teamwork Videos：每「左+右各进作品一次」为 1 轮；轮与轮之间列表下滑约半屏换批。完整互点与此共用本上限（另受 mutual_follow_tap_session_limit 等约束）；历史「仅互点评论」指令仍生效但管理台已合并为单一启动入口。
+    val mutual_videos_scroll_rounds: Int = 5,
+    /** 完整互点：本会话内在粉丝列表中点击 Follow（按钮中心）的累计次数上限；达到后本会话内 teamwork Videos 剩余轮次仅执行点赞/收藏/互点评论，不再左滑与进入 Followers。 */
+    val mutual_follow_tap_session_limit: Int = 20,
+    /**
+     * 仅涨粉队列（设备 App 选择的 run_mode=growth）：连续多少「整批拉取的用户名在设备端全部执行完毕」后，自动进入与「启动所选设备互点」等价的互点会话。
+     * 触发顺序：向云端上报关闭本设备「自动开启程序」→ 互点 teamwork 流程 → 会话结束强停 TikTok 并再上报恢复自动开启。
+     * **-1** 或 **0**：永不自动切换；**≥1** 时生效。若某批内有用户名执行失败未标记完成，则该批不计入（直至该批被新拉取覆盖）。
+     */
+    val growth_pull_batches_before_auto_mutual: Int = -1,
     // 评论动作内部细分（文字）
     val comment_text_prob: Double = 0.7,
     // 每个动作每天的上限（默认 800）
@@ -94,6 +113,14 @@ data class AppConfig(
     val action_delay_min: Double = 0.7,
     val action_delay_max: Double = 1.2,
     val comment_texts: List<String> = listOf("hi", "moring", "so cute"),
+    val mutual_comment_texts: List<String> = listOf("hi", "moring", "so cute"),
+    /**
+     * 引流：TikTok 搜索框输入的关键词库（逗号/换行多条）；每次进入/恢复 Videos 标签流程时随机选一条。
+     * 为空则设备端回退为 "teamwork"（与旧版固定搜索一致）。
+     */
+    val mutual_traffic_target_texts: List<String> = listOf("teamwork"),
+    /** 远控「修改基本资料」：Bio 编辑时随机选用其一；逗号/换行分隔。缺省或 null 视为空列表（Bio 步会失败并提示配置）。 */
+    val profile_edit_bio_texts: List<String>? = null,
 )
 
 data class ConfigResponse(
@@ -110,6 +137,8 @@ data class CheckStartResponse(
     val status: String? = null,
     /** 云端「自动开启」策略；为 true 且本机未暂停时，设备应在未运行时自行拉起 */
     val auto_start: Boolean? = null,
+    /** 与 PrefsStore 中 last_applied_config_push_revision 对齐；管理台保存配置后服务端递增 */
+    val config_push_revision: Int? = null,
 )
 
 data class PullUsernameResponse(
@@ -141,6 +170,13 @@ data class DeviceOpPollRequest(
     val alias: String,
 )
 
+/** 与服务端 `MutualClickRequest` 及互点相关 admin 路由请求体一致。 */
+data class MutualClickRequest(
+    val device_id: String,
+    val alias: String,
+    val package_name: String,
+)
+
 data class DeviceOpPayload(
     val device_id: String? = null,
     val alias: String? = null,
@@ -148,6 +184,15 @@ data class DeviceOpPayload(
     val backup_name: String? = null,
     val backup_path: String? = null,
     val backup_record_id: Int? = null,
+    /** 重复备份时服务端下发的上一份设备端 tar 路径，成功后由设备 rm -f。 */
+    val previous_backup_path: String? = null,
+    /** 为 true 时还原前跳过 pm clear（切号流程：前序已备份并清理） */
+    val skip_pm_clear: Boolean? = null,
+    /** 切号：备份并清理成功回传后由云端写库；设备原样回传 */
+    val cut_switch_after_backup: String? = null,
+    val cut_switch_target_row_index: Int? = null,
+    /** 还原成功后云端要写切号高亮的 device_editor_rows.row_index */
+    val restore_highlight_row_index: Int? = null,
     val username: String? = null,
     val text: String? = null,
     val key_code: Int? = null,
@@ -198,6 +243,13 @@ data class DeviceAutoStartOptOutRequest(
     val opt_out: Boolean,
 )
 
+/** 设备鉴权：会话结束后将云端「自动开启程序」恢复为开启（opt_out=false）。 */
+data class ReportDeviceAutoStartOptOutRequest(
+    val device_id: String,
+    val alias: String,
+    val opt_out: Boolean,
+)
+
 data class DeviceAutoStartOptOutResponse(
     val code: Int,
     val msg: String,
@@ -237,11 +289,14 @@ data class DeviceEditorRowRecord(
     val ip: String? = null,
     val region: String? = null,
     val username: String? = null,
+    val assigned_alias: String? = null,
     val backup_path: String? = null,
     val backup_name: String? = null,
     val backup_time: String? = null,
     val backup_status: String? = null,
     val remark: String? = null,
+    /** 切号高亮：「是」或「否」 */
+    val switch_highlight: String? = null,
 )
 
 data class DeviceEditorRowsResponse(
@@ -263,6 +318,8 @@ data class AccountEditorRowRecord(
     val video_count: String? = null,
     val follower_count: String? = null,
     val follower_growth: String? = null,
+    /** 「是」表示已在设备/线下完成 TikTok 基本资料修改；「否」为默认。 */
+    val basic_profile_modified: String? = null,
 )
 
 data class AccountEditorRowsResponse(
@@ -280,4 +337,17 @@ data class RuntimeState(
     val effectiveTemplate: String = "",
     val lastMessage: String = "等待初始化",
     val hardStopRequested: Boolean = false,
+)
+
+data class ReportMutualCopiedUsernameRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+)
+
+data class ReportMutualCopiedUsernameResponse(
+    val code: Int,
+    val msg: String,
+    val username: String? = null,
+    val usage_count: Int? = null,
 )

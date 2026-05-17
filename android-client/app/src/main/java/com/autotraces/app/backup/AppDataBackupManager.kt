@@ -2,58 +2,76 @@ package com.autotraces.app.backup
 
 import android.content.Context
 import android.util.Log
+import com.autotraces.app.util.Config
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
 
 /**
- * 应用数据本地备份/恢复工具。
+ * 通过 Root 对**指定包**的 `/data/data/<包名>` 做备份/恢复。
  *
- * 这个版本统一改成 Root + tar 的实现：
- * - 备份时通过 su 调用 tar 打包当前 App 私有目录
- * - 恢复时通过 su 调用 tar 解包回当前 App 私有目录
- * - 备份范围统一排除 cache
- *
- * 说明：
- * - 这里只适用于你自己拥有或明确授权的 App
- * - 需要设备已 Root，并且 su 可用
+ * - **包名**由调用方传入（与远控 `package_name`、后端下发一致）；空则默认 [Config.TIKTOK_PACKAGE_NAME]。
+ * - **备份**：`am force-stop` 目标包 → [DeviceBackupShell.tiktokStyleDataTarCommand] 写入 [UnifiedBackupPaths] →
+ *   若目标包 ≠ 本应用宿主包，则 `pm clear` 目标包（与远控「备份并清理」一致；备份文件在宿主外置目录，不会被 clear 掉）。
+ * - **恢复**：目标为宿主包时在本包 `dataDir` 内解压；否则与远控 `tiktok_restore` 相同（解压到 `/data/data` 后 chown / restorecon / chmod）。
  */
 class AppDataBackupManager(private val context: Context) {
 
-    fun backupAppData(accountName: String): BackupResult {
+    fun backupAppData(accountName: String, dataPackageName: String): BackupResult {
         return try {
-            val backupDir = File(context.getExternalFilesDir(null), "backups")
-            if (!backupDir.exists()) backupDir.mkdirs()
+            val pkg = dataPackageName.trim().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+            val hostPkg = context.packageName
 
-            val dataDir = File(context.applicationInfo.dataDir)
-            val parentDir = dataDir.parentFile ?: throw IllegalStateException("Missing parent dir for ${dataDir.absolutePath}")
-            val packageName = dataDir.name
+            val backupRoot = UnifiedBackupPaths.ensureBackupsDir(context)
+            val qBackupDir = DeviceBackupShell.shellQuote(backupRoot.absolutePath)
             val filename = "backup_${accountName}_${System.currentTimeMillis()}.tar.gz"
-            val outFile = File(backupDir, filename)
+            val outFile = File(backupRoot, filename)
+            val qOut = DeviceBackupShell.shellQuote(outFile.absolutePath)
 
             if (outFile.exists()) outFile.delete()
 
-            val command = buildString {
-                append("cd ")
-                append(shellQuote(parentDir.absolutePath))
-                append(" && find ")
-                append(shellQuote(packageName))
-                append(" \\( -type f -o -type l \\) ! -path '*/cache/*' ! -path '*/code_cache/*' ! -path '*/no_backup/*' -print0 | tar -czf ")
-                append(shellQuote(outFile.absolutePath))
-                append(" --null -T -")
+            val archiveCmd = buildString {
+                append("am force-stop ")
+                append(DeviceBackupShell.shellQuote(pkg))
+                append(" && ")
+                append(
+                    DeviceBackupShell.tiktokStyleDataTarCommand(
+                        dataPackageName = pkg,
+                        quotedBackupDir = qBackupDir,
+                        quotedOutputTarPath = qOut,
+                    ),
+                )
             }
 
-            val result = runAsRoot(command)
+            val result = runAsRoot(archiveCmd)
             if (result.exitCode != 0 || !outFile.exists()) {
                 return BackupResult(
                     success = false,
                     path = outFile.absolutePath,
                     filename = filename,
                     exitCode = result.exitCode,
-                    command = command,
+                    command = archiveCmd,
                     output = result.output,
                     message = "tar backup failed: exit=${result.exitCode}; ${result.output.ifBlank { "no output" }}",
                 )
+            }
+
+            var fullCommand = archiveCmd
+            if (pkg != hostPkg) {
+                val clearCmd = "pm clear ${DeviceBackupShell.shellQuote(pkg)}"
+                val clearRes = runAsRoot(clearCmd)
+                fullCommand = "$archiveCmd ; $clearCmd"
+                if (clearRes.exitCode != 0) {
+                    return BackupResult(
+                        success = false,
+                        path = outFile.absolutePath,
+                        filename = filename,
+                        exitCode = clearRes.exitCode,
+                        command = fullCommand,
+                        output = clearRes.output,
+                        message = "backup tar ok but pm clear failed: exit=${clearRes.exitCode}; ${clearRes.output.ifBlank { "no output" }}",
+                    )
+                }
             }
 
             BackupResult(
@@ -61,7 +79,7 @@ class AppDataBackupManager(private val context: Context) {
                 path = outFile.absolutePath,
                 filename = filename,
                 checksum = sha256(outFile),
-                command = command,
+                command = fullCommand,
                 output = result.output,
                 message = "backup completed",
             )
@@ -76,8 +94,10 @@ class AppDataBackupManager(private val context: Context) {
         }
     }
 
-    fun restoreAppData(zipPath: String): BackupResult {
+    fun restoreAppData(zipPath: String, dataPackageName: String): BackupResult {
         return try {
+            val pkg = dataPackageName.trim().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+            val hostPkg = context.packageName
             val backupFile = File(zipPath)
             if (!backupFile.exists()) {
                 return BackupResult(
@@ -88,55 +108,10 @@ class AppDataBackupManager(private val context: Context) {
                 )
             }
 
-            val dataDir = File(context.applicationInfo.dataDir)
-            val parentDir = dataDir.parentFile ?: throw IllegalStateException("Missing parent dir for ${dataDir.absolutePath}")
-            val packageName = dataDir.name
-
-            val command = buildString {
-                append("am force-stop ")
-                append(shellQuote(packageName))
-                append(" && tar -xzf ")
-                append(shellQuote(backupFile.absolutePath))
-                append(" -C ")
-                append(shellQuote(parentDir.absolutePath))
+            if (pkg == hostPkg) {
+                return restoreHostSelf(backupFile, pkg)
             }
-
-            val result = runAsRoot(command)
-            if (result.exitCode != 0) {
-                return BackupResult(
-                    success = false,
-                    path = backupFile.absolutePath,
-                    filename = backupFile.name,
-                    exitCode = result.exitCode,
-                    command = command,
-                    output = result.output,
-                    message = "tar restore failed: exit=${result.exitCode}; ${result.output.ifBlank { "no output" }}",
-                )
-            }
-
-            val chmodCommand = "chmod -R 700 ${shellQuote(dataDir.absolutePath)}"
-            val chmodResult = runAsRoot(chmodCommand)
-            if (chmodResult.exitCode != 0) {
-                return BackupResult(
-                    success = false,
-                    path = backupFile.absolutePath,
-                    filename = backupFile.name,
-                    exitCode = chmodResult.exitCode,
-                    command = "$command && $chmodCommand",
-                    output = chmodResult.output,
-                    message = "restore completed but chmod failed: exit=${chmodResult.exitCode}; ${chmodResult.output.ifBlank { "no output" }}",
-                )
-            }
-
-            BackupResult(
-                success = true,
-                path = backupFile.absolutePath,
-                filename = backupFile.name,
-                checksum = sha256(backupFile),
-                command = command,
-                output = result.output,
-                message = "restore completed for $packageName",
-            )
+            return restoreThirdPartyApp(backupFile, pkg)
         } catch (e: Exception) {
             Log.e("AppDataBackupManager", "restore failed", e)
             BackupResult(
@@ -146,6 +121,166 @@ class AppDataBackupManager(private val context: Context) {
                 message = e.message ?: "unknown error",
             )
         }
+    }
+
+    private fun restoreHostSelf(backupFile: File, pkg: String): BackupResult {
+        val dataDir = File(context.applicationInfo.dataDir)
+        val command = buildString {
+            append("am force-stop ")
+            append(DeviceBackupShell.shellQuote(pkg))
+            append(" && cd ")
+            append(DeviceBackupShell.shellQuote(dataDir.absolutePath))
+            append(" && tar -xzf ")
+            append(DeviceBackupShell.shellQuote(backupFile.absolutePath))
+        }
+
+        val result = runAsRoot(command)
+        if (result.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = result.exitCode,
+                command = command,
+                output = result.output,
+                message = "tar restore failed: exit=${result.exitCode}; ${result.output.ifBlank { "no output" }}",
+            )
+        }
+
+        val chmodCommand = "chmod -R 700 ${DeviceBackupShell.shellQuote(dataDir.absolutePath)}"
+        val chmodResult = runAsRoot(chmodCommand)
+        if (chmodResult.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = chmodResult.exitCode,
+                command = "$command ; $chmodCommand",
+                output = chmodResult.output,
+                message = "restore completed but chmod failed: exit=${chmodResult.exitCode}; ${chmodResult.output.ifBlank { "no output" }}",
+            )
+        }
+
+        return BackupResult(
+            success = true,
+            path = backupFile.absolutePath,
+            filename = backupFile.name,
+            checksum = sha256(backupFile),
+            command = "$command ; $chmodCommand",
+            output = result.output,
+            message = "restore completed for $pkg",
+        )
+    }
+
+    private fun restoreThirdPartyApp(backupFile: File, pkg: String): BackupResult {
+        val qBak = DeviceBackupShell.shellQuote(backupFile.absolutePath)
+        val sourceDir = "/data/data/$pkg"
+        val qSource = DeviceBackupShell.shellQuote(sourceDir)
+
+        val stopCmd = "am force-stop ${DeviceBackupShell.shellQuote(pkg)}"
+        val stopRes = runAsRoot(stopCmd)
+        if (stopRes.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = stopRes.exitCode,
+                command = stopCmd,
+                output = stopRes.output,
+                message = "am force-stop failed: exit=${stopRes.exitCode}",
+            )
+        }
+
+        val tarCmd = "test -f $qBak && tar -xzf $qBak -C /data/data"
+        val tarRes = runAsRoot(tarCmd)
+        if (tarRes.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = tarRes.exitCode,
+                command = "$stopCmd ; $tarCmd",
+                output = tarRes.output,
+                message = "tar restore failed: exit=${tarRes.exitCode}; ${tarRes.output.ifBlank { "no output" }}",
+            )
+        }
+
+        val statCmd =
+            "stat -c '%u:%g' $qSource 2>/dev/null || ls -ldn $qSource 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'"
+        val statOut = runAsRootWithOutput(statCmd)
+        val uidGid = statOut.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.contains(":") }
+
+        if (uidGid.isNullOrBlank()) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                command = "$stopCmd ; $tarCmd ; $statCmd",
+                output = statOut,
+                message = "restore tar ok but failed to resolve uid:gid for $sourceDir",
+            )
+        }
+
+        val chownCmd = "chown -R $uidGid $qSource"
+        val chownRes = runAsRoot(chownCmd)
+        if (chownRes.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = chownRes.exitCode,
+                command = "$stopCmd ; $tarCmd ; $chownCmd",
+                output = chownRes.output,
+                message = "chown failed: exit=${chownRes.exitCode}",
+            )
+        }
+
+        val hasRc = runAsRoot("command -v restorecon >/dev/null 2>&1").exitCode == 0
+        val restoreconCmd = "restorecon -RF $qSource"
+        val restoreconRes = if (hasRc) runAsRoot(restoreconCmd) else RootCommandResult(0, "")
+        if (hasRc && restoreconRes.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = restoreconRes.exitCode,
+                command = "$stopCmd ; $tarCmd ; $chownCmd ; $restoreconCmd",
+                output = restoreconRes.output,
+                message = "restorecon failed: exit=${restoreconRes.exitCode}",
+            )
+        }
+
+        val chmodCmd = "chmod -R 700 $qSource"
+        val chmodRes = runAsRoot(chmodCmd)
+        if (chmodRes.exitCode != 0) {
+            return BackupResult(
+                success = false,
+                path = backupFile.absolutePath,
+                filename = backupFile.name,
+                exitCode = chmodRes.exitCode,
+                command = "$stopCmd ; $tarCmd ; $chownCmd ; $chmodCmd",
+                output = chmodRes.output,
+                message = "chmod failed: exit=${chmodRes.exitCode}",
+            )
+        }
+
+        val joined = buildString {
+            append(stopCmd).append(" ; ").append(tarCmd).append(" ; ").append(chownCmd)
+            if (hasRc) append(" ; ").append(restoreconCmd)
+            append(" ; ").append(chmodCmd)
+        }
+
+        return BackupResult(
+            success = true,
+            path = backupFile.absolutePath,
+            filename = backupFile.name,
+            checksum = sha256(backupFile),
+            command = joined,
+            output = tarRes.output,
+            message = "restore completed for $pkg",
+        )
     }
 
     private fun runAsRoot(command: String): RootCommandResult {
@@ -163,8 +298,14 @@ class AppDataBackupManager(private val context: Context) {
         )
     }
 
-    private fun shellQuote(value: String): String {
-        return "'${value.replace("'", "'\\''")}'"
+    private fun runAsRootWithOutput(command: String): String {
+        val process = ProcessBuilder("su", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+        val output = ByteArrayOutputStream()
+        process.inputStream.use { input -> input.copyTo(output) }
+        process.waitFor()
+        return output.toString().trim()
     }
 
     private fun sha256(file: File): String {

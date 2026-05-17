@@ -12,12 +12,15 @@ object PrefsStore {
     private const val KEY_DEVICE_ALIAS = "device_alias"
     private const val KEY_LOCAL_STATUS = "local_status"
     private const val KEY_SERVER_BASE_URL = "server_base_url"
-    private const val KEY_PULL_COUNT = "pull_count"
-    /** 与设置页「每次拉取数量」范围一致（1～10）；未保存时使用该默认值 */
-    private const val DEFAULT_PULL_COUNT = 10
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
     private const val KEY_BATCH_COMPLETED = "batch_completed"
+    /** 每次 [savePulledBatch] 后递增，标记「当前拉取清单」代数（用于整批完成去重） */
+    private const val KEY_PULL_BATCH_SEQ = "pull_batch_seq"
+    /** 已计入「涨粉整批完成→自动互点」累加器的拉取序号 */
+    private const val KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ = "last_attributed_pull_batch_seq"
+    /** 已连续完成多少整批拉取清单（向模板 growth_pull_batches_before_auto_mutual 对齐） */
+    private const val KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL = "growth_batches_toward_auto_mutual"
     /** 上次向服务端校验绑定的时间；用于避免每次回到前台都请求 bindDevice。 */
     private const val KEY_LAST_BIND_REFRESH_MS = "last_bind_refresh_ms"
     /** 设备端选择的任务队列/运行模式，与 get_config/pull_username 的 run_mode 参数一致 */
@@ -26,11 +29,54 @@ object PrefsStore {
     private const val KEY_AUTH_USERNAME = "auth_username"
     private const val KEY_AUTH_PASSWORD = "auth_password"
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
+    private const val KEY_MUTUAL_CLICK_REQUESTED = "mutual_click_requested"
+    private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
+    /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
+    private const val KEY_MUTUAL_COMMENT_ONLY_SESSION = "mutual_comment_only_session"
+    /** 管理台「发布作品」设备任务：与互点类似 requested+pending；互点会话进行中时置 queued_after_mutual */
+    private const val KEY_PUBLISH_POST_REQUESTED = "publish_post_requested"
+    private const val KEY_PUBLISH_POST_PENDING = "publish_post_pending"
+    private const val KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL = "publish_post_queued_after_mutual"
+    /** 下发 publish_post_start 时写入，供 TraceExecutor 内 `__publish_post__` 使用（包名来自 payload） */
+    private const val KEY_PUBLISH_POST_PACKAGE = "publish_post_package_name"
+    /**
+     * 发作品：首条「Post Now / Don't allow / 底部 Cancel」权限类 OCR 按设备别名按自然日只跑一轮。
+     * 值为上次完成该组操作的 yyyyMMdd（[Locale.US]）。
+     */
+    private const val KEY_PUBLISH_POST_FIRST_DAILY_PERM_OCR_DAY_PREFIX = "publish_post_first_daily_perm_ocr_day_"
+    /**
+     * 发作品断点续发：按账号键记录「下一条要发的 0-based 序号」（= 已成功条数）。
+     * 第 N 条失败时不递增，下次仍从第 N+1 个图库坐标继续。
+     */
+    private const val KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX = "publish_post_resume_next_index_"
+    /** 与 check_start.config_push_revision 对齐；管理台「保存并下发」后服务端递增，本机成功拉取配置后写入 */
+    private const val KEY_LAST_APPLIED_CONFIG_PUSH_REVISION = "last_applied_config_push_revision"
+    /**
+     * 与设备编辑表「切号高亮」及本机分配账号下拉当前选中一致，用于本地 txt 日志行首 username。
+     */
+    private const val KEY_LOG_CONTEXT_USERNAME = "log_context_username"
 
+    private lateinit var appContext: Context
     private lateinit var prefs: SharedPreferences
 
     fun init(context: Context) {
-        prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        appContext = context.applicationContext
+        prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun applicationContext(): Context = appContext
+
+    /** 当前写入本地设备日志时使用的 TikTok username（可为空，文件里会写为 `-`）。 */
+    fun getLogContextUsername(): String? =
+        prefs.getString(KEY_LOG_CONTEXT_USERNAME, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setLogContextUsername(username: String?) {
+        val v = username?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_LOG_CONTEXT_USERNAME).apply()
+        } else {
+            prefs.edit().putString(KEY_LOG_CONTEXT_USERNAME, v).apply()
+        }
     }
 
     fun saveBinding(deviceId: String, alias: String) {
@@ -46,6 +92,8 @@ object PrefsStore {
             .remove(KEY_DEVICE_ALIAS)
             .putString(KEY_LOCAL_STATUS, "online")
             .putLong(KEY_LAST_BIND_REFRESH_MS, 0L)
+            .remove(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION)
+            .remove(KEY_LOG_CONTEXT_USERNAME)
             .apply()
     }
 
@@ -65,8 +113,7 @@ object PrefsStore {
     fun clearAuth() {
         prefs.edit()
             .remove(KEY_AUTH_TOKEN)
-            .remove(KEY_AUTH_USERNAME)
-            .remove(KEY_AUTH_PASSWORD)
+            .remove(KEY_LOG_CONTEXT_USERNAME)
             .apply()
     }
 
@@ -75,6 +122,112 @@ object PrefsStore {
     }
 
     fun isHardStopRequested(): Boolean = prefs.getBoolean(KEY_HARD_STOP_REQUESTED, false)
+
+    fun setMutualClickRequested(requested: Boolean) {
+        prefs.edit().putBoolean(KEY_MUTUAL_CLICK_REQUESTED, requested).apply()
+    }
+
+    fun isMutualClickRequested(): Boolean = prefs.getBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
+
+    fun setMutualClickPending(pending: Boolean) {
+        prefs.edit().putBoolean(KEY_MUTUAL_CLICK_PENDING, pending).apply()
+    }
+
+    fun isMutualClickPending(): Boolean = prefs.getBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+
+    fun setMutualCommentOnlySession(active: Boolean) {
+        prefs.edit().putBoolean(KEY_MUTUAL_COMMENT_ONLY_SESSION, active).apply()
+    }
+
+    fun isMutualCommentOnlySession(): Boolean = prefs.getBoolean(KEY_MUTUAL_COMMENT_ONLY_SESSION, false)
+
+    fun setPublishPostRequested(requested: Boolean) {
+        prefs.edit().putBoolean(KEY_PUBLISH_POST_REQUESTED, requested).apply()
+    }
+
+    fun isPublishPostRequested(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_REQUESTED, false)
+
+    fun setPublishPostPending(pending: Boolean) {
+        prefs.edit().putBoolean(KEY_PUBLISH_POST_PENDING, pending).apply()
+    }
+
+    fun isPublishPostPending(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_PENDING, false)
+
+    fun setPublishPostQueuedAfterMutual(queued: Boolean) {
+        prefs.edit().putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, queued).apply()
+    }
+
+    fun isPublishPostQueuedAfterMutual(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
+
+    fun setPublishPostPackageName(packageName: String?) {
+        val v = packageName?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_PUBLISH_POST_PACKAGE).apply()
+        } else {
+            prefs.edit().putString(KEY_PUBLISH_POST_PACKAGE, v).apply()
+        }
+    }
+
+    fun getPublishPostPackageName(): String? =
+        prefs.getString(KEY_PUBLISH_POST_PACKAGE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun publishPostPermOcrPrefsKeyForAlias(alias: String): String =
+        KEY_PUBLISH_POST_FIRST_DAILY_PERM_OCR_DAY_PREFIX + alias.trim().lowercase(Locale.US)
+
+    /** 今日是否仍需在「该账号当天首条作品」上跑 Post Now / Don't allow / Cancel 三段 OCR。 */
+    fun shouldRunPublishPostFirstDailyPermissionOcr(alias: String): Boolean {
+        val a = alias.trim().lowercase(Locale.US)
+        if (a.isEmpty()) return true
+        val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+        val stored = prefs.getString(publishPostPermOcrPrefsKeyForAlias(a), null)?.trim().orEmpty()
+        return stored != today
+    }
+
+    /** 首条作品当日权限 OCR 已成功跑完时调用（在整条发布成功之后）。 */
+    fun markPublishPostFirstDailyPermissionOcrDone(alias: String) {
+        val a = alias.trim().lowercase(Locale.US)
+        if (a.isEmpty()) return
+        val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+        prefs.edit().putString(publishPostPermOcrPrefsKeyForAlias(a), today).apply()
+    }
+
+    private fun publishPostResumeNextIndexKey(accountKey: String): String =
+        KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX + accountKey.trim().lowercase(Locale.US)
+
+    /** 下一条待发作品的 0-based 序号（已成功 [返回值] 条）。 */
+    fun getPublishPostResumeNextIndex(accountKey: String): Int {
+        val a = accountKey.trim().lowercase(Locale.US)
+        if (a.isEmpty()) return 0
+        return prefs.getInt(publishPostResumeNextIndexKey(a), 0).coerceAtLeast(0)
+    }
+
+    fun setPublishPostResumeNextIndex(accountKey: String, nextIndex: Int) {
+        val a = accountKey.trim().lowercase(Locale.US)
+        if (a.isEmpty()) return
+        prefs.edit().putInt(publishPostResumeNextIndexKey(a), nextIndex.coerceAtLeast(0)).apply()
+    }
+
+    fun clearPublishPostResumeProgress(accountKey: String) {
+        val a = accountKey.trim().lowercase(Locale.US)
+        if (a.isEmpty()) return
+        prefs.edit().remove(publishPostResumeNextIndexKey(a)).apply()
+    }
+
+    fun clearPublishPostState() {
+        prefs.edit()
+            .putBoolean(KEY_PUBLISH_POST_REQUESTED, false)
+            .putBoolean(KEY_PUBLISH_POST_PENDING, false)
+            .putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
+            .remove(KEY_PUBLISH_POST_PACKAGE)
+            .apply()
+    }
+
+    fun clearMutualClickState() {
+        prefs.edit()
+            .putBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
+            .putBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+            .apply()
+    }
 
     fun getAuthToken(): String? = prefs.getString(KEY_AUTH_TOKEN, null)?.trim()?.takeIf { it.isNotEmpty() }
 
@@ -100,23 +253,17 @@ object PrefsStore {
 
     fun getServerBaseUrl(): String? = prefs.getString(KEY_SERVER_BASE_URL, null)?.trim()
 
-    fun savePullCount(count: Int) {
-        prefs.edit().putInt(KEY_PULL_COUNT, count.coerceIn(1, 10)).apply()
-    }
-
-    fun getPullCount(): Int = prefs.getInt(KEY_PULL_COUNT, DEFAULT_PULL_COUNT).coerceIn(1, 10)
-
     fun getDeviceRunMode(): String {
         val raw = prefs.getString(KEY_DEVICE_RUN_MODE, ServerRunMode.GROWTH)?.trim()?.lowercase()
         return when (raw) {
-            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH -> raw
+            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH, ServerRunMode.MUTUAL -> raw
             else -> ServerRunMode.GROWTH
         }
     }
 
     fun saveDeviceRunMode(mode: String) {
         val m = when (mode.trim().lowercase()) {
-            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH -> mode.trim().lowercase()
+            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH, ServerRunMode.MUTUAL -> mode.trim().lowercase()
             else -> ServerRunMode.GROWTH
         }
         prefs.edit().putString(KEY_DEVICE_RUN_MODE, m).apply()
@@ -133,13 +280,51 @@ object PrefsStore {
         prefs.edit().putLong(KEY_LAST_BIND_REFRESH_MS, System.currentTimeMillis()).apply()
     }
 
+    fun getLastAppliedConfigPushRevision(): Int =
+        prefs.getInt(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION, 0).coerceAtLeast(0)
+
+    fun saveLastAppliedConfigPushRevision(revision: Int) {
+        prefs.edit().putInt(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION, revision.coerceAtLeast(0)).apply()
+    }
+
     @Synchronized
     fun savePulledBatch(usernames: List<String>) {
         val normalized = usernames.map { it.trim() }.filter { it.isNotBlank() }
+        val nextSeq = prefs.getInt(KEY_PULL_BATCH_SEQ, 0) + 1
         prefs.edit()
             .putStringSet(KEY_BATCH_USERNAMES, normalized.toSet())
             .putStringSet(KEY_BATCH_COMPLETED, emptySet())
+            .putInt(KEY_PULL_BATCH_SEQ, nextSeq)
             .apply()
+    }
+
+    /**
+     * 当前拉取清单中用户名是否均已 [markUsernameCompleted]（含「无作品跳过」等成功收尾）。
+     * 若有失败未标记完成，则整批不算完成，不会向自动互点批次数累加。
+     */
+    @Synchronized
+    fun tryConsumeCompletedPullBatchForAutoMutualStat(): Boolean {
+        val batch = prefs.getStringSet(KEY_BATCH_USERNAMES, null) ?: return false
+        if (batch.isEmpty()) return false
+        val completed = prefs.getStringSet(KEY_BATCH_COMPLETED, null) ?: return false
+        if (!batch.all { completed.contains(it) }) return false
+        val seq = prefs.getInt(KEY_PULL_BATCH_SEQ, 0)
+        if (seq <= 0) return false
+        val lastAttr = prefs.getInt(KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ, 0)
+        if (seq <= lastAttr) return false
+        prefs.edit().putInt(KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ, seq).apply()
+        return true
+    }
+
+    @Synchronized
+    fun incrementGrowthBatchesTowardAutoMutual(): Int {
+        val next = prefs.getInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, 0) + 1
+        prefs.edit().putInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, next).apply()
+        return next
+    }
+
+    fun resetGrowthBatchesTowardAutoMutual() {
+        prefs.edit().putInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, 0).apply()
     }
 
     @Synchronized

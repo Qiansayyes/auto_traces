@@ -19,8 +19,6 @@
     <string name="overlay_log_hint">实时日志会以透明悬浮窗显示在屏幕顶部</string>
     <string name="action_save_server">保存服务端地址</string>
     <string name="action_clear_binding">清除绑定信息</string>
-    <string name="hint_pull_count">每次拉取数量</string>
-    <string name="action_save_pull_count">保存拉取数量</string>
     <!-- 无障碍服务描述 -->
     <string name="accessibility_service_desc">TikTok自动化辅助服务，用于模拟真人操作</string>
 </resources>

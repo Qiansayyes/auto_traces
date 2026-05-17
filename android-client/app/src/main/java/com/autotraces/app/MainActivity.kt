@@ -25,8 +25,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.TimeUnit
+
+/** API 34+ 读剪贴板；部分编译环境未生成 [Manifest.permission.READ_CLIPBOARD] 符号，用字面量避免编译失败。 */
+private const val PERM_READ_CLIPBOARD = "android.permission.READ_CLIPBOARD"
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
@@ -36,6 +43,14 @@ class MainActivity : AppCompatActivity() {
     private var assignedUsernameAdapter: ArrayAdapter<String>? = null
     private var suppressAssignedUsernameSelectCallback: Boolean = false
 
+    private val codeFetchHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -43,6 +58,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         requestNotificationPermissionIfNeeded()
+        requestReadClipboardPermissionIfNeeded()
         setupBindingSection()
         setupRunModeSpinner()
         setupAssignedAccountSection()
@@ -53,7 +69,7 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch {
                 val alias = PrefsStore.getAlias()
                 LogCenter.op(alias, "已请求启动后台服务")
-                runCatching { WorkerService.start(this@MainActivity) }.onFailure { error ->
+                runCatching { WorkerService.startResumingAutomation(this@MainActivity) }.onFailure { error ->
                     LogCenter.op(alias, "启动后台服务请求失败：${error.message}")
                     AppCoordinator.refreshRuntimeSnapshot()
                     return@launch
@@ -72,18 +88,18 @@ class MainActivity : AppCompatActivity() {
 
         binding.stopServiceButton.setOnClickListener {
             lifecycleScope.launch {
-                val alias = PrefsStore.getAlias()
-                PrefsStore.setHardStopRequested(true)
-                AppCoordinator.refreshRuntimeSnapshot()
-                LogCenter.op(alias, "已请求停止后台服务（硬停）")
-                WorkerService.stop(this@MainActivity)
-                delay(1200)
-                AppCoordinator.refreshRuntimeSnapshot()
-                if (WorkerServiceTracker.isRunning) {
-                    LogCenter.op(alias, "后台服务仍在运行，已再次请求停止")
-                } else {
-                    LogCenter.op(alias, "后台服务已停止")
-                }
+                val alias = PrefsStore.getAlias().orEmpty()
+                AppCoordinator.requestUserGracefulHardStop()
+                LogCenter.op(
+                    alias,
+                    "已请求硬停：当前步骤结束后停下自动任务；后台继续轮询 check_start / 设备指令；已请求云端关闭本机自动开启",
+                )
+                runCatching { WorkerService.start(this@MainActivity) }
+                    .onFailure { err ->
+                        LogCenter.op(alias, "硬停后确保后台服务失败：${err.message}")
+                    }
+                AppCoordinator.startIfNeeded()
+                delay(600)
                 AppCoordinator.refreshRuntimeSnapshot()
             }
         }
@@ -93,6 +109,7 @@ class MainActivity : AppCompatActivity() {
         binding.showLogButton.setOnClickListener {
             binding.logPanel.visibility = View.VISIBLE
             binding.actionPanel.visibility = View.GONE
+            scrollLogToLatest()
         }
         binding.showActionButton.setOnClickListener {
             binding.logPanel.visibility = View.GONE
@@ -110,7 +127,16 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.refreshRuntimeSnapshot()
         } else {
             AppCoordinator.refreshRuntimeSnapshot()
-            LogCenter.op(PrefsStore.getAlias(), "当前处于停止状态，打开应用不自动拉起后台服务")
+            lifecycleScope.launch {
+                if (PrefsStore.isBound()) {
+                    runCatching { WorkerService.start(this@MainActivity) }
+                    AppCoordinator.startIfNeeded()
+                }
+                LogCenter.op(
+                    PrefsStore.getAlias(),
+                    "当前为硬停：用户名任务已暂停，后台仍轮询云端指令",
+                )
+            }
         }
     }
 
@@ -120,22 +146,33 @@ class MainActivity : AppCompatActivity() {
             renderDeviceInfo()
             return
         }
-        if (!PrefsStore.isHardStopRequested()) {
-            ensureBoundIfNeeded()
-        }
+        ensureBoundIfNeeded()
         renderDeviceInfo()
+        clarifyStaleBindErrorIfNeeded()
         refreshAssignedAccountFields()
+    }
+
+    /** 「重新绑定」失败后文案仍留在界面，容易误以为未绑定；已与 prefs/get_config 语义对齐时给予说明。 */
+    private fun clarifyStaleBindErrorIfNeeded() {
+        if (!PrefsStore.isBound() || PrefsStore.getAuthToken().isNullOrBlank()) return
+        val hint = binding.bindStatusText.text?.toString().orEmpty()
+        if (!hint.startsWith("绑定失败")) return
+        if (hint.contains("本地仍为已绑定")) return
+        binding.bindStatusText.text =
+            "已绑定（Device ID 已保存）。上次失败多为「重新绑定」请求超时；服务端日志里 get_config 为 200 即仍视为在册。"
     }
 
     private fun refreshAssignedAccountFields() {
         val alias = PrefsStore.getAlias().orEmpty().trim()
         if (alias.isBlank() || PrefsStore.getAuthToken().isNullOrBlank()) {
+            PrefsStore.setLogContextUsername(null)
             assignedAccountRows = emptyList()
             assignedUsernameAdapter?.clear()
             binding.assignedUsernameInput.setText("")
             binding.assignedPasswordInput.setText("")
             binding.assignedApiInput.setText("")
             binding.assignedEmailInput.setText("")
+            binding.assignedEmailPasswordInput.setText("")
             binding.assignedCopyStatusText.text = "未登录或未绑定，无法拉取分配账号"
             return
         }
@@ -148,13 +185,37 @@ class MainActivity : AppCompatActivity() {
             val editorRows = editorRowsResp?.items.orEmpty()
 
             assignedAccountRows = accountRows.filter { !it.username.isNullOrBlank() }
-            val usernames = editorRows
+            val aliasNorm = alias.trim()
+            fun effectiveDeviceAlias(r: DeviceEditorRowRecord): String {
+                val aa = r.assigned_alias?.trim().orEmpty()
+                return if (aa.isNotEmpty()) aa else r.device_alias?.trim().orEmpty()
+            }
+            fun isCutSwitchHighlight(r: DeviceEditorRowRecord) =
+                r.switch_highlight?.trim() == "是"
+
+            val matchedRows = editorRows
                 .asSequence()
-                .filter { (it.device_alias ?: "").trim() == alias }
-                .mapNotNull { it.username?.trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
+                .filter { effectiveDeviceAlias(it) == aliasNorm }
+                .sortedWith(
+                    compareByDescending<DeviceEditorRowRecord> { isCutSwitchHighlight(it) }
+                        .thenBy { it.row_index ?: Int.MAX_VALUE },
+                )
                 .toList()
+
+            val highlightedUsername = matchedRows
+                .firstOrNull { isCutSwitchHighlight(it) }
+                ?.username
+                ?.trim()
+                .orEmpty()
+            val usernames = buildList {
+                if (highlightedUsername.isNotBlank()) add(highlightedUsername)
+                matchedRows
+                    .asSequence()
+                    .mapNotNull { it.username?.trim() }
+                    .filter { it.isNotBlank() }
+                    .filter { it != highlightedUsername }
+                    .forEach { add(it) }
+            }
 
             suppressAssignedUsernameSelectCallback = true
             assignedUsernameAdapter?.clear()
@@ -163,9 +224,16 @@ class MainActivity : AppCompatActivity() {
             binding.assignedUsernameSelect.isEnabled = usernames.isNotEmpty()
 
             if (usernames.isNotEmpty()) {
+                val selectedUsername = usernames.first()
                 binding.assignedUsernameSelect.setSelection(0)
-                applyAssignedAccountByUsername(usernames.first())
+                applyAssignedAccountByUsername(selectedUsername)
+                val ctxUser = when {
+                    highlightedUsername.isNotBlank() -> highlightedUsername
+                    else -> selectedUsername
+                }
+                PrefsStore.setLogContextUsername(ctxUser.trim().takeIf { it.isNotEmpty() })
             } else {
+                PrefsStore.setLogContextUsername(null)
                 applyAssignedAccountByUsername("")
                 binding.assignedCopyStatusText.text = "该别名暂无分配账号：$alias"
             }
@@ -183,6 +251,7 @@ class MainActivity : AppCompatActivity() {
             binding.assignedPasswordInput.setText("")
             binding.assignedApiInput.setText("")
             binding.assignedEmailInput.setText("")
+            binding.assignedEmailPasswordInput.setText("")
             binding.assignedCopyStatusText.text = "未找到该 username 对应的账号表单数据：$username"
             return
         }
@@ -190,6 +259,7 @@ class MainActivity : AppCompatActivity() {
         binding.assignedPasswordInput.setText(account.password.orEmpty())
         binding.assignedApiInput.setText(account.api.orEmpty())
         binding.assignedEmailInput.setText(account.email.orEmpty())
+        binding.assignedEmailPasswordInput.setText(account.email_password.orEmpty())
         binding.assignedCopyStatusText.text = "已加载：${account.username.orEmpty()}"
     }
 
@@ -217,6 +287,58 @@ class MainActivity : AppCompatActivity() {
         binding.copyAssignedEmailButton.setOnClickListener {
             copy("Email", binding.assignedEmailInput.text?.toString().orEmpty())
         }
+        binding.copyAssignedEmailPasswordButton.setOnClickListener {
+            copy("Email Password", binding.assignedEmailPasswordInput.text?.toString().orEmpty())
+        }
+
+        binding.fetchTikTokCodeButton.setOnClickListener {
+            lifecycleScope.launch {
+                val apiUrl = binding.assignedApiInput.text?.toString().orEmpty().trim()
+                if (apiUrl.isBlank()) {
+                    binding.assignedCopyStatusText.text = "API 为空：无法获取验证码"
+                    return@launch
+                }
+                if (!apiUrl.startsWith("http://") && !apiUrl.startsWith("https://")) {
+                    binding.assignedCopyStatusText.text = "API 链接无效：$apiUrl"
+                    return@launch
+                }
+
+                val deviceId = PrefsStore.getDeviceId().orEmpty()
+                val alias = PrefsStore.getAlias().orEmpty().trim()
+
+                binding.fetchTikTokCodeButton.isEnabled = false
+                binding.assignedCopyStatusText.text = "正在获取验证码..."
+                val result = withContext(Dispatchers.IO) {
+                    val local = fetchTikTokEmailCode(apiUrl)
+                    if (local.isSuccess) {
+                        local
+                    } else {
+                        val localErr = local.exceptionOrNull()!!
+                        val serverResult = fetchTikTokEmailCodeFromServer(deviceId, alias, apiUrl)
+                        if (serverResult.isSuccess) {
+                            serverResult
+                        } else {
+                            val serverErr = serverResult.exceptionOrNull()!!
+                            Result.failure(
+                                IllegalStateException(
+                                    "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；云端代取失败：${serverErr.message ?: serverErr.javaClass.simpleName}",
+                                ),
+                            )
+                        }
+                    }
+                }
+                binding.fetchTikTokCodeButton.isEnabled = true
+
+                val code = result.getOrNull()
+                if (code.isNullOrBlank()) {
+                    val msg = result.exceptionOrNull()?.message ?: "未识别到 6 位验证码"
+                    binding.assignedCopyStatusText.text = "获取失败：$msg"
+                    return@launch
+                }
+                copy("TikTok Code", code)
+                binding.assignedCopyStatusText.text = "获取成功：$code（已复制）"
+            }
+        }
 
         assignedUsernameAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf())
         binding.assignedUsernameSelect.adapter = assignedUsernameAdapter
@@ -224,15 +346,74 @@ class MainActivity : AppCompatActivity() {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 if (suppressAssignedUsernameSelectCallback) return
                 val uname = assignedUsernameAdapter?.getItem(position).orEmpty()
+                PrefsStore.setLogContextUsername(uname.trim().takeIf { it.isNotEmpty() })
                 applyAssignedAccountByUsername(uname)
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) {
                 if (suppressAssignedUsernameSelectCallback) return
+                PrefsStore.setLogContextUsername(null)
                 applyAssignedAccountByUsername("")
             }
         }
         refreshAssignedAccountFields()
+    }
+
+    private fun fetchTikTokEmailCode(apiUrl: String): Result<String> {
+        return runCatching {
+            val req = Request.Builder()
+                .url(apiUrl)
+                .get()
+                .build()
+            val resp = codeFetchHttpClient.newCall(req).execute()
+            if (!resp.isSuccessful) {
+                throw IllegalStateException("HTTP ${resp.code}")
+            }
+            val bodyText = resp.body?.string().orEmpty()
+            if (bodyText.isBlank()) {
+                throw IllegalStateException("返回内容为空")
+            }
+            extractEmailCode(bodyText)
+        }
+    }
+
+    private suspend fun fetchTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): Result<String> {
+        return runCatching {
+            val resp = ApiService.getTikTokEmailCodeFromServer(deviceId, alias, apiUrl)
+            if (resp.code != 0) {
+                throw IllegalStateException(resp.msg.ifBlank { "云端代取失败" })
+            }
+            val code = resp.email_code?.trim().orEmpty()
+            if (!code.matches(Regex("""\d{6}"""))) {
+                throw IllegalStateException("云端未返回有效验证码")
+            }
+            code
+        }
+    }
+
+    private fun extractEmailCode(bodyText: String): String {
+        val normalized = bodyText
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace(Regex("[\\u00A0\\t]"), " ")
+
+        val patterns = listOf(
+            // 主题: 760553 is your 6-digit code
+            Regex("""(?im)^\s*(主题|subject)\s*[:：]\s*(\d{6})\b"""),
+            // Your 6-digit code is: 760553
+            Regex("""(?i)\b6[- ]?digit\s+code\b[^\d]{0,24}(\d{6})\b"""),
+            // 兜底：任意 6 位数字（可能误命中，但只作为最后手段）
+            Regex("""\b(\d{6})\b"""),
+        )
+        for (re in patterns) {
+            val m = re.find(normalized) ?: continue
+            val code = m.groupValues.getOrNull(2)?.ifBlank { null } ?: m.groupValues.getOrNull(1)
+            val out = code?.trim().orEmpty()
+            if (out.matches(Regex("""\d{6}"""))) return out
+        }
+        throw IllegalStateException("未识别到 6 位验证码")
     }
 
     private fun requireCloudLoginIfNeeded(): Boolean {
@@ -253,6 +434,7 @@ class MainActivity : AppCompatActivity() {
             "log" -> {
                 binding.logPanel.visibility = View.VISIBLE
                 binding.actionPanel.visibility = View.GONE
+                scrollLogToLatest()
             }
         }
     }
@@ -261,6 +443,13 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         if (!granted) ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
+    }
+
+    /** Android 14+：互点读 TikTok 复制到剪贴板的用户名需此权限，否则 [ClipboardManager.getPrimaryClip] 多为 null。 */
+    private fun requestReadClipboardPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < 34) return
+        if (ContextCompat.checkSelfPermission(this, PERM_READ_CLIPBOARD) == PackageManager.PERMISSION_GRANTED) return
+        ActivityCompat.requestPermissions(this, arrayOf(PERM_READ_CLIPBOARD), 101)
     }
 
     private fun renderDeviceInfo() {
@@ -273,10 +462,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun scrollLogToLatest() {
+        binding.logScroll.post {
+            binding.logScroll.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
     private fun observeLogs() {
         lifecycleScope.launch {
             LogCenter.logs.collect { logs ->
                 binding.logText.text = logs.takeLast(120).joinToString("\n")
+                scrollLogToLatest()
             }
         }
 
@@ -302,12 +498,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupRunModeSpinner() {
-        val labels = listOf("涨粉模式", "主播访问模式", "直客访问模式")
+        val labels = listOf("涨粉模式", "主播访问模式", "直客访问模式", "互点模式")
         binding.runModeSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
 
         fun indexForStored(): Int = when (PrefsStore.getDeviceRunMode()) {
             ServerRunMode.LIVE -> 1
             ServerRunMode.DIRECT -> 2
+            ServerRunMode.MUTUAL -> 3
             else -> 0
         }
 
@@ -319,6 +516,7 @@ class MainActivity : AppCompatActivity() {
                 val mode = when (position) {
                     1 -> ServerRunMode.LIVE
                     2 -> ServerRunMode.DIRECT
+                    3 -> ServerRunMode.MUTUAL
                     else -> ServerRunMode.GROWTH
                 }
                 PrefsStore.saveDeviceRunMode(mode)
@@ -421,24 +619,52 @@ class MainActivity : AppCompatActivity() {
         binding.bindStatusText.text = "正在绑定..."
 
         lifecycleScope.launch {
-            runCatching {
-                ApiService.bindDevice(alias, DeviceFingerprint.fromContext(this@MainActivity))
-            }.onSuccess { response ->
-                if (response.code == 0 && !response.device_id.isNullOrBlank()) {
-                    PrefsStore.saveBinding(response.device_id, alias)
-                    PrefsStore.markBindingRefreshedNow()
-                    LogCenter.op(alias, "绑定成功：${response.device_id}")
-                    AppCoordinator.syncOnline()
-                    binding.bindStatusText.text = "绑定成功"
-                    WorkerService.start(this@MainActivity)
-                    AppCoordinator.startIfNeeded()
-                } else {
-                    binding.bindStatusText.text = response.msg
+            binding.bindButton.isEnabled = false
+            try {
+                val cappedMs = 40_000L
+                val result = withTimeoutOrNull(cappedMs) {
+                    runCatching {
+                        ApiService.bindDevice(alias, DeviceFingerprint.fromContext(this@MainActivity))
+                    }
+                }
+                when {
+                    result == null -> {
+                        binding.bindStatusText.text =
+                            "绑定超时（${cappedMs / 1000}秒内无完整响应）。多为网络或未打到本服务：请在服务端查是否出现 POST /api/bind_device；接口与库表无误时一般不会卡在数据库。"
+                        LogCenter.op(alias, "绑定请求协程超时（${cappedMs}ms）")
+                    }
+                    result.isFailure -> {
+                        val err = result.exceptionOrNull()!!
+                        val stillBound = PrefsStore.isBound()
+                        binding.bindStatusText.text = buildString {
+                            append("绑定失败：${err.message}")
+                            if (stillBound) {
+                                append("（本地仍为已绑定；服务端 get_config 返回 200 即表示在册，可忽略本次重新绑定超时）")
+                            }
+                        }
+                        LogCenter.op(alias, "绑定异常：${err.message}")
+                    }
+                    else -> {
+                        val response = result.getOrThrow()
+                        if (response.code == 0 && !response.device_id.isNullOrBlank()) {
+                            PrefsStore.saveBinding(response.device_id, alias)
+                            PrefsStore.markBindingRefreshedNow()
+                            LogCenter.op(alias, "绑定成功：${response.device_id}")
+                            AppCoordinator.syncOnline()
+                            binding.bindStatusText.text = "绑定成功"
+                            WorkerService.startResumingAutomation(this@MainActivity)
+                            AppCoordinator.startIfNeeded()
+                        } else {
+                            binding.bindStatusText.text =
+                                response.msg.ifBlank { "服务端返回 code=${response.code}，未携带 device_id（请确认账号已登录且服务端为当前仓库版本）" }
+                            LogCenter.op(alias, "绑定被拒：${response.msg} code=${response.code}")
+                        }
+                    }
                 }
                 updateBindSectionState()
                 renderDeviceInfo()
-            }.onFailure {
-                binding.bindStatusText.text = "绑定失败：${it.message}"
+            } finally {
+                binding.bindButton.isEnabled = true
             }
         }
     }

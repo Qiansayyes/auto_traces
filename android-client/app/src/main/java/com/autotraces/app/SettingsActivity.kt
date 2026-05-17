@@ -16,8 +16,8 @@ class SettingsActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         binding.serverUrlInput.setText(PrefsStore.getServerBaseUrl() ?: ApiService.getBaseUrl())
-        binding.pullCountInput.setText(PrefsStore.getPullCount().toString())
         binding.cloudUsernameInput.setText(PrefsStore.getAuthUsername().orEmpty())
+        binding.cloudPasswordInput.setText(PrefsStore.getAuthPassword().orEmpty())
         renderDeviceInfo()
 
         binding.showSettingsButton.setOnClickListener {
@@ -81,18 +81,6 @@ class SettingsActivity : AppCompatActivity() {
             AppCoordinator.refreshRuntimeSnapshot()
             binding.statusText.text = "服务器地址已保存"
             LogCenter.op(PrefsStore.getAlias(), "已保存服务器地址")
-        }
-
-        binding.savePullCountButton.setOnClickListener {
-            val text = binding.pullCountInput.text?.toString()?.trim().orEmpty()
-            val count = text.toIntOrNull()
-            if (count == null || count !in 1..10) {
-                binding.statusText.text = "拉取数量必须是 1-10 之间的整数"
-                return@setOnClickListener
-            }
-            PrefsStore.savePullCount(count)
-            binding.statusText.text = "拉取数量已保存"
-            LogCenter.op(PrefsStore.getAlias(), "已保存单次拉取数量：$count")
         }
 
         binding.clearBindingButton.setOnClickListener {
