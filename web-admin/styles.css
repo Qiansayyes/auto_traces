@@ -401,12 +401,17 @@ nav {
   cursor: not-allowed;
 }
 
-select.alias-template-select.ui-select {
+select.alias-template-select.ui-select,
+select.device-group-select.ui-select {
   min-width: 140px;
   font-size: 12px;
   min-height: 32px;
   padding: 4px 28px 4px 8px;
   background-position: right 8px center;
+}
+
+select.device-group-select.ui-select {
+  min-width: 100px;
 }
 
 .modal-overlay {

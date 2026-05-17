@@ -1032,7 +1032,23 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const disabled = info?.status === "offline" ? "disabled" : "";
   const rowStyle = info?.status === "offline" ? ' style="opacity:.55;"' : "";
   const groupName = String(info?.device_group || "").trim();
-  const groupCell = `<td>${escapeHtml(groupName ? groupName : "未分组")}</td>`;
+  const selectedGroupValue = groupName || "__ungrouped__";
+  const groupOptionsHtml = getTableGroupOptions(groupName)
+    .map((name) => (
+      `<option value="${escapeHtml(name)}" ${name === selectedGroupValue ? "selected" : ""}>${escapeHtml(displayGroupName(name))}</option>`
+    ))
+    .join("");
+  const groupCell = `
+    <td>
+      <select
+        class="device-group-select ui-select ui-select--table"
+        data-device="${deviceId}"
+        style="min-width:100px;padding:4px 6px;font-size:12px;"
+      >
+        ${groupOptionsHtml}
+      </select>
+    </td>
+  `;
   const ownerCell = isAdmin ? `<td>${String(info?.owner_username || "")}</td>` : "";
   const aliasKey = String(alias || "").trim().toLowerCase();
   const mappedTemplate = String(aliasTemplateByMode?.[currentRunMode]?.[aliasKey] || "").trim();
@@ -1234,6 +1250,33 @@ function renderDevices(devices) {
       } finally {
         el.disabled = false;
         el.textContent = oldText;
+      }
+    });
+  });
+  deviceTable.querySelectorAll("select.device-group-select").forEach((selectEl) => {
+    selectEl.addEventListener("change", async (e) => {
+      const target = e.currentTarget;
+      const deviceId = String(target?.dataset?.device || "").trim();
+      const picked = String(target?.value || "").trim();
+      const groupName = picked === "__ungrouped__" ? "" : picked;
+      const prevGroup = String(latestDevices?.[deviceId]?.device_group || "").trim();
+      const prevValue = prevGroup || "__ungrouped__";
+      if (!deviceId) return;
+      try {
+        const data = await request("/api/admin/devices/set_group", {
+          method: "POST",
+          body: JSON.stringify({ device_group: groupName, device_ids: [deviceId] }),
+        });
+        if (latestDevices?.[deviceId]) latestDevices[deviceId].device_group = groupName;
+        if (groupName && !customDeviceGroupNames.includes(groupName)) {
+          customDeviceGroupNames.push(groupName);
+          persistCustomDeviceGroupNames();
+        }
+        void refreshDeviceGroupsDetail();
+        setStatus(data?.msg || `设备已设为「${displayGroupName(picked)}」`, "success");
+      } catch (error) {
+        setStatus(error.message || "更新设备分组失败", "error");
+        target.value = prevValue;
       }
     });
   });
@@ -1634,6 +1677,17 @@ function getModalGroupOptions() {
   const names = new Set(["__ungrouped__"]);
   (deviceGroupNames || []).forEach((n) => names.add(String(n).trim()));
   (customDeviceGroupNames || []).forEach((n) => names.add(String(n).trim()));
+  return Array.from(names).sort((a, b) => {
+    if (a === "__ungrouped__") return -1;
+    if (b === "__ungrouped__") return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function getTableGroupOptions(currentGroupName = "") {
+  const names = new Set(getModalGroupOptions());
+  const current = String(currentGroupName || "").trim();
+  if (current) names.add(current);
   return Array.from(names).sort((a, b) => {
     if (a === "__ungrouped__") return -1;
     if (b === "__ungrouped__") return 1;
