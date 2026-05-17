@@ -3661,17 +3661,18 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
     if not fp or not alias:
         return {"code": 1, "msg": "参数无效"}
 
+    row_group = ""
     conn = _get_db()
     try:
         row = conn.execute(
-            "SELECT device_id, owner_username, alias FROM client_devices WHERE fingerprint = ?",
+            "SELECT device_id, owner_username, alias, device_group FROM client_devices WHERE fingerprint = ?",
             (fp,),
         ).fetchone()
         if row:
             existing_id = str(row[0])
             row_owner = str(row[1])
             old_alias = str(row[2])
-            row_group = str(row[3] or "") if len(row.keys()) > 3 else ""
+            row_group = str(row[3] or "")
             conflict = conn.execute(
                 "SELECT 1 FROM client_devices WHERE owner_username = ? AND alias = ? AND device_id != ?",
                 (owner, alias, existing_id),
