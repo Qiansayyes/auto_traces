@@ -77,6 +77,8 @@ BASE_DEFAULT_CONFIG = {
     "following_filter_max_following_count": 1000,
     # 手机端单次拉取数量默认值（/api/pull_username 在未传 count 时采用）
     "pull_batch_size": 5,
+    # 设备连续完成多少批拉取后，下一次拉取触发休息（与 pull_batch_size 解耦）
+    "pull_batches_before_rest": 5,
     # 立即处理 follower_queue 的默认批次大小
     "process_queue_batch_size": 100,
     # 评论文本库
@@ -137,7 +139,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "tiktok_fans.db"
 CV_TEMPLATE_ZIP_PATH = BASE_DIR / "server" / "cv_templates.zip"
 FOLLOW_SCRAPER_PATH = BASE_DIR / "tiktok_follow_scraper.py"
-AUTOSEARCH_PATH = BASE_DIR / "autoSearch_5.28.py"
+AUTOSEARCH_PATH = BASE_DIR / "autoSearch_5.28_with_debug.py"
 TIKTOK_PACKAGE_NAME = "com.zhiliaoapp.musically"
 DEFAULT_PROCESS_QUEUE_BATCH_SIZE = int(BASE_DEFAULT_CONFIG.get("process_queue_batch_size", 100))
 DEVICE_LOG_DEDUP_WINDOW_SEC = 5.0
@@ -1977,6 +1979,7 @@ class UpdateConfigRequest(BaseModel):
     following_filter_min_video_count: int | None = None
     following_filter_max_following_count: int | None = None
     pull_batch_size: int | None = None
+    pull_batches_before_rest: int | None = None
     process_queue_batch_size: int | None = None
     comment_texts: List[str] | None = None
     mutual_comment_texts: List[str] | None = None
@@ -2042,6 +2045,15 @@ class UpdateConfigRequest(BaseModel):
             return value
         if value < 1 or value > 100:
             raise ValueError("单次拉取数量必须在 1~100 之间")
+        return value
+
+    @field_validator("pull_batches_before_rest")
+    @classmethod
+    def validate_pull_batches_before_rest(cls, value: int | None):
+        if value is None:
+            return value
+        if value < 1 or value > 100:
+            raise ValueError("休息前拉取批次数必须在 1~100 之间")
         return value
 
     @field_validator("process_queue_batch_size")
@@ -2924,6 +2936,78 @@ def _cleanup_finished_tasks():
             store.task_processes.pop(key, None)
 
 
+def _start_task_process(task_name: str, command: List[str]):
+    _cleanup_finished_tasks()
+    with store.lock:
+        if not store.scheduler_enabled:
+            return {"code": 1, "msg": "定时任务已停止，请先点击开始定时任务"}
+        old = store.task_processes.get(task_name)
+        if old and old.poll() is None:
+            return {"code": 1, "msg": f"任务已在运行：{task_name}"}
+
+        proc = subprocess.Popen(
+            command,
+            cwd=str(BASE_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding=(locale.getpreferredencoding(False) or "utf-8"),
+            errors="replace",
+            bufsize=1,
+        )
+        store.task_processes[task_name] = proc
+        store.task_logs[task_name] = [f"[{now_text()}] 任务启动: {' '.join(command)}"]
+
+    def _reader():
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                text = (line or "").rstrip("\r\n")
+                if not text:
+                    continue
+                with store.lock:
+                    logs = store.task_logs.setdefault(task_name, [])
+                    logs.append(text)
+                    if len(logs) > 500:
+                        del logs[: len(logs) - 500]
+        finally:
+            code = proc.poll()
+            with store.lock:
+                logs = store.task_logs.setdefault(task_name, [])
+                logs.append(f"[{now_text()}] 任务结束: exit_code={code}")
+                if len(logs) > 500:
+                    del logs[: len(logs) - 500]
+
+    Thread(target=_reader, daemon=True).start()
+    return {"code": 0, "msg": f"任务已触发：{task_name}", "pid": proc.pid}
+
+
+def _stop_all_task_processes():
+    with store.lock:
+        for _, proc in list(store.task_processes.items()):
+            if proc.poll() is None:
+                proc.terminate()
+        store.task_processes.clear()
+
+
+def _stop_task_processes_by_prefix(prefix: str) -> int:
+    stopped = 0
+    with store.lock:
+        for name, proc in list(store.task_processes.items()):
+            if not str(name).startswith(prefix):
+                continue
+            if proc.poll() is None:
+                proc.terminate()
+                stopped += 1
+            store.task_processes.pop(name, None)
+            logs = store.task_logs.setdefault(name, [])
+            logs.append(f"[{now_text()}] 手动停止任务: prefix={prefix}")
+            if len(logs) > 500:
+                del logs[: len(logs) - 500]
+    return stopped
+
+
 def _task_log_file_path(task_name: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_name or "task").strip()) or "task"
     log_dir = (BASE_DIR / "task_logs").resolve()
@@ -3337,13 +3421,22 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
     }
 
     if include_raw:
+        # 不返回完整 headers（CSP 等动辄数万字符）；仅保留排查用摘要
+        hdr = response.headers
         result["raw_response"] = {
             "status_code": response.status_code,
             "url": str(response.url),
             "encoding": response.encoding,
             "apparent_encoding": response.apparent_encoding,
-            "headers": dict(response.headers),
-            "text": _build_sanitized_raw_response_text(response_text_raw),
+            "headers_summary": {
+                "content-type": hdr.get("content-type"),
+                "content-length": hdr.get("content-length"),
+                "x-tt-trace-id": hdr.get("x-tt-trace-id"),
+                "set-cookie_count": len(response.cookies),
+                "header_count": len(hdr),
+            },
+            "text_preview": _build_sanitized_raw_response_text(response_text_raw)[:8000],
+            "text_truncated": len(response_text_raw or "") > 8000,
         }
 
     return result
@@ -4290,7 +4383,7 @@ def pull_username(device_id: str, alias: str, count: int | None = None, run_mode
         _persist_client_device_to_db(device_id)
 
     # 设备 owner 的运行配置（含模板合并/共享模板）应与 get_config 一致；
-    # pull_username 用它来决定 pull_batch_size 与休息策略。
+    # pull_username 用它来决定 pull_batch_size、休息前批次数与休息策略。
     data = _normalize_user_runtime_state(_load_user_runtime_state(device.owner_username))
     mode = run_mode if run_mode in RUN_MODES else data.get("run_mode", "growth")
     active_template, eff_config, templates, _template_meta = _resolve_template_for_mode_alias(
@@ -4300,17 +4393,22 @@ def pull_username(device_id: str, alias: str, count: int | None = None, run_mode
         alias,
     )
 
-    # 约定：pull_batch_size 既作为“单次拉取用户名数量”的默认值，
-    # 也作为“每拉取 N 批后，下一次拉取触发休息”的阈值。
     cfg_default = int(eff_config.get("pull_batch_size", 5) or 5)
     req_count = cfg_default if count is None else int(count)
     safe_count = max(1, min(req_count, 100))
 
-    # ——按“拉取批次”触发休息（第 N+1 次拉取返回休息指令）——
+    # 休息前需完成的拉取批次数（默认 5）；旧模板未配置时回退 pull_batch_size 以兼容历史行为
+    if "pull_batches_before_rest" in eff_config:
+        batches_before_rest = int(eff_config.get("pull_batches_before_rest", 5) or 5)
+    else:
+        batches_before_rest = int(eff_config.get("pull_batch_size", 5) or 5)
+    batches_before_rest = max(1, min(batches_before_rest, 100))
+
+    # ——按“拉取批次”触发休息（完成 N 批后，第 N+1 次拉取返回休息指令）——
     with store.lock:
         rounds = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
         store.device_pull_rounds[device_id] = rounds
-        should_rest = rounds > max(1, cfg_default)
+        should_rest = rounds > batches_before_rest
         if should_rest:
             store.device_pull_rounds[device_id] = 0
 

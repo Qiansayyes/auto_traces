@@ -53,11 +53,20 @@ coverage/
 
 # Browser / app runtime data
 chrome_profile_tiktok/
+tiktok_cookies.json
+tiktok_cookies.txt
+.well-known/
 
 # Local tool / cache directories
 /tools/gradle-8.7-all/
 /tools/gradle-8.7-all.zip
 
-# Misc generated artifacts
+# SQLite / local databases (do not commit to GitHub)
+*.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite3
+
+# Misc generated artifacts
 *.xlsx

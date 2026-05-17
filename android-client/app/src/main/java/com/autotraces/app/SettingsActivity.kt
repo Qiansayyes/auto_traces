@@ -26,14 +26,14 @@ class SettingsActivity : AppCompatActivity() {
         binding.showActionButton.setOnClickListener {
             startActivity(
                 Intent(this, MainActivity::class.java)
-                    .putExtra("initial_panel", "action")
+                    .putExtra(EXTRA_INITIAL_PANEL, "action")
             )
             finish()
         }
         binding.showLogButton.setOnClickListener {
             startActivity(
                 Intent(this, MainActivity::class.java)
-                    .putExtra("initial_panel", "log")
+                    .putExtra(EXTRA_INITIAL_PANEL, "log")
             )
             finish()
         }

@@ -92,6 +92,8 @@ object AppCoordinator {
     @Volatile
     private var inPullUsernameRestSleep: Boolean = false
 
+    fun isInPullUsernameRestSleep(): Boolean = inPullUsernameRestSleep
+
     fun init(application: android.content.Context) {
         appContext = application.applicationContext
         updateRuntime(
@@ -545,6 +547,7 @@ object AppCoordinator {
                 }
                 runSu("am force-stop $pkg")
                 inPullUsernameRestSleep = true
+                MainActivity.navigateToLogPanel(appContext)
                 try {
                     delay(minutes.toLong() * 60_000L)
                 } finally {

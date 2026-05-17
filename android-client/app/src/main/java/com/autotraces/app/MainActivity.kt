@@ -35,6 +35,8 @@ import java.util.concurrent.TimeUnit
 /** API 34+ 读剪贴板；部分编译环境未生成 [Manifest.permission.READ_CLIPBOARD] 符号，用字面量避免编译失败。 */
 private const val PERM_READ_CLIPBOARD = "android.permission.READ_CLIPBOARD"
 
+const val EXTRA_INITIAL_PANEL = "initial_panel"
+
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
 
@@ -106,14 +108,13 @@ class MainActivity : AppCompatActivity() {
 
         binding.openSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
-        binding.showLogButton.setOnClickListener {
-            binding.logPanel.visibility = View.VISIBLE
-            binding.actionPanel.visibility = View.GONE
-            scrollLogToLatest()
-        }
+        binding.showLogButton.setOnClickListener { showLogPanel() }
         binding.showActionButton.setOnClickListener {
-            binding.logPanel.visibility = View.GONE
-            binding.actionPanel.visibility = View.VISIBLE
+            if (AppCoordinator.isInPullUsernameRestSleep()) {
+                showLogPanel()
+                return@setOnClickListener
+            }
+            showActionPanel()
         }
         binding.clearLogButton.setOnClickListener {
             LogCenter.clear()
@@ -140,11 +141,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyInitialPanelFromIntent()
+    }
+
     override fun onResume() {
         super.onResume()
         if (requireCloudLoginIfNeeded()) {
             renderDeviceInfo()
             return
+        }
+        if (AppCoordinator.isInPullUsernameRestSleep()) {
+            showLogPanel()
         }
         ensureBoundIfNeeded()
         renderDeviceInfo()
@@ -426,16 +436,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyInitialPanelFromIntent() {
-        when (intent?.getStringExtra("initial_panel")) {
+        when (intent?.getStringExtra(EXTRA_INITIAL_PANEL)) {
             "action" -> {
-                binding.logPanel.visibility = View.GONE
-                binding.actionPanel.visibility = View.VISIBLE
+                if (AppCoordinator.isInPullUsernameRestSleep()) {
+                    showLogPanel()
+                } else {
+                    showActionPanel()
+                }
             }
-            "log" -> {
-                binding.logPanel.visibility = View.VISIBLE
-                binding.actionPanel.visibility = View.GONE
-                scrollLogToLatest()
-            }
+            "log" -> showLogPanel()
+        }
+    }
+
+    private fun showLogPanel() {
+        binding.logPanel.visibility = View.VISIBLE
+        binding.actionPanel.visibility = View.GONE
+        scrollLogToLatest()
+    }
+
+    private fun showActionPanel() {
+        binding.logPanel.visibility = View.GONE
+        binding.actionPanel.visibility = View.VISIBLE
+    }
+
+    companion object {
+        fun navigateToLogPanel(context: android.content.Context) {
+            val intent = Intent(context, MainActivity::class.java)
+                .putExtra(EXTRA_INITIAL_PANEL, "log")
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                )
+            context.startActivity(intent)
         }
     }
 

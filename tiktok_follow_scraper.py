@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     "max_followers_per_user": 70,
     "max_following_per_user": 70,
     "db_path": str(Path(__file__).resolve().parent / "tiktok_fans.db"),
-    "autosearch_path": str(Path(__file__).resolve().parent / "autoSearch_5.28.py"),
+    "autosearch_path": str(Path(__file__).resolve().parent / "autoSearch_5.28_with_debug.py"),
     "chrome_user_data_dir": str(Path(__file__).resolve().parent / "chrome_profile_tiktok"),
     "hubstudio_local_api": "http://127.0.0.1:6873",
     "hubstudio_container_id": "",
@@ -352,45 +352,27 @@ def load_quality_filter_config(overview_api: str, default_min_video: int, defaul
     return min_video, max_following
 
 
-def fetch_profile_metrics_via_autosearch(username: str, autosearch_path: str) -> dict | None:
-    """调用 autoSearch_5.28.py 查询单个用户质量信息。"""
-    auto_path = Path(autosearch_path)
-    if not auto_path.exists():
-        print(f"[质量筛选] autoSearch脚本不存在: {auto_path}", flush=True)
-        return None
-
-    cmd = [sys.executable, str(auto_path), "--profile", username]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(Path(__file__).resolve().parent),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            encoding="utf-8",
-            errors="replace",
+def fetch_profile_metrics_via_autosearch(username: str, autosearch_path: str = "") -> dict | None:
+    """通过 autoSearch_5.28_with_debug 查询单个用户质量信息（进程内加载，无子进程）。"""
+    _ = autosearch_path  # 保留参数兼容旧配置；实现固定走 with_debug
+    project_root = Path(__file__).resolve().parent
+    server_dir = project_root / "server"
+    if not (project_root / "autoSearch_5.28_with_debug.py").is_file():
+        print(
+            f"[质量筛选] 未找到脚本: {project_root / 'autoSearch_5.28_with_debug.py'}",
+            flush=True,
         )
+        return None
+    try:
+        server = str(server_dir)
+        if server not in sys.path:
+            sys.path.insert(0, server)
+        from tiktok_universal_snapshot import fetch_tiktok_profile_metrics_dict
+
+        return fetch_tiktok_profile_metrics_dict(username)
     except Exception as exc:
         print(f"[质量筛选] 查询失败 @{username}: {exc}", flush=True)
         return None
-
-    out = (proc.stdout or "").strip()
-    if proc.returncode != 0:
-        err = (proc.stderr or "").strip()
-        print(f"[质量筛选] 查询异常 @{username}: rc={proc.returncode}, stderr={err}", flush=True)
-        return None
-
-    if not out:
-        return None
-
-    try:
-        data = json.loads(out)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    return None
 
 
 def evaluate_following_by_autosearch(

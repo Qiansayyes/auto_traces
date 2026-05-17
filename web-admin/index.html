@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Auto Traces 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-size='28' font-family='Arial,Helvetica,sans-serif' fill='white'%3EAT%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=20260516-4" />
+  <link rel="stylesheet" href="styles.css?v=20260518-1" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -225,7 +225,8 @@
           <h2>根用户管理</h2>
           <p>手动添加根用户+博主类型，数据写入 tiktok_roots。</p>
         </header>
-        <div class="split">
+        <div class="tiktok-roots-layout">
+        <div class="split tiktok-roots-top">
           <div class="panel-card">
             <h3>添加到 tiktok_roots</h3>
             <div class="field">
@@ -281,9 +282,11 @@
               </table>
             </div>
           </div>
-          <div class="panel-card">
+        </div>
+        <div class="tiktok-roots-bottom">
+          <div class="panel-card scheduler-controls-card">
             <h3>定时任务控制</h3>
-            <p>点击即可立即触发对应任务。</p>
+            <p class="hint">点击即可立即触发对应任务；右侧为实时日志（每 2 秒刷新）。</p>
             <label>环境ID（每行一个，可选）</label>
             <textarea id="taskContainerIds" placeholder="每行一个环境ID"></textarea>
             <label>并行数量（可选）</label>
@@ -312,11 +315,26 @@
               <button id="startSchedulers" class="primary">开启总开关</button>
               <button id="stopSchedulers" class="danger">关闭总开关</button>
             </div>
-            <div id="schedulerTaskSettings" style="margin-top:12px;display:grid;gap:10px;"></div>
-            <pre id="taskStatus" style="white-space:pre-wrap;max-height:220px;overflow:auto;"></pre>
-            <h4 style="margin-top:8px;">实时日志按任务分组</h4>
-            <div id="schedulerTaskLogs" style="display:grid;gap:10px;"></div>
           </div>
+          <div class="panel-card scheduler-log-card">
+            <div class="log-console-toolbar">
+              <h3>任务运行日志</h3>
+              <div class="log-console-toolbar-actions">
+                <label class="log-follow-toggle">
+                  <input id="schedulerLogsFollow" type="checkbox" checked />
+                  跟随最新
+                </label>
+                <button type="button" id="schedulerLogsScrollBottom" class="ghost">跳到最新</button>
+              </div>
+            </div>
+            <pre id="taskStatus" class="log-console-status"></pre>
+            <pre id="schedulerTaskLogs" class="log-console-body">暂无日志</pre>
+          </div>
+        </div>
+        <details class="scheduler-tasks-panel panel-card" id="schedulerTasksPanel">
+          <summary class="scheduler-tasks-panel-summary">定时任务列表（点击展开配置）</summary>
+          <div id="schedulerTaskSettings" class="scheduler-task-settings"></div>
+        </details>
         </div>
       </section>
 
@@ -435,7 +453,7 @@
                 <h4 style="margin:0;">任务日志（follower_queue）</h4>
                 <small style="color:#666;">自动刷新</small>
               </div>
-              <pre id="cvTaskLogs" style="white-space:pre-wrap;margin:0;max-height:460px;overflow:auto;">暂无日志</pre>
+              <pre id="cvTaskLogs" class="log-console-body" style="max-height:460px;">暂无日志</pre>
             </div>
           </div>
         </div>
@@ -444,7 +462,7 @@
       <section id="tiktok-stats" class="panel">
         <header>
           <h2>TikTok数据查询</h2>
-          <p>输入用户名后，从主页内嵌 Universal 解析与 autoSearch <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。<strong>默认仅展示该快照 JSON</strong>（与函数输出字段一致）；需排查壳页时再勾选「附带原始 HTTP」。<strong>无需 Cookie 即可查询</strong>；可选在 server 目录放置 <code>tiktok_cookies.json</code> / <code>tiktok_cookies.txt</code> 或 <code>TIKTOK_COOKIES_FILE</code>；<code>TIKTOK_SKIP_COOKIE=1</code> 与参考脚本一致可强制不带 Cookie。</p>
+          <p>输入用户名后，从主页内嵌 Universal 解析与项目根目录 <code>autoSearch_5.28_with_debug.py</code> 中 <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。<strong>默认仅展示该快照 JSON</strong>；需排查壳页时再勾选「附带原始 HTTP」。Cookie 默认自动读取项目根目录或 <code>server/</code> 下的 <code>tiktok_cookies.json</code>；也可用环境变量 <code>TIKTOK_COOKIES_FILE</code>；<code>TIKTOK_SKIP_COOKIE=1</code> 可强制不带 Cookie。</p>
         </header>
         <div class="split">
           <div class="panel-card">
@@ -456,7 +474,7 @@
             <div class="field" style="margin-top:8px;">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal;">
                 <input id="statsIncludeRaw" type="checkbox" />
-                附带原始 HTTP 响应（含 headers / 截断 HTML，仅调试用）
+                附带调试信息（HTTP 摘要 + 页面片段，不含完整 headers）
               </label>
             </div>
             <button id="fetchTiktokStats" class="primary">查询 TikTok 数据</button>
@@ -986,8 +1004,13 @@
             <label>单次拉取用户名数量（配置键 pull_batch_size）</label>
             <input name="pull_batch_size" type="number" min="1" max="100" step="1" value="5" />
             <div class="hint">
-              <strong>仅由本页模板保存并下发</strong>，设备 App <strong>不再提供</strong>「每次拉取数量」本地设置。设备每次请求 <code>/api/pull_username</code> 时使用的 <code>count</code> 一律取当前模板中的本值（1～100）。服务端亦用同一字段作为「未显式传 count」时的默认，并参与「每拉取若干次触发休息」等逻辑（见服务端 <code>pull_username</code>）。
+              <strong>仅由本页模板保存并下发</strong>，设备 App <strong>不再提供</strong>「每次拉取数量」本地设置。设备每次请求 <code>/api/pull_username</code> 时使用的 <code>count</code> 一律取当前模板中的本值（1～100）。服务端亦用同一字段作为「未显式传 count」时的默认。
             </div>
+          </div>
+          <div class="field">
+            <label>休息前拉取批次数（配置键 pull_batches_before_rest）</label>
+            <input name="pull_batches_before_rest" type="number" min="1" max="100" step="1" value="5" />
+            <div class="hint">设备 App 连续完成本值的整批拉取并执行完毕后，<strong>下一次</strong>拉取请求将触发休息（默认 <strong>5 批</strong>）。与单次拉取用户名数量无关。</div>
           </div>
           <div class="field">
             <label>休息时长（分钟，随机区间）</label>
@@ -1002,7 +1025,7 @@
                 <input id="cfg-break-max" name="break_max" type="number" min="1" />
               </div>
             </div>
-            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。<strong>何时触发休息</strong>由上方「单次拉取用户名数量 <code>pull_batch_size</code>」对应的服务端拉取轮次逻辑决定。</div>
+            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。设备 App 默认连续完成 <strong>5 批</strong>拉取并执行完毕后进入休息（由「休息前拉取批次数 <code>pull_batches_before_rest</code>」控制，默认 5）。</div>
           </div>
           <div class="field">
             <label>访问延迟（秒，随机区间）</label>
@@ -1225,6 +1248,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260516-4"></script>
+  <script src="app.js?v=20260518-1"></script>
 </body>
 </html>

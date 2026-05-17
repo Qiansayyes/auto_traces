@@ -119,6 +119,9 @@ const stopSchedulersBtn = document.getElementById("stopSchedulers");
 const taskStatusEl = document.getElementById("taskStatus");
 const schedulerTaskSettingsEl = document.getElementById("schedulerTaskSettings");
 const schedulerTaskLogsEl = document.getElementById("schedulerTaskLogs");
+const schedulerLogsFollowToggle = document.getElementById("schedulerLogsFollow");
+const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrollBottom");
+const LOG_SCROLL_THRESHOLD = 48;
 const taskContainerIdsInput = document.getElementById("taskContainerIds");
 const taskParallelInput = document.getElementById("taskParallel");
 const collectRootsDbPrioritySelect = document.getElementById("collectRootsDbPriority");
@@ -436,6 +439,22 @@ function setTaskStatusInfo(text) {
   taskStatusEl.textContent = text;
 }
 
+function isLogFollowEnabled() {
+  return schedulerLogsFollowToggle?.checked !== false;
+}
+
+function isLogContainerAtBottom(el) {
+  if (!el) return true;
+  return el.scrollHeight - (el.scrollTop + el.clientHeight) <= LOG_SCROLL_THRESHOLD;
+}
+
+function scrollLogContainerToBottom(el, force = false) {
+  if (!el) return;
+  if (force || isLogFollowEnabled()) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
 function appendLogToElement(el, line) {
   if (!el) return;
   const text = String(line || "").trim();
@@ -509,20 +528,22 @@ function renderSchedulerTaskSettings(tasks = {}) {
 
 function renderGroupedTaskLogs(taskLogs = {}) {
   if (!schedulerTaskLogsEl) return;
-  const names = Object.keys(taskLogs);
+  const wasAtBottom = isLogContainerAtBottom(schedulerTaskLogsEl);
+  const names = Object.keys(taskLogs).sort();
   if (!names.length) {
     schedulerTaskLogsEl.textContent = "暂无日志";
+    scrollLogContainerToBottom(schedulerTaskLogsEl, wasAtBottom);
     return;
   }
-  schedulerTaskLogsEl.innerHTML = names.map((name) => {
-    const body = (taskLogs[name] || []).join("\n") || "暂无日志";
-    return `
-      <details open style="border:1px solid rgba(0,0,0,.08);border-radius:12px;padding:10px;">
-        <summary style="cursor:pointer;font-weight:600;">${name}</summary>
-        <pre style="white-space:pre-wrap;max-height:220px;overflow:auto;margin:10px 0 0;">${body}</pre>
-      </details>
-    `;
-  }).join("");
+  const blocks = names.map((name) => {
+    const lines = Array.isArray(taskLogs[name]) ? taskLogs[name] : [];
+    const body = lines.length ? lines.slice(-150).join("\n") : "（无输出）";
+    return `── ${name} ──\n${body}`;
+  });
+  schedulerTaskLogsEl.textContent = blocks.join("\n\n");
+  if (wasAtBottom || isLogFollowEnabled()) {
+    requestAnimationFrame(() => scrollLogContainerToBottom(schedulerTaskLogsEl, true));
+  }
 }
 
 function renderCvProcessQueueLogs(taskLogs = {}, runningTasks = []) {
@@ -533,11 +554,17 @@ function renderCvProcessQueueLogs(taskLogs = {}, runningTasks = []) {
     const running = Array.isArray(runningTasks)
       ? runningTasks.filter((item) => /^process_queue/i.test(String(item?.name || "")) && !!item?.running)
       : [];
+    const wasAtBottomEarly = isLogContainerAtBottom(cvTaskLogsEl);
     if (running.length) {
       const text = running.map((item) => `${item.name} (pid=${item.pid ?? "-"})`).join("\n");
       cvTaskLogsEl.textContent = `任务运行中，等待输出...\n${text}`;
     } else {
       cvTaskLogsEl.textContent = "暂无日志";
+    }
+    if (wasAtBottomEarly) {
+      requestAnimationFrame(() => {
+        cvTaskLogsEl.scrollTop = cvTaskLogsEl.scrollHeight;
+      });
     }
     return;
   }
@@ -554,7 +581,13 @@ function renderCvProcessQueueLogs(taskLogs = {}, runningTasks = []) {
       }
       lines.push("");
     });
+  const wasAtBottom = isLogContainerAtBottom(cvTaskLogsEl);
   cvTaskLogsEl.textContent = lines.join("\n").trim() || "暂无日志";
+  if (wasAtBottom) {
+    requestAnimationFrame(() => {
+      cvTaskLogsEl.scrollTop = cvTaskLogsEl.scrollHeight;
+    });
+  }
 }
 
 function toggleDeviceOpsButtons() {
@@ -1982,6 +2015,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     action_single: true,
     skip_post_click_prob: 0,
     pull_batch_size: 5,
+    pull_batches_before_rest: 5,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -2020,6 +2054,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     action_single: true,
     skip_post_click_prob: 0,
     pull_batch_size: 5,
+    pull_batches_before_rest: 5,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -2057,6 +2092,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     action_single: true,
     skip_post_click_prob: 0,
     pull_batch_size: 5,
+    pull_batches_before_rest: 5,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -3279,12 +3315,14 @@ async function refreshTaskStatus() {
     const runningTasks = Array.isArray(data.running_tasks) ? data.running_tasks : [];
     if (schedulerEnabledToggle) schedulerEnabledToggle.checked = !!data.scheduler_enabled;
     if (taskStatusEl) {
-      const taskStatusLines = [
-        `scheduler_enabled: ${data.scheduler_enabled}`,
-        `running_tasks: ${JSON.stringify(runningTasks)}`,
-        `auto_search_schedule: ${JSON.stringify(data.auto_search_schedule || {})}`,
-      ];
-      taskStatusEl.textContent = taskStatusLines.join("\n");
+      const runningLabel = runningTasks.length
+        ? runningTasks.map((item) => item?.name || item).join(", ")
+        : "无";
+      taskStatusEl.textContent = [
+        `总开关: ${data.scheduler_enabled ? "开" : "关"}`,
+        `运行中: ${runningLabel}`,
+        `自动搜索: ${JSON.stringify(data.auto_search_schedule || {})}`,
+      ].join("  |  ");
     }
     renderSchedulerTaskSettings(schedulerTasks);
     renderGroupedTaskLogs(taskLogs);
@@ -3782,8 +3820,20 @@ async function fetchTiktokStats() {
     });
 
     if (statsResultEl) {
-      if (!include_raw && data && Number(data.code) === 0 && data.universal_extract) {
-        statsResultEl.textContent = JSON.stringify(data.universal_extract, null, 2);
+      if (data && Number(data.code) === 0 && data.universal_extract) {
+        const lines = [JSON.stringify(data.universal_extract, null, 2)];
+        if (include_raw) {
+          const debug = {
+            username: data.username,
+            private_account_guess: data.private_account_guess,
+            private_account_reason: data.private_account_reason,
+            debug: data.debug,
+            raw_response: data.raw_response,
+          };
+          lines.push("\n--- 调试信息（已省略完整 HTTP headers）---\n");
+          lines.push(JSON.stringify(debug, null, 2));
+        }
+        statsResultEl.textContent = lines.join("\n");
       } else {
         statsResultEl.textContent = JSON.stringify(data, null, 2);
       }
@@ -4832,6 +4882,21 @@ if (saveCvQualityFilterBtn) {
 }
 if (triggerAutoSearchBtn) {
   triggerAutoSearchBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_autosearch_once", "已触发：autoSearch执行一次"));
+}
+if (schedulerLogsScrollBottomBtn) {
+  schedulerLogsScrollBottomBtn.addEventListener("click", () => {
+    if (schedulerLogsFollowToggle) schedulerLogsFollowToggle.checked = true;
+    scrollLogContainerToBottom(schedulerTaskLogsEl, true);
+    scrollLogContainerToBottom(taskStatusEl, true);
+  });
+}
+if (schedulerTaskLogsEl) {
+  schedulerTaskLogsEl.addEventListener("scroll", () => {
+    if (!isLogFollowEnabled()) return;
+    if (!isLogContainerAtBottom(schedulerTaskLogsEl) && schedulerLogsFollowToggle) {
+      schedulerLogsFollowToggle.checked = false;
+    }
+  });
 }
 if (saveSchedulerConfigBtn) {
   saveSchedulerConfigBtn.addEventListener("click", saveSchedulerConfig);

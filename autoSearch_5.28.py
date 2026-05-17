@@ -19,16 +19,25 @@ TikTok 粉丝监控（极简版）：只为手机端下发队列准备数据。
 
 import argparse
 import json
-import requests
-import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from bs4 import BeautifulSoup
-
 from zoneinfo import ZoneInfo  # Python 3.9+
+
+_SERVER_DIR = Path(__file__).resolve().parent / "server"
+
+
+def _import_profile_metrics():
+    import sys
+
+    server = str(_SERVER_DIR)
+    if server not in sys.path:
+        sys.path.insert(0, server)
+    from tiktok_universal_snapshot import fetch_tiktok_profile_metrics_dict
+
+    return fetch_tiktok_profile_metrics_dict
 
 # 统一使用一个数据库文件（与脚本同目录）
 DB_PATH = Path(__file__).resolve().parent / "tiktok_fans.db"
@@ -73,175 +82,24 @@ def init_db():
         conn.close()
 
 
-# ---------- 抓取 ----------
-
-def _safe_int(v):
-    try:
-        if isinstance(v, bool):
-            return None
-        if isinstance(v, (int, float)):
-            return int(v)
-        if isinstance(v, str):
-            m = re.search(r"\d+", v.replace(",", ""))
-            return int(m.group()) if m else None
-    except Exception:
-        return None
-    return None
-
-
-def _extract_universal_data(html_text: str):
-    """从 __UNIVERSAL_DATA_FOR_REHYDRATION__ script 中提取 JSON。"""
-    soup = BeautifulSoup(html_text, "html.parser")
-    tag = soup.find("script", {"id": "__UNIVERSAL_DATA_FOR_REHYDRATION__"})
-    if not tag:
-        return None
-    raw = tag.string or tag.get_text() or ""
-    raw = raw.strip()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
-def _walk(obj):
-    """递归遍历 JSON，产出所有 dict。"""
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _walk(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from _walk(item)
+# ---------- 抓取（统一走 autoSearch_5.28_with_debug） ----------
 
 
 def scrape_tiktok_profile_metrics(username):
-    """
-    抓取 TikTok 主页关键指标：
-    - follower_count
-    - following_count
-    - heart_count
-    - video_count
-    并附带尝试提取 recent_video_play_counts（可为空）。
-
-    :return: dict | None
-    """
-    url = f"https://www.tiktok.com/@{username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        html_text = response.text
-
-        universal = _extract_universal_data(html_text)
-
-        follower_count = None
-        following_count = None
-        heart_count = None
-        video_count = None
-        recent_video_play_counts = []
-
-        if universal is not None:
-            for node in _walk(universal):
-                if follower_count is None and "followerCount" in node:
-                    follower_count = _safe_int(node.get("followerCount"))
-                if following_count is None and "followingCount" in node:
-                    following_count = _safe_int(node.get("followingCount"))
-                if heart_count is None and "heartCount" in node:
-                    heart_count = _safe_int(node.get("heartCount"))
-                if video_count is None and "videoCount" in node:
-                    video_count = _safe_int(node.get("videoCount"))
-
-                stats_obj = node.get("stats") if isinstance(node.get("stats"), dict) else None
-                for candidate in (node, stats_obj):
-                    if not isinstance(candidate, dict):
-                        continue
-                    pc = None
-                    for key in ("playCount", "play_count", "viewCount", "view_count"):
-                        if key in candidate:
-                            pc = _safe_int(candidate.get(key))
-                            if pc is not None:
-                                break
-                    if pc is not None:
-                        recent_video_play_counts.append(pc)
-
-        # 兜底：若 JSON 没解析到，就用正则取关键字段
-        if follower_count is None:
-            m = re.search(r'"followerCount"\s*:\s*(\d+)', html_text)
-            follower_count = int(m.group(1)) if m else None
-        if following_count is None:
-            m = re.search(r'"followingCount"\s*:\s*(\d+)', html_text)
-            following_count = int(m.group(1)) if m else None
-        if heart_count is None:
-            m = re.search(r'"heartCount"\s*:\s*(\d+)', html_text)
-            heart_count = int(m.group(1)) if m else None
-        if video_count is None:
-            m = re.search(r'"videoCount"\s*:\s*(\d+)', html_text)
-            video_count = int(m.group(1)) if m else None
-
-        # 去重并限制采样量
-        if recent_video_play_counts:
-            dedup = []
-            seen = set()
-            for x in recent_video_play_counts:
-                if x not in seen:
-                    seen.add(x)
-                    dedup.append(x)
-            recent_video_play_counts = dedup[:20]
-
-        # 对质量筛选场景，不强依赖 follower_count，尽量返回可用字段
-        if follower_count is None and following_count is None and video_count is None:
-            return None
-
-        private_account_guess = False
-        private_account_reason = ""
-
-        if universal is not None:
-            matched_private = None
-            matched_secret = None
-            target = username.strip().lstrip("@").lower()
-            for node in _walk(universal):
-                uid = node.get("uniqueId") if isinstance(node, dict) else None
-                if isinstance(uid, str) and uid.lower() == target:
-                    p = node.get("privateAccount")
-                    s = node.get("secret")
-                    if isinstance(p, bool):
-                        matched_private = p
-                    if isinstance(s, bool):
-                        matched_secret = s
-                    break
-
-            if matched_private is True or matched_secret is True:
-                private_account_guess = True
-                private_account_reason = (
-                    f"universal_user_flags:privateAccount={matched_private},secret={matched_secret}"
-                )
-
-        return {
-            "username": username,
-            "follower_count": follower_count,
-            "following_count": following_count,
-            "heart_count": heart_count,
-            "video_count": video_count,
-            "recent_video_play_counts": recent_video_play_counts,
-            "private_account_guess": private_account_guess,
-            "private_account_reason": private_account_reason,
-        }
-
-    except Exception as e:
-        print(f"抓取失败 [{username}]: {str(e)}")
-        return None
+    """抓取 TikTok 主页关键指标（实现见 autoSearch_5.28_with_debug）。"""
+    return _import_profile_metrics()(username)
 
 
 def scrape_tiktok_followers(username):
     """兼容旧逻辑：仅返回粉丝数。"""
     profile = scrape_tiktok_profile_metrics(username)
-    return profile.get("follower_count") if profile else None
+    if not profile:
+        return None
+    follower_count = profile.get("follower_count")
+    try:
+        return int(follower_count) if follower_count is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------- root 用户管理（tiktok_roots）----------
@@ -382,7 +240,7 @@ if __name__ == "__main__":
     init_db()
     if args.profile:
         uname = str(args.profile).strip().lstrip("@")
-        data = scrape_tiktok_profile_metrics(uname)
+        data = _import_profile_metrics()(uname)
         print(json.dumps(data or {}, ensure_ascii=False))
     elif args.once:
         run_once()

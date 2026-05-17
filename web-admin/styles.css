@@ -840,6 +840,145 @@ button.danger {
   z-index: 1;
 }
 
+.tiktok-roots-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.tiktok-roots-bottom {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.scheduler-controls-card {
+  max-height: none;
+  overflow: visible;
+}
+
+.scheduler-tasks-panel {
+  margin-top: 0;
+}
+
+.scheduler-tasks-panel-summary {
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  list-style: none;
+  user-select: none;
+}
+
+.scheduler-tasks-panel-summary::-webkit-details-marker {
+  display: none;
+}
+
+.scheduler-tasks-panel-summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.scheduler-tasks-panel[open] .scheduler-tasks-panel-summary::before {
+  transform: rotate(90deg);
+}
+
+.scheduler-tasks-panel .scheduler-task-settings {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.scheduler-task-settings {
+  display: grid;
+  gap: 10px;
+}
+
+.scheduler-log-card {
+  display: flex;
+  flex-direction: column;
+  min-height: min(58vh, 620px);
+}
+
+.log-console-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.log-console-toolbar h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.log-console-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.log-follow-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.log-console-status {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #f4f6ff;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 72px;
+  overflow: auto;
+  flex-shrink: 0;
+}
+
+.log-console-body {
+  flex: 1;
+  min-height: 360px;
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+
+@media (max-width: 1200px) {
+  .tiktok-roots-bottom {
+    grid-template-columns: 1fr;
+  }
+
+  .scheduler-log-card {
+    min-height: 48vh;
+  }
+
+  .log-console-body {
+    min-height: 280px;
+  }
+}
+
 @media (max-width: 960px) {
   .app {
     flex-direction: column;
