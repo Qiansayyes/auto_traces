@@ -117,6 +117,12 @@ interface TraceExecutor {
     suspend fun profileEditRunOcrChain(ctx: Context, runtimeConfig: AppConfig): ProfileEditChainResult
 
     /**
+     * 修改基本资料外轮：假定拉起后已在 For You，刷两下视频（与主流程 For You 预滑同向；无点赞、不跑完整预滑循环）。
+     * 每次滑后 delay 450ms。硬停返回 false。
+     */
+    suspend fun profileEditForYouTwoSwipesAfterLaunch(logAlias: String, w: Int, h: Int): Boolean
+
+    /**
      * `Pictures` 目录树下图片文件数（su + find 递归，扩展名 jpg/jpeg/png/webp/gif；
      * 与 adb `find /storage/emulated/0/Pictures … | wc -l` 一致）。失败返回 -1。
      */
@@ -268,6 +274,9 @@ class RealTraceExecutor(
         /** 未见 Privacy 时最多复点次数（固定同坐标复点）。 */
         private const val PROFILE_EDIT_SETTINGS_GEAR_RETAP_MAX = 6
 
+        /** 修改基本资料：Upload photo 后整屏 OCR「Allow all」最多次数（未命中仅跳过）。 */
+        private const val PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES = 3
+
         /** 发作品图库统计根路径（与 adb `find /storage/emulated/0/Pictures` 一致）。 */
         private const val PUBLISH_POST_PICTURES_PATH = "/storage/emulated/0/Pictures"
 
@@ -299,28 +308,23 @@ class RealTraceExecutor(
         return if (pm.resolveActivity(fallbackIntent, 0) != null) fallbackIntent else null
     }
 
-    private fun launchTikTokWithRoot(alias: String, tag: String): Boolean {
+    /** 仅执行 root 拉起命令（不含等待与前台校验）；强停由调用方按需处理。 */
+    private fun runTikTokRootLaunchCommands(): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
-        val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-        runSuCommand("am force-stop $pkg")
-        Thread.sleep(forceStopWaitMs)
         val commands = listOf(
             "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $pkg",
             "monkey -p $pkg -c android.intent.category.LAUNCHER 1",
         )
-
         for (command in commands) {
-            val ok = runSuCommand(command)
-            if (!ok) continue
-            Thread.sleep(launchWaitMs)
-            if (isPackageVisible(pkg)) return true
-            Thread.sleep(1200)
-            if (isPackageVisible(pkg)) return true
+            if (runSuCommand(command)) return true
         }
         return false
     }
 
+    /**
+     * 拉起 TikTok：启动命令 → 等待 [launchWaitMs] → dumpsys 前台校验 →
+     * **仅在前台已确认时** OCR 处理 Don't allow（非 TikTok 前台时 OCR 无意义）。
+     */
     private suspend fun launchTikTokOnceWithCheck(
         ctx: Context,
         alias: String,
@@ -336,49 +340,47 @@ class RealTraceExecutor(
         }
 
         var didLaunchCommand = false
-        var confirmed = false
-
         val intent = buildTikTokLaunchIntent(ctx)
         if (intent != null) {
             try {
                 ctx.startActivity(intent)
                 didLaunchCommand = true
-                delay(launchWaitMs)
-                confirmed = isPackageVisible(pkg)
-                if (!confirmed) {
-                    delay(1200)
-                    confirmed = isPackageVisible(pkg)
-                }
             } catch (_: Exception) {
                 // fall through to root launch
             }
         }
+        if (!didLaunchCommand) {
+            didLaunchCommand = runTikTokRootLaunchCommands()
+        }
+        if (!didLaunchCommand) {
+            devOp(alias, "$tag：拉起 TikTok 失败（启动命令均未成功）")
+            return false
+        }
 
+        devOp(alias, "$tag：启动命令已执行，等待 ${launchWaitMs}ms（tiktok_launch_wait_ms）后进行前台校验")
+        delay(launchWaitMs)
+
+        var confirmed = isPackageVisible(pkg)
         if (!confirmed) {
-            if (launchTikTokWithRoot(alias, tag)) {
-                didLaunchCommand = true
-                delay(launchWaitMs)
-                if (!isPackageVisible(pkg)) delay(1200)
-                confirmed = isPackageVisible(pkg)
-            }
+            devOp(alias, "$tag：配置等待后前台校验未通过，再等 1200ms 重试 dumpsys")
+            delay(1200)
+            confirmed = isPackageVisible(pkg)
+        }
+        if (!confirmed) {
+            devOp(alias, "$tag：拉起 TikTok 失败（配置等待后前台校验未通过，跳过 Don't allow OCR）")
+            return false
         }
 
-        var dismissedDontAllow = false
-        if (didLaunchCommand) {
-            dismissedDontAllow = dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
-            delay(if (dismissedDontAllow) 600L else 350L)
-            if (!confirmed) confirmed = isPackageVisible(pkg)
-        }
+        val dismissedDontAllow = dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
+        delay(if (dismissedDontAllow) 600L else 350L)
 
         when {
-            confirmed && dismissedDontAllow ->
+            dismissedDontAllow ->
                 devOp(alias, "$tag：拉起 TikTok 成功（权限弹窗已处理）")
-            confirmed ->
-                devOp(alias, "$tag：拉起 TikTok 成功")
             else ->
-                devOp(alias, "$tag：拉起 TikTok 失败")
+                devOp(alias, "$tag：拉起 TikTok 成功")
         }
-        return confirmed
+        return true
     }
 
     /** 拉起 TikTok 命令已执行后：统一 OCR「Don't allow」并点击（至多 3 次、间隔 0.5s）。 */
@@ -435,7 +437,7 @@ class RealTraceExecutor(
         runSuCommand("am force-stop $pkg")
         delay(forceStopWaitMs)
 
-        val firstOk = launchOnce("首次启动") && isPackageVisible(pkg)
+        val firstOk = launchOnce("首次启动")
         if (firstOk) {
             devOp(alias, "重启 TikTok 成功", System.currentTimeMillis() - t0)
             return true
@@ -443,13 +445,13 @@ class RealTraceExecutor(
 
         delay(350)
         if (isPackageVisible(pkg)) {
-            devOp(alias, "重启 TikTok 成功", System.currentTimeMillis() - t0)
+            devOp(alias, "重启 TikTok 成功（短等后 dumpsys 已为前台）", System.currentTimeMillis() - t0)
             return true
         }
 
         runSuCommand("am force-stop $pkg")
         delay(forceStopWaitMs)
-        val secondOk = launchOnce("二次启动") && isPackageVisible(pkg)
+        val secondOk = launchOnce("二次启动")
         devOp(alias, "重启 TikTok ${if (secondOk) "成功" else "失败"}", System.currentTimeMillis() - t0)
         return secondOk
     }
@@ -919,6 +921,27 @@ class RealTraceExecutor(
         profileEditDelay(logAlias, 450, "列表下滑后")
     }
 
+    /** For You 刷下一条：与 [runForYouWarmupIfNeeded] 同向（手指上滑）。 */
+    private suspend fun profileEditForYouFeedSwipeOnce(logAlias: String, w: Int, h: Int) {
+        val swipeX = (w * 0.5f).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
+        val startY = (h * 0.78f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val endY = (h * 0.32f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val swipeDuration = Random.nextInt(260, 421)
+        devOp(logAlias, "「修改基本资料」For You 下滑：swipe ($swipeX,$startY)→($swipeX,$endY) ${swipeDuration}ms")
+        runSuCommand("input swipe $swipeX $startY $swipeX $endY $swipeDuration")
+    }
+
+    override suspend fun profileEditForYouTwoSwipesAfterLaunch(logAlias: String, w: Int, h: Int): Boolean {
+        if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
+        devOp(logAlias, "「修改基本资料」For You：假定已在推荐页，刷两下视频（无点赞）")
+        repeat(2) { pass ->
+            if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
+            profileEditForYouFeedSwipeOnce(logAlias, w, h)
+            if (!profileEditDelay(logAlias, 450, "For You下滑${pass + 1}后")) return false
+        }
+        return true
+    }
+
     /**
      * 整屏 OCR + [findHit]；命中仅写日志**不点击**（用于 Comments 等跳转校验）。
      */
@@ -1023,7 +1046,11 @@ class RealTraceExecutor(
             timingConfig = config,
         )
         devOp(logAlias, "「修改基本资料」Bio后② 重试 warmup：拉起结果=${if (launchOk) "success" else "failed"}")
-        if (!profileEditDelay(logAlias, if (launchOk) 1600L else 1200L, "②重试拉起后")) return false
+        if (!launchOk) {
+            devOp(logAlias, "「修改基本资料」Bio后② 重试 warmup：拉起未通过前台校验，中止本轮回试")
+            return false
+        }
+        if (!profileEditDelay(logAlias, 1600L, "②重试拉起后")) return false
         if (hardStopOrNull(logAlias, "修改基本资料-②重试warmup")) return false
 
         val dm = ctx.resources.displayMetrics
@@ -1723,7 +1750,7 @@ class RealTraceExecutor(
             "「修改基本资料」OCR 链开始：屏=${w}x${h}px；步骤=OCR Edit 坐标→点击 Edit→" +
                 "OCR 分别记录「Change photo」「Name」「Bio」三词坐标（不点）→" +
                 "同屏严格「Change photo」首击（若无则专段整屏 OCR）→" +
-                "整屏「Upload photo」（OCR 最多 3 次）→「Allow all」（OCR 最多 2 次，未命中仅跳过该按钮）→" +
+                "整屏「Upload photo」（OCR 最多 3 次）→「Allow all」（OCR 最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次，未命中仅跳过该按钮）→" +
                 "左上固定点→Next×2（间隔 0.5s）→Post this photo to Story→Save→" +
                 "等 2s 后 OCR「Change photo」校验至多 7 次→Name→Bio(模板)→" +
                 "①Save→终验→返回(至多3轮)→②比例点→【插入】Permissions+Save login info(2.5s)+返回→【旧】Permissions校验+Privacy→Comments(6)→下滑→Viewers→On/Off→Viewer history(7)→等3s",
@@ -2110,29 +2137,41 @@ class RealTraceExecutor(
         delay(600)
         devOp(
             logAlias,
-            "「修改基本资料」「Upload photo」tap 已完成；短延迟后尝试整屏 OCR「Allow all」（最多 2 次；均未命中则跳过，不中断链路）",
+            "「修改基本资料」「Upload photo」tap 已完成；短延迟后尝试整屏 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；均未命中则跳过，不中断链路）",
         )
 
         val allowPreviews = mutableListOf<String>()
         var allowTapPx: Pair<Int, Int>? = null
         var allowTapOk = false
         var allowAttempts = 0
-        while (allowAttempts < 2 && !allowTapOk) {
+        while (allowAttempts < PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES && !allowTapOk) {
             allowAttempts++
             delay(600)
-            devOp(logAlias, "「修改基本资料」严格「Allow all」OCR 第 $allowAttempts/2 次…")
+            devOp(
+                logAlias,
+                "「修改基本资料」严格「Allow all」OCR 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次…",
+            )
             val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_allow_all_$allowAttempts")
             if (vision == null) {
                 allowPreviews.add("[$errTag]")
-                devOp(logAlias, "「修改基本资料」Allow all 第 $allowAttempts/2 次失败：$errTag")
+                devOp(
+                    logAlias,
+                    "「修改基本资料」Allow all 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次失败：$errTag",
+                )
                 continue
             }
             val ap = buildProfileEditOcrPreview(vision)
             allowPreviews.add(ap)
-            devOp(logAlias, "「修改基本资料」Allow all 第 $allowAttempts/2 次：行摘要=${ap.take(500)}")
+            devOp(
+                logAlias,
+                "「修改基本资料」Allow all 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次：行摘要=${ap.take(500)}",
+            )
             val hit = findStrictExactLabelHit(vision, "Allow all")
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」Allow all 第 $allowAttempts/2 次：未命中严格文案")
+                devOp(
+                    logAlias,
+                    "「修改基本资料」Allow all 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次：未命中严格文案",
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, "Allow all", "Allow all", hit, w, h)
@@ -2174,7 +2213,7 @@ class RealTraceExecutor(
         if (!allowTapOk) {
             devOp(
                 logAlias,
-                "「修改基本资料」Allow all：2 次 OCR 均未命中严格文案（可能无系统权限弹窗或当前为相册/最近界面），不再查找点击位置，跳过本步继续后续流程",
+                "「修改基本资料」Allow all：${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次 OCR 均未命中严格文案（可能无系统权限弹窗或当前为相册/最近界面），不再查找点击位置，跳过本步继续后续流程",
             )
         }
 
@@ -2716,17 +2755,43 @@ class RealTraceExecutor(
         runSuCommand("input keyevent 4")
     }
 
-    private fun confirmTikTokForeground(alias: String, action: String): Boolean {
+    /**
+     * dumpsys 判定 TikTok 非前台时尽量恢复任务，不因「当前不在 TikTok 界面」直接放弃：
+     * 1) 先不切前台强停，尝试把已在后台的 TikTok 拉到前台（部分机型有效）；
+     * 2) 仍非前台则 [restartTikTokForRecovery]：强停杀后台 → 完整冷启 → dumpsys 再验。
+     *
+     * TikTok 在后台但 dumpsys 仍显示非前台时，第 1 步可能无效，第 2 步更可靠。
+     */
+    private suspend fun ensureTikTokInForeground(
+        ctx: Context,
+        alias: String,
+        tag: String,
+    ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        val top = getTopPackageNameBySu()
-        val ok = top.contains(pkg, ignoreCase = true)
-        if (!ok) devOp(alias, "$action：未在 TikTok 前台")
-        return ok
+        if (isPackageVisible(pkg)) return true
+
+        val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+
+        devOp(alias, "$tag：dumpsys 非 TikTok 前台，先尝试切到前台（不强停，避免误杀后台进程）")
+        if (launchTikTokOnceWithCheck(ctx, alias, "$tag·切前台", launchWaitMs, forceStopBeforeLaunch = false)) {
+            devOp(alias, "$tag：切前台后已确认 TikTok 在前台，继续任务")
+            return true
+        }
+
+        devOp(alias, "$tag：切前台后仍非 TikTok 前台（可能在后台或拉起无效），强停后完整重拉")
+        if (restartTikTokForRecovery()) {
+            devOp(alias, "$tag：强停重拉成功，已确认 TikTok 在前台，继续任务")
+            return true
+        }
+
+        devOp(alias, "$tag：强停重拉后前台仍未确认，本段任务无法安全继续")
+        return false
     }
 
     private suspend fun runForYouWarmupIfNeeded(service: Context, alias: String, config: AppConfig) {
         val totalMs = (config.for_you_swipe_total_sec * 1000.0).toLong().coerceAtLeast(0L)
         if (totalMs < 500L) return
+        if (!ensureTikTokInForeground(service, alias, "For You 预滑")) return
 
         val likeProb = config.for_you_like_prob.coerceIn(0.0, 1.0)
         val rawMinMs = (config.for_you_watch_min_sec * 1000.0).toLong().coerceAtLeast(500L)
@@ -2877,28 +2942,31 @@ class RealTraceExecutor(
             devOp(alias, "涨粉模式：重启后从点击放大镜重新开始")
             restartFromMagnifierForGrowth = false
             delay(500)
-            clickMagnifier(service)
+            if (!clickMagnifier(service)) {
+                return "TikTok 恢复拉起失败，无法点击放大镜，无法执行 $username"
+            }
         } else if (lastEndedAtUsersSelection) {
             devOp(alias, "复用 Users 选择界面，跳过重启 TikTok")
+            if (!ensureTikTokInForeground(ctx, alias, "复用 Users")) {
+                return "TikTok 恢复拉起失败，无法复用 Users 界面，无法执行 $username"
+            }
             focusSearchInput(service)
             clearSearchInputText()
             delay(Random.nextLong(400, 700))
         } else {
-            val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-            var launched = launchTikTokOnceWithCheck(ctx, alias, "打开 TikTok", launchWaitMs)
-            if (!launched) {
-                devOp(alias, "打开 TikTok 失败：判活未通过，尝试 restartTikTokForRecovery 二次拉起")
-                launched = restartTikTokForRecovery()
-            }
-            if (!launched) {
-                devOp(alias, "打开 TikTok 失败：二次恢复拉起仍未通过前台校验")
-                return "TikTok 启动失败（前台校验未通过），无法执行 $username"
+            if (!ensureTikTokInForeground(ctx, alias, "打开 TikTok")) {
+                return "TikTok 恢复拉起失败，无法执行 $username"
             }
             delay(500)
             runForYouWarmupIfNeeded(service, alias, config)
-            clickMagnifier(service)
+            if (!clickMagnifier(service)) {
+                return "TikTok 恢复拉起失败，无法点击放大镜，无法执行 $username"
+            }
         }
 
+        if (!ensureTikTokInForeground(ctx, alias, "输入搜索词前")) {
+            return "TikTok 恢复拉起失败，无法输入搜索词，无法执行 $username"
+        }
         val safeUsername = shellEscape(username)
         val inputResult = runSuCommand("input text $safeUsername")
         if (!inputResult) {
@@ -2908,7 +2976,9 @@ class RealTraceExecutor(
         delay(Random.nextLong(800, 1500))
 
         // 4. 通过坐标点击 Search 按钮（root input tap）
-        clickSearchButtonAndWait(service)
+        if (!clickSearchButtonAndWait(service)) {
+            return "TikTok 恢复拉起失败，无法点击 Search，无法执行 $username"
+        }
 
         // 5. 搜索结果页：点击 Users。主播模式增加“>=3个Follow”验收，不通过则补点重试。
         val modeForUsersCheck = config.run_mode.trim().lowercase()
@@ -2992,10 +3062,11 @@ class RealTraceExecutor(
         return "已拉取用户名 $username，已完成：搜索 → 点头像 → 进粉丝列表并处理用户"
     }
 
-    private suspend fun clickMagnifier(service: Context) {
+    /** @return 是否已恢复前台并完成放大镜点击 */
+    private suspend fun clickMagnifier(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        withTikTokGuard(alias, "点击放大镜") {
-            if (!confirmTikTokForeground(alias, "点击放大镜前校验")) return@withTikTokGuard
+        return withTikTokGuard(alias, "点击放大镜") {
+            if (!ensureTikTokInForeground(service, alias, "点击放大镜")) return@withTikTokGuard false
             val metrics = service.resources.displayMetrics
             val width = metrics.widthPixels
             val height = metrics.heightPixels
@@ -3005,7 +3076,8 @@ class RealTraceExecutor(
             val clickY = height * ratioY
             runSuCommand("input tap ${clickX.toInt()} ${clickY.toInt()}")
             delay(Random.nextLong(800, 1200))
-        }
+            true
+        } == true
     }
 
     /** 互点 Videos 标签点击 Y：与涨粉模式中 Users 标签同一级别，仍沿用顶部标签区 OCR 定位。 */
@@ -3801,7 +3873,6 @@ class RealTraceExecutor(
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
         val forceStopWaitMs = config.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         val mutualSearchText = pickMutualTikTokSearchKeyword(config)
         val safeSearchText = shellEscape(mutualSearchText)
@@ -3809,32 +3880,26 @@ class RealTraceExecutor(
         runSuCommand("am force-stop $pkg")
         delay(forceStopWaitMs)
 
-        var launched = launchTikTokOnceWithCheck(service, alias, launchCheckTag, launchWaitMs)
-        if (!launched) {
-            devOp(alias, "互点：TikTok 首次启动未通过前台校验（$launchCheckTag），尝试 restartTikTokForRecovery")
-            launched = restartTikTokForRecovery()
-        }
-        if (!launched) {
-            devOp(alias, "互点：TikTok 启动失败（$launchCheckTag）")
+        if (!ensureTikTokInForeground(service, alias, "互点·$launchCheckTag")) {
+            devOp(alias, "互点：TikTok 恢复拉起失败（$launchCheckTag）")
             return false
         }
 
         delay(800)
-        if (!isPackageVisible(pkg)) {
-            delay(1000)
-        }
-        if (!isPackageVisible(pkg)) {
-            devOp(alias, "互点：TikTok 未成功回到前台（$launchCheckTag）")
+
+        if (!clickMagnifier(service)) {
+            devOp(alias, "互点：TikTok 恢复拉起失败，无法点击放大镜（$launchCheckTag）")
             return false
         }
-
-        clickMagnifier(service)
         delay(500)
         runSuCommand("input keyevent 67")
         runSuCommand("input keyevent 67")
         runSuCommand("input text $safeSearchText")
         delay(800)
-        clickSearchButtonAndWait(service)
+        if (!clickSearchButtonAndWait(service)) {
+            devOp(alias, "互点：TikTok 恢复拉起失败，无法点击 Search（$launchCheckTag）")
+            return false
+        }
         devOp(alias, "互点：已完成放大镜点击并搜索「$mutualSearchText」（$launchCheckTag）")
         delay(2400)
         val videosAnchor = findVideosTabAnchorByOcrFast(service)
@@ -4143,10 +4208,15 @@ class RealTraceExecutor(
             devOp(alias, "发作品：拉起失败（包名=$pkg）")
             return false
         }
+        devOp(alias, "发作品：非 TikTok 包拉起，等待 ${launchWaitMs}ms 后进行前台校验（包名=$pkg）")
         delay(launchWaitMs)
-        if (!isPackageVisible(pkg)) delay(1200)
         var confirmed = isPackageVisible(pkg)
-        if (!confirmed) devOp(alias, "发作品：冷启 TikTok 失败（包名=$pkg）")
+        if (!confirmed) {
+            devOp(alias, "发作品：配置等待后前台校验未通过，再等 1200ms 重试（包名=$pkg）")
+            delay(1200)
+            confirmed = isPackageVisible(pkg)
+        }
+        if (!confirmed) devOp(alias, "发作品：冷启失败（包名=$pkg，配置等待后前台校验未通过）")
         return confirmed
     }
 
@@ -4364,6 +4434,10 @@ class RealTraceExecutor(
             delay(launchWaitMs)
         } else if (skipLaunchWait) {
             devOp(alias, "发作品：跳过拉起等待（已在主界面或刚完成冷启）")
+        }
+        if (!ensureTikTokInForeground(service, alias, "发作品资料入口")) {
+            devOp(alias, "发作品：TikTok 恢复拉起失败，中止资料入口点击")
+            return false
         }
         val ratioTapY = 0.95f
         val dm = service.resources.displayMetrics
@@ -4871,6 +4945,14 @@ class RealTraceExecutor(
                     "发作品：上一条已成功，不冷启 TikTok，等待 ${PUBLISH_POST_INTER_ITEM_DELAY_MS}ms 后进入第 ${idx + 1} 条创作入口",
                 )
                 delay(PUBLISH_POST_INTER_ITEM_DELAY_MS)
+                if (!ensureTikTokInForeground(service, alias, "发作品条间续作")) {
+                    devOp(alias, "发作品 第 ${idx + 1}/$publishRounds 条：条间恢复拉起未通过，尝试冷启后继续")
+                    if (!publishPostColdLaunch(service, packageName, alias, config)) {
+                        devOp(alias, "发作品 第 ${idx + 1}/$publishRounds 条：条间冷启失败，跳过本条")
+                        if (isHardStopActive()) return false
+                        continue
+                    }
+                }
             }
             val videoIndex = idx
             if (hardStopOrNull(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条")) return false
@@ -4992,10 +5074,11 @@ class RealTraceExecutor(
         }
     }
 
-    private suspend fun clickSearchButtonAndWait(service: Context) {
+    /** @return 是否已恢复前台并完成 Search 点击 */
+    private suspend fun clickSearchButtonAndWait(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        withTikTokGuard(alias, "点击 Search") {
-            if (!confirmTikTokForeground(alias, "点击 Search 前校验")) return@withTikTokGuard
+        return withTikTokGuard(alias, "点击 Search") {
+            if (!ensureTikTokInForeground(service, alias, "点击 Search")) return@withTikTokGuard false
             val metrics = service.resources.displayMetrics
             val width = metrics.widthPixels
             val height = metrics.heightPixels
@@ -5005,7 +5088,8 @@ class RealTraceExecutor(
             val searchY = height * searchRatioY
             runSuCommand("input tap ${searchX.toInt()} ${searchY.toInt()}")
             delay(2500)
-        }
+            true
+        } == true
     }
 
     private suspend fun ensureUsersTabClicked(service: Context): Point? {
@@ -7975,16 +8059,26 @@ class RealTraceExecutor(
             return false
         }
         delay(500)
-        clickMagnifier(service)
+        if (!clickMagnifier(service)) {
+            devOp(alias, "Users OCR 恢复：TikTok 恢复拉起失败，无法点击放大镜")
+            return false
+        }
         val safeUsername = shellEscape(username)
         devOp(alias, "Users OCR 恢复：输入搜索用户名：$username")
+        if (!ensureTikTokInForeground(service, alias, "Users OCR 恢复输入")) {
+            devOp(alias, "Users OCR 恢复：TikTok 恢复拉起失败，无法输入搜索词")
+            return false
+        }
         val inputResult = runSuCommand("input text $safeUsername")
         if (!inputResult) {
             devOp(alias, "Users OCR 恢复：输入搜索词失败")
             return false
         }
         delay(Random.nextLong(800, 1500))
-        clickSearchButtonAndWait(service)
+        if (!clickSearchButtonAndWait(service)) {
+            devOp(alias, "Users OCR 恢复：TikTok 恢复拉起失败，无法点击 Search")
+            return false
+        }
         ensureUsersTabClicked(service)
         if (isLiveModeForUsersCheck) {
             ensureUsersTabReadyForLiveMode(service)

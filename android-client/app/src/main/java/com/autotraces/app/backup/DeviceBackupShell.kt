@@ -17,7 +17,7 @@ object DeviceBackupShell {
      * `/data/data/<包名>` 目录（`du -sk`）低于此值时不打包 tar，仅 force-stop + pm clear。
      * 未登录/空数据通常 < 50MB；已登录账号一般 > 100MB。
      */
-    const val MIN_DATA_DIR_KB_FOR_BACKUP: Long = 80L * 1024L
+    const val MIN_DATA_DIR_KB_FOR_BACKUP: Long = 60L * 1024L
 
     fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 

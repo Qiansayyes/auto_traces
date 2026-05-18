@@ -317,13 +317,24 @@ class MainActivity : AppCompatActivity() {
                 val alias = PrefsStore.getAlias().orEmpty().trim()
 
                 binding.fetchTikTokCodeButton.isEnabled = false
-                binding.assignedCopyStatusText.text = "正在获取验证码..."
+                binding.assignedCopyStatusText.text = "正在设备端获取验证码..."
                 val result = withContext(Dispatchers.IO) {
                     val local = fetchTikTokEmailCode(apiUrl)
                     if (local.isSuccess) {
                         local
                     } else {
                         val localErr = local.exceptionOrNull()!!
+                        if (deviceId.isBlank() || alias.isBlank()) {
+                            return@withContext Result.failure(
+                                IllegalStateException(
+                                    "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；设备未绑定，无法云端代取（请先在设置中绑定设备）",
+                                ),
+                            )
+                        }
+                        withContext(Dispatchers.Main) {
+                            binding.assignedCopyStatusText.text =
+                                "设备端失败，正在云端代取…（${localErr.message ?: localErr.javaClass.simpleName}）"
+                        }
                         val serverResult = fetchTikTokEmailCodeFromServer(deviceId, alias, apiUrl)
                         if (serverResult.isSuccess) {
                             serverResult

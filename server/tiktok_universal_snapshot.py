@@ -94,6 +94,10 @@ def extract_tiktok_universal_profile_snapshot(
     )
 
 
+def apply_following_visibility_html_fallback(snap: Any, html_text: str) -> None:
+    _load_autosearch_module().apply_following_visibility_html_fallback(snap, html_text)
+
+
 def prepare_tiktok_profile_request_headers_and_cookies() -> Tuple[
     Dict[str, str], Optional[Dict[str, str]], List[str], Optional[str]
 ]:
@@ -145,6 +149,7 @@ def fetch_tiktok_profile_metrics_dict(username: str) -> Optional[Dict[str, Any]]
 
     universal = _get_universal_data(html_text)
     snap = extract_tiktok_universal_profile_snapshot(universal, username)
+    apply_following_visibility_html_fallback(snap, html_text)
     is_private = snap.profile_private_account is True or snap.profile_secret is True
     private_reason = ""
     if is_private:
@@ -152,6 +157,13 @@ def fetch_tiktok_profile_metrics_dict(username: str) -> Optional[Dict[str, Any]]
             "universal_matched_user_flags:"
             f"privateAccount={snap.profile_private_account},"
             f"secret={snap.profile_secret}"
+        )
+
+    following_hidden = snap.following_list_hidden_guess
+    following_hidden_reason = ""
+    if following_hidden is True:
+        following_hidden_reason = (
+            f"universal_matched_user_flags:followingVisibility={snap.profile_following_visibility}"
         )
 
     follower_count = snap.follower_count or None
@@ -170,6 +182,9 @@ def fetch_tiktok_profile_metrics_dict(username: str) -> Optional[Dict[str, Any]]
         "recent_video_play_counts": [],
         "private_account_guess": is_private,
         "private_account_reason": private_reason,
+        "profile_following_visibility": snap.profile_following_visibility,
+        "following_list_hidden_guess": following_hidden,
+        "following_list_hidden_reason": following_hidden_reason,
     }
 
 

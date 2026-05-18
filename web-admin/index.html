@@ -369,11 +369,16 @@
               <option value="">全部</option>
               <option value="unknown">unknown</option>
               <option value="pending">pending</option>
+              <option value="available">available</option>
+              <option value="following_private">following_private</option>
+              <option value="private_account">private_account</option>
+              <option value="not_found">not_found</option>
               <option value="running">running</option>
               <option value="success">success</option>
               <option value="failed">failed</option>
             </select>
             <button id="queryCvAccessData" class="primary">查询直客访问模式数据</button>
+            <button id="preflightFollowerQueueBtn" class="ghost">预检关注列表可见性</button>
             <button id="triggerProcessQueueInline" class="ghost">立即处理 follower_queue</button>
             <button id="stopProcessQueueInline" class="danger">停止处理 follower_queue</button>
           </div>
@@ -462,7 +467,7 @@
       <section id="tiktok-stats" class="panel">
         <header>
           <h2>TikTok数据查询</h2>
-          <p>输入用户名后，从主页内嵌 Universal 解析与项目根目录 <code>autoSearch_5.28_with_debug.py</code> 中 <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。<strong>默认仅展示该快照 JSON</strong>；需排查壳页时再勾选「附带原始 HTTP」。Cookie 默认自动读取项目根目录或 <code>server/</code> 下的 <code>tiktok_cookies.json</code>；也可用环境变量 <code>TIKTOK_COOKIES_FILE</code>；<code>TIKTOK_SKIP_COOKIE=1</code> 可强制不带 Cookie。</p>
+          <p>输入用户名后，从主页内嵌 Universal 解析与项目根目录 <code>autoSearch_5.28_with_debug.py</code> 中 <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。结果顶部摘要含 <code>profile_following_visibility</code>（<code>followingVisibility</code>，1=公开）与 <code>following_list_hidden_guess</code>（非 1 表示关注列表对他人隐藏）。<strong>默认仅展示该快照 JSON</strong>；需排查壳页时再勾选「附带原始 HTTP」。Cookie 默认自动读取项目根目录或 <code>server/</code> 下的 <code>tiktok_cookies.json</code>；也可用环境变量 <code>TIKTOK_COOKIES_FILE</code>；<code>TIKTOK_SKIP_COOKIE=1</code> 可强制不带 Cookie。</p>
         </header>
         <div class="split">
           <div class="panel-card">
@@ -721,6 +726,7 @@
           <h3>2. 随机抽取一批（来自 tiktok_roots）的标准流程（严格版）</h3>
           <ol>
             <li><strong>读取批次</strong>：从 <code>follower_queue</code> 按创建时间读取待处理记录（支持 limit）。</li>
+            <li><strong>关注列表预检（推荐）</strong>：处理前用 Universal 的 <code>followingVisibility</code> 判断关注列表是否对他人可见；不可见则标记 <code>following_access_status=following_private</code> 并跳过浏览器采集。可点「预检关注列表可见性」，或在「立即处理」时自动先跑一批预检。</li>
             <li><strong>进入主页</strong>：优先直接访问 <code>https://www.tiktok.com/@用户名</code>，失败再走搜索页兜底。</li>
             <li><strong>主页可用性判断</strong>：若主页打不开，标记 <code>following_access_status=not_found</code>，并标记 <code>mobile_push_status=not_eligible</code>。</li>
             <li><strong>粉丝账号私密拦截</strong>：若 follower 主页是私密账号，标记 <code>following_access_status=private_account</code>，并标记 <code>mobile_push_status=not_eligible</code>。</li>
@@ -934,6 +940,7 @@
             <li>查询入口：<code>/api/admin/tiktok_profile_stats</code>。</li>
             <li>返回主体：<code>universal_extract</code>，字段与 autoSearch <code>extract_tiktok_universal_profile_snapshot</code> 输出一致（含 <code>to_publish_style_metrics</code>）。</li>
             <li>私密判断：<code>profile_private_account</code> / <code>profile_secret</code>（与 page_username 匹配的 userInfo），汇总为 <code>private_account_guess</code>。</li>
+            <li>关注列表：<code>profile_following_visibility</code>（<code>user.followingVisibility</code>，1=公开），汇总为 <code>following_list_hidden_guess</code>（非 1 视为对他人隐藏）。</li>
             <li><code>raw_response.text</code> 已做展示过滤：去除大段 script/style，便于人工判断。</li>
             <li>调试字段：<code>debug.user_detail_meta</code>、<code>debug.universal_data_present</code> 等。</li>
           </ul>

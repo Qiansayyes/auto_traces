@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Literal
 import requests
 
 from tiktok_universal_snapshot import (
+    apply_following_visibility_html_fallback,
     _get_universal_data,
     _webapp_user_detail_meta,
     extract_tiktok_universal_profile_snapshot,
@@ -1133,6 +1134,65 @@ def _normalize_alias_key(raw: object) -> str:
     return text.lower()
 
 
+def _normalize_tiktok_username_key(raw: object) -> str:
+    text = str(raw or "").strip().lstrip("@")
+    return text.lower()
+
+
+def _alias_account_template_key(alias: object, tiktok_username: object) -> str:
+    """别名设备上某 TikTok 账号的配置映射键（与仅 alias 的设备级键并存，解析时账号键优先）。"""
+    alias_clean = _normalize_alias_key(alias)
+    user_clean = _normalize_tiktok_username_key(tiktok_username)
+    if not alias_clean or not user_clean:
+        return alias_clean
+    return f"{alias_clean}::{user_clean}"
+
+
+def _device_editor_effective_alias(row: dict) -> str:
+    assigned = str(row.get("assigned_alias") or "").strip()
+    if assigned:
+        return _normalize_alias_key(assigned)
+    return _normalize_alias_key(row.get("device_alias"))
+
+
+def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -> str:
+    """按 device_editor_rows 切号高亮解析该别名桶内当前 TikTok 账号。"""
+    owner = str(owner_username or "").strip()
+    alias_clean = _normalize_alias_key(alias)
+    if not owner or not alias_clean:
+        return ""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT username, switch_highlight, device_alias, assigned_alias
+            FROM device_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+    matched: list[dict] = []
+    for row in rows or []:
+        item = {
+            "username": str(row[0] or "").strip(),
+            "switch_highlight": _normalize_switch_highlight(row[1]),
+            "device_alias": str(row[2] or "").strip(),
+            "assigned_alias": str(row[3] or "").strip(),
+        }
+        if _device_editor_effective_alias(item) != alias_clean:
+            continue
+        matched.append(item)
+    if not matched:
+        return ""
+    highlighted = [r for r in matched if r.get("switch_highlight") == "是"]
+    pick = highlighted[0] if len(highlighted) == 1 else (matched[0] if len(matched) == 1 else None)
+    if not pick:
+        return ""
+    return _normalize_tiktok_username_key(pick.get("username"))
+
+
 def _parse_template_ref(template_ref: object) -> tuple[str, str, bool]:
     text = str(template_ref or "").strip()
     if text.startswith("shared::"):
@@ -1292,6 +1352,7 @@ def _resolve_template_for_mode_alias(
     data: dict,
     mode: str,
     alias: str,
+    tiktok_username: str | None = None,
 ) -> tuple[str, Dict[str, object], Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
     templates, template_meta = _build_effective_template_bundle(owner_username, data)
     if not templates:
@@ -1304,31 +1365,43 @@ def _resolve_template_for_mode_alias(
         )
     mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
     alias_clean = _normalize_alias_key(alias)
+    account_clean = _normalize_tiktok_username_key(tiktok_username or "")
+    account_key = _alias_account_template_key(alias_clean, account_clean) if account_clean else ""
     alias_map_all = data.get("alias_template_by_mode", {})
     raw_ref = ""
+    template_source_hint = ""
+
+    def _lookup_mode_map(mode_probe: str) -> str:
+        mode_map = alias_map_all.get(mode_probe) if isinstance(alias_map_all, dict) else None
+        if not isinstance(mode_map, dict):
+            return ""
+        if account_key:
+            cand = str(mode_map.get(account_key) or "").strip()
+            if cand in templates:
+                return cand
+        return str(mode_map.get(alias_clean) or "").strip()
+
     # 互点模式：若别名为 mutual 队列单独绑定了模板，优先使用（含 mutual_comment_texts）；
     # 否则仍按涨粉 alias 绑定解析（与旧客户端兼容）。
     if mode_key == "mutual":
-        mutual_map = alias_map_all.get("mutual") if isinstance(alias_map_all, dict) else None
-        if isinstance(mutual_map, dict):
-            cand = str(mutual_map.get(alias_clean) or "").strip()
-            if cand in templates:
-                raw_ref = cand
+        cand = _lookup_mode_map("mutual")
+        if cand in templates:
+            raw_ref = cand
+            template_source_hint = "mutual"
     template_mode_key = "growth" if mode_key == "mutual" else mode_key
     if not raw_ref:
-        mode_map = alias_map_all.get(template_mode_key) if isinstance(alias_map_all, dict) else {}
-        raw_ref = str(mode_map.get(alias_clean) or "").strip() if isinstance(mode_map, dict) else ""
+        cand = _lookup_mode_map(template_mode_key)
+        if cand in templates:
+            raw_ref = cand
+            template_source_hint = template_mode_key
     cross_mode_hit = ""
-    # 兜底：若当前模式未配置该 alias，尝试复用其它模式同 alias 的模板，避免误回退到 active_template。
+    # 兜底：若当前模式未配置该 alias/账号，尝试复用其它模式同键的模板，避免误回退到 active_template。
     if not raw_ref and isinstance(alias_map_all, dict) and alias_clean:
         probe_modes = [template_mode_key, "mutual", "growth", "live", "direct"]
         for probe_mode in probe_modes:
             if probe_mode == template_mode_key:
                 continue
-            probe_map = alias_map_all.get(probe_mode)
-            if not isinstance(probe_map, dict):
-                continue
-            probe_ref = str(probe_map.get(alias_clean) or "").strip()
+            probe_ref = _lookup_mode_map(probe_mode)
             if probe_ref in templates:
                 raw_ref = probe_ref
                 cross_mode_hit = probe_mode
@@ -1342,7 +1415,7 @@ def _resolve_template_for_mode_alias(
     selected_name = raw_ref if raw_ref in templates else fallback_name
     config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
     print(
-        f"[{now_text()}] 模板解析 | owner={owner_username} mode={mode_key} alias={alias_clean} raw_ref={raw_ref or '-'} cross_mode_hit={cross_mode_hit or '-'} selected={selected_name} fallback={fallback_name} templates={','.join(sorted(templates.keys()))}"
+        f"[{now_text()}] 模板解析 | owner={owner_username} mode={mode_key} alias={alias_clean} account={account_clean or '-'} account_key={account_key or '-'} source={template_source_hint or '-'} raw_ref={raw_ref or '-'} cross_mode_hit={cross_mode_hit or '-'} selected={selected_name} fallback={fallback_name} templates={','.join(sorted(templates.keys()))}"
     )
     return selected_name, config, templates, template_meta
 
@@ -1682,6 +1755,11 @@ class AliasTemplateSelectRequest(BaseModel):
     template_name: str = Field(..., min_length=1, max_length=128)
     mode: Literal["growth", "live", "direct", "mutual"] | None = None
     owner_username: str | None = Field(default=None, max_length=64)
+    tiktok_username: str | None = Field(
+        default=None,
+        max_length=128,
+        description="非空时绑定到「别名+该 TikTok 账号」；为空则仍绑定整个别名设备",
+    )
 
 
 class TemplateGrantUpsertRequest(BaseModel):
@@ -1928,6 +2006,12 @@ class MutualClickRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
     package_name: str = Field(..., min_length=1, max_length=255)
+
+
+class DeviceTikTokEmailCodeRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    api_url: str = Field(..., min_length=1, max_length=2048)
 
 
 class DeviceOpReportRequest(BaseModel):
@@ -2252,13 +2336,11 @@ def auth_or_error(device_id: str, alias: str):
 
 
 def _session_device_ids_from_fallback(session: dict) -> set[str]:
-    """store.lock 抢不到时，用上一次成功概览缓存的设备表，避免 admin 得到空集合整页无设备。"""
+    """store.lock 抢不到时，用上一次成功概览缓存的设备表，避免得到空集合整页无设备。"""
     cached_devices = _overview_fallback_snapshot.get("devices") or {}
     if not isinstance(cached_devices, dict):
         return set()
-    if session.get("role") == "admin":
-        return {str(k) for k in cached_devices.keys()}
-    owner = session["username"]
+    owner = str(session.get("username") or "").strip()
     out: set[str] = set()
     for did, entry in cached_devices.items():
         if isinstance(entry, dict) and str(entry.get("owner_username") or "") == owner:
@@ -2267,11 +2349,18 @@ def _session_device_ids_from_fallback(session: dict) -> set[str]:
 
 
 def _session_device_ids(session: dict, *, lock_wait_sec: float = 2.0) -> set[str]:
-    """管理台当前用户可见的设备 ID 集合：管理员为全部，普通客户仅本人 owner_username。"""
+    """管理台当前用户可见的设备 ID 集合：仅 owner_username 与登录用户名一致的设备。"""
+    owner = str(session.get("username") or "").strip()
+    if not owner:
+        return set()
+
     if session.get("role") == "admin":
         conn = _get_db()
         try:
-            rows = conn.execute("SELECT device_id FROM client_devices").fetchall()
+            rows = conn.execute(
+                "SELECT device_id FROM client_devices WHERE owner_username = ?",
+                (owner,),
+            ).fetchall()
             return {str(r[0]) for r in rows}
         except sqlite3.OperationalError:
             print(f"[{now_text()}] session_device_ids | admin_db_failed | using_overview_fallback_devices")
@@ -2286,16 +2375,13 @@ def _session_device_ids(session: dict, *, lock_wait_sec: float = 2.0) -> set[str
         )
         return _session_device_ids_from_fallback(session)
     try:
-        owner = session["username"]
         return {did for did, d in store.devices.items() if d.owner_username == owner}
     finally:
         store.lock.release()
 
 
 def _device_session_allowed(device: DeviceInfo, session: dict) -> bool:
-    if session.get("role") == "admin":
-        return True
-    return device.owner_username == session["username"]
+    return str(device.owner_username or "").strip() == str(session.get("username") or "").strip()
 
 
 def _require_login_and_owning_device(
@@ -2600,6 +2686,30 @@ def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) 
         conn.commit()
     finally:
         conn.close()
+
+
+def _restore_device_auto_start_opt_out_after_cut_switch(device_id: str, alias: str = "") -> bool:
+    """切号全流程成功后恢复该设备参与「自动开启程序」（清除 auto_start_opt_out）。"""
+    did = (device_id or "").strip()
+    if not did:
+        return False
+    restored = False
+    dev_alias = ""
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev or not dev.auto_start_opt_out:
+            return False
+        dev.auto_start_opt_out = False
+        dev_alias = str(dev.alias or alias or "").strip()
+        restored = True
+    if restored:
+        _persist_client_device_to_db(did)
+        _append_device_log(
+            did,
+            f"[{now_text()}] 切号完成 | 已自动恢复该设备「自动开启程序」参与"
+            + (f"（alias={dev_alias}）" if dev_alias else ""),
+        )
+    return restored
 
 
 def _get_device_editor_record(username: str, mobile_alias: str | None = None):
@@ -3314,6 +3424,118 @@ def _build_sanitized_raw_response_text(html: str) -> str:
         return (html or "")[:120_000]
 
 
+def _mark_follower_queue_preflight_status(
+    username: str,
+    following_access_status: str,
+    mobile_push_status: str = "not_eligible",
+    following_fetch_success: int = 1,
+) -> None:
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            UPDATE follower_queue
+            SET following_access_status = ?,
+                mobile_push_status = ?,
+                following_fetch_success = ?
+            WHERE username = ?
+            """,
+            (
+                following_access_status,
+                mobile_push_status,
+                int(following_fetch_success),
+                username.strip().lstrip("@"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def preflight_follower_queue_following_visibility(limit: int = 100) -> dict:
+    """
+    批量预检 follower_queue：用 Universal/followingVisibility 标记关注列表不可见等状态，
+    避免 process_queue 开浏览器后再发现无法采集。
+    """
+    limit = max(1, min(1000, int(limit or 100)))
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT username
+            FROM follower_queue
+            WHERE COALESCE(following_fetch_success, 0) = 0
+              AND COALESCE(following_access_status, 'unknown') NOT IN (
+                  'following_private', 'private_account', 'not_found'
+              )
+            ORDER BY created_at
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    stats = {
+        "scanned": len(rows),
+        "marked_following_private": 0,
+        "marked_private_account": 0,
+        "marked_not_found": 0,
+        "still_processable": 0,
+        "check_failed": 0,
+    }
+    for row in rows:
+        username = str(row[0] or "").strip().lstrip("@")
+        if not username:
+            continue
+        try:
+            result = fetch_tiktok_profile_stats(username)
+        except Exception as exc:
+            stats["check_failed"] += 1
+            print(
+                f"[{now_text()}] follower_queue预检失败 | username={username} | error={exc}",
+            )
+            continue
+
+        if not isinstance(result, dict) or int(result.get("code", 1)) != 0:
+            stats["check_failed"] += 1
+            continue
+
+        if bool(result.get("private_account_guess")):
+            _mark_follower_queue_preflight_status(username, "private_account")
+            stats["marked_private_account"] += 1
+            print(
+                f"[{now_text()}] follower_queue预检 | username={username} | private_account",
+            )
+            continue
+
+        if result.get("following_list_hidden_guess") is True:
+            vis = result.get("profile_following_visibility")
+            _mark_follower_queue_preflight_status(username, "following_private")
+            stats["marked_following_private"] += 1
+            print(
+                f"[{now_text()}] follower_queue预检 | username={username} | "
+                f"following_private | followingVisibility={vis}",
+            )
+            continue
+
+        follower_count = (result.get("universal_extract") or {}).get("follower_count")
+        following_count = (result.get("universal_extract") or {}).get("following_count")
+        video_count = (result.get("universal_extract") or {}).get("video_count")
+        if (
+            follower_count is None
+            and following_count is None
+            and video_count is None
+        ):
+            _mark_follower_queue_preflight_status(username, "not_found")
+            stats["marked_not_found"] += 1
+            continue
+
+        stats["still_processable"] += 1
+
+    return stats
+
+
 def _is_private_username(username: str) -> tuple[bool, str]:
     """统一私密账号检测入口。"""
     result = fetch_tiktok_profile_stats(username)
@@ -3378,6 +3600,7 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
 
     universal = _get_universal_data(html)
     snap = extract_tiktok_universal_profile_snapshot(universal, username)
+    apply_following_visibility_html_fallback(snap, html)
     extract_dict = tiktok_universal_extract_to_json_dict(snap)
     user_detail_meta = _webapp_user_detail_meta(universal)
 
@@ -3388,6 +3611,13 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
             "universal_matched_user_flags:"
             f"privateAccount={snap.profile_private_account},"
             f"secret={snap.profile_secret}"
+        )
+
+    following_list_hidden_guess = snap.following_list_hidden_guess
+    following_list_hidden_reason = ""
+    if following_list_hidden_guess is True:
+        following_list_hidden_reason = (
+            f"universal_matched_user_flags:followingVisibility={snap.profile_following_visibility}"
         )
 
     debug_payload = {
@@ -3407,7 +3637,9 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
 
     print(
         f"[{now_text()}] TikTok stats | username={username} | universal_extract={extract_dict} | "
-        f"private_guess={is_private_guess} | reason={private_reason or '-'}"
+        f"private_guess={is_private_guess} | reason={private_reason or '-'} | "
+        f"following_hidden={following_list_hidden_guess} | "
+        f"followingVisibility={snap.profile_following_visibility}"
     )
 
     result = {
@@ -3417,6 +3649,9 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
         "universal_extract": extract_dict,
         "private_account_guess": is_private_guess,
         "private_account_reason": private_reason,
+        "profile_following_visibility": snap.profile_following_visibility,
+        "following_list_hidden_guess": following_list_hidden_guess,
+        "following_list_hidden_reason": following_list_hidden_reason,
         "debug": debug_payload,
     }
 
@@ -3833,23 +4068,38 @@ def sync_status(payload: SyncStatusRequest):
 
 
 @app.get("/api/get_config")
-def get_config(device_id: str, alias: str, run_mode: str | None = None):
+def get_config(
+    device_id: str,
+    alias: str,
+    run_mode: str | None = None,
+    tiktok_username: str | None = None,
+):
     error, device = auth_or_error(device_id, alias)
     if error:
         return error
     data = _normalize_user_runtime_state(_load_user_runtime_state(device.owner_username))
     mode = run_mode if run_mode in RUN_MODES else data.get("run_mode", "growth")
     mode = mode if mode in RUN_MODES else "growth"
+    alias_clean = _normalize_alias_key(alias)
+    account_clean = _normalize_tiktok_username_key(tiktok_username or "")
+    if not account_clean:
+        account_clean = _resolve_switch_highlight_tiktok_username(device.owner_username, alias_clean)
     active_template, config, templates, template_meta = _resolve_template_for_mode_alias(
         device.owner_username,
         data,
         mode,
         alias,
+        account_clean or None,
     )
-    alias_clean = _normalize_alias_key(alias)
     alias_map_all = data.get("alias_template_by_mode", {})
     mode_map = alias_map_all.get(mode) if isinstance(alias_map_all, dict) else {}
-    mode_raw_ref = str(mode_map.get(alias_clean) or "").strip() if isinstance(mode_map, dict) else ""
+    account_key = _alias_account_template_key(alias_clean, account_clean) if account_clean else ""
+    mode_raw_ref = ""
+    if isinstance(mode_map, dict):
+        if account_key:
+            mode_raw_ref = str(mode_map.get(account_key) or "").strip()
+        if not mode_raw_ref:
+            mode_raw_ref = str(mode_map.get(alias_clean) or "").strip()
     cross_mode_hit = ""
     cross_mode_ref = ""
     if not mode_raw_ref and isinstance(alias_map_all, dict):
@@ -3884,6 +4134,8 @@ def get_config(device_id: str, alias: str, run_mode: str | None = None):
             "device_id": device_id,
             "alias_raw": alias,
             "alias_normalized": alias_clean,
+            "tiktok_username": account_clean or "",
+            "account_template_key": account_key or "",
             "run_mode_requested": run_mode,
             "run_mode_effective": mode,
             "run_mode_stored": str(data.get("run_mode") or "").strip(),
@@ -4012,19 +4264,24 @@ def set_alias_template(payload: AliasTemplateSelectRequest, authorization: str |
     mode_map = alias_map_all.get(mode, {})
     if not isinstance(mode_map, dict):
         mode_map = {}
-    mode_map[alias] = requested
+    map_key = alias
+    tiktok_user = _normalize_tiktok_username_key(payload.tiktok_username or "")
+    if tiktok_user:
+        map_key = _alias_account_template_key(alias, tiktok_user)
+    mode_map[map_key] = requested
     alias_map_all[mode] = mode_map
     data["alias_template_by_mode"] = alias_map_all
     _save_user_runtime_state(target_username, data)
     print(
-        f"[{now_text()}] 模板映射 | operator={session['username']} user={target_username} mode={mode} alias={alias} raw_alias={alias_raw} template={requested}"
+        f"[{now_text()}] 模板映射 | operator={session['username']} user={target_username} mode={mode} alias={alias} account={tiktok_user or '-'} map_key={map_key} raw_alias={alias_raw} template={requested}"
     )
     return {
         "code": 0,
-        "msg": "别名模板已更新",
+        "msg": "账号模板已更新" if tiktok_user else "别名模板已更新",
         "owner_username": target_username,
         "mode": mode,
         "alias": alias,
+        "tiktok_username": tiktok_user,
         "template_name": requested,
         "alias_template_by_mode": alias_map_all,
     }
@@ -4362,7 +4619,13 @@ def check_start(device_id: str, alias: str):
 
 
 @app.get("/api/pull_username")
-def pull_username(device_id: str, alias: str, count: int | None = None, run_mode: str | None = None):
+def pull_username(
+    device_id: str,
+    alias: str,
+    count: int | None = None,
+    run_mode: str | None = None,
+    tiktok_username: str | None = None,
+):
     error, device = auth_or_error(device_id, alias)
     if error:
         print(f"[{now_text()}] pull_username | auth_failed | device_id={device_id} alias={alias}")
@@ -4386,11 +4649,15 @@ def pull_username(device_id: str, alias: str, count: int | None = None, run_mode
     # pull_username 用它来决定 pull_batch_size、休息前批次数与休息策略。
     data = _normalize_user_runtime_state(_load_user_runtime_state(device.owner_username))
     mode = run_mode if run_mode in RUN_MODES else data.get("run_mode", "growth")
+    account_clean = _normalize_tiktok_username_key(tiktok_username or "")
+    if not account_clean:
+        account_clean = _resolve_switch_highlight_tiktok_username(device.owner_username, alias)
     active_template, eff_config, templates, _template_meta = _resolve_template_for_mode_alias(
         device.owner_username,
         data,
         mode,
         alias,
+        account_clean or None,
     )
 
     cfg_default = int(eff_config.get("pull_batch_size", 5) or 5)
@@ -4573,6 +4840,91 @@ def device_ops_poll(payload: DeviceOpPollRequest):
         return {"code": 1, "msg": "暂无待执行设备任务"}
     print(f"[{now_text()}] device_ops.poll | return_task | type={op.get('type')}")
     return {"code": 0, "msg": "ok", "op": op}
+
+
+_TIKTOK_EMAIL_CODE_PATTERNS = (
+    re.compile(r"(?im)^\s*(主题|subject)\s*[:：]\s*(\d{6})\b"),
+    re.compile(r"(?i)\b6[- ]?digit\s+code\b[^\d]{0,24}(\d{6})\b"),
+    re.compile(r"\b(\d{6})\b"),
+)
+
+
+def _extract_tiktok_email_code(body_text: str) -> str:
+    """与 Android MainActivity.extractEmailCode 保持一致的 6 位验证码解析。"""
+    normalized = (
+        (body_text or "")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+    normalized = re.sub(r"[\u00A0\t]", " ", normalized)
+    for pat in _TIKTOK_EMAIL_CODE_PATTERNS:
+        m = pat.search(normalized)
+        if not m:
+            continue
+        code = (m.group(2) if m.lastindex and m.lastindex >= 2 else "").strip()
+        if not code:
+            code = (m.group(1) or "").strip()
+        if re.fullmatch(r"\d{6}", code):
+            return code
+    raise ValueError("未识别到 6 位验证码")
+
+
+def _fetch_tiktok_email_code_from_api(api_url: str) -> tuple[int, str, str | None]:
+    url = (api_url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return 1, "API 链接无效", None
+    try:
+        response = requests.get(url, timeout=15)
+    except Exception as exc:
+        return 1, f"请求邮箱 API 失败: {exc}", None
+    if response.status_code != 200:
+        return 1, f"HTTP {response.status_code}", None
+    body = (response.text or "").strip()
+    if not body:
+        return 1, "返回内容为空", None
+    try:
+        code = _extract_tiktok_email_code(body)
+    except ValueError as exc:
+        return 1, str(exc), None
+    return 0, "ok", code
+
+
+def _tiktok_email_code_response(device_id: str, alias: str, api_url: str) -> dict:
+    code, msg, email_code = _fetch_tiktok_email_code_from_api(api_url)
+    if code != 0 or not email_code:
+        print(
+            f"[{now_text()}] device_tiktok.email_code | failed | device={device_id} "
+            f"alias={alias} | {msg}"
+        )
+        return {"code": code, "msg": msg, "email_code": None}
+    print(
+        f"[{now_text()}] device_tiktok.email_code | ok | device={device_id} "
+        f"alias={alias} | code={email_code}"
+    )
+    return {"code": 0, "msg": "ok", "email_code": email_code}
+
+
+@app.post("/api/device/tiktok/email_code")
+def device_tiktok_email_code(payload: DeviceTikTokEmailCodeRequest):
+    """设备端直连邮箱 API 失败时，由服务端代拉并解析 6 位 TikTok 验证码（仅需设备绑定）。"""
+    error, _device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    return _tiktok_email_code_response(payload.device_id, payload.alias, payload.api_url)
+
+
+@app.post("/api/admin/device_tiktok/email_code")
+def admin_device_tiktok_email_code(
+    payload: DeviceTikTokEmailCodeRequest,
+    authorization: str | None = Header(default=None),
+):
+    """管理台/已登录用户代设备拉取 TikTok 邮箱验证码。"""
+    err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    if err:
+        return err
+    return _tiktok_email_code_response(payload.device_id, payload.alias, payload.api_url)
 
 
 @app.post("/api/admin/device_tiktok/mutual_click_start")
@@ -4850,8 +5202,19 @@ def device_ops_report(payload: DeviceOpReportRequest):
         if owner_u:
             if op_type == "tiktok_backup_and_clear":
                 _device_ops_apply_cut_switch_after_backup(owner_u, data)
+                cut_mode = str(data.get("cut_switch_after_backup") or "").strip().lower()
+                if cut_mode == "exclusive_activate_target":
+                    _restore_device_auto_start_opt_out_after_cut_switch(
+                        payload.device_id,
+                        payload.alias,
+                    )
             elif op_type == "tiktok_restore":
                 _device_ops_apply_cut_switch_after_restore(owner_u, data)
+                if bool(data.get("skip_pm_clear")):
+                    _restore_device_auto_start_opt_out_after_cut_switch(
+                        payload.device_id,
+                        payload.alias,
+                    )
 
     return {"code": 0, "msg": "设备任务结果已接收"}
 
@@ -4979,6 +5342,10 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
     if err:
         return err
 
+    _resume_device_for_cloud_op(
+        payload.device_id,
+        f"[{now_text()}] 云端后台 | 已入队清理 TikTok 任务，等待设备拉取（alias={payload.alias}）",
+    )
     op_id = _enqueue_tiktok_device_op(
         payload.device_id,
         "tiktok_clear",
@@ -4988,6 +5355,7 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
             "package_name": payload.package_name.strip(),
         },
     )
+    _append_device_log(payload.device_id, f"[{now_text()}] 设备任务已入队 op_id={op_id} type=tiktok_clear")
 
     return {
         "code": 0,
@@ -5040,10 +5408,18 @@ def admin_device_tiktok_backup_and_clear(payload: DeviceTikTokBackupClearRequest
     if payload.cut_switch_target_row_index is not None and int(payload.cut_switch_target_row_index) >= 0:
         op_payload["cut_switch_target_row_index"] = int(payload.cut_switch_target_row_index)
 
+    _resume_device_for_cloud_op(
+        payload.device_id,
+        f"[{now_text()}] 云端后台 | 已入队备份并清理/切号任务，等待设备拉取（alias={payload.alias}）",
+    )
     op_id = _enqueue_tiktok_device_op(
         payload.device_id,
         "tiktok_backup_and_clear",
         op_payload,
+    )
+    _append_device_log(
+        payload.device_id,
+        f"[{now_text()}] 设备任务已入队 op_id={op_id} type=tiktok_backup_and_clear alias={payload.alias}",
     )
 
     return {
@@ -6090,6 +6466,10 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
     }
     if record_row_index >= 0:
         restore_payload["restore_highlight_row_index"] = record_row_index
+    _resume_device_for_cloud_op(
+        payload.device_id,
+        f"[{now_text()}] 云端后台 | 已入队还原备份/切号任务，等待设备拉取（alias={payload.alias}）",
+    )
     _enqueue_device_op(
         payload.device_id,
         {
@@ -6098,6 +6478,10 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
             "payload": restore_payload,
             "created_at": now_text(),
         },
+    )
+    _append_device_log(
+        payload.device_id,
+        f"[{now_text()}] 设备任务已入队 op_id={op_id} type=tiktok_restore alias={payload.alias}",
     )
 
     return {
@@ -7112,8 +7496,29 @@ def trigger_collect_roots_db(
     return result
 
 
+@app.post("/api/admin/follower_queue/preflight_following_visibility")
+def follower_queue_preflight_following_visibility(limit: int = 100):
+    """批量预检关注列表可见性并回写 follower_queue 状态（不启动浏览器）。"""
+    stats = preflight_follower_queue_following_visibility(limit=limit)
+    return {
+        "code": 0,
+        "msg": "预检完成",
+        "limit": max(1, min(1000, int(limit or 100))),
+        "stats": stats,
+    }
+
+
 @app.post("/api/admin/tasks/trigger_process_queue")
-def trigger_process_queue(limit: int = 100, container_ids: str = "", parallel: int = 1):
+def trigger_process_queue(
+    limit: int = 100,
+    container_ids: str = "",
+    parallel: int = 1,
+    preflight: bool = True,
+):
+    preflight_stats = None
+    if preflight:
+        preflight_stats = preflight_follower_queue_following_visibility(limit=limit)
+
     env_ids = [x.strip() for x in (container_ids or "").splitlines() if x.strip()]
     if env_ids:
         jobs = []
@@ -7134,10 +7539,19 @@ def trigger_process_queue(limit: int = 100, container_ids: str = "", parallel: i
                 "--container-id", first,
             ]
             results.append(_start_task_process(f"process_queue_worker_{idx}", cmd))
-        return {"code": 0, "msg": "队列任务已按环境ID并行触发", "workers": len(jobs), "results": results}
+        return {
+            "code": 0,
+            "msg": "队列任务已按环境ID并行触发",
+            "workers": len(jobs),
+            "results": results,
+            "preflight": preflight_stats,
+        }
 
     cmd = [sys.executable, str(FOLLOW_SCRAPER_PATH), "--mode", "process_queue", "--limit", str(limit)]
-    return _start_task_process("process_queue_once", cmd)
+    started = _start_task_process("process_queue_once", cmd)
+    if isinstance(started, dict):
+        started["preflight"] = preflight_stats
+    return started
 
 
 @app.post("/api/admin/tasks/trigger_autosearch_once")

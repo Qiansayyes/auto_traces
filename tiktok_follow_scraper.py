@@ -352,6 +352,43 @@ def load_quality_filter_config(overview_api: str, default_min_video: int, defaul
     return min_video, max_following
 
 
+def profile_following_list_hidden(profile: dict | None) -> bool:
+    """profile 来自 fetch_profile_metrics_via_autosearch / Universal 查询。"""
+    if not profile:
+        return False
+    hidden = profile.get("following_list_hidden_guess")
+    if hidden is True:
+        return True
+    if hidden is False:
+        return False
+    vis = profile.get("profile_following_visibility")
+    if vis is None:
+        return False
+    try:
+        return int(vis) != 1
+    except (TypeError, ValueError):
+        return False
+
+
+def preflight_follower_profile(
+    username: str,
+    autosearch_path: str = "",
+) -> tuple[str | None, dict | None]:
+    """
+    开浏览器前预检 follower：一次 HTTP 查询。
+    返回 (skip_reason, profile)；skip_reason 为 None 表示可继续采集关注列表。
+    skip_reason: profile_unavailable | private_account | following_private
+    """
+    profile = fetch_profile_metrics_via_autosearch(username, autosearch_path)
+    if not profile:
+        return "profile_unavailable", None
+    if bool(profile.get("private_account_guess")):
+        return "private_account", profile
+    if profile_following_list_hidden(profile):
+        return "following_private", profile
+    return None, profile
+
+
 def fetch_profile_metrics_via_autosearch(username: str, autosearch_path: str = "") -> dict | None:
     """通过 autoSearch_5.28_with_debug 查询单个用户质量信息（进程内加载，无子进程）。"""
     _ = autosearch_path  # 保留参数兼容旧配置；实现固定走 with_debug
@@ -698,6 +735,9 @@ def fetch_follower_batch(limit: int = 100) -> List[tuple[str, str, str, int, str
             SELECT username, root_username, following_access_status, following_fetch_success, mobile_push_status
             FROM follower_queue
             WHERE COALESCE(following_fetch_success, 0) = 0
+              AND COALESCE(following_access_status, 'unknown') NOT IN (
+                  'following_private', 'private_account', 'not_found'
+              )
             ORDER BY created_at
             LIMIT ?
             """,
@@ -2450,6 +2490,8 @@ def run_process_queue_once(cfg: dict, limit: int = 100, container_id: str | None
         batch_skipped_quality = 0
         batch_skipped_private = 0
         batch_skipped_profile_unavailable = 0
+        batch_skipped_following_private = 0
+        batch_skipped_preflight = 0
         batch_skipped_existing_root = 0
 
         for f_idx, (follower_name, root_username, following_access_status, following_fetch_success, mobile_push_status) in enumerate(batch, start=1):
@@ -2462,6 +2504,39 @@ def run_process_queue_once(cfg: dict, limit: int = 100, container_id: str | None
             stage_save_db = 0.0
             print(f"  -> follower [{f_idx}/{len(batch)}]: {follower_name} (root={root_username})", flush=True)
             print(f"    [阶段] 开始处理 follower={follower_name}", flush=True)
+
+            preflight_start = time.time()
+            skip_reason, preflight_profile = preflight_follower_profile(
+                follower_name, AUTOSEARCH_PATH
+            )
+            preflight_cost = time.time() - preflight_start
+            if skip_reason:
+                batch_skipped_preflight += 1
+                if skip_reason == "profile_unavailable":
+                    update_follower_queue_status(follower_name, "not_found", "not_eligible", 1)
+                    print(
+                        f"    [预检跳过] 主页数据不可用: {follower_name} | 预检耗时={preflight_cost:.1f}s",
+                        flush=True,
+                    )
+                elif skip_reason == "private_account":
+                    batch_skipped_private += 1
+                    reason = (preflight_profile or {}).get("private_account_reason") or ""
+                    update_follower_queue_status(follower_name, "private_account", "not_eligible", 1)
+                    print(
+                        f"    [预检跳过] 私密账号: {follower_name} | reason={reason} | 预检耗时={preflight_cost:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    batch_skipped_following_private += 1
+                    vis = (preflight_profile or {}).get("profile_following_visibility")
+                    update_follower_queue_status(follower_name, "following_private", "not_eligible", 1)
+                    print(
+                        f"    [预检跳过] 关注列表对他人隐藏: {follower_name} | followingVisibility={vis} | 预检耗时={preflight_cost:.1f}s",
+                        flush=True,
+                    )
+                processed.append(follower_name)
+                continue
+            print(f"    [预检] 关注列表可见，继续浏览器采集 | 预检耗时={preflight_cost:.1f}s", flush=True)
 
             # 打开粉丝主页（直接 @username 访问，失败再尝试搜索）
             print("    [阶段] 尝试直接打开主页", flush=True)
@@ -2599,6 +2674,8 @@ def run_process_queue_once(cfg: dict, limit: int = 100, container_id: str | None
         f"写入mobile_pending_usernames={batch_inserted_pending} | "
         f"筛掉(质量/不完整)={batch_skipped_quality} | "
         f"筛掉(私密)={batch_skipped_private} | "
+        f"筛掉(关注列表隐藏)={batch_skipped_following_private} | "
+        f"预检跳过总计={batch_skipped_preflight} | "
         f"筛掉(profile_unavailable)={batch_skipped_profile_unavailable} | "
         f"去重(已在tiktok_roots)={batch_skipped_existing_root}",
         flush=True,

@@ -262,8 +262,9 @@ object AppCoordinator {
         val deviceQueueMode = PrefsStore.getDeviceRunMode()
         val modeForRequest =
             configQueryRunMode?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: deviceQueueMode
+        val tiktokAccount = PrefsStore.getLogContextUsername()
         return runCatching {
-            ApiService.getConfig(deviceId, alias, modeForRequest)
+            ApiService.getConfig(deviceId, alias, modeForRequest, tiktokAccount)
         }.fold(
             onSuccess = { response ->
                 if (response.code == 0 && response.config != null) {
@@ -526,6 +527,7 @@ object AppCoordinator {
                 alias,
                 pullN,
                 PrefsStore.getDeviceRunMode(),
+                PrefsStore.getLogContextUsername(),
             )
             if (response.code == 2) {
                 val minutes = (response.rest_minutes ?: 0).coerceAtLeast(1)
@@ -619,16 +621,21 @@ object AppCoordinator {
                     else -> 5_000L
                 }
 
-                val hadOp = runCatching {
-                    ApiService.pollDeviceOps(deviceId, alias)
-                }.onSuccess { resp ->
+                var pollOk = false
+                try {
+                    val resp = ApiService.pollDeviceOps(deviceId, alias)
+                    pollOk = true
                     if (resp.code == 0 && resp.op != null) {
                         idleRounds = 0
+                        LogCenter.op(alias, "设备任务轮询：收到 ${resp.op.op_type}（${resp.op.op_id}）")
                         handleDeviceOp(alias, deviceId, resp.op)
                     }
-                }.isSuccess
+                } catch (err: Exception) {
+                    LogCenter.op(alias, "设备任务轮询失败：${err.message}")
+                    pollOk = false
+                }
 
-                if (!hadOp) {
+                if (!pollOk) {
                     idleRounds = 0
                 } else if (PrefsStore.getLocalStatus() != "running") {
                     idleRounds++
@@ -702,6 +709,133 @@ object AppCoordinator {
         }
     }
 
+    private val destructiveTikTokOps = setOf(
+        "tiktok_clear",
+        "tiktok_backup_and_clear",
+        "tiktok_restore",
+    )
+
+    /** 需独占 TikTok 界面（OCR/点击链较长）：暂停涨粉，避免与自动任务并发操作 TikTok。 */
+    private val exclusiveTikTokUiOps = setOf(
+        "tiktok_edit_basic_profile",
+    )
+
+    /**
+     * 备份/清理/还原/切号前：停拉取循环、强停 TikTok，等待涨粉步骤收尾，避免与 pm clear 并发冲突。
+     */
+    private suspend fun prepareForDestructiveTikTokOp(
+        alias: String,
+        deviceId: String,
+        opType: String,
+        opId: String,
+        packageName: String,
+        settleMs: Long = 10_000L,
+    ) {
+        LogCenter.op(alias, "[OP][$opId] 收到 $opType：暂停涨粉，${settleMs / 1000}s 后执行…")
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = "备份/切号前等待任务收尾")
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "paused")
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 同步 paused 失败：${err.message}")
+        }
+        val pkg = packageName.trim().ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
+        runCatching {
+            executor.run {
+                val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
+                m.isAccessible = true
+                m.invoke(this, "am force-stop $pkg")
+            }
+        }
+        delay(settleMs)
+        LogCenter.op(alias, "[OP][$opId] 等待结束，开始执行 $opType")
+    }
+
+    /**
+     * 修改基本资料等独占 TikTok UI 的远控：暂停涨粉、临时关闭云端自动拉起，强停 TikTok 并等待收尾。
+     * @return 任务结束后是否应恢复涨粉（任务开始前为 running 且未硬停/悬浮暂停）。
+     */
+    private suspend fun prepareForExclusiveTikTokUiOp(
+        alias: String,
+        deviceId: String,
+        opType: String,
+        opId: String,
+        packageName: String,
+        settleMs: Long = 8_000L,
+    ): Boolean {
+        val wasRunning = PrefsStore.getLocalStatus() == "running" && !PrefsStore.isHardStopRequested() && !manuallyPaused
+        LogCenter.op(alias, "[OP][$opId] 收到 $opType：暂停涨粉并独占 TikTok（${settleMs / 1000}s 后执行）…")
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = true)
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 上报关闭自动开启失败：${err.message}")
+        }
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = "修改基本资料：暂停涨粉，独占 TikTok")
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "paused")
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 同步 paused 失败：${err.message}")
+        }
+        if (!started.get()) {
+            started.set(true)
+        }
+        if (!WorkerServiceTracker.isRunning) {
+            runCatching { WorkerService.start(appContext) }
+                .onFailure { LogCenter.op(alias, "[OP][$opId] 拉起后台服务失败：${it.message}") }
+        }
+        val pkg = packageName.trim().ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
+        runCatching {
+            executor.run {
+                val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
+                m.isAccessible = true
+                m.invoke(this, "am force-stop $pkg")
+            }
+        }
+        delay(settleMs)
+        LogCenter.op(alias, "[OP][$opId] 独占准备完成，开始执行 $opType")
+        return wasRunning
+    }
+
+    /** [prepareForExclusiveTikTokUiOp] 收尾：恢复云端自动拉起，并按需恢复涨粉。 */
+    private suspend fun finishExclusiveTikTokUiOp(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        resumePullAfter: Boolean,
+    ) {
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = false)
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 恢复自动开启上报失败：${err.message}")
+        }
+        if (
+            resumePullAfter &&
+            !PrefsStore.isHardStopRequested() &&
+            !manuallyPaused
+        ) {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "修改基本资料结束，恢复涨粉")
+            runCatching {
+                ApiService.syncStatus(deviceId, alias, "running")
+            }.onFailure { err ->
+                LogCenter.op(alias, "[OP][$opId] 同步 running 失败：${err.message}")
+            }
+            startPullLoop()
+            LogCenter.op(alias, "[OP][$opId] 已恢复涨粉拉取")
+        } else {
+            LogCenter.op(alias, "[OP][$opId] 修改基本资料结束，保持暂停（resume=$resumePullAfter）")
+        }
+    }
+
     /** 分段 delay，硬停时尽快返回 false（修改基本资料外轮等长等待可中断）。 */
     private suspend fun delayUnlessHardStop(ms: Long): Boolean {
         var left = ms
@@ -717,7 +851,19 @@ object AppCoordinator {
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
         val opId = op.op_id
         val payload = op.payload
-        resumeExecutionForCloudDeviceOp(alias, deviceId, "云端设备指令：${op.op_type}")
+        val packageNameEarly = payload?.package_name?.trim().orEmpty()
+        val isDestructive = op.op_type in destructiveTikTokOps
+        val isExclusiveUi = op.op_type in exclusiveTikTokUiOps
+        var resumePullAfterExclusive = false
+        if (isDestructive) {
+            prepareForDestructiveTikTokOp(alias, deviceId, op.op_type, opId, packageNameEarly)
+        } else if (isExclusiveUi) {
+            resumePullAfterExclusive = prepareForExclusiveTikTokUiOp(
+                alias, deviceId, op.op_type, opId, packageNameEarly,
+            )
+        } else {
+            resumeExecutionForCloudDeviceOp(alias, deviceId, "云端设备指令：${op.op_type}")
+        }
         if (op.op_type == "gallery_import_media" || op.op_type == "gallery_import_images") {
             handleGalleryImportOp(alias, deviceId, op)
             return
@@ -817,6 +963,9 @@ object AppCoordinator {
                     "operation_logs" to listOf("[OP][$opId] 缺少 package_name，已拒绝执行"),
                 ),
             )
+            if (isExclusiveUi) {
+                finishExclusiveTikTokUiOp(alias, deviceId, opId, resumePullAfterExclusive)
+            }
             return
         }
         val operationLogs = mutableListOf<String>()
@@ -829,8 +978,12 @@ object AppCoordinator {
             LogCenter.op(alias, line)
         }
 
-        /** 备份/还原/清理/切号：步骤细节不上报、不写设备日志，仅 [opDone] 记结果 */
-        fun opStep(@Suppress("UNUSED_PARAMETER") text: String) = Unit
+        fun opStep(text: String) {
+            if (!isDestructive) return
+            val line = "[OP][$opId] $text"
+            operationLogs.add(line)
+            LogCenter.op(alias, line)
+        }
 
         fun opDone(ok: Boolean, successText: String, failText: String) {
             opLog(if (ok) successText else failText)
@@ -1094,6 +1247,16 @@ object AppCoordinator {
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
+                    }
+                    if (lastLaunchOk) {
+                        opLog("修改基本资料：For You 等待 1.6s 后刷两下视频")
+                        val forYouOk = executor.profileEditForYouTwoSwipesAfterLaunch(alias, lastW, lastH)
+                        if (!forYouOk) {
+                            opLog("修改基本资料：硬停中止")
+                            lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                            runSu("am force-stop $packageName")
+                            break
+                        }
                     }
                     lastRatioTapOk = runSu("input tap $rtx $rty")
 
@@ -1379,6 +1542,12 @@ object AppCoordinator {
                 val chmodOk = restoreconOk && runSu("chmod -R 700 $sourceDir")
 
                 val restoreOk = restoreDataOk && chownOk && restoreconOk && chmodOk
+                if (restoreOk) {
+                    payload?.username?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                        PrefsStore.setLogContextUsername(it)
+                    }
+                    fetchConfig(logToUser = true)
+                }
                 opDone(
                     restoreOk,
                     if (skipPmClear) "切号：目标账号还原完成" else "还原完成",
@@ -1394,6 +1563,9 @@ object AppCoordinator {
                     "package_name" to packageName,
                     "operation_logs" to operationLogs,
                 )
+                if (skipPmClear) {
+                    restoreReport["skip_pm_clear"] = true
+                }
                 payload?.restore_highlight_row_index?.let { restoreReport["restore_highlight_row_index"] = it }
 
                 ApiService.reportDeviceOp(
@@ -1420,6 +1592,9 @@ object AppCoordinator {
         }
         } finally {
             ExecutionScope.exit()
+            if (isExclusiveUi) {
+                finishExclusiveTikTokUiOp(alias, deviceId, opId, resumePullAfterExclusive)
+            }
         }
     }
 

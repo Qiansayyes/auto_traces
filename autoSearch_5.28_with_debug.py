@@ -201,6 +201,8 @@ class TikTokUniversalExtract:
     profile_nickname: str = ""
     profile_private_account: Optional[bool] = None
     profile_secret: Optional[bool] = None
+    profile_following_visibility: Optional[int] = None
+    following_list_hidden_guess: Optional[bool] = None
     follower_count: int = 0
     following_count: int = 0
     heart_count: int = 0
@@ -280,6 +282,8 @@ def extract_tiktok_fields_from_text(
         "视频数": "videoCount",
         "主页是否隐私": "privateAccount",
         "会话是否隐私": "isPrivateAccount",
+        "关注列表可见性": "followingVisibility",
+        "profile_following_visibility": "followingVisibility",
     }
 
     result: Dict[str, Any] = {}
@@ -464,6 +468,54 @@ def _optional_bool(v: Any) -> Optional[bool]:
     return None
 
 
+def _safe_int_optional(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def following_list_hidden_guess_from_visibility(visibility: Optional[int]) -> Optional[bool]:
+    """user.followingVisibility：1=公开；非 1（常见 2）= 关注列表对他人隐藏。"""
+    if visibility is None:
+        return None
+    return visibility != 1
+
+
+def _following_visibility_near_unique_id(html_text: str, unique_id: str) -> Optional[int]:
+    """在 uniqueId 附近窗口内查找 followingVisibility，避免误匹配页面其它用户。"""
+    uid = str(unique_id or "").strip()
+    if not uid or not html_text:
+        return None
+    pat = rf'"uniqueId"\s*:\s*"{re.escape(uid)}"'
+    m = re.search(pat, html_text, re.I)
+    if not m:
+        return None
+    chunk = html_text[m.start() : m.start() + 4000]
+    vm = re.search(r'"followingVisibility"\s*:\s*(\d+)', chunk, re.I)
+    return int(vm.group(1)) if vm else None
+
+
+def apply_following_visibility_html_fallback(
+    snap: TikTokUniversalExtract,
+    html_text: str,
+) -> None:
+    """Universal user 块缺 followingVisibility 时，从主页 HTML 回退解析。"""
+    if snap.profile_following_visibility is not None or not html_text:
+        return
+    uid = (snap.profile_unique_id or snap.page_username or "").strip()
+    vis = _following_visibility_near_unique_id(html_text, uid) if uid else None
+    if vis is None:
+        fb = extract_tiktok_fields_from_text(html_text, ["followingVisibility"])
+        vis = _safe_int_optional(fb.get("followingVisibility"))
+    if vis is None:
+        return
+    snap.profile_following_visibility = vis
+    snap.following_list_hidden_guess = following_list_hidden_guess_from_visibility(vis)
+
+
 def _get_matched_user_info_from_universal(
     universal: Dict[str, Any], page_username: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -577,6 +629,8 @@ def extract_tiktok_universal_profile_snapshot(
       的 userInfo；用于当前 @handle 主页统计，避免误用 JSON 树里其它账号数据。
     - profile_private_account：user.privateAccount，主页作者是否私密账号。
     - profile_secret：user.secret，另一私密相关标记。
+    - profile_following_visibility：user.followingVisibility，关注列表可见性（1=公开，非 1 常见为仅自己）。
+    - following_list_hidden_guess：由 followingVisibility 推导，True 表示关注列表对他人不可见。
     - session_*：来自 webapp.app-context.user，**当前 Cookie 登录会话**，可能与主页不是同一人；
       isPrivateAccount / showPrivateBanner 常在此对象上。
     - force_login_special_regions：webapp.biz-context.forceLoginSpecialRegions，策略涉及的国家码列表。
@@ -604,6 +658,10 @@ def extract_tiktok_universal_profile_snapshot(
             snap.profile_nickname = str(u.get("nickname") or "").strip()
             snap.profile_private_account = _optional_bool(u.get("privateAccount"))
             snap.profile_secret = _optional_bool(u.get("secret"))
+            snap.profile_following_visibility = _safe_int_optional(u.get("followingVisibility"))
+            snap.following_list_hidden_guess = following_list_hidden_guess_from_visibility(
+                snap.profile_following_visibility
+            )
         snap.follower_count = _safe_int_metric(st.get("followerCount"))
         snap.following_count = _safe_int_metric(st.get("followingCount"))
         snap.heart_count = _safe_int_metric(st.get("heartCount"))
@@ -741,6 +799,8 @@ def _append_tiktok_debug_txt(
         lines.append(f"  请求主页: @{ex.page_username}")
         lines.append(
             f"  主页作者 user: privateAccount={ex.profile_private_account}, secret={ex.profile_secret}, "
+            f"followingVisibility={ex.profile_following_visibility}, "
+            f"following_list_hidden_guess={ex.following_list_hidden_guess}, "
             f"uniqueId={ex.profile_unique_id!r}"
         )
         lines.append(
@@ -856,6 +916,7 @@ def profile_metrics_dict_for_username(username: str) -> Optional[Dict[str, Any]]
 
     universal = _get_universal_data(html_raw)
     snap = extract_tiktok_universal_profile_snapshot(universal, username)
+    apply_following_visibility_html_fallback(snap, html_raw)
     is_private = snap.profile_private_account is True or snap.profile_secret is True
     private_reason = ""
     if is_private:
@@ -863,6 +924,13 @@ def profile_metrics_dict_for_username(username: str) -> Optional[Dict[str, Any]]
             "universal_matched_user_flags:"
             f"privateAccount={snap.profile_private_account},"
             f"secret={snap.profile_secret}"
+        )
+
+    following_hidden = snap.following_list_hidden_guess
+    following_hidden_reason = ""
+    if following_hidden is True:
+        following_hidden_reason = (
+            f"universal_matched_user_flags:followingVisibility={snap.profile_following_visibility}"
         )
 
     follower_count = snap.follower_count or None
@@ -881,6 +949,9 @@ def profile_metrics_dict_for_username(username: str) -> Optional[Dict[str, Any]]
         "recent_video_play_counts": [],
         "private_account_guess": is_private,
         "private_account_reason": private_reason,
+        "profile_following_visibility": snap.profile_following_visibility,
+        "following_list_hidden_guess": following_hidden,
+        "following_list_hidden_reason": following_hidden_reason,
     }
 
 
@@ -969,6 +1040,8 @@ def scrape_tiktok_followers(
                         "profile_nickname",
                         "profile_private_account",
                         "profile_secret",
+                        "profile_following_visibility",
+                        "following_list_hidden_guess",
                         "follower_count",
                         "following_count",
                         "heart_count",

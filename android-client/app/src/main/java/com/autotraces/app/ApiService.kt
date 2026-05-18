@@ -94,10 +94,18 @@ object ApiService {
         clazz = BaseResponse::class.java,
     )
 
-    suspend fun getConfig(deviceId: String, alias: String, runMode: String? = null): ConfigResponse {
+    suspend fun getConfig(
+        deviceId: String,
+        alias: String,
+        runMode: String? = null,
+        tiktokUsername: String? = null,
+    ): ConfigResponse {
         val modeQ = runMode?.takeIf { it.isNotBlank() }?.let { "&run_mode=${encode(it)}" }.orEmpty()
+        val accountQ = tiktokUsername?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { "&tiktok_username=${encode(it)}" }
+            .orEmpty()
         return get(
-            path = "/api/get_config?device_id=${encode(deviceId)}&alias=${encode(alias)}$modeQ",
+            path = "/api/get_config?device_id=${encode(deviceId)}&alias=${encode(alias)}$modeQ$accountQ",
             clazz = ConfigResponse::class.java,
         )
     }
@@ -108,11 +116,20 @@ object ApiService {
         clazz = CheckStartResponse::class.java,
     )
 
-    suspend fun pullUsername(deviceId: String, alias: String, count: Int, runMode: String? = null): PullUsernameResponse {
+    suspend fun pullUsername(
+        deviceId: String,
+        alias: String,
+        count: Int,
+        runMode: String? = null,
+        tiktokUsername: String? = null,
+    ): PullUsernameResponse {
         val modeQ = runMode?.takeIf { it.isNotBlank() }?.let { "&run_mode=${encode(it)}" }.orEmpty()
+        val accountQ = tiktokUsername?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { "&tiktok_username=${encode(it)}" }
+            .orEmpty()
         return getWithClient(
             pollClient,
-            path = "/api/pull_username?device_id=${encode(deviceId)}&alias=${encode(alias)}&count=${count}$modeQ",
+            path = "/api/pull_username?device_id=${encode(deviceId)}&alias=${encode(alias)}&count=${count}$modeQ$accountQ",
             clazz = PullUsernameResponse::class.java,
         )
     }
@@ -135,16 +152,35 @@ object ApiService {
         clazz = CvTemplateResponse::class.java,
     )
 
-    suspend fun getTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): TikTokEmailCodeResponse = post(
-        path = "/api/admin/device_tiktok/email_code",
-        body = mapOf(
+    suspend fun getTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): TikTokEmailCodeResponse {
+        val body = mapOf(
             "device_id" to deviceId,
             "alias" to alias,
             "api_url" to apiUrl,
-        ),
-        clazz = TikTokEmailCodeResponse::class.java,
-        includeAuth = true,
-    )
+        )
+        val paths = listOf(
+            "/api/device/tiktok/email_code",
+            "/api/admin/device_tiktok/email_code",
+        )
+        var lastError: Exception? = null
+        for (path in paths) {
+            try {
+                return post(
+                    path = path,
+                    body = body,
+                    clazz = TikTokEmailCodeResponse::class.java,
+                    includeAuth = path.startsWith("/api/admin/"),
+                )
+            } catch (e: Exception) {
+                lastError = e
+                val http404 = e is IOException && e.message?.contains("HTTP 404") == true
+                if (!http404) {
+                    throw e
+                }
+            }
+        }
+        throw lastError ?: IOException("云端代取失败")
+    }
 
     suspend fun pollDeviceOps(deviceId: String, alias: String): DeviceOpPollResponse = postWithClient(
         pollClient,

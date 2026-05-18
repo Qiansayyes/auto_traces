@@ -153,6 +153,7 @@ const statsResultEl = document.getElementById("statsResult");
 const cvAccessFilterEl = document.getElementById("cvAccessFilter");
 const queryCvAccessDataBtn = document.getElementById("queryCvAccessData");
 const triggerProcessQueueInlineBtn = document.getElementById("triggerProcessQueueInline");
+const preflightFollowerQueueBtn = document.getElementById("preflightFollowerQueueBtn");
 const cvAccessTableBodyEl = document.getElementById("cvAccessTableBody");
 const cvTaskContainerIdsInput = document.getElementById("cvTaskContainerIds");
 const cvTaskParallelInput = document.getElementById("cvTaskParallel");
@@ -225,6 +226,30 @@ let currentConfigTemplate = "default";
 let currentTemplateMeta = {};
 let currentTemplatesByName = {};
 let aliasTemplateByMode = { growth: {}, live: {}, direct: {}, mutual: {} };
+
+function normalizeTiktokUsernameKey(raw) {
+  return String(raw || "").trim().replace(/^@+/, "").toLowerCase();
+}
+
+/** 别名设备上某 TikTok 账号的配置映射键（与仅 alias 的设备级键并存）。 */
+function accountTemplateMapKey(alias, tiktokUsername) {
+  const aliasKey = String(alias || "").trim().toLowerCase();
+  const userKey = normalizeTiktokUsernameKey(tiktokUsername);
+  if (!aliasKey || !userKey) return aliasKey;
+  return `${aliasKey}::${userKey}`;
+}
+
+function resolveBoundTemplateRef(alias, tiktokUsername, mode = currentRunMode) {
+  const aliasKey = String(alias || "").trim().toLowerCase();
+  const modeMap = aliasTemplateByMode?.[mode];
+  if (!modeMap || typeof modeMap !== "object") return "";
+  const accountKey = accountTemplateMapKey(aliasKey, tiktokUsername);
+  if (accountKey && accountKey !== aliasKey) {
+    const accountRef = String(modeMap[accountKey] || "").trim();
+    if (accountRef) return accountRef;
+  }
+  return String(modeMap[aliasKey] || "").trim();
+}
 const pendingAutoAliasTemplateBindings = new Set();
 let configTargetUsersLoaded = false;
 let currentDbPage = 1;
@@ -1084,7 +1109,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
   `;
   const ownerCell = isAdmin ? `<td>${String(info?.owner_username || "")}</td>` : "";
   const aliasKey = String(alias || "").trim().toLowerCase();
-  const mappedTemplate = String(aliasTemplateByMode?.[currentRunMode]?.[aliasKey] || "").trim();
+  const mappedTemplate = resolveBoundTemplateRef(aliasKey, "", currentRunMode);
   const isTemplateBound = Boolean(mappedTemplate);
   const fallbackDisplayTemplate = String(fallbackTemplate || "default").trim() || "default";
   const selectedTemplate = String(mappedTemplate || fallbackDisplayTemplate).trim() || fallbackDisplayTemplate;
@@ -1329,6 +1354,7 @@ function renderDevices(devices) {
             mode: currentRunMode,
             template_name: nextTemplate,
             owner_username: ownerUsername || undefined,
+            tiktok_username: "",
           }),
         });
         aliasTemplateByMode = (data?.alias_template_by_mode && typeof data.alias_template_by_mode === "object")
@@ -1336,11 +1362,11 @@ function renderDevices(devices) {
           : aliasTemplateByMode;
         const stateEl = target?.closest("td")?.querySelector(".js-template-bind-state");
         if (stateEl) {
-          stateEl.textContent = "已绑定";
+          stateEl.textContent = "已绑定(设备)";
           stateEl.classList.remove("offline");
           stateEl.classList.add("online");
         }
-        setStatus(`别名 ${alias} 已切换模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
+        setStatus(`别名 ${alias} 已切换设备级模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
       } catch (error) {
         setStatus(error.message || "更新别名模板失败", "error");
         const rollback = String(aliasTemplateByMode?.[currentRunMode]?.[aliasKey] || fallbackTemplate).trim() || fallbackTemplate;
@@ -3821,12 +3847,20 @@ async function fetchTiktokStats() {
 
     if (statsResultEl) {
       if (data && Number(data.code) === 0 && data.universal_extract) {
-        const lines = [JSON.stringify(data.universal_extract, null, 2)];
+        const summary = [
+          `账号私密: ${data.private_account_guess ?? "—"}`,
+          `关注列表 visibility: ${data.profile_following_visibility ?? "—"} (1=公开)`,
+          `关注列表对他人隐藏: ${data.following_list_hidden_guess ?? "—"}`,
+        ].join("\n");
+        const lines = [summary, "", JSON.stringify(data.universal_extract, null, 2)];
         if (include_raw) {
           const debug = {
             username: data.username,
             private_account_guess: data.private_account_guess,
             private_account_reason: data.private_account_reason,
+            profile_following_visibility: data.profile_following_visibility,
+            following_list_hidden_guess: data.following_list_hidden_guess,
+            following_list_hidden_reason: data.following_list_hidden_reason,
             debug: data.debug,
             raw_response: data.raw_response,
           };
@@ -3877,12 +3911,29 @@ function collectDeviceIdentityByAlias(alias, options = {}) {
   return { device_id, alias: normalizedAlias, package_name };
 }
 
+/** 备份档案行的 device_id 可能过期；始终以当前在线设备的 device_id 下发远控。 */
+function resolveLiveDeviceIdentityForArchive(actionAlias, rowDeviceId = "", options = {}) {
+  const normalizedAlias = String(actionAlias || "").trim();
+  if (!normalizedAlias) {
+    setStatus("未提供设备别名", "warning");
+    return null;
+  }
+  const live = collectDeviceIdentityByAlias(normalizedAlias, options);
+  if (!live) return null;
+  const rowId = String(rowDeviceId || "").trim();
+  if (rowId && rowId !== live.device_id) {
+    console.warn(
+      `[backup-archive] 档案 device_id=${rowId} 与当前在线设备 ${live.device_id} 不一致，已使用在线设备`,
+    );
+  }
+  return live;
+}
+
 function collectDeviceIdentityByDeviceAndAlias(deviceId, alias, options = {}) {
   const normalizedDeviceId = String(deviceId || "").trim();
   const normalizedAlias = String(alias || "").trim();
   if (!normalizedDeviceId || !normalizedAlias) {
-    setStatus("设备信息不完整（缺少 device_id 或 alias）", "warning");
-    return null;
+    return resolveLiveDeviceIdentityForArchive(normalizedAlias, "", options);
   }
   // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
   const package_name = String(
@@ -4028,9 +4079,7 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
     cutSwitchAfterBackup,
     cutSwitchTargetRowIndex,
   } = execOptions;
-  const identity = deviceId
-    ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
-    : collectDeviceIdentityByAlias(alias);
+  const identity = resolveLiveDeviceIdentityForArchive(alias, deviceId);
   if (!identity) return;
   const detailText = [`设备别名：${alias}`, username ? `账号：${username}` : null].filter(Boolean).join("\n");
   if (!skipConfirm && !confirmTikTokAction("备份并清理设备", detailText)) return;
@@ -4075,7 +4124,10 @@ async function handleBasicProfileEditFromBackupCard(card) {
   const bucketSize = Number(card.getAttribute("data-bucket-size") || "") || (details ? details.querySelectorAll(".backup-archive-record").length : 0);
   const switchHlDb = normalizeSwitchHighlightField(card.getAttribute("data-switch-hl"));
   const effectiveHighlight = bucketSize <= 1 || switchHlDb === "是";
-  if (!effectiveHighlight) return;
+  if (!effectiveHighlight) {
+    setStatus("请先点击「切号」将本条设为当前高亮账号，再执行「修改账号基本资料」", "warning");
+    return;
+  }
 
   const actionAlias = String(card.getAttribute("data-action-alias") || "").trim();
   const deviceId = String(card.getAttribute("data-row-device-id") || "").trim();
@@ -4088,6 +4140,7 @@ async function handleBasicProfileEditFromBackupCard(card) {
   const detailLines = [
     `设备别名：${actionAlias}`,
     username ? `账号：${username}` : null,
+    "执行期间设备会暂停涨粉并临时关闭「自动开启程序」，避免与修改资料流程争抢 TikTok。",
     "设备端总结果为 success 并回传云端后，系统会自动将该账号「基本资料已修改」标为「是」并关闭 TikTok；随后可回到 AutoTraces 查看。",
   ].filter(Boolean);
   if (!confirmTikTokAction("修改账号基本资料", detailLines.join("\n"))) return;
@@ -4112,9 +4165,7 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     setStatus("缺少备份名称，无法执行清理并还原", "warning");
     return;
   }
-  const identity = deviceId
-    ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias, { requirePackageName: false })
-    : collectDeviceIdentityByAlias(alias, { requirePackageName: false });
+  const identity = resolveLiveDeviceIdentityForArchive(alias, deviceId, { requirePackageName: false });
   if (!identity) return;
   const payload = {
     device_id: identity.device_id,
@@ -4174,15 +4225,11 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     return;
   }
 
-  /** 远控操作必须以「当前高亮」行的 device_id 为准；被点行常为空或过期，不能用来 collectDeviceIdentity */
   const clickedDeviceId = String(clickedCard.getAttribute("data-row-device-id") || "").trim();
   const sourceDeviceId = sourceCard instanceof HTMLElement
     ? String(sourceCard.getAttribute("data-row-device-id") || "").trim()
     : "";
-  const opDeviceId = sourceDeviceId || clickedDeviceId;
-  const opsIdentity = opDeviceId
-    ? collectDeviceIdentityByDeviceAndAlias(opDeviceId, actionAlias)
-    : collectDeviceIdentityByAlias(actionAlias);
+  const opsIdentity = resolveLiveDeviceIdentityForArchive(actionAlias, sourceDeviceId || clickedDeviceId);
   if (!opsIdentity) return;
 
   const targetUser = String(clickedCard.getAttribute("data-row-username") || "").trim();
@@ -4207,13 +4254,10 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   try {
     const sRi = Number(sourceCard.getAttribute("data-backup-row-index"));
     const sUser = String(sourceCard.getAttribute("data-row-username") || "").trim();
-    const sDevice = sourceDeviceId || clickedDeviceId;
-    const sid = sDevice
-      ? collectDeviceIdentityByDeviceAndAlias(sDevice, actionAlias)
-      : collectDeviceIdentityByAlias(actionAlias);
+    const sid = resolveLiveDeviceIdentityForArchive(actionAlias, sourceDeviceId || clickedDeviceId);
     if (!sid) return;
     const backupRecordId = Number.isFinite(sRi) && sRi >= 0 ? sRi : undefined;
-    await handleBackupAndClearClick(actionAlias, backupRecordId, sUser, sDevice, {
+    await handleBackupAndClearClick(actionAlias, backupRecordId, sUser, sid.device_id, {
       skipConfirm: true,
       refreshAfter: false,
       ...cutSwitchWait,
@@ -4221,7 +4265,7 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       cutSwitchTargetRowIndex: canRestoreToDevice ? undefined : targetRi,
     });
     if (canRestoreToDevice) {
-      await handleRestoreClick(actionAlias, targetBackup, sDevice, {
+      await handleRestoreClick(actionAlias, targetBackup, sid.device_id, {
         skipConfirm: true,
         skipPmClear: true,
         refreshAfter: false,
@@ -4801,21 +4845,59 @@ if (triggerCollectRootsDbBtn) {
 if (stopCollectRootsDbBtn) {
   stopCollectRootsDbBtn.addEventListener("click", () => stopTaskByPrefix("collect_roots_db", "已停止 tiktok_roots 抓取任务"));
 }
+function formatPreflightStats(stats) {
+  if (!stats || typeof stats !== "object") return "";
+  return [
+    `预检扫描=${stats.scanned ?? 0}`,
+    `标记关注列表隐藏=${stats.marked_following_private ?? 0}`,
+    `标记私密=${stats.marked_private_account ?? 0}`,
+    `标记不可用=${stats.marked_not_found ?? 0}`,
+    `仍可处理=${stats.still_processable ?? 0}`,
+  ].join("，");
+}
+
+if (preflightFollowerQueueBtn) {
+  preflightFollowerQueueBtn.addEventListener("click", async () => {
+    try {
+      setStatus("正在预检关注列表可见性...", "info");
+      const raw = Number(processQueueBatchSizeInput?.value || 100);
+      const limit = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : 100);
+      const data = await request(
+        `/api/admin/follower_queue/preflight_following_visibility?limit=${limit}`,
+        { method: "POST" }
+      );
+      const summary = formatPreflightStats(data.stats);
+      setStatus(summary ? `预检完成：${summary}` : "预检完成", "success");
+      await loadCvAccessData();
+      currentCvPage = 1;
+      applyCvAccessView();
+    } catch (error) {
+      setStatus(error.message || "预检失败", "error");
+    }
+  });
+}
 if (triggerProcessQueueInlineBtn) {
   triggerProcessQueueInlineBtn.addEventListener("click", async () => {
     try {
-      setStatus("任务触发中...", "info");
+      setStatus("任务触发中（含预检）...", "info");
       const raw = Number(processQueueBatchSizeInput?.value || 100);
       const limit = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : 100);
       const container_ids = (cvTaskContainerIdsInput?.value || "").trim();
       const parallelRaw = Number(cvTaskParallelInput?.value || 1);
       const parallel = Math.max(1, Number.isFinite(parallelRaw) ? parallelRaw : 1);
-      const query = `?limit=${limit}&container_ids=${encodeURIComponent(container_ids)}&parallel=${parallel}`;
+      const query = `?limit=${limit}&container_ids=${encodeURIComponent(container_ids)}&parallel=${parallel}&preflight=true`;
       const data = await request(`/api/admin/tasks/trigger_process_queue${query}`, { method: "POST" });
+      const pre = formatPreflightStats(data.preflight);
       if (data.workers) {
-        setStatus(`已触发：follower_queue处理（workers=${data.workers}）`, "success");
+        setStatus(
+          `已触发：follower_queue处理（workers=${data.workers}）${pre ? `；${pre}` : ""}`,
+          "success"
+        );
       } else {
-        setStatus(`已触发：follower_queue处理（pid=${data.pid ?? "-"}）`, "success");
+        setStatus(
+          `已触发：follower_queue处理（pid=${data.pid ?? "-"}）${pre ? `；${pre}` : ""}`,
+          "success"
+        );
       }
     } catch (error) {
       const msg = error.message || "任务触发失败";
@@ -6103,6 +6185,10 @@ function renderBackupGroups(items = []) {
     deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
     return;
   }
+  const templateNames = Object.keys(currentTemplatesByName || {}).sort((a, b) => a.localeCompare(b));
+  if (!templateNames.length) templateNames.push("default");
+  const fallbackTemplate = String(currentConfigTemplate || templateNames[0] || "default").trim() || "default";
+  const modeMap = aliasTemplateByMode?.[currentRunMode] || {};
   const groups = new Map();
   items.forEach((item) => {
     const alias = String(item?.assigned_alias || item?.mobile_alias || "").trim() || "__EMPTY_ALIAS__";
@@ -6121,6 +6207,13 @@ function renderBackupGroups(items = []) {
       const deviceRowIndex = Number(row?.row_index);
       const deviceId = String(row?.device_id || "").trim();
       const actionAlias = alias === "__EMPTY_ALIAS__" ? mobileAlias : alias;
+      const accountMapKey = accountTemplateMapKey(actionAlias, username);
+      const accountMapped = resolveBoundTemplateRef(actionAlias, username, currentRunMode);
+      const isAccountBound = Boolean(String(modeMap[accountMapKey] || "").trim());
+      const selectedTemplate = String(accountMapped || fallbackTemplate).trim() || fallbackTemplate;
+      const templateOptionsHtml = templateNames.map((name) => (
+        `<option value="${escapeHtml(name)}" ${name === selectedTemplate ? "selected" : ""}>${templateDisplayName(name, currentTemplateMeta)}</option>`
+      )).join("");
       const linkedAccountInfo = renderLinkedAccountInfo({ username });
       const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
       const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
@@ -6147,6 +6240,17 @@ function renderBackupGroups(items = []) {
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">username</label><div style="word-break:break-word;">${escapeHtml(username || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">mobile_alias</label><div style="word-break:break-word;">${escapeHtml(mobileAlias || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">updated_at</label><div style="word-break:break-word;">${escapeHtml(updatedAt || "-")}</div></div>
+          </div>
+          <div style="margin-top:10px;">
+            <label style="display:block;color:#666;font-size:12px;margin-bottom:4px;">行为配置模板（按账号）</label>
+            <select
+              class="account-template-select ui-select"
+              data-alias="${escapeHtml(actionAlias)}"
+              data-username="${escapeHtml(username)}"
+              style="min-width:200px;padding:4px 6px;font-size:12px;"
+              ${username ? "" : "disabled"}
+            >${templateOptionsHtml}</select>
+            <span class="badge ${isAccountBound ? "online" : "pending"}" style="margin-left:8px;">${isAccountBound ? "账号已绑定" : "继承设备/默认"}</span>
           </div>
           <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px;">
             <div style="min-width:0;">
@@ -6289,6 +6393,34 @@ if (deviceAliasGroupsEl) {
       }
     }
     syncEditorField(scope, index, field, target.value, target.checked).catch((e) => setStatus(humanizeRequestErrorMessage(e) || "保存失败", "error"));
+  });
+  deviceAliasGroupsEl.addEventListener("change", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLSelectElement)) return;
+    if (!target.classList.contains("account-template-select")) return;
+    const alias = String(target.dataset.alias || "").trim();
+    const tiktokUsername = String(target.dataset.username || "").trim();
+    const nextTemplate = String(target.value || "").trim();
+    if (!alias || !tiktokUsername || !nextTemplate) return;
+    const prevTemplate = resolveBoundTemplateRef(alias, tiktokUsername, currentRunMode) || String(currentConfigTemplate || "default");
+    try {
+      const data = await request("/api/admin/alias_template/select", {
+        method: "POST",
+        body: JSON.stringify({
+          alias,
+          mode: currentRunMode,
+          template_name: nextTemplate,
+          tiktok_username: tiktokUsername,
+        }),
+      });
+      aliasTemplateByMode = (data?.alias_template_by_mode && typeof data.alias_template_by_mode === "object")
+        ? data.alias_template_by_mode
+        : aliasTemplateByMode;
+      setStatus(`账号 ${tiktokUsername}（${alias}）已绑定模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
+    } catch (error) {
+      setStatus(error.message || "更新账号模板失败", "error");
+      target.value = prevTemplate;
+    }
   });
   deviceAliasGroupsEl.addEventListener("click", async (event) => {
     const targetEl = event.target;

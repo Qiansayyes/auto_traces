@@ -354,8 +354,14 @@ object PrefsStore {
         return fmt.format(Date())
     }
 
-    private fun dateKey(action: String) = "${KEY_DAILY_PREFIX}${action}_date"
-    private fun countKey(action: String) = "${KEY_DAILY_PREFIX}${action}_count"
+    /** 切号高亮 TikTok 账号；有值时每日行为计数按账号隔离，否则仍按整机。 */
+    private fun dailyActionScopeSuffix(): String {
+        val user = getLogContextUsername()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return ""
+        return "_acct_${user.replace(Regex("[^a-z0-9._-]"), "_")}"
+    }
+
+    private fun dateKey(action: String) = "${KEY_DAILY_PREFIX}${action}_date${dailyActionScopeSuffix()}"
+    private fun countKey(action: String) = "${KEY_DAILY_PREFIX}${action}_count${dailyActionScopeSuffix()}"
 
     /**
      * 返回某动作的“今日已执行次数”。会在跨天时自动清零。
