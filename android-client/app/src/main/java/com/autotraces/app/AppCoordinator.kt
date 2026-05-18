@@ -877,7 +877,7 @@ object AppCoordinator {
             LogCenter.op(alias, mutualLogLine)
             PrefsStore.setMutualClickRequested(true)
             PrefsStore.setMutualClickPending(true)
-            triggerMutualSwitchNow(alias, pauseCloudAutoStartForMutual = false)
+            triggerMutualSwitchNow(alias)
             ApiService.reportDeviceOp(
                 deviceId = deviceId,
                 alias = alias,
@@ -1598,7 +1598,7 @@ object AppCoordinator {
         }
     }
 
-    private fun triggerMutualSwitchNow(alias: String, pauseCloudAutoStartForMutual: Boolean = false) {
+    private fun triggerMutualSwitchNow(alias: String) {
         if (mutualSwitchJob?.isActive == true) {
             LogCenter.op(alias, "互点切换任务已在执行中，忽略重复触发")
             return
@@ -1606,21 +1606,6 @@ object AppCoordinator {
         mutualSwitchJob = scope.launch {
             ExecutionScope.enter()
             try {
-                if (pauseCloudAutoStartForMutual) {
-                    val did = PrefsStore.getDeviceId()
-                    val aid = PrefsStore.getAlias()
-                    if (!did.isNullOrBlank() && !aid.isNullOrBlank()) {
-                        runCatching {
-                            withContext(Dispatchers.IO) {
-                                ApiService.reportDeviceAutoStartOptOut(deviceId = did, alias = aid, optOut = true)
-                            }
-                        }
-                        LogCenter.op(
-                            alias,
-                            "互点切换：已向服务端上报关闭本设备「自动开启程序」（opt_out=true）；互点会话结束后会再上报恢复",
-                        )
-                    }
-                }
                 val beforeRequested = PrefsStore.isMutualClickRequested()
                 val beforePending = PrefsStore.isMutualClickPending()
                 val beforeHardStop = PrefsStore.isHardStopRequested()
@@ -1833,7 +1818,7 @@ object AppCoordinator {
     /**
      * 涨粉：模板 [AppConfig.growth_pull_batches_before_auto_mutual] ≥1 时，
      * 每完成一整批「服务端拉取清单」内全部用户名（均已 [PrefsStore.markUsernameCompleted]）计 1；
-     * 累计达到阈值则等价于管理台「启动所选设备互点」：先上报云端关闭本机自动开启 → 互点会话 → 收尾再恢复自动开启。
+     * 累计达到阈值则等价于管理台「启动所选设备互点」：暂停涨粉拉取 → 互点会话 → 结束后恢复拉取。
      */
     private suspend fun evaluateGrowthAutoMutualAfterBatchIfNeeded(alias: String, deviceId: String) {
         val threshold = _config.value.growth_pull_batches_before_auto_mutual
@@ -1847,14 +1832,14 @@ object AppCoordinator {
         PrefsStore.resetGrowthBatchesTowardAutoMutual()
         LogCenter.op(
             alias,
-            "涨粉：已连续 $threshold 批拉取清单全部执行完毕，自动进入互点（关云端自动开启 → 互点 → 结束后恢复）",
+            "涨粉：已连续 $threshold 批拉取清单全部执行完毕，自动进入互点",
         )
         PrefsStore.setMutualCommentOnlySession(false)
         PrefsStore.setMutualClickRequested(true)
         PrefsStore.setMutualClickPending(true)
         PrefsStore.setHardStopRequested(false)
         updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = "涨粉批阈值已达，自动互点即将开始")
-        triggerMutualSwitchNow(alias, pauseCloudAutoStartForMutual = true)
+        triggerMutualSwitchNow(alias)
     }
 
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {

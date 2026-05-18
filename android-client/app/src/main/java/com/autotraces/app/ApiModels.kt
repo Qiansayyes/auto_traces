@@ -96,7 +96,7 @@ data class AppConfig(
     val mutual_follow_tap_session_limit: Int = 20,
     /**
      * 仅涨粉队列（设备 App 选择的 run_mode=growth）：连续多少「整批拉取的用户名在设备端全部执行完毕」后，自动进入与「启动所选设备互点」等价的互点会话。
-     * 触发顺序：向云端上报关闭本设备「自动开启程序」→ 互点 teamwork 流程 → 会话结束强停 TikTok 并再上报恢复自动开启。
+     * 触发顺序：暂停涨粉拉取 → 互点 teamwork 流程 → 会话结束强停 TikTok 后恢复涨粉拉取。
      * **-1** 或 **0**：永不自动切换；**≥1** 时生效。若某批内有用户名执行失败未标记完成，则该批不计入（直至该批被新拉取覆盖）。
      */
     val growth_pull_batches_before_auto_mutual: Int = -1,
@@ -243,7 +243,7 @@ data class DeviceAutoStartOptOutRequest(
     val opt_out: Boolean,
 )
 
-/** 设备鉴权：会话结束后将云端「自动开启程序」恢复为开启（opt_out=false）。 */
+/** 设备鉴权：上报本设备是否参与云端「自动开启程序」（硬停、发作品等；互点不再使用）。 */
 data class ReportDeviceAutoStartOptOutRequest(
     val device_id: String,
     val alias: String,

@@ -800,6 +800,48 @@ IMPLICIT_WAIT_SECONDS = 5
 EXPLICIT_WAIT_SECONDS = 20
 
 
+def _apply_page_load_strategy(options: Options) -> None:
+    """
+    TikTok 等 SPA 可能长时间不触发 window.onload，ChromeDriver 会在 driver.get 上阻塞较久，
+    进而触发 Python 端 urllib3 对 ChromeDriver 的默认读超时（常见 120s）。
+    eager：DOMContentLoaded 后即认为导航完成，通常与「页面已可点」更一致。
+    可用环境变量 PAGE_LOAD_STRATEGY=normal|eager|none 覆盖（默认 eager）。
+    """
+    raw = (os.environ.get("PAGE_LOAD_STRATEGY") or "eager").strip().lower()
+    if raw not in ("eager", "normal", "none"):
+        raw = "eager"
+    try:
+        options.page_load_strategy = raw
+    except Exception:
+        try:
+            options.page_load_strategy = "eager"
+        except Exception:
+            return
+    if _coerce_bool(os.environ.get("VERBOSE_DRIVER_LOGS"), DEFAULT_CONFIG.get("verbose_driver_logs", False)):
+        print(f"[环境模式] page_load_strategy={raw}", flush=True)
+
+
+def _configure_selenium_chromedriver_http_timeout(seconds: int) -> None:
+    """拉长 Python ↔ ChromeDriver 的 HTTP 读超时，避免 ReadTimeoutError(read timeout=120)。"""
+    try:
+        from selenium.webdriver.remote.remote_connection import RemoteConnection
+
+        RemoteConnection.set_timeout(float(seconds))
+    except Exception:
+        pass
+
+
+def _patch_driver_command_client_timeout(driver: webdriver.Chrome, seconds: int) -> None:
+    """新版 Selenium 的 ClientConfig.timeout（若存在）与全局 RemoteConnection 一并调整。"""
+    try:
+        ce = getattr(driver, "command_executor", None)
+        cfg = getattr(ce, "_client_config", None) if ce is not None else None
+        if cfg is not None and hasattr(cfg, "timeout"):
+            setattr(cfg, "timeout", int(seconds))
+    except Exception:
+        pass
+
+
 def wait_for_element_with_heartbeat(
     driver: webdriver.Chrome,
     locator,
@@ -996,7 +1038,12 @@ def init_driver(container_id: str | None = None, chrome_user_data_dir: str | Non
         raise RuntimeError("必须提供 --container-id。已禁用手动登录模式。")
     verbose = _coerce_bool(os.environ.get("VERBOSE_DRIVER_LOGS"), DEFAULT_CONFIG.get("verbose_driver_logs", False))
 
+    remote_http_sec = _coerce_int(os.environ.get("REMOTE_DRIVER_HTTP_TIMEOUT_SEC"), 360)
+    remote_http_sec = max(60, min(900, int(remote_http_sec)))
+    _configure_selenium_chromedriver_http_timeout(remote_http_sec)
+
     options = Options()
+    _apply_page_load_strategy(options)
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
 
@@ -1027,6 +1074,13 @@ def init_driver(container_id: str | None = None, chrome_user_data_dir: str | Non
         if verbose:
             print(f"[环境模式] 使用Hubstudio webdriver失败，回退系统驱动。错误: {ex}")
         driver = webdriver.Chrome(options=options)
+    _patch_driver_command_client_timeout(driver, remote_http_sec)
+    try:
+        pl_sec = _coerce_int(os.environ.get("BROWSER_PAGE_LOAD_TIMEOUT_SEC"), 240)
+        pl_sec = max(30, min(900, int(pl_sec)))
+        driver.set_page_load_timeout(pl_sec)
+    except Exception:
+        pass
     driver.implicitly_wait(IMPLICIT_WAIT_SECONDS)
     return driver
 

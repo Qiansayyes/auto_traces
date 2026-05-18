@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TikTok 粉丝监控（极简版）：只为手机端下发队列准备数据。
+TikTok 根账号粉丝增长监控：扫描 tiktok_roots，增长达标则写入 mobile_pending_usernames。
 
 数据库表结构（字段说明）：
 
@@ -27,7 +27,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo  # Python 3.9+
 
 _SERVER_DIR = Path(__file__).resolve().parent / "server"
-
+GROWTH_THRESHOLD = 50
 
 def _import_profile_metrics():
     import sys
@@ -56,7 +56,7 @@ def _get_db():
 
 
 def init_db():
-    """确保 autoSearch 相关表存在（以 tiktok_roots 为准）。"""
+    """确保粉丝增长监控相关表存在（以 tiktok_roots 为准）。"""
     conn = _get_db()
     try:
         conn.executescript(
@@ -119,7 +119,7 @@ def get_all_root_usernames():
 def run_once(batch_size: int = 1000):
     """
     抓取当前粉丝数，更新 tiktok_roots.last_use_follower_count，
-    并把符合增长条件（当前粉丝-上次基准>=50）的 root_username 写入 mobile_pending_usernames。
+    并把符合增长条件（当前粉丝-上次基准>=GROWTH_THRESHOLD）的 root_username 写入 mobile_pending_usernames。
     每处理 batch_size 个 root 提交一次。
     """
     init_db()
@@ -152,7 +152,7 @@ def run_once(batch_size: int = 1000):
                 updated += 1
             else:
                 growth = current - last_use_follower_count
-                if growth >= 50:
+                if growth >= GROWTH_THRESHOLD:
                     conn.execute(
                         "UPDATE tiktok_roots SET last_use_follower_count = ?, usage_count = usage_count + 1 WHERE root_username = ?",
                         (current, username),
@@ -216,7 +216,7 @@ def run_scheduler():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TikTok 粉丝监控：可每日美东 6:00 自动跑一次")
+    parser = argparse.ArgumentParser(description="TikTok 粉丝增长监控：可每日美东 6:00 自动跑一次")
     parser.add_argument(
         "--once",
         action="store_true",

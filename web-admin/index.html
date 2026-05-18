@@ -304,7 +304,10 @@
               从 <code>tiktok_roots</code> 中按优先级执行全量账号；不影响长期队列策略。
             </div>
             <button id="stopCollectRootsDb" class="danger">停止抓取（tiktok_roots）</button>
-            <button id="triggerAutoSearch" class="ghost">立即执行 autoSearch 一次</button>
+            <button id="triggerAutoSearch" class="ghost">立即执行粉丝增长监控一次</button>
+            <div style="margin:6px 0 0;color:#666;font-size:12px;line-height:1.6;max-width:760px;">
+              扫描 <code>tiktok_roots</code>：较上次基准粉丝增长 ≥50 时写入 <code>mobile_pending_usernames</code>；未达阈值不写库。
+            </div>
             <div style="height:10px"></div>
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px;">
               <label style="display:flex;align-items:center;gap:8px;">
@@ -1185,7 +1188,7 @@ so cute</textarea>
             <input name="growth_pull_batches_before_auto_mutual" type="number" min="-1" max="10000" step="1" value="-1" />
             <div class="hint">
               仅当设备 App 当前队列为<strong>涨粉模式</strong>且本模板生效时判断。<strong>一批</strong>指：某次从服务端拉取的用户名清单在设备上<strong>每一条</strong>都已成功收尾（含「无作品/私密」等跳过并标记完成）；若同批内有失败未标记完成，则该批<strong>不计入</strong>，直至下次拉取覆盖清单。<br />
-              达到设定批数后的行为与设备概览页<strong>「启动所选设备互点（引流）」</strong>一致：先向云端上报<strong>关闭</strong>该设备「自动开启程序」→ 执行引流会话 → 会话结束<strong>强停 TikTok</strong>并再上报<strong>恢复</strong>自动开启。<br />
+              达到设定批数后的行为与设备概览页<strong>「启动所选设备互点（引流）」</strong>一致：暂停涨粉拉取 → 执行引流会话 → 会话结束<strong>强停 TikTok</strong>后继续涨粉（不再改动云端「自动开启程序」开关）。<br />
               <strong>-1</strong> 或 <strong>0</strong>：永不自动切引流（默认 -1）。填 <strong>1、2…</strong> 表示累计满该批数后触发一次，计数会清零后再重新累计。
             </div>
           </div>
@@ -1202,7 +1205,7 @@ so cute</textarea>
           <div class="field full">
             <label>引流 · 粉丝列表 Follow 点击上限</label>
             <input name="mutual_follow_tap_session_limit" type="number" min="1" max="99999" step="1" value="20" />
-            <div class="hint">一次引流会话内，在 <strong>Followers 列表</strong>中累计点击 Follow（按钮中心）的次数上限；达到后<strong>不再左滑、不再进入粉丝列表</strong>，本会话内 Videos 列表<strong>剩余轮次仅发引流评论</strong>（点赞/收藏/发评，<strong>不发评论框粘贴、不回传复制用户名</strong>）；全部轮次跑完后<strong>结束本次引流</strong>并收尾（短暂停留 → 强停 TikTok → 云端恢复「自动开启程序」）。</div>
+            <div class="hint">一次引流会话内，在 <strong>Followers 列表</strong>中累计点击 Follow（按钮中心）的次数上限；达到后<strong>不再左滑、不再进入粉丝列表</strong>，本会话内 Videos 列表<strong>剩余轮次仅发引流评论</strong>（点赞/收藏/发评，<strong>不发评论框粘贴、不回传复制用户名</strong>）；全部轮次跑完后<strong>结束本次引流</strong>并收尾（短暂停留 → 强停 TikTok）。</div>
           </div>
           <div class="field full">
             <label>引流评论文本（多条用逗号或换行，仅引流流程使用）</label>

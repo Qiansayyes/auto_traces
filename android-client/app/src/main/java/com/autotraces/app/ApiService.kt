@@ -222,7 +222,7 @@ object ApiService {
         includeAuth = true,
     )
 
-    /** 设备鉴权：互点/互点评论会话收尾时恢复云端「自动开启程序」。 */
+    /** 设备鉴权：上报本设备是否参与云端「自动开启程序」（硬停、发作品、修改资料等）。 */
     suspend fun reportDeviceAutoStartOptOut(deviceId: String, alias: String, optOut: Boolean): BaseResponse = post(
         path = "/api/report_device_auto_start_opt_out",
         body = ReportDeviceAutoStartOptOutRequest(device_id = deviceId, alias = alias, opt_out = optOut),

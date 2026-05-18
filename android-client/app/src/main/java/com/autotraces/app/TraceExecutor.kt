@@ -3912,24 +3912,13 @@ class RealTraceExecutor(
         return true
     }
 
-    /** 互点/互点评论：达到配置上限并成功跑完 Videos 单元后，短暂停留、强停 TikTok、云端恢复自动开启。 */
+    /** 互点/互点评论：达到配置上限并成功跑完 Videos 单元后，短暂停留、强停 TikTok。 */
     private suspend fun finalizeMutualSessionLimitedExit(alias: String) {
-        devOp(alias, "互点会话已达配置上限：短暂停留后强停 TikTok，并请求云端恢复该设备自动开启程序（opt_out=false）")
+        devOp(alias, "互点会话已达配置上限：短暂停留后强停 TikTok")
         delay(Random.nextLong(800, 2001))
         val pkg = Config.TIKTOK_PACKAGE_NAME
         runSuCommand("am force-stop $pkg")
         delay(Random.nextLong(400, 901))
-        val did = PrefsStore.getDeviceId()
-        val aid = PrefsStore.getAlias()
-        if (!did.isNullOrBlank() && !aid.isNullOrBlank()) {
-            val r = withContext(Dispatchers.IO) {
-                runCatching { ApiService.reportDeviceAutoStartOptOut(deviceId = did, alias = aid, optOut = false) }
-                    .getOrNull()
-            }
-            devOp(alias, "互点会话收尾：report_device_auto_start_opt_out 已发 code=${r?.code}")
-        } else {
-            devOp(alias, "互点会话收尾：缺少 device_id 或 alias，跳过云端自动开启恢复")
-        }
     }
 
     /**

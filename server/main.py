@@ -1426,6 +1426,13 @@ def _user_auto_start_enabled(username: str) -> bool:
     return bool(raw) if isinstance(raw, bool) else False
 
 
+def _user_run_mode(username: str) -> str:
+    """当前登录用户在库中的运行模式（勿用全局 store.run_mode，否则多账号会互相覆盖）。"""
+    data = _normalize_user_runtime_state(_load_user_runtime_state(username))
+    mode = data.get("run_mode")
+    return mode if mode in RUN_MODES else "growth"
+
+
 class DeviceAutoStartOptOutRequest(BaseModel):
     device_id: str = Field(..., description="设备ID")
     opt_out: bool = Field(..., description="true=该设备禁用自动开启；false=允许自动开启")
@@ -1704,7 +1711,7 @@ class ReportDeviceAutoStartOptOutRequest(DeviceAuthModel):
 
 @app.post("/api/report_device_auto_start_opt_out")
 def report_device_auto_start_opt_out(payload: ReportDeviceAutoStartOptOutRequest):
-    """设备端上报：更新该设备 auto_start_opt_out（互点/互点评论会话收尾时恢复自动开启）。"""
+    """设备端上报：更新该设备 auto_start_opt_out（硬停、发作品、修改资料等；互点流程不再使用）。"""
     error, _device = auth_or_error(payload.device_id, payload.alias)
     if error:
         return error
@@ -3230,7 +3237,7 @@ SCHEDULER_TASK_DEFS = {
         ],
     },
     "autosearch": {
-        "label": "自动搜索",
+        "label": "粉丝增长监控",
         "default_enabled": True,
         "default_interval_sec": 2 * 60 * 60,
         "command": lambda: [sys.executable, str(AUTOSEARCH_PATH), "--once"],
@@ -3424,6 +3431,18 @@ def _build_sanitized_raw_response_text(html: str) -> str:
         return (html or "")[:120_000]
 
 
+def _append_task_log(task_name: str, line: str, max_lines: int = 500) -> None:
+    """向内存任务日志追加一行（供 web-admin 轮询 /api/admin/tasks/status 展示）。"""
+    text = (line or "").strip()
+    if not text:
+        return
+    with store.lock:
+        logs = store.task_logs.setdefault(str(task_name), [])
+        logs.append(f"[{now_text()}] {text}")
+        if len(logs) > max_lines:
+            del logs[: len(logs) - max_lines]
+
+
 def _mark_follower_queue_preflight_status(
     username: str,
     following_access_status: str,
@@ -3484,14 +3503,22 @@ def preflight_follower_queue_following_visibility(limit: int = 100) -> dict:
         "still_processable": 0,
         "check_failed": 0,
     }
-    for row in rows:
+    log_key = "process_queue_preflight"
+    with store.lock:
+        store.task_logs[log_key] = [
+            f"[{now_text()}] follower_queue 预检开始 | 本批待检 {len(rows)} 条 | limit={limit}（拉取 TikTok 页 / Universal 判断关注列表可见性）",
+        ]
+    total = len(rows)
+    for idx, row in enumerate(rows, start=1):
         username = str(row[0] or "").strip().lstrip("@")
         if not username:
             continue
+        _append_task_log(log_key, f"预检 [{idx}/{total}] @{username} …")
         try:
             result = fetch_tiktok_profile_stats(username)
         except Exception as exc:
             stats["check_failed"] += 1
+            _append_task_log(log_key, f"预检 [{idx}/{total}] @{username} | 异常跳过 | {exc}")
             print(
                 f"[{now_text()}] follower_queue预检失败 | username={username} | error={exc}",
             )
@@ -3499,11 +3526,14 @@ def preflight_follower_queue_following_visibility(limit: int = 100) -> dict:
 
         if not isinstance(result, dict) or int(result.get("code", 1)) != 0:
             stats["check_failed"] += 1
+            msg = result.get("msg", "unknown") if isinstance(result, dict) else "non_dict"
+            _append_task_log(log_key, f"预检 [{idx}/{total}] @{username} | 接口失败 | {msg}")
             continue
 
         if bool(result.get("private_account_guess")):
             _mark_follower_queue_preflight_status(username, "private_account")
             stats["marked_private_account"] += 1
+            _append_task_log(log_key, f"预检 [{idx}/{total}] @{username} | 判定私密账号 → 标记 private_account")
             print(
                 f"[{now_text()}] follower_queue预检 | username={username} | private_account",
             )
@@ -3513,6 +3543,10 @@ def preflight_follower_queue_following_visibility(limit: int = 100) -> dict:
             vis = result.get("profile_following_visibility")
             _mark_follower_queue_preflight_status(username, "following_private")
             stats["marked_following_private"] += 1
+            _append_task_log(
+                log_key,
+                f"预检 [{idx}/{total}] @{username} | 关注列表对他人不可见 → following_private | visibility={vis}",
+            )
             print(
                 f"[{now_text()}] follower_queue预检 | username={username} | "
                 f"following_private | followingVisibility={vis}",
@@ -3529,10 +3563,22 @@ def preflight_follower_queue_following_visibility(limit: int = 100) -> dict:
         ):
             _mark_follower_queue_preflight_status(username, "not_found")
             stats["marked_not_found"] += 1
+            _append_task_log(log_key, f"预检 [{idx}/{total}] @{username} | 画像关键字段为空 → not_found")
             continue
 
         stats["still_processable"] += 1
+        _append_task_log(
+            log_key,
+            f"预检 [{idx}/{total}] @{username} | 通过（关注列表可见，可进入浏览器采集）",
+        )
 
+    _append_task_log(
+        log_key,
+        "预检结束 | "
+        f"scanned={stats['scanned']} still_processable={stats['still_processable']} "
+        f"following_private={stats['marked_following_private']} private={stats['marked_private_account']} "
+        f"not_found={stats['marked_not_found']} check_failed={stats['check_failed']}",
+    )
     return stats
 
 
@@ -4932,15 +4978,6 @@ def admin_device_tiktok_mutual_click_start(payload: MutualClickRequest, authoriz
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
-    auto_start_disabled = False
-    with store.lock:
-        dev = store.devices.get(payload.device_id)
-        if dev and not dev.auto_start_opt_out:
-            dev.auto_start_opt_out = True
-            auto_start_disabled = True
-    if auto_start_disabled:
-        _persist_client_device_to_db(payload.device_id)
-        _append_device_log(payload.device_id, "互点指令：云端已自动关闭该设备的自动开启程序")
     _resume_device_for_cloud_op(
         payload.device_id,
         f"[{now_text()}] 云端后台 | 已下发互点指令，设备由暂停切换为 running（alias={payload.alias}）",
@@ -4956,9 +4993,9 @@ def admin_device_tiktok_mutual_click_start(payload: MutualClickRequest, authoriz
     )
     return {
         "code": 0,
-        "msg": "已下发设备端任务：进入互点模式（已自动关闭该设备自动开启程序）" if auto_start_disabled else "已下发设备端任务：进入互点模式",
+        "msg": "已下发设备端任务：进入互点模式",
         "op_id": op_id,
-        "auto_start_opt_out": True if auto_start_disabled else bool(getattr(_device, "auto_start_opt_out", False)),
+        "auto_start_opt_out": bool(getattr(_device, "auto_start_opt_out", False)),
     }
 
 
@@ -4970,15 +5007,6 @@ def admin_device_tiktok_mutual_click_comment_only_start(
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
-    auto_start_disabled = False
-    with store.lock:
-        dev = store.devices.get(payload.device_id)
-        if dev and not dev.auto_start_opt_out:
-            dev.auto_start_opt_out = True
-            auto_start_disabled = True
-    if auto_start_disabled:
-        _persist_client_device_to_db(payload.device_id)
-        _append_device_log(payload.device_id, "互点仅评论指令：云端已自动关闭该设备的自动开启程序")
     _resume_device_for_cloud_op(
         payload.device_id,
         f"[{now_text()}] 云端后台 | 已下发互点仅评论指令，设备由暂停切换为 running（alias={payload.alias}）",
@@ -4994,11 +5022,9 @@ def admin_device_tiktok_mutual_click_comment_only_start(
     )
     return {
         "code": 0,
-        "msg": "已下发设备端任务：进入互点仅评论模式（已自动关闭该设备自动开启程序）"
-        if auto_start_disabled
-        else "已下发设备端任务：进入互点仅评论模式",
+        "msg": "已下发设备端任务：进入互点仅评论模式",
         "op_id": op_id,
-        "auto_start_opt_out": True if auto_start_disabled else bool(getattr(_device, "auto_start_opt_out", False)),
+        "auto_start_opt_out": bool(getattr(_device, "auto_start_opt_out", False)),
     }
 
 
@@ -7825,7 +7851,7 @@ def admin_overview(
         devices, devices_total = _paginate_dict_items(all_devices, safe_page, safe_size)
         device_logs = _device_logs_dict_for_ids(list(devices.keys()), 120)
         config_snapshot = dict(store.config)
-        run_mode_snapshot = store.run_mode
+        run_mode_snapshot = _user_run_mode(session["username"])
         follow_total = conn.execute("SELECT COUNT(1) FROM follower_queue").fetchone()[0]
         follow_unprocessed = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 0").fetchone()[0]
         follow_done = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 1").fetchone()[0]
@@ -7910,7 +7936,7 @@ def admin_logs_snapshot(
     with store.lock:
         _trim_task_log_keys_unlocked()
         task_logs = {k: v[-120:] for k, v in store.task_logs.items()}
-        mode = store.run_mode
+    mode = _user_run_mode(session["username"])
     device_logs = _device_logs_dict_for_ids(snapshot_log_device_ids, 120)
     return {
         "code": 0,

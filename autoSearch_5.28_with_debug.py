@@ -1270,12 +1270,12 @@ def _init_debug_txt_header(txt_path: str, extra_line: str = "") -> None:
 
 
 def _run_autosearch_once_from_cli() -> None:
-    """定时任务 --once：执行 autoSearch_5.28 的粉丝监控逻辑（抓取仍走本文件）。"""
+    """定时任务 --once：执行 tiktok_follower_growth_monitor 的粉丝增长监控（抓取仍走本文件）。"""
     import importlib.util
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    legacy_path = os.path.join(script_dir, "autoSearch_5.28.py")
-    spec = importlib.util.spec_from_file_location("autosearch528", legacy_path)
+    legacy_path = os.path.join(script_dir, "tiktok_follower_growth_monitor.py")
+    spec = importlib.util.spec_from_file_location("tiktok_follower_growth_monitor", legacy_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"无法加载: {legacy_path}")
     mod = importlib.util.module_from_spec(spec)

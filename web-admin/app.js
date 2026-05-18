@@ -602,7 +602,7 @@ function renderCvProcessQueueLogs(taskLogs = {}, runningTasks = []) {
       if (!body.length) {
         lines.push("暂无日志");
       } else {
-        lines.push(...body.slice(-80));
+        lines.push(...body.slice(-200));
       }
       lines.push("");
     });
@@ -1346,6 +1346,11 @@ function renderDevices(devices) {
       const aliasKey = alias.toLowerCase();
       const nextTemplate = String(target?.value || "").trim();
       if (!alias || !nextTemplate) return;
+      const bindKey = `${currentRunMode}::${ownerUsername}::${aliasKey}`;
+      pendingAutoAliasTemplateBindings.delete(bindKey);
+      if (!aliasTemplateByMode[currentRunMode]) aliasTemplateByMode[currentRunMode] = {};
+      aliasTemplateByMode[currentRunMode][aliasKey] = nextTemplate;
+      target.removeAttribute("data-needs-bind");
       try {
         const data = await request("/api/admin/alias_template/select", {
           method: "POST",
@@ -1382,9 +1387,18 @@ function renderDevices(devices) {
     if (!alias || !templateName) return;
     const bindKey = `${currentRunMode}::${ownerUsername}::${aliasKey}`;
     if (pendingAutoAliasTemplateBindings.has(bindKey)) return;
+    const existingRef = resolveBoundTemplateRef(aliasKey, "", currentRunMode);
+    if (existingRef) {
+      selectEl.removeAttribute("data-needs-bind");
+      return;
+    }
     pendingAutoAliasTemplateBindings.add(bindKey);
     (async () => {
       try {
+        if (resolveBoundTemplateRef(aliasKey, "", currentRunMode)) {
+          selectEl.removeAttribute("data-needs-bind");
+          return;
+        }
         const data = await request("/api/admin/alias_template/select", {
           method: "POST",
           body: JSON.stringify({
@@ -2164,7 +2178,7 @@ function updateModeButtons() {
 
 /** 更新设备卡片、表格、别名筛选下表格、运维下拉与日志区（由 overview 或 logs_snapshot 共用） */
 function applyDevicesAndLogsPayload(data, options = {}) {
-  const shouldSyncRunMode = options.syncRunMode !== false;
+  const shouldSyncRunMode = options.syncRunMode === true;
   const shouldSyncConfigForm = options.syncConfigForm === true;
   const hasDevicesField = data && Object.prototype.hasOwnProperty.call(data, "devices");
   const hasDeviceLogsField = data && Object.prototype.hasOwnProperty.call(data, "device_logs");
@@ -2220,7 +2234,8 @@ async function loadOverview() {
   const data = await overviewPromise;
   // overview 仅用于设备与概览数据；配置表单必须由 runtime_config/template_select 驱动，
   // 否则会出现“模板名正确但表单值被 overview 旧快照覆盖”的错位。
-  applyDevicesAndLogsPayload(data, { syncRunMode: true, syncConfigForm: false });
+  // 勿用 overview 的 run_mode 覆盖本地：其曾取自全局 store，会导致别名模板映射查错 mode 并自动回绑 default。
+  applyDevicesAndLogsPayload(data, { syncRunMode: false, syncConfigForm: false });
   const queueStats = data?.queue_stats || {};
   const followerPendingCount =
     queueStats?.follower?.pending ??
@@ -2283,6 +2298,7 @@ async function pollDeviceLogsSnapshot() {
 async function handleRefresh() {
   try {
     setStatus("刷新中...", "info");
+    await loadUserRuntimeConfig();
     await loadOverview();
     setStatus("已刷新概览", "success");
   } catch (error) {
@@ -3347,7 +3363,7 @@ async function refreshTaskStatus() {
       taskStatusEl.textContent = [
         `总开关: ${data.scheduler_enabled ? "开" : "关"}`,
         `运行中: ${runningLabel}`,
-        `自动搜索: ${JSON.stringify(data.auto_search_schedule || {})}`,
+        `粉丝增长监控: ${JSON.stringify(data.auto_search_schedule || {})}`,
       ].join("  |  ");
     }
     renderSchedulerTaskSettings(schedulerTasks);
@@ -4963,7 +4979,7 @@ if (saveCvQualityFilterBtn) {
   saveCvQualityFilterBtn.addEventListener("click", saveCvQualityFilter);
 }
 if (triggerAutoSearchBtn) {
-  triggerAutoSearchBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_autosearch_once", "已触发：autoSearch执行一次"));
+  triggerAutoSearchBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_autosearch_once", "已触发：粉丝增长监控执行一次"));
 }
 if (schedulerLogsScrollBottomBtn) {
   schedulerLogsScrollBottomBtn.addEventListener("click", () => {
