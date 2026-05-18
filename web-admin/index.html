@@ -1187,7 +1187,7 @@ so cute</textarea>
             <label>涨粉 → 引流（自动）：连续「整批拉取清单全部执行完毕」多少批后自动引流</label>
             <input name="growth_pull_batches_before_auto_mutual" type="number" min="-1" max="10000" step="1" value="-1" />
             <div class="hint">
-              仅当设备 App 当前队列为<strong>涨粉模式</strong>且本模板生效时判断。<strong>一批</strong>指：某次从服务端拉取的用户名清单在设备上<strong>每一条</strong>都已成功收尾（含「无作品/私密」等跳过并标记完成）；若同批内有失败未标记完成，则该批<strong>不计入</strong>，直至下次拉取覆盖清单。<br />
+              仅当设备 App 当前队列为<strong>涨粉模式</strong>且本模板生效时判断。<strong>一批</strong>指：某次从服务端拉取的用户名清单在设备上<strong>每一条</strong>都已跑完一轮（成功、无作品/私密跳过，或失败已跳过继续下一个）；<strong>不要求全部成功</strong>，避免单条失败拖死整批计数。失败用户下次拉取仍可能再次出现并重试。<br />
               达到设定批数后的行为与设备概览页<strong>「启动所选设备互点（引流）」</strong>一致：暂停涨粉拉取 → 执行引流会话 → 会话结束<strong>强停 TikTok</strong>后继续涨粉（不再改动云端「自动开启程序」开关）。<br />
               <strong>-1</strong> 或 <strong>0</strong>：永不自动切引流（默认 -1）。填 <strong>1、2…</strong> 表示累计满该批数后触发一次，计数会清零后再重新累计。
             </div>

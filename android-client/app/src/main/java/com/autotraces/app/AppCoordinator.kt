@@ -1817,7 +1817,7 @@ object AppCoordinator {
 
     /**
      * 涨粉：模板 [AppConfig.growth_pull_batches_before_auto_mutual] ≥1 时，
-     * 每完成一整批「服务端拉取清单」内全部用户名（均已 [PrefsStore.markUsernameCompleted]）计 1；
+     * 每完成一整批「服务端拉取清单」内全部用户名（均已处理：成功/跳过或涨粉失败已跳过，见 [PrefsStore.markUsernameProcessed]）计 1；
      * 累计达到阈值则等价于管理台「启动所选设备互点」：暂停涨粉拉取 → 互点会话 → 结束后恢复拉取。
      */
     private suspend fun evaluateGrowthAutoMutualAfterBatchIfNeeded(alias: String, deviceId: String) {
@@ -1944,6 +1944,10 @@ object AppCoordinator {
         if (runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) {
             val qLabel = if (runMode == ServerRunMode.MUTUAL) "互点（mobile 队列）" else "涨粉"
             LogCenter.op(alias, "$qLabel：跳过失败用户，继续下一个")
+            PrefsStore.markUsernameProcessed(username)
+            if (runMode == ServerRunMode.GROWTH) {
+                evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
+            }
         } else {
             LogCenter.op(alias, "主播/直客：本用户失败，将按策略重试或跳过")
         }

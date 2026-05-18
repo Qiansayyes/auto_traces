@@ -6201,10 +6201,6 @@ function renderBackupGroups(items = []) {
     deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
     return;
   }
-  const templateNames = Object.keys(currentTemplatesByName || {}).sort((a, b) => a.localeCompare(b));
-  if (!templateNames.length) templateNames.push("default");
-  const fallbackTemplate = String(currentConfigTemplate || templateNames[0] || "default").trim() || "default";
-  const modeMap = aliasTemplateByMode?.[currentRunMode] || {};
   const groups = new Map();
   items.forEach((item) => {
     const alias = String(item?.assigned_alias || item?.mobile_alias || "").trim() || "__EMPTY_ALIAS__";
@@ -6223,13 +6219,6 @@ function renderBackupGroups(items = []) {
       const deviceRowIndex = Number(row?.row_index);
       const deviceId = String(row?.device_id || "").trim();
       const actionAlias = alias === "__EMPTY_ALIAS__" ? mobileAlias : alias;
-      const accountMapKey = accountTemplateMapKey(actionAlias, username);
-      const accountMapped = resolveBoundTemplateRef(actionAlias, username, currentRunMode);
-      const isAccountBound = Boolean(String(modeMap[accountMapKey] || "").trim());
-      const selectedTemplate = String(accountMapped || fallbackTemplate).trim() || fallbackTemplate;
-      const templateOptionsHtml = templateNames.map((name) => (
-        `<option value="${escapeHtml(name)}" ${name === selectedTemplate ? "selected" : ""}>${templateDisplayName(name, currentTemplateMeta)}</option>`
-      )).join("");
       const linkedAccountInfo = renderLinkedAccountInfo({ username });
       const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
       const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
@@ -6256,17 +6245,6 @@ function renderBackupGroups(items = []) {
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">username</label><div style="word-break:break-word;">${escapeHtml(username || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">mobile_alias</label><div style="word-break:break-word;">${escapeHtml(mobileAlias || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">updated_at</label><div style="word-break:break-word;">${escapeHtml(updatedAt || "-")}</div></div>
-          </div>
-          <div style="margin-top:10px;">
-            <label style="display:block;color:#666;font-size:12px;margin-bottom:4px;">行为配置模板（按账号）</label>
-            <select
-              class="account-template-select ui-select"
-              data-alias="${escapeHtml(actionAlias)}"
-              data-username="${escapeHtml(username)}"
-              style="min-width:200px;padding:4px 6px;font-size:12px;"
-              ${username ? "" : "disabled"}
-            >${templateOptionsHtml}</select>
-            <span class="badge ${isAccountBound ? "online" : "pending"}" style="margin-left:8px;">${isAccountBound ? "账号已绑定" : "继承设备/默认"}</span>
           </div>
           <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px;">
             <div style="min-width:0;">
@@ -6409,34 +6387,6 @@ if (deviceAliasGroupsEl) {
       }
     }
     syncEditorField(scope, index, field, target.value, target.checked).catch((e) => setStatus(humanizeRequestErrorMessage(e) || "保存失败", "error"));
-  });
-  deviceAliasGroupsEl.addEventListener("change", async (event) => {
-    const target = event.target;
-    if (!(target instanceof HTMLSelectElement)) return;
-    if (!target.classList.contains("account-template-select")) return;
-    const alias = String(target.dataset.alias || "").trim();
-    const tiktokUsername = String(target.dataset.username || "").trim();
-    const nextTemplate = String(target.value || "").trim();
-    if (!alias || !tiktokUsername || !nextTemplate) return;
-    const prevTemplate = resolveBoundTemplateRef(alias, tiktokUsername, currentRunMode) || String(currentConfigTemplate || "default");
-    try {
-      const data = await request("/api/admin/alias_template/select", {
-        method: "POST",
-        body: JSON.stringify({
-          alias,
-          mode: currentRunMode,
-          template_name: nextTemplate,
-          tiktok_username: tiktokUsername,
-        }),
-      });
-      aliasTemplateByMode = (data?.alias_template_by_mode && typeof data.alias_template_by_mode === "object")
-        ? data.alias_template_by_mode
-        : aliasTemplateByMode;
-      setStatus(`账号 ${tiktokUsername}（${alias}）已绑定模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
-    } catch (error) {
-      setStatus(error.message || "更新账号模板失败", "error");
-      target.value = prevTemplate;
-    }
   });
   deviceAliasGroupsEl.addEventListener("click", async (event) => {
     const targetEl = event.target;

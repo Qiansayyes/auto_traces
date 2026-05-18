@@ -15,11 +15,13 @@ object PrefsStore {
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
     private const val KEY_BATCH_COMPLETED = "batch_completed"
+    /** 本批已跑过（成功、跳过或失败跳过）；用于自动互点批计数，与 [KEY_BATCH_COMPLETED]（仅成功收尾）区分 */
+    private const val KEY_BATCH_PROCESSED = "batch_processed"
     /** 每次 [savePulledBatch] 后递增，标记「当前拉取清单」代数（用于整批完成去重） */
     private const val KEY_PULL_BATCH_SEQ = "pull_batch_seq"
     /** 已计入「涨粉整批完成→自动互点」累加器的拉取序号 */
     private const val KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ = "last_attributed_pull_batch_seq"
-    /** 已连续完成多少整批拉取清单（向模板 growth_pull_batches_before_auto_mutual 对齐） */
+    /** 已连续完成多少整批拉取清单（每条均已处理，向模板 growth_pull_batches_before_auto_mutual 对齐） */
     private const val KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL = "growth_batches_toward_auto_mutual"
     /** 上次向服务端校验绑定的时间；用于避免每次回到前台都请求 bindDevice。 */
     private const val KEY_LAST_BIND_REFRESH_MS = "last_bind_refresh_ms"
@@ -294,20 +296,21 @@ object PrefsStore {
         prefs.edit()
             .putStringSet(KEY_BATCH_USERNAMES, normalized.toSet())
             .putStringSet(KEY_BATCH_COMPLETED, emptySet())
+            .putStringSet(KEY_BATCH_PROCESSED, emptySet())
             .putInt(KEY_PULL_BATCH_SEQ, nextSeq)
             .apply()
     }
 
     /**
-     * 当前拉取清单中用户名是否均已 [markUsernameCompleted]（含「无作品跳过」等成功收尾）。
-     * 若有失败未标记完成，则整批不算完成，不会向自动互点批次数累加。
+     * 当前拉取清单中用户名是否均已处理（成功收尾、无作品跳过，或涨粉失败已跳过）。
+     * 不要求全部成功，避免单条失败导致整批永不计入自动互点。
      */
     @Synchronized
     fun tryConsumeCompletedPullBatchForAutoMutualStat(): Boolean {
         val batch = prefs.getStringSet(KEY_BATCH_USERNAMES, null) ?: return false
         if (batch.isEmpty()) return false
-        val completed = prefs.getStringSet(KEY_BATCH_COMPLETED, null) ?: return false
-        if (!batch.all { completed.contains(it) }) return false
+        val processed = prefs.getStringSet(KEY_BATCH_PROCESSED, null) ?: return false
+        if (!batch.all { processed.contains(it) }) return false
         val seq = prefs.getInt(KEY_PULL_BATCH_SEQ, 0)
         if (seq <= 0) return false
         val lastAttr = prefs.getInt(KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ, 0)
@@ -328,9 +331,19 @@ object PrefsStore {
     }
 
     @Synchronized
+    fun markUsernameProcessed(username: String) {
+        val key = username.trim()
+        if (key.isBlank()) return
+        val processed = prefs.getStringSet(KEY_BATCH_PROCESSED, emptySet())?.toMutableSet() ?: mutableSetOf()
+        processed.add(key)
+        prefs.edit().putStringSet(KEY_BATCH_PROCESSED, processed).apply()
+    }
+
+    @Synchronized
     fun markUsernameCompleted(username: String) {
         val key = username.trim()
         if (key.isBlank()) return
+        markUsernameProcessed(key)
         val completed = prefs.getStringSet(KEY_BATCH_COMPLETED, emptySet())?.toMutableSet() ?: mutableSetOf()
         completed.add(key)
         prefs.edit().putStringSet(KEY_BATCH_COMPLETED, completed).apply()

@@ -4463,6 +4463,7 @@ class RealTraceExecutor(
             val label = "While using the app"
             val maxOcrPasses = 3
             var whileUsingTapped = false
+            var lastTappedPoint: Point? = null
             for (pass in 1..maxOcrPasses) {
                 if (hardStopOrNull(alias, "发作品 While using OCR")) return false
                 if (pass > 1) delay(700)
@@ -4481,14 +4482,23 @@ class RealTraceExecutor(
                     continue
                 }
                 val tap = coerceTapToScreen(hit.point, w, h)
+                lastTappedPoint = tap
                 devOp(alias, "发作品：第 $pass/$maxOcrPasses 次命中「$label」拟 tap (${tap.x},${tap.y})")
                 if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                     devOp(alias, "发作品：已点击「$label」")
+                    if (pass < maxOcrPasses) {
+                        delay(500)
+                        continue
+                    }
                     whileUsingTapped = true
                     break
                 }
             }
-            if (!whileUsingTapped) {
+            if (whileUsingTapped) {
+                devOp(alias, "发作品：已完成「$label」的连续点击尝试（最多 $maxOcrPasses 次）")
+            } else if (lastTappedPoint != null) {
+                devOp(alias, "发作品：${maxOcrPasses} 次中已点过「$label」，但未进入需要重复点击的确认状态，跳过该项")
+            } else {
                 devOp(alias, "发作品：${maxOcrPasses} 次仍未点击「$label」，跳过该项")
             }
         } else {

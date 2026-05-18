@@ -93,7 +93,7 @@ BASE_DEFAULT_CONFIG = {
     # 引流 Videos 列表轮次（与完整互点共用）；粉丝列表 Follow 单次会话点击上限
     "mutual_videos_scroll_rounds": 5,
     "mutual_follow_tap_session_limit": 20,
-    # 涨粉：连续「整批拉取的用户名在设备端全部执行完毕」多少批后自动进入互点；-1 表示永不自动切换
+    # 涨粉：连续多少「整批拉取清单在设备端每条均已处理（含失败跳过）」后自动进入互点；-1 表示永不自动切换
     "growth_pull_batches_before_auto_mutual": -1,
     # 互动动作之间的随机间隔（秒）
     "action_delay_min": 0.7,

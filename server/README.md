@@ -83,3 +83,42 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - `POST /api/admin/add_usernames`
 - `POST /api/admin/update_config`
 - `GET /api/admin/overview`
+- `POST /api/admin/device_tiktok/publish_post_start`
+
+## 设备任务队列（TikTok 相关）
+
+服务端通过统一的设备任务队列下发 TikTok 操作。管理端点击“发布作品”时，后端并不直接操控页面，而是创建一个 `publish_post_start` 任务，设备端需要先轮询 `/api/device_ops/poll` 再执行后续动作。
+
+### `publish_post_start` 的服务端前置步骤
+
+1. **鉴权与设备归属校验**
+   - 先调用 `_require_login_and_owning_device(...)`。
+   - 校验登录状态、设备归属和 `alias` 是否匹配。
+   - 校验失败时，任务不会入队。
+
+2. **必要时关闭设备自动开启程序**
+   - 进入 `store.lock` 后检查设备的 `auto_start_opt_out`。
+   - 如果设备存在且尚未关闭，会将其置为 `True`。
+   - 随后调用 `_persist_client_device_to_db(...)` 持久化。
+   - 并写入设备日志：`发作品指令：云端已自动关闭该设备的自动开启程序`。
+
+3. **把设备状态恢复为 running**
+   - 调用 `_resume_device_for_cloud_op(...)`。
+   - 这一步只是把设备从暂停态切回可运行态，方便设备端继续拉取任务。
+
+4. **下发任务到队列**
+   - 调用 `_enqueue_tiktok_device_op(device_id, "publish_post_start", ...)`。
+   - 生成 `op_id`，并写入设备的待处理任务队列。
+   - 任务载荷包含：`device_id`、`alias`、`package_name`。
+
+5. **接口返回结果**
+   - 返回 `code=0`、`op_id`、`auto_start_opt_out`。
+   - 如果第 2 步确实关闭了自动开启程序，提示语会带上“已自动关闭该设备自动开启程序”。
+
+### 设备端后续行为（基于当前仓库可确认的部分）
+
+- 设备端通过 `/api/device_ops/poll` 轮询任务。
+- 轮询到任务后，服务端返回结构为 `{"code": 0, "msg": "ok", "op": ...}`。
+- 对于 `publish_post_start`，仓库中当前能确认的是：服务端仅负责下发该任务；设备端“如何打开页面、点击按钮、填写发布内容”等 UI 级操作逻辑不在服务端实现中。
+- 设备端在 `While using the app` 阶段支持可选重复点击：如果 OCR 再次识别到该行，会继续点击，最多 3 轮；识别不到则跳过，不视为失败。
+
