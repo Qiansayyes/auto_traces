@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import Event, Lock, Thread, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Any, Dict, Iterable, List, Literal
 
 import requests
@@ -164,17 +164,123 @@ def _new_session_token() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
 
-def _get_db() -> sqlite3.Connection:
-    # 关键诉求：管理台接口不能因为 sqlite 写锁卡死几十秒。
-    # WAL + 较短 timeout/busy_timeout 让读写更可并发；遇到锁则尽快返回错误由前端提示/重试。
-    # 注意：FastAPI 同步 handler 跑在线程池里；sqlite 若长期等待锁，会把请求线程占满，最终触发 504。
-    # 这里把等待时间压到很短：锁忙就快速失败，让上层返回 503（前端可重试）。
-    conn = sqlite3.connect(str(DB_PATH), timeout=1.0)
-    conn.row_factory = sqlite3.Row
-    # 缓解并发读写下的 "database is locked"（尤其登录写 session 时）
-    conn.execute("PRAGMA busy_timeout=500")
+_DB_GUARD = RLock()
+_sqlite_wal_ready = False
+_DB_BUSY_TIMEOUT_MS = 30_000
+_DB_RETRY_ATTEMPTS = 10
+_DB_RETRY_BASE_SEC = 0.03
+_AUTH_SESSION_CACHE: dict[str, tuple[dict, float]] = {}
+_AUTH_SESSION_CACHE_TTL_SEC = 20.0
+_DEVICE_EDITOR_PRUNE_INTERVAL_SEC = 120.0
+_device_editor_prune_last_at: dict[str, float] = {}
+
+
+def _is_db_lock_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg or "locked" in msg
+
+
+def _db_retry_call(fn):
+    last: BaseException | None = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            last = exc
+            if not _is_db_lock_error(exc) or attempt >= _DB_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_DB_RETRY_BASE_SEC * (2**attempt))
+    if last:
+        raise last
+    raise RuntimeError("db_retry_call: unreachable")
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute(f"PRAGMA busy_timeout={_DB_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+
+
+def _ensure_sqlite_wal_mode() -> None:
+    """一次性开启 WAL，提升读写并发（须在 init_databases 最早调用）。"""
+    global _sqlite_wal_ready
+    if _sqlite_wal_ready:
+        return
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    try:
+        _apply_sqlite_pragmas(conn)
+    finally:
+        conn.close()
+    _sqlite_wal_ready = True
+
+
+def _invalidate_auth_session_cache(token: str | None = None) -> None:
+    if not token:
+        _AUTH_SESSION_CACHE.clear()
+        return
+    _AUTH_SESSION_CACHE.pop(token, None)
+
+
+class _DbConn:
+    """包装 sqlite3 连接：进程内串行化访问，避免线程池并发 handler 触发 database is locked。"""
+
+    __slots__ = ("_conn",)
+
+    def __init__(self) -> None:
+        _DB_GUARD.acquire()
+        self._conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+        self._conn.row_factory = sqlite3.Row
+        try:
+            _apply_sqlite_pragmas(self._conn)
+        except Exception:
+            self._conn.close()
+            _DB_GUARD.release()
+            raise
+
+    def execute(self, *args, **kwargs):
+        return _db_retry_call(lambda: self._conn.execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs):
+        return _db_retry_call(lambda: self._conn.executemany(*args, **kwargs))
+
+    def commit(self) -> None:
+        _db_retry_call(self._conn.commit)
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        finally:
+            _DB_GUARD.release()
+
+
+def _get_db() -> sqlite3.Connection:
+    return _DbConn()  # type: ignore[return-value]
+
+
+def _maybe_prune_orphan_device_editor_rows(conn: sqlite3.Connection, owner_username: str) -> int:
+    """列表接口用：限频清理孤儿档案，避免每次打开 device_rows 都做重 DELETE。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return 0
+    now = time.monotonic()
+    last = _device_editor_prune_last_at.get(owner, 0.0)
+    if now - last < _DEVICE_EDITOR_PRUNE_INTERVAL_SEC:
+        return 0
+    try:
+        pruned = _prune_orphan_device_editor_rows(conn, owner)
+        _device_editor_prune_last_at[owner] = now
+        return pruned
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            print(f"[{now_text()}] device_editor.prune | skipped_db_busy | owner={owner}")
+            return 0
+        raise
 
 
 def _table_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -739,6 +845,7 @@ def migrate_backup_owner_history():
 
 
 def init_databases():
+    _ensure_sqlite_wal_mode()
     init_follow_db()
     init_autosearch_db()
     init_auth_db()
@@ -1592,6 +1699,16 @@ app = FastAPI(
     version="1.1.0",
 )
 
+@app.exception_handler(sqlite3.OperationalError)
+async def sqlite_operational_error_handler(_request: Request, exc: sqlite3.OperationalError):
+    if _is_db_lock_error(exc):
+        return JSONResponse(
+            status_code=503,
+            content={"code": 1, "msg": "数据库繁忙，请稍后重试"},
+        )
+    return JSONResponse(status_code=500, content={"code": 1, "msg": str(exc)})
+
+
 app.add_middleware(
     CORSMiddleware,
     # 管理台可能通过 file://、局域网 IP、不同端口静态服务访问；
@@ -1672,6 +1789,26 @@ async def log_request_timing(request: Request, call_next):
             status_code=504,
             content={"code": 1, "msg": "服务繁忙：请求超时，请稍后重试"},
         )
+    except sqlite3.OperationalError as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if _is_db_lock_error(exc):
+            print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 503 | {elapsed_ms:.1f}ms | DB_BUSY")
+            return JSONResponse(
+                status_code=503,
+                content={"code": 1, "msg": "数据库繁忙，请稍后重试"},
+            )
+        print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
+        raise
+    except RuntimeError as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if str(exc).startswith("DB_BUSY:"):
+            print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 503 | {elapsed_ms:.1f}ms | DB_BUSY")
+            return JSONResponse(
+                status_code=503,
+                content={"code": 1, "msg": "数据库繁忙，请稍后重试"},
+            )
+        print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
+        raise
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
@@ -2282,6 +2419,12 @@ def _current_session(headers: dict | None = None) -> dict | None:
     if not token:
         print(f"[{now_text()}] auth.session | missing_token")
         return None
+    cached = _AUTH_SESSION_CACHE.get(token)
+    if cached:
+        session, expires_at = cached
+        if time.monotonic() < expires_at:
+            return dict(session)
+        _AUTH_SESSION_CACHE.pop(token, None)
     conn = _get_db()
     try:
         print(f"[{now_text()}] auth.session | lookup_start")
@@ -2305,7 +2448,9 @@ def _current_session(headers: dict | None = None) -> dict | None:
             print(f"[{now_text()}] auth.session | user_inactive | {(time.perf_counter() - started) * 1000:.1f}ms")
             return None
         print(f"[{now_text()}] auth.session | ok | {(time.perf_counter() - started) * 1000:.1f}ms user={row[1]}")
-        return {"token": row[0], "username": row[1], "role": row[2]}
+        session = {"token": row[0], "username": row[1], "role": row[2]}
+        _AUTH_SESSION_CACHE[token] = (session, time.monotonic() + _AUTH_SESSION_CACHE_TTL_SEC)
+        return dict(session)
     except sqlite3.OperationalError as exc:
         print(f"[{now_text()}] auth.session | db_busy | {(time.perf_counter() - started) * 1000:.1f}ms err={exc}")
         # e.g. database is locked / busy_timeout hit
@@ -3970,6 +4115,7 @@ def auth_login(payload: dict):
             (token, username, row[2], now_text(), "2999-12-31 23:59:59"),
         )
         conn.commit()
+        _invalidate_auth_session_cache()
         return {"code": 0, "msg": "登录成功", "token": token, "role": row[2], "username": username}
     finally:
         conn.close()
@@ -4717,11 +4863,10 @@ def pull_username(
         batches_before_rest = int(eff_config.get("pull_batch_size", 5) or 5)
     batches_before_rest = max(1, min(batches_before_rest, 100))
 
-    # ——按“拉取批次”触发休息（完成 N 批后，第 N+1 次拉取返回休息指令）——
+    # ——按“拉取批次”触发休息：已完成 N 次成功拉取后，下一次拉取直接返回休息（不查库）——
     with store.lock:
-        rounds = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
-        store.device_pull_rounds[device_id] = rounds
-        should_rest = rounds > batches_before_rest
+        rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
+        should_rest = rounds >= batches_before_rest
         if should_rest:
             store.device_pull_rounds[device_id] = 0
 
@@ -4746,6 +4891,12 @@ def pull_username(
             "force_stop_tiktok": True,
         }
 
+    def _finish_pull_username_response(payload: dict) -> dict:
+        """仅在本次拉取已成功完成 DB 读写后累计休息批次数（避免 500 虚增轮次）。"""
+        with store.lock:
+            store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
+        return payload
+
     consumed_mobile_pending = False
     selected: List[str] = []
     conn = _get_db()
@@ -4761,7 +4912,7 @@ def pull_username(
             ).fetchall()
             selected = [r[0] for r in rows]
             if not selected:
-                return {"code": 1, "msg": "暂无主播访问数据"}
+                return _finish_pull_username_response({"code": 1, "msg": "暂无主播访问数据"})
             current_time = now_text()
             for username in selected:
                 conn.execute(
@@ -4777,7 +4928,7 @@ def pull_username(
             selected_rowids = [r[0] for r in rows]
             selected = [r[1] for r in rows]
             if not selected:
-                return {"code": 1, "msg": "暂无直客访问数据（follower_queue为空）"}
+                return _finish_pull_username_response({"code": 1, "msg": "暂无直客访问数据（follower_queue为空）"})
             consumed_at = now_text()
             conn.executemany(
                 "UPDATE follower_queue SET consume_status = 'sent', consumed_at = ?, consumed_mode = 'direct', consumed_by = ? WHERE rowid = ?",
@@ -4791,7 +4942,7 @@ def pull_username(
                 (safe_count,),
             ).fetchall()
             if not rows:
-                return {"code": 1, "msg": "暂无待执行的用户名"}
+                return _finish_pull_username_response({"code": 1, "msg": "暂无待执行的用户名"})
 
             selected_ids = [r[0] for r in rows]
             selected = [r[1] for r in rows]
@@ -4806,7 +4957,7 @@ def pull_username(
         conn.close()
 
     print(f"[{now_text()}] 设备别名：{alias} | 拉取用户名：{selected}")
-    return {"code": 0, "usernames": selected}
+    return _finish_pull_username_response({"code": 0, "usernames": selected})
 
 
 @app.post("/api/report_mutual_copied_username")
@@ -6192,7 +6343,7 @@ def list_device_editor_rows(
     try:
         owner = str(session["username"] or "").strip()
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
-        pruned = _prune_orphan_device_editor_rows(conn, owner)
+        pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
         if pruned:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
