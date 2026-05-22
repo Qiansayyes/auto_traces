@@ -3,6 +3,9 @@
     <string name="accessibility_service_description">用于自动化操作第三方应用。</string>
     <string name="bind_title">设备绑定</string>
     <string name="settings_title">设置</string>
+    <string name="config_params_title">配置参数</string>
+    <string name="nav_config_params">配置</string>
+    <string name="action_open_config_params">查看配置参数</string>
     <string name="hint_alias">请输入设备别名</string>
     <string name="hint_server_url">请输入服务端地址</string>
     <string name="action_bind">绑定设备</string>

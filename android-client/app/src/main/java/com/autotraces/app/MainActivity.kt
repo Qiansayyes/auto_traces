@@ -108,11 +108,16 @@ class MainActivity : AppCompatActivity() {
 
         binding.openSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        binding.showConfigButton.setOnClickListener { openConfigParamsScreen() }
+        binding.openConfigParamsButton.setOnClickListener { openConfigParamsScreen() }
         binding.showLogButton.setOnClickListener { showLogPanel() }
         binding.showActionButton.setOnClickListener {
             if (AppCoordinator.isInPullUsernameRestSleep()) {
-                showLogPanel()
-                return@setOnClickListener
+                Toast.makeText(
+                    this,
+                    "云端休息中：自动涨粉已暂停，仍可在此绑定/复制账号等操作",
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
             showActionPanel()
         }
@@ -123,6 +128,8 @@ class MainActivity : AppCompatActivity() {
 
         if (requireCloudLoginIfNeeded()) return
         applyInitialPanelFromIntent()
+
+        updateConfigSummaryLine()
 
         if (!PrefsStore.isHardStopRequested()) {
             AppCoordinator.refreshRuntimeSnapshot()
@@ -153,13 +160,17 @@ class MainActivity : AppCompatActivity() {
             renderDeviceInfo()
             return
         }
-        if (AppCoordinator.isInPullUsernameRestSleep()) {
-            showLogPanel()
+        lifecycleScope.launch {
+            val recovered = BindingRecovery.tryRecoverFromCloud(this@MainActivity)
+            if (recovered) {
+                binding.bindInput.setText(PrefsStore.getAlias().orEmpty())
+                AppCoordinator.startIfNeeded()
+            }
+            ensureBoundIfNeeded()
+            renderDeviceInfo()
+            clarifyStaleBindErrorIfNeeded()
+            refreshAssignedAccountFields()
         }
-        ensureBoundIfNeeded()
-        renderDeviceInfo()
-        clarifyStaleBindErrorIfNeeded()
-        refreshAssignedAccountFields()
     }
 
     /** 「重新绑定」失败后文案仍留在界面，容易误以为未绑定；已与 prefs/get_config 语义对齐时给予说明。 */
@@ -448,13 +459,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyInitialPanelFromIntent() {
         when (intent?.getStringExtra(EXTRA_INITIAL_PANEL)) {
-            "action" -> {
-                if (AppCoordinator.isInPullUsernameRestSleep()) {
-                    showLogPanel()
-                } else {
-                    showActionPanel()
-                }
-            }
+            "action" -> showActionPanel()
             "log" -> showLogPanel()
         }
     }
@@ -468,7 +473,27 @@ class MainActivity : AppCompatActivity() {
     private fun showActionPanel() {
         binding.logPanel.visibility = View.GONE
         binding.actionPanel.visibility = View.VISIBLE
+        updateConfigSummaryLine()
     }
+
+    private fun openConfigParamsScreen() {
+        startActivity(Intent(this, ConfigParamsActivity::class.java))
+    }
+
+    private fun updateConfigSummaryLine() {
+        val cfg = AppCoordinator.config.value
+        val state = AppCoordinator.runtimeState.value
+        val tpl = state.effectiveTemplate.ifBlank { "—" }
+        val loaded = if (state.configLoaded) "已同步" else "未同步"
+        binding.configSummaryText.text =
+            "当前模板：$tpl · ${ConfigDisplay.prettyRunMode(cfg.run_mode)} · $loaded\n" +
+                "互动：赞${formatProbShort(cfg.like_prob)} 评${formatProbShort(cfg.comment_prob)} " +
+                "藏${formatProbShort(cfg.favorite_prob)} 转${formatProbShort(cfg.share_prob)} · " +
+                "每日上限 ${cfg.like_daily_limit}/${cfg.comment_daily_limit}/${cfg.favorite_daily_limit}/${cfg.share_daily_limit}"
+    }
+
+    private fun formatProbShort(v: Double): String =
+        String.format("%.2f", v.coerceIn(0.0, 1.0))
 
     companion object {
         fun navigateToLogPanel(context: android.content.Context) {
@@ -521,7 +546,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         lifecycleScope.launch {
+            AppCoordinator.config.collectLatest {
+                updateConfigSummaryLine()
+            }
+        }
+
+        lifecycleScope.launch {
             AppCoordinator.runtimeState.collectLatest { state ->
+                updateConfigSummaryLine()
                 binding.runtimeStateText.text = buildString {
                     appendLine("后台服务: ${if (state.serviceRunning) "运行中" else "未启动"}")
                     appendLine("本地状态: ${state.localStatus}")
@@ -613,10 +645,13 @@ class MainActivity : AppCompatActivity() {
         binding.bindButton.text = if (PrefsStore.isBound()) "重新绑定" else getString(R.string.action_bind)
     }
 
-    private fun ensureBoundIfNeeded() {
+    private suspend fun ensureBoundIfNeeded() {
         if (!PrefsStore.isBound()) {
-            updateBindSectionState()
-            return
+            if (!BindingRecovery.tryRecoverFromCloud(this@MainActivity)) {
+                updateBindSectionState()
+                return
+            }
+            binding.bindInput.setText(PrefsStore.getAlias().orEmpty())
         }
         if (PrefsStore.getAuthToken().isNullOrBlank()) {
             updateBindSectionState()
@@ -627,23 +662,21 @@ class MainActivity : AppCompatActivity() {
             updateBindSectionState()
             return
         }
-        lifecycleScope.launch {
-            runCatching {
-                ApiService.bindDevice(PrefsStore.getAlias().orEmpty(), DeviceFingerprint.fromContext(this@MainActivity))
-            }.onSuccess { response ->
-                if (response.code == 0 && !response.device_id.isNullOrBlank()) {
-                    PrefsStore.saveBinding(response.device_id, PrefsStore.getAlias().orEmpty())
-                    PrefsStore.markBindingRefreshedNow()
-                    LogCenter.op(PrefsStore.getAlias(), "绑定校验通过：${response.device_id}")
-                } else {
-                    LogCenter.op(PrefsStore.getAlias(), response.msg)
-                }
-                updateBindSectionState()
-                renderDeviceInfo()
-            }.onFailure {
-                LogCenter.op(PrefsStore.getAlias(), "绑定校验失败：${it.message}")
-                updateBindSectionState()
+        runCatching {
+            ApiService.bindDevice(PrefsStore.getAlias().orEmpty(), DeviceFingerprint.fromContext(this@MainActivity))
+        }.onSuccess { response ->
+            if (response.code == 0 && !response.device_id.isNullOrBlank()) {
+                PrefsStore.saveBinding(response.device_id, PrefsStore.getAlias().orEmpty())
+                PrefsStore.markBindingRefreshedNow()
+                LogCenter.op(PrefsStore.getAlias(), "绑定校验通过：${response.device_id}")
+            } else {
+                LogCenter.op(PrefsStore.getAlias(), response.msg)
             }
+            updateBindSectionState()
+            renderDeviceInfo()
+        }.onFailure {
+            LogCenter.op(PrefsStore.getAlias(), "绑定校验失败：${it.message}")
+            updateBindSectionState()
         }
     }
 

@@ -9,6 +9,7 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,6 +80,27 @@ object AppCoordinator {
     private var deviceLogSyncJob: Job? = null
     private var mutualSwitchJob: Job? = null
     private var publishPostSwitchJob: Job? = null
+
+    private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
+
+    private fun isMutualSwitchActive(): Boolean = mutualSwitchJob?.isActive == true
+
+    /** 发作品或互点切换占用 TikTok 时，不启动涨粉拉取循环。 */
+    private fun canStartPullLoopNow(): Boolean =
+        !isPublishPostSwitchActive() && !isMutualSwitchActive()
+
+    /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常，不得计入本批自动互点。 */
+    private fun isPullLoopJobCancellation(err: Throwable): Boolean {
+        var t: Throwable? = err
+        while (t != null) {
+            if (t is CancellationException) return true
+            t = t.cause
+        }
+        val msg = err.message.orEmpty()
+        return msg.contains("cancelled", ignoreCase = true) ||
+            msg.contains("CancellationException", ignoreCase = true)
+    }
+
     @Volatile
     private var manuallyPaused: Boolean = false
     private val pendingUsernames = mutableListOf<String>()
@@ -102,9 +124,12 @@ object AppCoordinator {
             currentServerUrl = ApiService.getBaseUrl(),
             lastMessage = "应用已初始化",
         )
-        // 素材下发等设备任务不应依赖“业务运行状态”，只要已绑定就保持轮询能力。
-        ensureDeviceOpsLoopIfBound()
-        startIfNeeded()
+        scope.launch {
+            if (BindingRecovery.tryRecoverFromCloud(appContext)) {
+                ensureDeviceOpsLoopIfBound()
+            }
+            startIfNeeded()
+        }
     }
 
     private fun ensureDeviceOpsLoopIfBound() {
@@ -256,7 +281,14 @@ object AppCoordinator {
         }
     }
 
-    suspend fun fetchConfig(configQueryRunMode: String? = null, logToUser: Boolean = false): Boolean {
+    suspend fun fetchConfig(
+        configQueryRunMode: String? = null,
+        logToUser: Boolean = false,
+        bindingRecoveryAttempted: Boolean = false,
+    ): Boolean {
+        if (!PrefsStore.isBound() && !bindingRecoveryAttempted) {
+            BindingRecovery.tryRecoverFromCloud(appContext)
+        }
         val deviceId = PrefsStore.getDeviceId() ?: return false
         val alias = PrefsStore.getAlias() ?: return false
         val deviceQueueMode = PrefsStore.getDeviceRunMode()
@@ -267,6 +299,13 @@ object AppCoordinator {
             ApiService.getConfig(deviceId, alias, modeForRequest, tiktokAccount)
         }.fold(
             onSuccess = { response ->
+                if (
+                    !bindingRecoveryAttempted &&
+                    BindingRecovery.looksLikeBindingAuthError(response.code, response.msg) &&
+                    BindingRecovery.tryRecoverFromCloud(appContext)
+                ) {
+                    return fetchConfig(configQueryRunMode, logToUser, bindingRecoveryAttempted = true)
+                }
                 if (response.code == 0 && response.config != null) {
                     val merged = response.config.copy(
                         run_mode = response.run_mode ?: response.config.run_mode,
@@ -327,8 +366,14 @@ object AppCoordinator {
 
         startPollJob = scope.launch {
             while (true) {
-                val deviceId = PrefsStore.getDeviceId()
-                val alias = PrefsStore.getAlias()
+                var deviceId = PrefsStore.getDeviceId()
+                var alias = PrefsStore.getAlias()
+                if (deviceId.isNullOrBlank() || alias.isNullOrBlank()) {
+                    if (BindingRecovery.tryRecoverFromCloud(appContext)) {
+                        deviceId = PrefsStore.getDeviceId()
+                        alias = PrefsStore.getAlias()
+                    }
+                }
                 if (deviceId.isNullOrBlank() || alias.isNullOrBlank()) {
                     delay(10_000)
                     continue
@@ -352,7 +397,12 @@ object AppCoordinator {
                         val cloudAutoStart = response.auto_start == true
                         if (response.status == "paused") {
                             /* 用户硬停后服务端仍为 paused，但管理员已重新允许自动开启：视为新指令，解除硬停并恢复。 */
-                            if (PrefsStore.isHardStopRequested() && cloudAutoStart && !inPullUsernameRestSleep) {
+                            if (
+                                PrefsStore.isHardStopRequested() &&
+                                cloudAutoStart &&
+                                !inPullUsernameRestSleep &&
+                                !PrefsStore.isWithinHardStopGracePeriod()
+                            ) {
                                 LogCenter.op(
                                     alias,
                                     "云端已重新允许自动开启（check_start 仍为 paused），解除硬停并恢复运行",
@@ -378,57 +428,60 @@ object AppCoordinator {
                                 }
                             }
                         } else {
-                            if (PrefsStore.isHardStopRequested()) {
-                                PrefsStore.setHardStopRequested(false)
+                            if (shouldHonorUserHardStop() && PrefsStore.isWithinHardStopGracePeriod()) {
+                                if (PrefsStore.getLocalStatus() != "paused") {
+                                    PrefsStore.saveLocalStatus("paused")
+                                }
+                                runCatching { ApiService.syncStatus(deviceId, alias, "paused") }
+                                LogCenter.op(alias, "本地硬停中：忽略云端「运行中」指令，保持暂停")
+                            } else {
+                                if (shouldHonorUserHardStop()) {
+                                    PrefsStore.setHardStopRequested(false)
+                                }
+                                manuallyPaused = false
+                                if (!started.get()) {
+                                    started.set(true)
+                                }
+                                PrefsStore.saveLocalStatus("running")
+                                ApiService.syncStatus(deviceId, alias, "running")
+                                LogCenter.op(alias, "管理台已下发「开始运行」，涨粉/任务即将启动")
+                                updateRuntime(localStatus = "running", lastMessage = "收到启动/继续指令")
+                                if (!WorkerServiceTracker.isRunning) {
+                                    runCatching { WorkerService.start(appContext) }
+                                        .onFailure {
+                                            LogCenter.op(alias, "收到启动指令后恢复后台服务失败：${it.message}")
+                                        }
+                                }
+                                fetchConfig(logToUser = true)
+                                startPullLoop()
                             }
-                            manuallyPaused = false
-                            if (!started.get()) {
-                                started.set(true)
-                            }
-                            PrefsStore.saveLocalStatus("running")
-                            ApiService.syncStatus(deviceId, alias, "running")
-                            LogCenter.op(alias, "管理台已下发「开始运行」，涨粉/任务即将启动")
-                            updateRuntime(localStatus = "running", lastMessage = "收到启动/继续指令")
-                            if (!WorkerServiceTracker.isRunning) {
-                                runCatching { WorkerService.start(appContext) }
-                                    .onFailure {
-                                        LogCenter.op(alias, "收到启动指令后恢复后台服务失败：${it.message}")
-                                    }
-                            }
-                            fetchConfig(logToUser = true)
-                            startPullLoop()
                         }
                     } else if (response.code == 1 && response.auto_start == true) {
                         if (manuallyPaused) {
                             // 悬浮硬暂停：不响应云端自动拉起
+                        } else if (shouldHonorUserHardStop() && PrefsStore.isWithinHardStopGracePeriod()) {
+                            LogCenter.op(alias, "本地硬停中：忽略云端 auto_start（等待本机关闭自动开启生效）")
+                        } else if (shouldHonorUserHardStop()) {
+                            LogCenter.op(alias, "云端已重新允许自动开启，解除硬停")
+                            forceStartRunningNow("云端已重新允许自动开启，解除硬停")
                         } else if (inPullUsernameRestSleep) {
                             // 休息窗口内不触发自动恢复，避免与休息意图矛盾
                         } else {
                             val ls = PrefsStore.getLocalStatus()
-                            val hardStop = PrefsStore.isHardStopRequested()
-                            /* 本地硬停时：只要云端 auto_start 为真即视为管理员重新开启自动开启，解除硬停；否则仅在非云端暂停态下沿用原逻辑 */
-                            if (!hardStop && ls == "paused") {
+                            if (ls == "paused") {
                                 // 云端暂停且非硬停：不自动拉起
                             } else {
                                 val needWake =
-                                    hardStop ||
-                                        !WorkerServiceTracker.isRunning ||
+                                    !WorkerServiceTracker.isRunning ||
                                         ls != "running"
                                 if (needWake) {
                                     val why = when {
-                                        hardStop -> "已解除暂停"
                                         !WorkerServiceTracker.isRunning -> "后台服务未运行"
                                         ls != "running" -> "任务未在运行中"
                                         else -> "需要恢复"
                                     }
                                     LogCenter.op(alias, "自动运行已开启，正在恢复任务（$why）")
-                                    forceStartRunningNow(
-                                        if (hardStop) {
-                                            "云端已重新允许自动开启，解除硬停"
-                                        } else {
-                                            "云端自动开启策略"
-                                        },
-                                    )
+                                    forceStartRunningNow("云端自动开启策略")
                                 }
                             }
                         }
@@ -450,6 +503,19 @@ object AppCoordinator {
         if (pullLoopJob?.isActive == true) {
             return
         }
+        if (!canStartPullLoopNow()) {
+            val alias = PrefsStore.getAlias()
+            if (alias != null) {
+                val reason =
+                    when {
+                        isPublishPostSwitchActive() -> "发作品"
+                        isMutualSwitchActive() -> "互点切换"
+                        else -> "独占任务"
+                    }
+                LogCenter.op(alias, "涨粉拉取循环暂缓：$reason 仍在执行")
+            }
+            return
+        }
 
         pullLoopJob = scope.launch {
             while (true) {
@@ -459,7 +525,7 @@ object AppCoordinator {
                     continue
                 }
 
-                if (PrefsStore.isHardStopRequested()) {
+                if (shouldHonorUserHardStop()) {
                     updateRuntime(lastMessage = "硬停中：自动任务已暂停，仍监听云端指令")
                     delay(2_000)
                     continue
@@ -473,9 +539,14 @@ object AppCoordinator {
                 val deviceId = PrefsStore.getDeviceId() ?: break
                 val alias = PrefsStore.getAlias() ?: break
 
-                if (pendingUsernames.isEmpty()) {
+                if (pendingUsernames.isEmpty() && !shouldAbortPullExecution()) {
                     reportOnlineBeforePull(alias, deviceId)
                     fetchUsernamesOnce(alias, deviceId)
+                }
+
+                if (shouldAbortPullExecution()) {
+                    delay(2_000)
+                    continue
                 }
 
                 val queueBeforeTake = pendingUsernames.size
@@ -488,6 +559,11 @@ object AppCoordinator {
                     updateRuntime(lastMessage = "暂无待执行用户名")
                     LogCenter.op(alias, "队列为空，进入等待/补拉分支")
                     logFailedSummaryIfAny(alias)
+                }
+
+                if (shouldAbortPullExecution()) {
+                    delay(2_000)
+                    continue
                 }
 
                 if (pendingUsernames.size <= 1) {
@@ -511,7 +587,9 @@ object AppCoordinator {
                     LogCenter.op(alias, "任务队列为空，${interval / 1000} 秒后再拉取用户名")
                     logFailedSummaryIfAny(alias)
                     updateRuntime(lastMessage = "等待用户名拉取")
-                    delay(interval)
+                    if (!delayUnlessHardStop(interval)) {
+                        LogCenter.op(alias, "硬停：已中断拉取等待")
+                    }
                 }
             }
         }
@@ -551,7 +629,10 @@ object AppCoordinator {
                 inPullUsernameRestSleep = true
                 MainActivity.navigateToLogPanel(appContext)
                 try {
-                    delay(minutes.toLong() * 60_000L)
+                    val restMs = minutes.toLong() * 60_000L
+                    if (!delayUnlessHardStop(restMs)) {
+                        LogCenter.op(alias, "硬停：已中断云端休息等待")
+                    }
                 } finally {
                     inPullUsernameRestSleep = false
                 }
@@ -840,12 +921,27 @@ object AppCoordinator {
     private suspend fun delayUnlessHardStop(ms: Long): Boolean {
         var left = ms
         while (left > 0) {
-            if (PrefsStore.isHardStopRequested()) return false
+            if (shouldHonorUserHardStop()) return false
             val chunk = minOf(left, 200L)
             delay(chunk)
             left -= chunk
         }
         return true
+    }
+
+    /** 用户主界面「停止后台服务」触发的硬停：不得被 check_start 竞态误解除。 */
+    private fun shouldHonorUserHardStop(): Boolean = PrefsStore.isHardStopRequested()
+
+    private fun isHardStopSkippedResult(message: String): Boolean {
+        val m = message.trim()
+        return m.contains("已硬停") || m.contains("硬停，跳过")
+    }
+
+    /** 涨粉拉取/执行前应中止（硬停、手动暂停、非 running）。 */
+    private fun shouldAbortPullExecution(): Boolean {
+        if (manuallyPaused) return true
+        if (shouldHonorUserHardStop()) return true
+        return PrefsStore.getLocalStatus() != "running"
     }
 
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
@@ -1603,6 +1699,10 @@ object AppCoordinator {
             LogCenter.op(alias, "互点切换任务已在执行中，忽略重复触发")
             return
         }
+        if (isPublishPostSwitchActive()) {
+            LogCenter.op(alias, "互点切换暂缓：发作品仍在执行，待发作品结束后再触发")
+            return
+        }
         mutualSwitchJob = scope.launch {
             ExecutionScope.enter()
             try {
@@ -1640,10 +1740,6 @@ object AppCoordinator {
                     alias,
                     "互点切换任务结束：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
                 )
-                if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
-                    LogCenter.op(alias, "互点切换结束后恢复拉取循环")
-                    startPullLoop()
-                }
             } finally {
                 val wasQueued = PrefsStore.isPublishPostQueuedAfterMutual()
                 PrefsStore.setPublishPostQueuedAfterMutual(false)
@@ -1652,6 +1748,13 @@ object AppCoordinator {
                     triggerPublishPostNow(alias)
                 }
                 ExecutionScope.exit()
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
+                    LogCenter.op(alias, "互点切换结束后恢复拉取循环")
+                    startPullLoop()
+                }
             }
         }
     }
@@ -1688,12 +1791,15 @@ object AppCoordinator {
                 alias,
                 "发作品切换任务结束：hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
             )
-            if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
-                LogCenter.op(alias, "发作品切换结束后恢复拉取循环")
-                startPullLoop()
-            }
             } finally {
                 ExecutionScope.exit()
+            }
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
+                    LogCenter.op(alias, "发作品切换结束后恢复拉取循环")
+                    startPullLoop()
+                }
             }
         }
     }
@@ -1825,6 +1931,10 @@ object AppCoordinator {
         if (threshold < 1) return
         if (PrefsStore.getDeviceRunMode() != ServerRunMode.GROWTH) return
         if (mutualSwitchJob?.isActive == true) return
+        if (isPublishPostSwitchActive()) {
+            LogCenter.op(alias, "涨粉自动互点暂缓：发作品执行中，本批不计入自动互点触发")
+            return
+        }
         if (!PrefsStore.tryConsumeCompletedPullBatchForAutoMutualStat()) return
         val n = PrefsStore.incrementGrowthBatchesTowardAutoMutual()
         LogCenter.op(alias, "涨粉：本拉取清单已全部执行完毕 → 自动互点批计数 $n / $threshold")
@@ -1843,6 +1953,10 @@ object AppCoordinator {
     }
 
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {
+        if (shouldAbortPullExecution()) {
+            LogCenter.op(alias, "硬停/暂停中：跳过执行 $username")
+            return
+        }
         ExecutionScope.enter()
         try {
         val runMode = _config.value.run_mode.trim().lowercase()
@@ -1853,12 +1967,20 @@ object AppCoordinator {
         var success = false
 
         for (attempt in 1..maxAttempts) {
+            if (shouldAbortPullExecution()) {
+                LogCenter.op(alias, "硬停/暂停中：中止 $username（第 $attempt/$maxAttempts 次）")
+                return
+            }
             LogCenter.op(alias, "开始执行任务：$username（第 $attempt/$maxAttempts 次）")
             val result = runCatching {
                 executor.executeForUsername(username, _config.value)
             }
             if (result.isSuccess) {
                 lastMessage = result.getOrNull().orEmpty()
+                if (isHardStopSkippedResult(lastMessage) || shouldAbortPullExecution()) {
+                    LogCenter.op(alias, "硬停：已结束当前用户 $username 的执行")
+                    return
+                }
                 val isNoVideosCompleted = lastMessage.contains("目标用户无作品")
                 if (isNoVideosCompleted) {
                     LogCenter.op(alias, "任务完成（无作品）：$username — $lastMessage")
@@ -1890,7 +2012,18 @@ object AppCoordinator {
                 break
             }
 
-            val err = result.exceptionOrNull()?.message ?: "unknown"
+            val errThrowable = result.exceptionOrNull()
+            if (errThrowable != null && isPullLoopJobCancellation(errThrowable)) {
+                LogCenter.op(
+                    alias,
+                    "任务已取消：$username（发作品/互点切换打断），不计入本批自动互点",
+                )
+                if (errThrowable is CancellationException) {
+                    throw errThrowable
+                }
+                throw CancellationException(errThrowable.message ?: "cancelled")
+            }
+            val err = errThrowable?.message ?: "unknown"
             if (err.contains("FATAL_DEBUG_STOP")) {
                 LogCenter.op(alias, "致命错误，已停止：$username — $err")
                 failedTracker.add("$username | $err")
@@ -2065,6 +2198,7 @@ object AppCoordinator {
         PrefsStore.setHardStopRequested(true)
         manuallyPaused = false
         started.set(false)
+        pendingUsernames.clear()
         PrefsStore.saveLocalStatus("paused")
         updateRuntime(
             localStatus = "paused",

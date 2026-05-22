@@ -990,3 +990,129 @@ button.danger {
     position: relative;
   }
 }
+
+/* 运行配置：引流粉丝列表 + 左滑 — 卡片化分组 */
+.config-subcard {
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: linear-gradient(165deg, rgba(99, 102, 241, 0.06), transparent 42%);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.config-subcard__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: rgba(247, 248, 251, 0.85);
+  border-bottom: 1px solid var(--border);
+}
+
+.config-subcard__title {
+  font-size: 14px;
+  font-weight: 650;
+  color: #1e293b;
+  letter-spacing: 0.01em;
+}
+
+.config-subcard__badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary);
+  background: rgba(99, 102, 241, 0.12);
+  padding: 4px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.config-subcard__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 0;
+}
+
+@media (max-width: 720px) {
+  .config-subcard__body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.config-subcard__col {
+  padding: 16px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.config-subcard__col + .config-subcard__col {
+  border-left: 1px solid var(--border);
+}
+
+@media (max-width: 720px) {
+  .config-subcard__col + .config-subcard__col {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+
+.config-subcard__col--accent {
+  background: rgba(99, 102, 241, 0.04);
+}
+
+.config-subcard__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.config-input-narrow {
+  max-width: 160px;
+  width: 100%;
+}
+
+.hint-list {
+  margin: 4px 0 0;
+  padding-left: 1.15rem;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.hint-list li {
+  margin-bottom: 6px;
+}
+
+.hint-list li:last-child {
+  margin-bottom: 0;
+}
+
+.hint--below-title {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.checkbox-inline input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
+
+.checkbox-inline__text {
+  line-height: 1.3;
+}

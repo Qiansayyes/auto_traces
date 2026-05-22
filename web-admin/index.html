@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Auto Traces 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-size='28' font-family='Arial,Helvetica,sans-serif' fill='white'%3EAT%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=20260518-1" />
+  <link rel="stylesheet" href="styles.css?v=20260519-1" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -1199,13 +1199,49 @@ so cute</textarea>
           </div>
           <div class="field full">
             <label>引流 · Videos 列表轮次</label>
-            <input name="mutual_videos_scroll_rounds" type="number" min="1" max="999" step="1" value="5" />
+            <input name="mutual_videos_scroll_rounds" type="number" min="1" max="500" step="1" value="5" />
             <div class="hint">一轮 = 两次引流视频评论；轮与轮之间会在 Videos 列表<strong>下滑约半屏</strong>换一批视频。与下方「粉丝列表 Follow 上限」一起在<strong>启动所选设备互点（引流）</strong>时生效。</div>
           </div>
           <div class="field full">
-            <label>引流 · 粉丝列表 Follow 点击上限</label>
-            <input name="mutual_follow_tap_session_limit" type="number" min="1" max="99999" step="1" value="20" />
-            <div class="hint">一次引流会话内，在 <strong>Followers 列表</strong>中累计点击 Follow（按钮中心）的次数上限；达到后<strong>不再左滑、不再进入粉丝列表</strong>，本会话内 Videos 列表<strong>剩余轮次仅发引流评论</strong>（点赞/收藏/发评，<strong>不发评论框粘贴、不回传复制用户名</strong>）；全部轮次跑完后<strong>结束本次引流</strong>并收尾（短暂停留 → 强停 TikTok）。</div>
+            <div class="config-subcard config-subcard--traffic-follow">
+              <div class="config-subcard__head">
+                <span class="config-subcard__title">引流 · 粉丝列表与左滑</span>
+                <span class="config-subcard__badge">互点 / 引流</span>
+              </div>
+              <div class="config-subcard__body">
+                <div class="config-subcard__col">
+                  <label class="config-subcard__label" for="mutual_follow_tap_session_limit_input">粉丝列表 Follow 点击上限</label>
+                  <input
+                    id="mutual_follow_tap_session_limit_input"
+                    name="mutual_follow_tap_session_limit"
+                    type="number"
+                    min="1"
+                    max="99999"
+                    step="1"
+                    value="20"
+                    class="config-input-narrow"
+                  />
+                  <ul class="hint-list">
+                    <li>单次会话内，在 <strong>Followers 列表</strong>中累计点击 Follow（按钮中心）的次数上限。</li>
+                    <li>达到上限后：<strong>不再进入粉丝列表</strong>；若未勾选右侧「左滑关注」，则<strong>也不再左滑</strong>。</li>
+                    <li>达上限后的剩余轮次：仍执行点赞 / 收藏 / 引流评论（<strong>不粘贴评论框、不回传复制用户名</strong>）。</li>
+                    <li>全部轮次结束后：结束本次引流并<strong>强停 TikTok</strong>。</li>
+                  </ul>
+                </div>
+                <div class="config-subcard__col config-subcard__col--accent">
+                  <label class="checkbox-inline">
+                    <input name="mutual_left_swipe_follow" type="checkbox" />
+                    <span class="checkbox-inline__text">左滑关注</span>
+                  </label>
+                  <p class="hint hint--below-title">达粉丝列表上限后，仍可在作者区尝试关注（与上限内「进粉丝列表」行为不同）。</p>
+                  <ul class="hint-list">
+                    <li>Videos 轮次未结束前：即使已达粉丝列表 Follow 上限，进作品后仍会<strong>先左滑</strong>，并在作者区检测 Follow / Message（有 Follow 则点）。</li>
+                    <li><strong>仅未达上限时</strong>才复制用户名并进入 Followers 列表。</li>
+                    <li>从作者层回到作品：<strong>未进 Followers → 返回 1 次</strong>；<strong>进了 Followers → 返回 2 次</strong>。</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="field full">
             <label>引流评论文本（多条用逗号或换行，仅引流流程使用）</label>
@@ -1258,6 +1294,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260518-1"></script>
+  <script src="app.js?v=20260520-3"></script>
 </body>
 </html>

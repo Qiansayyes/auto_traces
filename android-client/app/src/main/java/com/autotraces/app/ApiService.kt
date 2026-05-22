@@ -88,6 +88,15 @@ object ApiService {
             includeAuth = true,
         )
 
+    /** 本地别名/device_id 丢失或与云端不一致时，按指纹拉取服务端在册绑定。 */
+    suspend fun lookupDeviceBinding(fingerprint: String): DeviceBindingResponse =
+        getWithClient(
+            bindClient,
+            "/api/device_binding?device_fingerprint=${encode(fingerprint)}",
+            DeviceBindingResponse::class.java,
+            includeAuth = true,
+        )
+
     suspend fun syncStatus(deviceId: String, alias: String, status: String): BaseResponse = post(
         path = "/api/sync_status",
         body = SyncStatusRequest(deviceId, alias, status),

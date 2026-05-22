@@ -31,6 +31,8 @@ object PrefsStore {
     private const val KEY_AUTH_USERNAME = "auth_username"
     private const val KEY_AUTH_PASSWORD = "auth_password"
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
+    /** 最近一次请求硬停的时间；用于忽略 opt_out 同步前的 check_start 竞态。 */
+    private const val KEY_HARD_STOP_AT_MS = "hard_stop_at_ms"
     private const val KEY_MUTUAL_CLICK_REQUESTED = "mutual_click_requested"
     private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
     /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
@@ -120,10 +122,24 @@ object PrefsStore {
     }
 
     fun setHardStopRequested(requested: Boolean) {
-        prefs.edit().putBoolean(KEY_HARD_STOP_REQUESTED, requested).apply()
+        val editor = prefs.edit().putBoolean(KEY_HARD_STOP_REQUESTED, requested)
+        if (requested) {
+            editor.putLong(KEY_HARD_STOP_AT_MS, System.currentTimeMillis())
+        } else {
+            editor.remove(KEY_HARD_STOP_AT_MS)
+        }
+        editor.apply()
     }
 
     fun isHardStopRequested(): Boolean = prefs.getBoolean(KEY_HARD_STOP_REQUESTED, false)
+
+    /** 硬停后短时间内忽略云端仍返回的 auto_start/running（等待 opt_out 与 paused 同步）。 */
+    fun isWithinHardStopGracePeriod(graceMs: Long = 15_000L): Boolean {
+        if (!isHardStopRequested()) return false
+        val at = prefs.getLong(KEY_HARD_STOP_AT_MS, 0L)
+        if (at <= 0L) return false
+        return System.currentTimeMillis() - at < graceMs
+    }
 
     fun setMutualClickRequested(requested: Boolean) {
         prefs.edit().putBoolean(KEY_MUTUAL_CLICK_REQUESTED, requested).apply()

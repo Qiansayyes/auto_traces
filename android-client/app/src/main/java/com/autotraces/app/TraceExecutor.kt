@@ -166,6 +166,19 @@ class RealTraceExecutor(
         return true
     }
 
+    /** 涨粉/互点等长等待：硬停时尽快退出。 */
+    private suspend fun growthDelay(alias: String, ms: Long, phase: String): Boolean {
+        var left = ms.coerceAtLeast(0L)
+        while (left > 0) {
+            if (hardStopOrNull(alias, phase)) return false
+            coroutineContext.ensureActive()
+            val chunk = minOf(left, 200L)
+            delay(chunk)
+            left -= chunk
+        }
+        return true
+    }
+
     private fun profileEditHardStopChainResult(
         editOcrAttempts: Int = 0,
         editOcrPreviews: List<String> = emptyList(),
@@ -233,6 +246,12 @@ class RealTraceExecutor(
         private const val FRAME_DIFF_RETRY_DELAY_MS = 5000L
         /** Videos 区连续帧差失败时，teamwork 全量恢复的最大轮数（避免死循环） */
         private const val MUTUAL_VIDEOS_FRAME_DIFF_MAX_RECOVERY_CYCLES = 8
+        /** 互点入口：force-stop 后重新搜索并进入 Videos 标签的最大尝试次数 */
+        private const val MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS = 3
+        /** 互点：单次进入流程内 Videos 标签 OCR 最大尝试次数 */
+        private const val MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS = 3
+        /** 帧差失败后单次 teamwork 恢复：关开 TikTok 并重新搜索的最大连续尝试次数 */
+        private const val MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS = 3
         /** 完整互点：未达 Follow 上限时 teamwork Videos 外圈最大轮数（每轮含左+右双侧），防止死循环。 */
         private const val MUTUAL_FULL_VIDEOS_SAFETY_ROUNDS = 500
         /** 单次「发布作品」任务最多连发条数（临时上限）；实际条数 = min(Pictures 图片+视频数, 本常量)。 */
@@ -921,23 +940,48 @@ class RealTraceExecutor(
         profileEditDelay(logAlias, 450, "列表下滑后")
     }
 
-    /** For You 刷下一条：与 [runForYouWarmupIfNeeded] 同向（手指上滑）。 */
-    private suspend fun profileEditForYouFeedSwipeOnce(logAlias: String, w: Int, h: Int) {
-        val swipeX = (w * 0.5f).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
-        val startY = (h * 0.78f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
-        val endY = (h * 0.32f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
-        val swipeDuration = Random.nextInt(260, 421)
-        devOp(logAlias, "「修改基本资料」For You 下滑：swipe ($swipeX,$startY)→($swipeX,$endY) ${swipeDuration}ms")
-        runSuCommand("input swipe $swipeX $startY $swipeX $endY $swipeDuration")
+    /**
+     * For You 推荐流翻下一条（手指上滑）：横向落点、滑动距离/时长、终点微漂移均带随机，
+     * 避免固定竖直轨迹。返回建议的翻页后停留毫秒数。
+     */
+    private suspend fun forYouFeedSwipeNextHumanized(
+        logAlias: String,
+        w: Int,
+        h: Int,
+        logLabel: String,
+    ): Long {
+        val baseXFrac = 0.46f + Random.nextFloat() * 0.10f
+        val startYFrac = 0.74f + Random.nextFloat() * 0.08f
+        val swipeSpanFrac = 0.36f + Random.nextFloat() * 0.14f
+        val endYFrac = (startYFrac - swipeSpanFrac).coerceIn(0.24f, 0.40f)
+        val xDriftPx = Random.nextInt(-40, 41)
+        val startX = (w * baseXFrac).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
+        val endX = (startX + xDriftPx).coerceIn(1, (w - 1).coerceAtLeast(1))
+        val startY = (h * startYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val endY = (h * endYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val quickFlick = Random.nextDouble() < 0.06
+        val (y0, y1, swipeMs) = if (quickFlick) {
+            val midY = ((startY + endY) / 2).coerceIn(1, (h - 1).coerceAtLeast(1))
+            Triple(startY, midY, Random.nextInt(200, 301))
+        } else {
+            Triple(startY, endY, Random.nextInt(360, 661))
+        }
+        devOp(logAlias, "$logLabel：swipe ($startX,$y0)→($endX,$y1) ${swipeMs}ms")
+        runSuCommand("input swipe $startX $y0 $endX $y1 $swipeMs")
+        return Random.nextLong(380, 920)
     }
+
+    /** For You 刷下一条：与 [runForYouWarmupIfNeeded] 同向（手指上滑）。 */
+    private suspend fun profileEditForYouFeedSwipeOnce(logAlias: String, w: Int, h: Int): Long =
+        forYouFeedSwipeNextHumanized(logAlias, w, h, "「修改基本资料」For You 翻页")
 
     override suspend fun profileEditForYouTwoSwipesAfterLaunch(logAlias: String, w: Int, h: Int): Boolean {
         if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
         devOp(logAlias, "「修改基本资料」For You：假定已在推荐页，刷两下视频（无点赞）")
         repeat(2) { pass ->
             if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
-            profileEditForYouFeedSwipeOnce(logAlias, w, h)
-            if (!profileEditDelay(logAlias, 450, "For You下滑${pass + 1}后")) return false
+            val settleMs = profileEditForYouFeedSwipeOnce(logAlias, w, h)
+            if (!profileEditDelay(logAlias, settleMs, "For You下滑${pass + 1}后")) return false
         }
         return true
     }
@@ -2801,15 +2845,13 @@ class RealTraceExecutor(
         val metrics = service.resources.displayMetrics
         val width = metrics.widthPixels
         val height = metrics.heightPixels
-        val baseX = (width * 0.5f).toInt()
-        val startY = (height * 0.78f).toInt()
-        val endY = (height * 0.32f).toInt()
         val likeX = (width * 0.5f).toInt()
         val likeY = (height * 0.55f).toInt()
         val startedAt = System.currentTimeMillis()
 
         devOp(alias, "For You 预滑开始：总时长=${totalMs}ms")
         while (System.currentTimeMillis() - startedAt < totalMs) {
+            if (hardStopOrNull(alias, "For You 预滑")) return
             if (mutualClickOrNull(alias, "For You 预滑")) return
             val planWatchMs =
                 if (watchMaxMs > watchMinMs) Random.nextLong(watchMinMs, watchMaxMs + 1) else watchMinMs
@@ -2825,7 +2867,7 @@ class RealTraceExecutor(
             if (doLike && watchMs >= likeTapBudgetMs + 80L) {
                 val hiExclusive = watchMs - likeTapBudgetMs
                 val preDelay = Random.nextLong(40L, hiExclusive + 1)
-                delay(preDelay)
+                if (!growthDelay(alias, preDelay, "For You 预滑-点赞前")) return
                 val jitterX = Random.nextInt(-18, 19)
                 val jitterY = Random.nextInt(-18, 19)
                 val tapX = (likeX + jitterX).coerceIn(1, width - 1)
@@ -2837,7 +2879,7 @@ class RealTraceExecutor(
             } else if (doLike && watchMs >= 120L) {
                 // 本段观看较短：在中间附近点一次赞，避免总在段首
                 val preDelay = Random.nextLong(0L, (watchMs / 2).coerceAtLeast(1L))
-                delay(preDelay)
+                if (!growthDelay(alias, preDelay, "For You 预滑-短段点赞前")) return
                 val jitterX = Random.nextInt(-18, 19)
                 val jitterY = Random.nextInt(-18, 19)
                 val tapX = (likeX + jitterX).coerceIn(1, width - 1)
@@ -2850,15 +2892,14 @@ class RealTraceExecutor(
 
             val spentInSegment = System.currentTimeMillis() - segmentT0
             val rest = (watchMs - spentInSegment).coerceAtLeast(0L)
-            if (rest > 0L) {
-                delay(rest)
-            }
+            if (rest > 0L && !growthDelay(alias, rest, "For You 预滑-观看")) return
             if (System.currentTimeMillis() - startedAt >= totalMs) break
 
-            val swipeX = (baseX + Random.nextInt(-24, 25)).coerceIn(1, width - 1)
-            val swipeDuration = Random.nextInt(260, 421)
-            runSuCommand("input swipe $swipeX $startY $swipeX $endY $swipeDuration")
-            delay(450)
+            if (Random.nextDouble() < 0.12) {
+                if (!growthDelay(alias, Random.nextLong(120, 401), "For You 预滑-翻页前犹豫")) return
+            }
+            val settleMs = forYouFeedSwipeNextHumanized(alias, width, height, "For You 预滑翻页")
+            if (!growthDelay(alias, settleMs, "For You 预滑-翻页")) return
         }
         devOp(alias, "For You 预滑结束：已达到配置时长")
     }
@@ -2927,16 +2968,7 @@ class RealTraceExecutor(
             lastEndedAtUsersSelection = false
             PrefsStore.setMutualClickPending(false)
             PrefsStore.setMutualClickRequested(false)
-            val ok = enterMutualClickMode(service, config)
-            return if (ok) {
-                if (commentOnlyForMessage) {
-                    "已切换到互点流程（仅评论）：已完成 teamwork Videos 单元（进作品→点赞/收藏/互点评论→回列表；未执行左滑与作者主页/Followers）"
-                } else {
-                    "已切换到互点流程：已完成 teamwork Videos 循环单元（进作品→左滑→回作品→点赞/收藏/互点评论→回列表）"
-                }
-            } else {
-                "互点流程切换失败：已尝试重启 TikTok 并走完 teamwork 进作品链路"
-            }
+            return enterMutualClickMode(service, config, commentOnlyForMessage)
         }
         if ((runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) && restartFromMagnifierForGrowth) {
             devOp(alias, "涨粉模式：重启后从点击放大镜重新开始")
@@ -3136,6 +3168,7 @@ class RealTraceExecutor(
     private suspend fun enterVideosVideoByQuarterTaps(service: Context, config: AppConfig): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val mutualCommentOnly = PrefsStore.isMutualCommentOnlySession()
+        val leftSwipeFollowEnabled = config.mutual_left_swipe_follow
         val videoRoundCap =
             config.mutual_videos_scroll_rounds.coerceAtLeast(1).coerceAtMost(MUTUAL_FULL_VIDEOS_SAFETY_ROUNDS)
         val followLimit = config.mutual_follow_tap_session_limit.coerceAtLeast(1)
@@ -3154,7 +3187,13 @@ class RealTraceExecutor(
             if (mutualCommentOnly) {
                 "互点：进入 Videos（互点评论·兼容旧指令）共 $videoRoundCap 轮（左+右各进 1 次作品为 1 轮），轮间下滑约半屏换批"
             } else {
-                "互点：进入 Videos（完整互点）共 $videoRoundCap 轮；粉丝列表 Follow 上限 $followLimit（达到后本会话剩余轮次仅互点评论，不再左滑/进粉丝列表）；轮间下滑换批"
+                val limitHint =
+                    if (leftSwipeFollowEnabled) {
+                        "达到粉丝列表 Follow 上限 $followLimit 后仍左滑并在作者区点 Follow，仅不再进 Followers"
+                    } else {
+                        "达到粉丝列表 Follow 上限 $followLimit 后本会话剩余轮次不再左滑/进 Followers，仅互点评论"
+                    }
+                "互点：进入 Videos（完整互点）共 $videoRoundCap 轮；$limitHint；轮间下滑换批"
             },
         )
         try {
@@ -3174,15 +3213,15 @@ class RealTraceExecutor(
                     break@mainVideosLoop
                 }
                 val roundCapLabel = "$videoRoundCap"
-                fixedTaps.forEachIndexed { tapIndex, tap ->
+                for ((tapIndex, tap) in fixedTaps.withIndex()) {
                     coroutineContext.ensureActive()
-                    if (hardStopOrNull(alias, "互点 Videos 互动")) return false
+                    if (hardStopOrNull(alias, "互点 Videos 互动")) break@mainVideosLoop
                     val sideLabel = if (tapIndex == 0) "左侧" else "右侧"
                     var verified = false
                     var recoveryCycles = 0
                     while (!verified) {
                         coroutineContext.ensureActive()
-                        if (hardStopOrNull(alias, "互点 Videos 互动")) return false
+                        if (hardStopOrNull(alias, "互点 Videos 互动")) break@mainVideosLoop
                         repeat(3) { attemptIndex ->
                             if (verified) return@repeat
                             if (beforeTapForVerify.exists()) beforeTapForVerify.delete()
@@ -3212,19 +3251,16 @@ class RealTraceExecutor(
                         if (recoveryCycles > MUTUAL_VIDEOS_FRAME_DIFF_MAX_RECOVERY_CYCLES) {
                             devOp(
                                 alias,
-                                "互点：Videos 第 ${roundIndex + 1}/$roundCapLabel 轮 $sideLabel teamwork 恢复已超过上限（${MUTUAL_VIDEOS_FRAME_DIFF_MAX_RECOVERY_CYCLES} 次），中止",
+                                "互点：Videos 第 ${roundIndex + 1}/$roundCapLabel 轮 $sideLabel 已连续 ${MUTUAL_VIDEOS_FRAME_DIFF_MAX_RECOVERY_CYCLES} 次 teamwork 恢复仍无法进作品，清零计数并再次关开 TikTok 重新搜索",
                             )
-                            return false
+                            recoveryCycles = 0
                         }
                         devOp(
                             alias,
                             "互点：判定当前界面未知（${sideLabel} 连续 3 次帧差未通过），关闭 TikTok 并重新搜索关键词",
                         )
                         didRestartTikTokInCurrentRun = true
-                        if (!reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "互点 teamwork 恢复")) {
-                            devOp(alias, "互点：teamwork 界面恢复失败，中止 Videos 互动")
-                            return false
-                        }
+                        reopenMutualTeamworkVideosTabWithRetries(service, config, "互点 teamwork 恢复")
                     }
                     val unitTag = if (mutualCommentOnly) {
                         "Videos ${roundIndex + 1}/$videoRoundCap $sideLabel"
@@ -3233,11 +3269,12 @@ class RealTraceExecutor(
                     } else {
                         "Videos 第${roundIndex + 1}轮 $sideLabel"
                     }
-                    val skipSwipeAndFollowers = mutualCommentOnly || mutualFollowLimitReached
-                    if (skipSwipeAndFollowers) {
+                    val skipLeftSwipeAuthor =
+                        mutualCommentOnly || (mutualFollowLimitReached && !leftSwipeFollowEnabled)
+                    if (skipLeftSwipeAuthor) {
                         val reason =
-                            if (mutualCommentOnly) "互点评论会话" else "已达粉丝列表 Follow 上限，后续仅互点评论"
-                        devOp(alias, "互点：$unitTag $reason，跳过左滑与作者主页/Followers，留在当前作品继续互动")
+                            if (mutualCommentOnly) "互点评论会话" else "已达粉丝列表 Follow 上限且未开启左滑关注"
+                        devOp(alias, "互点：$unitTag $reason，跳过左滑与作者主页，留在当前作品继续互动")
                     } else {
                         mutualVideosLeftSwipeThenDoubleBackToPost(service, config, unitTag)
                     }
@@ -3673,29 +3710,31 @@ class RealTraceExecutor(
         devOp(alias, "互点：粉丝列表 Follow+下滑结束 rounds=$rounds reachedEnd=$reachedEnd")
     }
 
-    private suspend fun mutualClickCopyUsernameReportAndOpenFollowers(service: Context, config: AppConfig) {
+    /** @return 是否已进入并处理 Followers 列表（用于决定返回次数：进了 2 次，未进 1 次）。 */
+    private suspend fun mutualClickCopyUsernameReportAndOpenFollowers(service: Context, config: AppConfig): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         if (mutualFollowLimitReached) {
             devOp(alias, "互点：已达粉丝列表 Follow 会话上限，不再执行复制用户名/进入 Followers 链路")
-            return
+            return false
         }
-        if (hardStopOrNull(alias, "互点复制用户名到系统剪贴板")) return
+        if (hardStopOrNull(alias, "互点复制用户名到系统剪贴板")) return false
         val copyPt = mutualClickCopyUsernameTapFromFollowersRowPx(service)
         devOp(alias, "互点：点按复制用户名（${copyPt.x},${copyPt.y}）（写入系统剪贴板；不在此读剪贴板，上报在 teamwork 发评时粘贴+uiautomator）")
         runSuCommand("input tap ${copyPt.x} ${copyPt.y}")
         delay(Random.nextLong(700, 1200))
 
         delay(Random.nextLong(280, 551))
-        if (hardStopOrNull(alias, "互点点击 Followers 并校验列表")) return
+        if (hardStopOrNull(alias, "互点点击 Followers 并校验列表")) return false
         val entered = mutualClickFollowersAndVerify(service)
         if (!entered) {
             devOp(alias, "互点：未进入粉丝列表（三轮 OCR 或重启后），跳过列表内 Follow")
-            return
+            return false
         }
 
         delay(Random.nextLong(800, 1400))
-        if (hardStopOrNull(alias, "互点粉丝列表 Follow+下滑")) return
+        if (hardStopOrNull(alias, "互点粉丝列表 Follow+下滑")) return true
         mutualProcessFollowersListFollowTapsAndGrowthSwipe(service, config)
+        return true
     }
 
     /**
@@ -3716,8 +3755,7 @@ class RealTraceExecutor(
 
     /**
      * 互点 Videos 单条作品单元（前半段）：在**已确认进入作品播放页**后执行左滑进作者层，
-     * 再连续两次返回回到**同一作品**播放页，供后续点赞/收藏/评论使用。
-     * 与 [mutualClickSwipeToAuthorThenMessageOrFollowersTap]（完整主页+Followers 链路）不同，此处不跑 OCR/上报。
+     * 再按是否进入 Followers 返回 1～2 次回到**同一作品**播放页，供后续点赞/收藏/评论使用。
      */
     private suspend fun mutualVideosLeftSwipeThenDoubleBackToPost(
         service: Context,
@@ -3794,14 +3832,16 @@ class RealTraceExecutor(
         }
 
         devOp(alias, "互点主页链路：步骤2/3 点击用户名复制（上报仅在 teamwork 发评粘贴+uiautomator）")
-        mutualClickCopyUsernameReportAndOpenFollowers(service, config)
+        val enteredFollowersList = mutualClickCopyUsernameReportAndOpenFollowers(service, config)
 
-        devOp(alias, "互点主页链路：步骤3/3 Followers 后返回 2 次")
-        navBack(alias, "互点主页链路完成后返回 Videos 第 1 次")
+        val backCount = if (enteredFollowersList) 2 else 1
+        devOp(alias, "互点主页链路：步骤3/3 从作者层返回作品 ${backCount} 次（enteredFollowers=$enteredFollowersList）")
+        repeat(backCount) { pass ->
+            navBack(alias, "互点主页链路完成后返回作品 ${pass + 1}/$backCount")
+            if (pass < backCount - 1) delay(Random.nextLong(700, 1100))
+        }
         delay(Random.nextLong(700, 1100))
-        navBack(alias, "互点主页链路完成后返回 Videos 第 2 次")
-        delay(Random.nextLong(700, 1100))
-        devOp(alias, "互点主页链路：已回到 Videos，准备继续轮转")
+        devOp(alias, "互点主页链路：已回到作品播放页，准备点赞/评论")
     }
 
     /** 互点流程统一：进入作者主页后先完成主页链路，再回到 Videos 做本轮作品互动。 */
@@ -3847,13 +3887,15 @@ class RealTraceExecutor(
             }
         }
         devOp(alias, "互点主页链路：步骤3/5 点击用户名复制（上报仅在 teamwork 发评粘贴+uiautomator）")
-        mutualClickCopyUsernameReportAndOpenFollowers(service, config)
-        devOp(alias, "互点主页链路：步骤4/5 Followers 后返回 2 次")
-        navBack(alias, "互点主页链路完成后返回 Videos 第 1 次")
+        val enteredFollowersList = mutualClickCopyUsernameReportAndOpenFollowers(service, config)
+        val backCount = if (enteredFollowersList) 2 else 1
+        devOp(alias, "互点主页链路：步骤4/5 从作者层返回 ${backCount} 次（enteredFollowers=$enteredFollowersList）")
+        repeat(backCount) { pass ->
+            navBack(alias, "互点主页链路完成后返回 ${pass + 1}/$backCount")
+            if (pass < backCount - 1) delay(Random.nextLong(700, 1100))
+        }
         delay(Random.nextLong(700, 1100))
-        navBack(alias, "互点主页链路完成后返回 Videos 第 2 次")
-        delay(Random.nextLong(700, 1100))
-        devOp(alias, "互点主页链路：步骤5/5 已回到 Videos，准备继续轮转")
+        devOp(alias, "互点主页链路：步骤5/5 已回到作品/列表，准备继续轮转")
     }
 
     /** 从模板 [AppConfig.mutual_traffic_target_texts] 随机选一条作为 TikTok 搜索词；为空则回退 teamwork。 */
@@ -3902,14 +3944,54 @@ class RealTraceExecutor(
         }
         devOp(alias, "互点：已完成放大镜点击并搜索「$mutualSearchText」（$launchCheckTag）")
         delay(2400)
-        val videosAnchor = findVideosTabAnchorByOcrFast(service)
+        var videosAnchor: Point? = null
+        for (ocrAttempt in 1..MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
+            videosAnchor = findVideosTabAnchorByOcrFast(service)
+            if (videosAnchor != null) break
+            if (ocrAttempt < MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
+                devOp(
+                    alias,
+                    "互点：未找到 Videos 标签（$launchCheckTag）第 $ocrAttempt/${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次，${1500}ms 后重试 OCR",
+                )
+                delay(1500)
+            }
+        }
         if (videosAnchor == null) {
-            devOp(alias, "互点：未找到 Videos 标签（$launchCheckTag）")
+            devOp(
+                alias,
+                "互点：${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次 OCR 均未找到 Videos 标签（$launchCheckTag）",
+            )
             return false
         }
         runSuCommand("input tap ${videosAnchor.x} ${videosAnchor.y}")
         delay(2200)
         return true
+    }
+
+    /** 帧差判定界面错乱后：关开 TikTok 并重新搜索进入 teamwork Videos（带连续重试，不跳过左/右侧）。 */
+    private suspend fun reopenMutualTeamworkVideosTabWithRetries(
+        service: Context,
+        config: AppConfig,
+        launchCheckTag: String,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        for (attempt in 1..MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS) {
+            if (reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "$launchCheckTag·$attempt")) {
+                return true
+            }
+            if (attempt < MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS) {
+                devOp(
+                    alias,
+                    "互点：teamwork 恢复失败（$launchCheckTag 第 $attempt/$MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS 次），${2000}ms 后再次关开 TikTok 重试",
+                )
+                delay(Random.nextLong(2000, 3501))
+            }
+        }
+        devOp(
+            alias,
+            "互点：teamwork 恢复 ${MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS} 次均未成功（$launchCheckTag），将继续关开 TikTok 重试",
+        )
+        return false
     }
 
     /** 互点/互点评论：达到配置上限并成功跑完 Videos 单元后，短暂停留、强停 TikTok。 */
@@ -5051,23 +5133,50 @@ class RealTraceExecutor(
         return null
     }
 
-    private suspend fun enterMutualClickMode(service: Context, config: AppConfig): Boolean {
+    private suspend fun enterMutualClickMode(
+        service: Context,
+        config: AppConfig,
+        commentOnlySession: Boolean,
+    ): String {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        var entryOk = false
         try {
             PrefsStore.clearMutualClickState()
             mutualSessionFollowTapCount = 0
             mutualFollowLimitReached = false
             devOp(alias, "互点模式：先关闭 TikTok，再重新打开并搜索引流目标关键词")
-            if (!reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "互点模式启动")) {
-                return false
+            for (attempt in 1..MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS) {
+                if (reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "互点模式启动·$attempt")) {
+                    entryOk = true
+                    break
+                }
+                if (attempt < MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS) {
+                    devOp(
+                        alias,
+                        "互点：入口未进入 teamwork Videos（第 $attempt/$MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS 次），${2000}ms 后重试整段入口",
+                    )
+                    delay(Random.nextLong(2000, 3501))
+                }
             }
-            val enteredVideo = enterVideosVideoByQuarterTaps(service, config)
-            if (!enteredVideo) {
-                devOp(alias, "互点模式：Videos 结果区互动未完成")
-                return false
+            if (!entryOk) {
+                devOp(
+                    alias,
+                    "互点：入口 ${MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS} 次均未进入 teamwork Videos，跳过 Videos 互动轮次",
+                )
+            } else {
+                enterVideosVideoByQuarterTaps(service, config)
             }
             finalizeMutualSessionLimitedExit(alias)
-            return true
+            val fullDoneHint =
+                if (commentOnlySession) {
+                    "进作品→点赞/收藏/互点评论→回列表（未执行左滑与作者主页/Followers）"
+                } else {
+                    "进作品→左滑→回作品→点赞/收藏/互点评论→回列表"
+                }
+            return when {
+                entryOk -> "互点会话已收尾：已执行 teamwork Videos 互动（$fullDoneHint）"
+                else -> "互点会话已收尾：入口未进入 Videos，已强停 TikTok（未判为流程失败，涨粉将照常恢复）"
+            }
         } finally {
             PrefsStore.setMutualCommentOnlySession(false)
         }
@@ -7079,6 +7188,7 @@ class RealTraceExecutor(
         var rounds = 0
         // 主循环：固定最多 7 轮；若中途判定到底则提前结束
         while (!reachedEnd && rounds < 7) {
+            if (hardStopOrNull(alias, "处理粉丝列表循环")) return
             if (mutualClickOrNull(alias, "处理粉丝列表循环")) {
                 return
             }
@@ -7094,8 +7204,9 @@ class RealTraceExecutor(
                 throw GrowthFlowRestartRequired("粉丝列表 OCR 未命中条目，页面异常，已执行重启 TikTok")
             }
             for (entry in followers) {
+                if (hardStopOrNull(alias, "处理粉丝列表单条")) return
                 runSuCommand("input tap ${entry.clickPoint.x} ${entry.clickPoint.y}")
-                delay(Random.nextLong(1200, 1600))
+                if (!growthDelay(alias, Random.nextLong(1200, 1600), "粉丝列表-点头像")) return
                 // 新增：按配置概率直接跳过点击作品，和无作品/私密保持同样处理
                 if (config.skip_post_click_prob > 0.0 && Random.nextDouble() < config.skip_post_click_prob) {
                     LogCenter.append(alias, "命中跳过作品概率，按无作品/私密同样流程处理")

@@ -250,7 +250,135 @@ function resolveBoundTemplateRef(alias, tiktokUsername, mode = currentRunMode) {
   }
   return String(modeMap[aliasKey] || "").trim();
 }
-const pendingAutoAliasTemplateBindings = new Set();
+
+function templateKeyExists(ref) {
+  const t = currentTemplatesByName || {};
+  return Boolean(ref && t && typeof t === "object" && Object.prototype.hasOwnProperty.call(t, ref));
+}
+
+/** 与服务端 _lookup_mode_map（含 cand in templates）一致 */
+function lookupAliasMapModeProbe(modeProbe, aliasClean, tiktokUsername) {
+  const modeMap = aliasTemplateByMode?.[modeProbe];
+  if (!modeMap || typeof modeMap !== "object") return "";
+  const accountKey = accountTemplateMapKey(aliasClean, tiktokUsername);
+  if (accountKey && accountKey !== aliasClean) {
+    const cand = String(modeMap[accountKey] || "").trim();
+    if (templateKeyExists(cand)) return cand;
+  }
+  return String(modeMap[aliasClean] || "").trim();
+}
+
+/** 设备行下拉回显应与服务端 _resolve_template_for_mode_alias 一致（含跨模式复用）。 */
+function resolveEffectiveDeviceTemplateUI(aliasRaw, tiktokUsername = "") {
+  const aliasClean = String(aliasRaw || "").trim().toLowerCase();
+  const templateModeKey = currentRunMode === "mutual" ? "growth" : currentRunMode;
+
+  let rawRef = "";
+  let sourceProbe = "";
+  let fromCross = false;
+  let crossFromMode = "";
+
+  if (currentRunMode === "mutual") {
+    const cand = lookupAliasMapModeProbe("mutual", aliasClean, tiktokUsername);
+    if (templateKeyExists(cand)) {
+      rawRef = cand;
+      sourceProbe = "mutual";
+    }
+  }
+
+  if (!rawRef) {
+    const cand = lookupAliasMapModeProbe(templateModeKey, aliasClean, tiktokUsername);
+    if (templateKeyExists(cand)) {
+      rawRef = cand;
+      sourceProbe = templateModeKey;
+    }
+  }
+
+  if (!rawRef && aliasClean) {
+    const probeModes = [templateModeKey, "mutual", "growth", "live", "direct"];
+    for (const probeMode of probeModes) {
+      if (probeMode === templateModeKey) continue;
+      const probeRef = lookupAliasMapModeProbe(probeMode, aliasClean, tiktokUsername);
+      if (!probeRef || !templateKeyExists(probeRef)) continue;
+      rawRef = probeRef;
+      fromCross = true;
+      crossFromMode = probeMode;
+      break;
+    }
+  }
+
+  const storedActive = String(currentConfigTemplate || "").trim();
+  const keys = Object.keys(currentTemplatesByName || {});
+  let fallbackName = "";
+  if (templateKeyExists(storedActive)) {
+    fallbackName = storedActive;
+  } else if (keys.includes("default")) {
+    fallbackName = "default";
+  } else {
+    fallbackName = keys[0] || "default";
+  }
+
+  const selectedTemplate = templateKeyExists(rawRef) ? rawRef : fallbackName;
+
+  /** 本条映射是否写在本模式下（与服务端语义一致）；跨模式借用不算「本模式显式」 */
+  let hasExplicitInCurrentMode =
+    Boolean(rawRef && !fromCross && sourceProbe &&
+      ((currentRunMode === "mutual" && sourceProbe === "mutual")
+        || (currentRunMode !== "mutual" && sourceProbe === templateModeKey)));
+
+  if (!aliasClean) {
+    return {
+      selectedTemplate,
+      badgeText: "-",
+      badgeClass: "pending",
+      badgeHint: "",
+      hasExplicitInCurrentMode: false,
+    };
+  }
+
+  const modeLabel =
+    ({ growth: "涨粉", live: "主播", direct: "直客", mutual: "互点" })[crossFromMode] || crossFromMode;
+  let badgeText = "";
+  let badgeClass = "pending";
+  let badgeHint = "";
+  if (!keys.length) {
+    badgeText = "暂无可选模板";
+    badgeClass = "offline";
+  } else if (hasExplicitInCurrentMode) {
+    badgeText = "已绑定(本模式)";
+    badgeClass = "online";
+    badgeHint = "该别名已在当前运行模式下保存设备级模板映射。";
+  } else if (fromCross) {
+    badgeText = crossFromMode ? `复用「${modeLabel}」映射` : "复用其它模式映射";
+    badgeClass = "online";
+    badgeHint =
+      "当前模式下未单独保存该别名映射；后台会复用其它模式中已绑定的别名→模板键，且与设备端解析一致。";
+  } else if (resolveBoundTemplateRef(aliasClean, tiktokUsername, currentRunMode)) {
+    badgeText = "（映射已失效，沿用运行配置）";
+    badgeClass = "pending";
+    badgeHint =
+      "仍保存了别名→模板键，但该模板暂不可用（如被删除或取消共享）。设备将回退到运行配置当前模板。";
+  } else {
+    badgeText = "继承运行配置";
+    badgeClass = "pending";
+    badgeHint = "未配置别名映射时，设备使用「运行配置」里当前选中的模板（active_template）。";
+  }
+
+  return { selectedTemplate, badgeText, badgeClass, badgeHint, hasExplicitInCurrentMode };
+}
+
+function collectTemplateRefsFromAliasMaps() {
+  const out = new Set();
+  Object.values(aliasTemplateByMode || {}).forEach((mm) => {
+    if (!mm || typeof mm !== "object") return;
+    Object.values(mm).forEach((v) => {
+      const s = String(v || "").trim();
+      if (s) out.add(s);
+    });
+  });
+  return out;
+}
+
 let configTargetUsersLoaded = false;
 let currentDbPage = 1;
 let currentDbSearchField = "";
@@ -328,6 +456,31 @@ function humanizeRequestErrorMessage(error) {
     return "无法连接服务器，请检查网络或联系管理员";
   }
   return raw || "操作失败";
+}
+
+/** FastAPI/Pydantic 422 等返回 `{ detail: [...] }`；业务接口多为 `{ code, msg }` */
+function formatHttpApiErrorMessage(responseStatus, data) {
+  const apiMsg = data?.msg;
+  if (typeof apiMsg === "string" && apiMsg.trim()) return apiMsg.trim();
+  if (Array.isArray(data?.detail) && data.detail.length) {
+    const parts = data.detail
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        const loc = Array.isArray(item?.loc)
+          ? item.loc.filter((x) => x !== "body").join(".")
+          : "";
+        const piece = typeof item?.msg === "string" ? item.msg.trim() : "";
+        if (!piece) return "";
+        return loc ? `${loc}：${piece}` : piece;
+      })
+      .filter(Boolean);
+    if (parts.length) return parts.join("；");
+  }
+  if (apiMsg != null && typeof apiMsg !== "string") return JSON.stringify(apiMsg);
+  if (responseStatus === 422) return "参数校验未通过（请检查表单数值是否在允许范围内）";
+  const code = data?.code;
+  if (typeof code === "number" && code !== 0) return `请求失败（code=${code}）`;
+  return "请求失败";
 }
 
 function setStatus(text, type = "info") {
@@ -1043,9 +1196,7 @@ async function request(path, options = {}) {
     updateRequestTrace({ phase: "response", url, baseBefore, baseAfter: baseBefore, method, status: `http ${response.status}`, changed: "-", note: data?.code === 0 ? "ok" : String(data?.msg || "api-error") });
     const elapsedMs = Date.now() - startedAt;
     if (!response.ok || data.code !== 0) {
-      const msg = typeof data?.msg === "string"
-        ? data.msg
-        : (data?.msg == null ? "请求失败" : JSON.stringify(data.msg));
+      const msg = formatHttpApiErrorMessage(response.status, data);
       updateRequestTrace({ phase: "response", url, baseBefore, baseAfter: baseBefore, method, status: `http ${response.status}`, changed: "-", note: `${msg} | ${elapsedMs}ms` });
       appendDebugLog("API_ERROR", { url, httpStatus: response.status, apiCode: data?.code, msg });
       throw new Error(msg);
@@ -1109,11 +1260,23 @@ function renderDeviceRow(deviceId, info, context = {}) {
   `;
   const ownerCell = isAdmin ? `<td>${String(info?.owner_username || "")}</td>` : "";
   const aliasKey = String(alias || "").trim().toLowerCase();
-  const mappedTemplate = resolveBoundTemplateRef(aliasKey, "", currentRunMode);
-  const isTemplateBound = Boolean(mappedTemplate);
-  const fallbackDisplayTemplate = String(fallbackTemplate || "default").trim() || "default";
-  const selectedTemplate = String(mappedTemplate || fallbackDisplayTemplate).trim() || fallbackDisplayTemplate;
-  const optionsHtml = templateNames.map((name) => (
+  const tmplUi = alias
+    ? resolveEffectiveDeviceTemplateUI(aliasKey, "")
+    : {
+      selectedTemplate: String(context.fallbackTemplate || "default").trim() || "default",
+      badgeText: "-",
+      badgeClass: "pending",
+      badgeHint: "",
+    };
+  const selectedTemplate = tmplUi.selectedTemplate;
+  const rowTemplateNames = (() => {
+    const base = Array.isArray(context.templateNames) ? context.templateNames : ["default"];
+    if (selectedTemplate && !base.includes(selectedTemplate)) {
+      return [selectedTemplate, ...base];
+    }
+    return base;
+  })();
+  const optionsHtml = rowTemplateNames.map((name) => (
     `<option value="${name}" ${name === selectedTemplate ? "selected" : ""}>${templateDisplayName(name, currentTemplateMeta)}</option>`
   )).join("");
   const templateCell = `
@@ -1123,15 +1286,14 @@ function renderDeviceRow(deviceId, info, context = {}) {
         data-device="${deviceId}"
         data-alias="${alias}"
         data-owner="${String(info?.owner_username || "").trim()}"
-        ${isTemplateBound ? "" : `data-needs-bind="1" data-default-template="${selectedTemplate}"`}
         style="min-width:140px;padding:4px 6px;font-size:12px;"
         ${alias ? "" : "disabled"}
       >
         ${optionsHtml}
       </select>
       <div style="margin-top:6px;">
-        <span class="badge ${isTemplateBound ? "online" : "pending"} js-template-bind-state">
-          ${isTemplateBound ? "已绑定" : "绑定中..."}
+        <span class="badge ${tmplUi.badgeClass || "pending"} js-template-bind-state" title="${escapeHtml(String(tmplUi.badgeHint || ""))}">
+          ${escapeHtml(tmplUi.badgeText || "—")}
         </span>
       </div>
     </td>
@@ -1203,7 +1365,9 @@ function renderDevices(devices) {
   deviceTable.innerHTML = "";
   const aliasFilter = aliasFilterInput.value.trim().toLowerCase();
   const isAdmin = currentUser?.role === "admin";
-  const templateNames = Object.keys(currentTemplatesByName || {}).sort((a, b) => a.localeCompare(b));
+  const baseTemplateKeys = Object.keys(currentTemplatesByName || {}).sort((a, b) => a.localeCompare(b));
+  const aliasRefKeys = Array.from(collectTemplateRefsFromAliasMaps());
+  const templateNames = [...new Set([...baseTemplateKeys, ...aliasRefKeys])].sort((a, b) => a.localeCompare(b));
   if (!templateNames.length) templateNames.push("default");
   // 未命中 alias 映射时，按服务端 active_template 回显，避免“看起来已绑定”的假象。
   const fallbackTemplate = String(currentConfigTemplate || templateNames[0] || "default").trim() || "default";
@@ -1346,11 +1510,11 @@ function renderDevices(devices) {
       const aliasKey = alias.toLowerCase();
       const nextTemplate = String(target?.value || "").trim();
       if (!alias || !nextTemplate) return;
-      const bindKey = `${currentRunMode}::${ownerUsername}::${aliasKey}`;
-      pendingAutoAliasTemplateBindings.delete(bindKey);
+      const modeBucket0 = aliasTemplateByMode[currentRunMode] || {};
+      const prevWasExplicit = Object.prototype.hasOwnProperty.call(modeBucket0, aliasKey);
+      const prevExplicitTemplate = prevWasExplicit ? modeBucket0[aliasKey] : undefined;
       if (!aliasTemplateByMode[currentRunMode]) aliasTemplateByMode[currentRunMode] = {};
       aliasTemplateByMode[currentRunMode][aliasKey] = nextTemplate;
-      target.removeAttribute("data-needs-bind");
       try {
         const data = await request("/api/admin/alias_template/select", {
           method: "POST",
@@ -1367,68 +1531,26 @@ function renderDevices(devices) {
           : aliasTemplateByMode;
         const stateEl = target?.closest("td")?.querySelector(".js-template-bind-state");
         if (stateEl) {
-          stateEl.textContent = "已绑定(设备)";
-          stateEl.classList.remove("offline");
+          stateEl.textContent = "已绑定(显式)";
+          stateEl.classList.remove("offline", "pending");
           stateEl.classList.add("online");
         }
-        setStatus(`别名 ${alias} 已切换设备级模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
+        setStatus(`别名 ${alias} 已显式绑定模板：${templateDisplayName(nextTemplate, currentTemplateMeta)}`, "success");
       } catch (error) {
         setStatus(error.message || "更新别名模板失败", "error");
-        const rollback = String(aliasTemplateByMode?.[currentRunMode]?.[aliasKey] || fallbackTemplate).trim() || fallbackTemplate;
-        target.value = rollback;
+        const modeBucket = aliasTemplateByMode[currentRunMode];
+        if (!modeBucket) aliasTemplateByMode[currentRunMode] = {};
+        if (prevWasExplicit) {
+          aliasTemplateByMode[currentRunMode][aliasKey] = prevExplicitTemplate;
+        } else {
+          delete aliasTemplateByMode[currentRunMode][aliasKey];
+        }
+        const rollbackTpl = prevWasExplicit
+          ? String(prevExplicitTemplate || "").trim()
+          : fallbackTemplate;
+        target.value = rollbackTpl || fallbackTemplate;
       }
     });
-  });
-  deviceTable.querySelectorAll('select.alias-template-select[data-needs-bind="1"]').forEach((selectEl) => {
-    const alias = String(selectEl?.dataset?.alias || "").trim();
-    const ownerUsername = String(selectEl?.dataset?.owner || "").trim();
-    const aliasKey = alias.toLowerCase();
-    const templateName = String(selectEl?.dataset?.defaultTemplate || selectEl?.value || "").trim();
-    if (!alias || !templateName) return;
-    const bindKey = `${currentRunMode}::${ownerUsername}::${aliasKey}`;
-    if (pendingAutoAliasTemplateBindings.has(bindKey)) return;
-    const existingRef = resolveBoundTemplateRef(aliasKey, "", currentRunMode);
-    if (existingRef) {
-      selectEl.removeAttribute("data-needs-bind");
-      return;
-    }
-    pendingAutoAliasTemplateBindings.add(bindKey);
-    (async () => {
-      try {
-        if (resolveBoundTemplateRef(aliasKey, "", currentRunMode)) {
-          selectEl.removeAttribute("data-needs-bind");
-          return;
-        }
-        const data = await request("/api/admin/alias_template/select", {
-          method: "POST",
-          body: JSON.stringify({
-            alias,
-            mode: currentRunMode,
-            template_name: templateName,
-            owner_username: ownerUsername || undefined,
-          }),
-        });
-        aliasTemplateByMode = (data?.alias_template_by_mode && typeof data.alias_template_by_mode === "object")
-          ? data.alias_template_by_mode
-          : aliasTemplateByMode;
-        const stateEl = selectEl?.closest("td")?.querySelector(".js-template-bind-state");
-        if (stateEl) {
-          stateEl.textContent = "已绑定";
-          stateEl.classList.remove("pending", "offline");
-          stateEl.classList.add("online");
-        }
-        selectEl.removeAttribute("data-needs-bind");
-      } catch (_) {
-        const stateEl = selectEl?.closest("td")?.querySelector(".js-template-bind-state");
-        if (stateEl) {
-          stateEl.textContent = "未绑定";
-          stateEl.classList.remove("pending", "online");
-          stateEl.classList.add("offline");
-        }
-      } finally {
-        pendingAutoAliasTemplateBindings.delete(bindKey);
-      }
-    })();
   });
   updateStartHint();
 }
@@ -2063,6 +2185,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
+    mutual_left_swipe_follow: false,
     growth_pull_batches_before_auto_mutual: -1,
     growth_post_check_after_tap_delay_ms: 1000,
     growth_post_second_check_delay_ms: 650,
@@ -2102,6 +2225,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
+    mutual_left_swipe_follow: false,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2140,6 +2264,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
+    mutual_left_swipe_follow: false,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2606,7 +2731,7 @@ function collectConfig() {
   for (const [key, value] of formData.entries()) {
     if (key === "config_mode") continue;
     if (value === "") continue;
-    if (key === "action_single") {
+    if (key === "action_single" || key === "mutual_left_swipe_follow") {
       payload[key] = value === "on";
       continue;
     }

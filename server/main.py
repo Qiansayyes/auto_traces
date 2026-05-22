@@ -93,6 +93,8 @@ BASE_DEFAULT_CONFIG = {
     # 引流 Videos 列表轮次（与完整互点共用）；粉丝列表 Follow 单次会话点击上限
     "mutual_videos_scroll_rounds": 5,
     "mutual_follow_tap_session_limit": 20,
+    # 引流：达粉丝列表 Follow 上限后仍左滑并在作者区点 Follow；未勾选则沿用旧逻辑（上限后不再左滑）
+    "mutual_left_swipe_follow": False,
     # 涨粉：连续多少「整批拉取清单在设备端每条均已处理（含失败跳过）」后自动进入互点；-1 表示永不自动切换
     "growth_pull_batches_before_auto_mutual": -1,
     # 互动动作之间的随机间隔（秒）
@@ -930,8 +932,10 @@ class MemoryStore:
     lock: Lock = field(default_factory=Lock)
 
     def verify_device(self, device_id: str, alias: str) -> DeviceInfo | None:
-        device = self.devices.get(device_id)
-        if not device or device.alias != alias:
+        device = self.devices.get((device_id or "").strip())
+        if not device:
+            return None
+        if _normalize_alias_key(device.alias) != _normalize_alias_key(alias):
             return None
         return device
 
@@ -2215,6 +2219,7 @@ class UpdateConfigRequest(BaseModel):
     profile_edit_bio_texts: List[str] | None = None
     mutual_videos_scroll_rounds: int | None = None
     mutual_follow_tap_session_limit: int | None = None
+    mutual_left_swipe_follow: bool | None = None
     growth_pull_batches_before_auto_mutual: int | None = None
 
     @field_validator(
@@ -2480,8 +2485,33 @@ def _require_admin(headers: dict | None = None):
     return None, session
 
 
+def _verify_device_from_db(device_id: str, alias: str) -> DeviceInfo | None:
+    """内存 store 未命中时从 SQLite 恢复（多 worker / 重启后避免误报未绑定）。"""
+    did = str(device_id or "").strip()
+    alias_norm = _normalize_alias_key(alias)
+    if not did or not alias_norm:
+        return None
+    conn = _get_db()
+    row = None
+    try:
+        row = conn.execute(
+            "SELECT device_id, owner_username, alias FROM client_devices WHERE device_id = ?",
+            (did,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    if _normalize_alias_key(row["alias"]) != alias_norm:
+        return None
+    _hydrate_device_from_db(did)
+    return store.verify_device(did, alias)
+
+
 def auth_or_error(device_id: str, alias: str):
     device = store.verify_device(device_id, alias)
+    if not device:
+        device = _verify_device_from_db(device_id, alias)
     if not device:
         return {"code": 2, "msg": "device_id与别名不匹配/设备未绑定"}, None
     return None, device
@@ -2506,30 +2536,19 @@ def _session_device_ids(session: dict, *, lock_wait_sec: float = 2.0) -> set[str
     if not owner:
         return set()
 
-    if session.get("role") == "admin":
-        conn = _get_db()
-        try:
-            rows = conn.execute(
-                "SELECT device_id FROM client_devices WHERE owner_username = ?",
-                (owner,),
-            ).fetchall()
-            return {str(r[0]) for r in rows}
-        except sqlite3.OperationalError:
-            print(f"[{now_text()}] session_device_ids | admin_db_failed | using_overview_fallback_devices")
-            return _session_device_ids_from_fallback(session)
-        finally:
-            conn.close()
-
-    if not store.lock.acquire(timeout=lock_wait_sec):
-        print(
-            f"[{now_text()}] session_device_ids | store_lock_timeout | wait_sec={lock_wait_sec} role=customer "
-            "| using_overview_fallback_devices"
-        )
-        return _session_device_ids_from_fallback(session)
+    _ = lock_wait_sec  # 保留参数以兼容既有调用方
+    conn = _get_db()
     try:
-        return {did for did, d in store.devices.items() if d.owner_username == owner}
+        rows = conn.execute(
+            "SELECT device_id FROM client_devices WHERE owner_username = ?",
+            (owner,),
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+    except sqlite3.OperationalError:
+        print(f"[{now_text()}] session_device_ids | db_failed | using_overview_fallback_devices")
+        return _session_device_ids_from_fallback(session)
     finally:
-        store.lock.release()
+        conn.close()
 
 
 def _device_session_allowed(device: DeviceInfo, session: dict) -> bool:
@@ -4170,6 +4189,58 @@ def _hydrate_device_from_db(device_id: str) -> None:
         store.fingerprint_to_device[str(row["fingerprint"])] = device_id
 
 
+@app.get("/api/device_binding")
+def lookup_device_binding(
+    device_fingerprint: str = Query(..., min_length=1, max_length=128),
+    authorization: str | None = Header(default=None),
+):
+    """按设备指纹查询当前登录用户下的绑定（用于 APP 本地别名丢失后的恢复）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    fp = str(device_fingerprint or "").strip()
+    if not fp:
+        return {"code": 1, "msg": "参数无效"}
+    conn = _get_db()
+    try:
+        # 优先当前用户；若无则按指纹全局查一条（设备曾转绑/多 worker 内存未同步时仍可恢复 device_id+alias）
+        row = conn.execute(
+            """
+            SELECT device_id, alias, owner_username
+            FROM client_devices
+            WHERE fingerprint = ? AND owner_username = ?
+            LIMIT 1
+            """,
+            (fp, owner),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                """
+                SELECT device_id, alias, owner_username
+                FROM client_devices
+                WHERE fingerprint = ?
+                LIMIT 1
+                """,
+                (fp,),
+            ).fetchone()
+            if row and str(row["owner_username"] or "").strip() != owner:
+                return {
+                    "code": 1,
+                    "msg": "该设备已绑定到其他云端账号，请使用原账号登录或联系管理员转绑",
+                }
+    finally:
+        conn.close()
+    if not row:
+        return {"code": 1, "msg": "未找到该设备的绑定记录，请重新绑定"}
+    did = str(row["device_id"] or "").strip()
+    alias = str(row["alias"] or "").strip()
+    if not did or not alias:
+        return {"code": 1, "msg": "绑定记录不完整，请重新绑定"}
+    _hydrate_device_from_db(did)
+    return {"code": 0, "msg": "ok", "device_id": did, "alias": alias}
+
+
 @app.post("/api/bind_device")
 def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(default=None)):
     err, session = _require_login({"authorization": authorization} if authorization else {})
@@ -4207,7 +4278,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 conn.commit()
                 _hydrate_device_from_db(existing_id)
                 print(f"[{now_text()}] 系统 | 设备转绑成功：{old_alias}/{row_owner} -> {alias}/{owner}（device_id={existing_id}）")
-                return {"code": 0, "msg": "绑定成功", "device_id": existing_id}
+                return {"code": 0, "msg": "绑定成功", "device_id": existing_id, "alias": alias}
             if old_alias != alias:
                 conn.execute(
                     "UPDATE client_devices SET alias = ?, device_group = ?, auto_start_opt_out = 1, updated_at = ? WHERE device_id = ?",
@@ -4216,7 +4287,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
             conn.commit()
             _hydrate_device_from_db(existing_id)
             print(f"[{now_text()}] 系统 | 设备绑定确认：{alias} -> {existing_id}（owner={owner}）")
-            return {"code": 0, "msg": "绑定成功", "device_id": existing_id}
+            return {"code": 0, "msg": "绑定成功", "device_id": existing_id, "alias": alias}
 
         conflict = conn.execute(
             "SELECT 1 FROM client_devices WHERE owner_username = ? AND alias = ?",
@@ -4242,7 +4313,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
 
     _hydrate_device_from_db(device_id)
     print(f"[{now_text()}] 系统 | 设备绑定成功：{alias} -> {device_id}（owner={owner}）")
-    return {"code": 0, "msg": "绑定成功", "device_id": device_id}
+    return {"code": 0, "msg": "绑定成功", "device_id": device_id, "alias": alias}
 
 
 @app.post("/api/sync_status")

@@ -11,6 +11,14 @@ data class BindDeviceResponse(
     val device_id: String? = null,
 )
 
+/** GET /api/device_binding — 按指纹恢复本机绑定 */
+data class DeviceBindingResponse(
+    val code: Int,
+    val msg: String,
+    val device_id: String? = null,
+    val alias: String? = null,
+)
+
 data class AuthLoginRequest(
     val username: String,
     val password: String,
@@ -92,8 +100,13 @@ data class AppConfig(
     val share_prob: Double = 0.3,
     // 互点 teamwork Videos：每「左+右各进作品一次」为 1 轮；轮与轮之间列表下滑约半屏换批。完整互点与此共用本上限（另受 mutual_follow_tap_session_limit 等约束）；历史「仅互点评论」指令仍生效但管理台已合并为单一启动入口。
     val mutual_videos_scroll_rounds: Int = 5,
-    /** 完整互点：本会话内在粉丝列表中点击 Follow（按钮中心）的累计次数上限；达到后本会话内 teamwork Videos 剩余轮次仅执行点赞/收藏/互点评论，不再左滑与进入 Followers。 */
+    /** 完整互点：本会话内在粉丝列表中点击 Follow（按钮中心）的累计次数上限；达到后不再进入 Followers；未勾选 [mutual_left_swipe_follow] 时也不再左滑。 */
     val mutual_follow_tap_session_limit: Int = 20,
+    /**
+     * 引流「左滑关注」：勾选后，粉丝列表 Follow 达上限仍会左滑并在作者区点 Follow，仅跳过 Followers 列表；
+     * 未勾选则沿用旧逻辑（达上限后剩余轮次不左滑、不进 Followers）。
+     */
+    val mutual_left_swipe_follow: Boolean = false,
     /**
      * 仅涨粉队列（设备 App 选择的 run_mode=growth）：连续多少「整批拉取的用户名在设备端全部执行完毕」后，自动进入与「启动所选设备互点」等价的互点会话。
      * 触发顺序：暂停涨粉拉取 → 互点 teamwork 流程 → 会话结束强停 TikTok 后恢复涨粉拉取。

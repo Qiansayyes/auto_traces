@@ -91,6 +91,10 @@ class SettingsActivity : AppCompatActivity() {
             binding.statusText.text = "绑定信息已清除，返回首页后会重新进入绑定页"
             renderDeviceInfo()
         }
+
+        binding.openConfigParamsButton.setOnClickListener {
+            startActivity(Intent(this, ConfigParamsActivity::class.java))
+        }
     }
 
     private fun renderDeviceInfo() {
