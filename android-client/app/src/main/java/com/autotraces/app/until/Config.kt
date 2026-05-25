@@ -6,6 +6,12 @@ package com.autotraces.app.util
 object Config {
     // TikTok 包名（常见为 com.zhiliaoapp.musically，国际版部分为 com.tiktok.android）
     const val TIKTOK_PACKAGE_NAME = "com.zhiliaoapp.musically"
+    /** dumpsys 前台校验：任一命中即视为 TikTok 在前台（与安装包名差异兼容）。 */
+    val TIKTOK_PACKAGE_CANDIDATES = listOf(
+        TIKTOK_PACKAGE_NAME,
+        "com.ss.android.ugc.trill",
+        "com.tiktok.android",
+    )
     // 云端服务器基础地址
     const val SERVER_BASE_URL = "http://192.168.100.249:8000"
     

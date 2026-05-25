@@ -27,6 +27,7 @@ const growthModeBtn = document.getElementById("growthModeBtn");
 const liveModeBtn = document.getElementById("liveModeBtn");
 const cvModeBtn = document.getElementById("cvModeBtn");
 const mutualStartSelectedBtn = document.getElementById("mutualStartSelectedBtn");
+const mutualFollowOnlySelectedBtn = document.getElementById("mutualFollowOnlySelectedBtn");
 const publishPostStartSelectedBtn = document.getElementById("publishPostStartSelectedBtn");
 const aliasFilterInput = document.getElementById("aliasFilter");
 const deviceGroupSelect = document.getElementById("deviceGroupSelect");
@@ -121,6 +122,10 @@ const schedulerTaskSettingsEl = document.getElementById("schedulerTaskSettings")
 const schedulerTaskLogsEl = document.getElementById("schedulerTaskLogs");
 const schedulerLogsFollowToggle = document.getElementById("schedulerLogsFollow");
 const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrollBottom");
+const autoSwitchEnabledToggle = document.getElementById("autoSwitchEnabledToggle");
+const saveAutoSwitchConfigBtn = document.getElementById("saveAutoSwitchConfig");
+const backupStatsFullQueryEnabledToggle = document.getElementById("backupStatsFullQueryEnabledToggle");
+const saveBackupStatsFullQueryConfigBtn = document.getElementById("saveBackupStatsFullQueryConfig");
 const LOG_SCROLL_THRESHOLD = 48;
 const taskContainerIdsInput = document.getElementById("taskContainerIds");
 const taskParallelInput = document.getElementById("taskParallel");
@@ -149,6 +154,7 @@ const adminUsersTableBodyEl = document.getElementById("adminUsersTableBody");
 const statsUsernameInput = document.getElementById("statsUsername");
 const statsIncludeRawInput = document.getElementById("statsIncludeRaw");
 const fetchTiktokStatsBtn = document.getElementById("fetchTiktokStats");
+const fetchTiktokStatsFullBtn = document.getElementById("fetchTiktokStatsFull");
 const statsResultEl = document.getElementById("statsResult");
 const cvAccessFilterEl = document.getElementById("cvAccessFilter");
 const queryCvAccessDataBtn = document.getElementById("queryCvAccessData");
@@ -398,6 +404,7 @@ let tiktokRootsUseServerPaging = false;
 let overviewAutoRefreshInFlight = false;
 let logsAutoRefreshInFlight = false;
 let taskStatusRefreshInFlight = false;
+let backupStatsFullQueryInFlight = false;
 let lastGalleryDispatchLogLine = "";
 let overviewAutoRefreshCooldownUntil = 0;
 let logsAutoRefreshCooldownUntil = 0;
@@ -438,6 +445,9 @@ const OVERVIEW_PAGE_KEY = "auto_traces_overview_page_v1";
 const OVERVIEW_PAGE_SIZE_KEY = "auto_traces_overview_page_size_v1";
 const BACKUP_ARCHIVE_PAGE_KEY = "auto_traces_backup_archive_page_v1";
 const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
+let autoSwitchDailyPlansByAlias = {};
+let autoSwitchDailyPlanDate = "";
+let autoSwitchSaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
 const DB_SEARCH_FIELD_KEY = "auto_traces_db_search_field_v1";
 const DB_SEARCH_KEYWORD_KEY = "auto_traces_db_search_keyword_v1";
@@ -2172,6 +2182,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     for_you_watch_max_sec: 5,
     like_daily_limit: 800,
     comment_daily_limit: 800,
+    mutual_traffic_comment_daily_limit: 800,
     favorite_daily_limit: 800,
     share_daily_limit: 800,
     action_single: true,
@@ -2185,7 +2196,9 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
-    mutual_left_swipe_follow: false,
+    mutual_traffic_comment: true,
+    mutual_traffic_author_follow: true,
+    mutual_traffic_followers_follow: true,
     growth_pull_batches_before_auto_mutual: -1,
     growth_post_check_after_tap_delay_ms: 1000,
     growth_post_second_check_delay_ms: 650,
@@ -2225,7 +2238,9 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
-    mutual_left_swipe_follow: false,
+    mutual_traffic_comment: true,
+    mutual_traffic_author_follow: true,
+    mutual_traffic_followers_follow: true,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2264,7 +2279,9 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     profile_edit_bio_texts: ["Just vibing", "Thanks for visiting"],
     mutual_videos_scroll_rounds: 5,
     mutual_follow_tap_session_limit: 20,
-    mutual_left_swipe_follow: false,
+    mutual_traffic_comment: true,
+    mutual_traffic_author_follow: true,
+    mutual_traffic_followers_follow: true,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2731,7 +2748,12 @@ function collectConfig() {
   for (const [key, value] of formData.entries()) {
     if (key === "config_mode") continue;
     if (value === "") continue;
-    if (key === "action_single" || key === "mutual_left_swipe_follow") {
+    if (
+      key === "action_single" ||
+      key === "mutual_traffic_comment" ||
+      key === "mutual_traffic_author_follow" ||
+      key === "mutual_traffic_followers_follow"
+    ) {
       payload[key] = value === "on";
       continue;
     }
@@ -2754,6 +2776,17 @@ function collectConfig() {
     const v = Number(processQueueBatchSizeInput.value);
     if (Number.isFinite(v)) {
       payload.process_queue_batch_size = Math.max(1, Math.min(1000, Math.floor(v)));
+    }
+  }
+  for (const key of [
+    "mutual_traffic_comment",
+    "mutual_traffic_comment_daily_limit",
+    "mutual_traffic_author_follow",
+    "mutual_traffic_followers_follow",
+  ]) {
+    const input = configForm?.querySelector(`[name='${key}']`);
+    if (input?.type === "checkbox") {
+      payload[key] = input.checked;
     }
   }
   return payload;
@@ -3108,44 +3141,22 @@ async function addSelectedRootsToPending() {
 
 async function addAllRootsToPending() {
   try {
-    const pageSize = 500;
-    let page = 1;
-    let totalPages = 1;
-    const allUsernames = [];
-    while (page <= totalPages) {
-      setStatus(`正在收集 tiktok_roots 全量用户名（${page}/${totalPages}）...`, "info");
-      const data = await request(
-        `/api/admin/table_page?table=tiktok_roots&page=${page}&page_size=${pageSize}`
-      );
-      const items = Array.isArray(data.items)
-        ? data.items
-        : (Array.isArray(data.rows) ? data.rows : (Array.isArray(data.data) ? data.data : []));
-      items.forEach((item) => {
-        const username = String(item?.root_username || "").trim();
-        if (username) allUsernames.push(username);
-      });
-      const total = Number(data.total || 0);
-      totalPages = Math.max(1, Math.ceil(total / pageSize));
-      page += 1;
-    }
-
-    const usernames = Array.from(new Set(allUsernames));
-    if (!usernames.length) {
-      setStatus("tiktok_roots 为空，无可下发用户", "warning");
-      return;
-    }
-
-    setStatus(`正在写入待下发队列（共 ${usernames.length} 条）...`, "info");
-    const result = await request("/api/admin/mobile_pending_usernames/add_from_roots_selection", {
+    setStatus("正在将全部 tiktok_roots 写入待下发队列（服务端处理）...", "info");
+    const result = await request("/api/admin/mobile_pending_usernames/add_all_roots", {
       method: "POST",
-      body: JSON.stringify({ usernames }),
       timeoutMs: 600000,
     });
     await loadOverview();
     await loadAccounts();
+    const selected = Number(result.selected || 0);
+    const inserted = Number(result.inserted ?? result.count ?? 0);
+    const skippedPending = Number(result.skipped_already_pending || 0);
+    const skippedNote = skippedPending > 0 ? `，${skippedPending} 条已在队列中` : "";
     setStatus(
-      `已将全部根用户写入待下发队列：${result.count ?? result.inserted ?? 0} 条（去重后 ${usernames.length}）`,
-      "success",
+      result.code === 0 && inserted <= 0 && skippedPending > 0
+        ? (result.msg || `无新用户写入（${skippedPending} 个已在待下发队列中）`)
+        : `已将全部根用户写入待下发队列：新增 ${inserted} 条（共 ${selected} 条${skippedNote}）`,
+      inserted > 0 || (result.code === 0 && skippedPending > 0) ? "success" : "warning",
     );
   } catch (error) {
     setStatus(error.message || "全量加入待下发队列失败", "error");
@@ -3481,12 +3492,24 @@ async function refreshTaskStatus() {
     const taskLogs = data.task_logs || {};
     const runningTasks = Array.isArray(data.running_tasks) ? data.running_tasks : [];
     if (schedulerEnabledToggle) schedulerEnabledToggle.checked = !!data.scheduler_enabled;
+    if (backupStatsFullQueryEnabledToggle) {
+      backupStatsFullQueryEnabledToggle.checked = !!data.backup_stats_full_query_enabled;
+    }
     if (taskStatusEl) {
       const runningLabel = runningTasks.length
         ? runningTasks.map((item) => item?.name || item).join(", ")
         : "无";
+      const autoSw = data.auto_switch_enabled ? "开" : "关";
+      const bj = data.auto_switch_beijing_time
+        ? `${data.auto_switch_beijing_date || ""} ${data.auto_switch_beijing_time}`.trim()
+        : "";
+      const bsq = data.backup_stats_full_query_enabled ? "开" : "关";
+      const bsqLast = data.backup_stats_full_query_last_run_date || "-";
+      const bsqRun = data.backup_stats_full_query_in_flight ? "执行中" : "空闲";
       taskStatusEl.textContent = [
         `总开关: ${data.scheduler_enabled ? "开" : "关"}`,
+        `自动切号: ${autoSw}${bj ? `（北京 ${bj}）` : ""}`,
+        `每日全量: ${bsq}（上次 ${bsqLast}，${bsqRun}）`,
         `运行中: ${runningLabel}`,
         `粉丝增长监控: ${JSON.stringify(data.auto_search_schedule || {})}`,
       ].join("  |  ");
@@ -3524,6 +3547,67 @@ async function saveSchedulerConfig() {
     setStatus("定时任务总开关已保存", "success");
   } catch (error) {
     setStatus(error.message || "保存配置失败", "error");
+  }
+}
+
+async function loadAutoSwitchConfig() {
+  try {
+    const data = await request("/api/admin/auto_switch/config");
+    const cfg = data.data || {};
+    if (autoSwitchEnabledToggle) autoSwitchEnabledToggle.checked = !!cfg.enabled;
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function loadBackupStatsFullQueryConfig() {
+  try {
+    const data = await request("/api/admin/backup_stats_full_query/config");
+    const cfg = data.data || {};
+    if (backupStatsFullQueryEnabledToggle) {
+      backupStatsFullQueryEnabledToggle.checked = cfg.enabled !== false;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function saveBackupStatsFullQueryConfig() {
+  try {
+    const enabled = !!backupStatsFullQueryEnabledToggle?.checked;
+    await request("/api/admin/backup_stats_full_query/config", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    await loadBackupStatsFullQueryConfig();
+    await refreshTaskStatus();
+    setStatus(enabled ? "已开启每日 0 点自动全量查询" : "已关闭每日自动全量查询", "success");
+  } catch (error) {
+    setStatus(error.message || "保存失败", "error");
+  }
+}
+
+async function saveAutoSwitchConfig(options = {}) {
+  if (autoSwitchSaveInFlight) return;
+  autoSwitchSaveInFlight = true;
+  const enabled = !!autoSwitchEnabledToggle?.checked;
+  try {
+    await request("/api/admin/auto_switch/config", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    if (options.refreshStatus !== false) {
+      await refreshTaskStatus();
+    }
+    setStatus(
+      enabled ? "自动切号已开启（将立即对齐当前时段账号）" : "自动切号已关闭",
+      "success",
+    );
+  } catch (error) {
+    await loadAutoSwitchConfig();
+    setStatus(error.message || "保存自动切号配置失败", "error");
+  } finally {
+    autoSwitchSaveInFlight = false;
   }
 }
 
@@ -3623,13 +3707,12 @@ async function switchRunMode(mode) {
   }
 }
 
-async function startMutualClickForSelectedDevices() {
+function buildMutualOpTargetsForSelectedDevices() {
   const selectedIds = selectedDeviceIds();
   if (!selectedIds.length) {
     setStatus("请先勾选设备", "warning");
-    return;
+    return null;
   }
-
   const targets = selectedIds
     .map((id) => {
       const info = latestDevices?.[id] || {};
@@ -3638,15 +3721,20 @@ async function startMutualClickForSelectedDevices() {
       return { device_id: id, alias, package_name: "com.zhiliaoapp.musically" };
     })
     .filter(Boolean);
-
   if (!targets.length) {
-    setStatus("所选设备缺少别名，无法启动引流流程", "warning");
-    return;
+    setStatus("所选设备缺少别名，无法启动互点流程", "warning");
+    return null;
   }
+  return targets;
+}
+
+async function startMutualClickForSelectedDevices() {
+  const targets = buildMutualOpTargetsForSelectedDevices();
+  if (!targets) return;
 
   let successCount = 0;
   let failedCount = 0;
-  setStatus(`正在为所选设备启动引流流程（${targets.length} 台）...`, "info");
+  setStatus(`正在为所选设备启动引流（${targets.length} 台）...`, "info");
   for (const payload of targets) {
     try {
       await request("/api/admin/device_tiktok/mutual_click_start", {
@@ -3663,6 +3751,32 @@ async function startMutualClickForSelectedDevices() {
     setStatus(`引流流程启动指令已下发（${successCount}/${targets.length}）`, "success");
   } else {
     setStatus(`引流流程部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
+  }
+}
+
+async function startMutualFollowOnlyForSelectedDevices() {
+  const targets = buildMutualOpTargetsForSelectedDevices();
+  if (!targets) return;
+
+  let successCount = 0;
+  let failedCount = 0;
+  setStatus(`正在为所选设备启动互点-仅关注（${targets.length} 台）...`, "info");
+  for (const payload of targets) {
+    try {
+      await request("/api/admin/device_tiktok/mutual_click_follow_only_start", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      successCount += 1;
+    } catch (_) {
+      failedCount += 1;
+    }
+  }
+  await loadOverview();
+  if (!failedCount) {
+    setStatus(`互点-仅关注指令已下发（${successCount}/${targets.length}）`, "success");
+  } else {
+    setStatus(`互点-仅关注部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
   }
 }
 
@@ -3967,6 +4081,48 @@ async function importLiveCustomers() {
   }
 }
 
+function formatDeviceGroupFilterLabel(groupFilter = "") {
+  const group = String(groupFilter || "").trim();
+  if (!group) return "全部分组";
+  if (group === "__ungrouped__") return "未分组";
+  return group;
+}
+
+async function collectBackupArchiveUsernamesForQuery(options = {}) {
+  const scope = options.scope === "page" ? "page" : "group";
+  const group = getActiveDeviceGroupFilter();
+  const pageSize = scope === "page" ? persistBackupArchivePageSize() : MAX_BACKUP_ARCHIVE_PAGE_SIZE;
+  const usernames = [];
+  const seen = new Set();
+  let page = scope === "page" ? currentBackupArchivePage : 1;
+  let totalPages = 1;
+
+  do {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    if (group) params.set("device_group", group);
+    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
+    const rows = Array.isArray(data.items) ? data.items : [];
+    rows.forEach((row) => {
+      const username = String(row?.username || "").trim().replace(/^@+/, "");
+      if (!username) return;
+      const key = username.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      usernames.push(username);
+    });
+    const total = Number(data?.total ?? 0) || 0;
+    const effectivePageSize = Number(data?.page_size ?? pageSize) || pageSize;
+    totalPages = Math.max(1, Math.ceil(total / effectivePageSize));
+    if (scope === "page") break;
+    page += 1;
+  } while (page <= totalPages);
+
+  return { usernames, group };
+}
+
 async function fetchTiktokStats() {
   const username = (statsUsernameInput?.value || "").trim();
 
@@ -3983,7 +4139,11 @@ async function fetchTiktokStats() {
     const include_raw = Boolean(statsIncludeRawInput?.checked);
     const data = await request("/api/admin/tiktok_profile_stats", {
       method: "POST",
-      body: JSON.stringify({ username, include_raw }),
+      body: JSON.stringify({
+        username,
+        include_raw,
+        write_back: false,
+      }),
     });
 
     if (statsResultEl) {
@@ -4020,6 +4180,87 @@ async function fetchTiktokStats() {
       statsResultEl.textContent = `查询失败: ${error.message || "unknown error"}`;
     }
     setStatus(error.message || "查询失败", "error");
+  }
+}
+
+async function fetchTiktokStatsFullForBackupArchive() {
+  if (backupStatsFullQueryInFlight) {
+    setStatus("全量查询正在进行中，请稍候", "warning");
+    return;
+  }
+
+  backupStatsFullQueryInFlight = true;
+  if (fetchTiktokStatsFullBtn) fetchTiktokStatsFullBtn.disabled = true;
+
+  try {
+    const groupFilter = getActiveDeviceGroupFilter();
+    const groupLabel = formatDeviceGroupFilterLabel(groupFilter);
+    setStatus(`正在收集「${groupLabel}」下的备份账号...`, "info");
+
+    const { usernames } = await collectBackupArchiveUsernamesForQuery({ scope: "group" });
+    if (!usernames.length) {
+      setStatus(`「${groupLabel}」下没有可查询的用户名`, "warning");
+      return;
+    }
+
+    const total = usernames.length;
+    let ok = 0;
+    let fail = 0;
+    const failedItems = [];
+
+    for (let i = 0; i < usernames.length; i += 1) {
+      const username = usernames[i];
+      const index = i + 1;
+      const remain = Math.max(total - index, 0);
+      const progress = `正在全量查询第 ${index} 个，还剩 ${remain} 个`;
+      setStatus(`${progress}（@${username}）`, "info");
+      if (deviceAliasGroupsPagerEl) {
+        deviceAliasGroupsPagerEl.textContent = `${progress} | 共 ${total} 个账号`;
+      }
+
+      try {
+        const data = await request("/api/admin/tiktok_profile_stats", {
+          method: "POST",
+          body: JSON.stringify({
+            username,
+            include_raw: false,
+            write_back: true,
+            query_index: index,
+            query_total: total,
+          }),
+        });
+        if (data && Number(data.code) === 0) {
+          ok += 1;
+        } else {
+          fail += 1;
+          failedItems.push(`${username}: ${data?.msg || "未知错误"}`);
+        }
+      } catch (error) {
+        fail += 1;
+        failedItems.push(`${username}: ${error.message || "查询失败"}`);
+      }
+
+      if (i < usernames.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+
+    await loadBackupArchiveRecords();
+
+    const summary = `全量查询完成：成功 ${ok}/${total}，失败 ${fail}`;
+    if (fail > 0) {
+      const detail = failedItems.slice(0, 3).join("；");
+      const suffix = failedItems.length > 3 ? "…" : "";
+      setStatus(`${summary}；失败：${detail}${suffix}`, fail === total ? "error" : "warning");
+    } else {
+      setStatus(summary, "success");
+    }
+  } catch (error) {
+    setStatus(error.message || "全量查询失败", "error");
+  } finally {
+    backupStatsFullQueryInFlight = false;
+    if (fetchTiktokStatsFullBtn) fetchTiktokStatsFullBtn.disabled = false;
+    updateBackupArchivePagerUi();
   }
 }
 
@@ -5124,6 +5365,17 @@ if (schedulerTaskLogsEl) {
 if (saveSchedulerConfigBtn) {
   saveSchedulerConfigBtn.addEventListener("click", saveSchedulerConfig);
 }
+if (saveAutoSwitchConfigBtn) {
+  saveAutoSwitchConfigBtn.addEventListener("click", () => saveAutoSwitchConfig());
+}
+if (autoSwitchEnabledToggle) {
+  autoSwitchEnabledToggle.addEventListener("change", () => saveAutoSwitchConfig({ refreshStatus: false }));
+}
+if (saveBackupStatsFullQueryConfigBtn) {
+  saveBackupStatsFullQueryConfigBtn.addEventListener("click", () => {
+    saveBackupStatsFullQueryConfig().catch((e) => setStatus(e.message || "保存失败", "error"));
+  });
+}
 if (startSchedulersBtn) {
   startSchedulersBtn.addEventListener("click", startSchedulers);
 }
@@ -5142,6 +5394,11 @@ if (cvModeBtn) {
 if (mutualStartSelectedBtn) {
   mutualStartSelectedBtn.addEventListener("click", () => {
     void startMutualClickForSelectedDevices();
+  });
+}
+if (mutualFollowOnlySelectedBtn) {
+  mutualFollowOnlySelectedBtn.addEventListener("click", () => {
+    void startMutualFollowOnlyForSelectedDevices();
   });
 }
 if (publishPostStartSelectedBtn) {
@@ -5239,7 +5496,14 @@ if (importLiveCustomersBtn) {
   importLiveCustomersBtn.addEventListener("click", importLiveCustomers);
 }
 if (fetchTiktokStatsBtn) {
-  fetchTiktokStatsBtn.addEventListener("click", fetchTiktokStats);
+  fetchTiktokStatsBtn.addEventListener("click", () => fetchTiktokStats());
+}
+if (fetchTiktokStatsFullBtn) {
+  fetchTiktokStatsFullBtn.addEventListener("click", () => {
+    fetchTiktokStatsFullForBackupArchive().catch((error) => {
+      setStatus(error.message || "全量查询失败", "error");
+    });
+  });
 }
 async function handleDbTableSwitch(nextTable = "") {
   currentDbPage = 1;
@@ -6002,6 +6266,22 @@ function renderClickableValue(value) {
   return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${safeText}</a>`;
 }
 
+function resolveBackupRowStats(row = {}) {
+  const username = String(row?.username || "").trim();
+  const acct = username ? getAccountRecordByUsername(username) : null;
+  const pick = (field) => {
+    const fromRow = String(row?.[field] ?? "").trim();
+    if (fromRow) return fromRow;
+    const fromAccount = String(acct?.[field] ?? "").trim();
+    return fromAccount || "-";
+  };
+  return {
+    video_count: pick("video_count"),
+    follower_count: pick("follower_count"),
+    follower_growth: pick("follower_growth"),
+  };
+}
+
 function renderLinkedAccountInfo(row = {}) {
   const username = String(row?.username || "").trim();
   if (!username) {
@@ -6011,6 +6291,7 @@ function renderLinkedAccountInfo(row = {}) {
   if (!matched) {
     return `<div class="hint">未在账号表单中找到 username 为「${username}」的记录。</div>`;
   }
+  const stats = resolveBackupRowStats({ ...matched, ...row, username });
   return `
     <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;font-size:12px;color:#334155;">
       <div><strong>username：</strong>${matched.username || "-"}</div>
@@ -6022,9 +6303,9 @@ function renderLinkedAccountInfo(row = {}) {
       <div><strong>login_time：</strong>${matched.login_time || "-"}</div>
       <div><strong>region：</strong>${matched.region || "-"}</div>
       <div><strong>分配别名：</strong>${normalizeAliasValue(matched.assigned_alias) || "无"}</div>
-      <div><strong>video_count：</strong>${matched.video_count || "-"}</div>
-      <div><strong>follower_count：</strong>${matched.follower_count || "-"}</div>
-      <div><strong>follower_growth：</strong>${matched.follower_growth || "-"}</div>
+      <div><strong>video_count：</strong>${stats.video_count}</div>
+      <div><strong>follower_count：</strong>${stats.follower_count}</div>
+      <div><strong>follower_growth：</strong>${stats.follower_growth}</div>
       <div><strong>基本资料已修改：</strong>${normalizeBasicProfileModifiedField(matched.basic_profile_modified) === "是" ? "是" : "否"}</div>
     </div>
   `;
@@ -6320,6 +6601,25 @@ function renderDeviceAliasGroups(groups = [], recordsByAlias = {}) {
   }).join("");
 }
 
+function resolveBackupRowDailySlot(alias, row) {
+  const aliasKey = alias === "__EMPTY_ALIAS__"
+    ? normalizeAliasValue(row?.mobile_alias || row?.assigned_alias || row?.device_alias)
+    : normalizeAliasValue(alias);
+  if (!aliasKey) return "";
+  const bucket = autoSwitchDailyPlansByAlias[aliasKey];
+  if (!bucket) return "";
+  const ri = Number(row?.row_index ?? row?.id);
+  if (Number.isFinite(ri) && bucket.slots_by_row_index) {
+    const hit = bucket.slots_by_row_index[String(ri)] ?? bucket.slots_by_row_index[ri];
+    if (hit?.label) return String(hit.label);
+  }
+  const user = String(row?.username || "").trim().toLowerCase();
+  if (user && bucket.slots_by_username?.[user]?.label) {
+    return String(bucket.slots_by_username[user].label);
+  }
+  return "";
+}
+
 function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
@@ -6332,6 +6632,9 @@ function renderBackupGroups(items = []) {
     if (!groups.has(alias)) groups.set(alias, []);
     groups.get(alias).push(item);
   });
+  const planDateHint = autoSwitchDailyPlanDate
+    ? `<span class="hint" style="font-weight:400;">（北京 ${escapeHtml(autoSwitchDailyPlanDate)}）</span>`
+    : "";
   deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
     const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
     const body = rows.map((row, idx) => {
@@ -6344,7 +6647,8 @@ function renderBackupGroups(items = []) {
       const deviceRowIndex = Number(row?.row_index);
       const deviceId = String(row?.device_id || "").trim();
       const actionAlias = alias === "__EMPTY_ALIAS__" ? mobileAlias : alias;
-      const linkedAccountInfo = renderLinkedAccountInfo({ username });
+      const linkedAccountInfo = renderLinkedAccountInfo({ username, ...row });
+      const stats = resolveBackupRowStats(row);
       const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
       const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
       const acct = username ? getAccountRecordByUsername(username) : null;
@@ -6353,6 +6657,7 @@ function renderBackupGroups(items = []) {
       const rowIndexRaw = row?.row_index ?? row?.id;
       const rowIndexNum = Number(rowIndexRaw);
       const hasCutSwitchRow = Number.isFinite(rowIndexNum) && rowIndexNum >= 0;
+      const dailySlotLabel = resolveBackupRowDailySlot(alias, row) || (rows.length >= 2 ? "-" : "");
       return `
         <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" style="margin-top:10px;background:#fafcff;" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
           <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -6370,6 +6675,12 @@ function renderBackupGroups(items = []) {
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">username</label><div style="word-break:break-word;">${escapeHtml(username || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">mobile_alias</label><div style="word-break:break-word;">${escapeHtml(mobileAlias || "-")}</div></div>
             <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">updated_at</label><div style="word-break:break-word;">${escapeHtml(updatedAt || "-")}</div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:10px;align-items:end;">
+            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">video_count</label><div style="word-break:break-word;">${escapeHtml(stats.video_count)}</div></div>
+            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>follower_count</strong></label><div style="word-break:break-word;"><strong>${escapeHtml(stats.follower_count)}</strong></div></div>
+            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>follower_growth</strong></label><div style="word-break:break-word;"><strong>${escapeHtml(stats.follower_growth)}</strong></div></div>
+            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>今日时段</strong></label><div style="word-break:break-word;white-space:nowrap;"><strong>${escapeHtml(dailySlotLabel || "-")}</strong></div></div>
           </div>
           <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px;">
             <div style="min-width:0;">
@@ -6392,7 +6703,7 @@ function renderBackupGroups(items = []) {
     }).join("");
     return `<details class="panel-card" style="margin-bottom:12px;" open>
       <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;">
-        <span>${escapeHtml(label)}</span><span class="hint">${rows.length} 条</span>
+        <span>${escapeHtml(label)}${planDateHint}</span><span class="hint">${rows.length} 条</span>
       </summary>
       <div style="margin-top:10px;">${body}</div>
     </details>`;
@@ -6408,7 +6719,13 @@ async function loadBackupArchiveRecords() {
     });
     const group = getActiveDeviceGroupFilter();
     if (group) params.set("device_group", group);
-    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
+    const [data, plansResp] = await Promise.all([
+      request(`/api/admin/editor/device_rows?${params.toString()}`),
+      request("/api/admin/auto_switch/daily_plans").catch(() => ({ data: {} })),
+    ]);
+    const plansPayload = plansResp?.data || {};
+    autoSwitchDailyPlansByAlias = plansPayload.plans_by_alias || {};
+    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
     backupArchiveAliasTotal = Number(data?.total ?? 0) || 0;
     if (Number.isFinite(Number(data?.page))) currentBackupArchivePage = Number(data.page) || 1;
     const rows = Array.isArray(data.items) ? data.items : [];
@@ -6421,6 +6738,9 @@ async function loadBackupArchiveRecords() {
       backup_name: row?.backup_name || "",
       backup_path: row?.backup_path || "",
       username: row?.username || "",
+      video_count: row?.video_count || "",
+      follower_count: row?.follower_count || "",
+      follower_growth: row?.follower_growth || "",
       switch_highlight: normalizeSwitchHighlightField(row?.switch_highlight),
     }));
     updateBackupArchivePagerUi();
@@ -6694,6 +7014,8 @@ if (apiBaseInput) {
     loadEditorState().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
+      void loadBackupStatsFullQueryConfig();
+      void loadAutoSwitchConfig();
       loadBackupArchiveRecords();
     }).catch((error) => {
       // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因

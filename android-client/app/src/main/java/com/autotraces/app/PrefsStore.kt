@@ -15,18 +15,12 @@ object PrefsStore {
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
     private const val KEY_BATCH_COMPLETED = "batch_completed"
-    /** 本批已跑过（成功、跳过或失败跳过）；用于自动互点批计数，与 [KEY_BATCH_COMPLETED]（仅成功收尾）区分 */
+    /** 本批已跑过（成功、跳过或失败跳过），与 [KEY_BATCH_COMPLETED]（仅成功收尾）区分 */
     private const val KEY_BATCH_PROCESSED = "batch_processed"
-    /** 每次 [savePulledBatch] 后递增，标记「当前拉取清单」代数（用于整批完成去重） */
+    /** 每次 [savePulledBatch] 后递增，标记「当前拉取清单」代数 */
     private const val KEY_PULL_BATCH_SEQ = "pull_batch_seq"
-    /** 已计入「涨粉整批完成→自动互点」累加器的拉取序号 */
-    private const val KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ = "last_attributed_pull_batch_seq"
-    /** 已连续完成多少整批拉取清单（每条均已处理，向模板 growth_pull_batches_before_auto_mutual 对齐） */
-    private const val KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL = "growth_batches_toward_auto_mutual"
     /** 上次向服务端校验绑定的时间；用于避免每次回到前台都请求 bindDevice。 */
     private const val KEY_LAST_BIND_REFRESH_MS = "last_bind_refresh_ms"
-    /** 设备端选择的任务队列/运行模式，与 get_config/pull_username 的 run_mode 参数一致 */
-    private const val KEY_DEVICE_RUN_MODE = "device_run_mode"
     private const val KEY_AUTH_TOKEN = "auth_token"
     private const val KEY_AUTH_USERNAME = "auth_username"
     private const val KEY_AUTH_PASSWORD = "auth_password"
@@ -37,6 +31,8 @@ object PrefsStore {
     private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
     /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
     private const val KEY_MUTUAL_COMMENT_ONLY_SESSION = "mutual_comment_only_session"
+    /** 互点-仅关注：跳过左滑/作者区，仅打开评论区（区内步骤 TODO），不受模板引流动作勾选影响。 */
+    private const val KEY_MUTUAL_FOLLOW_ONLY_SESSION = "mutual_follow_only_session"
     /** 管理台「发布作品」设备任务：与互点类似 requested+pending；互点会话进行中时置 queued_after_mutual */
     private const val KEY_PUBLISH_POST_REQUESTED = "publish_post_requested"
     private const val KEY_PUBLISH_POST_PENDING = "publish_post_pending"
@@ -159,6 +155,12 @@ object PrefsStore {
 
     fun isMutualCommentOnlySession(): Boolean = prefs.getBoolean(KEY_MUTUAL_COMMENT_ONLY_SESSION, false)
 
+    fun setMutualFollowOnlySession(active: Boolean) {
+        prefs.edit().putBoolean(KEY_MUTUAL_FOLLOW_ONLY_SESSION, active).apply()
+    }
+
+    fun isMutualFollowOnlySession(): Boolean = prefs.getBoolean(KEY_MUTUAL_FOLLOW_ONLY_SESSION, false)
+
     fun setPublishPostRequested(requested: Boolean) {
         prefs.edit().putBoolean(KEY_PUBLISH_POST_REQUESTED, requested).apply()
     }
@@ -271,22 +273,6 @@ object PrefsStore {
 
     fun getServerBaseUrl(): String? = prefs.getString(KEY_SERVER_BASE_URL, null)?.trim()
 
-    fun getDeviceRunMode(): String {
-        val raw = prefs.getString(KEY_DEVICE_RUN_MODE, ServerRunMode.GROWTH)?.trim()?.lowercase()
-        return when (raw) {
-            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH, ServerRunMode.MUTUAL -> raw
-            else -> ServerRunMode.GROWTH
-        }
-    }
-
-    fun saveDeviceRunMode(mode: String) {
-        val m = when (mode.trim().lowercase()) {
-            ServerRunMode.LIVE, ServerRunMode.DIRECT, ServerRunMode.GROWTH, ServerRunMode.MUTUAL -> mode.trim().lowercase()
-            else -> ServerRunMode.GROWTH
-        }
-        prefs.edit().putString(KEY_DEVICE_RUN_MODE, m).apply()
-    }
-
     /** @param intervalMs 距上次刷新不足该间隔则跳过静默刷新（手动绑定不受限）。 */
     fun shouldRefreshBindingSilently(intervalMs: Long): Boolean {
         val last = prefs.getLong(KEY_LAST_BIND_REFRESH_MS, 0L)
@@ -315,35 +301,6 @@ object PrefsStore {
             .putStringSet(KEY_BATCH_PROCESSED, emptySet())
             .putInt(KEY_PULL_BATCH_SEQ, nextSeq)
             .apply()
-    }
-
-    /**
-     * 当前拉取清单中用户名是否均已处理（成功收尾、无作品跳过，或涨粉失败已跳过）。
-     * 不要求全部成功，避免单条失败导致整批永不计入自动互点。
-     */
-    @Synchronized
-    fun tryConsumeCompletedPullBatchForAutoMutualStat(): Boolean {
-        val batch = prefs.getStringSet(KEY_BATCH_USERNAMES, null) ?: return false
-        if (batch.isEmpty()) return false
-        val processed = prefs.getStringSet(KEY_BATCH_PROCESSED, null) ?: return false
-        if (!batch.all { processed.contains(it) }) return false
-        val seq = prefs.getInt(KEY_PULL_BATCH_SEQ, 0)
-        if (seq <= 0) return false
-        val lastAttr = prefs.getInt(KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ, 0)
-        if (seq <= lastAttr) return false
-        prefs.edit().putInt(KEY_LAST_ATTRIBUTED_PULL_BATCH_SEQ, seq).apply()
-        return true
-    }
-
-    @Synchronized
-    fun incrementGrowthBatchesTowardAutoMutual(): Int {
-        val next = prefs.getInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, 0) + 1
-        prefs.edit().putInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, next).apply()
-        return next
-    }
-
-    fun resetGrowthBatchesTowardAutoMutual() {
-        prefs.edit().putInt(KEY_GROWTH_BATCHES_TOWARD_AUTO_MUTUAL, 0).apply()
     }
 
     @Synchronized

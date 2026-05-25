@@ -104,7 +104,8 @@
             <button id="growthModeBtn" class="primary">涨粉模式</button>
             <button id="liveModeBtn" class="ghost">主播访问模式</button>
             <button id="cvModeBtn" class="ghost">直客访问模式</button>
-            <button id="mutualStartSelectedBtn" class="ghost">启动所选设备互点（引流）</button>
+            <button id="mutualStartSelectedBtn" class="ghost" title="下发互点引流会话；不依赖手机 App 本机模式">启动所选设备互点（引流）</button>
+            <button id="mutualFollowOnlySelectedBtn" class="ghost" type="button" title="独立方案：进 teamwork Videos 后仅打开评论区（区内步骤待实现），不受模板引流动作勾选影响">互点-仅关注</button>
             <button id="publishPostStartSelectedBtn" class="ghost" type="button" title="对勾选设备下发：关闭云端自动开启→关开 TikTok→屏中点→OCR「While using the app」；互点/引流会话进行中设备端会自动排队">发布作品</button>
             <button id="startSelected" class="primary">启动所选设备</button>
             <button id="startAll" class="ghost">启动全部在线设备</button>
@@ -671,6 +672,17 @@
                 <option value="">全部分组</option>
                 <option value="__ungrouped__">未分组</option>
               </select>
+              <button id="fetchTiktokStatsFull" class="ghost" type="button" title="按上方分组筛选，批量查询该分组下全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）">全量查询并落库</button>
+              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;" title="每天北京时间 0:00 自动对全部 owner 的备份档案执行全量查询并落库（不限分组）">
+                <input id="backupStatsFullQueryEnabledToggle" type="checkbox" checked />
+                每日0点自动全量查询
+              </label>
+              <button id="saveBackupStatsFullQueryConfig" type="button" class="ghost">保存定时全量</button>
+              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;" title="北京时间 0:00 起按别名账号数随机均分 24 小时，到点自动切号；开启后立即对齐当前时段">
+                <input id="autoSwitchEnabledToggle" type="checkbox" />
+                自动切号（全局）
+              </label>
+              <button id="saveAutoSwitchConfig" type="button" class="ghost">保存自动切号</button>
             </div>
             <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
               <button id="backupArchivePrevPageBtn" type="button" class="ghost">上一页</button>
@@ -681,10 +693,6 @@
             </div>
           </div>
           <div id="deviceAliasGroups" class="backup-archive-list">加载中...</div>
-        </div>
-        <div class="panel-card" style="margin-top:12px;">
-          <h3>云端回执</h3>
-          <pre id="backupCloudInfo" style="white-space:pre-wrap;max-height:220px;overflow:auto;">暂无结果</pre>
         </div>
       </section>
 
@@ -1027,15 +1035,15 @@
             <div class="range-pair" role="group" aria-label="休息时长最短至最长">
               <div class="range-half">
                 <label class="range-sublabel" for="cfg-break-min">最短</label>
-                <input id="cfg-break-min" name="break_min" type="number" min="1" />
+                <input id="cfg-break-min" name="break_min" type="number" min="0" />
               </div>
               <span class="range-sep" aria-hidden="true">~</span>
               <div class="range-half">
                 <label class="range-sublabel" for="cfg-break-max">最长</label>
-                <input id="cfg-break-max" name="break_max" type="number" min="1" />
+                <input id="cfg-break-max" name="break_max" type="number" min="0" />
               </div>
             </div>
-            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。设备 App 默认连续完成 <strong>5 批</strong>拉取并执行完毕后进入休息（由「休息前拉取批次数 <code>pull_batches_before_rest</code>」控制，默认 5）。</div>
+            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。<strong>最短、最长均为 0 时不触发休息</strong>。设备 App 默认连续完成 <strong>5 批</strong>拉取并执行完毕后进入休息（由「休息前拉取批次数 <code>pull_batches_before_rest</code>」控制，默认 5）。</div>
           </div>
           <div class="field">
             <label>访问延迟（秒，随机区间）</label>
@@ -1170,6 +1178,10 @@
             <input name="comment_daily_limit" type="number" min="0" step="1" value="800" />
           </div>
           <div class="field">
+            <label>引流评论每日上限</label>
+            <input name="mutual_traffic_comment_daily_limit" type="number" min="0" step="1" value="800" />
+          </div>
+          <div class="field">
             <label>收藏每日上限</label>
             <input name="favorite_daily_limit" type="number" min="0" step="1" value="800" />
           </div>
@@ -1184,15 +1196,6 @@ moring
 so cute</textarea>
           </div>
           <div class="field full">
-            <label>涨粉 → 引流（自动）：连续「整批拉取清单全部执行完毕」多少批后自动引流</label>
-            <input name="growth_pull_batches_before_auto_mutual" type="number" min="-1" max="10000" step="1" value="-1" />
-            <div class="hint">
-              仅当设备 App 当前队列为<strong>涨粉模式</strong>且本模板生效时判断。<strong>一批</strong>指：某次从服务端拉取的用户名清单在设备上<strong>每一条</strong>都已跑完一轮（成功、无作品/私密跳过，或失败已跳过继续下一个）；<strong>不要求全部成功</strong>，避免单条失败拖死整批计数。失败用户下次拉取仍可能再次出现并重试。<br />
-              达到设定批数后的行为与设备概览页<strong>「启动所选设备互点（引流）」</strong>一致：暂停涨粉拉取 → 执行引流会话 → 会话结束<strong>强停 TikTok</strong>后继续涨粉（不再改动云端「自动开启程序」开关）。<br />
-              <strong>-1</strong> 或 <strong>0</strong>：永不自动切引流（默认 -1）。填 <strong>1、2…</strong> 表示累计满该批数后触发一次，计数会清零后再重新累计。
-            </div>
-          </div>
-          <div class="field full">
             <label>引流目标文案（多条用逗号或换行）</label>
             <textarea name="mutual_traffic_target_texts" rows="3">teamwork</textarea>
             <div class="hint">设备进入引流流程时在 TikTok 搜索框输入的关键词；多条时每次「重新打开并搜索」随机选一条。留空则与旧版一致，仍搜索 <code>teamwork</code>。</div>
@@ -1200,12 +1203,12 @@ so cute</textarea>
           <div class="field full">
             <label>引流 · Videos 列表轮次</label>
             <input name="mutual_videos_scroll_rounds" type="number" min="1" max="500" step="1" value="5" />
-            <div class="hint">一轮 = 两次引流视频评论；轮与轮之间会在 Videos 列表<strong>下滑约半屏</strong>换一批视频。与下方「粉丝列表 Follow 上限」一起在<strong>启动所选设备互点（引流）</strong>时生效。</div>
+            <div class="hint">一轮 = 左右各进 1 次作品；轮与轮之间在 Videos 列表<strong>下滑约半屏</strong>换批。管理台将账号队列设为<strong>互点</strong>时设备自动周期性引流，或由「启动所选设备互点（引流）/ 互点-仅关注」一次性下发（不依赖手机 App 本机切换）。</div>
           </div>
           <div class="field full">
             <div class="config-subcard config-subcard--traffic-follow">
               <div class="config-subcard__head">
-                <span class="config-subcard__title">引流 · 粉丝列表与左滑</span>
+                <span class="config-subcard__title">引流 · Follow 上限与动作开关</span>
                 <span class="config-subcard__badge">互点 / 引流</span>
               </div>
               <div class="config-subcard__body">
@@ -1222,22 +1225,29 @@ so cute</textarea>
                     class="config-input-narrow"
                   />
                   <ul class="hint-list">
-                    <li>单次会话内，在 <strong>Followers 列表</strong>中累计点击 Follow（按钮中心）的次数上限。</li>
-                    <li>达到上限后：<strong>不再进入粉丝列表</strong>；若未勾选右侧「左滑关注」，则<strong>也不再左滑</strong>。</li>
-                    <li>达上限后的剩余轮次：仍执行点赞 / 收藏 / 引流评论（<strong>不粘贴评论框、不回传复制用户名</strong>）。</li>
-                    <li>全部轮次结束后：结束本次引流并<strong>强停 TikTok</strong>。</li>
+                    <li>单次会话内，<strong>作者区</strong>与 <strong>Followers 列表</strong>点击 Follow 共用本上限计数。</li>
+                    <li>达上限后：若勾了<strong>评论</strong>，剩余 Videos 轮次仅点赞/收藏/评论；若未勾评论则<strong>立即结束</strong>本次引流。</li>
+                    <li>全部轮次结束后：强停 TikTok。</li>
                   </ul>
                 </div>
                 <div class="config-subcard__col config-subcard__col--accent">
+                  <p class="hint hint--below-title">进 teamwork Videos 后每条作品可独立组合（至少勾一项才有对应动作）。</p>
                   <label class="checkbox-inline">
-                    <input name="mutual_left_swipe_follow" type="checkbox" />
-                    <span class="checkbox-inline__text">左滑关注</span>
+                    <input name="mutual_traffic_comment" type="checkbox" checked />
+                    <span class="checkbox-inline__text">评论</span>
                   </label>
-                  <p class="hint hint--below-title">达粉丝列表上限后，仍可在作者区尝试关注（与上限内「进粉丝列表」行为不同）。</p>
+                  <label class="checkbox-inline">
+                    <input name="mutual_traffic_author_follow" type="checkbox" checked />
+                    <span class="checkbox-inline__text">作者区尝试关注</span>
+                  </label>
+                  <label class="checkbox-inline">
+                    <input name="mutual_traffic_followers_follow" type="checkbox" checked />
+                    <span class="checkbox-inline__text">Followers 关注</span>
+                  </label>
                   <ul class="hint-list">
-                    <li>Videos 轮次未结束前：即使已达粉丝列表 Follow 上限，进作品后仍会<strong>先左滑</strong>，并在作者区检测 Follow / Message（有 Follow 则点）。</li>
-                    <li><strong>仅未达上限时</strong>才复制用户名并进入 Followers 列表。</li>
-                    <li>从作者层回到作品：<strong>未进 Followers → 返回 1 次</strong>；<strong>进了 Followers → 返回 2 次</strong>。</li>
+                    <li><strong>作者区</strong>：左滑后在作者条点 Follow（计入上限）。</li>
+                    <li><strong>Followers</strong>：复制用户名并进粉丝列表点 Follow；可不勾作者区（仍左滑，不在作者区点 Follow）。</li>
+                    <li>返回作品：未进列表 1 次，进了列表 2 次。</li>
                   </ul>
                 </div>
               </div>
@@ -1294,6 +1304,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260520-3"></script>
+  <script src="app.js?v=20260523-1"></script>
 </body>
 </html>

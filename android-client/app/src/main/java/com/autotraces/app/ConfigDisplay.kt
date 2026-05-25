@@ -9,7 +9,7 @@ object ConfigDisplay {
         ServerRunMode.GROWTH -> "涨粉模式"
         ServerRunMode.LIVE -> "主播访问模式"
         ServerRunMode.DIRECT -> "直客访问模式"
-        ServerRunMode.MUTUAL -> "互点模式"
+        ServerRunMode.MUTUAL -> "互点引流模式"
         null, "" -> "—"
         else -> mode!!.trim()
     }
@@ -27,7 +27,7 @@ object ConfigDisplay {
         "${min} ~ ${max} 秒"
 
     fun formatRangeMin(min: Int, max: Int): String =
-        "${min} ~ ${max} 分钟"
+        if (min == 0 && max == 0) "不触发休息（0 ~ 0）" else "${min} ~ ${max} 分钟"
 
     fun formatTextListPreview(items: List<String>?, maxLines: Int = 4): String {
         val lines = (items ?: emptyList()).map { it.trim() }.filter { it.isNotBlank() }
@@ -90,6 +90,7 @@ object ConfigDisplay {
         appendSection("每日上限（各动作单独计数）") {
             appendLine("点赞：${config.like_daily_limit} 次/天")
             appendLine("评论：${config.comment_daily_limit} 次/天")
+            appendLine("引流评论：${config.mutual_traffic_comment_daily_limit} 次/天")
             appendLine("收藏：${config.favorite_daily_limit} 次/天")
             appendLine("转发：${config.share_daily_limit} 次/天")
         }
@@ -106,15 +107,10 @@ object ConfigDisplay {
         appendSection("引流 / 互点") {
             appendLine("Videos 列表轮次 mutual_videos_scroll_rounds：${config.mutual_videos_scroll_rounds}")
             appendLine("粉丝列表 Follow 上限 mutual_follow_tap_session_limit：${config.mutual_follow_tap_session_limit}")
-            appendLine("左滑关注 mutual_left_swipe_follow：${if (config.mutual_left_swipe_follow) "开启" else "关闭"}")
-            val autoMutual = config.growth_pull_batches_before_auto_mutual
-            appendLine(
-                "涨粉满批后自动引流 growth_pull_batches_before_auto_mutual：" +
-                    when {
-                        autoMutual < 1 -> "$autoMutual（关闭）"
-                        else -> "$autoMutual 批"
-                    },
-            )
+            appendLine("引流评论 mutual_traffic_comment：${if (config.mutual_traffic_comment) "开启" else "关闭"}")
+            appendLine("作者区关注 mutual_traffic_author_follow：${if (config.mutual_traffic_author_follow) "开启" else "关闭"}")
+            appendLine("Followers 关注 mutual_traffic_followers_follow：${if (config.mutual_traffic_followers_follow) "开启" else "关闭"}")
+            appendLine("引流由管理台云端指令或队列 run_mode=mutual 触发（App 端无本机模式切换）")
         }
 
         appendSection("文案库") {

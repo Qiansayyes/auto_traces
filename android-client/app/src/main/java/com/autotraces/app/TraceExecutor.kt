@@ -106,7 +106,8 @@ interface TraceExecutor {
      * 同屏再严格找「Change photo」并首击（若无则整屏专段 OCR）→
      * 整屏「Upload photo」→「Allow all」（Allow 未命中仅跳过**该按钮**，其余选图发帖步骤照常）→
      * 左上固定点→OCR「Next」×2（间隔 0.5s）→「Post this photo to Story」→「Save」→
-     * 等 2s 后最多 7 次 OCR 校验「Change photo」→Name→Bio(模板)→
+     * OCR 等待头像上传（含 uploading 则每 1s 轮询至消失；已见 Change photo 则跳过等待；逾时 60s 强停并重拉 TikTok）→
+     * 最多 7 次 OCR 校验「Change photo」→Name→Bio(模板)→
      * **Bio 后两段（各自至多 3 轮）**：① Save→等 2s→终验「Change photo」→返回（任一步失败只重试①）；
      * ② 设置点→点 Settings and privacy→【插入】点 Permissions→OCR 点 Save login info(等2.5s)→返回→【旧】校验 Permissions→点其下 Privacy→Comments 校验→下滑→Viewers→…
      * 下滑→OCR「Viewers」（找不到再下滑再 OCR）→同行 On 则成功 / Off 则点 Viewers→OCR「Viewer history」并点（7 次）→等 3s
@@ -221,11 +222,39 @@ class RealTraceExecutor(
     // 仅 growth：发生恢复重启后，下一轮从“点击放大镜”重新开始（不复用 Users，不再二次拉起 App）。
     private var restartFromMagnifierForGrowth: Boolean = false
 
-    /** 完整互点：粉丝列表 Follow 累计计数（本会话）。 */
+    /** 引流：作者区 + Followers 列表 Follow 累计计数（本会话，共用上限）。 */
     private var mutualSessionFollowTapCount: Int = 0
 
     @Volatile
     private var mutualFollowLimitReached: Boolean = false
+
+    /** 记录一次 Follow 点击；@return true 表示已达本会话上限。 */
+    private fun recordMutualFollowTap(alias: String, config: AppConfig, source: String): Boolean {
+        if (mutualFollowLimitReached) return true
+        val limit = config.mutual_follow_tap_session_limit.coerceAtLeast(1)
+        mutualSessionFollowTapCount++
+        devOp(alias, "互点：Follow 会话计数($source) $mutualSessionFollowTapCount/$limit")
+        if (mutualSessionFollowTapCount >= limit) {
+            mutualFollowLimitReached = true
+            devOp(alias, "互点：已达 Follow 会话上限 $limit")
+            return true
+        }
+        return false
+    }
+
+    private fun shouldStopMutualVideosAfterFollowLimit(config: AppConfig): Boolean {
+        if (!mutualFollowLimitReached) return false
+        // 仅关注无评论：Follow 达限即整段会话完成，不必跑满 mutual_videos_scroll_rounds
+        if (PrefsStore.isMutualFollowOnlySession()) return true
+        return !config.mutual_traffic_comment
+    }
+
+    private fun shouldSkipMutualAuthorLayerSwipe(config: AppConfig, mutualCommentOnly: Boolean): Boolean {
+        if (PrefsStore.isMutualFollowOnlySession()) return true
+        if (mutualCommentOnly) return true
+        if (mutualFollowLimitReached) return true
+        return !config.mutual_traffic_author_follow && !config.mutual_traffic_followers_follow
+    }
 
     /** 单次发作品任务内：资料页进图库入口布局（首条试探成功后后续条目不重复 Recents 试探）。 */
     @Volatile
@@ -250,8 +279,15 @@ class RealTraceExecutor(
         private const val MUTUAL_ENTRY_LAUNCH_MAX_ATTEMPTS = 3
         /** 互点：单次进入流程内 Videos 标签 OCR 最大尝试次数 */
         private const val MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS = 3
+        /** 互点：首次点击 Videos 标签后，至二次顶栏 OCR 开始的间隔（毫秒） */
+        private const val MUTUAL_VIDEOS_TAB_AFTER_FIRST_TAP_DELAY_MS = 1500L
         /** 帧差失败后单次 teamwork 恢复：关开 TikTok 并重新搜索的最大连续尝试次数 */
         private const val MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS = 3
+        /** 互点-仅关注：Reply / Replying / Follow 布局 OCR 共用重试（6 次、间隔 0.5s） */
+        private const val MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS = 6
+        private const val MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS = 500L
+        /** 评论区列表上滑约 40% 屏高（换批） */
+        private const val MUTUAL_FOLLOW_ONLY_COMMENT_SWIPE_HEIGHT_RATIO = 0.40f
         /** 完整互点：未达 Follow 上限时 teamwork Videos 外圈最大轮数（每轮含左+右双侧），防止死循环。 */
         private const val MUTUAL_FULL_VIDEOS_SAFETY_ROUNDS = 500
         /** 单次「发布作品」任务最多连发条数（临时上限）；实际条数 = min(Pictures 图片+视频数, 本常量)。 */
@@ -268,6 +304,15 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_ALLOW_ALL_OCR_MAX_PASSES = 5
         /** 布局试探时 Allow all 累计命中点击次数上限（含 OCR 命中但 su tap 失败）。 */
         private const val PUBLISH_POST_ALLOW_ALL_MAX_CLICKS = 2
+        /** 图库点选素材后等待界面稳定，再 OCR「Next」。 */
+        private const val PUBLISH_POST_AFTER_GALLERY_DELAY_MS = 1000L
+        /** 第一次定位 Next：全屏 OCR 最多次数（均未命中则本条失败）。 */
+        private const val PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES = 5
+        /** 第一次 Next OCR 相邻两次间隔（毫秒，含随机）。 */
+        private const val PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MIN_MS = 500L
+        private const val PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MAX_MS = 1000L
+        /** 文案屏顶部 Post：bbox 中心 Y ≤ 屏高×本比例视为「屏幕上方」（用于与中部工具栏 Post 区分）。 */
+        private const val PUBLISH_POST_CAPTION_TOP_POST_MAX_CENTER_Y_FRACTION = 0.28f
 
         /**
          * 测试 Bio 后② 时 true：跳过 Edit→Bio→Bio后①，外轮比例点后须已在 TikTok 个人主页。
@@ -295,6 +340,10 @@ class RealTraceExecutor(
 
         /** 修改基本资料：Upload photo 后整屏 OCR「Allow all」最多次数（未命中仅跳过）。 */
         private const val PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES = 3
+
+        /** Save(发帖) 后等待头像上传完成：轮询 OCR 间隔与总超时（毫秒）。 */
+        private const val PROFILE_EDIT_AVATAR_UPLOAD_POLL_MS = 1000L
+        private const val PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS = 60_000L
 
         /** 发作品图库统计根路径（与 adb `find /storage/emulated/0/Pictures` 一致）。 */
         private const val PUBLISH_POST_PICTURES_PATH = "/storage/emulated/0/Pictures"
@@ -340,9 +389,41 @@ class RealTraceExecutor(
         return false
     }
 
+    private fun isHostAppInForeground(): Boolean =
+        isPackageVisible(AppConstants.APP_PACKAGE_NAME)
+
+    /**
+     * 远控/后台任务时用户常在桌面或其它 App：先切回本应用，降低后台 Activity 启动（BAL）拦截概率。
+     * 同时提供 root 拉起本应用，避免仅 intent 被系统静默忽略。
+     */
+    private fun bringHostAppToForeground(ctx: Context): Boolean {
+        val hostPkg = AppConstants.APP_PACKAGE_NAME
+        if (isHostAppInForeground()) return true
+
+        val intent = Intent(ctx, MainActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+            )
+        }
+        runCatching { ctx.startActivity(intent) }
+
+        if (runSuCommand(
+                "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $hostPkg",
+            )
+        ) {
+            return true
+        }
+        return runSuCommand("monkey -p $hostPkg -c android.intent.category.LAUNCHER 1")
+    }
+
     /**
      * 拉起 TikTok：启动命令 → 等待 [launchWaitMs] → dumpsys 前台校验 →
      * **仅在前台已确认时** OCR 处理 Don't allow（非 TikTok 前台时 OCR 无意义）。
+     *
+     * 不在本应用界面时：先切回 AutoTraces，并优先 root 拉起 TikTok（避免 startActivity 成功但未切前台）；
+     * 前台校验失败时再 root 补拉一次。
      */
     private suspend fun launchTikTokOnceWithCheck(
         ctx: Context,
@@ -352,46 +433,92 @@ class RealTraceExecutor(
         forceStopBeforeLaunch: Boolean = true,
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
+        if (!forceStopBeforeLaunch && isTikTokForeground()) {
+            devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
+            dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
+            return true
+        }
         val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         if (forceStopBeforeLaunch) {
             runSuCommand("am force-stop $pkg")
             delay(forceStopWaitMs)
+            invalidateForegroundProbeCache()
+        }
+
+        val hostWasForeground = isHostAppInForeground()
+        val tiktokAlreadyForeground = !forceStopBeforeLaunch && isTikTokForeground()
+        if (!hostWasForeground && !tiktokAlreadyForeground) {
+            devOp(alias, "$tag：当前不在本应用界面，先切回 AutoTraces 再拉起 TikTok")
+            bringHostAppToForeground(ctx)
+            delay(400)
         }
 
         var didLaunchCommand = false
-        val intent = buildTikTokLaunchIntent(ctx)
-        if (intent != null) {
-            try {
-                ctx.startActivity(intent)
-                didLaunchCommand = true
-            } catch (_: Exception) {
-                // fall through to root launch
-            }
-        }
-        if (!didLaunchCommand) {
+        if (tiktokAlreadyForeground) {
+            devOp(alias, "$tag：TikTok 已在前台（严格 dumpsys），跳过重复拉起")
+            didLaunchCommand = true
+        } else {
+            // 本应用/悬浮层在前台时 startActivity 常无法切到 TikTok，优先 root 拉起
             didLaunchCommand = runTikTokRootLaunchCommands()
+            if (!didLaunchCommand) {
+                val intent = buildTikTokLaunchIntent(ctx)
+                if (intent != null) {
+                    try {
+                        ctx.startActivity(intent)
+                        didLaunchCommand = true
+                    } catch (_: Exception) {
+                        // fall through to root launch
+                    }
+                }
+            }
+            if (!didLaunchCommand) {
+                didLaunchCommand = runTikTokRootLaunchCommands()
+            }
         }
         if (!didLaunchCommand) {
             devOp(alias, "$tag：拉起 TikTok 失败（启动命令均未成功）")
             return false
         }
 
-        devOp(alias, "$tag：启动命令已执行，等待 ${launchWaitMs}ms（tiktok_launch_wait_ms）后进行前台校验")
+        devOp(alias, "$tag：启动命令已执行，等待 ${launchWaitMs}ms（tiktok_launch_wait_ms）后进行严格前台校验")
         delay(launchWaitMs)
 
-        var confirmed = isPackageVisible(pkg)
+        suspend fun confirmStrictForeground(): Boolean {
+            invalidateForegroundProbeCache()
+            return isPackageVisible(pkg)
+        }
+
+        var confirmed = confirmStrictForeground()
         if (!confirmed) {
-            devOp(alias, "$tag：配置等待后前台校验未通过，再等 1200ms 重试 dumpsys")
-            delay(1200)
-            confirmed = isPackageVisible(pkg)
+            devOp(alias, "$tag：配置等待后严格前台校验未通过，root 补拉 TikTok 一次")
+            if (runTikTokRootLaunchCommands()) {
+                delay(launchWaitMs.coerceAtMost(4000L).coerceAtLeast(1200L))
+                confirmed = confirmStrictForeground()
+            }
         }
         if (!confirmed) {
-            devOp(alias, "$tag：拉起 TikTok 失败（配置等待后前台校验未通过，跳过 Don't allow OCR）")
+            devOp(alias, "$tag：补拉后仍未通过，再等 1200ms 重试严格 dumpsys")
+            delay(1200)
+            confirmed = confirmStrictForeground()
+        }
+        if (!confirmed) {
+            logForegroundProbeFailure(alias, tag, pkg)
+            devOp(alias, "$tag：拉起 TikTok 失败（严格前台校验未通过，跳过 Don't allow OCR）")
             return false
         }
 
+        val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
+        devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}）")
+
         val dismissedDontAllow = dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
         delay(if (dismissedDontAllow) 600L else 350L)
+
+        invalidateForegroundProbeCache()
+        if (!confirmStrictForeground()) {
+            logForegroundProbeFailure(alias, tag, pkg)
+            devOp(alias, "$tag：Don't allow 处理后 TikTok 已不在前台，拉起失败")
+            return false
+        }
 
         when {
             dismissedDontAllow ->
@@ -463,8 +590,14 @@ class RealTraceExecutor(
         }
 
         delay(350)
+        invalidateForegroundProbeCache()
         if (isPackageVisible(pkg)) {
-            devOp(alias, "重启 TikTok 成功（短等后 dumpsys 已为前台）", System.currentTimeMillis() - t0)
+            val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
+            devOp(
+                alias,
+                "重启 TikTok 成功（短等后严格前台=${fgPkg ?: "未知"}）",
+                System.currentTimeMillis() - t0,
+            )
             return true
         }
 
@@ -893,6 +1026,130 @@ class RealTraceExecutor(
             delay(12)
         }
         delay(80)
+    }
+
+    private sealed class ProfileEditAvatarUploadWaitOutcome {
+        data object HardStop : ProfileEditAvatarUploadWaitOutcome()
+        /** 等待阶段已 strict 命中「Change photo」，可跳过其后 7 次校验。 */
+        data class ChangePhotoReady(val pollAttempts: Int) : ProfileEditAvatarUploadWaitOutcome()
+        /** uploading 已消失（或曾出现），进入 Change photo 7 次校验。 */
+        data class NeedChangePhotoVerify(val pollAttempts: Int) : ProfileEditAvatarUploadWaitOutcome()
+        /** 60s 内未完成等待；已执行强停并重拉 TikTok。 */
+        data class TimedOut(val pollAttempts: Int) : ProfileEditAvatarUploadWaitOutcome()
+    }
+
+    /** Save(发帖) 后：强停 TikTok 并重新拉起（不含资料比例点）。 */
+    private suspend fun profileEditForceStopAndRelaunchTikTok(
+        ctx: Context,
+        logAlias: String,
+        phaseTag: String,
+        config: AppConfig,
+    ): Boolean {
+        val pkg = Config.TIKTOK_PACKAGE_NAME
+        devOp(logAlias, "「修改基本资料」$phaseTag：am force-stop $pkg")
+        val stopOk = runSuCommand("am force-stop $pkg")
+        if (!stopOk) {
+            devOp(logAlias, "「修改基本资料」$phaseTag：强停命令未成功，仍继续拉起")
+        }
+        if (!profileEditDelay(logAlias, 1200L, "$phaseTag·强停后")) return false
+        devOp(logAlias, "「修改基本资料」$phaseTag：拉起 TikTok + dumpsys 前台校验")
+        val launchOk = launchTikTokWithForegroundVerification(
+            ctx = ctx,
+            alias = logAlias,
+            tag = phaseTag,
+            forceStopBeforeLaunch = false,
+            timingConfig = config,
+        )
+        devOp(logAlias, "「修改基本资料」$phaseTag：拉起结果=${if (launchOk) "success" else "failed"}")
+        return launchOk
+    }
+
+    /**
+     * Save(发帖) 之后：每 1s 整屏 OCR。
+     * - strict「Change photo」→ 上传已完成；
+     * - 文案含 uploading → 上传中，继续轮询；
+     * - 曾见 uploading 且本轮未见 → 进入后续 Change photo 校验；
+     * - 逾 [PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS] → 强停并重拉 TikTok。
+     */
+    private suspend fun profileEditWaitAvatarUploadSettledOrChangePhoto(
+        ctx: Context,
+        logAlias: String,
+        runtimeConfig: AppConfig,
+    ): ProfileEditAvatarUploadWaitOutcome {
+        val startedAt = System.currentTimeMillis()
+        var pollAttempts = 0
+        var sawUploading = false
+
+        while (System.currentTimeMillis() - startedAt < PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS) {
+            if (hardStopOrNull(logAlias, "发帖后头像上传等待")) {
+                return ProfileEditAvatarUploadWaitOutcome.HardStop
+            }
+            pollAttempts++
+            val elapsedSec = (System.currentTimeMillis() - startedAt) / 1000
+            val (vision, err) = mlKitRecognizeFullScreen(ctx, "profile_edit_avatar_upload_wait_$pollAttempts")
+            if (vision == null) {
+                devOp(
+                    logAlias,
+                    "「修改基本资料」发帖后上传等待 OCR $pollAttempts 次失败：$err（已等待约 ${elapsedSec}s）",
+                )
+                if (err == "hard_stop") return ProfileEditAvatarUploadWaitOutcome.HardStop
+            } else {
+                val preview = buildProfileEditOcrPreview(vision).take(420)
+                devOp(
+                    logAlias,
+                    "「修改基本资料」发帖后上传等待第 $pollAttempts 次（约 ${elapsedSec}s）：摘要=$preview",
+                )
+                if (findStrictExactLabelHit(vision, "Change photo") != null) {
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」发帖后上传等待：已 strict 定位「Change photo」（第 $pollAttempts 次），跳过后续 7 次校验",
+                    )
+                    return ProfileEditAvatarUploadWaitOutcome.ChangePhotoReady(pollAttempts)
+                }
+                val uploadingHit = findLabelHitContainingIgnoreCase(vision, "uploading")
+                if (uploadingHit != null) {
+                    sawUploading = true
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」发帖后上传等待：检测到 uploading（头像上传中），继续每 1s OCR",
+                    )
+                } else if (sawUploading) {
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」发帖后上传等待：uploading 已消失（第 $pollAttempts 次），进入 Change photo 校验（至多 7 次）",
+                    )
+                    return ProfileEditAvatarUploadWaitOutcome.NeedChangePhotoVerify(pollAttempts)
+                } else {
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」发帖后上传等待：未见 uploading、未见「Change photo」，1s 后继续 OCR",
+                    )
+                }
+            }
+
+            val remainingMs = PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS - (System.currentTimeMillis() - startedAt)
+            if (remainingMs <= 0L) break
+            if (!profileEditDelay(
+                    logAlias,
+                    minOf(PROFILE_EDIT_AVATAR_UPLOAD_POLL_MS, remainingMs),
+                    "发帖后头像上传等待",
+                )
+            ) {
+                return ProfileEditAvatarUploadWaitOutcome.HardStop
+            }
+        }
+
+        devOp(
+            logAlias,
+            "「修改基本资料」发帖后上传等待：逾时 ${PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS / 1000}s（OCR $pollAttempts 次，曾见 uploading=$sawUploading），强停并重拉 TikTok",
+        )
+        profileEditForceStopAndRelaunchTikTok(
+            ctx,
+            logAlias,
+            "发帖后上传等待超时",
+            runtimeConfig,
+        )
+        return ProfileEditAvatarUploadWaitOutcome.TimedOut(pollAttempts)
     }
 
     /**
@@ -1796,7 +2053,7 @@ class RealTraceExecutor(
                 "同屏严格「Change photo」首击（若无则专段整屏 OCR）→" +
                 "整屏「Upload photo」（OCR 最多 3 次）→「Allow all」（OCR 最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次，未命中仅跳过该按钮）→" +
                 "左上固定点→Next×2（间隔 0.5s）→Post this photo to Story→Save→" +
-                "等 2s 后 OCR「Change photo」校验至多 7 次→Name→Bio(模板)→" +
+                "uploading 轮询(1s,≤60s,超时强停重拉)→OCR「Change photo」校验至多 7 次→Name→Bio(模板)→" +
                 "①Save→终验→返回(至多3轮)→②比例点→【插入】Permissions+Save login info(2.5s)+返回→【旧】Permissions校验+Privacy→Comments(6)→下滑→Viewers→On/Off→Viewer history(7)→等3s",
         )
 
@@ -2361,29 +2618,52 @@ class RealTraceExecutor(
             return chainBase(success = false, failureStep = "post_save_ocr_miss")
         }
 
-        delay(2000L)
+        if (!profileEditDelay(logAlias, 400L, "Save(发帖)后")) {
+            return chainBase(success = false, failureStep = "hard_stop")
+        }
+        val uploadWaitOutcome = profileEditWaitAvatarUploadSettledOrChangePhoto(ctx, logAlias, runtimeConfig)
         var avatarPostVerifyCount = 0
         var avatarPostSeen = false
-        while (avatarPostVerifyCount < 7) {
-            avatarPostVerifyCount++
-            if (avatarPostVerifyCount > 1) delay(800)
-            val (vAv, eAv) = mlKitRecognizeFullScreen(ctx, "profile_edit_avatar_verify_$avatarPostVerifyCount")
-            if (vAv == null) {
-                devOp(logAlias, "「修改基本资料」发帖后头像校验 OCR $avatarPostVerifyCount/7 失败：$eAv")
-                continue
+        when (uploadWaitOutcome) {
+            ProfileEditAvatarUploadWaitOutcome.HardStop ->
+                return chainBase(success = false, failureStep = "hard_stop")
+            is ProfileEditAvatarUploadWaitOutcome.TimedOut -> {
+                avatarPostVerifyCount = uploadWaitOutcome.pollAttempts
+                return chainBase(
+                    success = false,
+                    failureStep = "avatar_uploading_wait_timeout",
+                    avatarTryCount = avatarPostVerifyCount,
+                )
             }
-            devOp(
-                logAlias,
-                "「修改基本资料」发帖后头像校验第 $avatarPostVerifyCount/7 次：摘要=${buildProfileEditOcrPreview(vAv).take(420)}",
-            )
-            if (findStrictExactLabelHit(vAv, "Change photo") != null) {
+            is ProfileEditAvatarUploadWaitOutcome.ChangePhotoReady -> {
                 avatarPostSeen = true
-                devOp(logAlias, "「修改基本资料」发帖后：已定位「Change photo」（$avatarPostVerifyCount/7），继续 Name→Bio 流程")
-                break
+                avatarPostVerifyCount = uploadWaitOutcome.pollAttempts
+                devOp(
+                    logAlias,
+                    "「修改基本资料」发帖后：上传等待阶段已见「Change photo」（等待 OCR ${uploadWaitOutcome.pollAttempts} 次），继续 Name→Bio",
+                )
             }
-            devOp(logAlias, "「修改基本资料」发帖后头像校验第 $avatarPostVerifyCount/7 次：未见「Change photo」")
+            is ProfileEditAvatarUploadWaitOutcome.NeedChangePhotoVerify -> {
+                avatarPostVerifyCount = uploadWaitOutcome.pollAttempts
+                devOp(
+                    logAlias,
+                    "「修改基本资料」发帖后：uploading 已结束，开始 Change photo 校验（等待阶段 OCR ${uploadWaitOutcome.pollAttempts} 次）",
+                )
+                val (seen, verifyTries) = profileEditOcrUntilChangePhotoSeen(
+                    ctx = ctx,
+                    logAlias = logAlias,
+                    ocrTagPrefix = "profile_edit_avatar_verify",
+                    humanPhase = "发帖后头像校验",
+                    maxTries = 7,
+                )
+                avatarPostSeen = seen
+                avatarPostVerifyCount = uploadWaitOutcome.pollAttempts + verifyTries
+            }
         }
         if (!avatarPostSeen) {
+            if (PrefsStore.isHardStopRequested()) {
+                return chainBase(success = false, failureStep = "hard_stop", avatarTryCount = avatarPostVerifyCount)
+            }
             devOp(
                 logAlias,
                 "「修改基本资料」发帖后：7 次均未出现「Change photo」，判定异常，本链失败（外轮将强停重来）",
@@ -2812,7 +3092,10 @@ class RealTraceExecutor(
         tag: String,
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        if (isPackageVisible(pkg)) return true
+        if (isPackageVisible(pkg)) {
+            devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
+            return true
+        }
 
         val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
 
@@ -2828,6 +3111,7 @@ class RealTraceExecutor(
             return true
         }
 
+        logForegroundProbeFailure(alias, tag, pkg)
         devOp(alias, "$tag：强停重拉后前台仍未确认，本段任务无法安全继续")
         return false
     }
@@ -2835,6 +3119,10 @@ class RealTraceExecutor(
     private suspend fun runForYouWarmupIfNeeded(service: Context, alias: String, config: AppConfig) {
         val totalMs = (config.for_you_swipe_total_sec * 1000.0).toLong().coerceAtLeast(0L)
         if (totalMs < 500L) return
+        if (PrefsStore.isWithinHardStopGracePeriod()) {
+            devOp(alias, "For You 预滑：检测到刚经历硬停恢复，跳过本次休息/预滑")
+            return
+        }
         if (!ensureTikTokInForeground(service, alias, "For You 预滑")) return
 
         val likeProb = config.for_you_like_prob.coerceIn(0.0, 1.0)
@@ -2958,6 +3246,7 @@ class RealTraceExecutor(
         devOp(alias, "进入 executeForUsername：username=$username runMode=$runMode mutualRequested=$mutualRequested mutualPending=$mutualPending hardStop=${PrefsStore.isHardStopRequested()}")
         if (shouldSwitchToMutualClick()) {
             val commentOnlyForMessage = PrefsStore.isMutualCommentOnlySession()
+            val followOnlyForMessage = PrefsStore.isMutualFollowOnlySession()
             val modeName = when (runMode) {
                 ServerRunMode.DIRECT -> "直客访问模式"
                 ServerRunMode.LIVE -> "主播访问模式"
@@ -2968,7 +3257,7 @@ class RealTraceExecutor(
             lastEndedAtUsersSelection = false
             PrefsStore.setMutualClickPending(false)
             PrefsStore.setMutualClickRequested(false)
-            return enterMutualClickMode(service, config, commentOnlyForMessage)
+            return enterMutualClickMode(service, config, commentOnlyForMessage, followOnlyForMessage)
         }
         if ((runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) && restartFromMagnifierForGrowth) {
             devOp(alias, "涨粉模式：重启后从点击放大镜重新开始")
@@ -3165,10 +3454,40 @@ class RealTraceExecutor(
         }
     }
 
+    /** 顶栏 Videos 标签 OCR 定位，最多 [MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS] 次，间隔 1.5s。 */
+    private suspend fun findVideosTabAnchorByOcrWithRetries(
+        service: Context,
+        launchCheckTag: String,
+        passLabel: String,
+    ): Point? {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val tagSuffix = if (passLabel.isBlank()) launchCheckTag else "$launchCheckTag·$passLabel"
+        var videosAnchor: Point? = null
+        for (ocrAttempt in 1..MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
+            videosAnchor = findVideosTabAnchorByOcrFast(service)
+            if (videosAnchor != null) return videosAnchor
+            if (ocrAttempt < MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
+                devOp(
+                    alias,
+                    "互点：未找到 Videos 标签（$tagSuffix）第 $ocrAttempt/${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次，${1500}ms 后重试 OCR",
+                )
+                delay(1500)
+            }
+        }
+        devOp(
+            alias,
+            "互点：${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次 OCR 均未找到 Videos 标签（$tagSuffix）",
+        )
+        return null
+    }
+
     private suspend fun enterVideosVideoByQuarterTaps(service: Context, config: AppConfig): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val mutualCommentOnly = PrefsStore.isMutualCommentOnlySession()
-        val leftSwipeFollowEnabled = config.mutual_left_swipe_follow
+        val mutualFollowOnly = PrefsStore.isMutualFollowOnlySession()
+        val trafficComment = config.mutual_traffic_comment
+        val trafficAuthor = config.mutual_traffic_author_follow
+        val trafficFollowers = config.mutual_traffic_followers_follow
         val videoRoundCap =
             config.mutual_videos_scroll_rounds.coerceAtLeast(1).coerceAtMost(MUTUAL_FULL_VIDEOS_SAFETY_ROUNDS)
         val followLimit = config.mutual_follow_tap_session_limit.coerceAtLeast(1)
@@ -3184,16 +3503,23 @@ class RealTraceExecutor(
         val beforeTapForVerify = File(service.cacheDir, "mutual_videos_before_tap.png")
         devOp(
             alias,
-            if (mutualCommentOnly) {
+            if (mutualFollowOnly) {
+                "互点：进入 Videos（仅关注·独立方案）最多 $videoRoundCap 轮；Follow 达上限 $followLimit 即提前完成（无评论）；轮间下滑换批"
+            } else if (mutualCommentOnly) {
                 "互点：进入 Videos（互点评论·兼容旧指令）共 $videoRoundCap 轮（左+右各进 1 次作品为 1 轮），轮间下滑约半屏换批"
             } else {
+                val actions = buildList {
+                    if (trafficComment) add("评论")
+                    if (trafficAuthor) add("作者区关注")
+                    if (trafficFollowers) add("Followers关注")
+                }.joinToString("/").ifBlank { "无引流动作" }
                 val limitHint =
-                    if (leftSwipeFollowEnabled) {
-                        "达到粉丝列表 Follow 上限 $followLimit 后仍左滑并在作者区点 Follow，仅不再进 Followers"
+                    if (trafficComment) {
+                        "Follow 上限 $followLimit（作者区+列表合计）达限后剩余轮次仅评论"
                     } else {
-                        "达到粉丝列表 Follow 上限 $followLimit 后本会话剩余轮次不再左滑/进 Followers，仅互点评论"
+                        "Follow 上限 $followLimit 达限后立即结束"
                     }
-                "互点：进入 Videos（完整互点）共 $videoRoundCap 轮；$limitHint；轮间下滑换批"
+                "互点：进入 Videos（引流）共 $videoRoundCap 轮；动作=$actions；$limitHint；轮间下滑换批"
             },
         )
         try {
@@ -3208,7 +3534,13 @@ class RealTraceExecutor(
                 if (roundIndex >= videoRoundCap) {
                     devOp(
                         alias,
-                        "互点：teamwork Videos 已达配置轮次 $videoRoundCap（${if (mutualCommentOnly) "互点评论兼容" else "完整互点"}），结束",
+                        "互点：teamwork Videos 已达配置轮次 $videoRoundCap（${
+                            when {
+                                mutualFollowOnly -> "互点仅关注"
+                                mutualCommentOnly -> "互点评论兼容"
+                                else -> "完整互点"
+                            }
+                        }），结束",
                     )
                     break@mainVideosLoop
                 }
@@ -3216,6 +3548,17 @@ class RealTraceExecutor(
                 for ((tapIndex, tap) in fixedTaps.withIndex()) {
                     coroutineContext.ensureActive()
                     if (hardStopOrNull(alias, "互点 Videos 互动")) break@mainVideosLoop
+                    if (shouldStopMutualVideosAfterFollowLimit(config)) {
+                        devOp(
+                            alias,
+                            if (mutualFollowOnly) {
+                                "互点仅关注：Follow 已达上限 $followLimit，会话提前完成（不继续 Videos 轮次/列表下滑）"
+                            } else {
+                                "互点：Follow 已达上限 $followLimit 且未开启引流评论，结束 Videos 轮次"
+                            },
+                        )
+                        break@mainVideosLoop
+                    }
                     val sideLabel = if (tapIndex == 0) "左侧" else "右侧"
                     var verified = false
                     var recoveryCycles = 0
@@ -3262,44 +3605,75 @@ class RealTraceExecutor(
                         didRestartTikTokInCurrentRun = true
                         reopenMutualTeamworkVideosTabWithRetries(service, config, "互点 teamwork 恢复")
                     }
-                    val unitTag = if (mutualCommentOnly) {
+                    val unitTag = if (mutualFollowOnly || mutualCommentOnly) {
                         "Videos ${roundIndex + 1}/$videoRoundCap $sideLabel"
                     } else if (mutualFollowLimitReached) {
                         "Videos ${roundIndex + 1}/$videoRoundCap $sideLabel·Follow已达上限仅评论"
                     } else {
                         "Videos 第${roundIndex + 1}轮 $sideLabel"
                     }
-                    val skipLeftSwipeAuthor =
-                        mutualCommentOnly || (mutualFollowLimitReached && !leftSwipeFollowEnabled)
+                    val skipLeftSwipeAuthor = shouldSkipMutualAuthorLayerSwipe(config, mutualCommentOnly)
                     if (skipLeftSwipeAuthor) {
-                        val reason =
-                            if (mutualCommentOnly) "互点评论会话" else "已达粉丝列表 Follow 上限且未开启左滑关注"
+                        val reason = when {
+                            mutualFollowOnly -> "互点仅关注（独立方案）"
+                            mutualCommentOnly -> "互点评论会话（兼容旧指令）"
+                            mutualFollowLimitReached -> "Follow 已达上限，仅保留作品内互动"
+                            else -> "未开启作者区/Followers 关注"
+                        }
                         devOp(alias, "互点：$unitTag $reason，跳过左滑与作者主页，留在当前作品继续互动")
                     } else {
-                        mutualVideosLeftSwipeThenDoubleBackToPost(service, config, unitTag)
+                        val stopAfterUnit =
+                            mutualVideosLeftSwipeThenDoubleBackToPost(service, config, unitTag)
+                        if (stopAfterUnit) {
+                            devOp(alias, "互点：$unitTag 作者/Followers 链路后 Follow 已满且未开评论，结束 Videos 轮次")
+                            break@mainVideosLoop
+                        }
                     }
                     val postStayMs = randomDelayMsFromSecondsRange(config.video_stay_min, config.video_stay_max)
                     devOp(alias, "互点：$unitTag 回到作品后停留 ${postStayMs}ms")
                     delay(postStayMs)
-                    val actionMode = if (config.like_prob >= config.favorite_prob) "like" else "favorite"
-                    if (actionMode == "like") {
-                        performLike(service)
-                    } else {
-                        performFavorite(service, useOcrAnchor = false)
-                    }
-                    val actionGapMin = config.action_delay_min.coerceAtLeast(0.0)
-                    val actionGapMax = config.action_delay_max.coerceAtLeast(actionGapMin)
-                    coroutineContext.ensureActive()
-                    if (!hardStopOrNull(alias, "互点 Videos 发表评论前")) {
-                        val commentAvail = config.comment_daily_limit > 0 &&
-                            PrefsStore.getDailyActionCount("comment") < config.comment_daily_limit
-                        if (commentAvail) {
-                            delay(randomDelayMsFromSecondsRange(actionGapMin, actionGapMax))
-                            if (performMutualCommentTextDirectFixedCoordinate(service, config)) {
-                                PrefsStore.incrementDailyActionCount("comment")
+                    if (mutualFollowOnly) {
+                        coroutineContext.ensureActive()
+                        if (!hardStopOrNull(alias, "互点 Videos 仅关注打开评论区前")) {
+                            openMutualCommentPanelOnly(service)
+                            val commentPanelClosed =
+                                performMutualFollowOnlyCommentAreaSteps(service, config)
+                            if (!commentPanelClosed) {
+                                closeMutualCommentPanelAfterFollowOnly(service)
                             }
+                        }
+                        if (mutualFollowLimitReached) {
+                            devOp(
+                                alias,
+                                "互点仅关注：本作品评论区 Follow 已满，结束 Videos 会话",
+                            )
+                            break@mainVideosLoop
+                        }
+                    } else {
+                        val actionMode = if (config.like_prob >= config.favorite_prob) "like" else "favorite"
+                        if (actionMode == "like") {
+                            performLike(service)
                         } else {
-                            devOp(alias, "互点：Videos 跳过评论（已达上限或 comment_daily_limit 为 0）")
+                            performFavorite(service, useOcrAnchor = false)
+                        }
+                        val actionGapMin = config.action_delay_min.coerceAtLeast(0.0)
+                        val actionGapMax = config.action_delay_max.coerceAtLeast(actionGapMin)
+                        coroutineContext.ensureActive()
+                        if (!hardStopOrNull(alias, "互点 Videos 发表评论前")) {
+                            if (!trafficComment) {
+                                devOp(alias, "互点：Videos 跳过评论（模板未开启 mutual_traffic_comment）")
+                            } else {
+                                val commentAvail = config.mutual_traffic_comment_daily_limit > 0 &&
+                                    PrefsStore.getDailyActionCount("mutual_traffic_comment") < config.mutual_traffic_comment_daily_limit
+                                if (commentAvail) {
+                                    delay(randomDelayMsFromSecondsRange(actionGapMin, actionGapMax))
+                                    if (performMutualCommentTextDirectFixedCoordinate(service, config)) {
+                                        PrefsStore.incrementDailyActionCount("mutual_traffic_comment")
+                                    }
+                                } else {
+                                    devOp(alias, "互点：Videos 跳过评论（已达引流评论日上限或 mutual_traffic_comment_daily_limit 为 0）")
+                                }
+                            }
                         }
                     }
                     delay(Random.nextLong(700, 1100))
@@ -3307,6 +3681,9 @@ class RealTraceExecutor(
                     delay(Random.nextLong(800, 1200))
                 }
                 roundIndex++
+                if (shouldStopMutualVideosAfterFollowLimit(config)) {
+                    break@mainVideosLoop
+                }
                 val sessionDone = roundIndex >= videoRoundCap
                 if (sessionDone) break@mainVideosLoop
                 // 左右两侧已在各自发评后各执行过一次 navBack 回到 teamwork Videos 列表，此处再按一次会多退一层（用户观感为「发评后连按两次返回」）。
@@ -3467,6 +3844,313 @@ class RealTraceExecutor(
         if (tokens.any { it == "message" }) return false
         return norm.contains("follow") && !norm.contains("following") && !norm.contains("followers")
     }
+
+    private fun isMutualFollowingLabelNormalized(norm: String): Boolean {
+        if (norm.isBlank()) return false
+        val tokens = norm.split(Regex("[^a-z]+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        if (tokens.any { it == "followers" }) return false
+        return tokens.any { it == "following" }
+    }
+
+    private fun isMutualMessageLabelNormalized(norm: String): Boolean {
+        if (norm.isBlank()) return false
+        val tokens = norm.split(Regex("[^a-z]+")).filter { it.isNotEmpty() }
+        return tokens.any { it == "message" } || norm.contains("message")
+    }
+
+    private sealed class MutualFollowOnlyProfileFollowDecision {
+        data class TapFollow(val point: Point, val layoutLabel: String) : MutualFollowOnlyProfileFollowDecision()
+        data class Skip(val reason: String) : MutualFollowOnlyProfileFollowDecision()
+        data object NoLayer : MutualFollowOnlyProfileFollowDecision()
+    }
+
+    private sealed class MutualFollowOnlyPostTapClassify {
+        /** 已识别分栏/横条主页格局（含可点 Follow 或应 Skip） */
+        data class ProfileLayout(val decision: MutualFollowOnlyProfileFollowDecision) :
+            MutualFollowOnlyPostTapClassify()
+
+        /** 仍在 Replying，未进主页 */
+        data object Replying : MutualFollowOnlyPostTapClassify()
+
+        /** 既无 Replying 也未认出主页格局 */
+        data object Unclear : MutualFollowOnlyPostTapClassify()
+    }
+
+    private data class MutualFollowOnlyReplyAvatarTapResult(
+        val abandonCoordinate: Boolean,
+        val profileDecision: MutualFollowOnlyProfileFollowDecision? = null,
+    )
+
+    private fun mutualFollowOnlyOcrElementsFromResult(result: Text): List<OcrLabelHit> =
+        result.textBlocks.asSequence()
+            .flatMap { it.lines.asSequence() }
+            .flatMap { it.elements.asSequence() }
+            .mapNotNull { el ->
+                val box = el.boundingBox ?: return@mapNotNull null
+                val norm = normalizeOcrButtonText(el.text)
+                if (norm.isBlank()) return@mapNotNull null
+                OcrLabelHit(norm, box.centerX(), box.centerY())
+            }
+            .toList()
+
+    private fun mutualFollowOnlyScreenShowsReplyingFromElements(elements: List<OcrLabelHit>): Boolean =
+        elements.any { isMutualFollowOnlyReplyingOcrLabel(it.norm) }
+
+    /**
+     * 从整屏 OCR 元素判断格局B（分栏/上半 Follow）或格局A（横条作者区）。
+     * 格局B 含：下半 Message + 上半 Follow；或上半仅有 Follow、下半无 Message/其他按钮。
+     */
+    private fun mutualFollowOnlyProfileDecisionFromElements(
+        elements: List<OcrLabelHit>,
+        fullW: Int,
+        fullH: Int,
+        cropTop: Int,
+        cropBottom: Int,
+    ): MutualFollowOnlyProfileFollowDecision {
+        val upperBound = (fullH * 0.52f).toInt()
+        val lowerBound = (fullH * 0.48f).toInt()
+        val upper = elements.filter { it.centerY <= upperBound }
+        val lower = elements.filter { it.centerY >= lowerBound }
+
+        val lowerMessages = lower.filter { isMutualMessageLabelNormalized(it.norm) }
+        val lowerFollows = lower.filter { isMutualFollowButtonTextNormalized(it.norm) }
+        val upperFollows = upper.filter { isMutualFollowButtonTextNormalized(it.norm) }
+        val upperFollowing = upper.filter {
+            isMutualFollowingLabelNormalized(it.norm) && !isMutualFollowButtonTextNormalized(it.norm)
+        }
+
+        // 格局B（分栏式）：下半有 Message + 上半有 Follow/Following；或上半仅有 Follow、下半无 Message/其他按钮
+        val splitLayoutClassic =
+            lowerMessages.isNotEmpty() && (upperFollows.isNotEmpty() || upperFollowing.isNotEmpty())
+        val splitLayoutUpperFollowOnly =
+            upperFollows.isNotEmpty() &&
+                lowerMessages.isEmpty() &&
+                lowerFollows.isEmpty()
+        if (splitLayoutClassic || splitLayoutUpperFollowOnly) {
+            if (upperFollowing.isNotEmpty() && upperFollows.isEmpty()) {
+                return MutualFollowOnlyProfileFollowDecision.Skip("格局B已为 Following")
+            }
+            val followHit = upperFollows.maxByOrNull { it.centerX } ?: upperFollows.firstOrNull()
+            if (followHit != null) {
+                return MutualFollowOnlyProfileFollowDecision.TapFollow(
+                    Point(
+                        followHit.centerX.coerceIn(1, fullW - 1),
+                        followHit.centerY.coerceIn(1, fullH - 1),
+                    ),
+                    if (splitLayoutUpperFollowOnly) "格局B上半屏仅Follow" else "格局B上半屏",
+                )
+            }
+            return MutualFollowOnlyProfileFollowDecision.Skip("格局B上半屏无 Follow")
+        }
+
+        val inAuthorCrop = elements.filter { it.centerY in cropTop..cropBottom }
+        val messageInCrop = inAuthorCrop.filter { isMutualMessageLabelNormalized(it.norm) }
+        val followInCrop = inAuthorCrop.filter { isMutualFollowButtonTextNormalized(it.norm) }
+        val rowYTol = (fullH * 0.015f).toInt().coerceIn(14, 56)
+        val halfW = (fullW * 0.5f).toInt()
+        fun sameRow(y: Int, base: Int) = kotlin.math.abs(y - base) <= rowYTol
+
+        val messageHit = messageInCrop.firstOrNull()
+        val messageY = messageHit?.centerY
+        val inlineFollow = if (messageY != null) {
+            val my = messageY
+            val mx = messageHit?.centerX
+            followInCrop.firstOrNull { sameRow(it.centerY, my) && it.centerX >= halfW }
+                ?: if (mx != null) {
+                    followInCrop.firstOrNull { sameRow(it.centerY, my) && it.centerX > mx }
+                } else {
+                    null
+                }
+                ?: followInCrop.firstOrNull { sameRow(it.centerY, my) }
+                ?: followInCrop.firstOrNull()
+        } else {
+            followInCrop.firstOrNull()
+        }
+        if (inlineFollow != null) {
+            return MutualFollowOnlyProfileFollowDecision.TapFollow(
+                Point(
+                    inlineFollow.centerX.coerceIn(1, fullW - 1),
+                    inlineFollow.centerY.coerceIn(1, fullH - 1),
+                ),
+                "格局A横条作者区",
+            )
+        }
+        if (messageInCrop.isNotEmpty()) {
+            return MutualFollowOnlyProfileFollowDecision.Skip("格局A已为 Message")
+        }
+        return MutualFollowOnlyProfileFollowDecision.NoLayer
+    }
+
+    private suspend fun mutualFollowOnlyClassifyPostTapScreen(service: Context): MutualFollowOnlyPostTapClassify? {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val screenshotFile = File(service.cacheDir, "mutual_follow_only_post_tap_ocr.png")
+        if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return null
+        val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
+            screenshotFile.delete()
+            return null
+        }
+        val fullW = bitmap.width.coerceAtLeast(1)
+        val fullH = bitmap.height.coerceAtLeast(1)
+        val followersRef = mutualClickFollowersLowerLeftReferencePx(service)
+        val cropTop = (followersRef.y + fullH * 0.05f).toInt().coerceIn(0, fullH - 1)
+        val cropBottom = (fullH * 0.5f).toInt().coerceIn(cropTop + 1, fullH)
+        val image = InputImage.fromBitmap(bitmap, 0)
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        return try {
+            val result = suspendCancellableCoroutine { cont ->
+                recognizer.process(image)
+                    .addOnSuccessListener { cont.resume(it) }
+                    .addOnFailureListener { cont.resumeWithException(it) }
+            }
+            val elements = mutualFollowOnlyOcrElementsFromResult(result)
+            val replying = mutualFollowOnlyScreenShowsReplyingFromElements(elements) ||
+                result.textBlocks.asSequence()
+                    .flatMap { it.lines.asSequence() }
+                    .any { line ->
+                        isMutualFollowOnlyReplyingOcrLabel(normalizeOcrButtonText(line.text))
+                    }
+            val profile = mutualFollowOnlyProfileDecisionFromElements(
+                elements,
+                fullW,
+                fullH,
+                cropTop,
+                cropBottom,
+            )
+            when {
+                profile !is MutualFollowOnlyProfileFollowDecision.NoLayer ->
+                    MutualFollowOnlyPostTapClassify.ProfileLayout(profile)
+                replying -> MutualFollowOnlyPostTapClassify.Replying
+                else -> MutualFollowOnlyPostTapClassify.Unclear
+            }
+        } catch (ex: Exception) {
+            devOp(alias, "互点仅关注：点击后 OCR 分类异常 ${ex.message}")
+            null
+        } finally {
+            recognizer.close()
+            bitmap.recycle()
+            screenshotFile.delete()
+        }
+    }
+
+    /**
+     * 同一次截屏：优先认主页格局，其次 Replying；最多 6 次、间隔 0.5s。
+     * @return 任一轮认出 ProfileLayout 即返回；连续 Replying 返回 Replying；否则 Unclear。
+     */
+    private suspend fun mutualFollowOnlyClassifyPostTapScreenWithRetries(
+        service: Context,
+        logTag: String,
+    ): MutualFollowOnlyPostTapClassify {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        var sawReplying = false
+        for (attempt in 1..MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, "互点仅关注 $logTag 点击后 OCR")) {
+                return MutualFollowOnlyPostTapClassify.Unclear
+            }
+            when (val one = mutualFollowOnlyClassifyPostTapScreen(service)) {
+                null -> devOp(alias, "互点仅关注：$logTag 点击后 OCR 第 $attempt 次截屏失败")
+                is MutualFollowOnlyPostTapClassify.ProfileLayout -> {
+                    if (attempt > 1) {
+                        devOp(
+                            alias,
+                            "互点仅关注：$logTag 第 $attempt 次 OCR 提前认定主页格局（${
+                                when (val d = one.decision) {
+                                    is MutualFollowOnlyProfileFollowDecision.TapFollow -> d.layoutLabel
+                                    is MutualFollowOnlyProfileFollowDecision.Skip -> d.reason
+                                    is MutualFollowOnlyProfileFollowDecision.NoLayer -> "?"
+                                }
+                            }）",
+                        )
+                    }
+                    return one
+                }
+                is MutualFollowOnlyPostTapClassify.Replying -> {
+                    sawReplying = true
+                    devOp(
+                        alias,
+                        "互点仅关注：$logTag 点击后 OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次仍为 Replying",
+                    )
+                }
+                is MutualFollowOnlyPostTapClassify.Unclear -> {
+                    devOp(
+                        alias,
+                        "互点仅关注：$logTag 点击后 OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次未见格局/Replying",
+                    )
+                }
+            }
+            if (attempt < MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+                delay(MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS)
+            }
+        }
+        return if (sawReplying) {
+            MutualFollowOnlyPostTapClassify.Replying
+        } else {
+            MutualFollowOnlyPostTapClassify.Unclear
+        }
+    }
+
+    /** Follow 布局 OCR：最多 6 次、间隔 0.5s（兜底，点击后分类未认出格局时）。 */
+    private suspend fun resolveMutualFollowOnlyProfileFollowWithRetries(
+        service: Context,
+        itemTag: String,
+    ): MutualFollowOnlyProfileFollowDecision {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        var lastSkip: MutualFollowOnlyProfileFollowDecision.Skip? = null
+        for (attempt in 1..MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, "互点仅关注 $itemTag Follow OCR")) {
+                return lastSkip ?: MutualFollowOnlyProfileFollowDecision.NoLayer
+            }
+            val decision = when (val c = mutualFollowOnlyClassifyPostTapScreen(service)) {
+                is MutualFollowOnlyPostTapClassify.ProfileLayout -> c.decision
+                is MutualFollowOnlyPostTapClassify.Replying,
+                is MutualFollowOnlyPostTapClassify.Unclear,
+                null,
+                -> MutualFollowOnlyProfileFollowDecision.NoLayer
+            }
+            when (decision) {
+                is MutualFollowOnlyProfileFollowDecision.TapFollow -> {
+                    if (attempt > 1) {
+                        devOp(
+                            alias,
+                            "互点仅关注：$itemTag Follow 布局 OCR 第 $attempt 次命中可点 Follow",
+                        )
+                    }
+                    return decision
+                }
+                is MutualFollowOnlyProfileFollowDecision.Skip -> {
+                    lastSkip = decision
+                    devOp(
+                        alias,
+                        "互点仅关注：$itemTag Follow 布局 OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次：${decision.reason}",
+                    )
+                }
+                is MutualFollowOnlyProfileFollowDecision.NoLayer -> {
+                    devOp(
+                        alias,
+                        "互点仅关注：$itemTag Follow 布局 OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次：未见 Follow/Message",
+                    )
+                }
+            }
+            if (attempt < MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+                delay(MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS)
+            }
+        }
+        if (lastSkip != null) {
+            devOp(
+                alias,
+                "互点仅关注：$itemTag Follow 布局 OCR ${MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS} 次均为跳过：${lastSkip.reason}",
+            )
+            return lastSkip
+        }
+        devOp(
+            alias,
+            "互点仅关注：$itemTag Follow 布局 OCR ${MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS} 次均未识别布局",
+        )
+        return MutualFollowOnlyProfileFollowDecision.NoLayer
+    }
+
+    private data class OcrLabelHit(val norm: String, val centerX: Int, val centerY: Int)
 
     private data class MutualFollowTarget(val point: Point, val messageY: Int)
 
@@ -3685,11 +4369,8 @@ class RealTraceExecutor(
                 if (mutualClickOrNull(alias, "互点粉丝列表单条 Follow")) return
                 if (mutualFollowLimitReached) return
                 runSuCommand("input tap ${entry.clickPoint.x} ${entry.clickPoint.y}")
-                mutualSessionFollowTapCount++
-                devOp(alias, "互点：粉丝列表 Follow 会话计数 $mutualSessionFollowTapCount/$limit")
-                if (mutualSessionFollowTapCount >= limit) {
-                    mutualFollowLimitReached = true
-                    devOp(alias, "互点：已达粉丝列表 Follow 会话上限 $limit，结束列表滑动")
+                if (recordMutualFollowTap(alias, config, "Followers列表")) {
+                    devOp(alias, "互点：已达 Follow 会话上限 $limit，结束列表滑动")
                     return
                 }
                 delay(Random.nextLong(1000, 1501))
@@ -3714,7 +4395,7 @@ class RealTraceExecutor(
     private suspend fun mutualClickCopyUsernameReportAndOpenFollowers(service: Context, config: AppConfig): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         if (mutualFollowLimitReached) {
-            devOp(alias, "互点：已达粉丝列表 Follow 会话上限，不再执行复制用户名/进入 Followers 链路")
+            devOp(alias, "互点：已达 Follow 会话上限，不再执行复制用户名/进入 Followers 链路")
             return false
         }
         if (hardStopOrNull(alias, "互点复制用户名到系统剪贴板")) return false
@@ -3757,13 +4438,17 @@ class RealTraceExecutor(
      * 互点 Videos 单条作品单元（前半段）：在**已确认进入作品播放页**后执行左滑进作者层，
      * 再按是否进入 Followers 返回 1～2 次回到**同一作品**播放页，供后续点赞/收藏/评论使用。
      */
+    /**
+     * 左滑进作者层并按模板执行作者区 / Followers 关注，再回到作品播放页。
+     * @return true 表示 Follow 已达上限且未开启引流评论，调用方应结束 Videos 轮次。
+     */
     private suspend fun mutualVideosLeftSwipeThenDoubleBackToPost(
         service: Context,
         config: AppConfig,
         unitLogTag: String,
-    ) {
+    ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        if (hardStopOrNull(alias, "互点 $unitLogTag 左滑")) return
+        if (hardStopOrNull(alias, "互点 $unitLogTag 左滑")) return false
         delay(Random.nextLong(800, 1200))
         val m = service.resources.displayMetrics
         val w = m.widthPixels.coerceAtLeast(1)
@@ -3771,6 +4456,8 @@ class RealTraceExecutor(
         val xStart = (w * 0.92f).toInt().coerceIn(1, w - 1)
         val xEnd = (w * 0.08f).toInt().coerceIn(1, w - 1)
         val afterTapMs = config.growth_post_check_after_tap_delay_ms.coerceIn(100L, 5000L)
+        val enableAuthorFollow = config.mutual_traffic_author_follow
+        val enableFollowersFollow = config.mutual_traffic_followers_follow
 
         // 重试条件见 [mutualProbeAuthorLayerAfterSwipe]：仅当 Follow/Message OCR 均未命中时才换参再滑。
         data class MutualAuthorSwipeTry(
@@ -3786,7 +4473,7 @@ class RealTraceExecutor(
         var ocrFollowTarget: MutualFollowTarget? = null
         var sawAuthorLayer = false
         for ((idx, variant) in swipeVariants.withIndex()) {
-            if (hardStopOrNull(alias, "互点 $unitLogTag 左滑")) return
+            if (hardStopOrNull(alias, "互点 $unitLogTag 左滑")) return false
             val yLine = (h * variant.yFrac).toInt().coerceIn(1, h - 1)
             val swipeMs = Random.nextInt(variant.swipeMsRange.first, variant.swipeMsRange.last + 1)
             devOp(
@@ -3812,27 +4499,43 @@ class RealTraceExecutor(
             )
         }
 
-        devOp(alias, "互点主页链路：步骤1/3 检查作者区 Follow（OCR）并点击")
-        when {
-            ocrFollowTarget != null -> {
-                val tap = ocrFollowTarget.point
-                devOp(
-                    alias,
-                    "互点主页链路：步骤1/3 作者区 Follow（OCR）通过，点击 (${tap.x},${tap.y}) messageY=${ocrFollowTarget.messageY}",
-                )
-                runSuCommand("input tap ${tap.x} ${tap.y}")
-                delay(Random.nextLong(1200, 1800))
+        if (enableAuthorFollow && !mutualFollowLimitReached) {
+            devOp(alias, "互点主页链路：步骤1/3 检查作者区 Follow（OCR）并点击")
+            when {
+                ocrFollowTarget != null -> {
+                    val tap = ocrFollowTarget.point
+                    devOp(
+                        alias,
+                        "互点主页链路：步骤1/3 作者区 Follow（OCR）通过，点击 (${tap.x},${tap.y}) messageY=${ocrFollowTarget.messageY}",
+                    )
+                    runSuCommand("input tap ${tap.x} ${tap.y}")
+                    delay(Random.nextLong(1200, 1800))
+                    recordMutualFollowTap(alias, config, "作者区")
+                }
+                sawAuthorLayer -> {
+                    devOp(alias, "互点主页链路：步骤1/3 已识别作者层（Message），无 Follow OCR 行可点，跳过")
+                }
+                else -> {
+                    devOp(alias, "互点主页链路：步骤1/3 作者区 Follow（OCR）未通过，跳过点击")
+                }
             }
-            sawAuthorLayer -> {
-                devOp(alias, "互点主页链路：步骤1/3 已识别作者层（Message），无 Follow OCR 行可点，跳过")
-            }
-            else -> {
-                devOp(alias, "互点主页链路：步骤1/3 作者区 Follow（OCR）未通过，跳过点击")
-            }
+        } else {
+            devOp(
+                alias,
+                "互点：$unitLogTag 跳过作者区 Follow（${if (!enableAuthorFollow) "未开启" else "已达上限"}）",
+            )
         }
 
-        devOp(alias, "互点主页链路：步骤2/3 点击用户名复制（上报仅在 teamwork 发评粘贴+uiautomator）")
-        val enteredFollowersList = mutualClickCopyUsernameReportAndOpenFollowers(service, config)
+        var enteredFollowersList = false
+        if (enableFollowersFollow && !mutualFollowLimitReached) {
+            devOp(alias, "互点主页链路：步骤2/3 点击用户名复制并进入 Followers（上报在 teamwork 发评粘贴时）")
+            enteredFollowersList = mutualClickCopyUsernameReportAndOpenFollowers(service, config)
+        } else {
+            devOp(
+                alias,
+                "互点：$unitLogTag 跳过 Followers 链路（${if (!enableFollowersFollow) "未开启" else "已达上限"}）",
+            )
+        }
 
         val backCount = if (enteredFollowersList) 2 else 1
         devOp(alias, "互点主页链路：步骤3/3 从作者层返回作品 ${backCount} 次（enteredFollowers=$enteredFollowersList）")
@@ -3842,6 +4545,7 @@ class RealTraceExecutor(
         }
         delay(Random.nextLong(700, 1100))
         devOp(alias, "互点主页链路：已回到作品播放页，准备点赞/评论")
+        return shouldStopMutualVideosAfterFollowLimit(config)
     }
 
     /** 互点流程统一：进入作者主页后先完成主页链路，再回到 Videos 做本轮作品互动。 */
@@ -3914,16 +4618,21 @@ class RealTraceExecutor(
         launchCheckTag: String,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        val pkg = Config.TIKTOK_PACKAGE_NAME
-        val forceStopWaitMs = config.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         val mutualSearchText = pickMutualTikTokSearchKeyword(config)
         val safeSearchText = shellEscape(mutualSearchText)
 
-        runSuCommand("am force-stop $pkg")
-        delay(forceStopWaitMs)
-
-        if (!ensureTikTokInForeground(service, alias, "互点·$launchCheckTag")) {
-            devOp(alias, "互点：TikTok 恢复拉起失败（$launchCheckTag）")
+        // 关开 TikTok 须走 launchTikTokWithForegroundVerification（强停→拉起→等待→dumpsys 校验→日志），
+        // 不可仅用 ensureTikTokInForeground：force-stop 后 dumpsys 残留包名会静默误判为已前台而跳过拉起。
+        didRestartTikTokInCurrentRun = true
+        if (!launchTikTokWithForegroundVerification(
+                ctx = service,
+                alias = alias,
+                tag = "互点·$launchCheckTag",
+                forceStopBeforeLaunch = true,
+                timingConfig = config,
+            )
+        ) {
+            devOp(alias, "互点：TikTok 拉起未通过前台校验（$launchCheckTag）")
             return false
         }
 
@@ -3944,26 +4653,15 @@ class RealTraceExecutor(
         }
         devOp(alias, "互点：已完成放大镜点击并搜索「$mutualSearchText」（$launchCheckTag）")
         delay(2400)
-        var videosAnchor: Point? = null
-        for (ocrAttempt in 1..MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
-            videosAnchor = findVideosTabAnchorByOcrFast(service)
-            if (videosAnchor != null) break
-            if (ocrAttempt < MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS) {
-                devOp(
-                    alias,
-                    "互点：未找到 Videos 标签（$launchCheckTag）第 $ocrAttempt/${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次，${1500}ms 后重试 OCR",
-                )
-                delay(1500)
-            }
-        }
-        if (videosAnchor == null) {
-            devOp(
-                alias,
-                "互点：${MUTUAL_VIDEOS_TAB_OCR_MAX_ATTEMPTS} 次 OCR 均未找到 Videos 标签（$launchCheckTag）",
-            )
-            return false
-        }
-        runSuCommand("input tap ${videosAnchor.x} ${videosAnchor.y}")
+        val firstVideosAnchor = findVideosTabAnchorByOcrWithRetries(service, launchCheckTag, "首次")
+        if (firstVideosAnchor == null) return false
+        runSuCommand("input tap ${firstVideosAnchor.x} ${firstVideosAnchor.y}")
+        devOp(alias, "互点：首次点击 Videos 标签（$launchCheckTag）")
+        delay(MUTUAL_VIDEOS_TAB_AFTER_FIRST_TAP_DELAY_MS)
+        val secondVideosAnchor = findVideosTabAnchorByOcrWithRetries(service, launchCheckTag, "二次")
+        if (secondVideosAnchor == null) return false
+        runSuCommand("input tap ${secondVideosAnchor.x} ${secondVideosAnchor.y}")
+        devOp(alias, "互点：二次点击 Videos 标签（$launchCheckTag）")
         delay(2200)
         return true
     }
@@ -4034,20 +4732,19 @@ class RealTraceExecutor(
     }
 
     /**
-     * 发作品图库选素材：第 1 张为左上区域基准点；第 2 张为屏宽水平中点、与第 1 同 Y；
-     * 第 3 张为第 1 张关于屏幕竖直中线（过屏心的竖线）的左右对称点；
-     * 第 4 张固定像素 (162, 1080)（按屏宽高钳位）；第 5 张为屏宽水平中点、Y 与第 4 张相同。
+     * 发作品图库选素材（单次任务最多 [PUBLISH_POST_MAX_ITEMS_PER_TASK] 条，索引 0～4）：
+     * 第 1 张基准 X≈16%*W、Y≈30%*H；第 2 张屏宽水平中点、Y 同第 1；第 3 张与第 1 关于竖直中线对称；
+     * 第 4 张 X 同第 1、Y≈49%*H；第 5 张屏宽水平中点、Y 同第 4。
      */
     private fun publishPostGalleryMediaTap(w: Int, h: Int, videoIndex: Int): Point {
-        val y1 = ((h * 0.2f) + (h * 0.028f)).toInt().coerceIn(1, h - 1)
-        val x1 = ((w * 0.15f).toInt()).coerceIn(1, w - 1)
-        val galleryFourthY = 1080
-        val y4 = galleryFourthY.coerceIn(1, h - 1)
+        val y1 = (h * 0.3f).toInt().coerceIn(1, h - 1)
+        val x1 = (w * 0.16f).toInt().coerceIn(1, w - 1)
+        val y4 = (h * 0.49f).toInt().coerceIn(1, h - 1)
         return when (videoIndex) {
             0 -> Point(x1, y1)
             1 -> Point((w / 2).coerceIn(1, w - 1), y1)
             2 -> Point((w - x1).coerceIn(1, w - 1), y1)
-            3 -> Point(162.coerceIn(1, w - 1), y4)
+            3 -> Point(x1, y4)
             4 -> Point((w / 2).coerceIn(1, w - 1), y4)
             else -> Point(x1, y1)
         }
@@ -4103,7 +4800,7 @@ class RealTraceExecutor(
         val hit: StrictLabelHit,
     )
 
-    /** 文案屏偏下区域标签：取最靠上的一个命中，降低误点顶部按钮的概率。 */
+    /** 文案屏偏下区域 Done 等：仅考虑 bbox.top ≥ 屏高 22% 的命中，取最靠上者。 */
     private fun findTopmostCaptionLabelHit(
         result: Text,
         screenH: Int,
@@ -4136,18 +4833,46 @@ class RealTraceExecutor(
         return best
     }
 
-    /** 文案确认：优先 Done；无 Done 时再认 Post/post（全字匹配，不含 Post Now）。 */
+    /** 文案屏顶部发布 Post：文案含 post（忽略大小写）、中心在屏上方；排除 Post Now / Post this…；多命中取最靠上。 */
+    private fun findTopScreenCaptionPostHit(result: Text, screenH: Int): StrictLabelHit? {
+        val maxCenterY = (screenH * PUBLISH_POST_CAPTION_TOP_POST_MAX_CENTER_Y_FRACTION).toInt()
+        var best: StrictLabelHit? = null
+        var bestTop = Int.MAX_VALUE
+        fun textQualifies(raw: String): Boolean {
+            val low = raw.trim().lowercase(Locale.US)
+            if (!low.contains("post")) return false
+            if (low.contains("post now")) return false
+            if (low.contains("post this")) return false
+            return true
+        }
+        fun consider(text: String, b: Rect) {
+            if (!textQualifies(text)) return
+            if (b.centerY() > maxCenterY) return
+            if (b.top <= bestTop) {
+                bestTop = b.top
+                best = StrictLabelHit(Point(b.centerX(), b.centerY()), b)
+            }
+        }
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    val b = el.boundingBox ?: continue
+                    consider(el.text, b)
+                }
+                line.boundingBox?.let { consider(line.text, it) }
+            }
+        }
+        return best
+    }
+
+    /** 文案确认：优先偏下区域 Done；无 Done 时再认屏幕上方含 post 的 Post（不含 Post Now）。 */
     private fun findPublishCaptionConfirmHit(result: Text, screenH: Int): PublishCaptionConfirmHit? {
         findTopmostCaptionLabelHit(result, screenH, setOf("Done"))
             ?.let { return PublishCaptionConfirmHit(PublishCaptionConfirmKind.DONE, it) }
-        findTopmostCaptionLabelHit(result, screenH, setOf("Post", "post"))
+        findTopScreenCaptionPostHit(result, screenH)
             ?.let { return PublishCaptionConfirmHit(PublishCaptionConfirmKind.POST, it) }
         findStrictExactLabelHit(result, "Done")
             ?.let { return PublishCaptionConfirmHit(PublishCaptionConfirmKind.DONE, it) }
-        findStrictExactLabelHit(result, "Post")
-            ?.let { return PublishCaptionConfirmHit(PublishCaptionConfirmKind.POST, it) }
-        findStrictExactLabelHit(result, "post")
-            ?.let { return PublishCaptionConfirmHit(PublishCaptionConfirmKind.POST, it) }
         return null
     }
 
@@ -4406,11 +5131,20 @@ class RealTraceExecutor(
         alias: String,
         tagPrefix: String,
         hardStopLabel: String,
+        clickRecents: Boolean = false,
+        clickPictures: Boolean = false,
     ): Boolean {
         for (pass in 1..PUBLISH_POST_RECENTS_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, hardStopLabel)) return false
             if (pass > 1) delay(700)
-            if (publishPostProbeRecentsOnScreen(service, alias, "${tagPrefix}_$pass")) return true
+            val ok = publishPostProbeRecentsOnScreen(
+                service = service,
+                alias = alias,
+                ocrTag = "${tagPrefix}_$pass",
+                clickRecents = clickRecents,
+                clickPictures = clickPictures,
+            )
+            if (ok) return true
         }
         return false
     }
@@ -4430,6 +5164,8 @@ class RealTraceExecutor(
                 alias,
                 "publish_post_recents",
                 "发作品 Recents OCR",
+                clickRecents = true,
+                clickPictures = true,
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.A
@@ -4438,7 +5174,7 @@ class RealTraceExecutor(
         }
         devOp(
             alias,
-            "发作品：右下固定点后 ${PUBLISH_POST_RECENTS_OCR_MAX_PASSES} 次未见 Recents，尝试布局 B 备用点击",
+            "发作品：右下固定点后 ${PUBLISH_POST_RECENTS_OCR_MAX_PASSES} 次未完成 Recents→Pictures 点击，尝试布局 B 备用点击",
         )
         if (!publishPostTapLayoutBFallback(alias, w, createPostTap)) return false
         if (!publishPostTryAllowAllAfterLayoutTap(service, alias, w, h, "布局B")) return false
@@ -4448,6 +5184,8 @@ class RealTraceExecutor(
                 alias,
                 "publish_post_recents_after_fallback",
                 "发作品 Recents 布局B后 OCR",
+                clickRecents = true,
+                clickPictures = true,
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.B
@@ -4456,7 +5194,7 @@ class RealTraceExecutor(
         }
         devOp(
             alias,
-            "发作品：布局 B 备用点击后 ${PUBLISH_POST_RECENTS_OCR_MAX_PASSES} 次仍未见 Recents，本条失败，需整条重试",
+            "发作品：布局 B 备用点击后 ${PUBLISH_POST_RECENTS_OCR_MAX_PASSES} 次仍未完成 Recents→Pictures 点击，本条失败，需整条重试",
         )
         return false
     }
@@ -4465,6 +5203,8 @@ class RealTraceExecutor(
         service: Context,
         alias: String,
         ocrTag: String,
+        clickRecents: Boolean = false,
+        clickPictures: Boolean = false,
     ): Boolean {
         val (vision, errTag) = mlKitRecognizeFullScreen(service, ocrTag)
         if (vision == null) {
@@ -4476,8 +5216,41 @@ class RealTraceExecutor(
             alias,
             "发作品：Recents 探测 OCR 摘要=${buildProfileEditOcrPreview(vision).take(420)} [$ocrTag]",
         )
-        if (findStrictExactLabelHit(vision, "Recents") != null) {
-            devOp(alias, "发作品：已探测到 Recents（仅记录，不点击） [$ocrTag]")
+        val recentsHit = findStrictExactLabelHit(vision, "Recents")
+        if (recentsHit != null) {
+            if (!clickRecents) {
+                devOp(alias, "发作品：已探测到 Recents（仅记录，不点击） [$ocrTag]")
+                return true
+            }
+            val tap = coerceTapToScreen(recentsHit.point, service.resources.displayMetrics.widthPixels, service.resources.displayMetrics.heightPixels)
+            devOp(alias, "发作品：已探测到 Recents，执行点击 (${tap.x},${tap.y}) [$ocrTag]")
+            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                devOp(alias, "发作品：Recents 点击失败 [$ocrTag]")
+                return false
+            }
+            delay(700)
+            if (!clickPictures) return true
+            val (vision2, errTag2) = mlKitRecognizeFullScreen(service, "${ocrTag}_pictures")
+            if (vision2 == null) {
+                devOp(alias, "发作品：Pictures 探测 OCR 失败：$errTag2 [$ocrTag]")
+                return false
+            }
+            devOp(
+                alias,
+                "发作品：Pictures 探测 OCR 摘要=${buildProfileEditOcrPreview(vision2).take(420)} [$ocrTag]",
+            )
+            val picturesHit = findStrictExactLabelHit(vision2, "Pictures")
+            if (picturesHit == null) {
+                devOp(alias, "发作品：Pictures 探测未命中 [$ocrTag]")
+                return false
+            }
+            val pictureTap = coerceTapToScreen(picturesHit.point, service.resources.displayMetrics.widthPixels, service.resources.displayMetrics.heightPixels)
+            devOp(alias, "发作品：已探测到 Pictures，执行点击 (${pictureTap.x},${pictureTap.y}) [$ocrTag]")
+            if (!runSuCommand("input tap ${pictureTap.x} ${pictureTap.y}")) {
+                devOp(alias, "发作品：Pictures 点击失败 [$ocrTag]")
+                return false
+            }
+            delay(700)
             return true
         }
         devOp(alias, "发作品：Recents 探测未命中 [$ocrTag]")
@@ -4642,19 +5415,20 @@ class RealTraceExecutor(
      *
      * 阶段顺序：
      * 1) 底部入口（上一段：资料比例点 →（仅本任务第 1 条）Continue / While using → …；首条试探 A/B 并缓存，后续条目不重复 Recents 试探）
-     * 2) 图库选素材：第 1～3 张按比例/对称；第 4 张固定 (162,1080)；第 5 张屏宽中点且 Y 同第 4
-     * 3) 第一次 OCR 定位 Next；同一轮 OCR 记录 Recents / Videos 之间的分界 Y，并尽量偏 Recents 一侧取值作为“音频位置”
+     * 2) 图库选素材：第 1 张 X≈16%*W、Y≈30%*H，第 2～3 相对第 1；第 4 张 X 同第 1、Y≈49%*H，第 5 屏宽中点且 Y 同第 4（最多 5 条）
+     * 3) 图库点选后等待 [PUBLISH_POST_AFTER_GALLERY_DELAY_MS]，再 OCR 定位 Next（最多 [PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES] 次，间隔 500~1000ms）；同一轮命中时记录 Recents / Videos 分界 Y 等
      * 4) 通过 OCR 反复校验 Your Story 是否出现，最多 7 次，间隔 1s；若失败则整条任务失败重来
      * 5) 点击第一次 Next
-     * 6) Your Story 命中后，说明素材加载成功，点击音频位置
-     * 7) OCR 定位并点击 Sound
-     * 8) 再次点击音频位置
+     * 6) [已禁用] Your Story 命中后，说明素材加载成功，点击音频位置
+     * 7) [已禁用] OCR 定位并点击 Sound
+     * 8) [已禁用] 再次点击音频位置
      * 9) 沿用第一次 Next 的坐标再次点击 Next
-     * 10) 输入文案后 OCR 定位 Done 或 Post/post（优先 Done）；点 Done 后再点一次第一次 Next；点 Post 则等价 Done+Next+确认 Post，跳过后续 Next
-     * 11)（仅 Done 路径）再次点击第一次 Next 的坐标，进入后续确认页
-     * 12) 使用运行配置中的 [AppConfig.comment_texts] 随机文案输入
-     * 13) 仅当日首条：可选权限弹窗（Post Now / Only this time×2（首轮点后二次 OCR，再命中则再点）/ Don't allow / 底部 Cancel），各最多 3 次 OCR，未命中不判失败
-     * 14) OCR 校验底部主导航：Home / Friends / Inbox / Profile 在屏幕偏下区域至少命中 2 类则判发布成功
+     * 10) OCR 定位 description（忽略大小写包含即命中）并点击聚焦，最多 3 次；均未命中则认定步骤混乱并重启 TikTok
+     * 11) 使用运行配置中的 [AppConfig.comment_texts] 随机文案输入
+     * 12) OCR 定位 Done（偏下）或屏幕上方含 post 的 Post（优先 Done）并点击；点 Done 后再点一次第一次 Next；点顶部 Post 则等价 Done+Next+确认 Post，跳过后续 Next
+     * 13)（仅 Done 路径）再次点击第一次 Next 的坐标，进入后续确认页
+     * 14) 仅当日首条：可选权限弹窗（Post Now / Only this time×2（首轮点后二次 OCR，再命中则再点）/ Don't allow / 底部 Cancel），各最多 3 次 OCR，未命中不判失败
+     * 15) OCR 校验底部主导航：Home / Friends / Inbox / Profile 在屏幕偏下区域至少命中 2 类则判发布成功
      */
     private suspend fun runPublishPostPickSoundCaptionAndMaybeDialogs(
         service: Context,
@@ -4669,11 +5443,11 @@ class RealTraceExecutor(
         val galleryTap = publishPostGalleryMediaTap(w, h, videoIndex)
         val galleryRule =
             when (videoIndex) {
-                0 -> "第1张基准（X≈15%*W，Y≈22.8%*H）"
+                0 -> "第1张基准（X≈16%*W，Y≈30%*H）"
                 1 -> "第2张（屏X中点，Y同第1）"
                 2 -> "第3张（与第1关于竖直中线对称）"
-                3 -> "第4张固定 (162,1080) 按屏钳位"
-                4 -> "第5张（屏X中点，Y与第4同）"
+                3 -> "第4张（X同第1，Y≈49%*H）"
+                4 -> "第5张（屏X中点，Y同第4）"
                 else -> "第${videoIndex + 1}张回退第1张规则"
             }
         devOp(
@@ -4681,22 +5455,52 @@ class RealTraceExecutor(
             "发作品 第${videoIndex + 1} 条：图库选素材 tap (${galleryTap.x},${galleryTap.y})（屏 ${w}x${h}；$galleryRule）",
         )
         if (!runSuCommand("input tap ${galleryTap.x} ${galleryTap.y}")) return false
-        delay(550)
+        devOp(alias, "发作品：图库点选后等待 ${PUBLISH_POST_AFTER_GALLERY_DELAY_MS}ms 再 OCR Next")
+        delay(PUBLISH_POST_AFTER_GALLERY_DELAY_MS)
 
-        val (vision0, err0) = mlKitRecognizeFullScreen(service, "publish_post_first_next_${videoIndex}")
-        if (vision0 == null) {
-            devOp(alias, "发作品：首轮 OCR 失败 $err0")
-            if (isMlKitHardStopError(err0)) hardStopOrNull(alias, "发作品首轮 OCR")
+        var nextHit: StrictLabelHit? = null
+        for (nextPass in 1..PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES) {
+            if (hardStopOrNull(alias, "发作品 Next OCR")) return false
+            if (nextPass > 1) {
+                val retryDelayMs = Random.nextLong(
+                    PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MIN_MS,
+                    PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MAX_MS + 1,
+                )
+                devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次，间隔 ${retryDelayMs}ms")
+                delay(retryDelayMs)
+            } else {
+                devOp(alias, "发作品：Next OCR 第 1/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次")
+            }
+            val (vision, err) = mlKitRecognizeFullScreen(
+                service,
+                "publish_post_first_next_${videoIndex}_$nextPass",
+            )
+            if (vision == null) {
+                devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次识别失败 $err")
+                if (isMlKitHardStopError(err)) return false
+                continue
+            }
+            devOp(
+                alias,
+                "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次摘要=" +
+                    buildProfileEditOcrPreview(vision).take(420),
+            )
+            val hit = findStrictExactLabelHit(vision, "Next")
+            if (hit != null) {
+                nextHit = hit
+                devOp(alias, "发作品：Next 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次已命中")
+                break
+            }
+            devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次未命中")
+        }
+        val resolvedNext = nextHit ?: run {
+            devOp(
+                alias,
+                "发作品：Next 连续 ${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次 OCR 均未命中，本条失败",
+            )
             return false
         }
-        devOp(alias, "发作品：首轮 OCR 摘要=${buildProfileEditOcrPreview(vision0).take(420)}")
-        val next0 = findStrictExactLabelHit(vision0, "Next") ?: run {
-            devOp(alias, "发作品：未命中 Next")
-            return false
-        }
-        val audioPoint = fixedAudioTapPoint(service)
-        devOp(alias, "发作品：点击固定音频位置 (${audioPoint.x},${audioPoint.y})（屏幕正中 X，顶部 1/10 处 Y）")
-        val tapNext0 = coerceTapToScreen(next0.point, w, h)
+        val tapNext0 = coerceTapToScreen(resolvedNext.point, w, h)
         devOp(alias, "发作品：第一次 Next 坐标记位 (${tapNext0.x},${tapNext0.y})")
         if (!runSuCommand("input tap ${tapNext0.x} ${tapNext0.y}")) return false
 
@@ -4725,7 +5529,10 @@ class RealTraceExecutor(
             return false
         }
 
-        val audioTap = audioPoint
+        // 步骤 6～8 已禁用：固定音频位置 ×2 + OCR 点 Sound
+        devOp(alias, "发作品：已跳过固定音频点与 Sound OCR（步骤 6～8 已注释）")
+        /*
+        val audioTap = fixedAudioTapPoint(service)
         devOp(alias, "发作品：第一次点击固定音频位置 (${audioTap.x},${audioTap.y})（屏幕正中 X，顶部 1/10 处 Y）")
         if (!runSuCommand("input tap ${audioTap.x} ${audioTap.y}")) return false
         delay(550)
@@ -4746,6 +5553,7 @@ class RealTraceExecutor(
         devOp(alias, "发作品：Sound 已点，准备第二次点击固定音频位置 (${audioTap.x},${audioTap.y})")
         if (!runSuCommand("input tap ${audioTap.x} ${audioTap.y}")) return false
         delay(550)
+        */
 
         delay(1000)
         devOp(alias, "发作品：准备复用第一次 Next 坐标 (${tapNext0.x},${tapNext0.y}) 再点一次 Next")
@@ -4758,16 +5566,25 @@ class RealTraceExecutor(
             return publishPostFail(alias, "发作品文案屏 OCR", tryRestart = !isMlKitHardStopError(errCap))
         }
         devOp(alias, "发作品：文案屏 OCR 摘要=${buildProfileEditOcrPreview(vCap).take(420)}")
-        val writingTapX = (w / 2).coerceIn(1, w - 1)
-        val writingTapY = (h / 2).coerceIn(1, h - 1)
         val captionPool = config.comment_texts.map { it.trim() }.filter { it.isNotBlank() }
         val phrase = captionPool.randomOrNull() ?: "Nice"
         devOp(alias, "发作品：准备输入文案，来源=config.comment_texts，候选数=${captionPool.size}，选中文案 len=${phrase.length} preview=${phrase.take(40)}")
-        devOp(alias, "发作品：在输入文案前双击屏幕中间固定坐标 (${writingTapX},${writingTapY})，等待页面变化")
-        if (!runSuCommand("input tap ${writingTapX} ${writingTapY}")) return false
-        delay(120)
-        if (!runSuCommand("input tap ${writingTapX} ${writingTapY}")) return false
-        devOp(alias, "发作品：已在输入文案前双击屏幕中间固定坐标 (${writingTapX},${writingTapY})，等待页面变化")
+        devOp(alias, "发作品：输入文案前 OCR 定位 description 并点击（至多 3 次）")
+        if (!publishPostOcrTapByFinder(
+                service,
+                alias,
+                "publish_post_description_${videoIndex}",
+                "description 聚焦",
+                3,
+            ) { findLabelHitContainingIgnoreCase(it, "description") }
+        ) {
+            devOp(
+                alias,
+                "发作品：description OCR 连续 3 次未命中，认定当前作品发布步骤混乱，关闭并重新打开 TikTok",
+            )
+            return publishPostFail(alias, "发作品 description OCR", tryRestart = true)
+        }
+        devOp(alias, "发作品：description 已点击，等待页面/键盘稳定")
         delay(1000)
 
         if (!tryInputCommentText(alias, phrase)) {
@@ -4798,7 +5615,17 @@ class RealTraceExecutor(
             captionConfirm = findPublishCaptionConfirmHit(vCapConfirm, h)
             if (captionConfirm != null) {
                 val label = if (captionConfirm.kind == PublishCaptionConfirmKind.DONE) "Done" else "Post"
-                devOp(alias, "发作品：Done/Post OCR 第 $pass/$captionConfirmRetryLimit 次命中「$label」")
+                val hitExtra =
+                    if (captionConfirm.kind == PublishCaptionConfirmKind.POST) {
+                        val r = captionConfirm.hit.rect
+                        "（屏上方含 post，bbox=(${r.left},${r.top})-(${r.right},${r.bottom})）"
+                    } else {
+                        ""
+                    }
+                devOp(
+                    alias,
+                    "发作品：Done/Post OCR 第 $pass/$captionConfirmRetryLimit 次命中「$label」$hitExtra",
+                )
                 break
             }
             devOp(alias, "发作品：Done/Post OCR 第 $pass/$captionConfirmRetryLimit 次未命中，等待 1s 后继续重试")
@@ -4888,7 +5715,7 @@ class RealTraceExecutor(
                     alias,
                     "publish_post_post_now_${videoIndex}",
                     "Post Now",
-                    3,
+                    8,
                 ) { findPostNowLabelHit(it) }
             ) {
                 devOp(alias, "发作品：Post Now 已点")
@@ -4971,6 +5798,7 @@ class RealTraceExecutor(
      * 图库统计为 0 时不执行发布并返回 false。
      * 全部条数发布成功后，su 删除 `Pictures` 下**全部文件**（含 AutoTraces、Screenshots、.thumbnails 等）。
      * 中途失败时 [PrefsStore] 记录已成功条数，下次从对应图库坐标序号续发（不逐个删素材文件）。
+     * 断点条数大于本次计划条数且图库仍有素材时，视为断点与图库不一致，清断点从第 1 条重发（不删图）。
      */
     private suspend fun runPublishPostEntryFlow(service: Context, packageName: String, config: AppConfig): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
@@ -4990,12 +5818,22 @@ class RealTraceExecutor(
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
         val needsPerm = PrefsStore.shouldRunPublishPostFirstDailyPermissionOcr(accountKey)
         var startIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
-        if (startIdx >= publishRounds) {
+        if (startIdx > publishRounds) {
             devOp(
                 alias,
-                "发作品：断点记录已成功 $startIdx 条，不少于本次计划 $publishRounds 条，视为本轮已完成并清理断点",
+                "发作品：断点已成功 $startIdx 条，大于本次计划 $publishRounds 条（图库仍有 $galleryMaterialCount 个素材），" +
+                    "断点与图库不一致，清断点并从第 1 条重新发",
             )
             PrefsStore.clearPublishPostResumeProgress(accountKey)
+            startIdx = 0
+        } else if (startIdx >= publishRounds) {
+            devOp(
+                alias,
+                "发作品：断点记录已成功 $startIdx 条，已达本次计划 $publishRounds 条，视为本轮已完成并清理断点",
+            )
+            PrefsStore.clearPublishPostResumeProgress(accountKey)
+            devOp(alias, "发作品：任务已完成，等待 30s 后再删除图库作品")
+            delay(30_000)
             publishPostDeleteAllPicturesAfterSuccess(alias)
             return true
         }
@@ -5137,6 +5975,7 @@ class RealTraceExecutor(
         service: Context,
         config: AppConfig,
         commentOnlySession: Boolean,
+        followOnlySession: Boolean,
     ): String {
         val alias = PrefsStore.getAlias() ?: "unknown"
         var entryOk = false
@@ -5167,18 +6006,21 @@ class RealTraceExecutor(
                 enterVideosVideoByQuarterTaps(service, config)
             }
             finalizeMutualSessionLimitedExit(alias)
-            val fullDoneHint =
-                if (commentOnlySession) {
+            val fullDoneHint = when {
+                followOnlySession ->
+                    "进作品→打开评论区（仅关注 TODO）→回列表（未执行左滑/点赞/发评）"
+                commentOnlySession ->
                     "进作品→点赞/收藏/互点评论→回列表（未执行左滑与作者主页/Followers）"
-                } else {
+                else ->
                     "进作品→左滑→回作品→点赞/收藏/互点评论→回列表"
-                }
+            }
             return when {
                 entryOk -> "互点会话已收尾：已执行 teamwork Videos 互动（$fullDoneHint）"
-                else -> "互点会话已收尾：入口未进入 Videos，已强停 TikTok（未判为流程失败，涨粉将照常恢复）"
+                else -> "互点会话已收尾：入口未进入 Videos，已强停 TikTok（未判为流程失败）"
             }
         } finally {
             PrefsStore.setMutualCommentOnlySession(false)
+            PrefsStore.setMutualFollowOnlySession(false)
         }
     }
 
@@ -5782,16 +6624,135 @@ class RealTraceExecutor(
         }
     }
 
-    private fun getTopPackageNameBySu(): String {
-        val out = runSuCommandWithOutput("dumpsys window | grep mCurrentFocus")
-            ?: runSuCommandWithOutput("dumpsys activity activities | grep mResumedActivity")
-            ?: ""
-        return out
+    private val dumpsysFocusLineKeywords = arrayOf(
+        "mCurrentFocus",
+        "mFocusedApp",
+        "mFocusedWindow",
+        "focusedApp",
+        "mResumedActivity",
+        "topResumedActivity",
+        "ResumedActivity",
+    )
+
+    @Volatile
+    private var foregroundProbeCache: Pair<Long, String>? = null
+
+    private fun invalidateForegroundProbeCache() {
+        foregroundProbeCache = null
+    }
+
+    /**
+     * 从 dumpsys 解析**当前焦点/顶层**包名（仅 mCurrentFocus / mFocusedApp / topResumed / activity top）。
+     * 不用 activity 栈里残留包名，避免 force-stop 后仍误判 TikTok 在前台。
+     */
+    private fun resolveStrictForegroundPackage(raw: String): String? {
+        for (line in filterDumpsysFocusLines(raw)) {
+            val lower = line.lowercase(Locale.US)
+            val highTrust = lower.contains("mcurrentfocus") ||
+                lower.contains("mfocusedapp") ||
+                lower.contains("mfocusedwindow") ||
+                lower.contains("topresumedactivity")
+            if (!highTrust) continue
+            extractPackageFromDumpsysComponentLine(line)?.let { return it }
+        }
+        return extractTopActivityPackage(raw)
+    }
+
+    private fun extractPackageFromDumpsysComponentLine(line: String): String? {
+        Regex("""packageName=([a-zA-Z][\w.]*)""", RegexOption.IGNORE_CASE).find(line)?.let {
+            return it.groupValues[1]
+        }
+        Regex("""([a-zA-Z][\w.]*)/[a-zA-Z][\w.$]+""").findAll(line).forEach { m ->
+            val pkg = m.groupValues[1]
+            if (pkg.contains('.') && !pkg.equals("android", ignoreCase = true)) return pkg
+        }
+        return null
+    }
+
+    /** 多源 dumpsys（不用 shell grep，避免空匹配阻断回退、部分 su 管道失效）。 */
+    private fun collectForegroundProbeTexts(): String {
+        val now = System.currentTimeMillis()
+        foregroundProbeCache?.let { (ts, text) ->
+            if (now - ts < 400L) return text
+        }
+        val parts = mutableListOf<String>()
+        for (cmd in listOf(
+            "dumpsys activity top",
+            "cmd activity top",
+            "dumpsys window",
+            "dumpsys activity activities",
+        )) {
+            val chunk = runSuCommandWithOutputMerged(cmd)
+            if (!chunk.isNullOrBlank()) parts += chunk
+        }
+        val merged = parts.joinToString("\n")
+        foregroundProbeCache = now to merged
+        return merged
+    }
+
+    private fun filterDumpsysFocusLines(raw: String): List<String> =
+        raw.lineSequence()
+            .map { it.trim() }
+            .filter { line ->
+                line.isNotEmpty() &&
+                    dumpsysFocusLineKeywords.any { kw -> line.contains(kw, ignoreCase = true) }
+            }
+            .toList()
+
+    private fun extractTopActivityPackage(raw: String): String? {
+        for (line in raw.lineSequence().map { it.trim() }) {
+            if (!line.startsWith("ACTIVITY ", ignoreCase = true)) continue
+            val m = Regex("""ACTIVITY\s+([a-zA-Z][\w.]*)/""", RegexOption.IGNORE_CASE).find(line) ?: continue
+            return m.groupValues[1]
+        }
+        return null
+    }
+
+    private fun extractPackagesFromDumpsys(raw: String): List<String> {
+        val pkgs = LinkedHashSet<String>()
+        extractTopActivityPackage(raw)?.let { pkgs += it }
+        for (line in raw.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }) {
+            Regex("""packageName=([a-zA-Z][\w.]*)""", RegexOption.IGNORE_CASE)
+                .findAll(line)
+                .forEach { pkgs += it.groupValues[1] }
+            if (!dumpsysFocusLineKeywords.any { kw -> line.contains(kw, ignoreCase = true) } &&
+                !line.startsWith("ACTIVITY ", ignoreCase = true)
+            ) {
+                continue
+            }
+            Regex("""\bu\d+\s+([a-zA-Z][\w.]*)""").findAll(line).forEach { pkgs += it.groupValues[1] }
+            Regex("""([a-zA-Z][\w.]*)/[a-zA-Z][\w.$]*""").findAll(line).forEach { pkgs += it.groupValues[1] }
+        }
+        return pkgs.toList()
+    }
+
+    private fun isPackageForeground(packageName: String): Boolean {
+        if (packageName.isBlank()) return false
+        val fg = resolveStrictForegroundPackage(collectForegroundProbeTexts()) ?: return false
+        return fg.equals(packageName, ignoreCase = true)
+    }
+
+    private fun isTikTokForeground(): Boolean {
+        val fg = resolveStrictForegroundPackage(collectForegroundProbeTexts()) ?: return false
+        return Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(fg, ignoreCase = true) }
+    }
+
+    private fun logForegroundProbeFailure(alias: String, tag: String, expectedPkg: String) {
+        val probe = collectForegroundProbeTexts()
+        val strictFg = resolveStrictForegroundPackage(probe)
+        val parsed = extractPackagesFromDumpsys(probe)
+        val focusSnippet = filterDumpsysFocusLines(probe).take(4).joinToString(" | ")
+        devOp(
+            alias,
+            "$tag：严格前台校验失败（期望=$expectedPkg 焦点包=${strictFg ?: "无"} 栈解析=${parsed.joinToString()} 焦点行=${focusSnippet.ifBlank { "无" }}）",
+        )
     }
 
     private fun isPackageVisible(packageName: String): Boolean {
-        val top = getTopPackageNameBySu()
-        return top.contains(packageName, ignoreCase = true)
+        if (Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(packageName, ignoreCase = true) }) {
+            return isTikTokForeground()
+        }
+        return isPackageForeground(packageName)
     }
 
     private fun resolveSuCommand(alias: String): SuCommand? {
@@ -7833,6 +8794,375 @@ class RealTraceExecutor(
         return mutualPool.random()
     }
 
+    /** 互点-仅关注：作品页右侧评论入口固定坐标（非底部评论输入条）。 */
+    private suspend fun openMutualCommentPanelOnly(service: Context) {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val metrics = service.resources.displayMetrics
+        val tapX = (metrics.widthPixels * 0.924f).toInt().coerceIn(1, metrics.widthPixels - 1)
+        val tapY = (metrics.heightPixels * 0.626f).toInt().coerceIn(1, metrics.heightPixels - 1)
+        devOp(alias, "互点仅关注：点击评论入口固定点 ($tapX,$tapY) 屏比 0.924×0.626")
+        runSuCommand("input tap $tapX $tapY")
+        delay(900)
+    }
+
+    private fun isMutualFollowOnlyReplyOcrLabel(normalized: String): Boolean {
+        val norm = normalized.trim().lowercase(Locale.US)
+            .replace('0', 'o')
+            .replace('1', 'l')
+            .replace('|', 'l')
+            .replace(Regex("\\s+"), " ")
+        if (norm.isBlank()) return false
+        val tokens = norm.split(Regex("[^a-z]+")).filter { it.isNotEmpty() }
+        return tokens.any { it == "reply" }
+    }
+
+    private fun isMutualFollowOnlyReplyingOcrLabel(normalized: String): Boolean {
+        val norm = normalized.trim().lowercase(Locale.US)
+            .replace('0', 'o')
+            .replace('1', 'l')
+            .replace('|', 'l')
+            .replace(Regex("\\s+"), " ")
+        if (norm.isBlank()) return false
+        val tokens = norm.split(Regex("[^a-z]+")).filter { it.isNotEmpty() }
+        return tokens.any { it == "replying" }
+    }
+
+    /**
+     * 点击 Reply 旁头像区；同轮 OCR 优先认主页格局，其次 Replying。
+     * @return [MutualFollowOnlyReplyAvatarTapResult.abandonCoordinate] true 表示 Replying 已返回评论区，放弃本坐标处理下一条；
+     *   [profileDecision] 非 null 时调用方无需再截屏做 Follow 布局 OCR。
+     */
+    private suspend fun mutualFollowOnlyTapReplyAvatarEntry(
+        service: Context,
+        tap: Point,
+        heightPx: Int,
+        itemTag: String,
+    ): MutualFollowOnlyReplyAvatarTapResult {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val h = heightPx.coerceAtLeast(1)
+        val y = tap.y.coerceIn(1, h - 1)
+        devOp(alias, "互点仅关注：$itemTag 点击 (${tap.x},$y)")
+        runSuCommand("input tap ${tap.x} $y")
+        delay(Random.nextLong(1100, 1701))
+        return when (
+            val c = mutualFollowOnlyClassifyPostTapScreenWithRetries(service, itemTag)
+        ) {
+            is MutualFollowOnlyPostTapClassify.ProfileLayout -> {
+                devOp(alias, "互点仅关注：$itemTag 点击后已认主页格局")
+                MutualFollowOnlyReplyAvatarTapResult(false, c.decision)
+            }
+            is MutualFollowOnlyPostTapClassify.Replying -> {
+                devOp(alias, "互点仅关注：$itemTag 仍为 Replying，返回评论区并跳过本坐标")
+                navBack(alias, "互点仅关注 $itemTag Replying 返回评论区")
+                delay(Random.nextLong(500, 801))
+                MutualFollowOnlyReplyAvatarTapResult(abandonCoordinate = true)
+            }
+            is MutualFollowOnlyPostTapClassify.Unclear -> {
+                devOp(
+                    alias,
+                    "互点仅关注：$itemTag 点击后未见 Replying/格局，进入主页 Follow 兜底 OCR",
+                )
+                MutualFollowOnlyReplyAvatarTapResult(false, null)
+            }
+        }
+    }
+
+    /** 评论区整屏 OCR：返回各 Reply 标签中心 Y（全屏坐标，自上而下排序）。 */
+    private suspend fun findMutualFollowOnlyReplyCenterYs(service: Context): List<Int> {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val screenshotFile = File(service.cacheDir, "mutual_follow_only_reply_ocr.png")
+        if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return emptyList()
+        val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
+            screenshotFile.delete()
+            return emptyList()
+        }
+        val fullH = bitmap.height.coerceAtLeast(1)
+        val image = InputImage.fromBitmap(bitmap, 0)
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        return try {
+            val result = suspendCancellableCoroutine { cont ->
+                recognizer.process(image)
+                    .addOnSuccessListener { cont.resume(it) }
+                    .addOnFailureListener { cont.resumeWithException(it) }
+            }
+            val rawYs = result.textBlocks.asSequence()
+                .flatMap { it.lines.asSequence() }
+                .flatMap { line ->
+                    val lineNorm = line.text.trim().lowercase(Locale.US)
+                    val lineHits = if (isMutualFollowOnlyReplyOcrLabel(lineNorm)) {
+                        line.boundingBox?.let { listOf(it.centerY()) } ?: emptyList()
+                    } else {
+                        emptyList()
+                    }
+                    val elementHits = line.elements.mapNotNull { el ->
+                        val norm = el.text.trim().lowercase(Locale.US)
+                        if (!isMutualFollowOnlyReplyOcrLabel(norm)) return@mapNotNull null
+                        el.boundingBox?.centerY()
+                    }
+                    (lineHits + elementHits).asSequence()
+                }
+                .map { it.coerceIn(0, fullH - 1) }
+                .sorted()
+                .toList()
+            val rowTol = (fullH * 0.028f).toInt().coerceIn(18, 72)
+            val deduped = mutableListOf<Int>()
+            for (y in rawYs) {
+                if (deduped.isEmpty() || kotlin.math.abs(y - deduped.last()) > rowTol) {
+                    deduped.add(y)
+                }
+            }
+            devOp(alias, "互点仅关注：Reply OCR 命中 ${deduped.size} 处 Y=${deduped.joinToString()}")
+            deduped
+        } catch (ex: Exception) {
+            devOp(alias, "互点仅关注：Reply OCR 异常 ${ex.message}")
+            emptyList()
+        } finally {
+            recognizer.close()
+            bitmap.recycle()
+            screenshotFile.delete()
+        }
+    }
+
+    /**
+     * Reply OCR：最多 6 次、间隔 1s；仍无则关评论区并关开 TikTok 回到 teamwork Videos。
+     * @return null 表示已执行恢复，调用方应结束本段评论区；非 null 为命中列表。
+     */
+    private suspend fun findMutualFollowOnlyReplyCenterYsWithRetries(
+        service: Context,
+        config: AppConfig,
+        logTag: String,
+    ): List<Int>? {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        for (attempt in 1..MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, "互点仅关注 Reply OCR")) return null
+            val ys = findMutualFollowOnlyReplyCenterYs(service)
+            if (ys.isNotEmpty()) {
+                if (attempt > 1) {
+                    devOp(alias, "互点仅关注：$logTag Reply OCR 第 $attempt 次命中 ${ys.size} 处")
+                }
+                return ys
+            }
+            devOp(
+                alias,
+                "互点仅关注：$logTag Reply OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次未命中",
+            )
+            if (attempt < MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+                delay(MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS)
+            }
+        }
+        devOp(
+            alias,
+            "互点仅关注：$logTag Reply OCR ${MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS} 次均未命中，关闭评论区并关开 TikTok 重新进入 teamwork Videos",
+        )
+        runSuCommand("input keyevent 4")
+        delay(Random.nextLong(500, 801))
+        didRestartTikTokInCurrentRun = true
+        reopenMutualTeamworkVideosTabWithRetries(service, config, "互点仅关注 Reply OCR·$logTag")
+        return null
+    }
+
+    private fun mutualFollowOnlyTapPointForReply(
+        widthPx: Int,
+        heightPx: Int,
+        replyCenterY: Int,
+    ): Point {
+        val w = widthPx.coerceAtLeast(1)
+        val h = heightPx.coerceAtLeast(1)
+        val x = (w * 0.084f).toInt().coerceIn(1, w - 1)
+        val y = (replyCenterY - h * 0.053f).toInt().coerceIn(1, h - 1)
+        return Point(x, y)
+    }
+
+    /**
+     * @return true 表示本条应计入 skip（Following / Message / 无 Follow）
+     */
+    private suspend fun applyMutualFollowOnlyProfileFollowDecision(
+        service: Context,
+        config: AppConfig,
+        itemTag: String,
+        decision: MutualFollowOnlyProfileFollowDecision,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        return when (decision) {
+            is MutualFollowOnlyProfileFollowDecision.TapFollow -> {
+                val tap = decision.point
+                devOp(
+                    alias,
+                    "互点仅关注：$itemTag ${decision.layoutLabel} Follow (${tap.x},${tap.y})",
+                )
+                runSuCommand("input tap ${tap.x} ${tap.y}")
+                delay(Random.nextLong(1200, 1801))
+                recordMutualFollowTap(alias, config, "评论区仅关注")
+                false
+            }
+            is MutualFollowOnlyProfileFollowDecision.Skip -> {
+                devOp(alias, "互点仅关注：$itemTag ${decision.reason}，跳过 Follow")
+                true
+            }
+            is MutualFollowOnlyProfileFollowDecision.NoLayer -> {
+                devOp(alias, "互点仅关注：$itemTag 未见 Follow/Message 主页层，跳过")
+                true
+            }
+        }
+    }
+
+    /**
+     * 分栏式 / 横条式主页上尝试 Follow；[preResolved] 来自点击后同屏 OCR 时可免二次截屏。
+     */
+    private suspend fun mutualFollowOnlyAuthorBarFollowOnProfile(
+        service: Context,
+        config: AppConfig,
+        itemTag: String,
+        preResolved: MutualFollowOnlyProfileFollowDecision? = null,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        if (mutualFollowLimitReached) return true
+        if (hardStopOrNull(alias, "互点仅关注 $itemTag 主页 Follow")) return true
+        if (preResolved != null) {
+            return applyMutualFollowOnlyProfileFollowDecision(service, config, itemTag, preResolved)
+        }
+        delay(Random.nextLong(900, 1401))
+        val decision = resolveMutualFollowOnlyProfileFollowWithRetries(service, itemTag)
+        return applyMutualFollowOnlyProfileFollowDecision(service, config, itemTag, decision)
+    }
+
+    private suspend fun swipeUpMutualFollowOnlyCommentList(
+        service: Context,
+        lowestReplyCenterY: Int,
+    ) {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val m = service.resources.displayMetrics
+        val w = m.widthPixels.coerceAtLeast(1)
+        val h = m.heightPixels.coerceAtLeast(1)
+        val x = (w * 0.5f).toInt().coerceIn(1, w - 1)
+        val marginBelow = (h * 0.04f).toInt().coerceAtLeast(24)
+        val swipeSpan =
+            (h * MUTUAL_FOLLOW_ONLY_COMMENT_SWIPE_HEIGHT_RATIO).toInt().coerceAtLeast(80)
+        var startY = (lowestReplyCenterY + marginBelow).coerceIn((h * 0.35f).toInt(), h - 1)
+        var endY = (startY - swipeSpan).coerceIn(1, h - 1)
+        if (startY <= endY) {
+            startY = (h * 0.78f).toInt().coerceIn(1, h - 1)
+            endY = (h * 0.53f).toInt().coerceIn(1, startY - 1)
+        }
+        val swipeMs = Random.nextInt(380, 561)
+        devOp(
+            alias,
+            "互点仅关注：评论区上滑换批 swipe $x,$startY → $x,$endY ${swipeMs}ms（最低 Reply Y=$lowestReplyCenterY）",
+        )
+        runSuCommand("input swipe $x $startY $x $endY $swipeMs")
+        delay(Random.nextLong(900, 1401))
+    }
+
+    /**
+     * 互点-仅关注：评论区 OCR Reply → 点头像区进主页 → 作者条 Follow → 返回；
+     * 批末上滑换批，直至 skip 过半或达 Follow 上限。
+     * @return true 表示评论区已在本函数内关闭（调用方勿再 back）
+     */
+    private suspend fun performMutualFollowOnlyCommentAreaSteps(
+        service: Context,
+        config: AppConfig,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val m = service.resources.displayMetrics
+        val widthPx = m.widthPixels
+        val heightPx = m.heightPixels
+        var commentPanelClosed = false
+        var batchIndex = 0
+        val maxBatches = 24
+
+        batchLoop@ while (batchIndex < maxBatches && !commentPanelClosed) {
+            coroutineContext.ensureActive()
+            if (hardStopOrNull(alias, "互点仅关注评论区批处理")) break@batchLoop
+            if (mutualFollowLimitReached) {
+                devOp(alias, "互点仅关注：Follow 已达上限，结束评论区批处理")
+                break@batchLoop
+            }
+
+            batchIndex++
+            val batchTag = "第 $batchIndex 批"
+            val replyCenterYs =
+                findMutualFollowOnlyReplyCenterYsWithRetries(service, config, batchTag)
+            if (replyCenterYs == null) {
+                devOp(alias, "互点仅关注：$batchTag Reply OCR 恢复后结束评论区（需从 Videos 重新进作品）")
+                commentPanelClosed = true
+                break@batchLoop
+            }
+            val replyCount = replyCenterYs.size
+            devOp(alias, "互点仅关注：$batchTag Reply=$replyCount")
+
+            if (replyCount == 0) {
+                devOp(alias, "互点仅关注：$batchTag 仍无 Reply，结束评论区")
+                break@batchLoop
+            }
+
+            var skipCount = 0
+            val tapPoints = replyCenterYs.map { mutualFollowOnlyTapPointForReply(widthPx, heightPx, it) }
+            for ((idx, tap) in tapPoints.withIndex()) {
+                coroutineContext.ensureActive()
+                if (hardStopOrNull(alias, "互点仅关注评论区单条")) break@batchLoop
+                if (mutualFollowLimitReached) break
+                val itemTag = "批${batchIndex}条${idx + 1}/${tapPoints.size}"
+                val tapResult = mutualFollowOnlyTapReplyAvatarEntry(
+                    service,
+                    tap,
+                    heightPx,
+                    itemTag,
+                )
+                if (tapResult.abandonCoordinate) {
+                    skipCount++
+                    devOp(alias, "互点仅关注：$itemTag Replying 已返回，跳过本坐标处理下一条")
+                    continue
+                }
+                val skipped = mutualFollowOnlyAuthorBarFollowOnProfile(
+                    service,
+                    config,
+                    itemTag,
+                    tapResult.profileDecision,
+                )
+                if (skipped) skipCount++
+                navBack(alias, "互点仅关注 $itemTag 返回评论区")
+                delay(Random.nextLong(700, 1101))
+            }
+
+            if (mutualFollowLimitReached) {
+                devOp(alias, "互点仅关注：Follow 上限后关闭评论区")
+                navBack(alias, "互点仅关注 Follow 达限关闭评论区")
+                delay(Random.nextLong(500, 801))
+                commentPanelClosed = true
+                break@batchLoop
+            }
+
+            val stopBySkipRatio = skipCount * 2 >= replyCount
+            if (stopBySkipRatio) {
+                devOp(
+                    alias,
+                    "互点仅关注：本批 skip=$skipCount / Reply=$replyCount（≥一半），不再上滑，关闭评论区",
+                )
+                navBack(alias, "互点仅关注 skip 过半关闭评论区")
+                delay(Random.nextLong(500, 801))
+                commentPanelClosed = true
+                break@batchLoop
+            }
+
+            val lowestY = replyCenterYs.maxOrNull() ?: break@batchLoop
+            swipeUpMutualFollowOnlyCommentList(service, lowestY)
+        }
+
+        if (!commentPanelClosed) {
+            navBack(alias, "互点仅关注 评论区批处理结束关闭评论区")
+            delay(Random.nextLong(500, 801))
+            commentPanelClosed = true
+        }
+        return commentPanelClosed
+    }
+
+    private suspend fun closeMutualCommentPanelAfterFollowOnly(service: Context) {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        devOp(alias, "互点仅关注：关闭评论区返回作品播放页")
+        runSuCommand("input keyevent 4")
+        delay(Random.nextLong(500, 801))
+    }
+
     /**
      * 互点：固定坐标打开评论输入并发评；文案仅 [pickMutualCommentPhrase]（仅 mutual_comment_texts）。
      */
@@ -7872,7 +9202,7 @@ class RealTraceExecutor(
                 delay(Random.nextLong(320, 520))
             }
         } else {
-            devOp(alias, "互点：已达粉丝列表 Follow 上限，跳过评论框粘贴与用户名回传")
+            devOp(alias, "互点：已达 Follow 会话上限，跳过评论框粘贴与用户名回传")
         }
 
         val text = pickMutualCommentPhrase(config, alias)

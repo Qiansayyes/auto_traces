@@ -62,7 +62,6 @@ class MainActivity : AppCompatActivity() {
         requestNotificationPermissionIfNeeded()
         requestReadClipboardPermissionIfNeeded()
         setupBindingSection()
-        setupRunModeSpinner()
         setupAssignedAccountSection()
         renderDeviceInfo()
         observeLogs()
@@ -571,38 +570,6 @@ class MainActivity : AppCompatActivity() {
                 renderDeviceInfo()
             }
         }
-    }
-
-    private fun setupRunModeSpinner() {
-        val labels = listOf("涨粉模式", "主播访问模式", "直客访问模式", "互点模式")
-        binding.runModeSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-
-        fun indexForStored(): Int = when (PrefsStore.getDeviceRunMode()) {
-            ServerRunMode.LIVE -> 1
-            ServerRunMode.DIRECT -> 2
-            ServerRunMode.MUTUAL -> 3
-            else -> 0
-        }
-
-        var suppressCallback = true
-        binding.runModeSpinner.setSelection(indexForStored())
-        binding.runModeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                if (suppressCallback) return
-                val mode = when (position) {
-                    1 -> ServerRunMode.LIVE
-                    2 -> ServerRunMode.DIRECT
-                    3 -> ServerRunMode.MUTUAL
-                    else -> ServerRunMode.GROWTH
-                }
-                PrefsStore.saveDeviceRunMode(mode)
-                lifecycleScope.launch { AppCoordinator.fetchConfig() }
-                LogCenter.op(PrefsStore.getAlias(), "已切换本机运行模式为 $mode，正在拉取配置")
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
-        binding.runModeSpinner.post { suppressCallback = false }
     }
 
     private fun setupBindingSection() {

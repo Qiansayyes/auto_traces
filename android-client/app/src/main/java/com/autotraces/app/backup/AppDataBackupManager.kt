@@ -24,7 +24,13 @@ class AppDataBackupManager(private val context: Context) {
 
             val backupRoot = UnifiedBackupPaths.ensureBackupsDir(context)
             val qBackupDir = DeviceBackupShell.shellQuote(backupRoot.absolutePath)
-            val filename = "backup_${accountName}_${System.currentTimeMillis()}.tar.gz"
+            val ts = System.currentTimeMillis().toString()
+            val filename = UnifiedBackupPaths.buildTikTokBackupArchiveName(
+                alias = accountName,
+                username = accountName,
+                deviceId = "local",
+                timestamp = ts,
+            ) ?: "backup_${UnifiedBackupPaths.sanitizeUsernameForBackupFilename(accountName)}_${ts}.tar.gz"
             val outFile = File(backupRoot, filename)
             val qOut = DeviceBackupShell.shellQuote(outFile.absolutePath)
 

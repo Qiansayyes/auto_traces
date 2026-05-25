@@ -40,11 +40,14 @@ object AppCoordinator {
             ServerRunMode.GROWTH -> "涨粉"
             ServerRunMode.LIVE -> "主播"
             ServerRunMode.DIRECT -> "直客"
-            ServerRunMode.MUTUAL -> "互点"
+            ServerRunMode.MUTUAL -> "互点引流"
             null, "" -> "未设置"
             else -> mode!!.trim()
         }
     }
+
+    private fun queueRunMode(): String =
+        _config.value.run_mode.trim().lowercase().ifBlank { ServerRunMode.GROWTH }
 
     private fun configSummaryLine(runMode: String, templateName: String): String {
         val tpl = templateName.trim()
@@ -89,7 +92,7 @@ object AppCoordinator {
     private fun canStartPullLoopNow(): Boolean =
         !isPublishPostSwitchActive() && !isMutualSwitchActive()
 
-    /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常，不得计入本批自动互点。 */
+    /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常。 */
     private fun isPullLoopJobCancellation(err: Throwable): Boolean {
         var t: Throwable? = err
         while (t != null) {
@@ -291,9 +294,7 @@ object AppCoordinator {
         }
         val deviceId = PrefsStore.getDeviceId() ?: return false
         val alias = PrefsStore.getAlias() ?: return false
-        val deviceQueueMode = PrefsStore.getDeviceRunMode()
-        val modeForRequest =
-            configQueryRunMode?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: deviceQueueMode
+        val modeForRequest = configQueryRunMode?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
         val tiktokAccount = PrefsStore.getLogContextUsername()
         return runCatching {
             ApiService.getConfig(deviceId, alias, modeForRequest, tiktokAccount)
@@ -307,15 +308,9 @@ object AppCoordinator {
                     return fetchConfig(configQueryRunMode, logToUser, bindingRecoveryAttempted = true)
                 }
                 if (response.code == 0 && response.config != null) {
-                    val merged = response.config.copy(
+                    val effective = response.config.copy(
                         run_mode = response.run_mode ?: response.config.run_mode,
                     )
-                    val effective =
-                        if (modeForRequest != deviceQueueMode) {
-                            merged.copy(run_mode = deviceQueueMode)
-                        } else {
-                            merged
-                        }
                     _config.value = effective
                     val templateLabel = prettyTemplateName(response.active_template)
                     if (logToUser) {
@@ -539,6 +534,11 @@ object AppCoordinator {
                 val deviceId = PrefsStore.getDeviceId() ?: break
                 val alias = PrefsStore.getAlias() ?: break
 
+                if (queueRunMode() == ServerRunMode.MUTUAL) {
+                    runMutualTrafficPullLoopIteration(alias, deviceId)
+                    continue
+                }
+
                 if (pendingUsernames.isEmpty() && !shouldAbortPullExecution()) {
                     reportOnlineBeforePull(alias, deviceId)
                     fetchUsernamesOnce(alias, deviceId)
@@ -595,6 +595,32 @@ object AppCoordinator {
         }
     }
 
+    /** 互点模式独立循环：不拉涨粉用户名队列，仅周期性执行 teamwork 引流会话。 */
+    private suspend fun runMutualTrafficPullLoopIteration(alias: String, deviceId: String) {
+        if (!isMutualSwitchActive() && !isPublishPostSwitchActive()) {
+            reportOnlineBeforePull(alias, deviceId)
+            fetchConfig()
+            PrefsStore.setMutualClickRequested(true)
+            PrefsStore.setMutualClickPending(true)
+            triggerMutualSwitchNow(alias)
+        }
+        if (isMutualSwitchActive() || isPublishPostSwitchActive()) {
+            delay(2_000)
+            return
+        }
+        val interval = Random.nextLong(30_000L, 60_000L)
+        if (forceImmediatePull) {
+            forceImmediatePull = false
+            LogCenter.op(alias, "互点模式：强制立即开始下一轮引流")
+        } else {
+            LogCenter.op(alias, "互点模式：${interval / 1000} 秒后开始下一轮引流")
+            updateRuntime(lastMessage = "互点模式等待下一轮引流")
+            if (!delayUnlessHardStop(interval)) {
+                LogCenter.op(alias, "硬停：已中断互点模式等待")
+            }
+        }
+    }
+
     private suspend fun fetchUsernamesOnce(alias: String, deviceId: String) {
         try {
             // 配置与批次拉取绑定：每次拉一批用户名前先拉一次最新配置。
@@ -604,7 +630,7 @@ object AppCoordinator {
                 deviceId,
                 alias,
                 pullN,
-                PrefsStore.getDeviceRunMode(),
+                queueRunMode(),
                 PrefsStore.getLogContextUsername(),
             )
             if (response.code == 2) {
@@ -965,11 +991,22 @@ object AppCoordinator {
             return
         }
         val packageName = payload?.package_name?.trim().orEmpty()
-        if (op.op_type == "mutual_click_start" || op.op_type == "mutual_click_comment_only_start") {
+        if (
+            op.op_type == "mutual_click_start" ||
+            op.op_type == "mutual_click_comment_only_start" ||
+            op.op_type == "mutual_click_follow_only_start"
+        ) {
             val commentOnly = op.op_type == "mutual_click_comment_only_start"
+            val followOnly = op.op_type == "mutual_click_follow_only_start"
             PrefsStore.setMutualCommentOnlySession(commentOnly)
+            PrefsStore.setMutualFollowOnlySession(followOnly)
+            val sessionLabel = when {
+                followOnly -> "仅关注"
+                commentOnly -> "仅评论"
+                else -> "完整"
+            }
             val mutualLogLine =
-                "[OP][$opId] 收到互点切换指令（${if (commentOnly) "仅评论" else "完整"}），开始请求设备进入互点模式"
+                "[OP][$opId] 收到互点引流指令（$sessionLabel），开始引流会话"
             LogCenter.op(alias, mutualLogLine)
             PrefsStore.setMutualClickRequested(true)
             PrefsStore.setMutualClickPending(true)
@@ -979,7 +1016,7 @@ object AppCoordinator {
                 alias = alias,
                 opId = opId,
                 status = "success",
-                message = "已收到互点切换请求",
+                message = "已收到互点引流请求",
                 data = mapOf(
                     "op_type" to op.op_type,
                     "device_id" to deviceId,
@@ -1481,7 +1518,37 @@ object AppCoordinator {
                 val backupDir = backupRoot.absolutePath
                 val qBackupDir = DeviceBackupShell.shellQuote(backupDir)
                 val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
-                val backupName = "${alias}_${deviceId}_${ts}.tar.gz"
+                val reportUsername = payload?.username?.trim().orEmpty()
+                val backupName = UnifiedBackupPaths.buildTikTokBackupArchiveName(
+                    alias = alias,
+                    username = reportUsername,
+                    deviceId = deviceId,
+                    timestamp = ts,
+                )
+                if (backupName == null) {
+                    val isCutSwitchEarly = !payload?.cut_switch_after_backup.isNullOrBlank()
+                    opStep("缺少有效 username，无法生成备份包名（包名须包含 username）")
+                    opDone(
+                        false,
+                        if (isCutSwitchEarly) "切号：备份失败（缺少 username）" else "备份失败（缺少 username）",
+                        if (isCutSwitchEarly) "切号：备份失败（缺少 username）" else "备份失败（缺少 username）",
+                    )
+                    ApiService.reportDeviceOp(
+                        deviceId = deviceId,
+                        alias = alias,
+                        opId = opId,
+                        status = "failed",
+                        message = "备份失败：下发任务未带 username，无法生成与账号绑定的包名",
+                        data = mapOf(
+                            "op_type" to "tiktok_backup_and_clear",
+                            "device_id" to deviceId,
+                            "package_name" to packageName,
+                            "username" to reportUsername,
+                            "operation_logs" to operationLogs,
+                        ),
+                    )
+                    return@handleDeviceOp
+                }
                 val backupPath = File(backupRoot, backupName).absolutePath
                 val qBackupPath = DeviceBackupShell.shellQuote(backupPath)
                 val sourceDir = "/data/data/$packageName"
@@ -1555,7 +1622,6 @@ object AppCoordinator {
                     if (isCutSwitch) "切号：当前账号备份或清理失败" else "备份或清理失败",
                 )
 
-                val reportUsername = payload?.username?.trim().orEmpty()
                 val reportBackupRecordId = payload?.backup_record_id
                 val reportData = mutableMapOf<String, Any>(
                     "op_type" to "tiktok_backup_and_clear",
@@ -1752,7 +1818,11 @@ object AppCoordinator {
         }.also { job ->
             job.invokeOnCompletion {
                 if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
-                    LogCenter.op(alias, "互点切换结束后恢复拉取循环")
+                    if (queueRunMode() == ServerRunMode.MUTUAL) {
+                        LogCenter.op(alias, "互点引流会话结束，云端队列模式为互点，将继续下一轮")
+                    } else {
+                        LogCenter.op(alias, "互点引流会话结束")
+                    }
                     startPullLoop()
                 }
             }
@@ -1921,37 +1991,6 @@ object AppCoordinator {
         }
     }
 
-    /**
-     * 涨粉：模板 [AppConfig.growth_pull_batches_before_auto_mutual] ≥1 时，
-     * 每完成一整批「服务端拉取清单」内全部用户名（均已处理：成功/跳过或涨粉失败已跳过，见 [PrefsStore.markUsernameProcessed]）计 1；
-     * 累计达到阈值则等价于管理台「启动所选设备互点」：暂停涨粉拉取 → 互点会话 → 结束后恢复拉取。
-     */
-    private suspend fun evaluateGrowthAutoMutualAfterBatchIfNeeded(alias: String, deviceId: String) {
-        val threshold = _config.value.growth_pull_batches_before_auto_mutual
-        if (threshold < 1) return
-        if (PrefsStore.getDeviceRunMode() != ServerRunMode.GROWTH) return
-        if (mutualSwitchJob?.isActive == true) return
-        if (isPublishPostSwitchActive()) {
-            LogCenter.op(alias, "涨粉自动互点暂缓：发作品执行中，本批不计入自动互点触发")
-            return
-        }
-        if (!PrefsStore.tryConsumeCompletedPullBatchForAutoMutualStat()) return
-        val n = PrefsStore.incrementGrowthBatchesTowardAutoMutual()
-        LogCenter.op(alias, "涨粉：本拉取清单已全部执行完毕 → 自动互点批计数 $n / $threshold")
-        if (n < threshold) return
-        PrefsStore.resetGrowthBatchesTowardAutoMutual()
-        LogCenter.op(
-            alias,
-            "涨粉：已连续 $threshold 批拉取清单全部执行完毕，自动进入互点",
-        )
-        PrefsStore.setMutualCommentOnlySession(false)
-        PrefsStore.setMutualClickRequested(true)
-        PrefsStore.setMutualClickPending(true)
-        PrefsStore.setHardStopRequested(false)
-        updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = "涨粉批阈值已达，自动互点即将开始")
-        triggerMutualSwitchNow(alias)
-    }
-
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {
         if (shouldAbortPullExecution()) {
             LogCenter.op(alias, "硬停/暂停中：跳过执行 $username")
@@ -1987,7 +2026,6 @@ object AppCoordinator {
                     PrefsStore.markUsernameCompleted(username)
                     completedTracker.add(username)
                     success = true
-                    evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
                     break
                 }
 
@@ -2005,7 +2043,6 @@ object AppCoordinator {
                 PrefsStore.markUsernameCompleted(username)
                 completedTracker.add(username)
                 success = true
-                evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
                 if (runMode == ServerRunMode.LIVE || runMode == ServerRunMode.DIRECT) {
                     LogCenter.op(alias, "已回 Users，继续下一名用户")
                 }
@@ -2016,7 +2053,7 @@ object AppCoordinator {
             if (errThrowable != null && isPullLoopJobCancellation(errThrowable)) {
                 LogCenter.op(
                     alias,
-                    "任务已取消：$username（发作品/互点切换打断），不计入本批自动互点",
+                    "任务已取消：$username（发作品/互点切换打断）",
                 )
                 if (errThrowable is CancellationException) {
                     throw errThrowable
@@ -2078,9 +2115,6 @@ object AppCoordinator {
             val qLabel = if (runMode == ServerRunMode.MUTUAL) "互点（mobile 队列）" else "涨粉"
             LogCenter.op(alias, "$qLabel：跳过失败用户，继续下一个")
             PrefsStore.markUsernameProcessed(username)
-            if (runMode == ServerRunMode.GROWTH) {
-                evaluateGrowthAutoMutualAfterBatchIfNeeded(alias, deviceId)
-            }
         } else {
             LogCenter.op(alias, "主播/直客：本用户失败，将按策略重试或跳过")
         }
@@ -2096,7 +2130,7 @@ object AppCoordinator {
             var success = false
             for (index in 0 until 3) {
                 val result = runCatching {
-                    ApiService.reportResult(deviceId, alias, message, PrefsStore.getDeviceRunMode())
+                    ApiService.reportResult(deviceId, alias, message, queueRunMode())
                 }
                 if (result.isSuccess && result.getOrNull()?.code == 0) {
                     success = true

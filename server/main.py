@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from threading import Event, Lock, RLock, Thread
 from typing import Any, Dict, Iterable, List, Literal
 
@@ -69,6 +70,8 @@ BASE_DEFAULT_CONFIG = {
     # 每个动作每日上限（默认 800，可后台修改）
     "like_daily_limit": 800,
     "comment_daily_limit": 800,
+    # 引流评论每日上限：独立于通用评论
+    "mutual_traffic_comment_daily_limit": 800,
     "favorite_daily_limit": 800,
     "share_daily_limit": 800,
     # 是否互斥只执行一个动作
@@ -93,9 +96,11 @@ BASE_DEFAULT_CONFIG = {
     # 引流 Videos 列表轮次（与完整互点共用）；粉丝列表 Follow 单次会话点击上限
     "mutual_videos_scroll_rounds": 5,
     "mutual_follow_tap_session_limit": 20,
-    # 引流：达粉丝列表 Follow 上限后仍左滑并在作者区点 Follow；未勾选则沿用旧逻辑（上限后不再左滑）
-    "mutual_left_swipe_follow": False,
-    # 涨粉：连续多少「整批拉取清单在设备端每条均已处理（含失败跳过）」后自动进入互点；-1 表示永不自动切换
+    # 引流 Videos 单条作品内可独立开关：评论 / 作者区 Follow / Followers 列表 Follow（作者区与列表点击共用上限计数）
+    "mutual_traffic_comment": True,
+    "mutual_traffic_author_follow": True,
+    "mutual_traffic_followers_follow": True,
+    # 已废弃：涨粉满批后自动引流（设备端仅在互点模式独立运行引流）
     "growth_pull_batches_before_auto_mutual": -1,
     # 互动动作之间的随机间隔（秒）
     "action_delay_min": 0.7,
@@ -144,6 +149,12 @@ CV_TEMPLATE_ZIP_PATH = BASE_DIR / "server" / "cv_templates.zip"
 FOLLOW_SCRAPER_PATH = BASE_DIR / "tiktok_follow_scraper.py"
 AUTOSEARCH_PATH = BASE_DIR / "autoSearch_5.28_with_debug.py"
 TIKTOK_PACKAGE_NAME = "com.zhiliaoapp.musically"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+AUTO_SWITCH_TASK_LOG_KEY = "auto_account_switch"
+AUTO_SWITCH_TICK_INTERVAL_SEC = 60
+BACKUP_STATS_FULL_QUERY_LOG_KEY = "backup_stats_full_query"
+BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
+BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
 DEFAULT_PROCESS_QUEUE_BATCH_SIZE = int(BASE_DEFAULT_CONFIG.get("process_queue_batch_size", 100))
 DEVICE_LOG_DEDUP_WINDOW_SEC = 5.0
 _device_log_dedup_cache_lock = Lock()
@@ -460,6 +471,9 @@ def init_follow_db():
                 ip TEXT NOT NULL DEFAULT '',
                 region TEXT NOT NULL DEFAULT '',
                 username TEXT NOT NULL DEFAULT '',
+                video_count TEXT NOT NULL DEFAULT '',
+                follower_count TEXT NOT NULL DEFAULT '',
+                follower_growth TEXT NOT NULL DEFAULT '',
                 backup_path TEXT NOT NULL DEFAULT '',
                 backup_name TEXT NOT NULL DEFAULT '',
                 backup_time TEXT NOT NULL DEFAULT '',
@@ -497,6 +511,18 @@ def init_follow_db():
             pass
         try:
             conn.execute("ALTER TABLE account_editor_rows ADD COLUMN follower_growth TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE device_editor_rows ADD COLUMN video_count TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE device_editor_rows ADD COLUMN follower_count TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE device_editor_rows ADD COLUMN follower_growth TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
         try:
@@ -700,6 +726,18 @@ def init_autosearch_db():
             CREATE TABLE IF NOT EXISTS persisted_runtime_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_switch_daily_plans (
+                owner_username TEXT NOT NULL,
+                schedule_date TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, schedule_date, alias)
             )
             """
         )
@@ -924,6 +962,12 @@ class MemoryStore:
     scheduler_task_enabled: Dict[str, bool] = field(default_factory=dict)
     scheduler_task_interval_sec: Dict[str, int] = field(default_factory=dict)
     scheduler_task_last_run_at: Dict[str, str] = field(default_factory=dict)
+    auto_switch_enabled: bool = False
+    auto_switch_align_on_next_tick: bool = True
+    auto_switch_last_slot_keys: Dict[str, str] = field(default_factory=dict)
+    backup_stats_full_query_enabled: bool = True
+    backup_stats_full_query_last_run_date: str = ""
+    backup_stats_full_query_in_flight: bool = False
     task_processes: Dict[str, subprocess.Popen] = field(default_factory=dict)
     task_logs: Dict[str, List[str]] = field(default_factory=dict)
     # 设备端操作任务队列与结果（用于“备份清理/恢复”）
@@ -1109,6 +1153,24 @@ def _load_persisted_runtime_state():
         if isinstance(auto_start, bool):
             with _tracked_store_lock("_load_persisted_runtime_state:auto_start"):
                 store.auto_start_enabled = auto_start
+        auto_sw = blob.get("auto_switch_enabled")
+        if isinstance(auto_sw, bool):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch"):
+                store.auto_switch_enabled = auto_sw
+        last_slots = blob.get("auto_switch_last_slot_keys")
+        if isinstance(last_slots, dict):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_slots"):
+                store.auto_switch_last_slot_keys = {
+                    str(k): str(v) for k, v in last_slots.items() if str(k).strip() and str(v).strip()
+                }
+        bs_enabled = blob.get("backup_stats_full_query_enabled")
+        if isinstance(bs_enabled, bool):
+            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_full_query"):
+                store.backup_stats_full_query_enabled = bs_enabled
+        bs_last = blob.get("backup_stats_full_query_last_run_date")
+        if isinstance(bs_last, str):
+            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_last"):
+                store.backup_stats_full_query_last_run_date = bs_last.strip()
         dc = blob.get("default_config")
         if isinstance(dc, dict):
             dm = dict(MODE_DEFAULT_CONFIGS["growth"])
@@ -1250,6 +1312,27 @@ def _normalize_tiktok_username_key(raw: object) -> str:
     return text.lower()
 
 
+def _sanitize_username_backup_token(username: str) -> str:
+    """与 Android UnifiedBackupPaths.sanitizeUsernameForBackupFilename 规则一致。"""
+    text = _normalize_tiktok_username_key(username)
+    if not text:
+        return ""
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch in "._-":
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    return "".join(cleaned).strip("_")
+
+
+def _backup_name_contains_username(backup_name: str, username: str) -> bool:
+    token = _sanitize_username_backup_token(username)
+    if not token:
+        return False
+    return token in str(backup_name or "").lower()
+
+
 def _alias_account_template_key(alias: object, tiktok_username: object) -> str:
     """别名设备上某 TikTok 账号的配置映射键（与仅 alias 的设备级键并存，解析时账号键优先）。"""
     alias_clean = _normalize_alias_key(alias)
@@ -1339,6 +1422,29 @@ def _load_template_grants_for_user(target_username: str) -> List[Dict[str, str]]
         conn.close()
 
 
+def _migrate_mutual_traffic_config(cfg: dict) -> dict:
+    """将已废弃的 mutual_left_swipe_follow 迁移为三项引流开关；缺省与历史「完整互点」一致。"""
+    out = dict(cfg)
+    has_new = any(
+        k in out
+        for k in (
+            "mutual_traffic_comment",
+            "mutual_traffic_author_follow",
+            "mutual_traffic_followers_follow",
+        )
+    )
+    out.pop("mutual_left_swipe_follow", None)
+    if not has_new:
+        out.setdefault("mutual_traffic_comment", True)
+        out.setdefault("mutual_traffic_author_follow", True)
+        out.setdefault("mutual_traffic_followers_follow", True)
+    else:
+        out.setdefault("mutual_traffic_comment", True)
+        out.setdefault("mutual_traffic_author_follow", True)
+        out.setdefault("mutual_traffic_followers_follow", True)
+    return out
+
+
 def _build_effective_template_bundle(username: str, data: dict) -> tuple[Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
     own_templates = data.get("configs_by_template", {})
     merged_templates: Dict[str, Dict[str, object]] = {}
@@ -1348,7 +1454,7 @@ def _build_effective_template_bundle(username: str, data: dict) -> tuple[Dict[st
             name = _sanitize_template_name(key, "default")
             if not isinstance(cfg, dict):
                 continue
-            merged_templates[name] = dict(cfg)
+            merged_templates[name] = _migrate_mutual_traffic_config(dict(cfg))
             template_meta[name] = {
                 "source_username": username,
                 "template_name": name,
@@ -1366,7 +1472,7 @@ def _build_effective_template_bundle(username: str, data: dict) -> tuple[Dict[st
         if not isinstance(owner_cfg, dict):
             continue
         key = _shared_template_key(source_username, template_name)
-        merged_templates[key] = dict(owner_cfg)
+        merged_templates[key] = _migrate_mutual_traffic_config(dict(owner_cfg))
         template_meta[key] = {
             "source_username": source_username,
             "template_name": template_name,
@@ -1421,7 +1527,7 @@ def _normalize_user_runtime_state(raw_state: dict | None) -> dict:
                 k: v for k, v in value.items() if not (k in _list_keys_no_null and v is None)
             }
             merged.update(filtered)
-            templates[name] = merged
+            templates[name] = _migrate_mutual_traffic_config(merged)
 
     # 兼容旧结构：仅存在 configs_by_mode 时，迁移到 default 模板。
     if not templates:
@@ -1440,9 +1546,9 @@ def _normalize_user_runtime_state(raw_state: dict | None) -> dict:
                         if not (k in _list_keys_no_null and v is None)
                     },
                 )
-            templates["default"] = merged
+            templates["default"] = _migrate_mutual_traffic_config(merged)
     if not templates:
-        templates["default"] = dict(MODE_DEFAULT_CONFIGS["growth"])
+        templates["default"] = _migrate_mutual_traffic_config(dict(MODE_DEFAULT_CONFIGS["growth"]))
 
     active_template = _sanitize_template_name(data.get("active_template"), "default")
     if active_template not in templates:
@@ -1556,6 +1662,10 @@ def persist_runtime_state():
             "run_mode": store.run_mode,
             "default_config": dict(store.default_config),
             "auto_start_enabled": store.auto_start_enabled,
+            "auto_switch_enabled": bool(store.auto_switch_enabled),
+            "auto_switch_last_slot_keys": dict(store.auto_switch_last_slot_keys),
+            "backup_stats_full_query_enabled": bool(store.backup_stats_full_query_enabled),
+            "backup_stats_full_query_last_run_date": str(store.backup_stats_full_query_last_run_date or ""),
         }
     conn = _get_db()
     try:
@@ -1921,6 +2031,14 @@ class AutoStartRequest(BaseModel):
     enabled: bool
 
 
+class AutoSwitchConfigRequest(BaseModel):
+    enabled: bool | None = None
+
+
+class BackupStatsFullQueryConfigRequest(BaseModel):
+    enabled: bool | None = None
+
+
 class SchedulerConfigRequest(BaseModel):
     enabled: bool
 
@@ -2002,6 +2120,11 @@ class AddTikTokRootsRequest(BaseModel):
 class TikTokProfileStatsRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     include_raw: bool = False
+    write_back: bool = False
+    query_index: int | None = None
+    query_total: int | None = None
+    query_index: int | None = Field(default=None, ge=1)
+    query_total: int | None = Field(default=None, ge=1)
 
 
 class LiveCustomerImportResponse(BaseModel):
@@ -2205,6 +2328,7 @@ class UpdateConfigRequest(BaseModel):
     for_you_watch_max_sec: float | None = None
     like_daily_limit: int | None = None
     comment_daily_limit: int | None = None
+    mutual_traffic_comment_daily_limit: int | None = None
     favorite_daily_limit: int | None = None
     share_daily_limit: int | None = None
     action_single: bool | None = None
@@ -2219,7 +2343,10 @@ class UpdateConfigRequest(BaseModel):
     profile_edit_bio_texts: List[str] | None = None
     mutual_videos_scroll_rounds: int | None = None
     mutual_follow_tap_session_limit: int | None = None
-    mutual_left_swipe_follow: bool | None = None
+    mutual_traffic_comment: bool | None = None
+    mutual_traffic_author_follow: bool | None = None
+    mutual_traffic_followers_follow: bool | None = None
+    mutual_left_swipe_follow: bool | None = None  # 已废弃，保存时忽略；读模板时迁移为三项开关
     growth_pull_batches_before_auto_mutual: int | None = None
 
     @field_validator(
@@ -2242,6 +2369,7 @@ class UpdateConfigRequest(BaseModel):
     @field_validator(
         "like_daily_limit",
         "comment_daily_limit",
+        "mutual_traffic_comment_daily_limit",
         "favorite_daily_limit",
         "share_daily_limit",
     )
@@ -2322,7 +2450,7 @@ class UpdateConfigRequest(BaseModel):
         if value is None:
             return value
         if value < -1 or value > 10_000:
-            raise ValueError("growth_pull_batches_before_auto_mutual 必须在 -1~10000 之间（-1=关闭自动互点）")
+            raise ValueError("growth_pull_batches_before_auto_mutual 必须在 -1~10000 之间（已废弃，设备端忽略）")
         return value
 
     @field_validator("direct_post_action_delay_ms")
@@ -2883,6 +3011,668 @@ def _restore_device_auto_start_opt_out_after_cut_switch(device_id: str, alias: s
     return restored
 
 
+def _beijing_now() -> datetime:
+    return datetime.now(BEIJING_TZ)
+
+
+def _beijing_date_str(dt: datetime | None = None) -> str:
+    return (_beijing_now() if dt is None else dt.astimezone(BEIJING_TZ)).strftime("%Y-%m-%d")
+
+
+def _beijing_minute_of_day(dt: datetime | None = None) -> int:
+    cur = _beijing_now() if dt is None else dt.astimezone(BEIJING_TZ)
+    return cur.hour * 60 + cur.minute
+
+
+def _auto_switch_bucket_key(owner_username: str, alias: str) -> str:
+    return f"{str(owner_username or '').strip()}::{_normalize_alias_key(alias)}"
+
+
+def _auto_switch_log(line: str) -> None:
+    text = str(line or "").rstrip("\r\n")
+    if not text:
+        return
+    with store.lock:
+        logs = store.task_logs.setdefault(AUTO_SWITCH_TASK_LOG_KEY, [])
+        logs.append(text)
+        if len(logs) > 500:
+            del logs[: len(logs) - 500]
+    print(f"[{now_text()}] auto_switch | {text}")
+
+
+def _auto_switch_row_dict(row: sqlite3.Row | tuple | dict) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "keys"):
+        return dict(row)
+    return {
+        "row_index": row[0] if len(row) > 0 else None,
+        "device_alias": row[1] if len(row) > 1 else "",
+        "device_id": row[2] if len(row) > 2 else "",
+        "username": row[3] if len(row) > 3 else "",
+        "assigned_alias": row[4] if len(row) > 4 else "",
+        "backup_path": row[5] if len(row) > 5 else "",
+        "backup_name": row[6] if len(row) > 6 else "",
+        "switch_highlight": row[7] if len(row) > 7 else "否",
+    }
+
+
+def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str, Any]]]:
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {}
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, device_alias, device_id, username, assigned_alias,
+                   backup_path, backup_name, switch_highlight
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+    buckets: Dict[str, List[dict[str, Any]]] = {}
+    for row in rows or []:
+        item = _auto_switch_row_dict(row)
+        alias_key = _device_editor_effective_alias(item)
+        if not alias_key:
+            continue
+        buckets.setdefault(alias_key, []).append(item)
+    return {k: v for k, v in buckets.items() if len(v) >= 2}
+
+
+def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(rows, key=lambda r: int(r.get("row_index") or 0))
+    shuffled = list(ordered)
+    random.shuffle(shuffled)
+    n = len(shuffled)
+    base = 1440 // n
+    extra = 1440 % n
+    slots: List[dict[str, Any]] = []
+    start = 0
+    for idx, row in enumerate(shuffled):
+        span = base + (1 if idx < extra else 0)
+        end = start + span
+        if idx == n - 1:
+            end = 1440
+        slots.append(
+            {
+                "slot_index": idx,
+                "start_min": start,
+                "end_min": end,
+                "row_index": int(row.get("row_index") or 0),
+                "username": str(row.get("username") or "").strip(),
+            }
+        )
+        start = end
+    return {"slot_minutes": base, "account_count": n, "slots": slots}
+
+
+def _load_auto_switch_daily_plan(owner_username: str, alias: str, schedule_date: str) -> dict[str, Any] | None:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    date_key = str(schedule_date or "").strip()
+    if not owner or not alias_key or not date_key:
+        return None
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT plan_json FROM auto_switch_daily_plans
+            WHERE owner_username = ? AND schedule_date = ? AND alias = ?
+            """,
+            (owner, date_key, alias_key),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        plan = json.loads(row[0])
+        return plan if isinstance(plan, dict) else None
+    except Exception:
+        return None
+
+
+def _save_auto_switch_daily_plan(owner_username: str, alias: str, schedule_date: str, plan: dict[str, Any]) -> None:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    date_key = str(schedule_date or "").strip()
+    if not owner or not alias_key or not date_key:
+        return
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO auto_switch_daily_plans
+            (owner_username, schedule_date, alias, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (owner, date_key, alias_key, json.dumps(plan, ensure_ascii=False), now_text()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_auto_switch_daily_plan(owner_username: str, alias: str, rows: List[dict[str, Any]], schedule_date: str) -> dict[str, Any]:
+    existing = _load_auto_switch_daily_plan(owner_username, alias, schedule_date)
+    if existing and isinstance(existing.get("slots"), list) and len(existing["slots"]) == len(rows):
+        return existing
+    plan = _generate_auto_switch_daily_plan(rows)
+    _save_auto_switch_daily_plan(owner_username, alias, schedule_date, plan)
+    slot_desc = ", ".join(
+        f"{s.get('username') or '-'}[{int(s.get('start_min') or 0)//60:02d}:{int(s.get('start_min') or 0)%60:02d}-{int(s.get('end_min') or 0)//60:02d}:{int(s.get('end_min') or 0)%60:02d})"
+        for s in plan.get("slots") or []
+    )
+    _auto_switch_log(
+        f"已生成今日随机时段 | owner={owner_username} alias={alias} date={schedule_date} | {slot_desc}"
+    )
+    return plan
+
+
+def _format_beijing_slot_range(start_min: int, end_min: int) -> str:
+    def fmt(m: int) -> str:
+        clamped = max(0, min(int(m), 1440))
+        h, mi = divmod(clamped, 60)
+        return f"{h:02d}:{mi:02d}"
+
+    start = max(0, int(start_min))
+    end = max(start, int(end_min))
+    if end >= 1440:
+        return f"{fmt(start)}-24:00"
+    return f"{fmt(start)}-{fmt(end)}"
+
+
+def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | None = None) -> dict[str, Any]:
+    owner = str(owner_username or "").strip()
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    if not owner:
+        return {"schedule_date": date_key, "plans_by_alias": {}}
+    buckets = _list_device_editor_buckets(owner)
+    plans_by_alias: Dict[str, Any] = {}
+    for alias_key, rows in buckets.items():
+        if len(rows) < 2:
+            continue
+        plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, date_key)
+        slots_by_row_index: Dict[str, dict[str, Any]] = {}
+        slots_by_username: Dict[str, dict[str, Any]] = {}
+        for slot in plan.get("slots") if isinstance(plan.get("slots"), list) else []:
+            try:
+                row_index = int(slot.get("row_index") or -1)
+            except (TypeError, ValueError):
+                row_index = -1
+            try:
+                start = int(slot.get("start_min") or 0)
+                end = int(slot.get("end_min") or 0)
+            except (TypeError, ValueError):
+                start, end = 0, 0
+            entry = {
+                "slot_index": int(slot.get("slot_index") or 0),
+                "start_min": start,
+                "end_min": end,
+                "label": _format_beijing_slot_range(start, end),
+                "username": str(slot.get("username") or "").strip(),
+            }
+            if row_index >= 0:
+                slots_by_row_index[str(row_index)] = entry
+            user_key = str(slot.get("username") or "").strip().lower()
+            if user_key:
+                slots_by_username[user_key] = entry
+        plans_by_alias[alias_key] = {
+            "account_count": len(rows),
+            "slot_minutes": plan.get("slot_minutes"),
+            "slots_by_row_index": slots_by_row_index,
+            "slots_by_username": slots_by_username,
+        }
+    return {"schedule_date": date_key, "plans_by_alias": plans_by_alias}
+
+
+def _auto_switch_slot_index_at_minute(plan: dict[str, Any], minute_of_day: int) -> int:
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    if not slots:
+        return 0
+    minute = max(0, min(int(minute_of_day), 1439))
+    for slot in slots:
+        try:
+            start = int(slot.get("start_min") or 0)
+            end = int(slot.get("end_min") or 0)
+        except (TypeError, ValueError):
+            continue
+        if start <= minute < end:
+            return int(slot.get("slot_index") or 0)
+    return int(slots[-1].get("slot_index") or len(slots) - 1)
+
+
+def _auto_switch_target_row(plan: dict[str, Any], minute_of_day: int) -> dict[str, Any] | None:
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    if not slots:
+        return None
+    idx = _auto_switch_slot_index_at_minute(plan, minute_of_day)
+    for slot in slots:
+        if int(slot.get("slot_index") or -1) == idx:
+            return slot
+    return slots[min(idx, len(slots) - 1)]
+
+
+def _auto_switch_highlighted_row(rows: List[dict[str, Any]]) -> dict[str, Any] | None:
+    highlighted = [r for r in rows if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
+    if len(highlighted) == 1:
+        return highlighted[0]
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _resolve_device_id_for_owner_alias(owner_username: str, alias: str, hint_device_id: str = "") -> str | None:
+    alias_key = _normalize_alias_key(alias)
+    owner = str(owner_username or "").strip()
+    if not owner or not alias_key:
+        return None
+    hint = str(hint_device_id or "").strip()
+    with store.lock:
+        if hint:
+            dev = store.devices.get(hint)
+            if dev and dev.owner_username == owner and _normalize_alias_key(dev.alias) == alias_key:
+                return hint
+        for did, dev in store.devices.items():
+            if dev.owner_username == owner and _normalize_alias_key(dev.alias) == alias_key:
+                return did
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT device_id FROM client_devices
+            WHERE owner_username = ? AND LOWER(TRIM(alias)) = LOWER(TRIM(?))
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (owner, alias_key),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row and str(row[0] or "").strip():
+        return str(row[0]).strip()
+    return None
+
+
+def _device_has_blocking_tiktok_ops(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    blocking = {
+        "tiktok_backup_and_clear",
+        "tiktok_restore",
+        "tiktok_clear",
+    }
+    with store.lock:
+        for op in store.pending_device_ops.get(did) or []:
+            if str(op.get("op_type") or "") in blocking:
+                return True
+    return False
+
+
+def _auto_switch_enqueue_cut_switch(
+    owner_username: str,
+    alias: str,
+    device_id: str,
+    source_row: dict[str, Any],
+    target_row: dict[str, Any],
+) -> bool:
+    alias_clean = _normalize_alias_key(alias)
+    did = str(device_id or "").strip()
+    if not did or not alias_clean:
+        return False
+    try:
+        source_ri = int(source_row.get("row_index") or -1)
+        target_ri = int(target_row.get("row_index") or -1)
+    except (TypeError, ValueError):
+        return False
+    if source_ri < 0 or target_ri < 0 or source_ri == target_ri:
+        return False
+
+    target_backup = str(target_row.get("backup_name") or "").strip()
+    can_restore = bool(target_backup and target_backup != "-")
+    source_user = str(source_row.get("username") or "").strip()
+    target_user = str(target_row.get("username") or "").strip()
+
+    auto_start_disabled = False
+    with store.lock:
+        dev = store.devices.get(did)
+        if dev and not dev.auto_start_opt_out:
+            dev.auto_start_opt_out = True
+            auto_start_disabled = True
+    if auto_start_disabled:
+        _persist_client_device_to_db(did)
+        _append_device_log(did, "自动切号：云端已自动关闭该设备的自动开启程序")
+
+    prev_path = _fetch_previous_backup_path_for_backup_op(
+        owner_username,
+        source_ri if source_ri > 0 else None,
+        did,
+        source_user,
+    )
+    backup_payload: dict[str, Any] = {
+        "device_id": did,
+        "alias": alias_clean,
+        "package_name": TIKTOK_PACKAGE_NAME,
+        "backup_record_id": source_ri,
+        "username": source_user,
+    }
+    if prev_path:
+        backup_payload["previous_backup_path"] = prev_path
+    if can_restore:
+        backup_payload["cut_switch_after_backup"] = "clear_source_for_restore"
+    else:
+        backup_payload["cut_switch_after_backup"] = "exclusive_activate_target"
+        backup_payload["cut_switch_target_row_index"] = target_ri
+
+    _resume_device_for_cloud_op(
+        did,
+        f"[{now_text()}] 自动切号 | 已入队备份并清理（alias={alias_clean} → {target_user or target_ri}）",
+    )
+    backup_op_id = _enqueue_tiktok_device_op(did, "tiktok_backup_and_clear", backup_payload)
+    _append_device_log(
+        did,
+        f"[{now_text()}] 自动切号 | op_id={backup_op_id} backup source={source_user or source_ri}",
+    )
+
+    if can_restore:
+        backup_name = Path(target_backup).name
+        restore_payload: dict[str, Any] = {
+            "device_id": did,
+            "alias": alias_clean,
+            "package_name": TIKTOK_PACKAGE_NAME,
+            "backup_name": backup_name,
+            "backup_path": str(target_row.get("backup_path") or "").strip() or backup_name,
+            "username": target_user,
+            "mobile_alias": alias_clean,
+            "assigned_alias": str(target_row.get("assigned_alias") or "").strip() or alias_clean,
+            "skip_pm_clear": True,
+            "restore_highlight_row_index": target_ri,
+        }
+        _enqueue_tiktok_device_op(did, "tiktok_restore", restore_payload)
+        _append_device_log(
+            did,
+            f"[{now_text()}] 自动切号 | 已入队还原 target={target_user or target_ri} backup={backup_name}",
+        )
+    return True
+
+
+def _auto_switch_list_owners_with_buckets() -> List[str]:
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT owner_username
+            FROM device_editor_rows
+            WHERE TRIM(owner_username) <> '' AND TRIM(username) <> ''
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(r[0] or "").strip() for r in rows or [] if str(r[0] or "").strip()]
+
+
+def _auto_switch_tick() -> None:
+    with store.lock:
+        if not store.auto_switch_enabled:
+            return
+        align_now = bool(store.auto_switch_align_on_next_tick)
+        if align_now:
+            store.auto_switch_align_on_next_tick = False
+
+    schedule_date = _beijing_date_str()
+    minute_of_day = _beijing_minute_of_day()
+    owners = _auto_switch_list_owners_with_buckets()
+
+    for owner in owners:
+        buckets = _list_device_editor_buckets(owner)
+        for alias_key, rows in buckets.items():
+            plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, schedule_date)
+            target_slot = _auto_switch_target_row(plan, minute_of_day)
+            if not target_slot:
+                continue
+            try:
+                target_ri = int(target_slot.get("row_index") or -1)
+            except (TypeError, ValueError):
+                continue
+            if target_ri < 0:
+                continue
+
+            target_row = next((r for r in rows if int(r.get("row_index") or -1) == target_ri), None)
+            if not target_row:
+                continue
+
+            slot_index = _auto_switch_slot_index_at_minute(plan, minute_of_day)
+            slot_key = f"{schedule_date}|{slot_index}"
+            bucket_key = _auto_switch_bucket_key(owner, alias_key)
+
+            highlighted = _auto_switch_highlighted_row(rows)
+            try:
+                current_ri = int(highlighted.get("row_index") or -1) if highlighted else -1
+            except (TypeError, ValueError):
+                current_ri = -1
+
+            if current_ri == target_ri:
+                with store.lock:
+                    store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                continue
+
+            with store.lock:
+                last_key = str(store.auto_switch_last_slot_keys.get(bucket_key) or "")
+            if last_key == slot_key and not align_now:
+                continue
+
+            device_id = _resolve_device_id_for_owner_alias(
+                owner,
+                alias_key,
+                str((highlighted or target_row).get("device_id") or ""),
+            )
+            if not device_id:
+                _auto_switch_log(f"跳过：未找到在线绑定设备 owner={owner} alias={alias_key}")
+                continue
+            if _device_has_blocking_tiktok_ops(device_id):
+                _auto_switch_log(f"跳过：设备任务队列未空闲 device={device_id} alias={alias_key}")
+                continue
+
+            if not highlighted:
+                _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
+                continue
+
+            ok = _auto_switch_enqueue_cut_switch(owner, alias_key, device_id, highlighted, target_row)
+            if ok:
+                with store.lock:
+                    store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                _auto_switch_log(
+                    f"已下发切号 | owner={owner} alias={alias_key} slot={slot_key} "
+                    f"{str(highlighted.get('username') or '')} → {str(target_row.get('username') or '')}"
+                )
+                persist_runtime_state()
+
+    if align_now:
+        persist_runtime_state()
+
+
+def _auto_switch_worker_loop() -> None:
+    _auto_switch_log("自动切号调度线程已启动（北京时间，每分钟检查）")
+    while True:
+        try:
+            _auto_switch_tick()
+        except Exception as exc:
+            _auto_switch_log(f"调度异常: {exc}")
+        time.sleep(AUTO_SWITCH_TICK_INTERVAL_SEC)
+
+
+def _start_auto_switch_worker() -> None:
+    Thread(target=_auto_switch_worker_loop, name="auto_account_switch", daemon=True).start()
+
+
+def _backup_stats_full_query_log(line: str) -> None:
+    _append_task_log(BACKUP_STATS_FULL_QUERY_LOG_KEY, line)
+
+
+def _list_distinct_backup_stats_owners() -> List[str]:
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT TRIM(owner_username) AS owner
+            FROM device_editor_rows
+            WHERE TRIM(owner_username) <> '' AND TRIM(username) <> ''
+            ORDER BY owner ASC
+            """
+        ).fetchall()
+        return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    finally:
+        conn.close()
+
+
+def _list_backup_archive_usernames_for_owner(owner_username: str) -> List[str]:
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return []
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT LOWER(TRIM(username)) AS uname
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY uname ASC
+            """,
+            (owner,),
+        ).fetchall()
+        seen: set[str] = set()
+        out: List[str] = []
+        for row in rows:
+            username = str(row[0] or "").strip().lstrip("@")
+            if not username:
+                continue
+            key = username.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(username)
+        return out
+    finally:
+        conn.close()
+
+
+def _run_backup_stats_full_query_job() -> dict[str, int]:
+    owners = _list_distinct_backup_stats_owners()
+    if not owners:
+        _backup_stats_full_query_log(f"[{now_text()}] 跳过：无备份档案账号")
+        return {"owners": 0, "total": 0, "ok": 0, "fail": 0}
+
+    total = 0
+    ok = 0
+    fail = 0
+    _backup_stats_full_query_log(
+        f"[{now_text()}] 开始全量查询并落库 | owners={len(owners)} | 北京时间={_beijing_now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    for owner in owners:
+        usernames = _list_backup_archive_usernames_for_owner(owner)
+        if not usernames:
+            continue
+        _backup_stats_full_query_log(f"[{now_text()}] owner={owner} | 待查询 {len(usernames)} 个账号")
+        for idx, username in enumerate(usernames, start=1):
+            total += 1
+            try:
+                result = fetch_tiktok_profile_stats(
+                    username,
+                    write_back=True,
+                    query_index=idx,
+                    query_total=len(usernames),
+                )
+                if isinstance(result, dict) and int(result.get("code", 1)) == 0:
+                    ok += 1
+                else:
+                    fail += 1
+                    msg = (result or {}).get("msg") if isinstance(result, dict) else "unknown"
+                    _backup_stats_full_query_log(f"[{now_text()}] 失败 @{username} | {msg}")
+            except Exception as exc:
+                fail += 1
+                _backup_stats_full_query_log(f"[{now_text()}] 异常 @{username} | {exc}")
+            if idx < len(usernames):
+                time.sleep(BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC)
+
+    _backup_stats_full_query_log(
+        f"[{now_text()}] 全量查询完成 | 成功 {ok}/{total}，失败 {fail}"
+    )
+    return {"owners": len(owners), "total": total, "ok": ok, "fail": fail}
+
+
+def _backup_stats_full_query_worker() -> None:
+    today = _beijing_date_str()
+    try:
+        stats = _run_backup_stats_full_query_job()
+        print(
+            f"[{now_text()}] backup_stats_full_query | done | date={today} "
+            f"owners={stats.get('owners', 0)} ok={stats.get('ok', 0)} "
+            f"total={stats.get('total', 0)} fail={stats.get('fail', 0)}"
+        )
+    except Exception as exc:
+        _backup_stats_full_query_log(f"[{now_text()}] 任务异常: {exc}")
+        print(f"[{now_text()}] backup_stats_full_query | failed | {exc}")
+    finally:
+        with store.lock:
+            store.backup_stats_full_query_in_flight = False
+        persist_runtime_state()
+
+
+def _backup_stats_full_query_tick() -> None:
+    with store.lock:
+        if not store.backup_stats_full_query_enabled:
+            return
+        if store.backup_stats_full_query_in_flight:
+            return
+
+    now = _beijing_now()
+    if now.hour != 0 or now.minute >= 2:
+        return
+
+    today = _beijing_date_str(now)
+    with store.lock:
+        if store.backup_stats_full_query_last_run_date == today:
+            return
+        store.backup_stats_full_query_last_run_date = today
+        store.backup_stats_full_query_in_flight = True
+    persist_runtime_state()
+
+    _backup_stats_full_query_log(
+        f"[{now_text()}] 触发每日定时全量查询（北京时间 0:00）| date={today}"
+    )
+    Thread(
+        target=_backup_stats_full_query_worker,
+        name="backup_stats_full_query",
+        daemon=True,
+    ).start()
+
+
+def _backup_stats_full_query_worker_loop() -> None:
+    _backup_stats_full_query_log("每日全量查询调度线程已启动（北京时间 0:00 自动执行）")
+    while True:
+        try:
+            _backup_stats_full_query_tick()
+        except Exception as exc:
+            _backup_stats_full_query_log(f"调度异常: {exc}")
+        time.sleep(BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC)
+
+
+def _start_backup_stats_full_query_worker() -> None:
+    Thread(
+        target=_backup_stats_full_query_worker_loop,
+        name="backup_stats_full_query_scheduler",
+        daemon=True,
+    ).start()
+
+
 def _get_device_editor_record(username: str, mobile_alias: str | None = None):
     conn = _get_db()
     try:
@@ -2963,13 +3753,24 @@ def _patch_backup_record_device_result(
     conn = _get_db()
     try:
         now = now_text()
+        follower_growth = ""
+        if isinstance(follower_count, int) and isinstance(new_follower_count, int):
+            follower_growth = str(max(follower_count - new_follower_count, 0))
+        elif isinstance(follower_count, int):
+            follower_growth = str(follower_count)
         cur = conn.execute(
             f"""
             UPDATE device_editor_rows
-            SET backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
+            SET video_count = COALESCE(?, ''),
+                follower_count = COALESCE(?, ''),
+                follower_growth = COALESCE(?, ''),
+                backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
             WHERE username = ? AND {_backup_record_alias_expr()} = ?
             """,
             (
+                None if video_count is None else str(video_count),
+                None if follower_count is None else str(follower_count),
+                follower_growth,
                 backup_path,
                 backup_name or "",
                 now,
@@ -3132,13 +3933,24 @@ def _patch_latest_backup_row_by_alias(
             return 0
         rid = row[0]
         now = now_text()
+        follower_growth = ""
+        if isinstance(follower_count, int) and isinstance(new_follower_count, int):
+            follower_growth = str(max(follower_count - new_follower_count, 0))
+        elif isinstance(follower_count, int):
+            follower_growth = str(follower_count)
         cur = conn.execute(
             """
             UPDATE device_editor_rows
-            SET backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
+            SET video_count = COALESCE(?, ''),
+                follower_count = COALESCE(?, ''),
+                follower_growth = COALESCE(?, ''),
+                backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
             WHERE row_index = ?
             """,
             (
+                None if video_count is None else str(video_count),
+                None if follower_count is None else str(follower_count),
+                follower_growth,
                 backup_path,
                 backup_name or "",
                 now,
@@ -3162,7 +3974,9 @@ def _backup_record_query_sql(base_where: str, owner_sql: str) -> str:
         SELECT username,
                {_backup_record_alias_expr()} AS mobile_alias,
                {_backup_record_alias_expr()} AS assigned_alias,
-               '' AS video_count, '' AS follower_count, '' AS new_follower_count,
+               video_count,
+               follower_count,
+               follower_growth AS new_follower_count,
                backup_path, backup_name, backup_time AS created_at, updated_at
         FROM device_editor_rows
         {base_where}{owner_sql}
@@ -3785,7 +4599,14 @@ def _filter_out_private_usernames(usernames: List[str], scene: str = "") -> tupl
     return cleaned, skipped
 
 
-def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
+def fetch_tiktok_profile_stats(
+    username: str,
+    include_raw: bool = False,
+    *,
+    write_back: bool = False,
+    query_index: int | None = None,
+    query_total: int | None = None,
+):
     """抓取 TikTok 主页并解析 __UNIVERSAL_DATA_FOR_REHYDRATION__，返回结构与 autoSearch extract 一致。"""
     username = username.strip().lstrip("@")
     if not username:
@@ -3845,12 +4666,59 @@ def fetch_tiktok_profile_stats(username: str, include_raw: bool = False):
         "__universal_script_marker_in_html": "__UNIVERSAL_DATA_FOR_REHYDRATION__" in html,
     }
 
+    progress_prefix = ""
+    if query_index is not None:
+        total = int(query_total or 0)
+        remain = max(total - int(query_index), 0) if total > 0 else 0
+        progress_prefix = f"正在全量查询第 {int(query_index)} 个，还剩 {remain} 个 | "
+
     print(
-        f"[{now_text()}] TikTok stats | username={username} | universal_extract={extract_dict} | "
+        f"[{now_text()}] {progress_prefix}TikTok stats | username={username} | universal_extract={extract_dict} | "
         f"private_guess={is_private_guess} | reason={private_reason or '-'} | "
         f"following_hidden={following_list_hidden_guess} | "
         f"followingVisibility={snap.profile_following_visibility}"
     )
+
+    if write_back:
+        video_count = extract_dict.get("video_count")
+        follower_count = extract_dict.get("follower_count")
+        new_fc = follower_count if isinstance(follower_count, int) else None
+        conn = _get_db()
+        try:
+            row = conn.execute(
+                """
+                SELECT row_index, username, follower_count, {_alias} AS mobile_alias
+                FROM device_editor_rows
+                WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))
+                ORDER BY updated_at DESC, row_index DESC
+                LIMIT 1
+                """.format(_alias=_backup_record_alias_expr()),
+                (username,),
+            ).fetchone()
+            if row:
+                prev_fc = _parse_count_text_to_int(row["follower_count"])
+                follower_growth = ""
+                if isinstance(new_fc, int) and isinstance(prev_fc, int):
+                    follower_growth = str(max(new_fc - prev_fc, 0))
+                elif isinstance(new_fc, int):
+                    follower_growth = "0"
+                conn.execute(
+                    """
+                    UPDATE device_editor_rows
+                    SET video_count = ?, follower_count = ?, follower_growth = ?, updated_at = ?
+                    WHERE row_index = ?
+                    """,
+                    (
+                        "" if video_count is None else str(video_count),
+                        "" if follower_count is None else str(follower_count),
+                        follower_growth,
+                        now_text(),
+                        int(row["row_index"]),
+                    ),
+                )
+                conn.commit()
+        finally:
+            conn.close()
 
     result = {
         "code": 0,
@@ -4934,24 +5802,38 @@ def pull_username(
         batches_before_rest = int(eff_config.get("pull_batch_size", 5) or 5)
     batches_before_rest = max(1, min(batches_before_rest, 100))
 
+    # break_min=0 为合法值，不可用 `or 10`（会把 0 当成未配置而回退默认 10）
+    def _cfg_int(key: str, default: int) -> int:
+        if key not in eff_config:
+            return default
+        raw = eff_config[key]
+        if raw is None:
+            return default
+        return int(raw)
+
+    try:
+        break_min_cfg = _cfg_int("break_min", 10)
+    except Exception:
+        break_min_cfg = 10
+    try:
+        break_max_cfg = _cfg_int("break_max", 20)
+    except Exception:
+        break_max_cfg = 20
+    # 最短、最长均为 0：关闭休息（仍按批次数清零轮次，但不返回 code=2）
+    rest_enabled = not (break_min_cfg == 0 and break_max_cfg == 0)
+
     # ——按“拉取批次”触发休息：已完成 N 次成功拉取后，下一次拉取直接返回休息（不查库）——
     with store.lock:
         rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
-        should_rest = rounds >= batches_before_rest
-        if should_rest:
+        batch_threshold_met = rounds >= batches_before_rest
+        if batch_threshold_met:
             store.device_pull_rounds[device_id] = 0
 
-    if should_rest:
-        try:
-            bmin = int(eff_config.get("break_min", 10) or 10)
-        except Exception:
-            bmin = 10
-        try:
-            bmax = int(eff_config.get("break_max", 20) or 20)
-        except Exception:
-            bmax = 20
-        bmin = max(1, min(bmin, 24 * 60))
-        bmax = max(1, min(bmax, 24 * 60))
+    if batch_threshold_met and rest_enabled:
+        bmin = max(0, min(break_min_cfg, 24 * 60))
+        bmax = max(0, min(break_max_cfg, 24 * 60))
+        bmin = max(1, bmin)
+        bmax = max(1, bmax)
         lo = min(bmin, bmax)
         hi = max(bmin, bmax)
         rest_minutes = random.randint(lo, hi)
@@ -5250,6 +6132,35 @@ def admin_device_tiktok_mutual_click_comment_only_start(
     }
 
 
+@app.post("/api/admin/device_tiktok/mutual_click_follow_only_start")
+def admin_device_tiktok_mutual_click_follow_only_start(
+    payload: MutualClickRequest, authorization: str | None = Header(default=None)
+):
+    """互点「仅关注」：独立方案，进 teamwork Videos 后仅打开评论区（区内 TODO），不受模板引流动作勾选影响。"""
+    err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    if err:
+        return err
+    _resume_device_for_cloud_op(
+        payload.device_id,
+        f"[{now_text()}] 云端后台 | 已下发互点仅关注指令，设备由暂停切换为 running（alias={payload.alias}）",
+    )
+    op_id = _enqueue_tiktok_device_op(
+        payload.device_id,
+        "mutual_click_follow_only_start",
+        {
+            "device_id": payload.device_id,
+            "alias": payload.alias,
+            "package_name": payload.package_name.strip(),
+        },
+    )
+    return {
+        "code": 0,
+        "msg": "已下发设备端任务：进入互点仅关注模式",
+        "op_id": op_id,
+        "auto_start_opt_out": bool(getattr(_device, "auto_start_opt_out", False)),
+    }
+
+
 @app.post("/api/admin/device_tiktok/publish_post_start")
 def admin_device_tiktok_publish_post_start(payload: MutualClickRequest, authorization: str | None = Header(default=None)):
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
@@ -5311,6 +6222,10 @@ def device_ops_report(payload: DeviceOpReportRequest):
         mobile_alias = str(data.get("mobile_alias") or "").strip()
         backup_path = str(data.get("backup_path") or "").strip()
         backup_name = str(data.get("backup_name") or "").strip() or None
+        if username and backup_name and not _backup_name_contains_username(backup_name, username):
+            print(
+                f"[{now_text()}] backup_name 未包含 username | user={username} name={backup_name} device={payload.device_id}"
+            )
         if backup_record_id:
             try:
                 rid = int(backup_record_id)
@@ -6450,7 +7365,7 @@ def list_device_editor_rows(
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
             f"""
-            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at
+            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
             WHERE owner_username = ? AND {alias_expr} IN ({placeholders})
             ORDER BY {alias_expr} ASC, row_index ASC
@@ -7189,6 +8104,23 @@ def add_mobile_pending_from_latest_roots(payload: AddLatestRootsToPendingRequest
     return result
 
 
+@app.post("/api/admin/mobile_pending_usernames/add_all_roots")
+def add_mobile_pending_from_all_roots():
+    """后台「将全部 tiktok_roots 加入待下发队列」：服务端直接读库分批写入，不做私密判定。"""
+    conn = _get_db()
+    try:
+        rows = conn.execute("SELECT root_username FROM tiktok_roots ORDER BY root_username ASC").fetchall()
+        usernames = [str(r["root_username"] or "").strip() for r in rows]
+    finally:
+        conn.close()
+    usernames = [u for u in usernames if u]
+    if not usernames:
+        return {"code": 1, "msg": "tiktok_roots 为空，无可下发用户"}
+    result = _insert_mobile_pending_usernames(usernames, skip_privacy_filter=True)
+    result["selected"] = len(usernames)
+    return result
+
+
 @app.get("/api/admin/mobile_pending_usernames/export")
 def export_mobile_pending_usernames(clear_after_export: bool = Query(default=False)):
     """导出 mobile_pending_usernames 到 xlsx；可选导出后清空。"""
@@ -7277,7 +8209,13 @@ def export_mobile_pending_status(
 
 @app.post("/api/admin/tiktok_profile_stats")
 def tiktok_profile_stats(payload: TikTokProfileStatsRequest):
-    return fetch_tiktok_profile_stats(payload.username, include_raw=payload.include_raw)
+    return fetch_tiktok_profile_stats(
+        payload.username,
+        include_raw=payload.include_raw,
+        write_back=payload.write_back,
+        query_index=payload.query_index,
+        query_total=payload.query_total,
+    )
 
 
 ## 已彻底砍掉：任务中心、队列监控、候选池、导出接口
@@ -7808,6 +8746,128 @@ def trigger_autosearch_once():
     return _start_task_process("autosearch_once", cmd)
 
 
+@app.get("/api/admin/backup_stats_full_query/config")
+def get_backup_stats_full_query_config(authorization: str | None = Header(default=None)):
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    with store.lock:
+        enabled = bool(store.backup_stats_full_query_enabled)
+        last_run_date = str(store.backup_stats_full_query_last_run_date or "")
+        in_flight = bool(store.backup_stats_full_query_in_flight)
+    return {
+        "code": 0,
+        "data": {
+            "enabled": enabled,
+            "last_run_date": last_run_date,
+            "in_flight": in_flight,
+            "schedule": "每天北京时间 00:00（0:00–0:01 窗口触发）",
+            "scope": "全部 owner 下所有备份档案 username（不限分组）",
+            "beijing_date": _beijing_date_str(),
+            "beijing_time": _beijing_now().strftime("%H:%M:%S"),
+        },
+    }
+
+
+@app.post("/api/admin/backup_stats_full_query/config")
+def config_backup_stats_full_query(
+    payload: BackupStatsFullQueryConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    with store.lock:
+        if payload.enabled is not None:
+            store.backup_stats_full_query_enabled = bool(payload.enabled)
+        enabled = bool(store.backup_stats_full_query_enabled)
+    persist_runtime_state()
+    if payload.enabled is not None:
+        _backup_stats_full_query_log(
+            f"[{now_text()}] 每日全量查询已{'开启' if enabled else '关闭'}"
+        )
+    return {
+        "code": 0,
+        "msg": "每日全量查询配置已更新",
+        "data": {"enabled": enabled},
+    }
+
+
+@app.post("/api/admin/backup_stats_full_query/trigger_once")
+def trigger_backup_stats_full_query_once(authorization: str | None = Header(default=None)):
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    with store.lock:
+        if store.backup_stats_full_query_in_flight:
+            return {"code": 1, "msg": "全量查询任务正在执行中，请稍后再试"}
+        store.backup_stats_full_query_in_flight = True
+    _backup_stats_full_query_log(f"[{now_text()}] 手动触发全量查询并落库")
+    Thread(
+        target=_backup_stats_full_query_worker,
+        name="backup_stats_full_query_manual",
+        daemon=True,
+    ).start()
+    return {"code": 0, "msg": "已提交后台全量查询任务，请在任务日志中查看进度"}
+
+
+@app.get("/api/admin/auto_switch/config")
+def get_auto_switch_config(authorization: str | None = Header(default=None)):
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    with store.lock:
+        enabled = bool(store.auto_switch_enabled)
+    return {
+        "code": 0,
+        "data": {
+            "enabled": enabled,
+            "beijing_date": _beijing_date_str(),
+            "beijing_time": _beijing_now().strftime("%H:%M:%S"),
+            "tick_interval_sec": AUTO_SWITCH_TICK_INTERVAL_SEC,
+        },
+    }
+
+
+@app.get("/api/admin/auto_switch/daily_plans")
+def get_auto_switch_daily_plans(
+    schedule_date: str = "",
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session.get("username") or "").strip()
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    view = _auto_switch_plans_view_for_owner(owner, date_key)
+    return {"code": 0, "data": view}
+
+
+@app.post("/api/admin/auto_switch/config")
+def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | None = Header(default=None)):
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    turning_on = False
+    with store.lock:
+        if payload.enabled is not None:
+            next_enabled = bool(payload.enabled)
+            turning_on = next_enabled and not store.auto_switch_enabled
+            store.auto_switch_enabled = next_enabled
+            if turning_on:
+                store.auto_switch_align_on_next_tick = True
+    persist_runtime_state()
+    if turning_on:
+        _auto_switch_log("自动切号总开关已开启，将在下一轮调度立即对齐当前时段账号")
+    elif payload.enabled is not None and not payload.enabled:
+        _auto_switch_log("自动切号总开关已关闭")
+    return {
+        "code": 0,
+        "msg": "自动切号配置已更新",
+        "data": {"enabled": bool(store.auto_switch_enabled)},
+    }
+
+
 @app.get("/api/admin/tasks/scheduler/config")
 def get_scheduler_config(authorization: str | None = Header(default=None)):
     err, _session = _require_login({"authorization": authorization} if authorization else {})
@@ -7876,6 +8936,11 @@ def task_status():
             running.append({"name": name, "pid": proc.pid, "running": proc.poll() is None})
         _trim_task_log_keys_unlocked()
         task_logs = {k: v[-120:] for k, v in store.task_logs.items()}
+    with store.lock:
+        auto_switch_enabled = bool(store.auto_switch_enabled)
+        backup_stats_full_query_enabled = bool(store.backup_stats_full_query_enabled)
+        backup_stats_full_query_last_run_date = str(store.backup_stats_full_query_last_run_date or "")
+        backup_stats_full_query_in_flight = bool(store.backup_stats_full_query_in_flight)
     return {
         "code": 0,
         "scheduler_enabled": snapshot["scheduler_enabled"],
@@ -7883,6 +8948,13 @@ def task_status():
         "running_tasks": running,
         "task_logs": task_logs,
         "auto_search_schedule": "由各任务独立间隔控制",
+        "auto_switch_enabled": auto_switch_enabled,
+        "auto_switch_beijing_date": _beijing_date_str(),
+        "auto_switch_beijing_time": _beijing_now().strftime("%H:%M:%S"),
+        "backup_stats_full_query_enabled": backup_stats_full_query_enabled,
+        "backup_stats_full_query_last_run_date": backup_stats_full_query_last_run_date,
+        "backup_stats_full_query_in_flight": backup_stats_full_query_in_flight,
+        "backup_stats_full_query_schedule": "每天北京时间 00:00",
     }
 
 
@@ -8172,3 +9244,7 @@ def admin_logs_snapshot(
         "run_mode": mode,
         "auto_start_enabled": auto_start_enabled,
     }
+
+
+_start_auto_switch_worker()
+_start_backup_stats_full_query_worker()

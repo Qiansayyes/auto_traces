@@ -100,24 +100,23 @@ data class AppConfig(
     val share_prob: Double = 0.3,
     // 互点 teamwork Videos：每「左+右各进作品一次」为 1 轮；轮与轮之间列表下滑约半屏换批。完整互点与此共用本上限（另受 mutual_follow_tap_session_limit 等约束）；历史「仅互点评论」指令仍生效但管理台已合并为单一启动入口。
     val mutual_videos_scroll_rounds: Int = 5,
-    /** 完整互点：本会话内在粉丝列表中点击 Follow（按钮中心）的累计次数上限；达到后不再进入 Followers；未勾选 [mutual_left_swipe_follow] 时也不再左滑。 */
+    /** 本会话内作者区 + Followers 列表 Follow 点击累计上限（两处点击共用计数）。 */
     val mutual_follow_tap_session_limit: Int = 20,
-    /**
-     * 引流「左滑关注」：勾选后，粉丝列表 Follow 达上限仍会左滑并在作者区点 Follow，仅跳过 Followers 列表；
-     * 未勾选则沿用旧逻辑（达上限后剩余轮次不左滑、不进 Followers）。
-     */
-    val mutual_left_swipe_follow: Boolean = false,
-    /**
-     * 仅涨粉队列（设备 App 选择的 run_mode=growth）：连续多少「整批拉取的用户名在设备端全部执行完毕」后，自动进入与「启动所选设备互点」等价的互点会话。
-     * 触发顺序：暂停涨粉拉取 → 互点 teamwork 流程 → 会话结束强停 TikTok 后恢复涨粉拉取。
-     * **-1** 或 **0**：永不自动切换；**≥1** 时生效。一批指本批拉取清单内每条均已处理（含失败跳过），不要求全部成功。
-     */
+    /** 引流：进作品后是否发 mutual_comment_texts 评论。 */
+    val mutual_traffic_comment: Boolean = true,
+    /** 引流：左滑进作者层后是否在作者区 OCR 点 Follow（计入 [mutual_follow_tap_session_limit]）。 */
+    val mutual_traffic_author_follow: Boolean = true,
+    /** 引流：是否复制用户名并进入 Followers 列表点 Follow（计入上限；可与作者区独立开关）。 */
+    val mutual_traffic_followers_follow: Boolean = true,
+    /** 已废弃：涨粉满批后自动引流。引流仅在设备 App「互点模式」下独立运行，本字段忽略。 */
     val growth_pull_batches_before_auto_mutual: Int = -1,
     // 评论动作内部细分（文字）
     val comment_text_prob: Double = 0.7,
     // 每个动作每天的上限（默认 800）
     val like_daily_limit: Int = 800,
     val comment_daily_limit: Int = 800,
+    // 引流评论单独每日上限：不与通用评论共用
+    val mutual_traffic_comment_daily_limit: Int = 800,
     val favorite_daily_limit: Int = 800,
     val share_daily_limit: Int = 800,
     // 是否只执行一个动作（默认开启，符合互斥规则）
