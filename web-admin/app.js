@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260511-3";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260603-4";
 
 const authShell = document.getElementById("authShell");
 const appShell = document.getElementById("appShell");
@@ -32,6 +32,16 @@ const publishPostStartSelectedBtn = document.getElementById("publishPostStartSel
 const aliasFilterInput = document.getElementById("aliasFilter");
 const deviceGroupSelect = document.getElementById("deviceGroupSelect");
 const backupArchiveGroupSelect = document.getElementById("backupArchiveGroupSelect");
+const exportBackupArchiveXlsxBtn = document.getElementById("exportBackupArchiveXlsxBtn");
+const exportBackupArchiveSelectedXlsxBtn = document.getElementById("exportBackupArchiveSelectedXlsxBtn");
+const backupArchiveSelectAllPageBtn = document.getElementById("backupArchiveSelectAllPageBtn");
+const backupArchiveClearSelectionBtn = document.getElementById("backupArchiveClearSelectionBtn");
+const backupArchiveSelectionHintEl = document.getElementById("backupArchiveSelectionHint");
+const backupArchiveSelectedCountEl = document.getElementById("backupArchiveSelectedCount");
+const importBackupArchiveXlsxBtn = document.getElementById("importBackupArchiveXlsxBtn");
+const backupArchiveImportFileInput = document.getElementById("backupArchiveImportFileInput");
+const backupArchiveSelectedRowIndices = new Set();
+let backupArchiveXlsxBusy = false;
 const groupMoveModalEl = document.getElementById("groupMoveModal");
 const groupMoveSelectedAliasesEl = document.getElementById("groupMoveSelectedAliases");
 const groupMoveSelectEl = document.getElementById("groupMoveSelect");
@@ -181,11 +191,24 @@ const galleryTargetAliasesSelect = document.getElementById("galleryTargetAliases
 const galleryImageFilesInput = document.getElementById("galleryImageFilesInput");
 const uploadGalleryBtn = document.getElementById("uploadGalleryBtn");
 const galleryDispatchLogsEl = document.getElementById("galleryDispatchLogs");
+const galleryLibraryGridEl = document.getElementById("galleryLibraryGrid");
+const galleryLibraryCountEl = document.getElementById("galleryLibraryCount");
+const galleryLibrarySelectedCountEl = document.getElementById("galleryLibrarySelectedCount");
+const galleryLibraryUploadInput = document.getElementById("galleryLibraryUploadInput");
+const galleryLibraryUploadBtn = document.getElementById("galleryLibraryUploadBtn");
+const galleryLibraryRefreshBtn = document.getElementById("galleryLibraryRefreshBtn");
+const galleryLibrarySelectAllBtn = document.getElementById("galleryLibrarySelectAllBtn");
+const galleryLibraryClearSelectionBtn = document.getElementById("galleryLibraryClearSelectionBtn");
+const GALLERY_LIBRARY_MAX_ITEMS = 100;
+let galleryLibraryItems = [];
+const galleryLibrarySelectedIds = new Set();
+const galleryLibraryThumbUrls = new Map();
 const deviceLogDeviceSelect = document.getElementById("deviceLogDeviceSelect");
 const deviceExecLogsEl = document.getElementById("deviceExecLogs");
 const backupCloudInfoEl = document.getElementById("backupCloudInfo");
 const addBlankRecordBtn = document.getElementById("addBlankRecordBtn");
 const addDeviceBlankRecordBtn = document.getElementById("addDeviceBlankRecordBtn");
+const deviceAssignCountInput = document.getElementById("deviceAssignCountInput");
 const accountBatchInputEl = document.getElementById("accountBatchInput");
 const accountBatchRegionInputEl = document.getElementById("accountBatchRegionInput");
 const accountBatchRejectEmptyToggleEl = document.getElementById("accountBatchRejectEmptyToggle");
@@ -213,6 +236,8 @@ const DEFAULT_OVERVIEW_PAGE_SIZE = 20;
 const DEFAULT_BACKUP_ARCHIVE_PAGE_SIZE = 20;
 const MAX_OVERVIEW_PAGE_SIZE = 500;
 const MAX_BACKUP_ARCHIVE_PAGE_SIZE = 200;
+const DEFAULT_DEVICE_ASSIGN_COUNT = 1;
+const MAX_DEVICE_ASSIGN_COUNT = 50;
 
 const COMMENT_TEXTS_LS_KEY = "auto_traces_admin_comment_texts_v1";
 const MUTUAL_COMMENT_TEXTS_LS_KEY = "auto_traces_admin_mutual_comment_texts_v1";
@@ -1136,6 +1161,8 @@ async function switchSection(id, options = {}) {
     try {
       await loadBoundDeviceAliases();
       await loadEditorState();
+      renderDeviceRegionPresetOptions();
+      renderDeviceAliasPresetOptions();
       await loadBackupArchiveRecords();
     } catch (_) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
@@ -1148,6 +1175,14 @@ async function switchSection(id, options = {}) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
+  if (nextSectionId === "gallery-dispatch") {
+    try {
+      await loadBoundDeviceAliases();
+      await loadGalleryLibrary();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
 }
 
 navItems.forEach((item) => {
@@ -1156,14 +1191,24 @@ navItems.forEach((item) => {
   });
 });
 
-async function request(path, options = {}) {
-  const baseBefore = String(await resolvedApiBase()).replace(/\/$/, "");
+function joinApiUrl(baseBefore, path) {
+  const base = String(baseBefore || "").replace(/\/$/, "");
   const rawPath = String(path || "").trim();
   const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-  const dedupedPath = baseBefore.endsWith("/api") && normalizedPath.startsWith("/api/")
+  const dedupedPath = base.endsWith("/api") && normalizedPath.startsWith("/api/")
     ? normalizedPath.slice(4)
     : normalizedPath;
-  let url = `${baseBefore}${dedupedPath}`;
+  return `${base}${dedupedPath}`;
+}
+
+async function buildApiUrl(path) {
+  const baseBefore = String(await resolvedApiBase()).replace(/\/$/, "");
+  return joinApiUrl(baseBefore, path);
+}
+
+async function request(path, options = {}) {
+  const baseBefore = String(await resolvedApiBase()).replace(/\/$/, "");
+  let url = joinApiUrl(baseBefore, path);
   const method = String(options.method || "GET").toUpperCase();
   const startedAt = Date.now();
   const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Math.max(1000, Number(options.timeoutMs)) : 30000;
@@ -2189,6 +2234,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -2231,6 +2277,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -2272,6 +2319,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -4477,7 +4525,7 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
   if (cutSwitchTargetRowIndex != null && Number.isFinite(Number(cutSwitchTargetRowIndex)) && Number(cutSwitchTargetRowIndex) >= 0) {
     payload.cut_switch_target_row_index = Number(cutSwitchTargetRowIndex);
   }
-  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/backup_and_clear", payload, {
+  const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/backup_and_clear", payload, {
     pendingText: "正在下发备份并清理任务...",
     successText: "备份并清理任务已完成",
     errorText: "备份并清理失败",
@@ -4485,19 +4533,60 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
     pollTimeoutMs,
     graceAfterTimeoutMs,
   });
+  if (result?.status !== "success") {
+    throw new Error(result?.message || "备份并清理失败");
+  }
+  return result;
 }
 
-async function handleAliasClearClick(alias, deviceId = "") {
+async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
+  const {
+    skipConfirm = false,
+    refreshAfter = true,
+    pollTimeoutMs,
+    graceAfterTimeoutMs,
+    cutSwitchAfterBackup,
+    cutSwitchTargetRowIndex,
+  } = execOptions;
   const identity = deviceId
     ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
     : collectDeviceIdentityByAlias(alias);
   if (!identity) return;
-  if (!confirmTikTokAction("清理 TikTok 数据", `设备别名：${alias}`)) return;
-  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/clear", identity, {
+  if (!skipConfirm && !confirmTikTokAction("清理 TikTok 数据", `设备别名：${alias}`)) return;
+  const payload = { ...identity };
+  const cs = String(cutSwitchAfterBackup || "").trim().toLowerCase();
+  if (cs === "clear_source_for_restore" || cs === "exclusive_activate_target") {
+    payload.cut_switch_after_backup = cs;
+  }
+  if (cutSwitchTargetRowIndex != null && Number.isFinite(Number(cutSwitchTargetRowIndex)) && Number(cutSwitchTargetRowIndex) >= 0) {
+    payload.cut_switch_target_row_index = Number(cutSwitchTargetRowIndex);
+  }
+  const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/clear", payload, {
     pendingText: "正在下发清理任务...",
     successText: "TikTok 数据已清理",
     errorText: "清理 TikTok 数据失败",
+    refreshAfter,
+    pollTimeoutMs,
+    graceAfterTimeoutMs,
   });
+  if (result?.status !== "success") {
+    throw new Error(result?.message || "清理 TikTok 数据失败");
+  }
+  return result;
+}
+
+async function setBackupArchiveSwitchHighlight(rowIndex) {
+  const ri = Number(rowIndex);
+  if (!Number.isFinite(ri) || ri < 0) {
+    throw new Error("无效的设备档案行号");
+  }
+  const resp = await request("/api/admin/editor/device_rows/set_switch_highlight", {
+    method: "POST",
+    body: JSON.stringify({ row_index: ri }),
+  });
+  if (resp?.code !== 0) {
+    throw new Error(resp?.msg || "更新切号高亮失败");
+  }
 }
 
 async function handleBasicProfileEditFromBackupCard(card) {
@@ -4566,7 +4655,7 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
   ) {
     return;
   }
-  await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/restore", payload, {
+  const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/restore", payload, {
     pendingText: "正在下发清理并还原任务...",
     successText: "清理并还原已完成",
     errorText: "清理并还原失败",
@@ -4574,6 +4663,10 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     pollTimeoutMs,
     graceAfterTimeoutMs,
   });
+  if (result?.status !== "success") {
+    throw new Error(result?.message || "清理并还原失败");
+  }
+  return result;
 }
 
 /** 同别名桶内：仅一条记录时视为当前高亮；多条时以 switch_highlight===「是」为高亮 */
@@ -4581,6 +4674,13 @@ function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row) {
   const n = Array.isArray(rowsInBucket) ? rowsInBucket.length : 0;
   if (n <= 1) return true;
   return normalizeSwitchHighlightField(row?.switch_highlight) === "是";
+}
+
+/** 同别名桶内是否存在切号高亮（多条且全部为「否」时返回 false） */
+function backupArchiveBucketHasHighlightFromCards(cards) {
+  const list = Array.isArray(cards) ? cards : [];
+  if (list.length <= 1) return true;
+  return list.some((c) => c instanceof HTMLElement && normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "是");
 }
 
 async function runBackupArchiveAccountCutSwitch(clickedCard) {
@@ -4601,20 +4701,83 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   }
 
   const cards = details ? Array.from(details.querySelectorAll(".backup-archive-record")) : [];
+  const bucketHasHighlight = backupArchiveBucketHasHighlightFromCards(cards);
+  const clickedDeviceId = String(clickedCard.getAttribute("data-row-device-id") || "").trim();
+  const targetUser = String(clickedCard.getAttribute("data-row-username") || "").trim();
+  const cutSwitchWait = {
+    pollTimeoutMs: 300000,
+    graceAfterTimeoutMs: 120000,
+  };
+
+  if (bucketSize > 1 && !bucketHasHighlight) {
+    const opsIdentity = resolveLiveDeviceIdentityForArchive(actionAlias, clickedDeviceId);
+    if (!opsIdentity) return;
+    const detailLines = canRestoreToDevice
+      ? [
+        `设备别名：${actionAlias}`,
+        "当前别名桶无切号高亮，将【仅清理 TikTok】后还原目标账号备份（不备份）。",
+        `目标 username：${targetUser || "-"}`,
+      ]
+      : [
+        `设备别名：${actionAlias}`,
+        "当前别名桶无切号高亮，将【仅清理 TikTok】后切换高亮到目标（目标无备份元数据，不还原）。",
+        `目标 username：${targetUser || "-"}`,
+      ];
+    if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
+    try {
+      await handleAliasClearClick(actionAlias, opsIdentity.device_id, {
+        skipConfirm: true,
+        refreshAfter: false,
+        ...cutSwitchWait,
+        cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
+        cutSwitchTargetRowIndex: canRestoreToDevice ? undefined : targetRi,
+      });
+      if (canRestoreToDevice) {
+        await handleRestoreClick(actionAlias, targetBackup, opsIdentity.device_id, {
+          skipConfirm: true,
+          skipPmClear: true,
+          refreshAfter: false,
+          ...cutSwitchWait,
+        });
+      }
+      setStatus(
+        canRestoreToDevice
+          ? "切号设备任务已完成（含还原；设备将自动登录 is_login=否 的账号，请刷新列表核对）"
+          : "切号设备任务已完成（设备将自动登录 is_login=否 的账号，请刷新列表核对）",
+        "success",
+      );
+    } catch (e) {
+      const msg = e?.message || "切号失败";
+      const timedOut = /超时/.test(msg);
+      setStatus(
+        timedOut
+          ? `${msg} 切号高亮将在设备回传成功时由服务端更新，请稍后点击「刷新数据」查看。`
+          : msg,
+        timedOut ? "warning" : "error",
+      );
+    } finally {
+      try {
+        await loadEditorState();
+        await loadBackupArchiveRecords();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    return;
+  }
+
   const sourceCard = bucketSize > 1 ? cards.find((c) => normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "是") : null;
   if (bucketSize > 1 && (!sourceCard || sourceCard === clickedCard)) {
     setStatus("同别名高亮数据异常（服务端应保证有且仅有一条为「是」），请刷新备份档案后重试", "warning");
     return;
   }
 
-  const clickedDeviceId = String(clickedCard.getAttribute("data-row-device-id") || "").trim();
   const sourceDeviceId = sourceCard instanceof HTMLElement
     ? String(sourceCard.getAttribute("data-row-device-id") || "").trim()
     : "";
   const opsIdentity = resolveLiveDeviceIdentityForArchive(actionAlias, sourceDeviceId || clickedDeviceId);
   if (!opsIdentity) return;
 
-  const targetUser = String(clickedCard.getAttribute("data-row-username") || "").trim();
   const detailLines = canRestoreToDevice
     ? [
       `设备别名：${actionAlias}`,
@@ -4627,11 +4790,6 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       `目标 username：${targetUser || "-"}`,
     ];
   if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
-
-  const cutSwitchWait = {
-    pollTimeoutMs: 300000,
-    graceAfterTimeoutMs: 120000,
-  };
 
   try {
     const sRi = Number(sourceCard.getAttribute("data-backup-row-index"));
@@ -4654,7 +4812,12 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
         ...cutSwitchWait,
       });
     }
-    setStatus("切号设备任务已完成（切号高亮随设备回传写库，请刷新列表核对）", "success");
+    setStatus(
+      canRestoreToDevice
+        ? "切号设备任务已完成（含还原；设备将自动登录 is_login=否 的账号，请刷新列表核对）"
+        : "切号设备任务已完成（设备将自动登录 is_login=否 的账号，请刷新列表核对）",
+      "success",
+    );
   } catch (e) {
     const msg = e?.message || "切号失败";
     const timedOut = /超时/.test(msg);
@@ -4674,6 +4837,190 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   }
 }
 
+function updateGalleryLibraryCount() {
+  const count = galleryLibraryItems.length;
+  if (galleryLibraryCountEl) {
+    galleryLibraryCountEl.textContent = `${count} / ${GALLERY_LIBRARY_MAX_ITEMS}`;
+  }
+  if (galleryLibrarySelectedCountEl) {
+    galleryLibrarySelectedCountEl.textContent = String(galleryLibrarySelectedIds.size);
+  }
+}
+
+function revokeGalleryLibraryThumbUrls() {
+  galleryLibraryThumbUrls.forEach((url) => {
+    try {
+      URL.revokeObjectURL(url);
+    } catch (_) {
+      /* ignore */
+    }
+  });
+  galleryLibraryThumbUrls.clear();
+}
+
+function toggleGalleryLibrarySelection(itemId, selected) {
+  const id = String(itemId || "").trim();
+  if (!id) return;
+  if (selected) galleryLibrarySelectedIds.add(id);
+  else galleryLibrarySelectedIds.delete(id);
+  const card = galleryLibraryGridEl?.querySelector(`[data-gallery-id="${id}"]`);
+  card?.classList.toggle("selected", selected);
+  const check = card?.querySelector(".gallery-library-item__check");
+  if (check) check.textContent = selected ? "✓" : "";
+  updateGalleryLibraryCount();
+}
+
+async function loadGalleryLibraryThumb(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id || galleryLibraryThumbUrls.has(id)) return galleryLibraryThumbUrls.get(id);
+  const base = String(await resolvedApiBase()).replace(/\/$/, "");
+  const headers = {};
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(`${base}/admin/gallery/library/${encodeURIComponent(id)}/file`, { headers });
+  if (!response.ok) return "";
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  galleryLibraryThumbUrls.set(id, url);
+  return url;
+}
+
+async function renderGalleryLibraryGrid() {
+  if (!galleryLibraryGridEl) return;
+  revokeGalleryLibraryThumbUrls();
+  if (!galleryLibraryItems.length) {
+    galleryLibraryGridEl.innerHTML = '<div class="gallery-library-empty">暂无图片，点击「上传到图库」添加素材</div>';
+    updateGalleryLibraryCount();
+    return;
+  }
+  galleryLibraryGridEl.innerHTML = galleryLibraryItems
+    .map((item) => {
+      const id = String(item?.id || "").trim();
+      const filename = String(item?.filename || id || "image");
+      const safeName = escapeHtml(filename);
+      const selected = galleryLibrarySelectedIds.has(id);
+      return `
+        <div class="gallery-library-item${selected ? " selected" : ""}" data-gallery-id="${id}" title="${safeName}">
+          <div class="gallery-library-item__check">${selected ? "✓" : ""}</div>
+          <button type="button" class="gallery-library-item__delete" data-gallery-delete="${id}" title="删除">×</button>
+          <img alt="${safeName}" data-gallery-thumb="${id}" />
+          <div class="gallery-library-item__name">${safeName}</div>
+        </div>
+      `;
+    })
+    .join("");
+  galleryLibraryGridEl.querySelectorAll(".gallery-library-item").forEach((card) => {
+    const id = String(card.getAttribute("data-gallery-id") || "").trim();
+    card.addEventListener("click", (event) => {
+      if (event.target?.closest?.("[data-gallery-delete]")) return;
+      toggleGalleryLibrarySelection(id, !galleryLibrarySelectedIds.has(id));
+    });
+  });
+  galleryLibraryGridEl.querySelectorAll("[data-gallery-delete]").forEach((btn) => {
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = String(btn.getAttribute("data-gallery-delete") || "").trim();
+      if (!id) return;
+      deleteGalleryLibraryItem(id).catch((error) => {
+        setStatus(error?.message || "删除图库图片失败", "error");
+      });
+    });
+  });
+  await Promise.all(
+    galleryLibraryItems.map(async (item) => {
+      const id = String(item?.id || "").trim();
+      if (!id) return;
+      const url = await loadGalleryLibraryThumb(id);
+      const img = galleryLibraryGridEl.querySelector(`img[data-gallery-thumb="${id}"]`);
+      if (img && url) img.src = url;
+    }),
+  );
+  updateGalleryLibraryCount();
+}
+
+async function loadGalleryLibrary() {
+  const data = await request("/api/admin/gallery/library");
+  galleryLibraryItems = Array.isArray(data?.items) ? data.items : [];
+  const validIds = new Set(galleryLibraryItems.map((item) => String(item?.id || "").trim()).filter(Boolean));
+  Array.from(galleryLibrarySelectedIds).forEach((id) => {
+    if (!validIds.has(id)) galleryLibrarySelectedIds.delete(id);
+  });
+  await renderGalleryLibraryGrid();
+}
+
+async function uploadGalleryLibraryFromInput() {
+  const files = Array.from(galleryLibraryUploadInput?.files || []);
+  if (!files.length) {
+    setStatus("请先选择要上传到图库的图片", "warning");
+    return;
+  }
+  const remaining = GALLERY_LIBRARY_MAX_ITEMS - galleryLibraryItems.length;
+  if (remaining <= 0) {
+    setStatus(`图库已满（最多 ${GALLERY_LIBRARY_MAX_ITEMS} 张）`, "warning");
+    return;
+  }
+  if (files.length > remaining) {
+    setStatus(`图库剩余容量 ${remaining} 张，请减少本次选择数量`, "warning");
+    return;
+  }
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  const base = String(await resolvedApiBase()).replace(/\/$/, "");
+  const headers = {};
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  setStatus(`正在上传 ${files.length} 张图片到图库...`, "info");
+  const response = await fetch(`${base}/admin/gallery/library`, {
+    method: "POST",
+    body: formData,
+    headers,
+  });
+  const data = await response.json();
+  if (!response.ok || data.code !== 0) {
+    throw new Error(data.msg || "上传到图库失败");
+  }
+  if (galleryLibraryUploadInput) galleryLibraryUploadInput.value = "";
+  await loadGalleryLibrary();
+  setStatus(data.msg || `已上传 ${files.length} 张图片到图库`, "success");
+}
+
+async function deleteGalleryLibraryItem(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id) return;
+  if (!window.confirm("确定从图库删除这张图片？")) return;
+  await request(`/api/admin/gallery/library/${encodeURIComponent(id)}`, { method: "DELETE" });
+  galleryLibrarySelectedIds.delete(id);
+  await loadGalleryLibrary();
+  setStatus("已从图库删除", "success");
+}
+
+async function resolveGalleryDispatchFiles() {
+  const selectedIds = galleryLibraryItems
+    .map((item) => String(item?.id || "").trim())
+    .filter((id) => id && galleryLibrarySelectedIds.has(id));
+  const localFiles = Array.from(galleryImageFilesInput?.files || []);
+  if (selectedIds.length) {
+    const base = String(await resolvedApiBase()).replace(/\/$/, "");
+    const headers = {};
+    const token = authToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const files = [];
+    for (const id of selectedIds) {
+      const meta = galleryLibraryItems.find((item) => String(item?.id || "").trim() === id);
+      const response = await fetch(`${base}/admin/gallery/library/${encodeURIComponent(id)}/file`, { headers });
+      if (!response.ok) {
+        throw new Error(`读取图库图片失败：${meta?.filename || id}`);
+      }
+      const blob = await response.blob();
+      const filename = String(meta?.filename || `${id}.jpg`);
+      const type = String(meta?.content_type || blob.type || "image/jpeg");
+      files.push(new File([blob], filename, { type }));
+    }
+    return files;
+  }
+  return localFiles;
+}
+
 async function uploadGalleryImagesToDevice() {
   const aliases = Array.from(galleryTargetAliasesSelect?.selectedOptions || [])
     .map((option) => String(option.value || "").trim())
@@ -4682,13 +5029,13 @@ async function uploadGalleryImagesToDevice() {
     setStatus("请先选择至少一个目标设备别名", "warning");
     return;
   }
-  const files = Array.from(galleryImageFilesInput?.files || []);
+  const files = await resolveGalleryDispatchFiles();
   if (!files.length) {
-    setStatus("请先选择图片文件（可多选）", "warning");
+    setStatus("请先在图库勾选图片，或从本机选择图片文件", "warning");
     return;
   }
-  if (files.length > 20) {
-    setStatus("单次最多选择 20 个素材", "warning");
+  if (files.length > GALLERY_LIBRARY_MAX_ITEMS) {
+    setStatus(`单次最多选择 ${GALLERY_LIBRARY_MAX_ITEMS} 个素材`, "warning");
     return;
   }
 
@@ -5103,6 +5450,37 @@ if (deviceGroupSelect) {
 }
 if (backupArchiveGroupSelect) {
   backupArchiveGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
+}
+if (exportBackupArchiveXlsxBtn) {
+  exportBackupArchiveXlsxBtn.addEventListener("click", () => {
+    exportBackupArchiveXlsx({ selectedOnly: false }).catch((e) => setStatus(e?.message || "导出失败", "error"));
+  });
+}
+if (exportBackupArchiveSelectedXlsxBtn) {
+  exportBackupArchiveSelectedXlsxBtn.addEventListener("click", () => {
+    exportBackupArchiveXlsx({ selectedOnly: true }).catch((e) => setStatus(e?.message || "导出失败", "error"));
+  });
+}
+if (backupArchiveSelectAllPageBtn) {
+  backupArchiveSelectAllPageBtn.addEventListener("click", () => {
+    selectAllBackupArchiveRowsOnPage();
+    setStatus("已勾选当前页全部记录", "info");
+  });
+}
+if (backupArchiveClearSelectionBtn) {
+  backupArchiveClearSelectionBtn.addEventListener("click", () => {
+    clearBackupArchiveSelection();
+    setStatus("已取消全部勾选", "info");
+  });
+}
+updateBackupArchiveSelectionUi();
+if (importBackupArchiveXlsxBtn && backupArchiveImportFileInput) {
+  importBackupArchiveXlsxBtn.addEventListener("click", () => backupArchiveImportFileInput.click());
+  backupArchiveImportFileInput.addEventListener("change", () => {
+    const file = backupArchiveImportFileInput.files?.[0];
+    if (!file) return;
+    importBackupArchiveXlsxFile(file).catch((e) => setStatus(e?.message || "导入失败", "error"));
+  });
 }
 if (manageDeviceGroupsBtn) {
   manageDeviceGroupsBtn.addEventListener("click", () => {
@@ -5586,6 +5964,38 @@ if (uploadGalleryBtn) {
     });
   });
 }
+if (galleryLibraryUploadBtn && galleryLibraryUploadInput) {
+  galleryLibraryUploadBtn.addEventListener("click", () => {
+    galleryLibraryUploadInput.click();
+  });
+  galleryLibraryUploadInput.addEventListener("change", () => {
+    uploadGalleryLibraryFromInput().catch((error) => {
+      setStatus(error?.message || "上传到图库失败", "error");
+    });
+  });
+}
+if (galleryLibraryRefreshBtn) {
+  galleryLibraryRefreshBtn.addEventListener("click", () => {
+    loadGalleryLibrary().catch((error) => {
+      setStatus(error?.message || "刷新图库失败", "error");
+    });
+  });
+}
+if (galleryLibrarySelectAllBtn) {
+  galleryLibrarySelectAllBtn.addEventListener("click", () => {
+    galleryLibraryItems.forEach((item) => {
+      const id = String(item?.id || "").trim();
+      if (id) galleryLibrarySelectedIds.add(id);
+    });
+    renderGalleryLibraryGrid().catch(() => {});
+  });
+}
+if (galleryLibraryClearSelectionBtn) {
+  galleryLibraryClearSelectionBtn.addEventListener("click", () => {
+    galleryLibrarySelectedIds.clear();
+    renderGalleryLibraryGrid().catch(() => {});
+  });
+}
 if (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput) {
   backupPackageNameInput.value = (backupPackageNameInput.value || "").trim() || "com.zhiliaoapp.musically";
 }
@@ -5674,7 +6084,7 @@ async function syncAssignableAliasOptionsIfNeeded() {
 async function loadEditorState() {
   const [accountsResp, devicesResp, backupResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
-    request(DEVICE_ROWS_API),
+    request("/api/admin/device_editor_rows/export_backup"),
     request("/api/admin/tiktok_backup/search?limit=100"),
     loadBoundDeviceAliases().catch(() => []),
   ]);
@@ -5691,6 +6101,32 @@ async function loadEditorState() {
     const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
     if (!username || !alias) return;
     if (!backupAliasByUsername.has(username)) backupAliasByUsername.set(username, alias);
+  });
+  enrichAccountStatsFromDeviceRows();
+}
+
+/** 历史数据：备份档案已有统计而账号表为空时，加载后用于展示（不写库，等下次回写会持久化） */
+function enrichAccountStatsFromDeviceRows() {
+  const deviceByUser = new Map();
+  (deviceEditorRows || []).forEach((dev) => {
+    const key = String(dev?.username || "").trim().toLowerCase();
+    if (!key) return;
+    const existing = deviceByUser.get(key);
+    const devUpdated = String(dev?.updated_at || "");
+    if (!existing || devUpdated > String(existing?.updated_at || "")) {
+      deviceByUser.set(key, dev);
+    }
+  });
+  (accountEditorRows || []).forEach((row) => {
+    const key = String(row?.username || "").trim().toLowerCase();
+    if (!key) return;
+    const dev = deviceByUser.get(key);
+    if (!dev) return;
+    for (const field of ["video_count", "follower_count", "follower_growth"]) {
+      if (String(row[field] ?? "").trim()) continue;
+      const fromDev = String(dev[field] ?? "").trim();
+      if (fromDev) row[field] = fromDev;
+    }
   });
 }
 
@@ -5709,7 +6145,7 @@ function buildBackupGroups(rows = []) {
   });
 }
 
-function renderBackupGroups(rows = []) {
+function renderBackupArchiveSummaryTable(rows = []) {
   if (!deviceAliasGroupsEl) return;
   if (!rows.length) {
     deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
@@ -5780,11 +6216,17 @@ async function saveAccountRow(index, options = {}) {
   const row = accountEditorRows[index];
   if (!row) return;
   const { skipReload = false } = options || {};
+  const effectiveAlias = getEffectiveAccountAssignedAlias(row);
+  if (effectiveAlias) row.assigned_alias = effectiveAlias;
   await request(`${ACCOUNT_ROWS_API}/upsert`, {
     method: "POST",
-    body: JSON.stringify({ row_index: index, ...row }),
+    body: JSON.stringify({
+      row_index: resolveAccountRowIndex(row, index),
+      ...row,
+      assigned_alias: effectiveAlias,
+    }),
   });
-  const persistedAlias = normalizeAliasValue(row.assigned_alias);
+  const persistedAlias = effectiveAlias || normalizeAliasValue(row.assigned_alias);
   if (persistedAlias) {
     await ensureBackupArchiveEntryForAccount(row, persistedAlias);
   }
@@ -5974,14 +6416,17 @@ function isAliasAssignedElsewhere(alias, currentIndex) {
 async function saveDeviceRow(index, options = {}) {
   const row = deviceEditorRows[index];
   if (!row) return;
-  const { skipUsernameDuplicateCheck = false, skipReload = false } = options || {};
+  const { skipUsernameDuplicateCheck = false, skipReload = false, rowIndex: rowIndexOverride } = options || {};
   const username = String(row.username || "").trim();
   if (!skipUsernameDuplicateCheck && username && isUsernameUsedElsewhere(username, index)) {
     throw new Error(`username 已被其他设备别名占用：${username}`);
   }
+  const rowIndex = Number.isFinite(Number(rowIndexOverride))
+    ? Number(rowIndexOverride)
+    : (Number.isFinite(Number(row?.row_index)) ? Number(row.row_index) : index);
   await request(`${DEVICE_ROWS_API}/upsert`, {
     method: "POST",
-    body: JSON.stringify({ ...row, row_index: index }),
+    body: JSON.stringify({ ...row, row_index: rowIndex }),
   });
   if (!skipReload) {
     await loadEditorState();
@@ -5990,10 +6435,27 @@ async function saveDeviceRow(index, options = {}) {
   }
 }
 
+function resolveAccountRowIndex(row, fallbackIndex) {
+  const ri = Number(row?.row_index);
+  return Number.isFinite(ri) && ri >= 0 ? ri : fallbackIndex;
+}
+
+/** 账号记录上展示/保存用的有效分配别名（含备份档案反查） */
+function getEffectiveAccountAssignedAlias(row = {}) {
+  const fromRow = normalizeAliasValue(row?.assigned_alias);
+  if (fromRow) return fromRow;
+  const username = String(row?.username || "").trim().toLowerCase();
+  if (username && backupAliasByUsername.has(username)) {
+    return backupAliasByUsername.get(username) || "";
+  }
+  return "";
+}
+
 function getAccountRowTemplate(source = {}) {
-  const username = String(source.username || "").trim().toLowerCase();
-  const backupAlias = username ? backupAliasByUsername.get(username) || "" : "";
+  const ri = source.row_index;
+  const rowIndex = ri != null && ri !== "" && !Number.isNaN(Number(ri)) ? Number(ri) : undefined;
   return {
+    ...(rowIndex !== undefined ? { row_index: rowIndex } : {}),
     username: source.username || "",
     password: source.password || "",
     email: source.email || "",
@@ -6006,7 +6468,8 @@ function getAccountRowTemplate(source = {}) {
     follower_count: source.follower_count || "",
     follower_growth: source.follower_growth || "",
     basic_profile_modified: normalizeBasicProfileModifiedField(source.basic_profile_modified),
-    assigned_alias: normalizeAliasValue(source.assigned_alias) || backupAlias || normalizeAliasValue(source.device_alias) || "",
+    // 分配别名仅以账号表单字段为准；备份档案别名由 backupAliasByUsername / 渲染层展示。
+    assigned_alias: normalizeAliasValue(source.assigned_alias) || "",
   };
 }
 
@@ -6184,51 +6647,94 @@ function getAssignableAliasOptions(currentValue = "") {
 }
 
 function isAccountAliasLocked(row = {}) {
-  const username = String(row?.username || "").trim().toLowerCase();
-  return Boolean(normalizeAliasValue(row?.assigned_alias) || (username && backupAliasByUsername.has(username)));
+  return Boolean(getEffectiveAccountAssignedAlias(row));
+}
+
+function isAccountAliasUnassigned(row = {}) {
+  return !isAccountAliasLocked(row);
 }
 
 function canEditAccountAlias(row = {}) {
-  return !isAccountAliasLocked(row);
+  return isAccountAliasUnassigned(row);
+}
+
+function accountEditorCellInput(idx, field, value, extraAttrs = "") {
+  return `<input class="account-editor-table__input" type="text" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" value="${escapeHtml(value)}" title="${field}" ${extraAttrs} />`;
+}
+
+function accountEditorCellSelect(idx, field, innerHtml) {
+  return `<select class="account-editor-table__input" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" title="${field}">${innerHtml}</select>`;
 }
 
 function renderAccountEditorRows() {
   if (!accountEditorListEl) return;
   const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
   const visibleRows = accountFilterUnassignedOnly
-    ? indexedRows.filter(({ row }) => !normalizeAliasValue(row?.assigned_alias))
+    ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
     : indexedRows;
   if (!visibleRows.length) {
     accountEditorListEl.innerHTML = '<div class="hint">暂无记录，点击“新增空白记录”开始</div>';
     return;
   }
   try {
-    accountEditorListEl.innerHTML = visibleRows.map(({ row, idx }) => `
-      <div class="panel-card" style="margin:0 0 12px 0;background:#fff;">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
-          <strong>账号记录 #${idx + 1}</strong>
-          <button class="ghost" data-editor-delete="account" data-editor-index="${idx}">删除</button>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;">
-          <div class="field"><label>username</label><input data-editor-scope="account" data-editor-field="username" data-editor-index="${idx}" value="${row.username}" /></div>
-          <div class="field"><label>password</label><input data-editor-scope="account" data-editor-field="password" data-editor-index="${idx}" value="${row.password}" /></div>
-          <div class="field"><label>Email</label><input data-editor-scope="account" data-editor-field="email" data-editor-index="${idx}" value="${row.email}" /></div>
-          <div class="field"><label>email_password</label><input data-editor-scope="account" data-editor-field="email_password" data-editor-index="${idx}" value="${row.email_password}" /></div>
-          <div class="field"><label>API</label><input data-editor-scope="account" data-editor-field="api" data-editor-index="${idx}" value="${row.api}" /></div>
-          <div class="field"><label>是否登录</label><select data-editor-scope="account" data-editor-field="is_login" data-editor-index="${idx}"><option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option></select></div>
-          <div class="field"><label>登录时间</label><input data-editor-scope="account" data-editor-field="login_time" data-editor-index="${idx}" value="${row.login_time}" /></div>
-          <div class="field"><label>国家地区</label><input data-editor-scope="account" data-editor-field="region" data-editor-index="${idx}" value="${row.region}" /></div>
-          ${isAccountAliasLocked(row)
-            ? `<div class="field"><label>分配别名</label><input value="${escapeHtml(normalizeAliasValue(row.assigned_alias) || backupAliasByUsername.get(String(row?.username || "").trim().toLowerCase()) || "")}" disabled /><div class="hint">已分配别名，此处不可修改；删除本账号记录将同步删除备份档案。</div></div>`
-            : `<div class="field"><label>分配别名</label><select data-editor-scope="account" data-editor-field="assigned_alias" data-editor-index="${idx}">${getAssignableAliasOptions(row.assigned_alias)}</select></div>`
-          }
-          <div class="field"><label>video_count</label><input data-editor-scope="account" data-editor-field="video_count" data-editor-index="${idx}" value="${row.video_count}" /></div>
-          <div class="field"><label>粉丝数量</label><input data-editor-scope="account" data-editor-field="follower_count" data-editor-index="${idx}" value="${row.follower_count}" /></div>
-          <div class="field" style="grid-column:span 2;"><label>较上次粉丝增长数量</label><input data-editor-scope="account" data-editor-field="follower_growth" data-editor-index="${idx}" value="${row.follower_growth}" /></div>
-          <div class="field"><label>基本资料已修改</label><select data-editor-scope="account" data-editor-field="basic_profile_modified" data-editor-index="${idx}"><option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option></select></div>
-        </div>
-      </div>
-    `).join("");
+    const bodyHtml = visibleRows.map(({ row, idx }) => {
+      const aliasLocked = isAccountAliasLocked(row);
+      const aliasCell = aliasLocked
+        ? `<span class="account-editor-table__alias-locked" title="已分配别名不可改；删除记录将同步删除备份档案">${escapeHtml(getEffectiveAccountAssignedAlias(row))}</span>`
+        : accountEditorCellSelect(idx, "assigned_alias", getAssignableAliasOptions(getEffectiveAccountAssignedAlias(row)));
+      const loginSelect = accountEditorCellSelect(
+        idx,
+        "is_login",
+        `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`
+      );
+      const profileSelect = accountEditorCellSelect(
+        idx,
+        "basic_profile_modified",
+        `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`
+      );
+      return `<tr>
+        <td class="account-editor-table__num">${idx + 1}</td>
+        <td>${accountEditorCellInput(idx, "username", row.username)}</td>
+        <td>${accountEditorCellInput(idx, "password", row.password)}</td>
+        <td>${accountEditorCellInput(idx, "email", row.email)}</td>
+        <td>${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
+        <td class="account-editor-table__api">${accountEditorCellInput(idx, "api", row.api)}</td>
+        <td>${loginSelect}</td>
+        <td>${accountEditorCellInput(idx, "login_time", row.login_time)}</td>
+        <td>${accountEditorCellInput(idx, "region", row.region)}</td>
+        <td class="account-editor-table__alias">${aliasCell}</td>
+        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "video_count", row.video_count, 'inputmode="numeric"')}</td>
+        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_count", row.follower_count, 'inputmode="numeric"')}</td>
+        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_growth", row.follower_growth, 'inputmode="numeric"')}</td>
+        <td>${profileSelect}</td>
+        <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
+      </tr>`;
+    }).join("");
+    accountEditorListEl.innerHTML = `
+      <div class="account-editor-table-wrap">
+        <table class="account-editor-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>username</th>
+              <th>password</th>
+              <th>email</th>
+              <th>email_pwd</th>
+              <th>api</th>
+              <th>登录</th>
+              <th>登录时间</th>
+              <th>地区</th>
+              <th>别名</th>
+              <th>视频</th>
+              <th>粉丝</th>
+              <th>增长</th>
+              <th>资料</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>${bodyHtml}</tbody>
+        </table>
+      </div>`;
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
     const msg = (error && (error.message || error.toString?.())) || "unknown";
@@ -6404,7 +6910,13 @@ async function syncEditorField(scope, index, field, value, checked = false) {
   if (scope === "account") {
     const row = accountEditorRows[index];
     if (!row) return;
-    row[field] = field === "is_login" ? (String(value) === "true" || checked) : value;
+    if (field === "username") {
+      const preservedAlias = getEffectiveAccountAssignedAlias(row);
+      row[field] = value;
+      if (preservedAlias) row.assigned_alias = preservedAlias;
+    } else {
+      row[field] = field === "is_login" ? (String(value) === "true" || checked) : value;
+    }
     await saveAccountRow(index);
     if (field === "region" || field === "is_login" || field === "username") {
       renderDeviceRegionPresetOptions();
@@ -6429,44 +6941,116 @@ function isAccountLoggedIn(row = {}) {
   return raw === true || raw === 1 || raw === "1" || raw === "true";
 }
 
-function pickUnloggedAccountByRegion(region) {
+function getDeviceAssignCount() {
+  const raw = Number(deviceAssignCountInput?.value ?? DEFAULT_DEVICE_ASSIGN_COUNT);
+  if (!Number.isFinite(raw) || raw < 1) return DEFAULT_DEVICE_ASSIGN_COUNT;
+  return Math.min(Math.floor(raw), MAX_DEVICE_ASSIGN_COUNT);
+}
+
+function getMaxDeviceRowIndex() {
+  return (deviceEditorRows || []).reduce((max, row) => {
+    const ri = Number(row?.row_index ?? row?.id);
+    return Number.isFinite(ri) ? Math.max(max, ri) : max;
+  }, -1);
+}
+
+function allocateDeviceRowIndexes(count) {
+  const safeCount = Math.max(1, Math.floor(Number(count) || 1));
+  const start = getMaxDeviceRowIndex() + 1;
+  return Array.from({ length: safeCount }, (_, i) => start + i);
+}
+
+function pickUnloggedAccountsByRegion(region, limit = 1) {
   const normalizedRegion = String(region || "").trim();
-  if (!normalizedRegion) return null;
-  return (accountEditorRows || []).find((row) => {
+  const maxCount = Math.max(1, Math.floor(Number(limit) || 1));
+  if (!normalizedRegion || maxCount < 1) return [];
+  const picked = [];
+  for (const row of accountEditorRows || []) {
+    if (picked.length >= maxCount) break;
     const accountRegion = String(row?.region || "").trim();
     const username = String(row?.username || "").trim();
-    if (!username) return false;
-    if (accountRegion !== normalizedRegion || isAccountLoggedIn(row)) return false;
-    return !isUsernameUsedElsewhere(username, -1);
-  }) || null;
+    if (!username) continue;
+    if (accountRegion !== normalizedRegion || isAccountLoggedIn(row)) continue;
+    if (!isAccountAliasUnassigned(row)) continue;
+    if (isUsernameUsedElsewhere(username, -1)) continue;
+    const normalizedUsername = username.toLowerCase();
+    if (picked.some((item) => String(item?.username || "").trim().toLowerCase() === normalizedUsername)) continue;
+    picked.push(row);
+  }
+  return picked;
 }
 
 async function addDeviceBlankEditorRow(aliasOverride = "") {
+  await loadEditorState();
+  renderDeviceRegionPresetOptions();
+  renderDeviceAliasPresetOptions();
   const selectedRegion = String(deviceRegionPresetSelect?.value || "").trim();
   if (!selectedRegion) {
     throw new Error("请先选择国家地区后再新增记录");
   }
-  const matchedAccount = pickUnloggedAccountByRegion(selectedRegion);
-  if (!matchedAccount) {
-    throw new Error(`新增失败：账号表单中没有地区为「${selectedRegion}」、未登录且未被分配的账号`);
+  const assignCount = getDeviceAssignCount();
+  if (deviceAssignCountInput) {
+    deviceAssignCountInput.value = String(assignCount);
+  }
+  const matchedAccounts = pickUnloggedAccountsByRegion(selectedRegion, assignCount);
+  if (!matchedAccounts.length) {
+    throw new Error(`新增失败：账号表单中没有地区为「${selectedRegion}」、未登录且未分配的可用账号`);
   }
   const selectedAlias = String(aliasOverride || deviceAliasPresetSelect?.value || "").trim();
   const inferredDeviceId = resolveDeviceIdByAlias(selectedAlias);
-  deviceEditorRows.push(getDeviceRowTemplate({
+  const newRowIndexes = allocateDeviceRowIndexes(matchedAccounts.length);
+  const startIndex = deviceEditorRows.length;
+  const newRows = matchedAccounts.map((matchedAccount, i) => getDeviceRowTemplate({
+    row_index: newRowIndexes[i],
     device_alias: selectedAlias,
     device_id: inferredDeviceId,
     region: selectedRegion,
     username: String(matchedAccount.username || "").trim(),
   }));
-  const index = deviceEditorRows.length - 1;
+  deviceEditorRows.push(...newRows);
   try {
-    await saveDeviceRow(index);
+    for (let i = 0; i < newRows.length; i += 1) {
+      await saveDeviceRow(startIndex + i, { skipReload: true, rowIndex: newRowIndexes[i] });
+    }
+    await loadEditorState();
+    renderAccountEditorRows();
     renderDeviceEditorRows();
+    const backupActive = document.getElementById("backup-section")?.classList.contains("active");
+    if (backupActive) {
+      await loadBackupArchiveRecords();
+    }
+    const aliasHint = selectedAlias ? `，别名 ${selectedAlias}` : "";
+    if (matchedAccounts.length < assignCount) {
+      setStatus(
+        `已分配 ${matchedAccounts.length} 条（请求 ${assignCount} 条，可用账号不足）${aliasHint}`,
+        "warning",
+      );
+    } else {
+      setStatus(`已成功分配 ${matchedAccounts.length} 条账号到设备档案${aliasHint}`, "success");
+    }
   } catch (error) {
-    // 保存失败时回滚本地临时新增，避免“失败但界面仍多一条记录”。
-    deviceEditorRows.splice(index, 1);
+    deviceEditorRows.splice(startIndex, newRows.length);
     renderDeviceEditorRows();
     throw error;
+  }
+}
+
+async function handleAddDeviceBlankRecordClick(aliasOverride = "") {
+  if (!addDeviceBlankRecordBtn) return;
+  if (addDeviceBlankRecordBtn.disabled) return;
+  const previousLabel = addDeviceBlankRecordBtn.textContent;
+  addDeviceBlankRecordBtn.disabled = true;
+  addDeviceBlankRecordBtn.textContent = "分配中...";
+  setStatus("正在分配账号到设备档案...", "info");
+  try {
+    await addDeviceBlankEditorRow(aliasOverride);
+  } catch (error) {
+    const message = humanizeRequestErrorMessage(error) || "新增失败";
+    setStatus(message, "error");
+    window.alert(message);
+  } finally {
+    addDeviceBlankRecordBtn.disabled = false;
+    addDeviceBlankRecordBtn.textContent = previousLabel || "新增并分配记录";
   }
 }
 
@@ -6601,6 +7185,26 @@ function renderDeviceAliasGroups(groups = [], recordsByAlias = {}) {
   }).join("");
 }
 
+function isMeaningfulBackupFieldValue(value) {
+  const text = String(value ?? "").trim();
+  return Boolean(text && text !== "-");
+}
+
+function buildBackupArchiveExtraSummary(stats = {}, backupName = "", backupPath = "", dailySlotLabel = "") {
+  const parts = [];
+  if (isMeaningfulBackupFieldValue(stats.follower_count)) parts.push(`粉丝 ${stats.follower_count}`);
+  if (isMeaningfulBackupFieldValue(stats.follower_growth)) parts.push(`增长 ${stats.follower_growth}`);
+  if (isMeaningfulBackupFieldValue(stats.video_count)) parts.push(`视频 ${stats.video_count}`);
+  if (isMeaningfulBackupFieldValue(dailySlotLabel)) parts.push(`时段 ${dailySlotLabel}`);
+  if (isMeaningfulBackupFieldValue(backupName)) {
+    const shortName = backupName.length > 28 ? `${backupName.slice(0, 28)}…` : backupName;
+    parts.push(`备份 ${shortName}`);
+  } else if (isMeaningfulBackupFieldValue(backupPath)) {
+    parts.push("已有备份路径");
+  }
+  return parts.length ? parts.join(" · ") : "数据统计与备份信息";
+}
+
 function resolveBackupRowDailySlot(alias, row) {
   const aliasKey = alias === "__EMPTY_ALIAS__"
     ? normalizeAliasValue(row?.mobile_alias || row?.assigned_alias || row?.device_alias)
@@ -6654,60 +7258,274 @@ function renderBackupGroups(items = []) {
       const acct = username ? getAccountRecordByUsername(username) : null;
       const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
       const otherDisabled = switchActive ? "" : " disabled";
-      const rowIndexRaw = row?.row_index ?? row?.id;
-      const rowIndexNum = Number(rowIndexRaw);
-      const hasCutSwitchRow = Number.isFinite(rowIndexNum) && rowIndexNum >= 0;
+      const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
+      const rowIndexNum = exportRowIndex ?? -1;
+      const hasCutSwitchRow = exportRowIndex != null;
       const dailySlotLabel = resolveBackupRowDailySlot(alias, row) || (rows.length >= 2 ? "-" : "");
+      const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath, dailySlotLabel);
+      const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
+      const exportSelectTitle = exportRowIndex != null
+        ? "勾选后可点「导出选中」"
+        : "该记录缺少 row_index，暂无法参与导出";
       return `
-        <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" style="margin-top:10px;background:#fafcff;" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
-          <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;">
-            <strong>记录 #${idx + 1}</strong>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
+          <div class="backup-archive-record__head">
+            <div class="backup-archive-record__title">
+              <label class="backup-archive-record__select" title="${escapeHtml(exportSelectTitle)}" onclick="event.stopPropagation()">
+                <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
+              </label>
+              <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
+              <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
+              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")} · ${escapeHtml(updatedAt || "-")}</span>
+            </div>
+            <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
               <button type="button" class="ghost"${otherDisabled} title="仅清理设备内 TikTok 数据，不做备份" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
               <button type="button" class="ghost"${otherDisabled} title="先备份，再清理设备内 TikTok 数据" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
               <button type="button" class="ghost"${otherDisabled} title="先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
               ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="高亮条目可点：下发后在设备完成修改链路；成功回传后云端自动将「基本资料已修改」标为「是」并关闭 TikTok" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
-              <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}" title="切号：高亮条目无需操作；未高亮将按流程备份/还原并切换高亮" data-account-switch="1">切号</button>
+              <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}" title="切号：高亮条目无需操作；无高亮时仅清理后还原/切高亮；有高亮时先备份当前再还原" data-account-switch="1">切号</button>
             </div>
           </div>
-          <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px;">
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">username</label><div style="word-break:break-word;">${escapeHtml(username || "-")}</div></div>
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">mobile_alias</label><div style="word-break:break-word;">${escapeHtml(mobileAlias || "-")}</div></div>
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">updated_at</label><div style="word-break:break-word;">${escapeHtml(updatedAt || "-")}</div></div>
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:10px;align-items:end;">
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;">video_count</label><div style="word-break:break-word;">${escapeHtml(stats.video_count)}</div></div>
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>follower_count</strong></label><div style="word-break:break-word;"><strong>${escapeHtml(stats.follower_count)}</strong></div></div>
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>follower_growth</strong></label><div style="word-break:break-word;"><strong>${escapeHtml(stats.follower_growth)}</strong></div></div>
-            <div style="min-width:0;"><label style="display:block;color:#666;font-size:12px;"><strong>今日时段</strong></label><div style="word-break:break-word;white-space:nowrap;"><strong>${escapeHtml(dailySlotLabel || "-")}</strong></div></div>
-          </div>
-          <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px;">
-            <div style="min-width:0;">
-              <label style="display:block;color:#666;font-size:12px;">backup_name</label>
-              <div style="word-break:break-all;overflow-wrap:anywhere;line-height:1.45;" title="${escapeHtml(backupName || "")}">${escapeHtml(backupName || "-")}</div>
+          <details class="backup-archive-record-extra">
+            <summary class="backup-archive-record-extra__summary" title="点击展开/收起">${escapeHtml(extraSummary)}</summary>
+            <div class="backup-archive-record-extra__body">
+              <div class="backup-archive-record-extra__grid backup-archive-record-extra__grid--stats">
+                <div><label>video_count</label><div>${escapeHtml(stats.video_count)}</div></div>
+                <div><label>follower_count</label><div><strong>${escapeHtml(stats.follower_count)}</strong></div></div>
+                <div><label>follower_growth</label><div><strong>${escapeHtml(stats.follower_growth)}</strong></div></div>
+                <div><label>今日时段</label><div><strong>${escapeHtml(dailySlotLabel || "-")}</strong></div></div>
+              </div>
+              <div class="backup-archive-record-extra__grid backup-archive-record-extra__grid--backup">
+                <div class="backup-archive-record-extra__field backup-archive-record-extra__field--wide">
+                  <label>backup_name</label>
+                  <div title="${escapeHtml(backupName || "")}">${escapeHtml(backupName || "-")}</div>
+                </div>
+                <div class="backup-archive-record-extra__field backup-archive-record-extra__field--wide">
+                  <label>backup_path</label>
+                  <div class="backup-archive-record-extra__path" title="${escapeHtml(backupPath || "")}">${escapeHtml(backupPath || "-")}</div>
+                </div>
+              </div>
             </div>
-            <div style="min-width:0;">
-              <label style="display:block;color:#666;font-size:12px;">backup_path</label>
-              <div style="word-break:break-all;overflow-wrap:anywhere;line-height:1.45;font-family:ui-monospace,monospace;font-size:12px;color:#0f172a;background:#f1f5f9;border-radius:6px;padding:8px 10px;" title="${escapeHtml(backupPath || "")}">${escapeHtml(backupPath || "-")}</div>
-            </div>
-          </div>
-          <details style="margin-top:10px;border:1px dashed #dbe3ff;border-radius:10px;padding:8px 10px;background:#f8fbff;">
-            <summary style="cursor:pointer;font-size:12px;color:#334155;font-weight:600;">查看该 username 关联的账号记录</summary>
-            <div style="margin-top:8px;">
+          </details>
+          <details class="backup-archive-record-linked">
+            <summary>查看该 username 关联的账号记录</summary>
+            <div class="backup-archive-record-linked__body">
               ${linkedAccountInfo}
             </div>
           </details>
         </div>
       `;
     }).join("");
+    const groupRowIndices = rows
+      .map((row) => resolveBackupArchiveExportRowIndex(row))
+      .filter((n) => n != null);
+    const groupAllSelected = groupRowIndices.length > 0 && groupRowIndices.every((n) => backupArchiveSelectedRowIndices.has(n));
     return `<details class="panel-card" style="margin-bottom:12px;" open>
-      <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;">
-        <span>${escapeHtml(label)}${planDateHint}</span><span class="hint">${rows.length} 条</span>
+      <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;align-items:center;">
+        <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          ${groupRowIndices.length ? `<label class="backup-archive-group-select" title="全选/取消本别名组" onclick="event.stopPropagation()"><input type="checkbox" class="backup-archive-group-select-all"${groupAllSelected ? " checked" : ""} data-group-row-indices="${escapeHtml(groupRowIndices.join(","))}" /></label>` : ""}
+          <span>${escapeHtml(label)}${planDateHint}</span>
+        </span>
+        <span class="hint">${rows.length} 条</span>
       </summary>
       <div style="margin-top:10px;">${body}</div>
     </details>`;
   }).join("");
+}
+
+function resolveBackupArchiveExportRowIndex(row) {
+  const raw = row?.row_index ?? row?.id;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function getBackupArchiveSelectedRowIndices() {
+  return Array.from(backupArchiveSelectedRowIndices)
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n) && n >= 0)
+    .sort((a, b) => a - b);
+}
+
+function updateBackupArchiveSelectionUi() {
+  const count = backupArchiveSelectedRowIndices.size;
+  if (backupArchiveSelectedCountEl) backupArchiveSelectedCountEl.textContent = String(count);
+  if (backupArchiveSelectionHintEl) {
+    backupArchiveSelectionHintEl.style.display = count > 0 ? "" : "none";
+  }
+  if (exportBackupArchiveSelectedXlsxBtn) {
+    exportBackupArchiveSelectedXlsxBtn.disabled = backupArchiveXlsxBusy || count <= 0;
+  }
+}
+
+function setBackupArchiveRowSelected(rowIndex, selected) {
+  const idx = Number(rowIndex);
+  if (!Number.isFinite(idx) || idx < 0) return;
+  if (selected) backupArchiveSelectedRowIndices.add(idx);
+  else backupArchiveSelectedRowIndices.delete(idx);
+  updateBackupArchiveSelectionUi();
+}
+
+function syncBackupArchiveExportCheckboxes() {
+  if (!deviceAliasGroupsEl) return;
+  deviceAliasGroupsEl.querySelectorAll(".backup-archive-export-select").forEach((el) => {
+    if (!(el instanceof HTMLInputElement)) return;
+    const idx = Number(el.dataset.rowIndex);
+    el.checked = Number.isFinite(idx) && backupArchiveSelectedRowIndices.has(idx);
+  });
+}
+
+function selectAllBackupArchiveRowsOnPage() {
+  if (!deviceAliasGroupsEl) return;
+  deviceAliasGroupsEl.querySelectorAll(".backup-archive-export-select").forEach((el) => {
+    if (!(el instanceof HTMLInputElement)) return;
+    const idx = Number(el.dataset.rowIndex);
+    if (Number.isFinite(idx) && idx >= 0) backupArchiveSelectedRowIndices.add(idx);
+    el.checked = true;
+  });
+  updateBackupArchiveSelectionUi();
+}
+
+function clearBackupArchiveSelection() {
+  backupArchiveSelectedRowIndices.clear();
+  syncBackupArchiveExportCheckboxes();
+  updateBackupArchiveSelectionUi();
+}
+
+function setBackupArchiveXlsxButtonsBusy(busy) {
+  backupArchiveXlsxBusy = Boolean(busy);
+  if (exportBackupArchiveXlsxBtn) {
+    exportBackupArchiveXlsxBtn.disabled = busy;
+    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出 xlsx";
+  }
+  if (exportBackupArchiveSelectedXlsxBtn) {
+    exportBackupArchiveSelectedXlsxBtn.disabled = busy || backupArchiveSelectedRowIndices.size <= 0;
+    exportBackupArchiveSelectedXlsxBtn.textContent = busy ? "导出中..." : "导出选中";
+  }
+  if (backupArchiveSelectAllPageBtn) backupArchiveSelectAllPageBtn.disabled = busy;
+  if (backupArchiveClearSelectionBtn) backupArchiveClearSelectionBtn.disabled = busy;
+  if (importBackupArchiveXlsxBtn) {
+    importBackupArchiveXlsxBtn.disabled = busy;
+    importBackupArchiveXlsxBtn.textContent = busy ? "导入中..." : "导入 xlsx";
+  }
+}
+
+async function downloadBackupArchiveExportFile(filename) {
+  const safeName = String(filename || "").trim();
+  if (!safeName) throw new Error("服务端未返回导出文件名");
+  const token = authToken();
+  const url = await buildApiUrl(
+    `/api/admin/editor/backup_archive/export_file?filename=${encodeURIComponent(safeName)}`,
+  );
+  const response = await fetch(url, {
+    method: "GET",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    let msg = `下载失败 (HTTP ${response.status})`;
+    try {
+      const data = await response.json();
+      msg = String(data?.msg || msg);
+    } catch {
+      const text = await response.text();
+      if (text) msg = text.slice(0, 200);
+    }
+    throw new Error(msg);
+  }
+  const blob = await response.blob();
+  const objectUrl = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = safeName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
+  if (backupArchiveXlsxBusy) return;
+  const selected = getBackupArchiveSelectedRowIndices();
+  if (selectedOnly && !selected.length) {
+    setStatus("请先勾选要导出的备份记录", "warning");
+    return;
+  }
+  setBackupArchiveXlsxButtonsBusy(true);
+  try {
+    const group = getActiveDeviceGroupFilter();
+    const params = new URLSearchParams();
+    if (group) params.set("device_group", group);
+    if (selectedOnly && selected.length) params.set("row_indices", selected.join(","));
+    const token = authToken();
+    const qs = params.toString();
+    const url = await buildApiUrl(
+      `/api/admin/editor/backup_archive/export_xlsx${qs ? `?${qs}` : ""}`,
+    );
+    setStatus(selectedOnly ? "正在导出已选备份档案..." : "正在导出备份档案 xlsx...", "info");
+    const response = await fetch(url, {
+      method: "GET",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(text ? text.slice(0, 200) : `导出失败 (HTTP ${response.status})`);
+    }
+    if (!response.ok) {
+      throw new Error(String(data?.msg || `导出失败 (HTTP ${response.status})`));
+    }
+    if (Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || "导出失败"));
+    }
+    const filename = String(data?.filename || "").trim();
+    const count = Number(data?.count || 0);
+    await downloadBackupArchiveExportFile(filename);
+    setStatus(`备份档案已导出：${filename}（${count} 条）`, "success");
+  } finally {
+    setBackupArchiveXlsxButtonsBusy(false);
+    updateBackupArchiveSelectionUi();
+  }
+}
+
+async function importBackupArchiveXlsxFile(file) {
+  if (!file || backupArchiveXlsxBusy) return;
+  const name = String(file.name || "").toLowerCase();
+  if (!name.endsWith(".xlsx")) {
+    setStatus("请选择 .xlsx 文件", "warning");
+    return;
+  }
+  setBackupArchiveXlsxButtonsBusy(true);
+  try {
+    const token = authToken();
+    const form = new FormData();
+    form.append("file", file);
+    setStatus("正在导入备份档案 xlsx...", "info");
+    const response = await fetch(await buildApiUrl("/api/admin/editor/backup_archive/import_xlsx"), {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || `导入失败 (HTTP ${response.status})`));
+    }
+    const imported = Number(data?.imported || 0);
+    const skippedDup = Number(data?.skipped_duplicate || 0);
+    const skippedEmpty = Number(data?.skipped_empty || 0);
+    await loadEditorState();
+    await loadBackupArchiveRecords();
+    const parts = [`新增 ${imported} 条`];
+    if (skippedDup > 0) parts.push(`跳过重复 username ${skippedDup} 条`);
+    if (skippedEmpty > 0) parts.push(`跳过空 username ${skippedEmpty} 条`);
+    setStatus(`备份档案导入完成：${parts.join("，")}`, imported > 0 ? "success" : "warning");
+  } finally {
+    setBackupArchiveXlsxButtonsBusy(false);
+    if (backupArchiveImportFileInput) backupArchiveImportFileInput.value = "";
+  }
 }
 
 async function loadBackupArchiveRecords() {
@@ -6731,6 +7549,7 @@ async function loadBackupArchiveRecords() {
     const rows = Array.isArray(data.items) ? data.items : [];
     const items = rows.map((row) => ({
       ...row,
+      row_index: resolveBackupArchiveExportRowIndex(row) ?? row?.row_index ?? row?.id,
       assigned_alias: row?.assigned_alias || row?.device_alias || "",
       mobile_alias: row?.mobile_alias || row?.device_alias || "",
       created_at: row?.created_at || row?.updated_at || "",
@@ -6745,6 +7564,8 @@ async function loadBackupArchiveRecords() {
     }));
     updateBackupArchivePagerUi();
     renderBackupGroups(items);
+    syncBackupArchiveExportCheckboxes();
+    updateBackupArchiveSelectionUi();
   } catch (error) {
     deviceAliasGroupsEl.innerHTML = `<div class="hint">加载备份档案失败：${escapeHtml(error.message || "unknown")}</div>`;
   }
@@ -6764,7 +7585,9 @@ if (importAccountBatchBtn) {
   });
 }
 if (addDeviceBlankRecordBtn) {
-  addDeviceBlankRecordBtn.addEventListener("click", () => addDeviceBlankEditorRow().catch((e) => setStatus(e.message || "新增失败", "error")));
+  addDeviceBlankRecordBtn.addEventListener("click", () => {
+    void handleAddDeviceBlankRecordClick();
+  });
 }
 if (accountUnassignedOnlyToggle) {
   accountUnassignedOnlyToggle.addEventListener("change", (event) => {
@@ -6803,6 +7626,28 @@ if (accountEditorListEl) {
   });
 }
 if (deviceAliasGroupsEl) {
+  deviceAliasGroupsEl.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.classList.contains("backup-archive-export-select")) {
+      event.stopPropagation();
+      const idx = Number(target.dataset.rowIndex);
+      setBackupArchiveRowSelected(idx, target.checked);
+      return;
+    }
+    if (target.classList.contains("backup-archive-group-select-all")) {
+      event.stopPropagation();
+      const raw = String(target.dataset.groupRowIndices || "");
+      const indices = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0);
+      indices.forEach((idx) => setBackupArchiveRowSelected(idx, target.checked));
+      const details = target.closest("details");
+      if (details) {
+        details.querySelectorAll(".backup-archive-export-select").forEach((el) => {
+          if (el instanceof HTMLInputElement) el.checked = target.checked;
+        });
+      }
+    }
+  });
   deviceAliasGroupsEl.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
@@ -6851,7 +7696,7 @@ if (deviceAliasGroupsEl) {
     if (target.hasAttribute("data-alias-add-row")) {
       event.preventDefault();
       const alias = String(target.getAttribute("data-alias-add-row") || "").trim();
-      await addDeviceBlankEditorRow(alias);
+      await handleAddDeviceBlankRecordClick(alias);
       return;
     }
     if (target.getAttribute("data-action") === "alias-clear") {

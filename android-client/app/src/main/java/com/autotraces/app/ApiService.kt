@@ -161,6 +161,39 @@ object ApiService {
         clazz = CvTemplateResponse::class.java,
     )
 
+    suspend fun getDeviceAssignedAccount(deviceId: String, alias: String): DeviceAssignedAccountResponse = get(
+        path = "/api/device/assigned_account?device_id=${encode(deviceId)}&alias=${encode(alias)}",
+        clazz = DeviceAssignedAccountResponse::class.java,
+    )
+
+    suspend fun fetchRandomGalleryLibraryItem(deviceId: String, alias: String): GalleryLibraryRandomResponse =
+        getWithClient(
+            longTimeoutClient,
+            "/api/gallery_library/random?device_id=${encode(deviceId)}&alias=${encode(alias)}",
+            GalleryLibraryRandomResponse::class.java,
+            includeAuth = false,
+        )
+
+    suspend fun markDeviceAssignedAccountLogin(
+        deviceId: String,
+        alias: String,
+        username: String,
+    ): BaseResponse = post(
+        path = "/api/device/assigned_account/mark_login",
+        body = DeviceAssignedAccountMarkLoginRequest(deviceId, alias, username),
+        clazz = BaseResponse::class.java,
+    )
+
+    suspend fun updateDeviceAssignedAccountUsername(
+        deviceId: String,
+        alias: String,
+        newUsername: String,
+    ): DeviceAssignedAccountUpdateUsernameResponse = post(
+        path = "/api/device/assigned_account/update_username",
+        body = DeviceAssignedAccountUpdateUsernameRequest(deviceId, alias, newUsername),
+        clazz = DeviceAssignedAccountUpdateUsernameResponse::class.java,
+    )
+
     suspend fun getTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): TikTokEmailCodeResponse {
         val body = mapOf(
             "device_id" to deviceId,

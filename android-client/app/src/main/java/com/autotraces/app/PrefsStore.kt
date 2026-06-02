@@ -27,6 +27,11 @@ object PrefsStore {
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
     /** 最近一次请求硬停的时间；用于忽略 opt_out 同步前的 check_start 竞态。 */
     private const val KEY_HARD_STOP_AT_MS = "hard_stop_at_ms"
+    /**
+     * 备份/清理/切号前为收尾而 sync 的 paused；登录保障通过并恢复涨粉后清除。
+     * 避免 check_start 仍返回 status=paused 时轮询把本机再次打回暂停。
+     */
+    private const val KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP = "transient_paused_for_destructive_op"
     private const val KEY_MUTUAL_CLICK_REQUESTED = "mutual_click_requested"
     private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
     /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
@@ -136,6 +141,13 @@ object PrefsStore {
         if (at <= 0L) return false
         return System.currentTimeMillis() - at < graceMs
     }
+
+    fun setTransientPausedForDestructiveOp(active: Boolean) {
+        prefs.edit().putBoolean(KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP, active).apply()
+    }
+
+    fun isTransientPausedForDestructiveOp(): Boolean =
+        prefs.getBoolean(KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP, false)
 
     fun setMutualClickRequested(requested: Boolean) {
         prefs.edit().putBoolean(KEY_MUTUAL_CLICK_REQUESTED, requested).apply()

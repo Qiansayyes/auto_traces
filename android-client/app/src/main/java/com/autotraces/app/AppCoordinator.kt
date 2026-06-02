@@ -83,14 +83,30 @@ object AppCoordinator {
     private var deviceLogSyncJob: Job? = null
     private var mutualSwitchJob: Job? = null
     private var publishPostSwitchJob: Job? = null
+    @Volatile
+    private var autoLoginActive: Boolean = false
+
+    /** 最近一次 [ensureAccountLoggedIn] 是否实际跑完自动登录链（含 Profile→Edit 终检）。 */
+    private var lastEnsureLoginPerformedFreshAutoLogin: Boolean = false
+
+    /**
+     * 云端下发/切换到涨粉模式后，在涨粉拉取循环中执行**一次**登录状态保障（非每轮拉取前）。
+     * 登录状态保障 = TikTok 界面 OCR 判定是否可继续；与云端 `is_login` 无关。
+     * 仍保留：切号完成、互点冷启、发作品冷启；已取消：每轮涨粉拉取前、每用户名任务开始、
+     * 修改基本资料外轮、云端设备指令前。
+     */
+    @Volatile
+    private var growthModeLoginSafeguardPending: Boolean = false
 
     private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
 
     private fun isMutualSwitchActive(): Boolean = mutualSwitchJob?.isActive == true
 
-    /** 发作品或互点切换占用 TikTok 时，不启动涨粉拉取循环。 */
+    private fun isAutoLoginActive(): Boolean = autoLoginActive
+
+    /** 发作品、互点切换或切号后自动登录占用 TikTok 时，不启动涨粉拉取循环。 */
     private fun canStartPullLoopNow(): Boolean =
-        !isPublishPostSwitchActive() && !isMutualSwitchActive()
+        !isAutoLoginActive() && !isPublishPostSwitchActive() && !isMutualSwitchActive()
 
     /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常。 */
     private fun isPullLoopJobCancellation(err: Throwable): Boolean {
@@ -193,7 +209,9 @@ object AppCoordinator {
         if (!PrefsStore.isBound()) return
         scope.launch {
             val alias = PrefsStore.getAlias()
+            val wasRunning = PrefsStore.getLocalStatus() == "running"
             // 显式启动（本机按钮/云端自动拉起）时，解除本地硬停与手动暂停闸门。
+            PrefsStore.setTransientPausedForDestructiveOp(false)
             if (PrefsStore.isHardStopRequested()) {
                 PrefsStore.setHardStopRequested(false)
             }
@@ -202,6 +220,9 @@ object AppCoordinator {
                 started.set(true)
             }
             fetchConfig()
+            if (!wasRunning && queueRunMode() == ServerRunMode.GROWTH) {
+                growthModeLoginSafeguardPending = true
+            }
             enqueuePendingReports()
             PrefsStore.saveLocalStatus("running")
             updateRuntime(localStatus = "running", lastMessage = reason)
@@ -308,9 +329,16 @@ object AppCoordinator {
                     return fetchConfig(configQueryRunMode, logToUser, bindingRecoveryAttempted = true)
                 }
                 if (response.code == 0 && response.config != null) {
+                    val previousRunMode = queueRunMode()
                     val effective = response.config.copy(
                         run_mode = response.run_mode ?: response.config.run_mode,
                     )
+                    val newRunMode = effective.run_mode.trim().lowercase().ifBlank { ServerRunMode.GROWTH }
+                    if (newRunMode == ServerRunMode.GROWTH && newRunMode != previousRunMode) {
+                        growthModeLoginSafeguardPending = true
+                    } else if (newRunMode != ServerRunMode.GROWTH) {
+                        growthModeLoginSafeguardPending = false
+                    }
                     _config.value = effective
                     val templateLabel = prettyTemplateName(response.active_template)
                     if (logToUser) {
@@ -413,7 +441,29 @@ object AppCoordinator {
                                     PrefsStore.saveLocalStatus("running")
                                     updateRuntime(localStatus = "running", lastMessage = "云端任务执行中")
                                 }
+                            } else if (
+                                cloudAutoStart &&
+                                !shouldHonorUserHardStop() &&
+                                !manuallyPaused &&
+                                !inPullUsernameRestSleep &&
+                                PrefsStore.isTransientPausedForDestructiveOp() &&
+                                PrefsStore.getLocalStatus() == "running"
+                            ) {
+                                /* 切号/备份已恢复 running 并 sync，云端 status 可能仍为 paused：勿打回暂停 */
+                            } else if (
+                                cloudAutoStart &&
+                                !shouldHonorUserHardStop() &&
+                                !manuallyPaused &&
+                                !inPullUsernameRestSleep &&
+                                PrefsStore.isTransientPausedForDestructiveOp()
+                            ) {
+                                LogCenter.op(
+                                    alias,
+                                    "切号/备份临时暂停已结束，按云端自动开启恢复涨粉（check_start 仍为 paused）",
+                                )
+                                forceStartRunningNow("切号/备份收尾完成，解除临时暂停")
                             } else {
+                                PrefsStore.setTransientPausedForDestructiveOp(false)
                                 val alreadyPaused = PrefsStore.getLocalStatus() == "paused"
                                 PrefsStore.saveLocalStatus("paused")
                                 ApiService.syncStatus(deviceId, alias, "paused")
@@ -536,6 +586,10 @@ object AppCoordinator {
 
                 if (queueRunMode() == ServerRunMode.MUTUAL) {
                     runMutualTrafficPullLoopIteration(alias, deviceId)
+                    continue
+                }
+
+                if (!ensureAssignedAccountReadyForGrowthPull(alias, deviceId)) {
                     continue
                 }
 
@@ -788,6 +842,7 @@ object AppCoordinator {
     ) {
         val wasHardStop = PrefsStore.isHardStopRequested()
         val wasPaused = PrefsStore.getLocalStatus() == "paused"
+        PrefsStore.setTransientPausedForDestructiveOp(false)
         PrefsStore.setHardStopRequested(false)
         manuallyPaused = false
         if (!started.get()) {
@@ -841,6 +896,7 @@ object AppCoordinator {
         LogCenter.op(alias, "[OP][$opId] 收到 $opType：暂停涨粉，${settleMs / 1000}s 后执行…")
         pullLoopJob?.cancel()
         pullLoopJob = null
+        PrefsStore.setTransientPausedForDestructiveOp(true)
         PrefsStore.saveLocalStatus("paused")
         updateRuntime(localStatus = "paused", lastMessage = "备份/切号前等待任务收尾")
         runCatching {
@@ -871,9 +927,11 @@ object AppCoordinator {
         opId: String,
         packageName: String,
         settleMs: Long = 8_000L,
+        forceStopTikTok: Boolean = true,
     ): Boolean {
         val wasRunning = PrefsStore.getLocalStatus() == "running" && !PrefsStore.isHardStopRequested() && !manuallyPaused
-        LogCenter.op(alias, "[OP][$opId] 收到 $opType：暂停涨粉并独占 TikTok（${settleMs / 1000}s 后执行）…")
+        val settleHint = if (forceStopTikTok) "${settleMs / 1000}s 后执行" else "立即执行（保留 TikTok 前台）"
+        LogCenter.op(alias, "[OP][$opId] 收到 $opType：暂停涨粉并独占 TikTok（$settleHint）…")
         runCatching {
             withContext(Dispatchers.IO) {
                 ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = true)
@@ -898,16 +956,432 @@ object AppCoordinator {
                 .onFailure { LogCenter.op(alias, "[OP][$opId] 拉起后台服务失败：${it.message}") }
         }
         val pkg = packageName.trim().ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
-        runCatching {
-            executor.run {
-                val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
-                m.isAccessible = true
-                m.invoke(this, "am force-stop $pkg")
+        if (forceStopTikTok) {
+            runCatching {
+                executor.run {
+                    val m = javaClass.getDeclaredMethod("runSuCommand", String::class.java)
+                    m.isAccessible = true
+                    m.invoke(this, "am force-stop $pkg")
+                }
             }
+            delay(settleMs)
         }
-        delay(settleMs)
         LogCenter.op(alias, "[OP][$opId] 独占准备完成，开始执行 $opType")
         return wasRunning
+    }
+
+    private fun isBasicProfileModificationPending(modified: String?): Boolean =
+        modified?.trim()?.equals("是", ignoreCase = true) != true
+
+    /** 自动/手动切号全流程成功后：恢复自动开启、按需自动登录，再拉起涨粉。 */
+    private suspend fun finishCutSwitchAfterSuccess(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        reportResp: BaseResponse? = null,
+    ) {
+        LogCenter.op(alias, "[OP][$opId] 切号完成：恢复该设备自动开启程序")
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = false)
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 切号后恢复自动开启上报失败：${err.message}")
+        }
+        PrefsStore.setHardStopRequested(false)
+        manuallyPaused = false
+
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        fetchConfig(logToUser = false)
+        val accountBeforeSafeguard = fetchDeviceAssignedAccount(alias, deviceId)
+        val cloudLoginRequiredBeforeSwitch = accountBeforeSafeguard?.code == 0 &&
+            accountBeforeSafeguard?.is_login != true
+        lastEnsureLoginPerformedFreshAutoLogin = false
+        val launched = executor.launchTikTokWithForegroundVerification(
+            ctx = appContext,
+            alias = alias,
+            tag = "切号后保障",
+            forceStopBeforeLaunch = true,
+            timingConfig = _config.value,
+        )
+        val loginPathOk = if (!launched) {
+            LogCenter.op(alias, "[OP][$opId] 切号后 TikTok 拉起失败")
+            false
+        } else if (cloudLoginRequiredBeforeSwitch) {
+            LogCenter.op(
+                alias,
+                "[OP][$opId] 切号后云端 is_login=否，执行自动登录（username=${accountBeforeSafeguard?.username.orEmpty()}）",
+            )
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                reason = "切号后 is_login=否",
+                strict = false,
+                forceRelogin = false,
+                resumeFromLoginEntryScreen = false,
+            )
+        } else {
+            ensureLoginSafeguardMeasure(alias, deviceId, "切号完成", strict = false)
+        }
+        val freshAutoLoginOnProfile = lastEnsureLoginPerformedFreshAutoLogin
+        lastEnsureLoginPerformedFreshAutoLogin = false
+        val profileEditPending = accountBeforeSafeguard?.code == 0 &&
+            isBasicProfileModificationPending(accountBeforeSafeguard?.basic_profile_modified)
+        if (!loginPathOk) {
+            LogCenter.op(alias, "[OP][$opId] 切号后自动登录/登录保障未通过，仍将按云端策略尝试恢复自动开启")
+        } else if (profileEditPending) {
+            if (freshAutoLoginOnProfile) {
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] 切号后登录保障通过且云端「基本资料已修改」=否，开始自动修改基本资料（外轮最多 3 次，第 1 轮直接 OCR）",
+                )
+                runProfileEditAfterCutSwitch(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = opId,
+                    skipOuterWarmup = true,
+                    profileEditTrigger = "cut_switch_after_login",
+                )
+            } else {
+                val loginNote = if (cloudLoginRequiredBeforeSwitch) {
+                    "切号后自动登录/保障通过"
+                } else {
+                    "切号后云端 is_login=是"
+                }
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] $loginNote 且「基本资料已修改」=否，开始自动修改基本资料（外轮进入 Profile）",
+                )
+                runProfileEditAfterCutSwitch(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = opId,
+                    skipOuterWarmup = false,
+                    profileEditTrigger = "cut_switch_logged_in",
+                )
+            }
+        } else {
+            LogCenter.op(alias, "[OP][$opId] 切号后「基本资料已修改」=是，跳过改资料")
+        }
+
+        if (shouldHonorUserHardStop() || manuallyPaused) {
+            LogCenter.op(alias, "[OP][$opId] 切号后保持暂停（硬停/手动暂停），不自动拉起")
+            return
+        }
+
+        if (reportResp?.cut_switch_auto_start_resumed == true) {
+            forceStartRunningNow("切号完成，恢复自动开启程序")
+            return
+        }
+
+        /*
+         * 备份/切号前 prepareForDestructiveTikTokOp 会把本机与云端 sync 为 paused；
+         * 登录保障已回 Home 时，只要云端仍参与自动开启就应解除临时暂停并 sync running。
+         * 不能仅因 check_start 仍返回 status=paused（或上报结果里 auto_start 尚未刷新）就停在「暂未自动拉起」。
+         */
+        if (loginPathOk) {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val resp = ApiService.checkStart(deviceId, alias)
+                    val cloudAutoStart = resp.auto_start == true || reportResp?.auto_start == true
+                    when {
+                        resp.code == 0 && resp.status == "running" ->
+                            forceStartRunningNow("切号完成，收到启动指令")
+                        cloudAutoStart ->
+                            forceStartRunningNow("切号完成，登录保障已通过，解除切号临时暂停并恢复任务")
+                        resp.code == 1 && resp.auto_start == true ->
+                            forceStartRunningNow("切号完成，云端允许自动开启")
+                        else ->
+                            LogCenter.op(
+                                alias,
+                                "[OP][$opId] 切号后暂未自动拉起（check_start code=${resp.code} status=${resp.status} auto_start=${resp.auto_start}）",
+                            )
+                    }
+                }
+            }.onFailure { err ->
+                LogCenter.op(alias, "[OP][$opId] 切号后 check_start 失败：${err.message}，登录保障已通过仍尝试恢复")
+                forceStartRunningNow("切号完成，登录保障已通过（check_start 失败仍恢复）")
+            }
+            return
+        }
+
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val resp = ApiService.checkStart(deviceId, alias)
+                val cloudAutoStart = resp.auto_start == true || reportResp?.auto_start == true
+                when {
+                    resp.code == 0 && resp.status == "running" ->
+                        forceStartRunningNow("切号完成，收到启动指令")
+                    resp.code == 1 && resp.auto_start == true ->
+                        forceStartRunningNow("切号完成，云端允许自动开启")
+                    reportResp?.auto_start == true ->
+                        forceStartRunningNow("切号完成，恢复自动开启程序")
+                    cloudAutoStart ->
+                        forceStartRunningNow("切号完成，按云端自动开启恢复任务")
+                    else ->
+                        LogCenter.op(
+                            alias,
+                            "[OP][$opId] 切号后暂未自动拉起（登录保障未通过；check_start code=${resp.code} status=${resp.status} auto_start=${resp.auto_start}）",
+                        )
+                }
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 切号后 check_start 失败：${err.message}")
+        }
+    }
+
+    private suspend fun fetchDeviceAssignedAccount(
+        alias: String,
+        deviceId: String,
+    ): DeviceAssignedAccountResponse? =
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.getDeviceAssignedAccount(deviceId, alias)
+            }
+        }.getOrNull()
+
+    /**
+     * 涨粉拉取循环门禁：校验云端分配账号；**不在每轮拉取前**做登录状态保障。
+     * 登录状态保障仅在云端下发/切换到涨粉模式时执行一次（[growthModeLoginSafeguardPending]）。
+     * 这与服务端 `is_login` 无关；单用户任务是否执行见 [handleUsername] 内的 `is_login` 判断。
+     */
+    private suspend fun ensureAssignedAccountReadyForGrowthPull(
+        alias: String,
+        deviceId: String,
+    ): Boolean {
+        val accountResp = fetchDeviceAssignedAccount(alias, deviceId)
+        if (accountResp == null) {
+            pauseGrowthAfterLoginFailure(alias, deviceId, "拉取分配账号失败")
+            return false
+        }
+        if (accountResp.code != 0) {
+            pauseGrowthAfterLoginFailure(
+                alias,
+                deviceId,
+                accountResp.msg?.takeIf { it.isNotBlank() } ?: "无分配账号",
+            )
+            return false
+        }
+        accountResp.username?.trim()?.takeIf { it.isNotBlank() }?.let {
+            PrefsStore.setLogContextUsername(it)
+        }
+        if (!growthModeLoginSafeguardPending) {
+            return true
+        }
+        growthModeLoginSafeguardPending = false
+        LogCenter.op(alias, "涨粉：云端涨粉模式，执行一次登录状态保障")
+        val safeguardOk = launchTikTokWithLoginSafeguard(
+            alias = alias,
+            deviceId = deviceId,
+            tag = "涨粉模式保障",
+            forceStopBeforeLaunch = true,
+            safeguardSource = "云端涨粉模式",
+            strict = true,
+        )
+        if (!safeguardOk) {
+            pauseGrowthAfterLoginFailure(alias, deviceId, "登录状态保障或自动登录失败")
+            return false
+        }
+        if (PrefsStore.getLocalStatus() != "running") {
+            resumeRunningAfterGrowthAutoLogin(alias, deviceId)
+        }
+        return true
+    }
+
+    private suspend fun resumeRunningAfterGrowthAutoLogin(alias: String, deviceId: String) {
+        if (shouldHonorUserHardStop() || manuallyPaused) return
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(localStatus = "running", lastMessage = "自动登录成功，继续涨粉")
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "running")
+        }.onFailure { err ->
+            LogCenter.op(alias, "涨粉：自动登录后同步 running 失败：${err.message}")
+        }
+    }
+
+    private suspend fun pauseGrowthAfterLoginFailure(
+        alias: String,
+        deviceId: String,
+        reason: String,
+    ) {
+        LogCenter.op(alias, "涨粉：$reason，程序已暂停（暂不拉取/执行任务）")
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = reason)
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "paused")
+        }.onFailure { err ->
+            LogCenter.op(alias, "涨粉：同步 paused 失败：${err.message}")
+        }
+    }
+
+    private suspend fun isAssignedAccountLoggedIn(alias: String, deviceId: String): Boolean {
+        val accountResp = fetchDeviceAssignedAccount(alias, deviceId) ?: return false
+        return accountResp.code == 0 && accountResp.is_login == true
+    }
+
+    /**
+     * 登录状态保障：TikTok 已在前台时 OCR 点 Profile 判定界面登录态；需登录则走自动登录链。
+     * 与云端 `is_login` 字段无关，仅依据 TikTok 界面 OCR。
+     * @param strict true：自动登录失败等返回 false；false：切号后尽力登录，凭证不齐等仍可返回 true。
+     */
+    private suspend fun ensureLoginSafeguardMeasure(
+        alias: String,
+        deviceId: String,
+        source: String,
+        strict: Boolean = true,
+    ): Boolean {
+        fetchConfig(logToUser = false)
+        when (executor.runLoginSafeguardMeasure(appContext, source)) {
+            LoginSafeguardOutcome.Ready -> {
+                LogCenter.op(alias, "登录状态保障($source)：界面可继续，已回 Home")
+                return true
+            }
+            LoginSafeguardOutcome.RequiresAutoLogin -> {
+                LogCenter.op(alias, "登录状态保障($source)：界面需登录，启动自动登录")
+                val opId = "safeguard_${System.currentTimeMillis()}"
+                return ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = opId,
+                    reason = "登录状态保障($source)",
+                    strict = strict,
+                    forceRelogin = true,
+                    resumeFromLoginEntryScreen = true,
+                )
+            }
+            LoginSafeguardOutcome.Failed -> {
+                LogCenter.op(alias, "登录状态保障($source)：执行失败")
+                return false
+            }
+        }
+    }
+
+    private suspend fun launchTikTokWithLoginSafeguard(
+        alias: String,
+        deviceId: String,
+        tag: String,
+        forceStopBeforeLaunch: Boolean,
+        safeguardSource: String,
+        strict: Boolean = true,
+    ): Boolean {
+        lastEnsureLoginPerformedFreshAutoLogin = false
+        val launched = executor.launchTikTokWithForegroundVerification(
+            ctx = appContext,
+            alias = alias,
+            tag = tag,
+            forceStopBeforeLaunch = forceStopBeforeLaunch,
+            timingConfig = _config.value,
+        )
+        if (!launched) {
+            LogCenter.op(alias, "登录状态保障：TikTok 拉起失败（$safeguardSource）")
+            return false
+        }
+        return ensureLoginSafeguardMeasure(alias, deviceId, safeguardSource, strict)
+    }
+
+    private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
+        LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录（来源=$source）")
+        val opId = "acct_status_${System.currentTimeMillis()}"
+        return ensureAccountLoggedIn(
+            alias = alias,
+            deviceId = deviceId,
+            opId = opId,
+            reason = "掉登录恢复($source)",
+            strict = true,
+            forceRelogin = true,
+        )
+    }
+
+    private suspend fun ensureAccountLoggedIn(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        reason: String,
+        strict: Boolean,
+        forceRelogin: Boolean = false,
+        resumeFromLoginEntryScreen: Boolean = false,
+    ): Boolean {
+        lastEnsureLoginPerformedFreshAutoLogin = false
+        val accountResp = fetchDeviceAssignedAccount(alias, deviceId)
+        if (accountResp == null) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：拉取分配账号失败")
+            return !strict
+        }
+        if (accountResp.code != 0) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：跳过（${accountResp.msg ?: "无分配账号"}）")
+            return !strict
+        }
+        if (accountResp.is_login == true && !forceRelogin) {
+            LogCenter.op(
+                alias,
+                "[OP][$opId] 自动登录($reason)：已登录（username=${accountResp.username.orEmpty()}）",
+            )
+            return true
+        }
+        if (forceRelogin && accountResp.is_login == true) {
+            LogCenter.op(
+                alias,
+                "[OP][$opId] 自动登录($reason)：云端 is_login=是 但 TikTok 已掉登录，强制重新登录（username=${accountResp.username.orEmpty()}）",
+            )
+        }
+        val username = accountResp.username.orEmpty().trim()
+        val email = accountResp.email.orEmpty().trim()
+        val password = accountResp.password.orEmpty().trim()
+        val api = accountResp.api.orEmpty().trim()
+        if (username.isBlank() || email.isBlank() || password.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（username/email/password）")
+            return !strict
+        }
+        if (api.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：api 为空，无法拉取邮箱验证码")
+            return !strict
+        }
+        username.let { PrefsStore.setLogContextUsername(it) }
+        fetchConfig(logToUser = true)
+        autoLoginActive = true
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = "自动登录 TikTok（$reason）")
+        runCatching {
+            ApiService.syncStatus(deviceId, alias, "paused")
+        }
+        LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：开始（$username，is_login=否）")
+        val loginOk = runCatching {
+            executor.runAutoLoginAfterCutSwitch(
+                appContext,
+                TikTokAutoLoginCredentials(
+                    username = username,
+                    email = email,
+                    password = password,
+                    apiUrl = api,
+                ),
+                resumeFromLoginEntryScreen = resumeFromLoginEntryScreen,
+            )
+        }.getOrElse { err ->
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)异常：${err.message}")
+            false
+        }
+        autoLoginActive = false
+        if (loginOk) {
+            lastEnsureLoginPerformedFreshAutoLogin = true
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ApiService.markDeviceAssignedAccountLogin(deviceId, alias, username)
+                }
+            }.onSuccess { resp ->
+                if (resp.code == 0) {
+                    LogCenter.op(alias, "[OP][$opId] 自动登录($reason)成功，已上报 is_login=是")
+                } else {
+                    LogCenter.op(alias, "[OP][$opId] 自动登录($reason)成功但上报 is_login 失败：${resp.msg}")
+                }
+            }.onFailure { err ->
+                LogCenter.op(alias, "[OP][$opId] 自动登录($reason)成功但上报 is_login 异常：${err.message}")
+            }
+            return true
+        }
+        LogCenter.op(alias, "[OP][$opId] 自动登录($reason)失败")
+        return false
     }
 
     /** [prepareForExclusiveTikTokUiOp] 收尾：恢复云端自动拉起，并按需恢复涨粉。 */
@@ -1296,34 +1770,96 @@ object AppCoordinator {
                 val cfgOk = fetchConfig()
                 if (!cfgOk) opLog("配置拉取失败，沿用上一版")
 
-                val galleryImageCount = executor.countPicturesGalleryImageFiles()
-                if (galleryImageCount < 1) {
-                    opLog(
-                        if (galleryImageCount == 0) {
-                            "不满足修改资料条件：图库无图片"
-                        } else {
-                            "不满足修改资料条件：图库检测失败"
-                        },
+                var profileEditAvatarFilename = ""
+                var profileEditGalleryClearedBefore = false
+                var profileEditAvatarImported = false
+                try {
+                    opStep("修改基本资料：清理设备图库（执行前）")
+                    executor.clearDevicePicturesGallery(alias)
+                    profileEditGalleryClearedBefore = true
+                    delayUnlessHardStop(800)
+
+                    opStep("修改基本资料：从云端图库随机拉取头像")
+                    val avatarItem = resolveProfileEditAvatarMediaItem(deviceId, alias, payload, ::opLog)
+                    if (avatarItem == null) {
+                        opLog("不满足修改资料条件：管理台图库为空或拉取失败（未写入设备图库）")
+                        ApiService.reportDeviceOp(
+                            deviceId = deviceId,
+                            alias = alias,
+                            opId = opId,
+                            status = "failed",
+                            message = "管理台图库为空，请先在「图库素材下发」页上传图片",
+                            data = mapOf(
+                                "op_type" to "tiktok_edit_basic_profile",
+                                "device_id" to deviceId,
+                                "package_name" to packageName,
+                                "profile_edit_skipped" to true,
+                                "profile_edit_skip_reason" to "cloud_gallery_empty",
+                                "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
+                                "operation_logs" to operationLogs,
+                            ),
+                        )
+                        return@handleDeviceOp
+                    }
+                    profileEditAvatarFilename = avatarItem.filename?.trim().orEmpty()
+                    profileEditAvatarImported = importGalleryMediaItemToDevice(
+                        avatarItem,
+                        picturesRelativePath = "${Environment.DIRECTORY_PICTURES}/",
+                        log = ::opLog,
                     )
-                    ApiService.reportDeviceOp(
-                        deviceId = deviceId,
-                        alias = alias,
-                        opId = opId,
-                        status = "failed",
-                        message = "不满足修改资料条件，图库图片为0",
-                        data = mapOf(
-                            "op_type" to "tiktok_edit_basic_profile",
-                            "device_id" to deviceId,
-                            "package_name" to packageName,
-                            "gallery_image_count" to galleryImageCount.coerceAtLeast(0),
-                            "gallery_image_count_raw" to galleryImageCount,
-                            "profile_edit_skipped" to true,
-                            "profile_edit_skip_reason" to "gallery_images_empty",
-                            "operation_logs" to operationLogs,
-                        ),
-                    )
-                    return@handleDeviceOp
-                }
+                    if (!profileEditAvatarImported) {
+                        ApiService.reportDeviceOp(
+                            deviceId = deviceId,
+                            alias = alias,
+                            opId = opId,
+                            status = "failed",
+                            message = "随机头像写入设备图库失败",
+                            data = mapOf(
+                                "op_type" to "tiktok_edit_basic_profile",
+                                "device_id" to deviceId,
+                                "package_name" to packageName,
+                                "profile_edit_avatar_filename" to profileEditAvatarFilename,
+                                "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
+                                "profile_edit_avatar_imported" to false,
+                                "operation_logs" to operationLogs,
+                            ),
+                        )
+                        return@handleDeviceOp
+                    }
+                    delayUnlessHardStop(1200)
+
+                    val galleryImageCount = executor.countPicturesGalleryImageFiles()
+                    if (galleryImageCount < 1) {
+                        opLog(
+                            if (galleryImageCount == 0) {
+                                "不满足修改资料条件：头像写入后图库仍无图片"
+                            } else {
+                                "不满足修改资料条件：图库检测失败"
+                            },
+                        )
+                        ApiService.reportDeviceOp(
+                            deviceId = deviceId,
+                            alias = alias,
+                            opId = opId,
+                            status = "failed",
+                            message = "头像写入后设备图库仍无可用图片",
+                            data = mapOf(
+                                "op_type" to "tiktok_edit_basic_profile",
+                                "device_id" to deviceId,
+                                "package_name" to packageName,
+                                "gallery_image_count" to galleryImageCount.coerceAtLeast(0),
+                                "gallery_image_count_raw" to galleryImageCount,
+                                "profile_edit_avatar_filename" to profileEditAvatarFilename,
+                                "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
+                                "profile_edit_avatar_imported" to profileEditAvatarImported,
+                                "profile_edit_skipped" to true,
+                                "profile_edit_skip_reason" to "gallery_images_empty_after_import",
+                                "operation_logs" to operationLogs,
+                            ),
+                        )
+                        return@handleDeviceOp
+                    }
+                    opLog("修改基本资料：设备图库已有头像素材（count=$galleryImageCount，file=$profileEditAvatarFilename）")
 
                 val ratioTapX = 0.97f
                 val ratioTapY = 0.95f
@@ -1405,6 +1941,14 @@ object AppCoordinator {
 
                     val chain = try {
                         executor.profileEditRunOcrChain(appContext, _config.value)
+                    } catch (e: AccountStatusLoggedOutException) {
+                        opLog("修改基本资料：掉登录 ${e.message}")
+                        recoverFromAccountStatusLogout(alias, deviceId, "修改基本资料")
+                        ProfileEditChainResult(
+                            success = false,
+                            failureStep = "account_status_logout",
+                            editOcrPreviews = listOf(e.message ?: "account_status_logout"),
+                        )
                     } catch (e: Exception) {
                         opLog("外轮$outer：OCR链异常 ${e.message}")
                         ProfileEditChainResult(
@@ -1487,30 +2031,60 @@ object AppCoordinator {
                         "profile_edit_edit_tap_ok" to (chain?.editTapOk ?: false),
                         "profile_edit_change_tap_ok" to (chain?.changeTapOk ?: false),
                         "tiktok_stopped_after_profile_edit" to stopAfterProfileEditOk,
+                        "profile_edit_avatar_filename" to profileEditAvatarFilename,
+                        "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
+                        "profile_edit_avatar_imported" to profileEditAvatarImported,
                         "operation_logs" to operationLogs,
                     ),
                 )
+                } finally {
+                    if (profileEditGalleryClearedBefore || profileEditAvatarImported) {
+                        opStep("修改基本资料：清理设备图库（流程结束）")
+                        executor.clearDevicePicturesGallery(alias)
+                    }
+                }
             }
 
             "tiktok_clear" -> {
-                opStep("开始清理 TikTok 数据")
+                val isCutSwitch = !payload?.cut_switch_after_backup.isNullOrBlank()
+                opStep(if (isCutSwitch) "切号：开始清理 TikTok 数据" else "开始清理 TikTok 数据")
                 opStep("正在清空 TikTok 应用数据")
                 val clearOk = runSu("pm clear $packageName")
-                opDone(clearOk, "TikTok 数据清理完成", "TikTok 数据清理失败")
+                opDone(
+                    clearOk,
+                    if (isCutSwitch) "切号：TikTok 数据清理完成" else "TikTok 数据清理完成",
+                    if (isCutSwitch) "切号：TikTok 数据清理失败" else "TikTok 数据清理失败",
+                )
 
-                ApiService.reportDeviceOp(
+                val clearReport = mutableMapOf<String, Any>(
+                    "op_type" to "tiktok_clear",
+                    "device_id" to deviceId,
+                    "package_name" to packageName,
+                    "operation_logs" to operationLogs,
+                )
+                payload?.cut_switch_after_backup?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                    clearReport["cut_switch_after_backup"] = it
+                }
+                payload?.cut_switch_target_row_index?.let { clearReport["cut_switch_target_row_index"] = it }
+
+                val clearReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
                     status = if (clearOk) "success" else "failed",
-                    message = if (clearOk) "TikTok 数据清理完成" else "TikTok 数据清理失败",
-                    data = mapOf(
-                        "op_type" to "tiktok_clear",
-                        "device_id" to deviceId,
-                        "package_name" to packageName,
-                        "operation_logs" to operationLogs,
-                    ),
+                    message = if (clearOk) {
+                        if (isCutSwitch) "切号：TikTok 数据清理完成" else "TikTok 数据清理完成"
+                    } else {
+                        if (isCutSwitch) "切号：TikTok 数据清理失败" else "TikTok 数据清理失败"
+                    },
+                    data = clearReport,
                 )
+                if (clearOk && isCutSwitch) {
+                    val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
+                    if (cutMode == "exclusive_activate_target") {
+                        finishCutSwitchAfterSuccess(alias, deviceId, opId, clearReportResp)
+                    }
+                }
             }
 
             "tiktok_backup_and_clear" -> {
@@ -1642,7 +2216,7 @@ object AppCoordinator {
                 }
                 payload?.cut_switch_target_row_index?.let { reportData["cut_switch_target_row_index"] = it }
 
-                ApiService.reportDeviceOp(
+                val backupReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
@@ -1654,6 +2228,12 @@ object AppCoordinator {
                     },
                     data = reportData,
                 )
+                if (ok && isCutSwitch) {
+                    val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
+                    if (cutMode == "exclusive_activate_target") {
+                        finishCutSwitchAfterSuccess(alias, deviceId, opId, backupReportResp)
+                    }
+                }
             }
 
             "tiktok_restore" -> {
@@ -1730,7 +2310,7 @@ object AppCoordinator {
                 }
                 payload?.restore_highlight_row_index?.let { restoreReport["restore_highlight_row_index"] = it }
 
-                ApiService.reportDeviceOp(
+                val restoreReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
                     alias = alias,
                     opId = opId,
@@ -1738,6 +2318,9 @@ object AppCoordinator {
                     message = if (restoreOk) "清理并还原完成" else "清理或还原失败",
                     data = restoreReport,
                 )
+                if (restoreOk && skipPmClear) {
+                    finishCutSwitchAfterSuccess(alias, deviceId, opId, restoreReportResp)
+                }
             }
 
             else -> {
@@ -1792,10 +2375,31 @@ object AppCoordinator {
                 if (!deviceId.isNullOrBlank()) {
                     fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL)
                 }
-                val switchResult = runCatching {
+                val deviceIdForMutual = deviceId.orEmpty()
+                var switchResult = runCatching {
                     executor.executeForUsername("__mutual_switch__", _config.value)
-                }.getOrElse {
-                    "互点流程切换异常：${it.message ?: "unknown"}"
+                }.getOrElse { err ->
+                    when (err) {
+                        is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                        is AccountStatusLoggedOutException -> {
+                            if (deviceIdForMutual.isNotBlank()) {
+                                recoverFromAccountStatusLogout(alias, deviceIdForMutual, "互点切换")
+                            }
+                            "互点流程掉登录：${err.message ?: "account_status"}"
+                        }
+                        else -> "互点流程切换异常：${err.message ?: "unknown"}"
+                    }
+                }
+                if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForMutual.isNotBlank()) {
+                    ensureAccountLoggedIn(
+                        alias, deviceIdForMutual, "mutual_safeguard", "互点保障",
+                        strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
+                    )
+                    switchResult = runCatching {
+                        executor.executeForUsername("__mutual_switch__", _config.value)
+                    }.getOrElse { err ->
+                        "互点流程切换异常：${err.message ?: "unknown"}"
+                    }
                 }
                 if (!deviceId.isNullOrBlank()) {
                     fetchConfig()
@@ -1850,10 +2454,31 @@ object AppCoordinator {
                 alias,
                 "发作品切换任务准备执行特殊用户名 __publish_post__：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}",
             )
-            val switchResult = runCatching {
+            val deviceIdForPublish = PrefsStore.getDeviceId().orEmpty()
+            var switchResult = runCatching {
                 executor.executeForUsername("__publish_post__", _config.value)
-            }.getOrElse {
-                "发作品入口流程异常：${it.message ?: "unknown"}"
+            }.getOrElse { err ->
+                when (err) {
+                    is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                    is AccountStatusLoggedOutException -> {
+                        if (deviceIdForPublish.isNotBlank()) {
+                            recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
+                        }
+                        "发作品掉登录：${err.message ?: "account_status"}"
+                    }
+                    else -> "发作品入口流程异常：${err.message ?: "unknown"}"
+                }
+            }
+            if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
+                ensureAccountLoggedIn(
+                    alias, deviceIdForPublish, "publish_safeguard", "发作品保障",
+                    strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
+                )
+                switchResult = runCatching {
+                    executor.executeForUsername("__publish_post__", _config.value)
+                }.getOrElse { err ->
+                    "发作品入口流程异常：${err.message ?: "unknown"}"
+                }
             }
             LogCenter.op(alias, switchResult)
             updateRuntime(lastMessage = switchResult)
@@ -1872,6 +2497,384 @@ object AppCoordinator {
                 }
             }
         }
+    }
+
+    /**
+     * 切号后云端「基本资料已修改」=否 时衔接改资料（与远控一致，最多 3 轮外轮重试）。
+     * @param skipOuterWarmup true：第 1 轮假定仍在个人页，跳过强停/重拉/比例点，直接 OCR 链；
+     *   第 2 轮起与 false 相同，走完整外轮 warmup。false：每轮均走外轮进入 Profile。
+     */
+    private suspend fun runProfileEditAfterCutSwitch(
+        alias: String,
+        deviceId: String,
+        parentOpId: String,
+        skipOuterWarmup: Boolean,
+        profileEditTrigger: String,
+    ) {
+        val profileOpId = "${parentOpId}_profile_${System.currentTimeMillis()}"
+        val packageName = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        val operationLogs = mutableListOf<String>()
+        fun opLog(text: String) {
+            val line = "[OP][$profileOpId] $text"
+            operationLogs.add(line)
+            LogCenter.op(alias, line)
+        }
+
+        opLog(
+            if (skipOuterWarmup) {
+                "切号后衔接修改基本资料（最多 3 轮外轮；第 1 轮跳过 warmup 直接 OCR，失败则完整外轮重试）"
+            } else {
+                "切号后衔接修改基本资料（最多 3 轮外轮，每轮强停/重拉/比例点进 Profile）"
+            },
+        )
+        prepareForExclusiveTikTokUiOp(
+            alias = alias,
+            deviceId = deviceId,
+            opType = "tiktok_edit_basic_profile",
+            opId = profileOpId,
+            packageName = packageName,
+            settleMs = 0L,
+            forceStopTikTok = false,
+        )
+
+        var profileEditAvatarFilename = ""
+        var profileEditGalleryClearedBefore = false
+        var profileEditAvatarImported = false
+        try {
+            val cfgOk = fetchConfig()
+            if (!cfgOk) opLog("配置拉取失败，沿用上一版")
+
+            opLog("修改基本资料：清理设备图库（执行前）")
+            executor.clearDevicePicturesGallery(alias)
+            profileEditGalleryClearedBefore = true
+            if (!delayUnlessHardStop(800)) {
+                opLog("硬停中止，未执行改资料")
+                return
+            }
+
+            opLog("修改基本资料：从云端图库随机拉取头像")
+            val avatarItem = resolveProfileEditAvatarMediaItem(deviceId, alias, null, ::opLog)
+            if (avatarItem == null) {
+                opLog("管理台图库为空或拉取失败，跳过切号后改资料")
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = profileOpId,
+                    status = "failed",
+                    message = "切号后改资料：图库素材不可用",
+                    data = mapOf(
+                        "op_type" to "tiktok_edit_basic_profile",
+                        "profile_edit_trigger" to profileEditTrigger,
+                        "profile_edit_skipped" to true,
+                        "profile_edit_skip_reason" to "cloud_gallery_empty",
+                        "operation_logs" to operationLogs,
+                    ),
+                )
+                return
+            }
+            profileEditAvatarFilename = avatarItem.filename?.trim().orEmpty()
+            profileEditAvatarImported = importGalleryMediaItemToDevice(
+                avatarItem,
+                picturesRelativePath = "${Environment.DIRECTORY_PICTURES}/",
+                log = ::opLog,
+            )
+            if (!profileEditAvatarImported) {
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = profileOpId,
+                    status = "failed",
+                    message = "切号后改资料：头像写入设备图库失败",
+                    data = mapOf(
+                        "op_type" to "tiktok_edit_basic_profile",
+                        "profile_edit_trigger" to profileEditTrigger,
+                        "profile_edit_avatar_filename" to profileEditAvatarFilename,
+                        "operation_logs" to operationLogs,
+                    ),
+                )
+                return
+            }
+            if (!delayUnlessHardStop(1200)) {
+                opLog("硬停中止，未执行改资料")
+                return
+            }
+
+            val galleryImageCount = executor.countPicturesGalleryImageFiles()
+            if (galleryImageCount < 1) {
+                opLog("头像写入后图库仍无可用图片，跳过切号后改资料")
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = profileOpId,
+                    status = "failed",
+                    message = "切号后改资料：图库无可用图片",
+                    data = mapOf(
+                        "op_type" to "tiktok_edit_basic_profile",
+                        "profile_edit_trigger" to profileEditTrigger,
+                        "profile_edit_skipped" to true,
+                        "profile_edit_skip_reason" to "gallery_images_empty_after_import",
+                        "operation_logs" to operationLogs,
+                    ),
+                )
+                return
+            }
+            opLog("设备图库已有头像（count=$galleryImageCount）")
+
+            val runSu: (String) -> Boolean = ::runExecutorSu
+            val dm = appContext.resources.displayMetrics
+            var lastW = dm.widthPixels
+            var lastH = dm.heightPixels
+            var lastChain: ProfileEditChainResult? = null
+            var successOverall = false
+            var stopAfterProfileEditOk = false
+            val ratioTapX = 0.97f
+            val ratioTapY = 0.95f
+            var lastRatioTapPx = Pair(0, 0)
+            var lastStopOk = false
+            var lastLaunchOk = false
+            var lastRatioTapOk = false
+            val maxOuter = 3
+
+            suspend fun runProfileEditChainOnce(): ProfileEditChainResult =
+                try {
+                    executor.profileEditRunOcrChain(appContext, _config.value)
+                } catch (e: AccountStatusLoggedOutException) {
+                    opLog("掉登录 ${e.message}")
+                    recoverFromAccountStatusLogout(alias, deviceId, "切号后修改基本资料")
+                    ProfileEditChainResult(
+                        success = false,
+                        failureStep = "account_status_logout",
+                        editOcrPreviews = listOf(e.message ?: "account_status_logout"),
+                    )
+                } catch (e: Exception) {
+                    opLog("OCR 链异常 ${e.message}")
+                    ProfileEditChainResult(
+                        success = false,
+                        failureStep = "ocr_chain_exception",
+                        editOcrPreviews = listOf(e.message ?: "unknown"),
+                    )
+                }
+
+            for (outer in 1..maxOuter) {
+                if (PrefsStore.isHardStopRequested()) {
+                    opLog("修改基本资料：检测到硬停，中止外轮")
+                    lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                    runSu("am force-stop $packageName")
+                    break
+                }
+                val skipWarmupThisRound = skipOuterWarmup && outer == 1
+                if (skipWarmupThisRound) {
+                    opLog("修改基本资料：第 $outer/$maxOuter 轮（跳过外轮 warmup，直接 OCR 链）")
+                } else {
+                    opLog("修改基本资料：第 $outer/$maxOuter 轮")
+                    lastStopOk = runSu("am force-stop $packageName")
+                    if (!delayUnlessHardStop(1200)) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+
+                    lastLaunchOk = executor.launchTikTokWithForegroundVerification(
+                        ctx = appContext,
+                        alias = alias,
+                        tag = "切号后改资料_外轮${outer}",
+                        forceStopBeforeLaunch = false,
+                        timingConfig = _config.value,
+                    )
+
+                    val metrics = appContext.resources.displayMetrics
+                    lastW = metrics.widthPixels
+                    lastH = metrics.heightPixels
+                    val rtx = (lastW * ratioTapX).toInt().coerceIn(1, (lastW - 1).coerceAtLeast(1))
+                    val rty = (lastH * ratioTapY).toInt().coerceIn(1, (lastH - 1).coerceAtLeast(1))
+                    lastRatioTapPx = rtx to rty
+                    lastRatioTapOk = false
+                    if (!delayUnlessHardStop(if (lastLaunchOk) 1600 else 1200)) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    if (PrefsStore.isHardStopRequested()) {
+                        opLog("修改基本资料：硬停中止")
+                        lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                        runSu("am force-stop $packageName")
+                        break
+                    }
+                    if (lastLaunchOk) {
+                        opLog("修改基本资料：For You 等待后刷两下视频")
+                        val forYouOk = executor.profileEditForYouTwoSwipesAfterLaunch(alias, lastW, lastH)
+                        if (!forYouOk) {
+                            opLog("修改基本资料：硬停中止")
+                            lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
+                            runSu("am force-stop $packageName")
+                            break
+                        }
+                    }
+                    lastRatioTapOk = runSu("input tap $rtx $rty")
+
+                    if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
+                        opLog("外轮$outer：准备阶段未就绪，重试")
+                        lastChain = ProfileEditChainResult(
+                            success = false,
+                            failureStep = "warmup_outer_$outer",
+                            editOcrPreviews = listOf("stop=$lastStopOk launch=$lastLaunchOk ratioTap=$lastRatioTapOk"),
+                        )
+                        continue
+                    }
+                }
+
+                val chain = runProfileEditChainOnce()
+                lastChain = chain
+                if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
+                    opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
+                    runSu("am force-stop $packageName")
+                    break
+                }
+                val bioPartsOk = chain.bioAfterPart1Ok && chain.bioAfterPart2Ok
+                if (chain.success && bioPartsOk) {
+                    successOverall = true
+                    opLog("修改基本资料完成（外轮 $outer/$maxOuter）")
+                    stopAfterProfileEditOk = runSu("am force-stop $packageName").also { delay(1200) }
+                    break
+                }
+                if (chain.bioAfterPart1Ok && !chain.bioAfterPart2Ok) {
+                    opLog("外轮$outer：Bio ① 完成、② 未完成（${chain.failureStep}）")
+                } else {
+                    opLog("外轮$outer：失败（${chain.failureStep}）")
+                }
+            }
+
+            val chain = lastChain ?: ProfileEditChainResult(success = false, failureStep = "no_chain")
+            val previewsJoin = { xs: List<String> -> xs.joinToString("\n---\n").take(6000) }
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = profileOpId,
+                status = if (successOverall) "success" else "failed",
+                message = when {
+                    successOverall ->
+                        "切号后衔接改资料成功，云端将「基本资料已修改」标为「是」"
+                    chain.failureStep == "hard_stop" ->
+                        "切号后改资料已硬停"
+                    chain.bioAfterPart1Ok && !chain.bioAfterPart2Ok ->
+                        "切号后改资料未完成：Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
+                    else ->
+                        "切号后改资料未完成：${chain.failureStep}（已最多外轮 $maxOuter 次）"
+                },
+                data = mutableMapOf<String, Any>(
+                    "op_type" to "tiktok_edit_basic_profile",
+                    "profile_edit_trigger" to profileEditTrigger,
+                    "device_id" to deviceId,
+                    "package_name" to packageName,
+                    "screen_width_px" to lastW,
+                    "screen_height_px" to lastH,
+                    "profile_edit_skip_outer_warmup" to skipOuterWarmup,
+                    "profile_edit_outer_max" to maxOuter,
+                    "tap_ratio_xy" to listOf(ratioTapX, ratioTapY),
+                    "tap_px_xy" to listOf(lastRatioTapPx.first, lastRatioTapPx.second),
+                    "stop_ok" to lastStopOk,
+                    "launch_ok" to lastLaunchOk,
+                    "ratio_tap_ok" to lastRatioTapOk,
+                    "profile_edit_success" to successOverall,
+                    "profile_edit_bio_after_part1_ok" to chain.bioAfterPart1Ok,
+                    "profile_edit_bio_after_part2_ok" to chain.bioAfterPart2Ok,
+                    "profile_edit_failure_step" to chain.failureStep,
+                    "profile_edit_edit_ocr_attempts" to chain.editOcrAttempts,
+                    "profile_edit_change_ocr_attempts" to chain.changeOcrAttempts,
+                    "profile_edit_edit_ocr_previews" to previewsJoin(chain.editOcrPreviews),
+                    "profile_edit_change_ocr_previews" to previewsJoin(chain.changeOcrPreviews),
+                    "profile_edit_bio_applied" to chain.profileEditBioApplied,
+                    "tiktok_stopped_after_profile_edit" to stopAfterProfileEditOk,
+                    "profile_edit_avatar_filename" to profileEditAvatarFilename,
+                    "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
+                    "profile_edit_avatar_imported" to profileEditAvatarImported,
+                    "operation_logs" to operationLogs,
+                ),
+            )
+        } finally {
+            if (profileEditGalleryClearedBefore || profileEditAvatarImported) {
+                opLog("修改基本资料：清理设备图库（流程结束）")
+                executor.clearDevicePicturesGallery(alias)
+            }
+            finishExclusiveTikTokUiOp(alias, deviceId, profileOpId, resumePullAfter = false)
+        }
+    }
+
+    private suspend fun resolveProfileEditAvatarMediaItem(
+        deviceId: String,
+        alias: String,
+        payload: DeviceOpPayload?,
+        log: (String) -> Unit,
+    ): DeviceGalleryMediaPayload? {
+        val fromPayload = payload?.avatar_media_item?.takeIf { !it.content_b64.isNullOrBlank() }
+        if (fromPayload != null) {
+            log("使用远控 payload 附带头像：${fromPayload.filename?.trim().orEmpty().ifBlank { "(无文件名)" }}")
+            return fromPayload
+        }
+        log("payload 无头像，请求管理台图库随机一张：/api/gallery_library/random")
+        val remote = runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.fetchRandomGalleryLibraryItem(deviceId, alias)
+            }
+        }.getOrElse { err ->
+            log("拉取管理台图库失败：${err.message ?: "unknown"}")
+            return null
+        }
+        if (remote.code != 0) {
+            log("拉取管理台图库失败：${remote.msg.ifBlank { "code=${remote.code}" }}")
+            return null
+        }
+        val item = remote.item?.takeIf { !it.content_b64.isNullOrBlank() }
+        if (item == null) {
+            log("拉取管理台图库失败：响应无有效素材（item/base64 为空）")
+        } else {
+            log("已从管理台图库随机选中：${item.filename?.trim().orEmpty().ifBlank { "(无文件名)" }}")
+        }
+        return item
+    }
+
+    private suspend fun importGalleryMediaItemToDevice(
+        item: DeviceGalleryMediaPayload,
+        index: Int = 0,
+        picturesRelativePath: String = "${Environment.DIRECTORY_PICTURES}/AutoTraces",
+        log: ((String) -> Unit)? = null,
+    ): Boolean {
+        val fileName = item.filename?.trim().takeUnless { it.isNullOrBlank() } ?: "image_${index + 1}.jpg"
+        val mime = item.content_type?.trim().takeUnless { it.isNullOrBlank() } ?: "image/jpeg"
+        val b64 = item.content_b64?.trim().orEmpty()
+        if (b64.isBlank()) {
+            log?.invoke("写入图库失败：$fileName（base64 为空）")
+            return false
+        }
+        val raw = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull()
+        if (raw == null || raw.isEmpty()) {
+            log?.invoke("写入图库失败：$fileName（base64 无法解码）")
+            return false
+        }
+        return runCatching {
+            val resolver = appContext.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, mime)
+                put(MediaStore.Images.Media.RELATIVE_PATH, picturesRelativePath)
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("MediaStore insert failed")
+            resolver.openOutputStream(uri)?.use { out ->
+                out.write(raw)
+                out.flush()
+            } ?: throw IOException("openOutputStream failed")
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            log?.invoke("已写入图库：$fileName → $picturesRelativePath（${raw.size} bytes）")
+            true
+        }.onFailure { err ->
+            log?.invoke("写入图库失败：$fileName（${err.message ?: "unknown"}）")
+        }.getOrDefault(false)
     }
 
     private suspend fun handleGalleryImportOp(alias: String, deviceId: String, op: DeviceOp) {
@@ -1907,62 +2910,13 @@ object AppCoordinator {
         opLog("开始导入图库：共 ${mediaList.size} 个素材")
         mediaList.forEachIndexed { index, item ->
             val fileName = item.filename?.trim().takeUnless { it.isNullOrBlank() } ?: "image_${index + 1}.jpg"
-            val mime = item.content_type?.trim().takeUnless { it.isNullOrBlank() } ?: "image/jpeg"
-            val explicitType = item.media_type?.trim()?.lowercase().orEmpty()
-            val isVideo = explicitType == "video" || mime.lowercase().startsWith("video/")
-            val b64 = item.content_b64?.trim().orEmpty()
-            if (b64.isBlank()) {
-                failedCount += 1
-                opLog("第 ${index + 1} 张失败：$fileName（base64 为空）")
-                return@forEachIndexed
+            val ok = importGalleryMediaItemToDevice(item, index) { line ->
+                opLog("第 ${index + 1} 张：$line")
             }
-            val raw = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull()
-            if (raw == null || raw.isEmpty()) {
-                failedCount += 1
-                opLog("第 ${index + 1} 张失败：$fileName（base64 无法解码）")
-                return@forEachIndexed
-            }
-
-            val ok = runCatching {
-                val resolver = appContext.contentResolver
-                val values = ContentValues().apply {
-                    if (isVideo) {
-                        put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
-                        put(MediaStore.Video.Media.MIME_TYPE, mime)
-                        put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/AutoTraces")
-                        put(MediaStore.Video.Media.IS_PENDING, 1)
-                    } else {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                        put(MediaStore.Images.Media.MIME_TYPE, mime)
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/AutoTraces")
-                        put(MediaStore.Images.Media.IS_PENDING, 1)
-                    }
-                }
-                val uri = resolver.insert(
-                    if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    values
-                )
-                    ?: throw IOException("MediaStore insert failed")
-                resolver.openOutputStream(uri)?.use { out ->
-                    out.write(raw)
-                    out.flush()
-                } ?: throw IOException("openOutputStream failed")
-                values.clear()
-                if (isVideo) {
-                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                } else {
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                }
-                resolver.update(uri, values, null, null)
-                true
-            }.getOrDefault(false)
-
             if (ok) {
                 successCount += 1
-                opLog("第 ${index + 1} 张成功：$fileName")
             } else {
                 failedCount += 1
-                opLog("第 ${index + 1} 张失败：$fileName（写入图库失败）")
             }
         }
 
@@ -1994,6 +2948,10 @@ object AppCoordinator {
     private suspend fun handleUsername(alias: String, deviceId: String, username: String) {
         if (shouldAbortPullExecution()) {
             LogCenter.op(alias, "硬停/暂停中：跳过执行 $username")
+            return
+        }
+        if (!isAssignedAccountLoggedIn(alias, deviceId)) {
+            LogCenter.op(alias, "涨粉：云端 is_login=否，跳过 $username（非登录状态保障）")
             return
         }
         ExecutionScope.enter()
@@ -2050,6 +3008,16 @@ object AppCoordinator {
             }
 
             val errThrowable = result.exceptionOrNull()
+            if (errThrowable is AccountStatusLoggedOutException) {
+                LogCenter.op(alias, "涨粉：掉登录，终止 $username：${errThrowable.message}")
+                val recovered = recoverFromAccountStatusLogout(alias, deviceId, "涨粉执行")
+                if (recovered) {
+                    resumeRunningAfterGrowthAutoLogin(alias, deviceId)
+                } else {
+                    pauseGrowthAfterLoginFailure(alias, deviceId, "掉登录后自动登录失败")
+                }
+                return
+            }
             if (errThrowable != null && isPullLoopJobCancellation(errThrowable)) {
                 LogCenter.op(
                     alias,

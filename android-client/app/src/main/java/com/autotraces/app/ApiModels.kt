@@ -46,6 +46,10 @@ data class SyncStatusRequest(
 data class BaseResponse(
     val code: Int,
     val msg: String,
+    val auto_start_opt_out: Boolean? = null,
+    val auto_start: Boolean? = null,
+    val cut_switch_auto_start_resumed: Boolean? = null,
+    val cut_switch_opt_out_cleared: Boolean? = null,
 )
 
 data class TikTokEmailCodeResponse(
@@ -133,6 +137,8 @@ data class AppConfig(
     val mutual_traffic_target_texts: List<String> = listOf("teamwork"),
     /** 远控「修改基本资料」：Bio 编辑时随机选用其一；逗号/换行分隔。缺省或 null 视为空列表（Bio 步会失败并提示配置）。 */
     val profile_edit_bio_texts: List<String>? = null,
+    /** 发作品前经本机 `POST /api/v1/tasks/request` 向 PC 拉取素材数量；0=不拉取。默认 3。 */
+    val publish_post_material_fetch_count: Int = 3,
 )
 
 data class ConfigResponse(
@@ -212,6 +218,14 @@ data class DeviceOpPayload(
     val media_items: List<DeviceGalleryMediaPayload>? = null,
     /** 兼容旧字段（仅图片） */
     val image_items: List<DeviceGalleryMediaPayload>? = null,
+    /** 修改基本资料：云端图库随机头像（单张） */
+    val avatar_media_item: DeviceGalleryMediaPayload? = null,
+)
+
+data class GalleryLibraryRandomResponse(
+    val code: Int,
+    val msg: String,
+    val item: DeviceGalleryMediaPayload? = null,
 )
 
 data class DeviceGalleryMediaPayload(
@@ -338,6 +352,49 @@ data class AccountEditorRowsResponse(
     val code: Int,
     val msg: String? = null,
     val items: List<AccountEditorRowRecord>? = null,
+)
+
+/** 设备端：当前别名分配账号（切号后自动登录）。 */
+data class DeviceAssignedAccountResponse(
+    val code: Int,
+    val msg: String? = null,
+    val row_index: Int? = null,
+    val username: String? = null,
+    val email: String? = null,
+    val password: String? = null,
+    val email_password: String? = null,
+    val api: String? = null,
+    val is_login: Boolean? = null,
+    val login_time: String? = null,
+    /** 「是」= 已完成基本资料修改；「否」或未返回时视为待修改。 */
+    val basic_profile_modified: String? = null,
+)
+
+data class DeviceAssignedAccountMarkLoginRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+)
+
+data class DeviceAssignedAccountUpdateUsernameRequest(
+    val device_id: String,
+    val alias: String,
+    val new_username: String,
+)
+
+data class DeviceAssignedAccountUpdateUsernameResponse(
+    val code: Int,
+    val msg: String? = null,
+    val username: String? = null,
+    val old_username: String? = null,
+    val updated: Boolean? = null,
+)
+
+data class TikTokAutoLoginCredentials(
+    val username: String,
+    val email: String,
+    val password: String,
+    val apiUrl: String,
 )
 
 data class RuntimeState(

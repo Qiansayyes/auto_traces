@@ -93,6 +93,8 @@ BASE_DEFAULT_CONFIG = {
     "mutual_traffic_target_texts": ["teamwork"],
     # 远控「修改基本资料」：Bio 随机文案库（设备端为空则 Bio 步失败）
     "profile_edit_bio_texts": ["Just vibing", "Thanks for visiting"],
+    # 发作品前本机 tasks/request 拉取素材条数（清理图库之后）；0=不拉取
+    "publish_post_material_fetch_count": 3,
     # 引流 Videos 列表轮次（与完整互点共用）；粉丝列表 Follow 单次会话点击上限
     "mutual_videos_scroll_rounds": 5,
     "mutual_follow_tap_session_limit": 20,
@@ -144,6 +146,9 @@ RUN_MODES = ("growth", "live", "direct", "mutual")
 DEFAULT_CONFIG = dict(MODE_DEFAULT_CONFIGS["growth"])
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+GALLERY_LIBRARY_DIR = BASE_DIR / "gallery_library"
+GALLERY_LIBRARY_MAX_ITEMS = 100
+GALLERY_LIBRARY_INDEX_FILENAME = "index.json"
 DB_PATH = BASE_DIR / "tiktok_fans.db"
 CV_TEMPLATE_ZIP_PATH = BASE_DIR / "server" / "cv_templates.zip"
 FOLLOW_SCRAPER_PATH = BASE_DIR / "tiktok_follow_scraper.py"
@@ -2285,6 +2290,16 @@ class DeviceTikTokEmailCodeRequest(BaseModel):
     api_url: str = Field(..., min_length=1, max_length=2048)
 
 
+class DeviceAssignedAccountMarkLoginRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    username: str = Field(..., min_length=1, max_length=128)
+
+
+class DeviceAssignedAccountUpdateUsernameRequest(DeviceAuthModel):
+    new_username: str = Field(..., min_length=1, max_length=128)
+
+
 class DeviceOpReportRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
@@ -2987,28 +3002,51 @@ def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) 
         conn.close()
 
 
-def _restore_device_auto_start_opt_out_after_cut_switch(device_id: str, alias: str = "") -> bool:
-    """切号全流程成功后恢复该设备参与「自动开启程序」（清除 auto_start_opt_out）。"""
+def _ensure_device_auto_start_after_cut_switch(
+    device_id: str,
+    alias: str = "",
+    owner_username: str = "",
+) -> dict[str, bool]:
+    """切号全流程成功后：清除 opt_out，并在用户开启自动开启策略时下发 pending_start。"""
     did = (device_id or "").strip()
     if not did:
-        return False
-    restored = False
+        return {"opt_out_cleared": False, "auto_start_resumed": False}
     dev_alias = ""
+    opt_out_cleared = False
+    auto_start_resumed = False
     with store.lock:
         dev = store.devices.get(did)
-        if not dev or not dev.auto_start_opt_out:
-            return False
-        dev.auto_start_opt_out = False
+        if not dev:
+            return {"opt_out_cleared": False, "auto_start_resumed": False}
         dev_alias = str(dev.alias or alias or "").strip()
-        restored = True
-    if restored:
+        owner = str(owner_username or dev.owner_username or "").strip()
+        if dev.auto_start_opt_out:
+            dev.auto_start_opt_out = False
+            opt_out_cleared = True
+        if _user_auto_start_enabled(owner):
+            dev.pending_start = True
+            dev.paused = False
+            dev.status = "running"
+            auto_start_resumed = True
+    if opt_out_cleared or auto_start_resumed:
         _persist_client_device_to_db(did)
+        parts = []
+        if opt_out_cleared:
+            parts.append("已清除自动开启排除")
+        if auto_start_resumed:
+            parts.append("已下发启动指令（参与自动开启程序）")
         _append_device_log(
             did,
-            f"[{now_text()}] 切号完成 | 已自动恢复该设备「自动开启程序」参与"
+            f"[{now_text()}] 切号完成 | {'，'.join(parts) or '已恢复自动开启'}"
             + (f"（alias={dev_alias}）" if dev_alias else ""),
         )
-    return restored
+    return {"opt_out_cleared": opt_out_cleared, "auto_start_resumed": auto_start_resumed}
+
+
+def _restore_device_auto_start_opt_out_after_cut_switch(device_id: str, alias: str = "") -> bool:
+    """兼容旧调用：切号成功后恢复自动开启参与。"""
+    result = _ensure_device_auto_start_after_cut_switch(device_id, alias=alias)
+    return bool(result.get("opt_out_cleared") or result.get("auto_start_resumed"))
 
 
 def _beijing_now() -> datetime:
@@ -3740,6 +3778,65 @@ def _get_latest_backup_record_for_alias(mobile_alias: str) -> dict | None:
     return _get_device_editor_record("", mobile_alias)
 
 
+def _compute_follower_growth_text(
+    follower_count: int | None,
+    new_follower_count: int | None = None,
+    *,
+    prev_follower_count: int | None = None,
+) -> str:
+    if isinstance(follower_count, int) and isinstance(new_follower_count, int):
+        return str(max(follower_count - new_follower_count, 0))
+    if isinstance(follower_count, int) and isinstance(prev_follower_count, int):
+        return str(max(follower_count - prev_follower_count, 0))
+    if isinstance(follower_count, int):
+        return "0" if new_follower_count is not None else str(follower_count)
+    return ""
+
+
+def _sync_account_editor_stats(
+    conn,
+    username: str,
+    *,
+    owner_username: str = "",
+    video_count: str | None = None,
+    follower_count: str | None = None,
+    follower_growth: str | None = None,
+    now: str | None = None,
+) -> int:
+    """设备/统计回写后，将粉丝与视频数同步持久化到 account_editor_rows。"""
+    uname = str(username or "").strip()
+    if not uname:
+        return 0
+    sets: list[str] = []
+    params: list[object] = []
+    if video_count is not None:
+        sets.append("video_count = ?")
+        params.append(str(video_count))
+    if follower_count is not None:
+        sets.append("follower_count = ?")
+        params.append(str(follower_count))
+    if follower_growth is not None:
+        sets.append("follower_growth = ?")
+        params.append(str(follower_growth))
+    if not sets:
+        return 0
+    now_val = now or now_text()
+    sets.append("updated_at = ?")
+    params.append(now_val)
+    owner = str(owner_username or "").strip()
+    if owner:
+        where = "owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))"
+        params.extend([owner, uname])
+    else:
+        where = "LOWER(TRIM(username)) = LOWER(TRIM(?))"
+        params.append(uname)
+    cur = conn.execute(
+        f"UPDATE account_editor_rows SET {', '.join(sets)} WHERE {where}",
+        tuple(params),
+    )
+    return int(cur.rowcount or 0)
+
+
 def _patch_backup_record_device_result(
     username: str,
     mobile_alias: str,
@@ -3753,11 +3850,17 @@ def _patch_backup_record_device_result(
     conn = _get_db()
     try:
         now = now_text()
-        follower_growth = ""
-        if isinstance(follower_count, int) and isinstance(new_follower_count, int):
-            follower_growth = str(max(follower_count - new_follower_count, 0))
-        elif isinstance(follower_count, int):
-            follower_growth = str(follower_count)
+        follower_growth = _compute_follower_growth_text(follower_count, new_follower_count)
+        vc_text = None if video_count is None else str(video_count)
+        fc_text = None if follower_count is None else str(follower_count)
+        owner_row = conn.execute(
+            f"""
+            SELECT owner_username FROM device_editor_rows
+            WHERE username = ? AND {_backup_record_alias_expr()} = ?
+            LIMIT 1
+            """,
+            (username, mobile_alias),
+        ).fetchone()
         cur = conn.execute(
             f"""
             UPDATE device_editor_rows
@@ -3768,8 +3871,8 @@ def _patch_backup_record_device_result(
             WHERE username = ? AND {_backup_record_alias_expr()} = ?
             """,
             (
-                None if video_count is None else str(video_count),
-                None if follower_count is None else str(follower_count),
+                vc_text,
+                fc_text,
                 follower_growth,
                 backup_path,
                 backup_name or "",
@@ -3779,6 +3882,19 @@ def _patch_backup_record_device_result(
                 username,
                 mobile_alias,
             ),
+        )
+        owner = str(owner_row["owner_username"] or "").strip() if owner_row else ""
+        fg_sync = follower_growth if follower_growth else None
+        if follower_count is not None or new_follower_count is not None:
+            fg_sync = follower_growth
+        _sync_account_editor_stats(
+            conn,
+            username,
+            owner_username=owner,
+            video_count=vc_text,
+            follower_count=fc_text,
+            follower_growth=fg_sync,
+            now=now,
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -3806,6 +3922,69 @@ def _update_backup_record_assigned_alias(record_id: int, assigned_alias: str) ->
         return int(cur.rowcount or 0)
     finally:
         conn.close()
+
+
+def _recover_assigned_alias_for_account_username(
+    conn: sqlite3.Connection, owner_username: str, username: str
+) -> str:
+    """从设备备份档案反查账号当前用户名对应的有效别名（账号表 assigned_alias 为空时兜底）。"""
+    owner = str(owner_username or "").strip()
+    uname = _normalized_alias(username).lstrip("@")
+    if not owner or not uname:
+        return ""
+    alias_expr = _backup_record_alias_expr()
+    row = conn.execute(
+        f"""
+        SELECT {alias_expr} AS eff_alias
+        FROM device_editor_rows
+        WHERE owner_username = ?
+          AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+          AND TRIM({alias_expr}) <> ''
+        ORDER BY updated_at DESC, row_index DESC
+        LIMIT 1
+        """,
+        (owner, uname),
+    ).fetchone()
+    return _blank_if_none(row["eff_alias"]) if row else ""
+
+
+def _sync_device_editor_username_for_account(
+    conn: sqlite3.Connection,
+    owner_username: str,
+    old_username: str,
+    new_username: str,
+    assigned_alias: str = "",
+) -> int:
+    """账号记录改名时，同步更新 device_editor_rows 中同账号的 username（保留其余字段）。"""
+    owner = str(owner_username or "").strip()
+    old_u = _normalized_alias(old_username).lstrip("@")
+    new_u = _normalized_alias(new_username).lstrip("@")
+    if not owner or not old_u or not new_u or old_u.lower() == new_u.lower():
+        return 0
+    alias_expr = _backup_record_alias_expr()
+    alias = _normalized_alias(assigned_alias)
+    now = now_text()
+
+    def _run_update(scope_by_alias: bool) -> int:
+        sql = f"""
+            UPDATE device_editor_rows
+            SET username = ?, updated_at = ?
+            WHERE owner_username = ?
+              AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+        """
+        params: list[Any] = [new_u, now, owner, old_u]
+        if scope_by_alias and alias:
+            sql += f" AND LOWER(TRIM({alias_expr})) = LOWER(TRIM(?))"
+            params.append(alias)
+        cur = conn.execute(sql, params)
+        return int(cur.rowcount or 0)
+
+    if alias:
+        touched = _run_update(scope_by_alias=True)
+        if touched < 1:
+            touched = _run_update(scope_by_alias=False)
+        return touched
+    return _run_update(scope_by_alias=False)
 
 
 def _link_backup_record_alias_for_username(username: str, assigned_alias: str) -> int:
@@ -3932,12 +4111,16 @@ def _patch_latest_backup_row_by_alias(
         if not row:
             return 0
         rid = row[0]
+        detail = conn.execute(
+            """
+            SELECT owner_username, username FROM device_editor_rows WHERE row_index = ? LIMIT 1
+            """,
+            (rid,),
+        ).fetchone()
         now = now_text()
-        follower_growth = ""
-        if isinstance(follower_count, int) and isinstance(new_follower_count, int):
-            follower_growth = str(max(follower_count - new_follower_count, 0))
-        elif isinstance(follower_count, int):
-            follower_growth = str(follower_count)
+        follower_growth = _compute_follower_growth_text(follower_count, new_follower_count)
+        vc_text = None if video_count is None else str(video_count)
+        fc_text = None if follower_count is None else str(follower_count)
         cur = conn.execute(
             """
             UPDATE device_editor_rows
@@ -3948,8 +4131,8 @@ def _patch_latest_backup_row_by_alias(
             WHERE row_index = ?
             """,
             (
-                None if video_count is None else str(video_count),
-                None if follower_count is None else str(follower_count),
+                vc_text,
+                fc_text,
                 follower_growth,
                 backup_path,
                 backup_name or "",
@@ -3959,6 +4142,21 @@ def _patch_latest_backup_row_by_alias(
                 rid,
             ),
         )
+        if detail:
+            owner = str(detail["owner_username"] or "").strip()
+            uname = str(detail["username"] or "").strip()
+            fg_sync = follower_growth if follower_growth else None
+            if follower_count is not None or new_follower_count is not None:
+                fg_sync = follower_growth
+            _sync_account_editor_stats(
+                conn,
+                uname,
+                owner_username=owner,
+                video_count=vc_text,
+                follower_count=fc_text,
+                follower_growth=fg_sync,
+                now=now,
+            )
         conn.commit()
         return int(cur.rowcount or 0)
     finally:
@@ -4687,7 +4885,7 @@ def fetch_tiktok_profile_stats(
         try:
             row = conn.execute(
                 """
-                SELECT row_index, username, follower_count, {_alias} AS mobile_alias
+                SELECT row_index, owner_username, username, follower_count, {_alias} AS mobile_alias
                 FROM device_editor_rows
                 WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))
                 ORDER BY updated_at DESC, row_index DESC
@@ -4702,6 +4900,9 @@ def fetch_tiktok_profile_stats(
                     follower_growth = str(max(new_fc - prev_fc, 0))
                 elif isinstance(new_fc, int):
                     follower_growth = "0"
+                now = now_text()
+                vc_text = "" if video_count is None else str(video_count)
+                fc_text = "" if follower_count is None else str(follower_count)
                 conn.execute(
                     """
                     UPDATE device_editor_rows
@@ -4709,12 +4910,36 @@ def fetch_tiktok_profile_stats(
                     WHERE row_index = ?
                     """,
                     (
-                        "" if video_count is None else str(video_count),
-                        "" if follower_count is None else str(follower_count),
+                        vc_text,
+                        fc_text,
                         follower_growth,
-                        now_text(),
+                        now,
                         int(row["row_index"]),
                     ),
+                )
+                owner = str(row["owner_username"] or "").strip()
+                _sync_account_editor_stats(
+                    conn,
+                    username,
+                    owner_username=owner,
+                    video_count=vc_text,
+                    follower_count=fc_text,
+                    follower_growth=follower_growth,
+                    now=now,
+                )
+                conn.commit()
+            elif isinstance(new_fc, int) or video_count is not None:
+                now = now_text()
+                vc_text = "" if video_count is None else str(video_count)
+                fc_text = "" if follower_count is None else str(follower_count)
+                fg_text = "0" if isinstance(new_fc, int) else ""
+                _sync_account_editor_stats(
+                    conn,
+                    username,
+                    video_count=vc_text if video_count is not None else None,
+                    follower_count=fc_text if follower_count is not None else None,
+                    follower_growth=fg_text if fg_text else None,
+                    now=now,
                 )
                 conn.commit()
         finally:
@@ -6056,6 +6281,234 @@ def _tiktok_email_code_response(device_id: str, alias: str, api_url: str) -> dic
     return {"code": 0, "msg": "ok", "email_code": email_code}
 
 
+def _effective_device_editor_alias(row: dict[str, Any]) -> str:
+    aa = str(row.get("assigned_alias") or "").strip()
+    da = str(row.get("device_alias") or "").strip()
+    return aa if aa else da
+
+
+def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username: str, alias: str) -> dict[str, Any] | None:
+    """按设备别名桶解析当前分配账号（优先 switch_highlight=是）。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return None
+    dev_rows = conn.execute(
+        """
+        SELECT row_index, username, assigned_alias, device_alias, switch_highlight
+        FROM device_editor_rows
+        WHERE owner_username = ? AND TRIM(username) <> ''
+        ORDER BY row_index ASC
+        """,
+        (owner,),
+    ).fetchall()
+    matched = [
+        dict(r)
+        for r in dev_rows
+        if _normalize_alias_key(_effective_device_editor_alias(dict(r))) == alias_key
+    ]
+    if not matched:
+        return None
+    yes_rows = [r for r in matched if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
+    if len(yes_rows) == 1:
+        pick = yes_rows[0]
+    elif len(matched) == 1:
+        pick = matched[0]
+    elif len(yes_rows) > 1:
+        pick = min(yes_rows, key=lambda r: int(r["row_index"]))
+    else:
+        pick = min(matched, key=lambda r: int(r["row_index"]))
+    username = str(pick.get("username") or "").strip()
+    if not username:
+        return None
+    acct = conn.execute(
+        """
+        SELECT row_index, username, password, email, email_password, api, is_login, login_time,
+               basic_profile_modified
+        FROM account_editor_rows
+        WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+        LIMIT 1
+        """,
+        (owner, username),
+    ).fetchone()
+    return dict(acct) if acct else None
+
+
+@app.get("/api/gallery_library/random")
+def device_gallery_library_random(device_id: str, alias: str):
+    """设备端：从所属管理账号的图库随机取一张图片（修改基本资料头像用）。"""
+    error, device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    item = _gallery_library_random_media_payload(owner)
+    if not item:
+        return {"code": 1, "msg": "管理台图库为空，请先在「图库素材下发」页上传图片"}
+    return {"code": 0, "msg": "ok", "item": item}
+
+
+@app.get("/api/device/assigned_account")
+def device_assigned_account(device_id: str, alias: str):
+    """设备端：拉取当前别名桶下分配账号及登录状态（切号后自动登录用）。"""
+    error, device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    conn = _get_db()
+    try:
+        row = _fetch_device_assigned_account_row(conn, owner, alias)
+        if not row:
+            return {"code": 1, "msg": "未找到该别名分配的 TikTok 账号"}
+        return {
+            "code": 0,
+            "msg": "ok",
+            "row_index": int(row.get("row_index") or 0),
+            "username": str(row.get("username") or "").strip(),
+            "email": str(row.get("email") or "").strip(),
+            "password": str(row.get("password") or "").strip(),
+            "email_password": str(row.get("email_password") or "").strip(),
+            "api": str(row.get("api") or "").strip(),
+            "is_login": bool(int(row.get("is_login") or 0)),
+            "login_time": str(row.get("login_time") or "").strip(),
+            "basic_profile_modified": _normalize_switch_highlight(row.get("basic_profile_modified")),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/device/assigned_account/mark_login")
+def device_assigned_account_mark_login(payload: DeviceAssignedAccountMarkLoginRequest):
+    """设备端：自动登录成功后标记账号已登录。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    username = str(payload.username or "").strip()
+    if not owner or not username:
+        return {"code": 1, "msg": "参数无效"}
+    conn = _get_db()
+    try:
+        now = now_text()
+        cur = conn.execute(
+            """
+            UPDATE account_editor_rows
+            SET is_login = 1, login_time = ?, updated_at = ?
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            """,
+            (now, now, owner, username),
+        )
+        conn.commit()
+        if int(cur.rowcount or 0) < 1:
+            return {"code": 1, "msg": "未找到对应账号记录"}
+        _append_device_log(
+            payload.device_id,
+            f"[{now}] 自动登录 | is_login=是 username={username}",
+        )
+        return {"code": 0, "msg": "已标记登录", "login_time": now}
+    finally:
+        conn.close()
+
+
+@app.post("/api/device/assigned_account/update_username")
+def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdateUsernameRequest):
+    """设备端：修改基本资料时检测到 TikTok 用户名与分配账号不一致，同步更新账号表与设备表。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    new_username = _normalize_mutual_clip_username(payload.new_username or "")
+    if not new_username:
+        return {"code": 1, "msg": "新用户名为空或格式无效"}
+    conn = _get_db()
+    try:
+        row = _fetch_device_assigned_account_row(conn, owner, payload.alias)
+        if not row:
+            return {"code": 1, "msg": "未找到该别名分配的 TikTok 账号"}
+        old_username = str(row.get("username") or "").strip()
+        row_index = int(row.get("row_index") or 0)
+        if not old_username:
+            return {"code": 1, "msg": "当前分配账号用户名为空"}
+        if new_username.lower() == old_username.lower():
+            return {
+                "code": 0,
+                "msg": "无需更新",
+                "username": old_username,
+                "updated": False,
+            }
+        conflict = conn.execute(
+            """
+            SELECT 1 FROM account_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+              AND row_index <> ?
+            LIMIT 1
+            """,
+            (owner, new_username, row_index),
+        ).fetchone()
+        if conflict:
+            return {"code": 1, "msg": "新用户名已被其他账号占用"}
+        now = now_text()
+        device_alias = _normalized_alias(payload.alias)
+        acct_cur = conn.execute(
+            """
+            UPDATE account_editor_rows
+            SET username = ?,
+                assigned_alias = CASE
+                    WHEN TRIM(COALESCE(assigned_alias, '')) <> '' THEN assigned_alias
+                    ELSE ?
+                END,
+                updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (new_username, device_alias, now, owner, row_index),
+        )
+        if int(acct_cur.rowcount or 0) < 1:
+            return {"code": 1, "msg": "账号表更新失败"}
+        alias_key = _normalize_alias_key(payload.alias)
+        dev_rows = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            """,
+            (owner, old_username),
+        ).fetchall()
+        dev_updated = 0
+        for dr in dev_rows:
+            d = dict(dr)
+            if _normalize_alias_key(_effective_device_editor_alias(d)) != alias_key:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET username = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (new_username, now, owner, int(d["row_index"])),
+            )
+            dev_updated += int(cur.rowcount or 0)
+        conn.commit()
+        _append_device_log(
+            payload.device_id,
+            f"[{now}] 修改基本资料 | 用户名同步 {old_username} → {new_username}（设备表 {dev_updated} 行）",
+        )
+        return {
+            "code": 0,
+            "msg": "已更新用户名",
+            "username": new_username,
+            "old_username": old_username,
+            "updated": True,
+            "device_rows_updated": dev_updated,
+        }
+    finally:
+        conn.close()
+
+
 @app.post("/api/device/tiktok/email_code")
 def device_tiktok_email_code(payload: DeviceTikTokEmailCodeRequest):
     """设备端直连邮箱 API 失败时，由服务端代拉并解析 6 位 TikTok 验证码（仅需设备绑定）。"""
@@ -6359,27 +6812,37 @@ def device_ops_report(payload: DeviceOpReportRequest):
                 ):
                     _delete_file_safely(old_backup_path)
 
+    cut_switch_auto_start: dict[str, bool] = {
+        "opt_out_cleared": False,
+        "auto_start_resumed": False,
+    }
     if payload.status == "success" and isinstance(data, dict):
         owner_u = str(device.owner_username or "").strip()
         op_type = str(data.get("op_type") or "").strip()
         if owner_u:
-            if op_type == "tiktok_backup_and_clear":
+            if op_type in ("tiktok_backup_and_clear", "tiktok_clear"):
                 _device_ops_apply_cut_switch_after_backup(owner_u, data)
-                cut_mode = str(data.get("cut_switch_after_backup") or "").strip().lower()
-                if cut_mode == "exclusive_activate_target":
-                    _restore_device_auto_start_opt_out_after_cut_switch(
-                        payload.device_id,
-                        payload.alias,
-                    )
+                # 切号后自动登录与恢复涨粉由设备端 finishCutSwitchAfterSuccess 统一处理，
+                # 避免云端过早 pending_start 导致涨粉与自动登录并发。
             elif op_type == "tiktok_restore":
                 _device_ops_apply_cut_switch_after_restore(owner_u, data)
-                if bool(data.get("skip_pm_clear")):
-                    _restore_device_auto_start_opt_out_after_cut_switch(
-                        payload.device_id,
-                        payload.alias,
-                    )
 
-    return {"code": 0, "msg": "设备任务结果已接收"}
+    with store.lock:
+        dev = store.devices.get(payload.device_id)
+        auto_start_flag = bool(
+            dev
+            and _user_auto_start_enabled(str(dev.owner_username or ""))
+            and not bool(getattr(dev, "auto_start_opt_out", False))
+        )
+        opt_out_now = bool(getattr(dev, "auto_start_opt_out", False)) if dev else False
+    return {
+        "code": 0,
+        "msg": "设备任务结果已接收",
+        "auto_start_opt_out": opt_out_now,
+        "auto_start": auto_start_flag,
+        "cut_switch_auto_start_resumed": bool(cut_switch_auto_start.get("auto_start_resumed")),
+        "cut_switch_opt_out_cleared": bool(cut_switch_auto_start.get("opt_out_cleared")),
+    }
 
 
 @app.post("/api/device_logs/sync")
@@ -6505,6 +6968,28 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
     if err:
         return err
 
+    cs = (payload.cut_switch_after_backup or "").strip().lower()
+    if cs in ("clear_source_for_restore", "exclusive_activate_target"):
+        auto_start_disabled = False
+        with store.lock:
+            dev = store.devices.get(payload.device_id)
+            if dev and not dev.auto_start_opt_out:
+                dev.auto_start_opt_out = True
+                auto_start_disabled = True
+        if auto_start_disabled:
+            _persist_client_device_to_db(payload.device_id)
+            _append_device_log(payload.device_id, "切号清理指令：云端已自动关闭该设备的自动开启程序")
+
+    op_payload: dict[str, Any] = {
+        "device_id": payload.device_id,
+        "alias": payload.alias,
+        "package_name": payload.package_name.strip(),
+    }
+    if cs in ("clear_source_for_restore", "exclusive_activate_target"):
+        op_payload["cut_switch_after_backup"] = cs
+    if payload.cut_switch_target_row_index is not None and int(payload.cut_switch_target_row_index) >= 0:
+        op_payload["cut_switch_target_row_index"] = int(payload.cut_switch_target_row_index)
+
     _resume_device_for_cloud_op(
         payload.device_id,
         f"[{now_text()}] 云端后台 | 已入队清理 TikTok 任务，等待设备拉取（alias={payload.alias}）",
@@ -6512,11 +6997,7 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
     op_id = _enqueue_tiktok_device_op(
         payload.device_id,
         "tiktok_clear",
-        {
-            "device_id": payload.device_id,
-            "alias": payload.alias,
-            "package_name": payload.package_name.strip(),
-        },
+        op_payload,
     )
     _append_device_log(payload.device_id, f"[{now_text()}] 设备任务已入队 op_id={op_id} type=tiktok_clear")
 
@@ -6733,24 +7214,32 @@ def admin_device_tiktok_launch_3(payload: DeviceTikTokBackupClearRequest, author
 
 @app.post("/api/admin/device_tiktok/edit_basic_profile")
 def admin_device_tiktok_edit_basic_profile(payload: DeviceTikTokBackupClearRequest, authorization: str | None = Header(default=None)):
-    err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    err, device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
+
+    op_payload: dict[str, Any] = {
+        "device_id": payload.device_id,
+        "alias": payload.alias,
+        "package_name": payload.package_name.strip(),
+    }
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    avatar_item = _gallery_library_random_media_payload(owner)
+    if avatar_item:
+        op_payload["avatar_media_item"] = avatar_item
 
     op_id = _enqueue_tiktok_device_op(
         payload.device_id,
         "tiktok_edit_basic_profile",
-        {
-            "device_id": payload.device_id,
-            "alias": payload.alias,
-            "package_name": payload.package_name.strip(),
-        },
+        op_payload,
     )
 
+    avatar_hint = "，已附带随机头像素材" if avatar_item else "（图库为空，设备端将尝试拉取或失败）"
     return {
         "code": 0,
-        "msg": "已下发设备端任务：修改基本资料（关→开→比例点→OCR Edit→OCR Change photo,name,Bio，失败自动整段重试）",
+        "msg": f"已下发设备端任务：修改基本资料（清图库→随机头像→OCR 链路，失败自动重试）{avatar_hint}",
         "op_id": op_id,
+        "avatar_attached": bool(avatar_item),
     }
 
 
@@ -7109,6 +7598,7 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
 
         row_index = int(payload.row_index)
         incoming_alias = _blank_if_none(payload.assigned_alias)
+        owner = str(session["username"] or "").strip()
         existing = conn.execute(
             """
             SELECT username, assigned_alias
@@ -7116,14 +7606,19 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
             WHERE owner_username = ? AND row_index = ?
             LIMIT 1
             """,
-            (session["username"], row_index),
+            (owner, row_index),
         ).fetchone()
         existing_username = str(existing["username"] or "").strip() if existing else ""
         existing_assigned_alias = _blank_if_none(existing["assigned_alias"]) if existing else ""
+        if not existing_assigned_alias and existing_username:
+            existing_assigned_alias = _recover_assigned_alias_for_account_username(
+                conn, owner, existing_username
+            )
         alias_locked = bool(existing_assigned_alias)
         if existing and alias_locked and incoming_alias and incoming_alias != existing_assigned_alias:
             return {"code": 1, "msg": "该账号已分配别名，不能修改别名；删除账号记录将同步清理设备备份档案"}
         persisted_alias = existing_assigned_alias or incoming_alias
+        new_username = payload.username.strip()
         conn.execute(
             """
             INSERT INTO account_editor_rows
@@ -7140,7 +7635,8 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 region = excluded.region,
                 assigned_alias = CASE
                     WHEN TRIM(COALESCE(account_editor_rows.assigned_alias, '')) <> '' THEN account_editor_rows.assigned_alias
-                    ELSE excluded.assigned_alias
+                    WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
+                    ELSE account_editor_rows.assigned_alias
                 END,
                 video_count = COALESCE(excluded.video_count, ''),
                 follower_count = COALESCE(excluded.follower_count, ''),
@@ -7149,9 +7645,9 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 updated_at = excluded.updated_at
             """,
             (
-                session["username"],
+                owner,
                 row_index,
-                payload.username.strip(),
+                new_username,
                 payload.password.strip(),
                 payload.email.strip(),
                 payload.email_password.strip(),
@@ -7167,13 +7663,22 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 now,
             ),
         )
+        if (
+            existing_username
+            and new_username
+            and existing_username.lower() != new_username.lower()
+        ):
+            _sync_device_editor_username_for_account(
+                conn, owner, existing_username, new_username, persisted_alias
+            )
         conn.commit()
-        if persisted_alias and existing_username:
-            _link_backup_record_alias_for_username(existing_username, persisted_alias)
+        link_username = new_username or existing_username
+        if persisted_alias and link_username:
+            _link_backup_record_alias_for_username(link_username, persisted_alias)
         if persisted_alias:
             _upsert_backup_record_for_account(
-                session["username"],
-                payload.username,
+                owner,
+                new_username,
                 persisted_alias,
                 payload.region,
             )
@@ -7383,6 +7888,494 @@ def list_device_editor_rows(
         }
     finally:
         conn.close()
+
+
+BACKUP_ARCHIVE_XLSX_HEADERS: List[str] = [
+    "row_index",
+    "assigned_alias",
+    "device_alias",
+    "device_id",
+    "username",
+    "ip",
+    "region",
+    "backup_path",
+    "backup_name",
+    "backup_time",
+    "backup_status",
+    "remark",
+    "switch_highlight",
+    "video_count",
+    "follower_count",
+    "follower_growth",
+    "updated_at",
+    "account_row_index",
+    "account_password",
+    "account_email",
+    "account_email_password",
+    "account_api",
+    "account_is_login",
+    "account_login_time",
+    "account_region",
+    "account_assigned_alias",
+    "account_video_count",
+    "account_follower_count",
+    "account_follower_growth",
+    "account_basic_profile_modified",
+]
+
+
+def _xlsx_cell_str(value: object | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _parse_editor_login_flag(value: object | None) -> bool:
+    text = _xlsx_cell_str(value).lower()
+    return text in {"1", "true", "yes", "y", "是", "已登录", "login"}
+
+
+def _list_device_editor_rows_for_backup_export(
+    conn: sqlite3.Connection,
+    owner: str,
+    device_group: str = "",
+) -> List[dict[str, Any]]:
+    alias_expr = _backup_record_alias_expr()
+    group_sql, group_params = _device_group_filter_sql(str(device_group or "").strip(), alias_expr)
+    rows = conn.execute(
+        f"""
+        SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias,
+               backup_path, backup_name, backup_time, backup_status, remark, switch_highlight,
+               video_count, follower_count, follower_growth, updated_at
+        FROM device_editor_rows
+        WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}
+        ORDER BY {alias_expr} ASC, row_index ASC
+        """,
+        (owner, *group_params),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _account_editor_rows_by_username(conn: sqlite3.Connection, owner: str) -> Dict[str, dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT row_index, username, password, email, email_password, api, is_login, login_time, region,
+               assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
+        FROM account_editor_rows
+        WHERE owner_username = ?
+        """,
+        (owner,),
+    ).fetchall()
+    out: Dict[str, dict[str, Any]] = {}
+    for row in rows:
+        uname = _normalized_alias(row["username"]).lstrip("@").lower()
+        if uname and uname not in out:
+            out[uname] = dict(row)
+    return out
+
+
+def _backup_archive_export_row(device_row: dict[str, Any], account_row: dict[str, Any] | None) -> List[str]:
+    acct = account_row or {}
+    alias_expr_val = _blank_if_none(device_row.get("assigned_alias")) or _blank_if_none(device_row.get("device_alias"))
+    return [
+        _xlsx_cell_str(device_row.get("row_index")),
+        alias_expr_val,
+        _xlsx_cell_str(device_row.get("device_alias")),
+        _xlsx_cell_str(device_row.get("device_id")),
+        _xlsx_cell_str(device_row.get("username")),
+        _xlsx_cell_str(device_row.get("ip")),
+        _xlsx_cell_str(device_row.get("region")),
+        _xlsx_cell_str(device_row.get("backup_path")),
+        _xlsx_cell_str(device_row.get("backup_name")),
+        _xlsx_cell_str(device_row.get("backup_time")),
+        _xlsx_cell_str(device_row.get("backup_status")),
+        _xlsx_cell_str(device_row.get("remark")),
+        _normalize_switch_highlight(device_row.get("switch_highlight")),
+        _xlsx_cell_str(device_row.get("video_count")),
+        _xlsx_cell_str(device_row.get("follower_count")),
+        _xlsx_cell_str(device_row.get("follower_growth")),
+        _xlsx_cell_str(device_row.get("updated_at")),
+        _xlsx_cell_str(acct.get("row_index")),
+        _xlsx_cell_str(acct.get("password")),
+        _xlsx_cell_str(acct.get("email")),
+        _xlsx_cell_str(acct.get("email_password")),
+        _xlsx_cell_str(acct.get("api")),
+        "是" if int(acct.get("is_login") or 0) else "否",
+        _xlsx_cell_str(acct.get("login_time")),
+        _xlsx_cell_str(acct.get("region")),
+        _xlsx_cell_str(acct.get("assigned_alias")),
+        _xlsx_cell_str(acct.get("video_count")),
+        _xlsx_cell_str(acct.get("follower_count")),
+        _xlsx_cell_str(acct.get("follower_growth")),
+        _normalize_switch_highlight(acct.get("basic_profile_modified")),
+    ]
+
+
+def _parse_backup_archive_row_indices_param(raw: str) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    for part in str(raw or "").split(","):
+        text = str(part or "").strip()
+        if not text:
+            continue
+        try:
+            idx = int(text)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+    return out
+
+
+def _export_backup_archive_xlsx(
+    owner: str,
+    device_group: str = "",
+    row_indices: List[int] | None = None,
+) -> dict[str, Any]:
+    if Workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法导出 xlsx"}
+    conn = _get_db()
+    try:
+        device_rows = _list_device_editor_rows_for_backup_export(conn, owner, device_group)
+        accounts_by_user = _account_editor_rows_by_username(conn, owner)
+    finally:
+        conn.close()
+    if row_indices:
+        wanted = set(int(x) for x in row_indices if int(x) >= 0)
+        device_rows = [r for r in device_rows if int(r.get("row_index") or -1) in wanted]
+        if not device_rows:
+            return {"code": 1, "msg": "所选记录不存在或不在当前分组筛选下"}
+    if not device_rows:
+        return {"code": 1, "msg": "当前筛选下没有可导出的备份档案"}
+
+    export_dir = (BASE_DIR / "exports").resolve()
+    export_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    group_tag = re.sub(r"[^\w\-]+", "_", str(device_group or "all").strip())[:32] or "all"
+    select_tag = "selected" if row_indices else "all"
+    filename = f"backup_archive_{group_tag}_{select_tag}_{timestamp}.xlsx"
+    file_path = export_dir / filename
+
+    try:
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(title="backup_archive")
+        ws.append(BACKUP_ARCHIVE_XLSX_HEADERS)
+        for device_row in device_rows:
+            uname = _normalized_alias(device_row.get("username")).lstrip("@").lower()
+            account_row = accounts_by_user.get(uname) if uname else None
+            ws.append(_backup_archive_export_row(device_row, account_row))
+        wb.save(file_path)
+    except Exception as exc:
+        return {"code": 1, "msg": f"生成 xlsx 失败：{exc}"}
+    if not file_path.is_file() or int(file_path.stat().st_size or 0) <= 0:
+        return {"code": 1, "msg": "导出文件生成失败"}
+    return {
+        "code": 0,
+        "msg": "导出成功",
+        "filename": filename,
+        "file_path": str(file_path),
+        "count": len(device_rows),
+    }
+
+
+def _parse_backup_archive_xlsx_sheet(sheet) -> tuple[List[str], List[dict[str, str]]]:
+    rows_iter = list(sheet.iter_rows(values_only=True))
+    if not rows_iter:
+        return [], []
+    header_cells = [_xlsx_cell_str(cell) for cell in rows_iter[0]]
+    if not any(header_cells):
+        return [], []
+    header_map: Dict[str, int] = {}
+    for idx, name in enumerate(header_cells):
+        key = name.strip()
+        if key and key not in header_map:
+            header_map[key] = idx
+    parsed: List[dict[str, str]] = []
+    for raw in rows_iter[1:]:
+        if not raw or not any(cell is not None and str(cell).strip() for cell in raw):
+            continue
+        item: dict[str, str] = {}
+        for key, idx in header_map.items():
+            val = raw[idx] if idx < len(raw) else None
+            item[key] = _xlsx_cell_str(val)
+        parsed.append(item)
+    headers = list(header_map.keys())
+    return headers, parsed
+
+
+def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str]]) -> dict[str, Any]:
+    if not parsed_rows:
+        return {"code": 1, "msg": "xlsx 中没有可导入的数据行"}
+    conn = _get_db()
+    try:
+        now = now_text()
+        accounts_by_user = _account_editor_rows_by_username(conn, owner)
+        existing_device_users = {
+            _normalized_alias(r["username"]).lstrip("@").lower()
+            for r in conn.execute(
+                "SELECT username FROM device_editor_rows WHERE owner_username = ?",
+                (owner,),
+            ).fetchall()
+            if _normalized_alias(r["username"])
+        }
+        max_device_ri = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(row_index), -1) FROM device_editor_rows WHERE owner_username = ?",
+                (owner,),
+            ).fetchone()[0]
+        )
+        max_account_ri = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(row_index), -1) FROM account_editor_rows WHERE owner_username = ?",
+                (owner,),
+            ).fetchone()[0]
+        )
+
+        imported = 0
+        skipped_duplicate = 0
+        skipped_empty = 0
+        seen_in_file: set[str] = set()
+
+        for row in parsed_rows:
+            username = _normalized_alias(row.get("username")).lstrip("@")
+            if not username:
+                skipped_empty += 1
+                continue
+            user_key = username.lower()
+            if user_key in seen_in_file or user_key in existing_device_users:
+                skipped_duplicate += 1
+                continue
+            seen_in_file.add(user_key)
+
+            assigned_alias = _blank_if_none(row.get("assigned_alias")) or _blank_if_none(row.get("device_alias"))
+            account_assigned = _blank_if_none(row.get("account_assigned_alias")) or assigned_alias
+
+            account_ri_raw = row.get("account_row_index", "")
+            account_ri: int | None = None
+            if account_ri_raw != "":
+                try:
+                    account_ri = int(float(account_ri_raw))
+                except (TypeError, ValueError):
+                    account_ri = None
+            existing_acct = accounts_by_user.get(user_key)
+            if account_ri is None or account_ri < 0:
+                account_ri = int(existing_acct["row_index"]) if existing_acct else max_account_ri + 1
+            if existing_acct is None and account_ri > max_account_ri:
+                max_account_ri = account_ri
+
+            acct_password = _blank_if_none(row.get("account_password"))
+            acct_email = _blank_if_none(row.get("account_email"))
+            acct_email_password = _blank_if_none(row.get("account_email_password"))
+            acct_api = _blank_if_none(row.get("account_api"))
+            acct_region = _blank_if_none(row.get("account_region")) or _blank_if_none(row.get("region"))
+            acct_login_time = _blank_if_none(row.get("account_login_time"))
+            acct_is_login = 1 if _parse_editor_login_flag(row.get("account_is_login")) else 0
+            acct_video = _blank_if_none(row.get("account_video_count")) or _blank_if_none(row.get("video_count"))
+            acct_follower = _blank_if_none(row.get("account_follower_count")) or _blank_if_none(
+                row.get("follower_count")
+            )
+            acct_growth = _blank_if_none(row.get("account_follower_growth")) or _blank_if_none(
+                row.get("follower_growth")
+            )
+            acct_basic = _normalize_switch_highlight(row.get("account_basic_profile_modified"))
+
+            conn.execute(
+                """
+                INSERT INTO account_editor_rows
+                    (owner_username, row_index, username, password, email, email_password, api, is_login, login_time,
+                     region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_username, row_index) DO UPDATE SET
+                    username = excluded.username,
+                    password = CASE WHEN TRIM(excluded.password) <> '' THEN excluded.password ELSE account_editor_rows.password END,
+                    email = CASE WHEN TRIM(excluded.email) <> '' THEN excluded.email ELSE account_editor_rows.email END,
+                    email_password = CASE WHEN TRIM(excluded.email_password) <> '' THEN excluded.email_password ELSE account_editor_rows.email_password END,
+                    api = CASE WHEN TRIM(excluded.api) <> '' THEN excluded.api ELSE account_editor_rows.api END,
+                    is_login = excluded.is_login,
+                    login_time = CASE WHEN TRIM(excluded.login_time) <> '' THEN excluded.login_time ELSE account_editor_rows.login_time END,
+                    region = CASE WHEN TRIM(excluded.region) <> '' THEN excluded.region ELSE account_editor_rows.region END,
+                    assigned_alias = CASE
+                        WHEN TRIM(COALESCE(account_editor_rows.assigned_alias, '')) <> '' THEN account_editor_rows.assigned_alias
+                        WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
+                        ELSE account_editor_rows.assigned_alias
+                    END,
+                    video_count = CASE WHEN TRIM(excluded.video_count) <> '' THEN excluded.video_count ELSE account_editor_rows.video_count END,
+                    follower_count = CASE WHEN TRIM(excluded.follower_count) <> '' THEN excluded.follower_count ELSE account_editor_rows.follower_count END,
+                    follower_growth = CASE WHEN TRIM(excluded.follower_growth) <> '' THEN excluded.follower_growth ELSE account_editor_rows.follower_growth END,
+                    basic_profile_modified = COALESCE(NULLIF(TRIM(excluded.basic_profile_modified), ''), account_editor_rows.basic_profile_modified),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    owner,
+                    account_ri,
+                    username,
+                    acct_password,
+                    acct_email,
+                    acct_email_password,
+                    acct_api,
+                    acct_is_login,
+                    acct_login_time,
+                    acct_region,
+                    account_assigned,
+                    acct_video,
+                    acct_follower,
+                    acct_growth,
+                    acct_basic,
+                    now,
+                ),
+            )
+            accounts_by_user[user_key] = {
+                "row_index": account_ri,
+                "username": username,
+                "assigned_alias": account_assigned,
+            }
+
+            device_ri_raw = row.get("row_index", "")
+            device_ri: int | None = None
+            if device_ri_raw != "":
+                try:
+                    device_ri = int(float(device_ri_raw))
+                except (TypeError, ValueError):
+                    device_ri = None
+            if device_ri is None or device_ri < 0:
+                max_device_ri += 1
+                device_ri = max_device_ri
+            else:
+                max_device_ri = max(max_device_ri, device_ri)
+
+            device_alias = _blank_if_none(row.get("device_alias")) or assigned_alias
+            sh = _normalize_switch_highlight(row.get("switch_highlight"))
+            conn.execute(
+                """
+                INSERT INTO device_editor_rows
+                    (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias,
+                     backup_path, backup_name, backup_time, backup_status, remark, switch_highlight,
+                     video_count, follower_count, follower_growth, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_username, row_index) DO UPDATE SET
+                    device_alias = excluded.device_alias,
+                    device_id = excluded.device_id,
+                    ip = excluded.ip,
+                    region = excluded.region,
+                    username = excluded.username,
+                    assigned_alias = excluded.assigned_alias,
+                    backup_path = excluded.backup_path,
+                    backup_name = excluded.backup_name,
+                    backup_time = excluded.backup_time,
+                    backup_status = excluded.backup_status,
+                    remark = excluded.remark,
+                    switch_highlight = excluded.switch_highlight,
+                    video_count = excluded.video_count,
+                    follower_count = excluded.follower_count,
+                    follower_growth = excluded.follower_growth,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    owner,
+                    device_ri,
+                    device_alias,
+                    _blank_if_none(row.get("device_id")),
+                    _blank_if_none(row.get("ip")),
+                    _blank_if_none(row.get("region")),
+                    username,
+                    assigned_alias,
+                    _blank_if_none(row.get("backup_path")),
+                    _blank_if_none(row.get("backup_name")),
+                    _blank_if_none(row.get("backup_time")),
+                    _blank_if_none(row.get("backup_status")),
+                    _blank_if_none(row.get("remark")),
+                    sh,
+                    _blank_if_none(row.get("video_count")),
+                    _blank_if_none(row.get("follower_count")),
+                    _blank_if_none(row.get("follower_growth")),
+                    now,
+                ),
+            )
+            existing_device_users.add(user_key)
+            imported += 1
+
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "code": 0,
+        "msg": "导入完成",
+        "imported": imported,
+        "skipped_duplicate": skipped_duplicate,
+        "skipped_empty": skipped_empty,
+    }
+
+
+@app.get("/api/admin/editor/backup_archive/export_xlsx")
+def export_backup_archive_xlsx(
+    device_group: str = "",
+    row_indices: str = "",
+    authorization: str | None = Header(default=None),
+):
+    """生成 xlsx 并返回 JSON（含 filename）；前端再通过 export_file 下载。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    indices = _parse_backup_archive_row_indices_param(row_indices)
+    result = _export_backup_archive_xlsx(
+        owner,
+        device_group,
+        indices if indices else None,
+    )
+    return result
+
+
+@app.get("/api/admin/editor/backup_archive/export_file")
+def download_backup_archive_export_file(
+    filename: str = "",
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    safe_name = Path(str(filename or "").strip()).name
+    if not safe_name.endswith(".xlsx") or not safe_name.startswith("backup_archive_"):
+        return {"code": 1, "msg": "非法文件名"}
+    file_path = (BASE_DIR / "exports" / safe_name).resolve()
+    export_root = (BASE_DIR / "exports").resolve()
+    if not str(file_path).startswith(str(export_root)) or not file_path.is_file():
+        return {"code": 1, "msg": "文件不存在"}
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=safe_name,
+    )
+
+
+@app.post("/api/admin/editor/backup_archive/import_xlsx")
+def import_backup_archive_xlsx(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return {"code": 1, "msg": "仅支持 xlsx 文件"}
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法导入 xlsx"}
+    owner = str(session["username"] or "").strip()
+    workbook = load_workbook(file.file, read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    _headers, parsed_rows = _parse_backup_archive_xlsx_sheet(sheet)
+    if not parsed_rows:
+        return {"code": 1, "msg": "xlsx 中没有可导入的数据行（需含表头与至少一行数据）"}
+    return _import_backup_archive_xlsx_rows(owner, parsed_rows)
 
 
 @app.post("/api/admin/editor/device_rows/upsert")
@@ -7659,6 +8652,225 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
     }
 
 
+def _gallery_library_owner_dir(owner: str) -> Path:
+    safe = re.sub(r"[^\w\-.@]+", "_", str(owner or "").strip()) or "unknown"
+    owner_dir = (GALLERY_LIBRARY_DIR / safe).resolve()
+    root = GALLERY_LIBRARY_DIR.resolve()
+    if not str(owner_dir).startswith(str(root)):
+        raise ValueError("invalid gallery owner path")
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    return owner_dir
+
+
+def _gallery_library_read_index(owner_dir: Path) -> list[dict[str, Any]]:
+    index_path = owner_dir / GALLERY_LIBRARY_INDEX_FILENAME
+    if not index_path.is_file():
+        return []
+    try:
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _gallery_library_write_index(owner_dir: Path, items: list[dict[str, Any]]) -> None:
+    index_path = owner_dir / GALLERY_LIBRARY_INDEX_FILENAME
+    index_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _gallery_library_item_path(owner_dir: Path, item_id: str) -> Path | None:
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", str(item_id or "").strip())
+    if not safe_id:
+        return None
+    for path in owner_dir.glob(f"{safe_id}.*"):
+        if path.is_file() and path.name != GALLERY_LIBRARY_INDEX_FILENAME:
+            resolved = path.resolve()
+            if str(resolved).startswith(str(owner_dir.resolve())):
+                return resolved
+    return None
+
+
+def _gallery_library_random_media_payload(owner: str) -> dict[str, Any] | None:
+    """从管理台图库随机取一张图片，编码为设备端 gallery_import 兼容结构。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return None
+    owner_dir = _gallery_library_owner_dir(owner_key)
+    items = _gallery_library_read_index(owner_dir)
+    valid = [it for it in items if isinstance(it, dict) and str(it.get("id") or "").strip()]
+    if not valid:
+        return None
+    pick = random.choice(valid)
+    item_id = str(pick.get("id") or "").strip()
+    file_path = _gallery_library_item_path(owner_dir, item_id)
+    if not file_path or not file_path.is_file():
+        return None
+    raw = file_path.read_bytes()
+    if not raw:
+        return None
+    return {
+        "id": item_id,
+        "filename": str(pick.get("filename") or file_path.name),
+        "content_type": str(pick.get("content_type") or "image/jpeg"),
+        "content_b64": base64.b64encode(raw).decode("ascii"),
+        "size": len(raw),
+        "media_type": "image",
+    }
+
+
+def _gallery_library_guess_ext(filename: str, content_type: str) -> str:
+    name = (filename or "").lower().strip()
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"):
+        if name.endswith(ext):
+            return ext
+    ctype = (content_type or "").lower().strip()
+    if "png" in ctype:
+        return ".png"
+    if "webp" in ctype:
+        return ".webp"
+    if "gif" in ctype:
+        return ".gif"
+    if "bmp" in ctype:
+        return ".bmp"
+    if "heic" in ctype or "heif" in ctype:
+        return ".heic"
+    return ".jpg"
+
+
+@app.get("/api/admin/gallery/library")
+def admin_gallery_library_list(authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    owner_dir = _gallery_library_owner_dir(owner)
+    items = _gallery_library_read_index(owner_dir)
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    for item in items:
+        if not isinstance(item, dict):
+            changed = True
+            continue
+        item_id = str(item.get("id") or "").strip()
+        filename = str(item.get("filename") or "").strip() or f"{item_id}.jpg"
+        file_path = _gallery_library_item_path(owner_dir, item_id)
+        if not item_id or not file_path:
+            changed = True
+            continue
+        normalized.append(
+            {
+                "id": item_id,
+                "filename": filename,
+                "content_type": str(item.get("content_type") or "image/jpeg"),
+                "size": int(file_path.stat().st_size),
+                "created_at": str(item.get("created_at") or ""),
+            }
+        )
+    if changed:
+        _gallery_library_write_index(owner_dir, normalized)
+    return {
+        "code": 0,
+        "items": normalized,
+        "count": len(normalized),
+        "max_items": GALLERY_LIBRARY_MAX_ITEMS,
+    }
+
+
+@app.post("/api/admin/gallery/library")
+def admin_gallery_library_upload(
+    files: List[UploadFile] = File(...),
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    if not files:
+        return {"code": 1, "msg": "请至少选择 1 张图片"}
+    owner = str(session["username"] or "").strip()
+    owner_dir = _gallery_library_owner_dir(owner)
+    items = _gallery_library_read_index(owner_dir)
+    max_single_image_size = 15 * 1024 * 1024
+    added: list[dict[str, Any]] = []
+    for idx, f in enumerate(files):
+        if len(items) >= GALLERY_LIBRARY_MAX_ITEMS:
+            return {
+                "code": 1,
+                "msg": f"图库已满（最多 {GALLERY_LIBRARY_MAX_ITEMS} 张），本次成功上传 {len(added)} 张",
+                "added": added,
+                "count": len(items),
+            }
+        content_type = (f.content_type or "").lower().strip()
+        if content_type and not content_type.startswith("image/"):
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件不是图片：{f.filename or '-'}"}
+        raw = f.file.read()
+        if not raw:
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件为空：{f.filename or '-'}"}
+        if len(raw) > max_single_image_size:
+            return {"code": 1, "msg": f"第 {idx + 1} 个文件超过 15MB：{f.filename or '-'}"}
+        item_id = uuid.uuid4().hex
+        ext = _gallery_library_guess_ext(f.filename or "", content_type)
+        safe_name = (f.filename or f"image_{len(items) + 1}{ext}").replace("\x00", "").strip() or f"image_{len(items) + 1}{ext}"
+        file_path = owner_dir / f"{item_id}{ext}"
+        file_path.write_bytes(raw)
+        entry = {
+            "id": item_id,
+            "filename": safe_name,
+            "content_type": content_type or "image/jpeg",
+            "created_at": now_text(),
+        }
+        items.append(entry)
+        added.append({**entry, "size": len(raw)})
+    _gallery_library_write_index(owner_dir, items)
+    return {
+        "code": 0,
+        "msg": f"已上传 {len(added)} 张图片到图库",
+        "added": added,
+        "count": len(items),
+        "max_items": GALLERY_LIBRARY_MAX_ITEMS,
+    }
+
+
+@app.delete("/api/admin/gallery/library/{item_id}")
+def admin_gallery_library_delete(
+    item_id: str,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    owner_dir = _gallery_library_owner_dir(owner)
+    file_path = _gallery_library_item_path(owner_dir, item_id)
+    items = _gallery_library_read_index(owner_dir)
+    next_items = [it for it in items if isinstance(it, dict) and str(it.get("id") or "").strip() != str(item_id or "").strip()]
+    if len(next_items) == len(items) and not file_path:
+        return {"code": 1, "msg": "图库中不存在该图片"}
+    if file_path and file_path.is_file():
+        file_path.unlink(missing_ok=True)
+    _gallery_library_write_index(owner_dir, next_items)
+    return {"code": 0, "msg": "已删除", "count": len(next_items)}
+
+
+@app.get("/api/admin/gallery/library/{item_id}/file")
+def admin_gallery_library_file(
+    item_id: str,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    owner_dir = _gallery_library_owner_dir(owner)
+    file_path = _gallery_library_item_path(owner_dir, item_id)
+    if not file_path or not file_path.is_file():
+        return {"code": 1, "msg": "图片不存在"}
+    items = _gallery_library_read_index(owner_dir)
+    meta = next((it for it in items if isinstance(it, dict) and str(it.get("id") or "").strip() == str(item_id or "").strip()), {})
+    media_type = str(meta.get("content_type") or "image/jpeg")
+    filename = str(meta.get("filename") or file_path.name)
+    return FileResponse(path=str(file_path), media_type=media_type, filename=filename)
+
+
 @app.post("/api/admin/device_gallery/upload")
 def admin_device_gallery_upload(
     device_id: str = Form(...),
@@ -7676,8 +8888,8 @@ def admin_device_gallery_upload(
         return err
     if not files:
         return {"code": 1, "msg": "请至少上传 1 个素材文件"}
-    if len(files) > 20:
-        return {"code": 1, "msg": "单次最多上传 20 张图片"}
+    if len(files) > GALLERY_LIBRARY_MAX_ITEMS:
+        return {"code": 1, "msg": f"单次最多上传 {GALLERY_LIBRARY_MAX_ITEMS} 张图片"}
 
     media_items: list[dict[str, Any]] = []
     max_single_image_size = 15 * 1024 * 1024

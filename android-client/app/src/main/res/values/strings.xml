@@ -5,6 +5,7 @@
     <string name="settings_title">设置</string>
     <string name="config_params_title">配置参数</string>
     <string name="nav_config_params">配置</string>
+    <string name="nav_video_ded">PC传输</string>
     <string name="action_open_config_params">查看配置参数</string>
     <string name="hint_alias">请输入设备别名</string>
     <string name="hint_server_url">请输入服务端地址</string>
@@ -24,4 +25,7 @@
     <string name="action_clear_binding">清除绑定信息</string>
     <!-- 无障碍服务描述 -->
     <string name="accessibility_service_desc">TikTok自动化辅助服务，用于模拟真人操作</string>
+    <string name="video_ded_app_name">视频传输/投屏</string>
+    <string name="action_open_video_ded">PC 素材传输 / 投屏（局域网）</string>
+    <string name="video_ded_notification_channel_name">视频传输投屏</string>
 </resources>

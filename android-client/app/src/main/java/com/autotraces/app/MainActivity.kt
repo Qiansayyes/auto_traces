@@ -20,17 +20,15 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.autotraces.app.databinding.ActivityMainBinding
+import com.autotraces.app.videoded.VideoDedMainActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
-import java.util.concurrent.TimeUnit
 
 /** API 34+ 读剪贴板；部分编译环境未生成 [Manifest.permission.READ_CLIPBOARD] 符号，用字面量避免编译失败。 */
 private const val PERM_READ_CLIPBOARD = "android.permission.READ_CLIPBOARD"
@@ -44,14 +42,6 @@ class MainActivity : AppCompatActivity() {
     private var assignedAccountRows: List<AccountEditorRowRecord> = emptyList()
     private var assignedUsernameAdapter: ArrayAdapter<String>? = null
     private var suppressAssignedUsernameSelectCallback: Boolean = false
-
-    private val codeFetchHttpClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .writeTimeout(15, TimeUnit.SECONDS)
-            .build()
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -106,9 +96,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.openSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
-        binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
-        binding.showConfigButton.setOnClickListener { openConfigParamsScreen() }
         binding.openConfigParamsButton.setOnClickListener { openConfigParamsScreen() }
+        binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        binding.showVideoDedButton.setOnClickListener {
+            startActivity(Intent(this, VideoDedMainActivity::class.java))
+        }
         binding.showLogButton.setOnClickListener { showLogPanel() }
         binding.showActionButton.setOnClickListener {
             if (AppCoordinator.isInPullUsernameRestSleep()) {
@@ -329,33 +321,18 @@ class MainActivity : AppCompatActivity() {
                 binding.fetchTikTokCodeButton.isEnabled = false
                 binding.assignedCopyStatusText.text = "正在设备端获取验证码..."
                 val result = withContext(Dispatchers.IO) {
-                    val local = fetchTikTokEmailCode(apiUrl)
-                    if (local.isSuccess) {
-                        local
+                    val first = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl)
+                    if (first.isSuccess) {
+                        first
                     } else {
-                        val localErr = local.exceptionOrNull()!!
-                        if (deviceId.isBlank() || alias.isBlank()) {
-                            return@withContext Result.failure(
-                                IllegalStateException(
-                                    "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；设备未绑定，无法云端代取（请先在设置中绑定设备）",
-                                ),
-                            )
+                        val err = first.exceptionOrNull()
+                        if (deviceId.isNotBlank() && alias.isNotBlank()) {
+                            withContext(Dispatchers.Main) {
+                                binding.assignedCopyStatusText.text =
+                                    "设备端失败，正在云端代取…（${err?.message ?: "未知错误"}）"
+                            }
                         }
-                        withContext(Dispatchers.Main) {
-                            binding.assignedCopyStatusText.text =
-                                "设备端失败，正在云端代取…（${localErr.message ?: localErr.javaClass.simpleName}）"
-                        }
-                        val serverResult = fetchTikTokEmailCodeFromServer(deviceId, alias, apiUrl)
-                        if (serverResult.isSuccess) {
-                            serverResult
-                        } else {
-                            val serverErr = serverResult.exceptionOrNull()!!
-                            Result.failure(
-                                IllegalStateException(
-                                    "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；云端代取失败：${serverErr.message ?: serverErr.javaClass.simpleName}",
-                                ),
-                            )
-                        }
+                        first
                     }
                 }
                 binding.fetchTikTokCodeButton.isEnabled = true
@@ -388,63 +365,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         refreshAssignedAccountFields()
-    }
-
-    private fun fetchTikTokEmailCode(apiUrl: String): Result<String> {
-        return runCatching {
-            val req = Request.Builder()
-                .url(apiUrl)
-                .get()
-                .build()
-            val resp = codeFetchHttpClient.newCall(req).execute()
-            if (!resp.isSuccessful) {
-                throw IllegalStateException("HTTP ${resp.code}")
-            }
-            val bodyText = resp.body?.string().orEmpty()
-            if (bodyText.isBlank()) {
-                throw IllegalStateException("返回内容为空")
-            }
-            extractEmailCode(bodyText)
-        }
-    }
-
-    private suspend fun fetchTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): Result<String> {
-        return runCatching {
-            val resp = ApiService.getTikTokEmailCodeFromServer(deviceId, alias, apiUrl)
-            if (resp.code != 0) {
-                throw IllegalStateException(resp.msg.ifBlank { "云端代取失败" })
-            }
-            val code = resp.email_code?.trim().orEmpty()
-            if (!code.matches(Regex("""\d{6}"""))) {
-                throw IllegalStateException("云端未返回有效验证码")
-            }
-            code
-        }
-    }
-
-    private fun extractEmailCode(bodyText: String): String {
-        val normalized = bodyText
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace(Regex("[\\u00A0\\t]"), " ")
-
-        val patterns = listOf(
-            // 主题: 760553 is your 6-digit code
-            Regex("""(?im)^\s*(主题|subject)\s*[:：]\s*(\d{6})\b"""),
-            // Your 6-digit code is: 760553
-            Regex("""(?i)\b6[- ]?digit\s+code\b[^\d]{0,24}(\d{6})\b"""),
-            // 兜底：任意 6 位数字（可能误命中，但只作为最后手段）
-            Regex("""\b(\d{6})\b"""),
-        )
-        for (re in patterns) {
-            val m = re.find(normalized) ?: continue
-            val code = m.groupValues.getOrNull(2)?.ifBlank { null } ?: m.groupValues.getOrNull(1)
-            val out = code?.trim().orEmpty()
-            if (out.matches(Regex("""\d{6}"""))) return out
-        }
-        throw IllegalStateException("未识别到 6 位验证码")
     }
 
     private fun requireCloudLoginIfNeeded(): Boolean {

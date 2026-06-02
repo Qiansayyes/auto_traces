@@ -58,6 +58,7 @@ object ConfigDisplay {
 
         appendSection("拉取与休息") {
             appendLine("单次拉取用户名数量 pull_batch_size：${config.pull_batch_size}")
+            appendLine("发作品前拉取素材 publish_post_material_fetch_count：${config.publish_post_material_fetch_count}（0=不拉取）")
             appendLine("休息时长 break_min ~ break_max：${formatRangeMin(config.break_min, config.break_max)}")
         }
 

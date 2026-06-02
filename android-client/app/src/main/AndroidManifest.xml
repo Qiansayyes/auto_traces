@@ -15,6 +15,11 @@
     <!-- Android 14+：targetSdk 34 时后台读他应用写入的剪贴板需显式声明（与 ClipboardManager.getPrimaryClip 一致） -->
     <uses-permission android:name="android.permission.READ_CLIPBOARD" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <permission
+        android:name="com.autotraces.app.videoded.permission.BRIDGE_READ"
+        android:protectionLevel="signature" />
 
     <application
         android:name=".AutoTracesApp"
@@ -46,6 +51,30 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- video_ded 独立入口：WiFi 素材传输 + PC 投屏（与涨粉主流程隔离） -->
+        <activity
+            android:name=".videoded.VideoDedMainActivity"
+            android:exported="false"
+            android:label="@string/video_ded_app_name" />
+        <activity
+            android:name=".videoded.TaskHistoryActivity"
+            android:exported="false" />
+        <activity
+            android:name=".videoded.TaskDetailActivity"
+            android:exported="false" />
+        <activity
+            android:name=".videoded.StatusLogActivity"
+            android:exported="false" />
+        <service
+            android:name=".videoded.VideoDedDeviceService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <provider
+            android:name=".videoded.CompanionBridgeProvider"
+            android:authorities="com.autotraces.app.videoded.bridge"
+            android:exported="true"
+            android:readPermission="com.autotraces.app.videoded.permission.BRIDGE_READ" />
 
     </application>
 
