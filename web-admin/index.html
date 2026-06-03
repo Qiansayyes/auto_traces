@@ -695,7 +695,7 @@
               <button id="backupArchiveClearSelectionBtn" type="button" class="ghost" title="取消全部勾选">取消选择</button>
               <button id="exportBackupArchiveSelectedXlsxBtn" type="button" class="ghost" title="将表格中已勾选的备份档案导出为 xlsx（一行一条）">导出已选 xlsx</button>
               <button id="exportBackupArchiveXlsxBtn" type="button" class="ghost" title="将当前设备分组筛选下的全部备份档案导出为 xlsx（一行一条，含关联账号字段）">导出分组全部 xlsx</button>
-              <button id="importBackupArchiveXlsxBtn" type="button" class="ghost" title="从 xlsx 批量导入；按 username 去重（文件内重复与库内已有均跳过）">导入 xlsx</button>
+              <button id="importBackupArchiveXlsxBtn" type="button" class="ghost" title="从 xlsx 批量导入；库内已有 username 会补全空备份字段，仅跳过文件内重复行">导入 xlsx</button>
               <input id="backupArchiveImportFileInput" type="file" accept=".xlsx" style="display:none;" />
             </div>
             <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">

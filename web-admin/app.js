@@ -7989,14 +7989,18 @@ async function importBackupArchiveXlsxFile(file) {
       throw new Error(String(data?.msg || `导入失败 (HTTP ${response.status})`));
     }
     const imported = Number(data?.imported || 0);
+    const updated = Number(data?.updated || 0);
     const skippedDup = Number(data?.skipped_duplicate || 0);
     const skippedEmpty = Number(data?.skipped_empty || 0);
     await loadEditorState();
     await loadBackupArchiveRecords();
-    const parts = [`新增 ${imported} 条`];
-    if (skippedDup > 0) parts.push(`跳过重复 username ${skippedDup} 条`);
+    const parts = [];
+    if (imported > 0) parts.push(`新增 ${imported} 条`);
+    if (updated > 0) parts.push(`更新已有 ${updated} 条`);
+    if (!parts.length) parts.push("新增 0 条");
+    if (skippedDup > 0) parts.push(`跳过文件内重复 username ${skippedDup} 条`);
     if (skippedEmpty > 0) parts.push(`跳过空 username ${skippedEmpty} 条`);
-    setStatus(`备份档案导入完成：${parts.join("，")}`, imported > 0 ? "success" : "warning");
+    setStatus(`备份档案导入完成：${parts.join("，")}`, imported > 0 || updated > 0 ? "success" : "warning");
   } finally {
     setBackupArchiveXlsxButtonsBusy(false);
     if (backupArchiveImportFileInput) backupArchiveImportFileInput.value = "";

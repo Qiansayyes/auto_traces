@@ -8809,6 +8809,47 @@ def _parse_backup_archive_xlsx_sheet(sheet) -> tuple[List[str], List[dict[str, s
     return headers, parsed
 
 
+def _backup_archive_import_user_key(username: str) -> str:
+    return _normalized_alias(username).lstrip("@").lower()
+
+
+def _device_backup_payload_empty(row: dict[str, Any]) -> bool:
+    fields = (
+        "backup_path",
+        "backup_name",
+        "backup_time",
+        "backup_status",
+        "video_count",
+        "follower_count",
+        "follower_growth",
+    )
+    return not any(str(row.get(f) or "").strip() for f in fields)
+
+
+def _pick_existing_device_row_for_import(
+    candidates: List[dict[str, Any]],
+    row: dict[str, str],
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    device_ri_raw = row.get("row_index", "")
+    device_ri: int | None = None
+    if device_ri_raw != "":
+        try:
+            device_ri = int(float(device_ri_raw))
+        except (TypeError, ValueError):
+            device_ri = None
+    if device_ri is not None and device_ri >= 0:
+        for item in candidates:
+            if int(item["row_index"]) == device_ri:
+                return item
+    empty_rows = [item for item in candidates if _device_backup_payload_empty(item)]
+    if len(empty_rows) == 1:
+        return empty_rows[0]
+    pool = empty_rows or candidates
+    return min(pool, key=lambda item: int(item["row_index"]))
+
+
 def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str]]) -> dict[str, Any]:
     if not parsed_rows:
         return {"code": 1, "msg": "xlsx 中没有可导入的数据行"}
@@ -8816,14 +8857,32 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
     try:
         now = now_text()
         accounts_by_user = _account_editor_rows_by_username(conn, owner)
-        existing_device_users = {
-            _normalized_alias(r["username"]).lstrip("@").lower()
-            for r in conn.execute(
-                "SELECT username FROM device_editor_rows WHERE owner_username = ?",
-                (owner,),
-            ).fetchall()
-            if _normalized_alias(r["username"])
-        }
+        existing_device_by_user: Dict[str, List[dict[str, Any]]] = {}
+        for r in conn.execute(
+            """
+            SELECT row_index, username, backup_path, backup_name, backup_time, backup_status,
+                   video_count, follower_count, follower_growth
+            FROM device_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall():
+            user_key = _backup_archive_import_user_key(r["username"])
+            if not user_key:
+                continue
+            existing_device_by_user.setdefault(user_key, []).append(
+                {
+                    "row_index": int(r["row_index"]),
+                    "username": str(r["username"] or ""),
+                    "backup_path": str(r["backup_path"] or ""),
+                    "backup_name": str(r["backup_name"] or ""),
+                    "backup_time": str(r["backup_time"] or ""),
+                    "backup_status": str(r["backup_status"] or ""),
+                    "video_count": str(r["video_count"] or ""),
+                    "follower_count": str(r["follower_count"] or ""),
+                    "follower_growth": str(r["follower_growth"] or ""),
+                }
+            )
         max_device_ri = int(
             conn.execute(
                 "SELECT COALESCE(MAX(row_index), -1) FROM device_editor_rows WHERE owner_username = ?",
@@ -8838,6 +8897,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
         )
 
         imported = 0
+        updated = 0
         skipped_duplicate = 0
         skipped_empty = 0
         seen_in_file: set[str] = set()
@@ -8848,10 +8908,12 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                 skipped_empty += 1
                 continue
             user_key = username.lower()
-            if user_key in seen_in_file or user_key in existing_device_users:
+            if user_key in seen_in_file:
                 skipped_duplicate += 1
                 continue
             seen_in_file.add(user_key)
+            existing_device_candidates = existing_device_by_user.get(user_key, [])
+            merge_existing_device = bool(existing_device_candidates)
 
             assigned_alias = _blank_if_none(row.get("assigned_alias")) or _blank_if_none(row.get("device_alias"))
             account_assigned = _blank_if_none(row.get("account_assigned_alias")) or assigned_alias
@@ -8938,26 +9000,54 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
 
             device_ri_raw = row.get("row_index", "")
             device_ri: int | None = None
-            if device_ri_raw != "":
+            if merge_existing_device:
+                picked = _pick_existing_device_row_for_import(existing_device_candidates, row)
+                device_ri = int(picked["row_index"]) if picked else None
+            if device_ri_raw != "" and not merge_existing_device:
                 try:
                     device_ri = int(float(device_ri_raw))
                 except (TypeError, ValueError):
                     device_ri = None
             if device_ri is None or device_ri < 0:
+                if merge_existing_device:
+                    skipped_duplicate += 1
+                    continue
                 max_device_ri += 1
                 device_ri = max_device_ri
-            else:
+            elif not merge_existing_device:
                 max_device_ri = max(max_device_ri, device_ri)
 
             device_alias = _blank_if_none(row.get("device_alias")) or assigned_alias
             sh = _normalize_switch_highlight(row.get("switch_highlight"))
-            conn.execute(
+            device_conflict_sql = (
                 """
-                INSERT INTO device_editor_rows
-                    (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias,
-                     backup_path, backup_name, backup_time, backup_status, remark, switch_highlight,
-                     video_count, follower_count, follower_growth, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_username, row_index) DO UPDATE SET
+                    device_alias = CASE WHEN TRIM(excluded.device_alias) <> '' THEN excluded.device_alias ELSE device_editor_rows.device_alias END,
+                    device_id = CASE WHEN TRIM(excluded.device_id) <> '' AND TRIM(COALESCE(device_editor_rows.device_id, '')) = '' THEN excluded.device_id ELSE device_editor_rows.device_id END,
+                    ip = CASE WHEN TRIM(excluded.ip) <> '' AND TRIM(COALESCE(device_editor_rows.ip, '')) = '' THEN excluded.ip ELSE device_editor_rows.ip END,
+                    region = CASE WHEN TRIM(excluded.region) <> '' AND TRIM(COALESCE(device_editor_rows.region, '')) = '' THEN excluded.region ELSE device_editor_rows.region END,
+                    username = excluded.username,
+                    assigned_alias = CASE
+                        WHEN TRIM(COALESCE(device_editor_rows.assigned_alias, '')) <> '' THEN device_editor_rows.assigned_alias
+                        WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
+                        ELSE device_editor_rows.assigned_alias
+                    END,
+                    backup_path = CASE WHEN TRIM(excluded.backup_path) <> '' AND TRIM(COALESCE(device_editor_rows.backup_path, '')) = '' THEN excluded.backup_path ELSE device_editor_rows.backup_path END,
+                    backup_name = CASE WHEN TRIM(excluded.backup_name) <> '' AND TRIM(COALESCE(device_editor_rows.backup_name, '')) = '' THEN excluded.backup_name ELSE device_editor_rows.backup_name END,
+                    backup_time = CASE WHEN TRIM(excluded.backup_time) <> '' AND TRIM(COALESCE(device_editor_rows.backup_time, '')) = '' THEN excluded.backup_time ELSE device_editor_rows.backup_time END,
+                    backup_status = CASE WHEN TRIM(excluded.backup_status) <> '' AND TRIM(COALESCE(device_editor_rows.backup_status, '')) = '' THEN excluded.backup_status ELSE device_editor_rows.backup_status END,
+                    remark = CASE WHEN TRIM(excluded.remark) <> '' AND TRIM(COALESCE(device_editor_rows.remark, '')) = '' THEN excluded.remark ELSE device_editor_rows.remark END,
+                    switch_highlight = CASE
+                        WHEN TRIM(excluded.switch_highlight) = '是' THEN '是'
+                        ELSE device_editor_rows.switch_highlight
+                    END,
+                    video_count = CASE WHEN TRIM(excluded.video_count) <> '' AND TRIM(COALESCE(device_editor_rows.video_count, '')) = '' THEN excluded.video_count ELSE device_editor_rows.video_count END,
+                    follower_count = CASE WHEN TRIM(excluded.follower_count) <> '' AND TRIM(COALESCE(device_editor_rows.follower_count, '')) = '' THEN excluded.follower_count ELSE device_editor_rows.follower_count END,
+                    follower_growth = CASE WHEN TRIM(excluded.follower_growth) <> '' AND TRIM(COALESCE(device_editor_rows.follower_growth, '')) = '' THEN excluded.follower_growth ELSE device_editor_rows.follower_growth END,
+                    updated_at = excluded.updated_at
+                """
+                if merge_existing_device
+                else """
                 ON CONFLICT(owner_username, row_index) DO UPDATE SET
                     device_alias = excluded.device_alias,
                     device_id = excluded.device_id,
@@ -8975,6 +9065,16 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                     follower_count = excluded.follower_count,
                     follower_growth = excluded.follower_growth,
                     updated_at = excluded.updated_at
+                """
+            )
+            conn.execute(
+                f"""
+                INSERT INTO device_editor_rows
+                    (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias,
+                     backup_path, backup_name, backup_time, backup_status, remark, switch_highlight,
+                     video_count, follower_count, follower_growth, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                {device_conflict_sql}
                 """,
                 (
                     owner,
@@ -8997,8 +9097,23 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                     now,
                 ),
             )
-            existing_device_users.add(user_key)
-            imported += 1
+            existing_device_by_user[user_key] = [
+                {
+                    "row_index": device_ri,
+                    "username": username,
+                    "backup_path": _blank_if_none(row.get("backup_path")),
+                    "backup_name": _blank_if_none(row.get("backup_name")),
+                    "backup_time": _blank_if_none(row.get("backup_time")),
+                    "backup_status": _blank_if_none(row.get("backup_status")),
+                    "video_count": _blank_if_none(row.get("video_count")),
+                    "follower_count": _blank_if_none(row.get("follower_count")),
+                    "follower_growth": _blank_if_none(row.get("follower_growth")),
+                }
+            ]
+            if merge_existing_device:
+                updated += 1
+            else:
+                imported += 1
 
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
@@ -9009,6 +9124,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
         "code": 0,
         "msg": "导入完成",
         "imported": imported,
+        "updated": updated,
         "skipped_duplicate": skipped_duplicate,
         "skipped_empty": skipped_empty,
     }
