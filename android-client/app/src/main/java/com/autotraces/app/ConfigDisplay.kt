@@ -111,6 +111,7 @@ object ConfigDisplay {
             appendLine("引流评论 mutual_traffic_comment：${if (config.mutual_traffic_comment) "开启" else "关闭"}")
             appendLine("作者区关注 mutual_traffic_author_follow：${if (config.mutual_traffic_author_follow) "开启" else "关闭"}")
             appendLine("Followers 关注 mutual_traffic_followers_follow：${if (config.mutual_traffic_followers_follow) "开启" else "关闭"}")
+            appendLine("互点仅关注 mutual_traffic_follow_only：${if (config.mutual_traffic_follow_only) "开启" else "关闭"}")
             appendLine("引流由管理台云端指令或队列 run_mode=mutual 触发（App 端无本机模式切换）")
         }
 

@@ -102,6 +102,8 @@ BASE_DEFAULT_CONFIG = {
     "mutual_traffic_comment": True,
     "mutual_traffic_author_follow": True,
     "mutual_traffic_followers_follow": True,
+    # 与上述三项引流动作互斥：开启后走「互点-仅关注」方案（评论区关注，不发评/不点作者区与 Followers）
+    "mutual_traffic_follow_only": False,
     # 已废弃：涨粉满批后自动引流（设备端仅在互点模式独立运行引流）
     "growth_pull_batches_before_auto_mutual": -1,
     # 互动动作之间的随机间隔（秒）
@@ -142,6 +144,15 @@ MODE_DEFAULT_CONFIGS = {
 }
 MODE_DEFAULT_CONFIGS["mutual"] = dict(MODE_DEFAULT_CONFIGS["growth"])
 RUN_MODES = ("growth", "live", "direct", "mutual")
+# 智能模板暂仅对涨粉模式生效（设备 get_config 与别名开关均按 growth 桶）
+SMART_TEMPLATE_RUN_MODES = frozenset({"growth"})
+
+DEFAULT_SMART_TEMPLATE_CONFIG: Dict[str, object] = {
+    "old_branch_min_followers": 100,
+    "old_branch_min_video_count": 15,
+    "new_branch_templates": [{"template_name": "default", "weight": 100}],
+    "old_branch_templates": [{"template_name": "default", "weight": 100}],
+}
 
 DEFAULT_CONFIG = dict(MODE_DEFAULT_CONFIGS["growth"])
 
@@ -160,6 +171,9 @@ AUTO_SWITCH_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_LOG_KEY = "backup_stats_full_query"
 BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
+MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
+MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD = 5000
+MOBILE_PENDING_AUTO_REFILL_DEFAULT_COOLDOWN_SEC = 600
 DEFAULT_PROCESS_QUEUE_BATCH_SIZE = int(BASE_DEFAULT_CONFIG.get("process_queue_batch_size", 100))
 DEVICE_LOG_DEDUP_WINDOW_SEC = 5.0
 _device_log_dedup_cache_lock = Lock()
@@ -973,6 +987,8 @@ class MemoryStore:
     backup_stats_full_query_enabled: bool = True
     backup_stats_full_query_last_run_date: str = ""
     backup_stats_full_query_in_flight: bool = False
+    mobile_pending_auto_refill_last_run_ts: float = 0.0
+    mobile_pending_auto_refill_in_flight: bool = False
     task_processes: Dict[str, subprocess.Popen] = field(default_factory=dict)
     task_logs: Dict[str, List[str]] = field(default_factory=dict)
     # 设备端操作任务队列与结果（用于“备份清理/恢复”）
@@ -1392,6 +1408,220 @@ def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -
     return _normalize_tiktok_username_key(pick.get("username"))
 
 
+def _parse_stat_int(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return 0
+    try:
+        return max(0, int(float(text)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_highlight_account_stats(owner_username: str, alias: str) -> dict[str, object]:
+    """按别名桶内切号高亮行读取粉丝数、作品数（用于智能模板分支）。"""
+    owner = str(owner_username or "").strip()
+    alias_clean = _normalize_alias_key(alias)
+    empty = {
+        "tiktok_username": "",
+        "follower_count": 0,
+        "video_count": 0,
+        "switch_highlight": "否",
+    }
+    if not owner or not alias_clean:
+        return empty
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT username, switch_highlight, device_alias, assigned_alias,
+                   video_count, follower_count
+            FROM device_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+    matched: list[dict] = []
+    for row in rows or []:
+        item = {
+            "username": str(row[0] or "").strip(),
+            "switch_highlight": _normalize_switch_highlight(row[1]),
+            "device_alias": str(row[2] or "").strip(),
+            "assigned_alias": str(row[3] or "").strip(),
+            "video_count": row[4] if len(row) > 4 else "",
+            "follower_count": row[5] if len(row) > 5 else "",
+        }
+        if _device_editor_effective_alias(item) != alias_clean:
+            continue
+        matched.append(item)
+    if not matched:
+        return empty
+    highlighted = [r for r in matched if r.get("switch_highlight") == "是"]
+    pick = highlighted[0] if len(highlighted) == 1 else (matched[0] if len(matched) == 1 else None)
+    if not pick:
+        return empty
+    return {
+        "tiktok_username": _normalize_tiktok_username_key(pick.get("username")),
+        "follower_count": _parse_stat_int(pick.get("follower_count")),
+        "video_count": _parse_stat_int(pick.get("video_count")),
+        "switch_highlight": str(pick.get("switch_highlight") or "否"),
+    }
+
+
+def _normalize_smart_template_entries(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("template_name") or "").strip()
+        if not name:
+            continue
+        try:
+            weight = int(item.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0
+        out.append({"template_name": name[:128], "weight": max(0, min(10000, weight))})
+    return out
+
+
+def _normalize_smart_template_config(raw: object | None) -> dict[str, object]:
+    base = dict(DEFAULT_SMART_TEMPLATE_CONFIG)
+    if not isinstance(raw, dict):
+        return base
+    try:
+        min_followers = int(raw.get("old_branch_min_followers", base["old_branch_min_followers"]))
+    except (TypeError, ValueError):
+        min_followers = int(base["old_branch_min_followers"])
+    try:
+        min_video = int(raw.get("old_branch_min_video_count", base["old_branch_min_video_count"]))
+    except (TypeError, ValueError):
+        min_video = int(base["old_branch_min_video_count"])
+    new_entries = _normalize_smart_template_entries(raw.get("new_branch_templates"))
+    old_entries = _normalize_smart_template_entries(raw.get("old_branch_templates"))
+    return {
+        "old_branch_min_followers": max(0, min_followers),
+        "old_branch_min_video_count": max(0, min_video),
+        "new_branch_templates": new_entries or list(base["new_branch_templates"]),
+        "old_branch_templates": old_entries or list(base["old_branch_templates"]),
+    }
+
+
+def _normalize_alias_smart_template_by_mode(raw: object | None) -> Dict[str, Dict[str, bool]]:
+    empty = {mode: {} for mode in RUN_MODES}
+    if not isinstance(raw, dict):
+        return empty
+    for mode_key in RUN_MODES:
+        mode_map = raw.get(mode_key)
+        if not isinstance(mode_map, dict):
+            continue
+        for raw_alias, raw_enabled in mode_map.items():
+            alias = _normalize_alias_key(raw_alias)
+            if not alias:
+                continue
+            empty[mode_key][alias] = bool(raw_enabled)
+    return empty
+
+
+def _alias_smart_template_enabled(data: dict, mode: str, alias: str) -> bool:
+    alias_clean = _normalize_alias_key(alias)
+    if not alias_clean:
+        return False
+    mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
+    if mode_key not in SMART_TEMPLATE_RUN_MODES:
+        return False
+    by_mode = data.get("alias_smart_template_by_mode")
+    if not isinstance(by_mode, dict):
+        return False
+    # 开关统一记在 growth 桶，避免与其它运行模式混用
+    mode_map = by_mode.get("growth")
+    if not isinstance(mode_map, dict):
+        return False
+    return bool(mode_map.get(alias_clean))
+
+
+def _stable_weighted_template_pick(seed: str, entries: list[dict[str, object]], valid_names: set[str]) -> str:
+    weighted: list[tuple[str, int]] = []
+    for item in entries:
+        name = str(item.get("template_name") or "").strip()
+        if not name or name not in valid_names:
+            continue
+        try:
+            weight = int(item.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0
+        if weight > 0:
+            weighted.append((name, weight))
+    if not weighted:
+        return ""
+    total = sum(w for _, w in weighted)
+    if total <= 0:
+        return weighted[0][0]
+    digest = hashlib.sha256(str(seed or "").encode("utf-8")).hexdigest()
+    roll = int(digest[:8], 16) % total
+    acc = 0
+    for name, weight in weighted:
+        acc += weight
+        if roll < acc:
+            return name
+    return weighted[-1][0]
+
+
+def _resolve_smart_template_for_alias(
+    owner_username: str,
+    data: dict,
+    mode: str,
+    alias: str,
+    templates: Dict[str, Dict[str, object]],
+) -> tuple[str, dict[str, object]]:
+    """智能模板：按高亮账号粉丝/作品数选分支，再按权重稳定命中具体模板。"""
+    mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
+    alias_clean = _normalize_alias_key(alias)
+    cfg = _normalize_smart_template_config(data.get("smart_template_config"))
+    stats = _get_highlight_account_stats(owner_username, alias_clean)
+    followers = int(stats.get("follower_count") or 0)
+    videos = int(stats.get("video_count") or 0)
+    min_followers = int(cfg.get("old_branch_min_followers") or 0)
+    min_videos = int(cfg.get("old_branch_min_video_count") or 0)
+    is_old_branch = followers > min_followers and videos > min_videos
+    branch = "old" if is_old_branch else "new"
+    branch_entries = (
+        cfg.get("old_branch_templates")
+        if is_old_branch
+        else cfg.get("new_branch_templates")
+    )
+    if not isinstance(branch_entries, list):
+        branch_entries = []
+    account = str(stats.get("tiktok_username") or "").strip()
+    seed = f"{owner_username}|{mode_key}|{alias_clean}|{account}|{branch}"
+    valid_names = set(templates.keys())
+    picked = _stable_weighted_template_pick(seed, branch_entries, valid_names)
+    stored_active = str(data.get("active_template") or "").strip()
+    fallback = stored_active if stored_active in valid_names else (sorted(valid_names)[0] if valid_names else "default")
+    selected = picked if picked in valid_names else fallback
+    debug = {
+        "branch": branch,
+        "branch_label": "老号分支" if is_old_branch else "新号分支",
+        "follower_count": followers,
+        "video_count": videos,
+        "tiktok_username": account,
+        "threshold_followers": min_followers,
+        "threshold_video_count": min_videos,
+        "seed": seed,
+        "picked_template": picked,
+    }
+    return selected, debug
+
+
 def _parse_template_ref(template_ref: object) -> tuple[str, str, bool]:
     text = str(template_ref or "").strip()
     if text.startswith("shared::"):
@@ -1427,6 +1657,29 @@ def _load_template_grants_for_user(target_username: str) -> List[Dict[str, str]]
         conn.close()
 
 
+def _normalize_mutual_traffic_action_mutex(cfg: dict) -> dict:
+    """「互点-仅关注」与评论/作者区/Followers 三项引流动作互斥。"""
+    out = dict(cfg)
+    follow_only = bool(out.get("mutual_traffic_follow_only"))
+    has_traffic_action = any(
+        bool(out.get(k))
+        for k in (
+            "mutual_traffic_comment",
+            "mutual_traffic_author_follow",
+            "mutual_traffic_followers_follow",
+        )
+    )
+    if follow_only:
+        out["mutual_traffic_comment"] = False
+        out["mutual_traffic_author_follow"] = False
+        out["mutual_traffic_followers_follow"] = False
+    elif has_traffic_action:
+        out["mutual_traffic_follow_only"] = False
+    else:
+        out.setdefault("mutual_traffic_follow_only", False)
+    return out
+
+
 def _migrate_mutual_traffic_config(cfg: dict) -> dict:
     """将已废弃的 mutual_left_swipe_follow 迁移为三项引流开关；缺省与历史「完整互点」一致。"""
     out = dict(cfg)
@@ -1436,6 +1689,7 @@ def _migrate_mutual_traffic_config(cfg: dict) -> dict:
             "mutual_traffic_comment",
             "mutual_traffic_author_follow",
             "mutual_traffic_followers_follow",
+            "mutual_traffic_follow_only",
         )
     )
     out.pop("mutual_left_swipe_follow", None)
@@ -1447,7 +1701,8 @@ def _migrate_mutual_traffic_config(cfg: dict) -> dict:
         out.setdefault("mutual_traffic_comment", True)
         out.setdefault("mutual_traffic_author_follow", True)
         out.setdefault("mutual_traffic_followers_follow", True)
-    return out
+    out.setdefault("mutual_traffic_follow_only", False)
+    return _normalize_mutual_traffic_action_mutex(out)
 
 
 def _build_effective_template_bundle(username: str, data: dict) -> tuple[Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
@@ -1566,6 +1821,10 @@ def _normalize_user_runtime_state(raw_state: dict | None) -> dict:
     result["configs_by_mode"] = {mode: dict(active_config) for mode in RUN_MODES}
     result["default_config"] = dict(active_config)
     result["alias_template_by_mode"] = alias_template_by_mode
+    result["smart_template_config"] = _normalize_smart_template_config(data.get("smart_template_config"))
+    result["alias_smart_template_by_mode"] = _normalize_alias_smart_template_by_mode(
+        data.get("alias_smart_template_by_mode"),
+    )
     return result
 
 
@@ -1588,7 +1847,27 @@ def _resolve_template_for_mode_alias(
     mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
     alias_clean = _normalize_alias_key(alias)
     account_clean = _normalize_tiktok_username_key(tiktok_username or "")
+    if not account_clean and alias_clean:
+        account_clean = _resolve_switch_highlight_tiktok_username(owner_username, alias_clean)
     account_key = _alias_account_template_key(alias_clean, account_clean) if account_clean else ""
+
+    if alias_clean and _alias_smart_template_enabled(data, mode_key, alias_clean):
+        selected_name, smart_debug = _resolve_smart_template_for_alias(
+            owner_username,
+            data,
+            mode_key,
+            alias_clean,
+            templates,
+        )
+        config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
+        print(
+            f"[{now_text()}] 智能模板 | owner={owner_username} mode={mode_key} alias={alias_clean} "
+            f"account={account_clean or '-'} branch={smart_debug.get('branch')} "
+            f"followers={smart_debug.get('follower_count')} videos={smart_debug.get('video_count')} "
+            f"selected={selected_name}"
+        )
+        return selected_name, config, templates, template_meta
+
     alias_map_all = data.get("alias_template_by_mode", {})
     raw_ref = ""
     template_source_hint = ""
@@ -2025,6 +2304,35 @@ class AliasTemplateSelectRequest(BaseModel):
     )
 
 
+class SmartTemplateBranchEntry(BaseModel):
+    template_name: str = Field(..., min_length=1, max_length=128)
+    weight: int = Field(default=100, ge=0, le=10000)
+
+
+class SmartTemplateConfigRequest(BaseModel):
+    old_branch_min_followers: int = Field(default=100, ge=0, le=10_000_000)
+    old_branch_min_video_count: int = Field(default=15, ge=0, le=10_000_000)
+    new_branch_templates: List[SmartTemplateBranchEntry] = Field(default_factory=list)
+    old_branch_templates: List[SmartTemplateBranchEntry] = Field(default_factory=list)
+
+
+class AliasSmartTemplateToggleRequest(BaseModel):
+    alias: str = Field(..., min_length=1, max_length=64)
+    enabled: bool
+    mode: Literal["growth", "live", "direct", "mutual"] | None = None
+    owner_username: str | None = Field(default=None, max_length=64)
+
+
+class SmartTemplatePreviewItem(BaseModel):
+    alias: str = Field(..., min_length=1, max_length=64)
+    mode: Literal["growth", "live", "direct", "mutual"] | None = None
+    owner_username: str | None = Field(default=None, max_length=64)
+
+
+class SmartTemplatePreviewRequest(BaseModel):
+    items: List[SmartTemplatePreviewItem] = Field(default_factory=list)
+
+
 class TemplateGrantUpsertRequest(BaseModel):
     target_username: str = Field(..., min_length=1, max_length=64)
     source_username: str = Field(default="", max_length=64)
@@ -2361,6 +2669,7 @@ class UpdateConfigRequest(BaseModel):
     mutual_traffic_comment: bool | None = None
     mutual_traffic_author_follow: bool | None = None
     mutual_traffic_followers_follow: bool | None = None
+    mutual_traffic_follow_only: bool | None = None
     mutual_left_swipe_follow: bool | None = None  # 已废弃，保存时忽略；读模板时迁移为三项开关
     growth_pull_batches_before_auto_mutual: int | None = None
 
@@ -2799,6 +3108,65 @@ def _backup_record_alias_expr() -> str:
     return "COALESCE(NULLIF(TRIM(assigned_alias), ''), device_alias)"
 
 
+def _device_editor_search_sql(search: str, *, table_alias: str = "device_editor_rows") -> tuple[str, list[Any]]:
+    """备份档案列表模糊筛选：username / 别名 / 备份名 / 路径及关联账号字段。"""
+    q = str(search or "").strip().lower()
+    if not q:
+        return "", []
+    pattern = f"%{q}%"
+    ta = table_alias
+    sql = f"""
+        AND (
+            LOWER(TRIM({ta}.username)) LIKE ?
+            OR LOWER(TRIM({ta}.device_alias)) LIKE ?
+            OR LOWER(TRIM({ta}.assigned_alias)) LIKE ?
+            OR LOWER(TRIM({ta}.backup_name)) LIKE ?
+            OR LOWER(TRIM({ta}.backup_path)) LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM account_editor_rows a
+                WHERE a.owner_username = {ta}.owner_username
+                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND (
+                    LOWER(TRIM(a.username)) LIKE ?
+                    OR LOWER(TRIM(a.assigned_alias)) LIKE ?
+                    OR LOWER(TRIM(a.email)) LIKE ?
+                    OR LOWER(TRIM(a.region)) LIKE ?
+                  )
+            )
+        )
+    """
+    return sql, [pattern] * 9
+
+
+def _sync_account_aliases_to_device_rows(conn: sqlite3.Connection, owner_username: str) -> int:
+    """将账号记录中的 assigned_alias 同步到同 username 的设备备份行（修复仅账号表有别名的情况）。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return 0
+    rows = conn.execute(
+        """
+        SELECT username, assigned_alias, region
+        FROM account_editor_rows
+        WHERE owner_username = ? AND TRIM(COALESCE(assigned_alias, '')) <> ''
+        ORDER BY row_index ASC
+        """,
+        (owner,),
+    ).fetchall()
+    touched = 0
+    for row in rows or []:
+        uname = str(row["username"] or "").strip()
+        alias = _normalized_alias(row["assigned_alias"])
+        region = _normalized_alias(row["region"])
+        if not uname or not alias:
+            continue
+        touched += _upsert_backup_record_for_account(
+            owner, uname, alias, region, conn=conn, commit=False
+        )
+    if touched:
+        conn.commit()
+    return touched
+
+
 def _prune_orphan_device_editor_rows(conn: sqlite3.Connection, owner_username: str) -> int:
     """删除账号记录已不存在、但 device_editor_rows 仍残留的备份档案（脏数据）。"""
     owner = str(owner_username or "").strip()
@@ -3047,6 +3415,47 @@ def _restore_device_auto_start_opt_out_after_cut_switch(device_id: str, alias: s
     """兼容旧调用：切号成功后恢复自动开启参与。"""
     result = _ensure_device_auto_start_after_cut_switch(device_id, alias=alias)
     return bool(result.get("opt_out_cleared") or result.get("auto_start_resumed"))
+
+
+# 发作品/切号/改资料等临时关闭 opt_out 的任务；上报结束（成功或失败）后应恢复参与自动开启。
+_TRANSIENT_AUTO_START_RESTORE_OP_TYPES = frozenset(
+    {
+        "tiktok_clear",
+        "tiktok_backup_and_clear",
+        "tiktok_restore",
+        "tiktok_edit_basic_profile",
+    }
+)
+
+
+def _restore_device_auto_start_participation(
+    device_id: str,
+    alias: str = "",
+    reason: str = "",
+) -> bool:
+    """任务结束后恢复设备参与云端自动开启（与成功与否无关；不含管理台手动 opt_out 的语义变更）。"""
+    did = (device_id or "").strip()
+    if not did:
+        return False
+    dev_alias = ""
+    cleared = False
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return False
+        dev_alias = str(dev.alias or alias or "").strip()
+        if dev.auto_start_opt_out:
+            dev.auto_start_opt_out = False
+            cleared = True
+    if cleared:
+        _persist_client_device_to_db(did)
+        extra = f" | {reason}" if reason else ""
+        alias_note = f"（alias={dev_alias}）" if dev_alias else ""
+        _append_device_log(
+            did,
+            f"[{now_text()}] 云端后台 | 任务结束，已恢复该设备自动开启程序{extra}{alias_note}",
+        )
+    return cleared
 
 
 def _beijing_now() -> datetime:
@@ -3711,6 +4120,116 @@ def _start_backup_stats_full_query_worker() -> None:
     ).start()
 
 
+def _mobile_pending_auto_refill_log(line: str) -> None:
+    text = str(line or "").strip()
+    if not text:
+        return
+    print(f"[{now_text()}] mobile_pending_auto_refill | {text}")
+
+
+def _count_mobile_pending_pending() -> int:
+    conn = _get_db()
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(1) FROM mobile_pending_usernames WHERE consume_status = 'pending'"
+            ).fetchone()[0]
+            or 0
+        )
+    finally:
+        conn.close()
+
+
+def _refill_mobile_pending_from_all_roots() -> dict:
+    """将全部 tiktok_roots 写入待下发队列（与后台「将所有根用户加入待下发队列」一致）。"""
+    conn = _get_db()
+    try:
+        rows = conn.execute("SELECT root_username FROM tiktok_roots ORDER BY root_username ASC").fetchall()
+        usernames = [str(r["root_username"] or "").strip() for r in rows]
+    finally:
+        conn.close()
+    usernames = [u for u in usernames if u]
+    if not usernames:
+        return {"code": 1, "msg": "tiktok_roots 为空，无可下发用户"}
+    result = _insert_mobile_pending_usernames(usernames, skip_privacy_filter=True)
+    result["selected"] = len(usernames)
+    return result
+
+
+def _mobile_pending_auto_refill_worker(pending_before: int, threshold: int) -> None:
+    try:
+        _mobile_pending_auto_refill_log(
+            f"[{now_text()}] 待下发 {pending_before} < 阈值 {threshold}，开始将全部根用户写入待下发队列..."
+        )
+        result = _refill_mobile_pending_from_all_roots()
+        inserted = int(result.get("inserted") or result.get("count") or 0)
+        selected = int(result.get("selected") or 0)
+        pending_after = _count_mobile_pending_pending()
+        msg = str(result.get("msg") or "")
+        if int(result.get("code") or 0) != 0:
+            _mobile_pending_auto_refill_log(f"[{now_text()}] 自动补货失败：{msg}")
+        else:
+            _mobile_pending_auto_refill_log(
+                f"[{now_text()}] 自动补货完成：新增 {inserted} 条，根用户 {selected} 条，"
+                f"待下发 {pending_before} → {pending_after}"
+            )
+    except Exception as exc:
+        _mobile_pending_auto_refill_log(f"[{now_text()}] 自动补货异常：{exc}")
+        print(f"[{now_text()}] mobile_pending_auto_refill | failed | {exc}")
+    finally:
+        with store.lock:
+            store.mobile_pending_auto_refill_in_flight = False
+            store.mobile_pending_auto_refill_last_run_ts = time.time()
+
+
+def _mobile_pending_auto_refill_tick() -> None:
+    threshold = MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD
+    cooldown_sec = MOBILE_PENDING_AUTO_REFILL_DEFAULT_COOLDOWN_SEC
+    with store.lock:
+        if store.mobile_pending_auto_refill_in_flight:
+            return
+        last_ts = float(store.mobile_pending_auto_refill_last_run_ts or 0.0)
+    if last_ts > 0 and (time.time() - last_ts) < cooldown_sec:
+        return
+
+    pending_count = _count_mobile_pending_pending()
+    if pending_count >= threshold:
+        return
+
+    with store.lock:
+        if store.mobile_pending_auto_refill_in_flight:
+            return
+        store.mobile_pending_auto_refill_in_flight = True
+
+    Thread(
+        target=_mobile_pending_auto_refill_worker,
+        args=(pending_count, threshold),
+        name="mobile_pending_auto_refill",
+        daemon=True,
+    ).start()
+
+
+def _mobile_pending_auto_refill_worker_loop() -> None:
+    _mobile_pending_auto_refill_log(
+        f"调度已启动：待下发 < {MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD} 时自动将全部根用户加入待下发队列"
+    )
+    while True:
+        try:
+            _mobile_pending_auto_refill_tick()
+        except Exception as exc:
+            _mobile_pending_auto_refill_log(f"调度异常: {exc}")
+            print(f"[{now_text()}] mobile_pending_auto_refill | tick_exc | {exc}")
+        time.sleep(MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC)
+
+
+def _start_mobile_pending_auto_refill_worker() -> None:
+    Thread(
+        target=_mobile_pending_auto_refill_worker_loop,
+        name="mobile_pending_auto_refill_scheduler",
+        daemon=True,
+    ).start()
+
+
 def _get_device_editor_record(username: str, mobile_alias: str | None = None):
     conn = _get_db()
     try:
@@ -3987,41 +4506,44 @@ def _sync_device_editor_username_for_account(
     return _run_update(scope_by_alias=False)
 
 
-def _link_backup_record_alias_for_username(username: str, assigned_alias: str) -> int:
+def _link_backup_record_alias_for_username(
+    username: str,
+    assigned_alias: str,
+    *,
+    owner_username: str = "",
+    conn: sqlite3.Connection | None = None,
+    commit: bool = True,
+) -> int:
     uname = _normalized_alias(username).lstrip("@").lower()
     alias = _normalized_alias(assigned_alias)
+    owner = str(owner_username or "").strip()
     if not uname or not alias:
         return 0
-    conn = _get_db()
+    own_conn = conn is None
+    db = conn or _get_db()
     try:
-        rows = conn.execute(
-            """
-            SELECT row_index, assigned_alias
-            FROM device_editor_rows
-            WHERE LOWER(username) = ?
-            ORDER BY updated_at DESC, row_index DESC
-            """,
-            (uname,),
-        ).fetchall()
         now = now_text()
-        touched = 0
-        for row in rows:
-            current = _normalized_alias(row["assigned_alias"])
-            if current and current != alias:
-                continue
-            cur = conn.execute(
-                """
-                UPDATE device_editor_rows
-                SET assigned_alias = ?, updated_at = ?
-                WHERE row_index = ? AND COALESCE(NULLIF(TRIM(assigned_alias), ''), device_alias) IN ('', ?)
-                """,
-                (alias, now, int(row["row_index"]), alias),
-            )
-            touched += int(cur.rowcount or 0)
-        conn.commit()
+        sql = """
+            UPDATE device_editor_rows
+            SET assigned_alias = ?, updated_at = ?
+            WHERE LOWER(TRIM(username)) = ?
+              AND (
+                TRIM(COALESCE(assigned_alias, '')) = ''
+                OR LOWER(TRIM(assigned_alias)) = LOWER(?)
+              )
+        """
+        params: list[Any] = [alias, now, uname, alias]
+        if owner:
+            sql += " AND owner_username = ?"
+            params.append(owner)
+        cur = db.execute(sql, params)
+        touched = int(cur.rowcount or 0)
+        if commit and own_conn:
+            db.commit()
         return touched
     finally:
-        conn.close()
+        if own_conn:
+            db.close()
 
 
 def _upsert_backup_record_for_account(
@@ -4029,6 +4551,9 @@ def _upsert_backup_record_for_account(
     username: str,
     assigned_alias: str,
     region: str = "",
+    *,
+    conn: sqlite3.Connection | None = None,
+    commit: bool = True,
 ) -> int:
     owner = _normalized_alias(owner_username)
     uname = _normalized_alias(username).lstrip("@")
@@ -4036,22 +4561,23 @@ def _upsert_backup_record_for_account(
     region_text = _normalized_alias(region)
     if not owner or not uname or not alias:
         return 0
-    conn = _get_db()
+    own_conn = conn is None
+    db = conn or _get_db()
     try:
         now = now_text()
-        existing = conn.execute(
-            f"""
+        existing = db.execute(
+            """
             SELECT row_index
             FROM device_editor_rows
-            WHERE owner_username = ? AND LOWER(username) = LOWER(?) AND {_backup_record_alias_expr()} = ?
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
             ORDER BY updated_at DESC, row_index DESC
             LIMIT 1
             """,
-            (owner, uname, alias),
+            (owner, uname),
         ).fetchone()
         if existing:
             rid = int(existing["row_index"])
-            cur = conn.execute(
+            cur = db.execute(
                 """
                 UPDATE device_editor_rows
                 SET username = ?,
@@ -4063,15 +4589,17 @@ def _upsert_backup_record_for_account(
                 """,
                 (uname, alias, alias, region_text, region_text, now, owner, rid),
             )
-            conn.commit()
-            return int(cur.rowcount or 0)
+            touched = int(cur.rowcount or 0)
+            if commit and own_conn:
+                db.commit()
+            return touched
 
-        max_row = conn.execute(
+        max_row = db.execute(
             "SELECT COALESCE(MAX(row_index), -1) FROM device_editor_rows WHERE owner_username = ?",
             (owner,),
         ).fetchone()[0]
         row_index = int(max_row) + 1
-        conn.execute(
+        db.execute(
             """
             INSERT INTO device_editor_rows
                 (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at)
@@ -4079,10 +4607,12 @@ def _upsert_backup_record_for_account(
             """,
             (owner, row_index, alias, region_text, uname, alias, now),
         )
-        conn.commit()
+        if commit and own_conn:
+            db.commit()
         return 1
     finally:
-        conn.close()
+        if own_conn:
+            db.close()
 
 
 def _patch_latest_backup_row_by_alias(
@@ -5365,7 +5895,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 return {"code": 1, "msg": "您已使用过该设备别名，请更换别名"}
             if row_owner != owner:
                 conn.execute(
-                    "UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, auto_start_opt_out = 1, updated_at = ? WHERE device_id = ?",
+                    "UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, updated_at = ? WHERE device_id = ?",
                     (owner, alias, row_group, now_text(), existing_id),
                 )
                 conn.commit()
@@ -5374,7 +5904,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 return {"code": 0, "msg": "绑定成功", "device_id": existing_id, "alias": alias}
             if old_alias != alias:
                 conn.execute(
-                    "UPDATE client_devices SET alias = ?, device_group = ?, auto_start_opt_out = 1, updated_at = ? WHERE device_id = ?",
+                    "UPDATE client_devices SET alias = ?, device_group = ?, updated_at = ? WHERE device_id = ?",
                     (alias, row_group, now_text(), existing_id),
                 )
             conn.commit()
@@ -5396,7 +5926,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
         conn.execute(
             """
             INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'offline', 0, 0, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'offline', 0, 0, 0, ?, ?)
             """,
             (device_id, owner, alias, row_group, fp, t, t),
         )
@@ -5530,7 +6060,135 @@ def get_runtime_config(response: Response, authorization: str | None = Header(de
         "alias_template_by_mode",
         {"growth": {}, "live": {}, "direct": {}, "mutual": {}},
     )
+    resp["smart_template_config"] = data.get("smart_template_config") or dict(DEFAULT_SMART_TEMPLATE_CONFIG)
+    resp["alias_smart_template_by_mode"] = data.get("alias_smart_template_by_mode") or {
+        mode: {} for mode in RUN_MODES
+    }
     return {"code": 0, "data": resp}
+
+
+@app.post("/api/admin/smart_template/config")
+def save_smart_template_config(
+    payload: SmartTemplateConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(session["username"]))
+    data["smart_template_config"] = _normalize_smart_template_config(
+        {
+            "old_branch_min_followers": payload.old_branch_min_followers,
+            "old_branch_min_video_count": payload.old_branch_min_video_count,
+            "new_branch_templates": [e.model_dump() for e in payload.new_branch_templates],
+            "old_branch_templates": [e.model_dump() for e in payload.old_branch_templates],
+        },
+    )
+    _save_user_runtime_state(session["username"], data)
+    return {
+        "code": 0,
+        "msg": "智能模板规则已保存",
+        "smart_template_config": data["smart_template_config"],
+    }
+
+
+@app.post("/api/admin/alias_smart_template/toggle")
+def toggle_alias_smart_template(
+    payload: AliasSmartTemplateToggleRequest,
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    target_username = session["username"]
+    requested_owner = str(payload.owner_username or "").strip()
+    if requested_owner:
+        if session.get("role") != "admin" and requested_owner != session["username"]:
+            return {"code": 1, "msg": "无权限修改其他用户智能模板开关"}
+        target_username = requested_owner
+    alias = _normalize_alias_key(payload.alias)
+    if not alias:
+        return {"code": 1, "msg": "alias不能为空"}
+    data = _normalize_user_runtime_state(_load_user_runtime_state(target_username))
+    mode = "growth"
+    by_mode = data.get("alias_smart_template_by_mode")
+    if not isinstance(by_mode, dict):
+        by_mode = {m: {} for m in RUN_MODES}
+    mode_map = by_mode.get(mode)
+    if not isinstance(mode_map, dict):
+        mode_map = {}
+    if payload.enabled:
+        mode_map[alias] = True
+    else:
+        mode_map.pop(alias, None)
+    by_mode[mode] = mode_map
+    data["alias_smart_template_by_mode"] = _normalize_alias_smart_template_by_mode(by_mode)
+    _save_user_runtime_state(target_username, data)
+    templates, _meta = _build_effective_template_bundle(target_username, data)
+    resolved_name = ""
+    resolved_debug: dict[str, object] = {}
+    if payload.enabled and templates:
+        resolved_name, resolved_debug = _resolve_smart_template_for_alias(
+            target_username,
+            data,
+            mode,
+            alias,
+            templates,
+        )
+    return {
+        "code": 0,
+        "msg": "已启用智能模板" if payload.enabled else "已关闭智能模板",
+        "owner_username": target_username,
+        "mode": mode,
+        "alias": alias,
+        "enabled": bool(payload.enabled),
+        "alias_smart_template_by_mode": data["alias_smart_template_by_mode"],
+        "resolved_template": resolved_name,
+        "resolution": resolved_debug,
+    }
+
+
+@app.post("/api/admin/smart_template/preview")
+def preview_smart_templates(
+    payload: SmartTemplatePreviewRequest,
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    is_admin = session.get("role") == "admin"
+    results: dict[str, dict[str, object]] = {}
+    for item in payload.items or []:
+        alias = _normalize_alias_key(item.alias)
+        if not alias:
+            continue
+        owner = str(item.owner_username or session["username"]).strip()
+        if not owner:
+            continue
+        if not is_admin and owner != session["username"]:
+            continue
+        mode = item.mode if item.mode in RUN_MODES else "growth"
+        data = _normalize_user_runtime_state(_load_user_runtime_state(owner))
+        templates, _meta = _build_effective_template_bundle(owner, data)
+        enabled = _alias_smart_template_enabled(data, mode, alias)
+        key = f"{owner}::{mode}::{alias}"
+        if not enabled:
+            manual_name, _, _, _ = _resolve_template_for_mode_alias(owner, data, mode, alias)
+            results[key] = {
+                "enabled": False,
+                "resolved_template": manual_name,
+            }
+            continue
+        if not templates:
+            results[key] = {"enabled": True, "resolved_template": "", "resolution": {}}
+            continue
+        resolved_name, debug = _resolve_smart_template_for_alias(owner, data, mode, alias, templates)
+        results[key] = {
+            "enabled": True,
+            "resolved_template": resolved_name,
+            "resolution": debug,
+        }
+    return {"code": 0, "results": results}
 
 
 @app.get("/api/admin/template_inventory")
@@ -6816,9 +7474,21 @@ def device_ops_report(payload: DeviceOpReportRequest):
         "opt_out_cleared": False,
         "auto_start_resumed": False,
     }
+    op_type_reported = str(data.get("op_type") or "").strip() if isinstance(data, dict) else ""
+    preserve_opt_out = bool(data.get("preserve_auto_start_opt_out")) if isinstance(data, dict) else False
+    if (
+        isinstance(data, dict)
+        and not preserve_opt_out
+        and op_type_reported in _TRANSIENT_AUTO_START_RESTORE_OP_TYPES
+    ):
+        cut_switch_auto_start["opt_out_cleared"] = _restore_device_auto_start_participation(
+            payload.device_id,
+            payload.alias or "",
+            reason=f"op={op_type_reported} status={payload.status}",
+        )
     if payload.status == "success" and isinstance(data, dict):
         owner_u = str(device.owner_username or "").strip()
-        op_type = str(data.get("op_type") or "").strip()
+        op_type = op_type_reported
         if owner_u:
             if op_type in ("tiktok_backup_and_clear", "tiktok_clear"):
                 _device_ops_apply_cut_switch_after_backup(owner_u, data)
@@ -7671,17 +8341,20 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
             _sync_device_editor_username_for_account(
                 conn, owner, existing_username, new_username, persisted_alias
             )
-        conn.commit()
         link_username = new_username or existing_username
         if persisted_alias and link_username:
-            _link_backup_record_alias_for_username(link_username, persisted_alias)
-        if persisted_alias:
+            _link_backup_record_alias_for_username(
+                link_username, persisted_alias, owner_username=owner, conn=conn, commit=False
+            )
             _upsert_backup_record_for_account(
                 owner,
-                new_username,
+                link_username,
                 persisted_alias,
                 payload.region,
+                conn=conn,
+                commit=False,
             )
+        conn.commit()
         return {"code": 0, "msg": "账号记录已保存", "row_index": payload.row_index, "assigned_alias_locked": alias_locked or bool(persisted_alias)}
     finally:
         conn.close()
@@ -7820,6 +8493,7 @@ def list_device_editor_rows(
     page: int = 1,
     page_size: int = 20,
     device_group: str = "",
+    search: str = "",
     authorization: str | None = Header(default=None),
 ):
     session = _current_session({"authorization": authorization} if authorization else {})
@@ -7830,6 +8504,7 @@ def list_device_editor_rows(
     offset = (safe_page - 1) * safe_size
     alias_expr = _backup_record_alias_expr()
     group_sql, group_params = _device_group_filter_sql(str(device_group or "").strip(), alias_expr)
+    search_sql, search_params = _device_editor_search_sql(search)
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
@@ -7837,25 +8512,28 @@ def list_device_editor_rows(
         pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
         if pruned:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        _sync_account_aliases_to_device_rows(conn, owner)
+        if pruned:
+            _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         count_row = conn.execute(
             f"""
             SELECT COUNT(DISTINCT {alias_expr})
             FROM device_editor_rows
-            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}
+            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}{search_sql}
             """,
-            (owner, *group_params),
+            (owner, *group_params, *search_params),
         ).fetchone()
         total_aliases = int(count_row[0] if count_row else 0)
         alias_rows = conn.execute(
             f"""
             SELECT DISTINCT {alias_expr} AS eff_alias
             FROM device_editor_rows
-            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}
+            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}{search_sql}
             ORDER BY eff_alias ASC
             LIMIT ? OFFSET ?
             """,
-            (owner, *group_params, safe_size, offset),
+            (owner, *group_params, *search_params, safe_size, offset),
         ).fetchall()
         page_aliases = [str(r[0]).strip() for r in alias_rows if str(r[0] or "").strip()]
         if not page_aliases:
@@ -7866,25 +8544,47 @@ def list_device_editor_rows(
                 "page_size": safe_size,
                 "total": total_aliases,
                 "alias_page_aliases": [],
+                "search": str(search or "").strip(),
             }
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
             f"""
             SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
-            WHERE owner_username = ? AND {alias_expr} IN ({placeholders})
+            WHERE owner_username = ? AND {alias_expr} IN ({placeholders}){search_sql}
             ORDER BY {alias_expr} ASC, row_index ASC
             """,
-            (owner, *page_aliases),
+            (owner, *page_aliases, *search_params),
         ).fetchall()
+        account_alias_by_user: dict[str, str] = {}
+        acct_rows = conn.execute(
+            """
+            SELECT username, assigned_alias
+            FROM account_editor_rows
+            WHERE owner_username = ? AND TRIM(COALESCE(assigned_alias, '')) <> ''
+            """,
+            (owner,),
+        ).fetchall()
+        for ar in acct_rows or []:
+            u = str(ar["username"] or "").strip().lower()
+            if u and u not in account_alias_by_user:
+                account_alias_by_user[u] = str(ar["assigned_alias"] or "").strip()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            ukey = str(item.get("username") or "").strip().lower()
+            if ukey and ukey in account_alias_by_user:
+                item["account_assigned_alias"] = account_alias_by_user[ukey]
+            items.append(item)
         return {
             "code": 0,
-            "items": [dict(r) for r in rows],
+            "items": items,
             "page": safe_page,
             "page_size": safe_size,
             "total": total_aliases,
             "alias_page_aliases": page_aliases,
             "device_groups": _list_distinct_device_groups(session),
+            "search": str(search or "").strip(),
         }
     finally:
         conn.close()
@@ -9319,18 +10019,7 @@ def add_mobile_pending_from_latest_roots(payload: AddLatestRootsToPendingRequest
 @app.post("/api/admin/mobile_pending_usernames/add_all_roots")
 def add_mobile_pending_from_all_roots():
     """后台「将全部 tiktok_roots 加入待下发队列」：服务端直接读库分批写入，不做私密判定。"""
-    conn = _get_db()
-    try:
-        rows = conn.execute("SELECT root_username FROM tiktok_roots ORDER BY root_username ASC").fetchall()
-        usernames = [str(r["root_username"] or "").strip() for r in rows]
-    finally:
-        conn.close()
-    usernames = [u for u in usernames if u]
-    if not usernames:
-        return {"code": 1, "msg": "tiktok_roots 为空，无可下发用户"}
-    result = _insert_mobile_pending_usernames(usernames, skip_privacy_filter=True)
-    result["selected"] = len(usernames)
-    return result
+    return _refill_mobile_pending_from_all_roots()
 
 
 @app.get("/api/admin/mobile_pending_usernames/export")
@@ -9721,6 +10410,7 @@ def update_config(payload: UpdateConfigRequest, authorization: str | None = Head
         templates[active_template] = seed
     current = dict(templates.get(active_template, MODE_DEFAULT_CONFIGS["growth"]))
     current.update(incoming)
+    current = _normalize_mutual_traffic_action_mutex(current)
     templates[active_template] = current
     data["active_template"] = active_template
     data["configs_by_template"] = templates
@@ -10460,3 +11150,4 @@ def admin_logs_snapshot(
 
 _start_auto_switch_worker()
 _start_backup_stats_full_query_worker()
+_start_mobile_pending_auto_refill_worker()

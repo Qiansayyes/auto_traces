@@ -112,6 +112,8 @@ data class AppConfig(
     val mutual_traffic_author_follow: Boolean = true,
     /** 引流：是否复制用户名并进入 Followers 列表点 Follow（计入上限；可与作者区独立开关）。 */
     val mutual_traffic_followers_follow: Boolean = true,
+    /** 与上述三项引流动作互斥：互点-仅关注（进评论区关注，不发评/不点作者区与 Followers 列表）。 */
+    val mutual_traffic_follow_only: Boolean = false,
     /** 已废弃：涨粉满批后自动引流。引流仅在设备 App「互点模式」下独立运行，本字段忽略。 */
     val growth_pull_batches_before_auto_mutual: Int = -1,
     // 评论动作内部细分（文字）

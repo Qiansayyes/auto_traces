@@ -65,6 +65,7 @@
       <nav id="mainNav">
         <div class="nav-group-title">设备管理模块</div>
         <button class="nav-item active" data-section="overview">设备概览</button>
+        <button class="nav-item" data-section="smart-template">智能模板</button>
         <button class="nav-item" data-section="config">运行配置</button>
         <div class="nav-group-title">账号管理模块</div>
         <button class="nav-item" data-section="account-manager">账号表单与账号记录</button>
@@ -104,8 +105,8 @@
             <button id="growthModeBtn" class="primary">涨粉模式</button>
             <button id="liveModeBtn" class="ghost">主播访问模式</button>
             <button id="cvModeBtn" class="ghost">直客访问模式</button>
-            <button id="mutualStartSelectedBtn" class="ghost" title="下发互点引流会话；不依赖手机 App 本机模式">启动所选设备互点（引流）</button>
-            <button id="mutualFollowOnlySelectedBtn" class="ghost" type="button" title="独立方案：进 teamwork Videos 后仅打开评论区（区内步骤待实现），不受模板引流动作勾选影响">互点-仅关注</button>
+            <button id="mutualStartSelectedBtn" class="ghost" title="下发互点会话：模板勾选「互点-仅关注」时走仅关注分支，否则走引流（评论/作者区/Followers）；与模板三项互斥">启动所选设备互点（引流）</button>
+            <button id="mutualFollowOnlySelectedBtn" class="ghost" type="button" title="互点分支：强制下发仅关注会话（与模板中评论/作者区/Followers 三项互斥，不可同时勾选）">互点-仅关注</button>
             <button id="publishPostStartSelectedBtn" class="ghost" type="button" title="对勾选设备下发：关闭云端自动开启→关开 TikTok→屏中点→OCR「While using the app」；互点/引流会话进行中设备端会自动排队">发布作品</button>
             <button id="startSelected" class="primary">启动所选设备</button>
             <button id="startAll" class="ghost">启动全部在线设备</button>
@@ -164,6 +165,7 @@
                 <th>别名</th>
                 <th>分组</th>
                 <th class="admin-only">归属客户</th>
+                <th>智能模板</th>
                 <th>模板（当前模式）</th>
                 <th>状态</th>
                 <th>待启动</th>
@@ -624,9 +626,10 @@
               <button id="importAccountBatchBtn" class="primary">批量导入账号</button>
             </div>
           </div>
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;flex-wrap:wrap;">
             <h3 style="margin:0;">账号记录</h3>
             <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+              <input id="accountRecordsSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 邮箱 / 地区…" style="min-width:220px;max-width:320px;" autocomplete="off" />
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#666;">
                 <input id="accountUnassignedOnlyToggle" type="checkbox" />
                 仅展示未分配别名
@@ -662,7 +665,7 @@
               </div>
               <div class="hint" style="margin-top:6px;">会从账号表单里自动挑选该地区“未登录且未分配”的账号，按上方数量写入设备档案（不足时分配实际可用条数）。</div>
             </div>
-            <div class="field">
+            <div class="field hidden">
               <label>TikTok 包名</label>
               <input id="backupPackageNameInput" type="text" value="com.zhiliaoapp.musically" />
             </div>
@@ -690,12 +693,13 @@
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>
               <button id="backupArchiveSelectAllPageBtn" type="button" class="ghost" title="勾选当前页全部备份记录">全选本页</button>
               <button id="backupArchiveClearSelectionBtn" type="button" class="ghost" title="取消全部勾选">取消选择</button>
-              <button id="exportBackupArchiveSelectedXlsxBtn" type="button" class="ghost" title="仅导出已勾选的备份档案">导出选中</button>
-              <button id="exportBackupArchiveXlsxBtn" type="button" class="ghost" title="导出当前分组下全部备份档案（一行一条，含关联账号字段）">导出 xlsx</button>
+              <button id="exportBackupArchiveSelectedXlsxBtn" type="button" class="ghost" title="将表格中已勾选的备份档案导出为 xlsx（一行一条）">导出已选 xlsx</button>
+              <button id="exportBackupArchiveXlsxBtn" type="button" class="ghost" title="将当前设备分组筛选下的全部备份档案导出为 xlsx（一行一条，含关联账号字段）">导出分组全部 xlsx</button>
               <button id="importBackupArchiveXlsxBtn" type="button" class="ghost" title="从 xlsx 批量导入；按 username 去重（文件内重复与库内已有均跳过）">导入 xlsx</button>
               <input id="backupArchiveImportFileInput" type="file" accept=".xlsx" style="display:none;" />
             </div>
             <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <input id="backupArchiveSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 备份名…" style="min-width:220px;max-width:320px;" autocomplete="off" title="模糊匹配；支持子序列匹配（如 uk6 可匹配 uk16）" />
               <button id="backupArchivePrevPageBtn" type="button" class="ghost">上一页</button>
               <span id="deviceAliasGroupsPager" class="hint">第 1 / 1 页</span>
               <button id="backupArchiveNextPageBtn" type="button" class="ghost">下一页</button>
@@ -1001,6 +1005,47 @@
         </div>
       </section>
 
+      <section id="smart-template" class="panel">
+        <header>
+          <h2>智能模板</h2>
+          <p>按设备别名桶内<strong>切号高亮</strong>账号的粉丝数、作品数判断走「新号分支」或「老号分支」，再按<strong>概率</strong>稳定命中该分支下的具体模板。<strong>暂仅涨粉模式</strong>生效；设备概览在涨粉模式下可对单台启用，启用后手动模板下拉不可用。</p>
+        </header>
+        <div class="panel-card">
+          <h3 style="margin:0 0 10px;">老号分支判定（同时满足）</h3>
+          <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+            <div class="field">
+              <label>粉丝数大于</label>
+              <input id="smartOldMinFollowers" type="number" min="0" step="1" value="100" />
+            </div>
+            <div class="field">
+              <label>作品数大于</label>
+              <input id="smartOldMinVideos" type="number" min="0" step="1" value="15" />
+            </div>
+          </div>
+          <p class="hint" style="margin:8px 0 0;">不满足上述条件时走<strong>新号分支</strong>。阈值为严格大于（例如填 100 表示粉丝数须 &gt; 100）。</p>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <h3 style="margin:0;">新号分支 · 模板概率</h3>
+            <button type="button" id="smartAddNewBranchRow" class="ghost">添加一行</button>
+          </div>
+          <div id="smartNewBranchRows" class="smart-template-weight-rows"></div>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <h3 style="margin:0;">老号分支 · 模板概率</h3>
+            <button type="button" id="smartAddOldBranchRow" class="ghost">添加一行</button>
+          </div>
+          <div id="smartOldBranchRows" class="smart-template-weight-rows"></div>
+          <p class="hint" style="margin:10px 0 0;">同一分支内各模板填写相对概率（数值越大占比越高）；同一别名+高亮账号+分支下命中结果稳定，换高亮或跨分支后会重新计算。</p>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" id="saveSmartTemplateConfigBtn" class="primary">保存智能模板规则</button>
+          <button type="button" id="reloadSmartTemplateConfigBtn" class="ghost">重新加载</button>
+        </div>
+        <div id="smartTemplateConfigStatus" class="hint" style="margin-top:8px;"></div>
+      </section>
+
       <section id="config" class="panel">
         <header>
           <h2>运行配置</h2>
@@ -1264,7 +1309,11 @@ so cute</textarea>
                   </ul>
                 </div>
                 <div class="config-subcard__col config-subcard__col--accent">
-                  <p class="hint hint--below-title">进 teamwork Videos 后每条作品可独立组合（至少勾一项才有对应动作）。</p>
+                  <p class="hint hint--below-title">进 teamwork Videos 后每条作品可独立组合（引流三项至少勾一项才有对应动作）。<strong>互点-仅关注</strong>与下方三项互斥，只能择一方案。</p>
+                  <label class="checkbox-inline" id="mutualTrafficFollowOnlyLabel">
+                    <input name="mutual_traffic_follow_only" type="checkbox" />
+                    <span class="checkbox-inline__text">互点-仅关注</span>
+                  </label>
                   <label class="checkbox-inline">
                     <input name="mutual_traffic_comment" type="checkbox" checked />
                     <span class="checkbox-inline__text">评论</span>
@@ -1278,6 +1327,7 @@ so cute</textarea>
                     <span class="checkbox-inline__text">Followers 关注</span>
                   </label>
                   <ul class="hint-list">
+                    <li><strong>互点-仅关注</strong>：进作品后打开评论区在区内关注；与评论/作者区/Followers 不可同开。管理台「启动所选设备互点」在模板勾选此项时自动走该分支。</li>
                     <li><strong>作者区</strong>：左滑后在作者条点 Follow（计入上限）。</li>
                     <li><strong>Followers</strong>：复制用户名并进粉丝列表点 Follow；可不勾作者区（仍左滑，不在作者区点 Follow）。</li>
                     <li>返回作品：未进列表 1 次，进了列表 2 次。</li>

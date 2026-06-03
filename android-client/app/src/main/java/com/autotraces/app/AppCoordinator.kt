@@ -653,7 +653,10 @@ object AppCoordinator {
     private suspend fun runMutualTrafficPullLoopIteration(alias: String, deviceId: String) {
         if (!isMutualSwitchActive() && !isPublishPostSwitchActive()) {
             reportOnlineBeforePull(alias, deviceId)
-            fetchConfig()
+            fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL)
+            val followOnly = _config.value.mutual_traffic_follow_only
+            PrefsStore.setMutualCommentOnlySession(false)
+            PrefsStore.setMutualFollowOnlySession(followOnly)
             PrefsStore.setMutualClickRequested(true)
             PrefsStore.setMutualClickPending(true)
             triggerMutualSwitchNow(alias)
@@ -973,6 +976,36 @@ object AppCoordinator {
     private fun isBasicProfileModificationPending(modified: String?): Boolean =
         modified?.trim()?.equals("是", ignoreCase = true) != true
 
+    private fun MutableMap<String, Any>.withDeviceOpReportFlags(): MutableMap<String, Any> {
+        if (PrefsStore.isHardStopRequested()) {
+            this["preserve_auto_start_opt_out"] = true
+        }
+        return this
+    }
+
+    /** 任务结束（成功或失败）后向云端恢复「参与自动开启」；不拉起涨粉。硬停时保持关闭。 */
+    private suspend fun restoreCloudAutoStartParticipation(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        reason: String = "",
+    ) {
+        if (shouldHonorUserHardStop()) {
+            LogCenter.op(alias, "[OP][$opId] 硬停中，保持关闭云端自动开启")
+            return
+        }
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = false)
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "[OP][$opId] 恢复自动开启上报失败：${err.message}")
+        }.onSuccess {
+            val suffix = if (reason.isNotBlank()) "（$reason）" else ""
+            LogCenter.op(alias, "[OP][$opId] 已恢复云端自动开启程序$suffix")
+        }
+    }
+
     /** 自动/手动切号全流程成功后：恢复自动开启、按需自动登录，再拉起涨粉。 */
     private suspend fun finishCutSwitchAfterSuccess(
         alias: String,
@@ -980,14 +1013,7 @@ object AppCoordinator {
         opId: String,
         reportResp: BaseResponse? = null,
     ) {
-        LogCenter.op(alias, "[OP][$opId] 切号完成：恢复该设备自动开启程序")
-        runCatching {
-            withContext(Dispatchers.IO) {
-                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = false)
-            }
-        }.onFailure { err ->
-            LogCenter.op(alias, "[OP][$opId] 切号后恢复自动开启上报失败：${err.message}")
-        }
+        restoreCloudAutoStartParticipation(alias, deviceId, opId, "切号成功")
         PrefsStore.setHardStopRequested(false)
         manuallyPaused = false
 
@@ -1391,13 +1417,7 @@ object AppCoordinator {
         opId: String,
         resumePullAfter: Boolean,
     ) {
-        runCatching {
-            withContext(Dispatchers.IO) {
-                ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = false)
-            }
-        }.onFailure { err ->
-            LogCenter.op(alias, "[OP][$opId] 恢复自动开启上报失败：${err.message}")
-        }
+        restoreCloudAutoStartParticipation(alias, deviceId, opId, "独占 TikTok 任务结束")
         if (
             resumePullAfter &&
             !PrefsStore.isHardStopRequested() &&
@@ -2066,6 +2086,7 @@ object AppCoordinator {
                     clearReport["cut_switch_after_backup"] = it
                 }
                 payload?.cut_switch_target_row_index?.let { clearReport["cut_switch_target_row_index"] = it }
+                clearReport.withDeviceOpReportFlags()
 
                 val clearReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -2215,6 +2236,7 @@ object AppCoordinator {
                     reportData["cut_switch_after_backup"] = it
                 }
                 payload?.cut_switch_target_row_index?.let { reportData["cut_switch_target_row_index"] = it }
+                reportData.withDeviceOpReportFlags()
 
                 val backupReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -2309,6 +2331,7 @@ object AppCoordinator {
                     restoreReport["skip_pm_clear"] = true
                 }
                 payload?.restore_highlight_row_index?.let { restoreReport["restore_highlight_row_index"] = it }
+                restoreReport.withDeviceOpReportFlags()
 
                 val restoreReportResp = ApiService.reportDeviceOp(
                     deviceId = deviceId,
@@ -2339,6 +2362,8 @@ object AppCoordinator {
             ExecutionScope.exit()
             if (isExclusiveUi) {
                 finishExclusiveTikTokUiOp(alias, deviceId, opId, resumePullAfterExclusive)
+            } else if (isDestructive) {
+                restoreCloudAutoStartParticipation(alias, deviceId, opId, "备份/切号任务结束")
             }
         }
     }
@@ -2488,6 +2513,11 @@ object AppCoordinator {
             )
             } finally {
                 ExecutionScope.exit()
+                val did = PrefsStore.getDeviceId()
+                val devAlias = PrefsStore.getAlias()
+                if (!did.isNullOrBlank() && !devAlias.isNullOrBlank()) {
+                    restoreCloudAutoStartParticipation(devAlias, did, "publish", "发作品任务结束")
+                }
             }
         }.also { job ->
             job.invokeOnCompletion {

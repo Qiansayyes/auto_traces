@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260603-4";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260603-5";
 
 const authShell = document.getElementById("authShell");
 const appShell = document.getElementById("appShell");
@@ -214,6 +214,8 @@ const accountBatchRegionInputEl = document.getElementById("accountBatchRegionInp
 const accountBatchRejectEmptyToggleEl = document.getElementById("accountBatchRejectEmptyToggle");
 const importAccountBatchBtn = document.getElementById("importAccountBatchBtn");
 const accountUnassignedOnlyToggle = document.getElementById("accountUnassignedOnlyToggle");
+const accountRecordsSearchInput = document.getElementById("accountRecordsSearchInput");
+const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
 const DEVICE_EDITOR_STORAGE_KEY = "auto_traces_device_editor_rows_v1";
@@ -225,6 +227,8 @@ let deviceEditorRows = [];
 let backupArchiveRows = [];
 let backupAliasByUsername = new Map();
 let accountFilterUnassignedOnly = false;
+let accountRecordsSearchQuery = "";
+let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
 let currentDeviceGroupFilter = "";
@@ -257,6 +261,48 @@ let currentConfigTemplate = "default";
 let currentTemplateMeta = {};
 let currentTemplatesByName = {};
 let aliasTemplateByMode = { growth: {}, live: {}, direct: {}, mutual: {} };
+let smartTemplateConfig = {
+  old_branch_min_followers: 100,
+  old_branch_min_video_count: 15,
+  new_branch_templates: [{ template_name: "default", weight: 100 }],
+  old_branch_templates: [{ template_name: "default", weight: 100 }],
+};
+let aliasSmartTemplateByMode = { growth: {}, live: {}, direct: {}, mutual: {} };
+let smartTemplatePreviewCache = {};
+
+/** 智能模板暂仅涨粉模式生效（与服务端 SMART_TEMPLATE_RUN_MODES 一致） */
+const SMART_TEMPLATE_MODE = "growth";
+
+const smartOldMinFollowersInput = document.getElementById("smartOldMinFollowers");
+const smartOldMinVideosInput = document.getElementById("smartOldMinVideos");
+const smartNewBranchRowsEl = document.getElementById("smartNewBranchRows");
+const smartOldBranchRowsEl = document.getElementById("smartOldBranchRows");
+const smartAddNewBranchRowBtn = document.getElementById("smartAddNewBranchRow");
+const smartAddOldBranchRowBtn = document.getElementById("smartAddOldBranchRow");
+const saveSmartTemplateConfigBtn = document.getElementById("saveSmartTemplateConfigBtn");
+const reloadSmartTemplateConfigBtn = document.getElementById("reloadSmartTemplateConfigBtn");
+const smartTemplateConfigStatusEl = document.getElementById("smartTemplateConfigStatus");
+
+function smartPreviewKey(owner, mode, alias) {
+  const o = String(owner || "").trim();
+  const m = String(mode || SMART_TEMPLATE_MODE).trim();
+  const a = String(alias || "").trim().toLowerCase();
+  return `${o}::${m}::${a}`;
+}
+
+function isSmartTemplateModeActive() {
+  return currentRunMode === SMART_TEMPLATE_MODE;
+}
+
+function isAliasSmartEnabledForOwner(owner, alias) {
+  const ownerKey = String(owner || currentUser?.username || "").trim();
+  const aliasKey = String(alias || "").trim().toLowerCase();
+  const cached = smartTemplatePreviewCache[smartPreviewKey(ownerKey, SMART_TEMPLATE_MODE, aliasKey)];
+  if (cached && typeof cached.enabled === "boolean") return cached.enabled;
+  if (ownerKey !== String(currentUser?.username || "").trim()) return false;
+  const modeMap = aliasSmartTemplateByMode?.[SMART_TEMPLATE_MODE];
+  return Boolean(modeMap && modeMap[aliasKey]);
+}
 
 function normalizeTiktokUsernameKey(raw) {
   return String(raw || "").trim().replace(/^@+/, "").toLowerCase();
@@ -396,6 +442,125 @@ function resolveEffectiveDeviceTemplateUI(aliasRaw, tiktokUsername = "") {
   }
 
   return { selectedTemplate, badgeText, badgeClass, badgeHint, hasExplicitInCurrentMode };
+}
+
+function applySmartTemplateConfigToForm(cfg) {
+  const c = cfg && typeof cfg === "object" ? cfg : smartTemplateConfig;
+  if (smartOldMinFollowersInput) {
+    smartOldMinFollowersInput.value = String(c.old_branch_min_followers ?? 100);
+  }
+  if (smartOldMinVideosInput) {
+    smartOldMinVideosInput.value = String(c.old_branch_min_video_count ?? 15);
+  }
+  renderSmartTemplateWeightRows("new", c.new_branch_templates);
+  renderSmartTemplateWeightRows("old", c.old_branch_templates);
+}
+
+function renderSmartTemplateWeightRows(branch, entries) {
+  const container = branch === "old" ? smartOldBranchRowsEl : smartNewBranchRowsEl;
+  if (!container) return;
+  const list = Array.isArray(entries) && entries.length
+    ? entries
+    : [{ template_name: "default", weight: 100 }];
+  const templateNames = Object.keys(currentTemplatesByName || {}).sort((a, b) => a.localeCompare(b));
+  if (!templateNames.length) templateNames.push("default");
+  container.innerHTML = list.map((row, idx) => {
+    const selected = String(row?.template_name || "default").trim() || "default";
+    const weight = Number(row?.weight);
+    const w = Number.isFinite(weight) ? Math.max(0, Math.floor(weight)) : 100;
+    const options = templateNames.map((name) => (
+      `<option value="${escapeHtml(name)}" ${name === selected ? "selected" : ""}>${escapeHtml(templateDisplayName(name, currentTemplateMeta))}</option>`
+    )).join("");
+    return `
+      <div class="smart-template-weight-row" data-branch="${branch}" data-row-index="${idx}">
+        <div class="field">
+          <label>模板</label>
+          <select class="ui-select smart-template-pick" data-branch="${branch}" data-row-index="${idx}">${options}</select>
+        </div>
+        <div class="field field--weight">
+          <label>概率</label>
+          <input class="smart-template-weight" type="number" min="0" max="10000" step="1" value="${w}" data-branch="${branch}" data-row-index="${idx}" title="同一分支内为相对概率，数值越大占比越高" />
+        </div>
+        <button type="button" class="ghost smart-template-remove-row" data-branch="${branch}" data-row-index="${idx}">删除</button>
+      </div>
+    `;
+  }).join("");
+}
+
+function collectSmartTemplateWeightRows(branch) {
+  const container = branch === "old" ? smartOldBranchRowsEl : smartNewBranchRowsEl;
+  if (!container) return [];
+  const rows = [];
+  container.querySelectorAll(".smart-template-weight-row").forEach((rowEl) => {
+    const pick = rowEl.querySelector(".smart-template-pick");
+    const weightInput = rowEl.querySelector(".smart-template-weight");
+    const template_name = String(pick?.value || "").trim();
+    const weight = Math.max(0, Math.floor(Number(weightInput?.value) || 0));
+    if (template_name) rows.push({ template_name, weight });
+  });
+  return rows;
+}
+
+function setSmartTemplateConfigStatus(text, tone = "info") {
+  if (!smartTemplateConfigStatusEl) return;
+  smartTemplateConfigStatusEl.textContent = text || "";
+  smartTemplateConfigStatusEl.className = `hint${tone === "success" ? " status-success" : tone === "error" ? " status-error" : ""}`;
+}
+
+async function saveSmartTemplateConfig() {
+  const payload = {
+    old_branch_min_followers: Math.max(0, Math.floor(Number(smartOldMinFollowersInput?.value) || 0)),
+    old_branch_min_video_count: Math.max(0, Math.floor(Number(smartOldMinVideosInput?.value) || 0)),
+    new_branch_templates: collectSmartTemplateWeightRows("new"),
+    old_branch_templates: collectSmartTemplateWeightRows("old"),
+  };
+  if (!payload.new_branch_templates.length || !payload.old_branch_templates.length) {
+    setSmartTemplateConfigStatus("每个分支至少保留一行模板概率", "error");
+    return;
+  }
+  try {
+    setSmartTemplateConfigStatus("正在保存…");
+    const data = await request("/api/admin/smart_template/config", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    smartTemplateConfig = data?.smart_template_config || payload;
+    applySmartTemplateConfigToForm(smartTemplateConfig);
+    setSmartTemplateConfigStatus("智能模板规则已保存", "success");
+    smartTemplatePreviewCache = {};
+    if (latestDevices && typeof latestDevices === "object") {
+      await refreshSmartTemplatePreviews(Object.entries(latestDevices).map(([deviceId, info]) => ({ deviceId, info })));
+    }
+  } catch (error) {
+    setSmartTemplateConfigStatus(error.message || "保存失败", "error");
+  }
+}
+
+async function refreshSmartTemplatePreviews(visibleRows = []) {
+  const items = (visibleRows || [])
+    .map((row) => (row.info ? row : { info: row }))
+    .filter(({ info }) => String(info?.alias || "").trim())
+    .map(({ info }) => ({
+      alias: String(info.alias || "").trim(),
+      mode: SMART_TEMPLATE_MODE,
+      owner_username: String(info?.owner_username || currentUser?.username || "").trim(),
+    }));
+  if (!items.length) return;
+  try {
+    const data = await request("/api/admin/smart_template/preview", {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    });
+    if (data?.results && typeof data.results === "object") {
+      smartTemplatePreviewCache = { ...smartTemplatePreviewCache, ...data.results };
+    }
+    if (latestDevices && typeof latestDevices === "object") {
+      renderDevices(latestDevices, { skipSmartPreview: true });
+      bindDeviceSelection();
+    }
+  } catch (error) {
+    console.warn("[smart_template/preview]", error);
+  }
 }
 
 function collectTemplateRefsFromAliasMaps() {
@@ -1315,7 +1480,16 @@ function renderDeviceRow(deviceId, info, context = {}) {
   `;
   const ownerCell = isAdmin ? `<td>${String(info?.owner_username || "")}</td>` : "";
   const aliasKey = String(alias || "").trim().toLowerCase();
-  const tmplUi = alias
+  const ownerUsername = String(info?.owner_username || currentUser?.username || "").trim();
+  const previewKey = smartPreviewKey(ownerUsername, SMART_TEMPLATE_MODE, aliasKey);
+  const smartPreview = smartTemplatePreviewCache[previewKey] || {};
+  const smartModeActive = isSmartTemplateModeActive();
+  const smartEnabled = alias && smartModeActive
+    ? (typeof smartPreview.enabled === "boolean"
+      ? smartPreview.enabled
+      : isAliasSmartEnabledForOwner(ownerUsername, aliasKey))
+    : false;
+  const tmplUi = alias && !smartEnabled
     ? resolveEffectiveDeviceTemplateUI(aliasKey, "")
     : {
       selectedTemplate: String(context.fallbackTemplate || "default").trim() || "default",
@@ -1323,7 +1497,24 @@ function renderDeviceRow(deviceId, info, context = {}) {
       badgeClass: "pending",
       badgeHint: "",
     };
-  const selectedTemplate = tmplUi.selectedTemplate;
+  let selectedTemplate = tmplUi.selectedTemplate;
+  let badgeText = tmplUi.badgeText || "";
+  let badgeClass = tmplUi.badgeClass || "pending";
+  let badgeHint = tmplUi.badgeHint || "";
+  if (smartEnabled) {
+    selectedTemplate = String(smartPreview.resolved_template || context.fallbackTemplate || "default").trim()
+      || "default";
+    const res = smartPreview.resolution || {};
+    const branchLabel = res.branch_label || (res.branch === "old" ? "老号分支" : "新号分支");
+    badgeText = `智能 · ${branchLabel}`;
+    badgeClass = "online";
+    badgeHint = [
+      `高亮账号：${res.tiktok_username || "（未解析）"}`,
+      `粉丝 ${res.follower_count ?? 0}（>${res.threshold_followers ?? 100} 且 `,
+      `作品 ${res.video_count ?? 0} >${res.threshold_video_count ?? 15} 为老号分支）`,
+      `命中模板：${templateDisplayName(selectedTemplate, currentTemplateMeta) || selectedTemplate}`,
+    ].join("\n");
+  }
   const rowTemplateNames = (() => {
     const base = Array.isArray(context.templateNames) ? context.templateNames : ["default"];
     if (selectedTemplate && !base.includes(selectedTemplate)) {
@@ -1334,21 +1525,43 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const optionsHtml = rowTemplateNames.map((name) => (
     `<option value="${name}" ${name === selectedTemplate ? "selected" : ""}>${templateDisplayName(name, currentTemplateMeta)}</option>`
   )).join("");
+  const smartToggleDisabled = !alias || !smartModeActive ? "disabled" : "";
+  const smartToggleClass = smartEnabled ? "primary" : "ghost";
+  const smartToggleTitle = !smartModeActive
+    ? "智能模板暂仅支持涨粉模式，请先在运行配置切换到涨粉模式"
+    : "开启后按智能模板规则自动选模板，右侧下拉不可手动修改";
+  const smartToggleLabel = !smartModeActive
+    ? "仅涨粉可用"
+    : (smartEnabled ? "已启用" : "启用智能模版");
+  const smartCell = `
+    <td style="white-space:nowrap;vertical-align:middle;">
+      <button
+        type="button"
+        class="${smartToggleClass} js-smart-template-toggle"
+        data-device="${deviceId}"
+        data-alias="${alias}"
+        data-owner="${escapeHtml(ownerUsername)}"
+        style="padding:6px 10px;font-size:12px;"
+        ${smartToggleDisabled}
+        title="${escapeHtml(smartToggleTitle)}"
+      >${smartToggleLabel}</button>
+    </td>
+  `;
   const templateCell = `
     <td>
       <select
         class="alias-template-select ui-select ui-select--table"
         data-device="${deviceId}"
         data-alias="${alias}"
-        data-owner="${String(info?.owner_username || "").trim()}"
+        data-owner="${escapeHtml(ownerUsername)}"
         style="min-width:140px;padding:4px 6px;font-size:12px;"
-        ${alias ? "" : "disabled"}
+        ${alias && !smartEnabled ? "" : "disabled"}
       >
         ${optionsHtml}
       </select>
       <div style="margin-top:6px;">
-        <span class="badge ${tmplUi.badgeClass || "pending"} js-template-bind-state" title="${escapeHtml(String(tmplUi.badgeHint || ""))}">
-          ${escapeHtml(tmplUi.badgeText || "—")}
+        <span class="badge ${badgeClass} js-template-bind-state" title="${escapeHtml(String(badgeHint || ""))}">
+          ${escapeHtml(badgeText || "—")}
         </span>
       </div>
     </td>
@@ -1406,6 +1619,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
       <td>${info?.alias || ""}</td>
       ${groupCell}
       ${ownerCell}
+      ${smartCell}
       ${templateCell}
       <td><span class="badge ${statusClass}">${info?.status || "unknown"}</span></td>
       <td>${info?.pending_start ? pendingBadge : pending}</td>
@@ -1415,7 +1629,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
   `;
 }
 
-function renderDevices(devices) {
+function renderDevices(devices, options = {}) {
   const prevSelected = selectedDeviceIds();
   deviceTable.innerHTML = "";
   const aliasFilter = aliasFilterInput.value.trim().toLowerCase();
@@ -1443,9 +1657,12 @@ function renderDevices(devices) {
     fallbackTemplate,
   }));
   if (!rowHtml.length) {
-    deviceTable.innerHTML = `<tr><td colspan="${isAdmin ? 10 : 9}" style="padding:10px;color:#666;">暂无匹配设备</td></tr>`;
+    deviceTable.innerHTML = `<tr><td colspan="${isAdmin ? 11 : 10}" style="padding:10px;color:#666;">暂无匹配设备</td></tr>`;
   } else {
     deviceTable.innerHTML = rowHtml.join("");
+  }
+  if (!options.skipSmartPreview) {
+    void refreshSmartTemplatePreviews(visibleRows);
   }
   updateOverviewPagerUi();
   deviceTable.querySelectorAll(".device-check").forEach((cb) => {
@@ -1607,6 +1824,54 @@ function renderDevices(devices) {
       }
     });
   });
+  deviceTable.querySelectorAll("button.js-smart-template-toggle").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const el = e.currentTarget;
+      const alias = String(el?.dataset?.alias || "").trim();
+      const ownerUsername = String(el?.dataset?.owner || "").trim();
+      if (!alias || el.disabled) return;
+      const aliasKey = alias.toLowerCase();
+      if (!isSmartTemplateModeActive()) {
+        setStatus("智能模板暂仅支持涨粉模式", "warning");
+        return;
+      }
+      const currentlyOn = isAliasSmartEnabledForOwner(ownerUsername, aliasKey);
+      const nextEnabled = !currentlyOn;
+      const oldText = String(el.textContent || "").trim();
+      el.disabled = true;
+      el.textContent = "处理中…";
+      try {
+        const data = await request("/api/admin/alias_smart_template/toggle", {
+          method: "POST",
+          body: JSON.stringify({
+            alias,
+            enabled: nextEnabled,
+            mode: SMART_TEMPLATE_MODE,
+            owner_username: ownerUsername || undefined,
+          }),
+        });
+        if (ownerUsername === String(currentUser?.username || "").trim()) {
+          aliasSmartTemplateByMode = (data?.alias_smart_template_by_mode
+            && typeof data.alias_smart_template_by_mode === "object")
+            ? data.alias_smart_template_by_mode
+            : aliasSmartTemplateByMode;
+        }
+        const key = smartPreviewKey(ownerUsername, SMART_TEMPLATE_MODE, aliasKey);
+        smartTemplatePreviewCache[key] = {
+          enabled: nextEnabled,
+          resolved_template: data?.resolved_template || "",
+          resolution: data?.resolution || {},
+        };
+        renderDevices(latestDevices, { skipSmartPreview: true });
+        bindDeviceSelection();
+        setStatus(data?.msg || (nextEnabled ? "已启用智能模板" : "已关闭智能模板"), "success");
+      } catch (error) {
+        setStatus(error.message || "切换智能模板失败", "error");
+        el.textContent = oldText;
+        el.disabled = false;
+      }
+    });
+  });
   updateStartHint();
 }
 
@@ -1630,6 +1895,69 @@ const TEXT_LIST_CONFIG_FORM_KEYS = [
   "mutual_traffic_target_texts",
   "profile_edit_bio_texts",
 ];
+
+const MUTUAL_TRAFFIC_ACTION_CHECKBOX_NAMES = [
+  "mutual_traffic_comment",
+  "mutual_traffic_author_follow",
+  "mutual_traffic_followers_follow",
+];
+
+function mutualTrafficActionCheckboxEls() {
+  if (!configForm) return { followOnlyEl: null, actionEls: [] };
+  const followOnlyEl = configForm.querySelector("[name='mutual_traffic_follow_only']");
+  const actionEls = MUTUAL_TRAFFIC_ACTION_CHECKBOX_NAMES.map((name) =>
+    configForm.querySelector(`[name='${name}']`)
+  ).filter(Boolean);
+  return { followOnlyEl, actionEls };
+}
+
+/** 「互点-仅关注」与评论/作者区/Followers 三项互斥。 */
+function syncMutualTrafficActionMutex(changedInput = null) {
+  const { followOnlyEl, actionEls } = mutualTrafficActionCheckboxEls();
+  if (!followOnlyEl || !actionEls.length) return;
+
+  if (changedInput === followOnlyEl && followOnlyEl.checked) {
+    actionEls.forEach((el) => {
+      el.checked = false;
+    });
+  } else if (changedInput && actionEls.includes(changedInput) && changedInput.checked) {
+    followOnlyEl.checked = false;
+  } else if (followOnlyEl.checked && actionEls.some((el) => el.checked)) {
+    actionEls.forEach((el) => {
+      el.checked = false;
+    });
+  } else if (actionEls.some((el) => el.checked) && followOnlyEl.checked) {
+    followOnlyEl.checked = false;
+  }
+
+  const followOnlyActive = followOnlyEl.checked;
+  const anyActionActive = actionEls.some((el) => el.checked);
+  actionEls.forEach((el) => {
+    el.disabled = followOnlyActive;
+    el.closest("label")?.classList.toggle("checkbox-inline--disabled", followOnlyActive);
+  });
+  followOnlyEl.disabled = anyActionActive;
+  followOnlyEl.closest("label")?.classList.toggle("checkbox-inline--disabled", anyActionActive);
+}
+
+function setupMutualTrafficActionMutexListeners() {
+  if (!configForm || configForm.dataset.mutualTrafficMutexBound === "1") return;
+  configForm.dataset.mutualTrafficMutexBound = "1";
+  const { followOnlyEl, actionEls } = mutualTrafficActionCheckboxEls();
+  const all = [followOnlyEl, ...actionEls].filter(Boolean);
+  all.forEach((el) => {
+    el.addEventListener("change", () => syncMutualTrafficActionMutex(el));
+  });
+  syncMutualTrafficActionMutex();
+}
+
+function isMutualFollowOnlyInTemplateConfig(templateName, tiktokUsername = "") {
+  const tmpl =
+    String(templateName || "").trim() ||
+    resolveEffectiveDeviceTemplateUI("", tiktokUsername).selectedTemplate;
+  const cfg = currentTemplatesByName?.[tmpl];
+  return Boolean(cfg && typeof cfg === "object" && cfg.mutual_traffic_follow_only);
+}
 
 function fillConfigForm(config, mode = currentRunMode) {
   if (!configForm) return;
@@ -1700,6 +2028,7 @@ function fillConfigForm(config, mode = currentRunMode) {
     input.value = Array.isArray(def) && def.length ? def.join("\n") : "";
   }
   syncCvQualityFilterInputsFromConfig(cfg);
+  syncMutualTrafficActionMutex();
 }
 
 function persistCommentTextsToLocal() {
@@ -2245,6 +2574,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     mutual_traffic_comment: true,
     mutual_traffic_author_follow: true,
     mutual_traffic_followers_follow: true,
+    mutual_traffic_follow_only: false,
     growth_pull_batches_before_auto_mutual: -1,
     growth_post_check_after_tap_delay_ms: 1000,
     growth_post_second_check_delay_ms: 650,
@@ -2288,6 +2618,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     mutual_traffic_comment: true,
     mutual_traffic_author_follow: true,
     mutual_traffic_followers_follow: true,
+    mutual_traffic_follow_only: false,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2330,6 +2661,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     mutual_traffic_comment: true,
     mutual_traffic_author_follow: true,
     mutual_traffic_followers_follow: true,
+    mutual_traffic_follow_only: false,
     growth_pull_batches_before_auto_mutual: -1,
     direct_post_action_delay_ms: 1500,
   },
@@ -2800,7 +3132,8 @@ function collectConfig() {
       key === "action_single" ||
       key === "mutual_traffic_comment" ||
       key === "mutual_traffic_author_follow" ||
-      key === "mutual_traffic_followers_follow"
+      key === "mutual_traffic_followers_follow" ||
+      key === "mutual_traffic_follow_only"
     ) {
       payload[key] = value === "on";
       continue;
@@ -2831,6 +3164,7 @@ function collectConfig() {
     "mutual_traffic_comment_daily_limit",
     "mutual_traffic_author_follow",
     "mutual_traffic_followers_follow",
+    "mutual_traffic_follow_only",
   ]) {
     const input = configForm?.querySelector(`[name='${key}']`);
     if (input?.type === "checkbox") {
@@ -2841,6 +3175,7 @@ function collectConfig() {
 }
 
 async function saveConfig() {
+  syncMutualTrafficActionMutex();
   const payload = collectConfig();
   const selectedTemplate = String(activeConfigTemplateSelect?.value || currentConfigTemplate || "default").trim() || "default";
   console.log("[saveConfig] clicked", {
@@ -3711,6 +4046,15 @@ async function loadUserRuntimeConfig() {
     aliasTemplateByMode = (cfg?.alias_template_by_mode && typeof cfg.alias_template_by_mode === "object")
       ? cfg.alias_template_by_mode
       : { growth: {}, live: {}, direct: {}, mutual: {} };
+    smartTemplateConfig = (cfg?.smart_template_config && typeof cfg.smart_template_config === "object")
+      ? cfg.smart_template_config
+      : smartTemplateConfig;
+    aliasSmartTemplateByMode = (cfg?.alias_smart_template_by_mode
+      && typeof cfg.alias_smart_template_by_mode === "object")
+      ? cfg.alias_smart_template_by_mode
+      : { growth: {}, live: {}, direct: {}, mutual: {} };
+    applySmartTemplateConfigToForm(smartTemplateConfig);
+    smartTemplatePreviewCache = {};
     if (latestDevices && typeof latestDevices === "object") {
       renderDevices(latestDevices);
       bindDeviceSelection();
@@ -3776,16 +4120,32 @@ function buildMutualOpTargetsForSelectedDevices() {
   return targets;
 }
 
-async function startMutualClickForSelectedDevices() {
+async function startMutualClickForSelectedDevices(options = {}) {
+  const forceFollowOnly = options.forceFollowOnly === true;
   const targets = buildMutualOpTargetsForSelectedDevices();
   if (!targets) return;
 
   let successCount = 0;
   let failedCount = 0;
-  setStatus(`正在为所选设备启动引流（${targets.length} 台）...`, "info");
+  let followOnlyCount = 0;
+  let trafficCount = 0;
+  const statusPrefix = forceFollowOnly
+    ? "互点-仅关注"
+    : "互点";
+  setStatus(`正在为所选设备启动${statusPrefix}（${targets.length} 台）...`, "info");
   for (const payload of targets) {
+    const info = latestDevices?.[payload.device_id] || {};
+    const tiktokUsername = String(info.tiktok_username || info.tiktokUsername || "").trim();
+    const templateUi = resolveEffectiveDeviceTemplateUI(payload.alias, tiktokUsername);
+    const useFollowOnly =
+      forceFollowOnly || isMutualFollowOnlyInTemplateConfig(templateUi.selectedTemplate, tiktokUsername);
+    const apiPath = useFollowOnly
+      ? "/api/admin/device_tiktok/mutual_click_follow_only_start"
+      : "/api/admin/device_tiktok/mutual_click_start";
+    if (useFollowOnly) followOnlyCount += 1;
+    else trafficCount += 1;
     try {
-      await request("/api/admin/device_tiktok/mutual_click_start", {
+      await request(apiPath, {
         method: "POST",
         body: JSON.stringify(payload),
       });
@@ -3795,37 +4155,29 @@ async function startMutualClickForSelectedDevices() {
     }
   }
   await loadOverview();
+  const branchHint =
+    followOnlyCount && trafficCount
+      ? `（仅关注 ${followOnlyCount} / 引流 ${trafficCount}）`
+      : followOnlyCount
+        ? "（仅关注分支）"
+        : forceFollowOnly
+          ? ""
+          : "（引流分支）";
   if (!failedCount) {
-    setStatus(`引流流程启动指令已下发（${successCount}/${targets.length}）`, "success");
+    setStatus(
+      `${statusPrefix}启动指令已下发${branchHint}（${successCount}/${targets.length}）`,
+      "success",
+    );
   } else {
-    setStatus(`引流流程部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
+    setStatus(
+      `${statusPrefix}部分下发失败${branchHint}：成功 ${successCount}，失败 ${failedCount}`,
+      "warning",
+    );
   }
 }
 
 async function startMutualFollowOnlyForSelectedDevices() {
-  const targets = buildMutualOpTargetsForSelectedDevices();
-  if (!targets) return;
-
-  let successCount = 0;
-  let failedCount = 0;
-  setStatus(`正在为所选设备启动互点-仅关注（${targets.length} 台）...`, "info");
-  for (const payload of targets) {
-    try {
-      await request("/api/admin/device_tiktok/mutual_click_follow_only_start", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      successCount += 1;
-    } catch (_) {
-      failedCount += 1;
-    }
-  }
-  await loadOverview();
-  if (!failedCount) {
-    setStatus(`互点-仅关注指令已下发（${successCount}/${targets.length}）`, "success");
-  } else {
-    setStatus(`互点-仅关注部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
-  }
+  return startMutualClickForSelectedDevices({ forceFollowOnly: true });
 }
 
 async function apiPublishPostStart(payload) {
@@ -5388,6 +5740,40 @@ if (refreshOverviewBtn) {
 }
 if (uploadBtn) uploadBtn.addEventListener("click", uploadUsernames);
 if (saveConfigBtn) saveConfigBtn.addEventListener("click", saveConfig);
+if (saveSmartTemplateConfigBtn) {
+  saveSmartTemplateConfigBtn.addEventListener("click", () => saveSmartTemplateConfig().catch(() => {}));
+}
+if (reloadSmartTemplateConfigBtn) {
+  reloadSmartTemplateConfigBtn.addEventListener("click", () => loadUserRuntimeConfig().catch(() => {}));
+}
+function appendSmartTemplateWeightRow(branch) {
+  const rows = collectSmartTemplateWeightRows(branch);
+  const names = Object.keys(currentTemplatesByName || {});
+  const defaultName = names.includes("default") ? "default" : (names[0] || "default");
+  rows.push({ template_name: defaultName, weight: 100 });
+  renderSmartTemplateWeightRows(branch, rows);
+}
+if (smartAddNewBranchRowBtn) {
+  smartAddNewBranchRowBtn.addEventListener("click", () => appendSmartTemplateWeightRow("new"));
+}
+if (smartAddOldBranchRowBtn) {
+  smartAddOldBranchRowBtn.addEventListener("click", () => appendSmartTemplateWeightRow("old"));
+}
+function handleSmartTemplateWeightRowClick(event) {
+  const btn = event.target?.closest?.(".smart-template-remove-row");
+  if (!btn) return;
+  const branch = String(btn.dataset.branch || "new");
+  const idx = Number(btn.dataset.rowIndex);
+  const rows = collectSmartTemplateWeightRows(branch);
+  if (Number.isFinite(idx)) rows.splice(idx, 1);
+  if (!rows.length) {
+    const names = Object.keys(currentTemplatesByName || {});
+    rows.push({ template_name: names[0] || "default", weight: 100 });
+  }
+  renderSmartTemplateWeightRows(branch, rows);
+}
+if (smartNewBranchRowsEl) smartNewBranchRowsEl.addEventListener("click", handleSmartTemplateWeightRowClick);
+if (smartOldBranchRowsEl) smartOldBranchRowsEl.addEventListener("click", handleSmartTemplateWeightRowClick);
 if (selectAllCheckbox) selectAllCheckbox.addEventListener("change", syncSelectAll);
 if (startSelectedBtn) startSelectedBtn.addEventListener("click", () => startDevices(selectedDeviceIds()));
 if (startAllBtn) startAllBtn.addEventListener("click", () => {
@@ -5769,6 +6155,7 @@ if (liveModeBtn) {
 if (cvModeBtn) {
   cvModeBtn.addEventListener("click", () => switchRunMode("direct"));
 }
+setupMutualTrafficActionMutexListeners();
 if (mutualStartSelectedBtn) {
   mutualStartSelectedBtn.addEventListener("click", () => {
     void startMutualClickForSelectedDevices();
@@ -6029,6 +6416,71 @@ async function loadBoundDeviceAliases() {
 
 function isAccountManagerActive() {
   return document.querySelector(".panel.active")?.id === "account-manager";
+}
+
+/** 模糊匹配：包含子串，或 needle 字符按顺序出现在 haystack 中（子序列） */
+function fuzzyMatchText(haystack, needle) {
+  const h = String(haystack || "").toLowerCase();
+  const n = String(needle || "").trim().toLowerCase();
+  if (!n) return true;
+  if (!h) return false;
+  if (h.includes(n)) return true;
+  let hi = 0;
+  for (let i = 0; i < n.length; i += 1) {
+    hi = h.indexOf(n[i], hi);
+    if (hi === -1) return false;
+    hi += 1;
+  }
+  return true;
+}
+
+function accountRecordSearchHaystack(row = {}) {
+  return [
+    row.username,
+    row.password,
+    row.email,
+    row.api,
+    row.region,
+    getEffectiveAccountAssignedAlias(row),
+    row.login_time,
+    row.video_count,
+    row.follower_count,
+  ].filter(Boolean).join(" ");
+}
+
+function backupArchiveRecordSearchHaystack(row = {}) {
+  const username = String(row?.username || "").trim();
+  const acct = username ? getAccountRecordByUsername(username) : null;
+  return [
+    username,
+    row.device_alias,
+    row.assigned_alias,
+    row.mobile_alias,
+    row.account_assigned_alias,
+    acct?.assigned_alias,
+    acct?.email,
+    row.backup_name,
+    row.backup_path,
+    row.region,
+  ].filter(Boolean).join(" ");
+}
+
+function accountRecordMatchesSearch(row = {}) {
+  return fuzzyMatchText(accountRecordSearchHaystack(row), accountRecordsSearchQuery);
+}
+
+function backupArchiveRecordMatchesSearch(row = {}) {
+  if (!backupArchiveSearchQuery) return true;
+  return fuzzyMatchText(backupArchiveRecordSearchHaystack(row), backupArchiveSearchQuery);
+}
+
+function resolveBackupArchiveDisplayAlias(item = {}) {
+  return normalizeAliasValue(
+    item?.assigned_alias
+    || item?.account_assigned_alias
+    || item?.mobile_alias
+    || item?.device_alias
+  );
 }
 
 function collectAssignableAliases(currentValue = "") {
@@ -6669,11 +7121,17 @@ function accountEditorCellSelect(idx, field, innerHtml) {
 function renderAccountEditorRows() {
   if (!accountEditorListEl) return;
   const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
-  const visibleRows = accountFilterUnassignedOnly
+  let visibleRows = accountFilterUnassignedOnly
     ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
     : indexedRows;
+  if (accountRecordsSearchQuery) {
+    visibleRows = visibleRows.filter(({ row }) => accountRecordMatchesSearch(row));
+  }
   if (!visibleRows.length) {
-    accountEditorListEl.innerHTML = '<div class="hint">暂无记录，点击“新增空白记录”开始</div>';
+    const emptyHint = accountRecordsSearchQuery
+      ? `未找到匹配「${accountRecordsSearchQuery}」的账号记录`
+      : "暂无记录，点击“新增空白记录”开始";
+    accountEditorListEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
     return;
   }
   try {
@@ -7230,9 +7688,19 @@ function renderBackupGroups(items = []) {
     deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
     return;
   }
+  const filteredItems = backupArchiveSearchQuery
+    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
+    : items;
+  if (!filteredItems.length) {
+    const emptyHint = backupArchiveSearchQuery
+      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
+      : "暂无备份档案";
+    deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
+    return;
+  }
   const groups = new Map();
-  items.forEach((item) => {
-    const alias = String(item?.assigned_alias || item?.mobile_alias || "").trim() || "__EMPTY_ALIAS__";
+  filteredItems.forEach((item) => {
+    const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
     if (!groups.has(alias)) groups.set(alias, []);
     groups.get(alias).push(item);
   });
@@ -7243,14 +7711,20 @@ function renderBackupGroups(items = []) {
     const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
     const body = rows.map((row, idx) => {
       const username = String(row?.username || "").trim();
-      const mobileAlias = String(row?.mobile_alias || "").trim();
+      const displayAlias = resolveBackupArchiveDisplayAlias(row);
+      const mobileAlias = String(row?.mobile_alias || row?.device_alias || "").trim();
+      const accountAlias = normalizeAliasValue(row?.account_assigned_alias)
+        || (username ? normalizeAliasValue(getAccountRecordByUsername(username)?.assigned_alias) : "");
+      const aliasBadge = displayAlias
+        ? `<span class="backup-archive-record__alias-badge" title="分配别名">${escapeHtml(displayAlias)}</span>`
+        : (accountAlias ? `<span class="backup-archive-record__alias-badge backup-archive-record__alias-badge--account" title="账号记录中的分配别名">${escapeHtml(accountAlias)}</span>` : "");
       const backupName = String(row?.backup_name || "").trim();
       const backupPath = String(row?.backup_path || "").trim();
       const updatedAt = String(row?.updated_at || row?.created_at || "").trim();
       const backupRecordId = Number(row?.row_index ?? row?.id ?? 0);
       const deviceRowIndex = Number(row?.row_index);
       const deviceId = String(row?.device_id || "").trim();
-      const actionAlias = alias === "__EMPTY_ALIAS__" ? mobileAlias : alias;
+      const actionAlias = displayAlias || (alias === "__EMPTY_ALIAS__" ? mobileAlias : alias);
       const linkedAccountInfo = renderLinkedAccountInfo({ username, ...row });
       const stats = resolveBackupRowStats(row);
       const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
@@ -7265,7 +7739,7 @@ function renderBackupGroups(items = []) {
       const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath, dailySlotLabel);
       const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
       const exportSelectTitle = exportRowIndex != null
-        ? "勾选后可点「导出选中」"
+        ? "勾选后可点「导出已选 xlsx」"
         : "该记录缺少 row_index，暂无法参与导出";
       return `
         <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
@@ -7275,8 +7749,9 @@ function renderBackupGroups(items = []) {
                 <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
               </label>
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
+              ${aliasBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
-              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")} · ${escapeHtml(updatedAt || "-")}</span>
+              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}</span>
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
@@ -7396,11 +7871,11 @@ function setBackupArchiveXlsxButtonsBusy(busy) {
   backupArchiveXlsxBusy = Boolean(busy);
   if (exportBackupArchiveXlsxBtn) {
     exportBackupArchiveXlsxBtn.disabled = busy;
-    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出 xlsx";
+    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出分组全部 xlsx";
   }
   if (exportBackupArchiveSelectedXlsxBtn) {
     exportBackupArchiveSelectedXlsxBtn.disabled = busy || backupArchiveSelectedRowIndices.size <= 0;
-    exportBackupArchiveSelectedXlsxBtn.textContent = busy ? "导出中..." : "导出选中";
+    exportBackupArchiveSelectedXlsxBtn.textContent = busy ? "导出中..." : "导出已选 xlsx";
   }
   if (backupArchiveSelectAllPageBtn) backupArchiveSelectAllPageBtn.disabled = busy;
   if (backupArchiveClearSelectionBtn) backupArchiveClearSelectionBtn.disabled = busy;
@@ -7462,7 +7937,7 @@ async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
     const url = await buildApiUrl(
       `/api/admin/editor/backup_archive/export_xlsx${qs ? `?${qs}` : ""}`,
     );
-    setStatus(selectedOnly ? "正在导出已选备份档案..." : "正在导出备份档案 xlsx...", "info");
+    setStatus(selectedOnly ? "正在导出已选备份为 xlsx..." : "正在导出当前分组全部备份为 xlsx...", "info");
     const response = await fetch(url, {
       method: "GET",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -7537,6 +8012,8 @@ async function loadBackupArchiveRecords() {
     });
     const group = getActiveDeviceGroupFilter();
     if (group) params.set("device_group", group);
+    const searchQ = String(backupArchiveSearchQuery || "").trim();
+    if (searchQ) params.set("search", searchQ);
     const [data, plansResp] = await Promise.all([
       request(`/api/admin/editor/device_rows?${params.toString()}`),
       request("/api/admin/auto_switch/daily_plans").catch(() => ({ data: {} })),
@@ -7550,7 +8027,8 @@ async function loadBackupArchiveRecords() {
     const items = rows.map((row) => ({
       ...row,
       row_index: resolveBackupArchiveExportRowIndex(row) ?? row?.row_index ?? row?.id,
-      assigned_alias: row?.assigned_alias || row?.device_alias || "",
+      account_assigned_alias: row?.account_assigned_alias || "",
+      assigned_alias: row?.assigned_alias || row?.account_assigned_alias || row?.device_alias || "",
       mobile_alias: row?.mobile_alias || row?.device_alias || "",
       created_at: row?.created_at || row?.updated_at || "",
       updated_at: row?.updated_at || row?.created_at || "",
@@ -7593,6 +8071,25 @@ if (accountUnassignedOnlyToggle) {
   accountUnassignedOnlyToggle.addEventListener("change", (event) => {
     accountFilterUnassignedOnly = Boolean(event?.target?.checked);
     renderAccountEditorRows();
+  });
+}
+if (accountRecordsSearchInput) {
+  let accountSearchTimer = null;
+  accountRecordsSearchInput.addEventListener("input", () => {
+    accountRecordsSearchQuery = String(accountRecordsSearchInput.value || "").trim();
+    clearTimeout(accountSearchTimer);
+    accountSearchTimer = setTimeout(() => renderAccountEditorRows(), 200);
+  });
+}
+if (backupArchiveSearchInput) {
+  let backupSearchTimer = null;
+  backupArchiveSearchInput.addEventListener("input", () => {
+    backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
+    clearTimeout(backupSearchTimer);
+    backupSearchTimer = setTimeout(() => {
+      currentBackupArchivePage = 1;
+      void loadBackupArchiveRecords();
+    }, 300);
   });
 }
 if (accountEditorListEl) {

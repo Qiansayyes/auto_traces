@@ -452,7 +452,8 @@ class RealTraceExecutor(
          */
         private const val PROFILE_EDIT_TEST_PART2_ONLY = false
 
-        private const val PROFILE_EDIT_SKIP_NAME_STEP = false
+        /** 临时跳过显示名(Name) 整段（点 Name→输入→Save→Confirm→终验）；测完其他功能后改回 false。 */
+        private const val PROFILE_EDIT_SKIP_NAME_STEP = true
 
         /** Bio 后②：设置齿轮比例点（相对屏宽/高）。 */
         private const val PROFILE_EDIT_SETTINGS_GEAR_RATIO_X = 0.96f
@@ -679,6 +680,7 @@ class RealTraceExecutor(
             confirmed = confirmStrictForeground()
         }
         if (!confirmed) {
+            logForegroundProbeFailure(alias, tag, pkg)
             devOp(alias, "$tag：拉起 TikTok 失败（严格前台校验未通过，跳过 Don't allow OCR）")
             return false
         }
@@ -699,11 +701,13 @@ class RealTraceExecutor(
             if (skipDontAllowOcr ||
                 !dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·权限叠层")
             ) {
+                logForegroundProbeFailure(alias, tag, pkg)
                 devOp(alias, "$tag：Don't allow 处理后 TikTok 已不在前台，拉起失败")
                 return false
             }
             invalidateForegroundProbeCache()
             if (!confirmStrictForeground()) {
+                logForegroundProbeFailure(alias, tag, pkg)
                 devOp(alias, "$tag：权限叠层恢复后 TikTok 仍非前台，拉起失败")
                 return false
             }
@@ -1511,16 +1515,15 @@ class RealTraceExecutor(
         useAutoLoginJitter: Boolean,
         markAutoLoginHandled: Boolean,
     ): Boolean {
-        val hit = findDontAllowDismissHitPreferSaveLogin(vision) ?: return false
+        val hit = findDontAllowLabelHit(vision) ?: return false
         val now = SystemClock.elapsedRealtime()
         if (now - lastInlineDontAllowTapAtMs < INLINE_DONT_ALLOW_TAP_COOLDOWN_MS) return false
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
         val tap = if (useAutoLoginJitter) autoLoginTapWithJitter(hit.point, w, h) else coerceTapToScreen(hit.point, w, h)
-        val tapLabel = if (dontAllowDismissPrefersSaveLogin(vision)) "Save login" else "Don't allow"
         alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
-            devOp(safeAlias, "$phaseLog：顺手命中 $tapLabel，tap (${tap.x},${tap.y})")
+            devOp(safeAlias, "$phaseLog：顺手命中 Don't allow，tap (${tap.x},${tap.y})")
         }
         val ok = runSuCommand("input tap ${tap.x} ${tap.y}")
         if (!ok) return false
@@ -2595,7 +2598,7 @@ class RealTraceExecutor(
         logPrefix: String = "",
         compactLog: Boolean = false,
         useSideEffectFreeOcr: Boolean = false,
-        findDismissHit: (Text) -> StrictLabelHit? = { findDontAllowDismissHitPreferSaveLogin(it) },
+        findDismissHit: (Text) -> StrictLabelHit? = { findDontAllowLabelHit(it) },
     ): Boolean {
         val logAlias = alias.trim().takeIf { it.isNotEmpty() } ?: "unknown"
         val dm = ctx.resources.displayMetrics
@@ -2650,12 +2653,11 @@ class RealTraceExecutor(
                 }
                 continue
             }
-            val tapLabel = if (dontAllowDismissPrefersSaveLogin(vision)) "Save login" else "Don't allow"
             if (prefix.isNotEmpty()) {
-                profileEditLogStrictHit(logAlias, phaseLog, tapLabel, hit, w, h)
+                profileEditLogStrictHit(logAlias, phaseLog, "Don't allow", hit, w, h)
             } else if (!compactLog) {
                 val tapPreview = coerceTapToScreen(hit.point, w, h)
-                devOp(logAlias, "$phaseLog：命中 $tapLabel (${tapPreview.x},${tapPreview.y}) [$logSuffix]")
+                devOp(logAlias, "$phaseLog：命中 Don't allow (${tapPreview.x},${tapPreview.y}) [$logSuffix]")
             }
             val tap = coerceTapToScreen(hit.point, w, h)
             if (!compactLog) {
@@ -3922,6 +3924,7 @@ class RealTraceExecutor(
         }
         devOp(alias, "$tag：点 Don't allow 后 TikTok 仍非前台，尝试拉起并严格校验")
         if (!bringTikTokToForegroundAndConfirm(ctx, alias, tag)) {
+            logForegroundProbeFailure(alias, tag, Config.TIKTOK_PACKAGE_NAME)
             devOp(alias, "$tag：权限弹窗处理后仍无法确认 TikTok 前台")
             return false
         }
@@ -3971,6 +3974,7 @@ class RealTraceExecutor(
             return true
         }
 
+        logForegroundProbeFailure(alias, tag, pkg)
         devOp(alias, "$tag：强停重拉后前台仍未确认，本段任务无法安全继续")
         return false
     }
@@ -4070,38 +4074,45 @@ class RealTraceExecutor(
         val trimmedUsername = username.trim()
         if (trimmedUsername == "__publish_post__") {
             currentRootUsernameForLogs = trimmedUsername
-            if (hardStopOrNull(alias, "发作品入口 __publish_post__")) {
-                PrefsStore.setPublishPostPackageName(null)
-                PrefsStore.clearPublishPostState()
-                return "已硬停，跳过发作品入口"
-            }
-            val pkg = PrefsStore.getPublishPostPackageName()?.trim()?.takeIf { it.isNotEmpty() }
-                ?: Config.TIKTOK_PACKAGE_NAME
-            val accountKeyForResume =
-                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
-            val ok = runPublishPostEntryFlow(service, pkg, config)
-            if (ok) {
-                PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
-                PrefsStore.setPublishPostPending(false)
-                PrefsStore.setPublishPostRequested(false)
-                PrefsStore.setPublishPostPackageName(null)
-                PrefsStore.clearPublishPostState()
-            } else {
-                PrefsStore.setPublishPostPending(true)
-                PrefsStore.setPublishPostRequested(true)
-            }
-            if (!PrefsStore.getDeviceId().isNullOrBlank() && !PrefsStore.getAlias().isNullOrBlank()) {
-                withContext(Dispatchers.IO) {
-                    runCatching {
-                        ApiService.reportDeviceAutoStartOptOut(
-                            deviceId = PrefsStore.getDeviceId()!!,
-                            alias = PrefsStore.getAlias()!!,
-                            optOut = false,
-                        )
+            try {
+                if (hardStopOrNull(alias, "发作品入口 __publish_post__")) {
+                    PrefsStore.setPublishPostPackageName(null)
+                    PrefsStore.clearPublishPostState()
+                    return "已硬停，跳过发作品入口"
+                }
+                val pkg = PrefsStore.getPublishPostPackageName()?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: Config.TIKTOK_PACKAGE_NAME
+                val accountKeyForResume =
+                    PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
+                val ok = runPublishPostEntryFlow(service, pkg, config)
+                if (ok) {
+                    PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
+                    PrefsStore.setPublishPostPending(false)
+                    PrefsStore.setPublishPostRequested(false)
+                    PrefsStore.setPublishPostPackageName(null)
+                    PrefsStore.clearPublishPostState()
+                } else {
+                    PrefsStore.setPublishPostPending(true)
+                    PrefsStore.setPublishPostRequested(true)
+                }
+                return if (ok) "发作品：已完成" else "发作品：未完成"
+            } finally {
+                if (!PrefsStore.isHardStopRequested()) {
+                    val deviceId = PrefsStore.getDeviceId()
+                    val devAlias = PrefsStore.getAlias()
+                    if (!deviceId.isNullOrBlank() && !devAlias.isNullOrBlank()) {
+                        withContext(Dispatchers.IO) {
+                            runCatching {
+                                ApiService.reportDeviceAutoStartOptOut(
+                                    deviceId = deviceId,
+                                    alias = devAlias,
+                                    optOut = false,
+                                )
+                            }
+                        }
                     }
                 }
             }
-            return if (ok) "发作品：已完成" else "发作品：未完成"
         }
         return withAccountStatusOcrWatch {
         didRestartTikTokInCurrentRun = false
@@ -4734,17 +4745,35 @@ class RealTraceExecutor(
             .replace(Regex("\\s+"), " ")
     }
 
-    private fun isMutualFollowButtonTextNormalized(norm: String): Boolean {
+    /** Followers/Following 统计行（含 follower 变体）；Follow 按钮不带 ers / ing 后缀。 */
+    private fun isMutualFollowersOrFollowingStatsCompact(compact: String): Boolean {
+        if (compact.isBlank()) return false
+        if (compact.contains("followers") || compact.contains("following")) return true
+        if (compact.contains("follower")) return true
+        if (compact.endsWith("ers") && compact.contains("follow")) return true
+        return false
+    }
+
+    /**
+     * 互点作者区/评论区主页：可点的 Follow 按钮文案判定。
+     * @param lineNorm 同行整行 OCR（用于排除 Followers 被拆成 follow+ers 时 element 仅命中 follow 的误认）。
+     */
+    private fun isMutualFollowButtonTextNormalized(norm: String, lineNorm: String = norm): Boolean {
         if (norm.isBlank()) return false
+        val lineCompact = lineNorm.replace(Regex("[^a-z]+"), "")
+        val normCompact = norm.replace(Regex("[^a-z]+"), "")
+        if (isMutualFollowersOrFollowingStatsCompact(lineCompact)) return false
+        if (isMutualFollowersOrFollowingStatsCompact(normCompact)) return false
         val tokens = norm.split(Regex("[^a-z]+"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
         if (tokens.isEmpty()) return false
-        if (tokens.any { it == "following" || it == "followers" }) return false
-        // 单行 OCR 常把 Follow 与 Message、简介连成一块；只要分词里有 follow 仍视为关注按钮候选。
-        if (tokens.any { it == "follow" }) return true
+        if (tokens.any { it == "following" || it == "followers" || it == "follower" }) return false
+        if (tokens.any { it.startsWith("follow") && it != "follow" }) return false
         if (tokens.any { it == "message" }) return false
-        return norm.contains("follow") && !norm.contains("following") && !norm.contains("followers")
+        // 单行 OCR 常把 Follow 与 Message、简介连成一块；分词恰为 follow 仍视为按钮。
+        if (tokens.any { it == "follow" }) return true
+        return normCompact == "follow"
     }
 
     private fun isMutualFollowingLabelNormalized(norm: String): Boolean {
@@ -4788,12 +4817,14 @@ class RealTraceExecutor(
     private fun mutualFollowOnlyOcrElementsFromResult(result: Text): List<OcrLabelHit> =
         result.textBlocks.asSequence()
             .flatMap { it.lines.asSequence() }
-            .flatMap { it.elements.asSequence() }
-            .mapNotNull { el ->
-                val box = el.boundingBox ?: return@mapNotNull null
-                val norm = normalizeOcrButtonText(el.text)
-                if (norm.isBlank()) return@mapNotNull null
-                OcrLabelHit(norm, box.centerX(), box.centerY())
+            .flatMap { line ->
+                val lineNorm = normalizeOcrButtonText(line.text)
+                line.elements.asSequence().mapNotNull { el ->
+                    val box = el.boundingBox ?: return@mapNotNull null
+                    val norm = normalizeOcrButtonText(el.text)
+                    if (norm.isBlank()) return@mapNotNull null
+                    OcrLabelHit(norm, box.centerX(), box.centerY(), lineNorm)
+                }
             }
             .toList()
 
@@ -4817,10 +4848,11 @@ class RealTraceExecutor(
         val lower = elements.filter { it.centerY >= lowerBound }
 
         val lowerMessages = lower.filter { isMutualMessageLabelNormalized(it.norm) }
-        val lowerFollows = lower.filter { isMutualFollowButtonTextNormalized(it.norm) }
-        val upperFollows = upper.filter { isMutualFollowButtonTextNormalized(it.norm) }
+        val lowerFollows = lower.filter { isMutualFollowButtonTextNormalized(it.norm, it.lineNorm) }
+        val upperFollows = upper.filter { isMutualFollowButtonTextNormalized(it.norm, it.lineNorm) }
         val upperFollowing = upper.filter {
-            isMutualFollowingLabelNormalized(it.norm) && !isMutualFollowButtonTextNormalized(it.norm)
+            isMutualFollowingLabelNormalized(it.norm) &&
+                !isMutualFollowButtonTextNormalized(it.norm, it.lineNorm)
         }
 
         // 格局B（分栏式）：下半有 Message + 上半有 Follow/Following；或上半仅有 Follow、下半无 Message/其他按钮
@@ -4849,7 +4881,7 @@ class RealTraceExecutor(
 
         val inAuthorCrop = elements.filter { it.centerY in cropTop..cropBottom }
         val messageInCrop = inAuthorCrop.filter { isMutualMessageLabelNormalized(it.norm) }
-        val followInCrop = inAuthorCrop.filter { isMutualFollowButtonTextNormalized(it.norm) }
+        val followInCrop = inAuthorCrop.filter { isMutualFollowButtonTextNormalized(it.norm, it.lineNorm) }
         val rowYTol = (fullH * 0.015f).toInt().coerceIn(14, 56)
         val halfW = (fullW * 0.5f).toInt()
         fun sameRow(y: Int, base: Int) = kotlin.math.abs(y - base) <= rowYTol
@@ -5053,11 +5085,45 @@ class RealTraceExecutor(
         return MutualFollowOnlyProfileFollowDecision.NoLayer
     }
 
-    private data class OcrLabelHit(val norm: String, val centerX: Int, val centerY: Int)
+    private data class OcrLabelHit(
+        val norm: String,
+        val centerX: Int,
+        val centerY: Int,
+        val lineNorm: String = norm,
+    )
 
     private data class MutualFollowTarget(val point: Point, val messageY: Int)
 
+    private data class MutualAuthorOcrElement(
+        val norm: String,
+        val lineNorm: String,
+        val centerX: Int,
+        val centerY: Int,
+    )
+
     private suspend fun mutualClickUpperHalfOcrFollowTarget(service: Context): MutualFollowTarget? {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        for (attempt in 1..MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, "互点作者区 Follow OCR")) return null
+            val target = mutualClickUpperHalfOcrFollowTargetOnce(service)
+            if (target != null) {
+                if (attempt > 1) {
+                    devOp(alias, "互点：作者区 Follow OCR 第 $attempt 次命中")
+                }
+                return target
+            }
+            if (attempt < MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS) {
+                devOp(
+                    alias,
+                    "互点：作者区 Follow OCR 第 $attempt/$MUTUAL_FOLLOW_ONLY_OCR_MAX_ATTEMPTS 次未命中，${MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS}ms 后重试",
+                )
+                delay(MUTUAL_FOLLOW_ONLY_OCR_RETRY_DELAY_MS)
+            }
+        }
+        return null
+    }
+
+    private suspend fun mutualClickUpperHalfOcrFollowTargetOnce(service: Context): MutualFollowTarget? {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val screenshotFile = File(service.cacheDir, "mutual_author_red_half.png")
         if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return null
@@ -5084,22 +5150,25 @@ class RealTraceExecutor(
 
             val allElements = result.textBlocks.asSequence()
                 .flatMap { it.lines.asSequence() }
-                .flatMap { it.elements.asSequence() }
-                .mapNotNull { el ->
-                    val box = el.boundingBox ?: return@mapNotNull null
-                    val norm = normalizeOcrButtonText(el.text)
-                    val centerX = box.centerX()
-                    val centerY = cropTop + box.centerY()
-                    Triple(norm, centerX, centerY)
+                .flatMap { line ->
+                    val lineNorm = normalizeOcrButtonText(line.text)
+                    line.elements.asSequence().mapNotNull { el ->
+                        val box = el.boundingBox ?: return@mapNotNull null
+                        val norm = normalizeOcrButtonText(el.text)
+                        val centerX = box.centerX()
+                        val centerY = cropTop + box.centerY()
+                        MutualAuthorOcrElement(norm, lineNorm, centerX, centerY)
+                    }
                 }
                 .toList()
 
-            val messageHit = allElements.firstOrNull { (norm, _, centerY) ->
-                norm.contains("message") && centerY in cropTop..cropBottom
+            val messageHit = allElements.firstOrNull { el ->
+                el.norm.contains("message") && el.centerY in cropTop..cropBottom
             }
-            val messageY = messageHit?.third
-            val followHits = allElements.filter { (norm, _, centerY) ->
-                centerY in cropTop..cropBottom && isMutualFollowButtonTextNormalized(norm)
+            val messageY = messageHit?.centerY
+            val followHits = allElements.filter { el ->
+                el.centerY in cropTop..cropBottom &&
+                    isMutualFollowButtonTextNormalized(el.norm, el.lineNorm)
             }
 
             val rowYTol = (fullH * 0.015f).toInt().coerceIn(14, 56)
@@ -5108,27 +5177,27 @@ class RealTraceExecutor(
 
             val target = if (messageY != null) {
                 val my = messageY
-                val mx = messageHit?.second
-                followHits.firstOrNull { (_, x, y) ->
-                    sameRow(y, my) && x >= halfW
+                val mx = messageHit?.centerX
+                followHits.firstOrNull { el ->
+                    sameRow(el.centerY, my) && el.centerX >= halfW
                 } ?: if (mx != null) {
-                    followHits.firstOrNull { (_, x, y) -> sameRow(y, my) && x > mx }
+                    followHits.firstOrNull { el -> sameRow(el.centerY, my) && el.centerX > mx }
                 } else {
                     null
-                } ?: followHits.firstOrNull { (_, _, y) -> sameRow(y, my) }
+                } ?: followHits.firstOrNull { el -> sameRow(el.centerY, my) }
                     ?: followHits.firstOrNull()
             } else {
                 followHits.firstOrNull()
             }
 
-            val preview = allElements.map { it.first }.filter { it.isNotEmpty() }.take(12).joinToString(" | ")
-            val messagePoint = messageHit?.let { Point(it.second, it.third) }
-            val followPoint = target?.let { Point(it.second, it.third) }
+            val preview = allElements.map { it.norm }.filter { it.isNotEmpty() }.take(12).joinToString(" | ")
+            val messagePoint = messageHit?.let { Point(it.centerX, it.centerY) }
+            val followPoint = target?.let { Point(it.centerX, it.centerY) }
             devOp(
                 alias,
                 "互点：OCR按钮区 crop=(${cropTop}-${cropBottom}) message=${messagePoint?.let { "(${it.x},${it.y})" } ?: "<none>"} follow=${followPoint?.let { "(${it.x},${it.y})" } ?: "<none>"} preview=$preview",
             )
-            target?.let { MutualFollowTarget(Point(it.second, it.third), messageY ?: it.third) }
+            target?.let { MutualFollowTarget(Point(it.centerX, it.centerY), messageY ?: it.centerY) }
         } catch (ex: Exception) {
             devOp(alias, "互点：作者区 Follow OCR 异常 ${ex.message}")
             null
@@ -5675,28 +5744,6 @@ class RealTraceExecutor(
         findStrictExactLabelHit(result, "Dont allow")?.let { return it }
         return null
     }
-
-    private fun ocrVisionContainsSaveLoginText(result: Text): Boolean =
-        result.text.lowercase(Locale.US).contains("save login")
-
-    private fun findSaveLoginLabelHit(result: Text): StrictLabelHit? =
-        findStrictExactLabelHit(result, "Save login")
-            ?: findStrictExactAcrossAdjacentLines(result, "Save login")
-            ?: findProfileEditSaveLoginInfoHit(result)
-
-    /** 同屏含 save login 文案且存在 Don't allow 时优先点 Save login，否则点 Don't allow。 */
-    private fun findDontAllowDismissHitPreferSaveLogin(result: Text): StrictLabelHit? {
-        val dontAllowHit = findDontAllowLabelHit(result)
-        if (dontAllowHit != null && ocrVisionContainsSaveLoginText(result)) {
-            findSaveLoginLabelHit(result)?.let { return it }
-        }
-        return dontAllowHit
-    }
-
-    private fun dontAllowDismissPrefersSaveLogin(result: Text): Boolean =
-        findDontAllowLabelHit(result) != null &&
-            ocrVisionContainsSaveLoginText(result) &&
-            findSaveLoginLabelHit(result) != null
 
     /** 拉起后专用：拒绝系统权限弹窗（英文 Don't allow + 中文取消/不允许）。 */
     private fun findLaunchPermissionDismissHit(result: Text): StrictLabelHit? {
@@ -6879,7 +6926,7 @@ class RealTraceExecutor(
                     "publish_post_dont_allow_${videoIndex}",
                     "Don't allow",
                     3,
-                ) { findDontAllowDismissHitPreferSaveLogin(it) }
+                ) { findDontAllowLabelHit(it) }
             ) {
                 devOp(alias, "发作品：Don't allow 已点")
                 delay(500)
@@ -6918,7 +6965,8 @@ class RealTraceExecutor(
      * 仅该账号当日首条尝试 Post Now / Only this time（点后二次 OCR 再点可选）/ Don't allow / 底部 Cancel（可选）。
      * 单条是否发布成功以底栏主导航 OCR（Home/Friends/Inbox/Profile 至少 2 类）为准。
      * 图库统计为 0 时不执行发布并返回 false。
-     * 新任务（无续发断点）时：先清理图库（MediaStore + 磁盘，避免幽灵项）→ 再按运行配置 [AppConfig.publish_post_material_fetch_count] 调本机 `tasks/request` 拉素材 → 再统计图库并发作品；发布完成后**不**再删图库，留待下次拉取前统一清理。
+     * 全部条数发布成功后，su 删除 `Pictures` 下**全部文件**（含 AutoTraces、Screenshots、.thumbnails 等）。
+     * 新任务（无续发断点）时：先清理图库 → 再按运行配置 [AppConfig.publish_post_material_fetch_count] 调本机 `tasks/request` 拉素材 → 再统计图库并发作品。
      * 中途失败时 [PrefsStore] 记录已成功条数，下次从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
      * 断点条数大于本次计划条数且图库仍有素材时，视为断点与图库不一致，清断点从第 1 条重发（不删图）。
      */
@@ -6967,9 +7015,12 @@ class RealTraceExecutor(
         } else if (startIdx >= publishRounds) {
             devOp(
                 alias,
-                "发作品：断点记录已成功 $startIdx 条，已达本次计划 $publishRounds 条，视为本轮已完成并清理断点（图库保留至下次拉取前清理）",
+                "发作品：断点记录已成功 $startIdx 条，已达本次计划 $publishRounds 条，视为本轮已完成并清理断点",
             )
             PrefsStore.clearPublishPostResumeProgress(accountKey)
+            devOp(alias, "发作品：任务已完成，等待 30s 后再删除图库作品")
+            delay(30_000)
+            publishPostDeleteAllPicturesAfterSuccess(alias)
             return true
         }
         if (galleryMaterialCount > PUBLISH_POST_MAX_ITEMS_PER_TASK) {
@@ -7064,7 +7115,7 @@ class RealTraceExecutor(
         }
         runCatching { publishPostTapBottomHomeAfterCompletion(service, alias) }
         PrefsStore.clearPublishPostResumeProgress(accountKey)
-        devOp(alias, "发作品：本轮全部发布成功，图库素材保留（下次新任务拉取前将统一清理）")
+        publishPostDeleteAllPicturesAfterSuccess(alias)
         return true
     }
 
@@ -7696,24 +7747,22 @@ class RealTraceExecutor(
         return out ?: -1
     }
 
-    private data class PicturesMediaStoreQuery(
-        val collections: List<Uri>,
-        val selection: String,
-        val selectionArgs: Array<String>,
-    )
-
-    private fun picturesMediaStoreQuery(): PicturesMediaStoreQuery {
+    /**
+     * 删除经 MediaStore 写入、仅 rm 文件仍会残留在图库里的索引（含 IS_PENDING 幽灵项）。
+     */
+    private fun deletePicturesMediaStoreEntries(ctx: Context): Int {
+        var deleted = 0
         val collections = mutableListOf<Uri>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             collections.add(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY))
             collections.add(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY))
-            collections.add(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY))
         } else {
             @Suppress("DEPRECATION")
             collections.add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
             @Suppress("DEPRECATION")
             collections.add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
         }
+        val resolver = ctx.contentResolver
         val relativePathCol = MediaStore.MediaColumns.RELATIVE_PATH
         val dataCol = MediaStore.MediaColumns.DATA
         val (selection, selectionArgs) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -7730,91 +7779,18 @@ class RealTraceExecutor(
         } else {
             "($dataCol LIKE ? OR $dataCol LIKE ?)" to arrayOf("%/Pictures/%", "%/emulated/0/Pictures/%")
         }
-        return PicturesMediaStoreQuery(collections, selection, selectionArgs)
-    }
-
-    /** 统计 Pictures 相关 MediaStore 索引条数（用于清理后残留/幽灵项检测）。 */
-    private fun countPicturesMediaStoreEntries(ctx: Context): Int {
-        val query = picturesMediaStoreQuery()
-        var count = 0
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        for (collection in query.collections) {
-            ctx.contentResolver.query(
-                collection,
-                projection,
-                query.selection,
-                query.selectionArgs,
-                null,
-            )?.use { cursor -> count += cursor.count }
-        }
-        return count
-    }
-
-    /**
-     * 删除经 MediaStore 写入、仅 rm 文件仍会残留在图库里的索引（含 IS_PENDING 幽灵项）。
-     * 先收集 _ID 再批量 delete，避免边遍历边删导致游标跳行漏删。
-     */
-    private fun deletePicturesMediaStoreEntries(ctx: Context): Int {
-        val query = picturesMediaStoreQuery()
-        var deleted = 0
-        val resolver = ctx.contentResolver
-        val projection = arrayOf(MediaStore.MediaColumns._ID)
-        for (collection in query.collections) {
-            val ids = mutableListOf<Long>()
-            resolver.query(collection, projection, query.selection, query.selectionArgs, null)?.use { cursor ->
+        for (collection in collections) {
+            resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 while (cursor.moveToNext()) {
-                    ids.add(cursor.getLong(idCol))
+                    val id = cursor.getLong(idCol)
+                    val itemUri = ContentUris.withAppendedId(collection, id)
+                    deleted += resolver.delete(itemUri, null, null).coerceAtLeast(0)
                 }
-            }
-            for (id in ids) {
-                val itemUri = ContentUris.withAppendedId(collection, id)
-                deleted += resolver.delete(itemUri, null, null).coerceAtLeast(0)
             }
         }
         return deleted
-    }
-
-    /**
-     * 对仍残留在 MediaStore 的 Pictures 项：若 DATA 路径可用则先 su 删磁盘文件，再删索引（降低仅 rm 后的幽灵项）。
-     */
-    private fun forceDeleteRemainingPicturesMediaStoreEntries(ctx: Context): Int {
-        val query = picturesMediaStoreQuery()
-        var deleted = 0
-        val resolver = ctx.contentResolver
-        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATA)
-        for (collection in query.collections) {
-            val pending = mutableListOf<Pair<Long, String?>>()
-            resolver.query(collection, projection, query.selection, query.selectionArgs, null)?.use { cursor ->
-                val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-                val dataColIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                while (cursor.moveToNext()) {
-                    val dataPath = if (dataColIdx >= 0) cursor.getString(dataColIdx)?.trim()?.takeIf { it.isNotEmpty() } else null
-                    pending.add(cursor.getLong(idCol) to dataPath)
-                }
-            }
-            for ((id, dataPath) in pending) {
-                if (!dataPath.isNullOrBlank()) {
-                    runSuCommandWithOutputMerged("rm -f ${shellEscape(dataPath)} 2>/dev/null")
-                }
-                val itemUri = ContentUris.withAppendedId(collection, id)
-                deleted += resolver.delete(itemUri, null, null).coerceAtLeast(0)
-            }
-        }
-        return deleted
-    }
-
-    private fun deletePicturesFilesystemViaSu(quotedRoot: String) {
-        runSuCommand("find $quotedRoot -type f -size 0 2>/dev/null -delete")
-        runSuCommand("find $quotedRoot -depth -mindepth 1 -delete 2>/dev/null")
-    }
-
-    private fun runPicturesGalleryCleanupPass(ctx: Context, quotedRoot: String): Int {
-        var msDeleted = runCatching { deletePicturesMediaStoreEntries(ctx) }.getOrElse { 0 }
-        deletePicturesFilesystemViaSu(quotedRoot)
-        msDeleted += runCatching { deletePicturesMediaStoreEntries(ctx) }.getOrElse { 0 }
-        msDeleted += runCatching { forceDeleteRemainingPicturesMediaStoreEntries(ctx) }.getOrElse { 0 }
-        return msDeleted
     }
 
     private fun requestPicturesMediaRescan(ctx: Context, alias: String, logContext: String) {
@@ -7844,39 +7820,30 @@ class RealTraceExecutor(
             val ctx = appContextProvider().applicationContext
             val quotedRoot = shellEscape(PUBLISH_POST_PICTURES_PATH)
             val beforeFs = countAllPicturesFilesViaSu()
-            var totalMsDeleted = 0
-            repeat(2) { pass ->
-                totalMsDeleted += runCatching { runPicturesGalleryCleanupPass(ctx, quotedRoot) }
-                    .getOrElse { ex ->
-                        devOp(alias, "$logContext：MediaStore 清理异常 ${ex.message}")
-                        0
-                    }
-                val remainingFs = countAllPicturesFilesViaSu()
-                val remainingMs = runCatching { countPicturesMediaStoreEntries(ctx) }.getOrElse { -1 }
-                if ((remainingFs <= 0) && (remainingMs <= 0)) return@repeat
-                if (pass == 0) {
-                    devOp(
-                        alias,
-                        "$logContext：首轮清理后仍有残留（磁盘=${remainingFs.coerceAtLeast(0)} MediaStore=${remainingMs.coerceAtLeast(0)}），补做第二轮",
-                    )
+            val msDeletedFirst = runCatching { deletePicturesMediaStoreEntries(ctx) }
+                .getOrElse { ex ->
+                    devOp(alias, "$logContext：MediaStore 清理异常 ${ex.message}")
+                    0
                 }
-            }
+            runSuCommand("find $quotedRoot -type f -size 0 2>/dev/null -delete")
+            runSuCommand("find $quotedRoot -mindepth 1 -delete 2>/dev/null")
+            runSuCommand("find $quotedRoot -type f 2>/dev/null -delete")
+            runSuCommand("find $quotedRoot -depth -type d -mindepth 1 2>/dev/null -delete")
+            val msDeletedSecond = runCatching { deletePicturesMediaStoreEntries(ctx) }.getOrElse { 0 }
             requestPicturesMediaRescan(ctx, alias, logContext)
             delay(800)
             val afterFs = countAllPicturesFilesViaSu()
-            val afterMs = runCatching { countPicturesMediaStoreEntries(ctx) }.getOrElse { -1 }
             val fsRemoved = if (beforeFs >= 0 && afterFs >= 0) (beforeFs - afterFs).coerceAtLeast(0) else beforeFs
-            val residualNote = if (afterFs > 0 || afterMs > 0) {
-                "；警告：清理后仍有残留（磁盘=$afterFs MediaStore=$afterMs），图库可能出现幽灵项"
-            } else {
-                ""
-            }
             devOp(
                 alias,
-                "$logContext：图库清理完成 MediaStore删=$totalMsDeleted " +
-                    "磁盘文件删前=$beforeFs 删后=$afterFs（约移除 $fsRemoved 个文件）$residualNote",
+                "$logContext：图库清理完成 MediaStore删=${msDeletedFirst + msDeletedSecond} " +
+                    "磁盘文件删前=$beforeFs 删后=$afterFs（约移除 $fsRemoved 个文件）",
             )
         }
+    }
+
+    private suspend fun publishPostDeleteAllPicturesAfterSuccess(alias: String) {
+        deleteAllPicturesOnDevice(alias, "发作品")
     }
 
     /**
@@ -8135,6 +8102,17 @@ class RealTraceExecutor(
     private fun isTikTokForeground(): Boolean {
         val fg = resolveStrictForegroundPackage(collectForegroundProbeTexts()) ?: return false
         return Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(fg, ignoreCase = true) }
+    }
+
+    private fun logForegroundProbeFailure(alias: String, tag: String, expectedPkg: String) {
+        val probe = collectForegroundProbeTexts()
+        val strictFg = resolveStrictForegroundPackage(probe)
+        val parsed = extractPackagesFromDumpsys(probe)
+        val focusSnippet = filterDumpsysFocusLines(probe).take(4).joinToString(" | ")
+        devOp(
+            alias,
+            "$tag：严格前台校验失败（期望=$expectedPkg 焦点包=${strictFg ?: "无"} 栈解析=${parsed.joinToString()} 焦点行=${focusSnippet.ifBlank { "无" }}）",
+        )
     }
 
     private fun isPackageVisible(packageName: String): Boolean {
@@ -11581,11 +11559,10 @@ class RealTraceExecutor(
             if (hardStopOrNull(alias, "自动登录-Don't allow")) return false
             if (pass > 1 && !autoLoginDelay(alias, 1000L, "Don't allow")) return false
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_dont_allow_$pass") ?: continue
-            val hit = findDontAllowDismissHitPreferSaveLogin(vision)
+            val hit = findDontAllowLabelHit(vision)
             if (hit == null) continue
             val tap = autoLoginTapWithJitter(hit.point, w, h)
-            val tapLabel = if (dontAllowDismissPrefersSaveLogin(vision)) "Save login" else "Don't allow"
-            devOp(alias, "自动登录 $tapLabel：tap (${tap.x},${tap.y})")
+            devOp(alias, "自动登录 Don't allow：tap (${tap.x},${tap.y})")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                 autoLoginDelay(alias, 450L, "Don't allow 后")
                 return true
@@ -11637,10 +11614,9 @@ class RealTraceExecutor(
             }
 
             if (!dontAllowHandled && !agreeTappedThisPass) {
-                val dontAllowHit = findDontAllowDismissHitPreferSaveLogin(vision) ?: continue
+                val dontAllowHit = findDontAllowLabelHit(vision) ?: continue
                 val tap = autoLoginTapWithJitter(dontAllowHit.point, w, h)
-                val tapLabel = if (dontAllowDismissPrefersSaveLogin(vision)) "Save login" else "Don't allow"
-                devOp(alias, "自动登录 $tapLabel(预处理)：tap (${tap.x},${tap.y})")
+                devOp(alias, "自动登录 Don't allow(预处理)：tap (${tap.x},${tap.y})")
                 if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                     if (!autoLoginDelay(alias, 450L, "Don't allow 后")) return true
                     dontAllowHandled = true
@@ -11714,11 +11690,10 @@ class RealTraceExecutor(
             }
 
             if (handleDontAllow) {
-                val dontAllowHit = findDontAllowDismissHitPreferSaveLogin(vision)
+                val dontAllowHit = findDontAllowLabelHit(vision)
                 if (dontAllowHit != null) {
                     val tap = autoLoginTapWithJitter(dontAllowHit.point, w, h)
-                    val tapLabel = if (dontAllowDismissPrefersSaveLogin(vision)) "Save login" else "Don't allow"
-                    devOp(alias, "自动登录 $tapLabel：tap (${tap.x},${tap.y})")
+                    devOp(alias, "自动登录 Don't allow：tap (${tap.x},${tap.y})")
                     if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                         autoLoginDelay(alias, 450L, "Don't allow 后")
                         handledAny = true
@@ -11883,6 +11858,10 @@ class RealTraceExecutor(
             devOp(alias, "登录状态保障：点底栏 Home (${tap.x},${tap.y}) [pass=$pass]")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                 autoLoginDelay(alias, 500L, "登录状态保障 Home 后")
+                if (lastEndedAtUsersSelection) {
+                    devOp(alias, "登录状态保障：已回 Home，清除 Users 复用标记")
+                }
+                lastEndedAtUsersSelection = false
                 return true
             }
         }
