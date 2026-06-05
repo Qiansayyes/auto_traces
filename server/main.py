@@ -160,6 +160,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 GALLERY_LIBRARY_DIR = BASE_DIR / "gallery_library"
 GALLERY_LIBRARY_MAX_ITEMS = 100
 GALLERY_LIBRARY_INDEX_FILENAME = "index.json"
+with contextlib.suppress(Exception):
+    GALLERY_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = BASE_DIR / "tiktok_fans.db"
 CV_TEMPLATE_ZIP_PATH = BASE_DIR / "server" / "cv_templates.zip"
 FOLLOW_SCRAPER_PATH = BASE_DIR / "tiktok_follow_scraper.py"
@@ -9558,38 +9560,46 @@ def admin_gallery_library_list(authorization: str | None = Header(default=None))
     err, session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
-    owner = str(session["username"] or "").strip()
-    owner_dir = _gallery_library_owner_dir(owner)
-    items = _gallery_library_read_index(owner_dir)
-    normalized: list[dict[str, Any]] = []
-    changed = False
-    for item in items:
-        if not isinstance(item, dict):
-            changed = True
-            continue
-        item_id = str(item.get("id") or "").strip()
-        filename = str(item.get("filename") or "").strip() or f"{item_id}.jpg"
-        file_path = _gallery_library_item_path(owner_dir, item_id)
-        if not item_id or not file_path:
-            changed = True
-            continue
-        normalized.append(
-            {
-                "id": item_id,
-                "filename": filename,
-                "content_type": str(item.get("content_type") or "image/jpeg"),
-                "size": int(file_path.stat().st_size),
-                "created_at": str(item.get("created_at") or ""),
-            }
-        )
-    if changed:
-        _gallery_library_write_index(owner_dir, normalized)
-    return {
-        "code": 0,
-        "items": normalized,
-        "count": len(normalized),
-        "max_items": GALLERY_LIBRARY_MAX_ITEMS,
-    }
+    try:
+        owner = str(session["username"] or "").strip()
+        owner_dir = _gallery_library_owner_dir(owner)
+        items = _gallery_library_read_index(owner_dir)
+        normalized: list[dict[str, Any]] = []
+        changed = False
+        for item in items:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            item_id = str(item.get("id") or "").strip()
+            filename = str(item.get("filename") or "").strip() or f"{item_id}.jpg"
+            file_path = _gallery_library_item_path(owner_dir, item_id)
+            if not item_id or not file_path:
+                changed = True
+                continue
+            try:
+                size = int(file_path.stat().st_size)
+            except OSError:
+                changed = True
+                continue
+            normalized.append(
+                {
+                    "id": item_id,
+                    "filename": filename,
+                    "content_type": str(item.get("content_type") or "image/jpeg"),
+                    "size": size,
+                    "created_at": str(item.get("created_at") or ""),
+                }
+            )
+        if changed:
+            _gallery_library_write_index(owner_dir, normalized)
+        return {
+            "code": 0,
+            "items": normalized,
+            "count": len(normalized),
+            "max_items": GALLERY_LIBRARY_MAX_ITEMS,
+        }
+    except Exception as exc:
+        return {"code": 1, "msg": f"读取图库失败：{exc}"}
 
 
 @app.post("/api/admin/gallery/library")

@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260605-1";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260605-2";
 
 const authShell = document.getElementById("authShell");
 const appShell = document.getElementById("appShell");
@@ -1114,17 +1114,21 @@ function renderDeviceLogDeviceSelect(devices = {}, deviceLogs = {}) {
   }
 }
 
+function isCurrentPageLocalDevHost() {
+  const { hostname } = window.location;
+  return hostname === "127.0.0.1" || hostname === "localhost";
+}
+
 function defaultApiBase() {
   const { protocol, hostname, port } = window.location;
   if (protocol === "file:") {
     return "http://127.0.0.1:8000/api";
   }
-  const isLocalDevHost = hostname === "127.0.0.1" || hostname === "localhost";
-  if (isLocalDevHost && String(port || "") === "8080") {
+  if (isCurrentPageLocalDevHost() && String(port || "") === "8080") {
     // 本地静态服务(8080) + 后端(8000) 的固定组合，避免 /api 打到静态服务 404。
     return `${protocol}//${hostname || "127.0.0.1"}:8000/api`;
   }
-  // 默认使用同源 API，后续不做自动切换。
+  // VPS / 公网部署默认走同源 /api（由 Nginx 反代到后端）。
   return "/api";
 }
 
@@ -1134,11 +1138,33 @@ function normalizeApiBaseForCurrentPage(base) {
   return raw;
 }
 
+function isLoopbackApiBase(base) {
+  const raw = String(base || "").trim().replace(/\/$/, "");
+  if (!raw || raw.startsWith("/")) return false;
+  try {
+    const url = new URL(raw.includes("://") ? raw : `http://${raw}`);
+    return url.hostname === "127.0.0.1" || url.hostname === "localhost";
+  } catch {
+    return /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?/i.test(raw);
+  }
+}
+
+/** 在 VPS 等远程页面上，自动丢弃 localStorage 里残留的 127.0.0.1:8000/api。 */
+function sanitizeApiBaseForCurrentPage(base) {
+  const normalized = normalizeApiBaseForCurrentPage(base);
+  if (!normalized) return "";
+  if (!isCurrentPageLocalDevHost() && isLoopbackApiBase(normalized)) {
+    return defaultApiBase();
+  }
+  return normalized;
+}
+
 function apiBase() {
-  if (runtimeApiBaseOverride) return runtimeApiBaseOverride;
-  const manual = normalizeApiBaseForCurrentPage((apiBaseInput?.value || "").trim().replace(/\/$/, ""));
+  const manual = sanitizeApiBaseForCurrentPage((apiBaseInput?.value || "").trim().replace(/\/$/, ""));
   if (manual) return manual;
-  const saved = normalizeApiBaseForCurrentPage((localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, ""));
+  const override = sanitizeApiBaseForCurrentPage(runtimeApiBaseOverride);
+  if (override) return override;
+  const saved = sanitizeApiBaseForCurrentPage((localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, ""));
   if (saved) return saved;
   return defaultApiBase();
 }
@@ -1166,11 +1192,13 @@ async function probeAuthMeStatus(base) {
       return result;
     }
     if (response.status === 401) {
+      result.ok = true;
       result.errorKind = "401";
       result.authState = "无效（未登录/失效）";
       return result;
     }
     if (response.status === 403) {
+      result.ok = true;
       result.errorKind = "403";
       result.authState = "有效但无权限";
       return result;
@@ -1213,12 +1241,8 @@ async function ensureApiBaseHealthyOnBoot() {
     authState: probe.authState,
     errorKind: probe.errorKind,
   });
-  if (probe.ok) {
-    runtimeApiBaseOverride = preferred;
-    return;
-  }
-  runtimeApiBaseOverride = preferred;
-  setStatus(`API Base 连通性检查失败：${preferred}（未自动切换，请检查填写地址与后端服务）`, "error");
+  if (probe.ok) return;
+  setStatus(`API Base 连通性检查失败：${preferred}（请确认后端已启动且 Nginx 已反代 /api）`, "error");
 }
 
 function isAuthExpiredError(error) {
@@ -1354,7 +1378,7 @@ async function switchSection(id, options = {}) {
       renderDeviceAliasPresetOptions();
       await loadGalleryLibrary();
     } catch (error) {
-      setStatus(error?.message || "加载图库失败", "error");
+      setStatus(humanizeRequestErrorMessage(error) || "加载图库失败", "error");
     }
   }
 }
@@ -8359,22 +8383,25 @@ if (adminReloadUsersBtn) {
 toggleDeviceOpsButtons();
 
 if (apiBaseInput) {
-  const stored = normalizeApiBaseForCurrentPage((localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, ""));
+  const stored = sanitizeApiBaseForCurrentPage((localStorage.getItem(API_BASE_LS_KEY) || "").trim().replace(/\/$/, ""));
   const normalizedDefault = defaultApiBase();
   const nextValue = stored || normalizedDefault;
   apiBaseInput.value = nextValue;
   localStorage.setItem(API_BASE_LS_KEY, nextValue);
+  runtimeApiBaseOverride = "";
   updateStartupSelfCheck({ apiBase: nextValue });
-  apiBaseInput.addEventListener("change", () => {
-    const normalized = (apiBaseInput.value || "").trim().replace(/\/$/, "");
-    runtimeApiBaseOverride = normalized || "";
+  const persistApiBaseInput = () => {
+    const normalized = sanitizeApiBaseForCurrentPage((apiBaseInput.value || "").trim().replace(/\/$/, ""));
+    runtimeApiBaseOverride = "";
     updateStartupSelfCheck({ apiBase: normalized || defaultApiBase() });
     if (normalized) {
       localStorage.setItem(API_BASE_LS_KEY, normalized);
     } else {
       localStorage.removeItem(API_BASE_LS_KEY);
     }
-  });
+  };
+  apiBaseInput.addEventListener("input", persistApiBaseInput);
+  apiBaseInput.addEventListener("change", persistApiBaseInput);
 }
 
 (async () => {
