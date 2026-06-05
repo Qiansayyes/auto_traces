@@ -78,18 +78,43 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         return runBlockingApi {
             val mine = CompanionApi.deviceId(context.applicationContext)
             val detail =
-                CompanionApi.fetchTaskDetail(context.applicationContext, taskId)
-                    ?: return@runBlockingApi jsonResponse(
-                        502,
-                        JSONObject().apply {
-                            put("success", false)
-                            put("error", "pc_task_fetch_failed")
-                            put(
-                                "detail",
-                                "无法在 Windows ${CompanionApi.windowsBaseUrl(context.applicationContext)} 读取任务详情，请核对手机「Windows 地址」与网络.",
+                runCatching { CompanionApi.pollTaskUntilReady(context.applicationContext, taskId) }
+                    .getOrElse { t ->
+                        val msg = t.message.orEmpty()
+                        if (msg.contains("task_prepare_failed")) {
+                            return@runBlockingApi jsonResponse(
+                                409,
+                                JSONObject().apply {
+                                    put("success", false)
+                                    put("error", "task_terminal")
+                                    put("detail", msg)
+                                },
                             )
-                        },
-                    )
+                        }
+                        if (msg.contains("task_prepare_timeout")) {
+                            return@runBlockingApi jsonResponse(
+                                504,
+                                JSONObject().apply {
+                                    put("success", false)
+                                    put("error", "task_prepare_timeout")
+                                    put("detail", msg)
+                                },
+                            )
+                        }
+                        return@runBlockingApi jsonResponse(
+                            502,
+                            JSONObject().apply {
+                                put("success", false)
+                                put("error", "pc_task_fetch_failed")
+                                put(
+                                    "detail",
+                                    msg.ifEmpty {
+                                        "无法在 Windows ${CompanionApi.windowsBaseUrl(context.applicationContext)} 读取任务详情，请核对手机「Windows 地址」与网络."
+                                    },
+                                )
+                            },
+                        )
+                    }
 
             val owner = detail.deviceId?.trim()?.takeIf { it.isNotEmpty() }
             if (owner != null && !owner.equals(mine, ignoreCase = true)) {
@@ -115,18 +140,7 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                     )
             }
 
-            val files =
-                detail.files.orEmpty().filter { it.fileName.isNotBlank() && it.md5.isNotBlank() && it.sizeBytes >= 0L }
-            if (files.isEmpty()) {
-                return@runBlockingApi jsonResponse(
-                    400,
-                    JSONObject().apply {
-                        put("success", false)
-                        put("error", "no_files_in_task")
-                        put("detail", "PC 任务中无可用文件条目.")
-                    },
-                )
-            }
+            val files = detail.files.orEmpty()
 
             val targetPath = CompanionApi.resolvedTargetPath(detail.targetPath)
             TaskStore.saveTaskSnapshot(
@@ -163,7 +177,7 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         val targetPath = CompanionApi.resolvedTargetPath(
             body.optString("targetPath", null).takeIf { body.has("targetPath") && !body.isNull("targetPath") },
         )
-        val task = runBlockingApi { CompanionApi.createTask(context, count, targetPath) }
+        val task = runBlockingApi { CompanionApi.createTaskAndWaitReady(context, count, targetPath) }
         TaskStore.saveTaskSnapshot(
             context,
             TaskSnapshot(
@@ -272,7 +286,6 @@ object ApiSettings {
     private const val KEY_API_TOKEN = "api_token"
     private const val KEY_API_LISTEN_PORT = "api_listen_port"
     private const val KEY_CALLBACK_PACKAGE = "callback_target_package"
-    private const val KEY_ROOT_ADB_TCPIP = "root_adb_tcpip_enabled"
     private const val KEY_ADB_TCPIP_PORT = "adb_tcpip_port"
     private const val KEY_MIRROR_IP_OVERRIDE = "mirror_ip_override"
 
@@ -319,12 +332,13 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_API_TOKEN, token).apply()
     }
 
-    /** Root + su：在已连 Wi‑Fi 时由前台服务尝试 `setprop` + 重启 adbd，固定 TCP 端口供 `adb connect`。 */
-    fun isRootAdbTcpipEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ROOT_ADB_TCPIP, false)
+    /** Root + su：在已连 Wi‑Fi 时由前台服务尝试 `setprop` + 重启 adbd，固定 TCP 端口供 `adb connect`（常开，不可关闭）。 */
+    @Suppress("UNUSED_PARAMETER")
+    fun isRootAdbTcpipEnabled(context: Context): Boolean = true
 
+    @Suppress("UNUSED_PARAMETER")
     fun setRootAdbTcpipEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ROOT_ADB_TCPIP, enabled).apply()
+        // 常开：忽略历史偏好与外部写入
     }
 
     fun getAdbTcpipPort(context: Context): Int {

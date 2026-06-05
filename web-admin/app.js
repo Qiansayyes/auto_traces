@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260603-5";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260605-1";
 
 const authShell = document.getElementById("authShell");
 const appShell = document.getElementById("appShell");
@@ -133,9 +133,7 @@ const schedulerTaskLogsEl = document.getElementById("schedulerTaskLogs");
 const schedulerLogsFollowToggle = document.getElementById("schedulerLogsFollow");
 const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrollBottom");
 const autoSwitchEnabledToggle = document.getElementById("autoSwitchEnabledToggle");
-const saveAutoSwitchConfigBtn = document.getElementById("saveAutoSwitchConfig");
 const backupStatsFullQueryEnabledToggle = document.getElementById("backupStatsFullQueryEnabledToggle");
-const saveBackupStatsFullQueryConfigBtn = document.getElementById("saveBackupStatsFullQueryConfig");
 const LOG_SCROLL_THRESHOLD = 48;
 const taskContainerIdsInput = document.getElementById("taskContainerIds");
 const taskParallelInput = document.getElementById("taskParallel");
@@ -638,6 +636,7 @@ const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
 let autoSwitchSaveInFlight = false;
+let backupStatsFullQuerySaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
 const DB_SEARCH_FIELD_KEY = "auto_traces_db_search_field_v1";
 const DB_SEARCH_KEYWORD_KEY = "auto_traces_db_search_keyword_v1";
@@ -652,6 +651,9 @@ function humanizeRequestErrorMessage(error) {
   raw = raw.replace(/\s*\[[^\]]*\/api[^\]]*\]\s*$/gi, "").trim();
   raw = raw.replace(/\s*\[https?:\/\/[^\]]+\]\s*$/gi, "").trim();
   if (/^请求超时：\d+ms/i.test(raw)) return "请求超时，请稍后重试";
+  if (/Unexpected token '<'|is not valid JSON/i.test(raw)) {
+    return "服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）";
+  }
   if (/网络请求失败|无法连接服务端|Failed to fetch|fetch failed/i.test(raw)) {
     return "无法连接服务器，请检查网络或联系管理员";
   }
@@ -661,7 +663,13 @@ function humanizeRequestErrorMessage(error) {
 /** FastAPI/Pydantic 422 等返回 `{ detail: [...] }`；业务接口多为 `{ code, msg }` */
 function formatHttpApiErrorMessage(responseStatus, data) {
   const apiMsg = data?.msg;
-  if (typeof apiMsg === "string" && apiMsg.trim()) return apiMsg.trim();
+  if (typeof apiMsg === "string" && apiMsg.trim()) {
+    const trimmed = apiMsg.trim();
+    if (trimmed.startsWith("<")) {
+      return "服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）";
+    }
+    return trimmed;
+  }
   if (Array.isArray(data?.detail) && data.detail.length) {
     const parts = data.detail
       .map((item) => {
@@ -1343,9 +1351,10 @@ async function switchSection(id, options = {}) {
   if (nextSectionId === "gallery-dispatch") {
     try {
       await loadBoundDeviceAliases();
+      renderDeviceAliasPresetOptions();
       await loadGalleryLibrary();
-    } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    } catch (error) {
+      setStatus(error?.message || "加载图库失败", "error");
     }
   }
 }
@@ -1369,6 +1378,36 @@ function joinApiUrl(baseBefore, path) {
 async function buildApiUrl(path) {
   const baseBefore = String(await resolvedApiBase()).replace(/\/$/, "");
   return joinApiUrl(baseBefore, path);
+}
+
+async function parseFetchJsonResponse(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (/^\s*</.test(text)) {
+      throw new Error("服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）");
+    }
+    throw new Error(String(text).slice(0, 240) || "服务返回非 JSON 响应");
+  }
+}
+
+async function fetchFormDataApi(path, formData, options = {}) {
+  const url = await buildApiUrl(path);
+  const headers = { ...(options.headers || {}) };
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, {
+    method: options.method || "POST",
+    body: formData,
+    headers,
+  });
+  const data = await parseFetchJsonResponse(response);
+  if (!response.ok || data.code !== 0) {
+    throw new Error(formatHttpApiErrorMessage(response.status, data));
+  }
+  return data;
 }
 
 async function request(path, options = {}) {
@@ -3955,18 +3994,25 @@ async function loadBackupStatsFullQueryConfig() {
   }
 }
 
-async function saveBackupStatsFullQueryConfig() {
+async function saveBackupStatsFullQueryConfig(options = {}) {
+  if (backupStatsFullQuerySaveInFlight) return;
+  backupStatsFullQuerySaveInFlight = true;
+  const enabled = !!backupStatsFullQueryEnabledToggle?.checked;
   try {
-    const enabled = !!backupStatsFullQueryEnabledToggle?.checked;
     await request("/api/admin/backup_stats_full_query/config", {
       method: "POST",
       body: JSON.stringify({ enabled }),
     });
     await loadBackupStatsFullQueryConfig();
-    await refreshTaskStatus();
+    if (options.refreshStatus !== false) {
+      await refreshTaskStatus();
+    }
     setStatus(enabled ? "已开启每日 0 点自动全量查询" : "已关闭每日自动全量查询", "success");
   } catch (error) {
+    await loadBackupStatsFullQueryConfig();
     setStatus(error.message || "保存失败", "error");
+  } finally {
+    backupStatsFullQuerySaveInFlight = false;
   }
 }
 
@@ -5225,11 +5271,13 @@ function toggleGalleryLibrarySelection(itemId, selected) {
 async function loadGalleryLibraryThumb(itemId) {
   const id = String(itemId || "").trim();
   if (!id || galleryLibraryThumbUrls.has(id)) return galleryLibraryThumbUrls.get(id);
-  const base = String(await resolvedApiBase()).replace(/\/$/, "");
   const headers = {};
   const token = authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(`${base}/admin/gallery/library/${encodeURIComponent(id)}/file`, { headers });
+  const response = await fetch(
+    await buildApiUrl(`/api/admin/gallery/library/${encodeURIComponent(id)}/file`),
+    { headers },
+  );
   if (!response.ok) return "";
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
@@ -5317,20 +5365,8 @@ async function uploadGalleryLibraryFromInput() {
   }
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file));
-  const base = String(await resolvedApiBase()).replace(/\/$/, "");
-  const headers = {};
-  const token = authToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
   setStatus(`正在上传 ${files.length} 张图片到图库...`, "info");
-  const response = await fetch(`${base}/admin/gallery/library`, {
-    method: "POST",
-    body: formData,
-    headers,
-  });
-  const data = await response.json();
-  if (!response.ok || data.code !== 0) {
-    throw new Error(data.msg || "上传到图库失败");
-  }
+  const data = await fetchFormDataApi("/api/admin/gallery/library", formData);
   if (galleryLibraryUploadInput) galleryLibraryUploadInput.value = "";
   await loadGalleryLibrary();
   setStatus(data.msg || `已上传 ${files.length} 张图片到图库`, "success");
@@ -5352,14 +5388,16 @@ async function resolveGalleryDispatchFiles() {
     .filter((id) => id && galleryLibrarySelectedIds.has(id));
   const localFiles = Array.from(galleryImageFilesInput?.files || []);
   if (selectedIds.length) {
-    const base = String(await resolvedApiBase()).replace(/\/$/, "");
     const headers = {};
     const token = authToken();
     if (token) headers.Authorization = `Bearer ${token}`;
     const files = [];
     for (const id of selectedIds) {
       const meta = galleryLibraryItems.find((item) => String(item?.id || "").trim() === id);
-      const response = await fetch(`${base}/admin/gallery/library/${encodeURIComponent(id)}/file`, { headers });
+      const response = await fetch(
+        await buildApiUrl(`/api/admin/gallery/library/${encodeURIComponent(id)}/file`),
+        { headers },
+      );
       if (!response.ok) {
         throw new Error(`读取图库图片失败：${meta?.filename || id}`);
       }
@@ -5421,16 +5459,13 @@ async function uploadGalleryImagesToDevice() {
       formData.append("device_id", deviceId);
       formData.append("alias", alias);
       formData.append("files", file);
-      const base = String(await resolvedApiBase()).replace(/\/$/, "");
-      const response = await fetch(`${base}/admin/device_gallery/upload`, {
-        method: "POST",
-        body: formData,
-        headers,
-      });
-      const data = await response.json();
-      if (!response.ok || data.code !== 0) {
-        summaries.push({ alias, status: "failed", message: data.msg || "下发图库任务失败" });
-        appendGalleryDispatchLog(`  失败：${data.msg || "下发图库任务失败"}`);
+      let data;
+      try {
+        data = await fetchFormDataApi("/api/admin/device_gallery/upload", formData, { headers });
+      } catch (error) {
+        const message = error?.message || "下发图库任务失败";
+        summaries.push({ alias, status: "failed", message });
+        appendGalleryDispatchLog(`  失败：${message}`);
         continue;
       }
       const opId = data.op_id;
@@ -6129,16 +6164,13 @@ if (schedulerTaskLogsEl) {
 if (saveSchedulerConfigBtn) {
   saveSchedulerConfigBtn.addEventListener("click", saveSchedulerConfig);
 }
-if (saveAutoSwitchConfigBtn) {
-  saveAutoSwitchConfigBtn.addEventListener("click", () => saveAutoSwitchConfig());
+if (backupStatsFullQueryEnabledToggle) {
+  backupStatsFullQueryEnabledToggle.addEventListener("change", () =>
+    saveBackupStatsFullQueryConfig({ refreshStatus: false }),
+  );
 }
 if (autoSwitchEnabledToggle) {
   autoSwitchEnabledToggle.addEventListener("change", () => saveAutoSwitchConfig({ refreshStatus: false }));
-}
-if (saveBackupStatsFullQueryConfigBtn) {
-  saveBackupStatsFullQueryConfigBtn.addEventListener("click", () => {
-    saveBackupStatsFullQueryConfig().catch((e) => setStatus(e.message || "保存失败", "error"));
-  });
 }
 if (startSchedulersBtn) {
   startSchedulersBtn.addEventListener("click", startSchedulers);

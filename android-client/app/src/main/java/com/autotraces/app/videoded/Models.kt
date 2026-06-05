@@ -21,6 +21,8 @@ data class CreateTaskRequest(
     val deviceId: String,
     val count: Int,
     val targetPath: String? = null,
+    /** 与 PC 配对页「手动下发」一致：指定 deviceId + count + targetPath。 */
+    val manualAssign: Boolean = true,
 )
 
 data class TaskAckRequest(

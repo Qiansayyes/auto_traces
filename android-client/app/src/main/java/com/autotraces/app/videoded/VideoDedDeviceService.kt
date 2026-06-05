@@ -125,7 +125,7 @@ class VideoDedDeviceService : Service() {
         val resolvedTarget = CompanionApi.resolvedTargetPath(targetPath)
         val task =
             try {
-                CompanionApi.createTask(applicationContext, count, resolvedTarget)
+                CompanionApi.createTaskAndWaitReady(applicationContext, count, resolvedTarget)
             } catch (t: Throwable) {
                 StatusLogBuffer.append("创建任务失败：${t.message}")
                 updateNotification("下载失败：${t.message}")

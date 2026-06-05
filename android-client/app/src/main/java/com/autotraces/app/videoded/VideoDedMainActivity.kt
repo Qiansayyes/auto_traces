@@ -42,7 +42,7 @@ class VideoDedMainActivity : ComponentActivity() {
     private lateinit var copyTokenButton: Button
     private lateinit var mirrorAddrView: TextView
     private lateinit var adbTcpPortInput: EditText
-    private lateinit var rootAdbToggleButton: Button
+    private lateinit var rootAdbStatusView: TextView
     private lateinit var copyMirrorAddrButton: Button
     private lateinit var mirrorIpOverrideInput: EditText
     private var pollJob: Job? = null
@@ -92,7 +92,6 @@ class VideoDedMainActivity : ComponentActivity() {
         }
         if (::mirrorAddrView.isInitialized) {
             refreshMirrorAddrLine()
-            refreshRootAdbToggleLabel()
         }
     }
 
@@ -156,13 +155,9 @@ class VideoDedMainActivity : ComponentActivity() {
             setPadding(0, 12, 0, 4)
         }
         adbTcpPortInput = editText("ADB 无线端口", ApiSettings.getAdbTcpipPort(this).toString(), inputType = InputType.TYPE_CLASS_NUMBER)
-        rootAdbToggleButton = Button(this).apply {
-            setOnClickListener {
-                val next = !ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)
-                ApiSettings.setRootAdbTcpipEnabled(this@VideoDedMainActivity, next)
-                refreshRootAdbToggleLabel()
-                if (next) VideoDedDeviceService.enqueueTryRootAdbTcpip(this@VideoDedMainActivity)
-            }
+        rootAdbStatusView = TextView(this).apply {
+            text = "Root：Wi‑Fi 后自动尝试无线 ADB（常开）"
+            setPadding(0, 8, 0, 8)
         }
         copyMirrorAddrButton = Button(this).apply {
             text = "复制 PC 无线 ADB 地址"
@@ -172,10 +167,9 @@ class VideoDedMainActivity : ComponentActivity() {
         section.addView(mirrorIpOverrideInput)
         section.addView(mirrorAddrView)
         section.addView(adbTcpPortInput)
-        section.addView(rootAdbToggleButton)
+        section.addView(rootAdbStatusView)
         section.addView(copyMirrorAddrButton)
         refreshMirrorAddrLine()
-        refreshRootAdbToggleLabel()
         return section
     }
 
@@ -423,7 +417,7 @@ class VideoDedMainActivity : ComponentActivity() {
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
         try {
             Log.d(TAG, "requestVideos start count=$count targetPath=$targetPath")
-            val task = CompanionApi.createTask(applicationContext, count, targetPath)
+            val task = CompanionApi.createTaskAndWaitReady(applicationContext, count, targetPath)
             Log.d(TAG, "requestVideos task=${task.taskId} status=${task.status} files=${task.files.size}")
             currentTaskId = task.taskId
             currentTaskView.text = "当前任务：${task.taskId} (${task.status})"
@@ -556,14 +550,6 @@ class VideoDedMainActivity : ComponentActivity() {
             "无线 ADB 地址：adb connect <本机 IPv4>:$port"
         } else {
             "无线 ADB 地址：adb connect $ip:$port"
-        }
-    }
-
-    private fun refreshRootAdbToggleLabel() {
-        rootAdbToggleButton.text = if (ApiSettings.isRootAdbTcpipEnabled(this)) {
-            "Root：已开「Wi‑Fi 后自动尝试无线 ADB」（再点此关闭）"
-        } else {
-            "Root：点此开启「Wi‑Fi 后自动尝试无线 ADB」"
         }
     }
 

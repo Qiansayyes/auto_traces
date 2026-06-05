@@ -54,6 +54,11 @@ object PrefsStore {
      * 第 N 条失败时不递增，下次仍从第 N+1 个图库坐标继续。
      */
     private const val KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX = "publish_post_resume_next_index_"
+    /**
+     * 发作品资料页进图库入口布局：按 [KEY_DEVICE_ID] 持久化（A=右下固定点，B=左侧备用点）。
+     * 同设备不同账号发布时优先沿用，减少 A→B 全量试探。
+     */
+    private const val KEY_PUBLISH_POST_ENTRY_LAYOUT_PREFIX = "publish_post_entry_layout_"
     /** 与 check_start.config_push_revision 对齐；管理台「保存并下发」后服务端递增，本机成功拉取配置后写入 */
     private const val KEY_LAST_APPLIED_CONFIG_PUSH_REVISION = "last_applied_config_push_revision"
     /**
@@ -243,6 +248,33 @@ object PrefsStore {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
         prefs.edit().remove(publishPostResumeNextIndexKey(a)).apply()
+    }
+
+    private fun publishPostEntryLayoutPrefsKey(): String? {
+        val id = getDeviceId()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return KEY_PUBLISH_POST_ENTRY_LAYOUT_PREFIX + id
+    }
+
+    /** 本机已确认的发作品入口布局：`A` 或 `B`；无记录时返回 null。 */
+    fun getPublishPostEntryLayoutForDevice(): String? {
+        val key = publishPostEntryLayoutPrefsKey() ?: return null
+        return when (prefs.getString(key, null)?.trim()?.uppercase(Locale.US)) {
+            "A" -> "A"
+            "B" -> "B"
+            else -> null
+        }
+    }
+
+    fun setPublishPostEntryLayoutForDevice(layout: String) {
+        val key = publishPostEntryLayoutPrefsKey() ?: return
+        val v = layout.trim().uppercase(Locale.US)
+        if (v != "A" && v != "B") return
+        prefs.edit().putString(key, v).apply()
+    }
+
+    fun clearPublishPostEntryLayoutForDevice() {
+        val key = publishPostEntryLayoutPrefsKey() ?: return
+        prefs.edit().remove(key).apply()
     }
 
     fun clearPublishPostState() {

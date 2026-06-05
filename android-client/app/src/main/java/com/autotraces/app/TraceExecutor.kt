@@ -381,7 +381,10 @@ class RealTraceExecutor(
         return !config.mutual_traffic_author_follow && !config.mutual_traffic_followers_follow
     }
 
-    /** 单次发作品任务内：资料页进图库入口布局（首条试探成功后后续条目不重复 Recents 试探）。 */
+    /**
+     * 发作品任务内：资料页进图库入口布局。
+     * 任务启动时从 [PrefsStore.getPublishPostEntryLayoutForDevice] 预填；试探成功写回本机缓存供跨账号沿用。
+     */
     @Volatile
     private var publishPostEntryLayout: PublishPostEntryLayout = PublishPostEntryLayout.UNKNOWN
 
@@ -392,6 +395,34 @@ class RealTraceExecutor(
         A,
         /** 须点 W/12 + CREATE/POST 的 Y */
         B,
+    }
+
+    private fun publishPostLoadDeviceEntryLayout(alias: String): PublishPostEntryLayout {
+        return when (PrefsStore.getPublishPostEntryLayoutForDevice()) {
+            "A" -> {
+                devOp(alias, "发作品：本机已缓存布局 A（跨账号优先），本任务将直接走布局 A、跳过 A/B 试探")
+                PublishPostEntryLayout.A
+            }
+            "B" -> {
+                devOp(alias, "发作品：本机已缓存布局 B（跨账号优先），本任务将直接走布局 B、跳过 A/B 试探")
+                PublishPostEntryLayout.B
+            }
+            else -> PublishPostEntryLayout.UNKNOWN
+        }
+    }
+
+    private fun publishPostPersistDeviceEntryLayout(alias: String, layout: PublishPostEntryLayout) {
+        when (layout) {
+            PublishPostEntryLayout.A -> PrefsStore.setPublishPostEntryLayoutForDevice("A")
+            PublishPostEntryLayout.B -> PrefsStore.setPublishPostEntryLayoutForDevice("B")
+            PublishPostEntryLayout.UNKNOWN -> return
+        }
+        devOp(alias, "发作品：已写入本机布局缓存（deviceId=${PrefsStore.getDeviceId().orEmpty()}），供同设备其他账号优先沿用")
+    }
+
+    private fun publishPostClearDeviceEntryLayout(alias: String) {
+        PrefsStore.clearPublishPostEntryLayoutForDevice()
+        devOp(alias, "发作品：已清除本机布局缓存，后续将重新试探 A/B")
     }
 
     companion object {
@@ -511,6 +542,9 @@ class RealTraceExecutor(
 
         /** 发作品图库统计根路径（与 adb `find /storage/emulated/0/Pictures` 一致）。 */
         private const val PUBLISH_POST_PICTURES_PATH = "/storage/emulated/0/Pictures"
+
+        /** 发作品前额外清空的系统 Camera 相册目录（DCIM/Camera）。 */
+        private const val PUBLISH_POST_DCIM_CAMERA_PATH = "/storage/emulated/0/DCIM/Camera"
 
         /** 发作品统计/选图时排除的子目录（App 调试截图、下发缓存等，不计入可发条数）。 */
         private const val PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR = "AutoTraces"
@@ -6322,6 +6356,7 @@ class RealTraceExecutor(
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.A
+            publishPostPersistDeviceEntryLayout(alias, PublishPostEntryLayout.A)
             devOp(alias, "发作品：已确认布局 A（右下固定点），本任务后续条目直接沿用、不再 Recents 试探")
             return true
         }
@@ -6342,6 +6377,7 @@ class RealTraceExecutor(
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.B
+            publishPostPersistDeviceEntryLayout(alias, PublishPostEntryLayout.B)
             devOp(alias, "发作品：已确认布局 B（左侧备用点），本任务后续条目直接沿用、不再 Recents 试探")
             return true
         }
@@ -6965,8 +7001,7 @@ class RealTraceExecutor(
      * 仅该账号当日首条尝试 Post Now / Only this time（点后二次 OCR 再点可选）/ Don't allow / 底部 Cancel（可选）。
      * 单条是否发布成功以底栏主导航 OCR（Home/Friends/Inbox/Profile 至少 2 类）为准。
      * 图库统计为 0 时不执行发布并返回 false。
-     * 全部条数发布成功后，su 删除 `Pictures` 下**全部文件**（含 AutoTraces、Screenshots、.thumbnails 等）。
-     * 新任务（无续发断点）时：先清理图库 → 再按运行配置 [AppConfig.publish_post_material_fetch_count] 调本机 `tasks/request` 拉素材 → 再统计图库并发作品。
+     * 新任务（无续发断点）时：先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；**全部成功后不删图库**（素材保留至下次新任务开始前清理）。
      * 中途失败时 [PrefsStore] 记录已成功条数，下次从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
      * 断点条数大于本次计划条数且图库仍有素材时，视为断点与图库不一致，清断点从第 1 条重发（不删图）。
      */
@@ -6977,8 +7012,8 @@ class RealTraceExecutor(
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
         val resumeStartIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
         if (resumeStartIdx <= 0) {
-            devOp(alias, "发作品：清理设备图库（拉取新素材前）")
-            deleteAllPicturesOnDevice(alias, "发作品")
+            devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
+            deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
             val fetchCount = config.publish_post_material_fetch_count.coerceIn(0, 20)
             if (fetchCount > 0) {
                 if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
@@ -7018,9 +7053,7 @@ class RealTraceExecutor(
                 "发作品：断点记录已成功 $startIdx 条，已达本次计划 $publishRounds 条，视为本轮已完成并清理断点",
             )
             PrefsStore.clearPublishPostResumeProgress(accountKey)
-            devOp(alias, "发作品：任务已完成，等待 30s 后再删除图库作品")
-            delay(30_000)
-            publishPostDeleteAllPicturesAfterSuccess(alias)
+            devOp(alias, "发作品：断点记录已达本次计划，视为本轮已完成（不删除图库，下次新任务开始前再清）")
             return true
         }
         if (galleryMaterialCount > PUBLISH_POST_MAX_ITEMS_PER_TASK) {
@@ -7041,7 +7074,7 @@ class RealTraceExecutor(
             )
         }
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-        publishPostEntryLayout = PublishPostEntryLayout.UNKNOWN
+        publishPostEntryLayout = publishPostLoadDeviceEntryLayout(alias)
         if (!publishPostColdLaunch(service, packageName, alias, config)) return false
         for (idx in startIdx until publishRounds) {
             if (idx > startIdx) {
@@ -7084,8 +7117,9 @@ class RealTraceExecutor(
                     )
                 ) {
                     if (publishPostEntryLayout != PublishPostEntryLayout.UNKNOWN) {
-                        devOp(alias, "发作品：已缓存布局失效，清除后本条重试将重新试探 A/B")
+                        devOp(alias, "发作品：已缓存布局失效，清除本机与任务内缓存后本条重试将重新试探 A/B")
                         publishPostEntryLayout = PublishPostEntryLayout.UNKNOWN
+                        publishPostClearDeviceEntryLayout(alias)
                     }
                     devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败（CREATE/POST 或 Recents/布局B），准备同一条重试")
                     if (isHardStopActive()) return false
@@ -7115,7 +7149,7 @@ class RealTraceExecutor(
         }
         runCatching { publishPostTapBottomHomeAfterCompletion(service, alias) }
         PrefsStore.clearPublishPostResumeProgress(accountKey)
-        publishPostDeleteAllPicturesAfterSuccess(alias)
+        devOp(alias, "发作品：本轮全部发布成功（不删除图库，下次新任务开始前再清）")
         return true
     }
 
@@ -7739,33 +7773,35 @@ class RealTraceExecutor(
         return out.lineSequence().firstOrNull()?.trim()?.toIntOrNull() ?: -1
     }
 
-    /** 统计 Pictures 树下全部普通文件（含 .thumbnails 等隐藏路径，用于清理前后对比）。 */
-    private fun countAllPicturesFilesViaSu(): Int {
-        val quotedRoot = shellEscape(PUBLISH_POST_PICTURES_PATH)
+    /** 统计指定目录树下全部普通文件（用于清理前后对比）。 */
+    private fun countAllFilesViaSu(absolutePath: String): Int {
+        val quotedRoot = shellEscape(absolutePath)
         val out = runSuCommandWithOutput("find $quotedRoot -type f 2>/dev/null | wc -l")
             ?.lineSequence()?.firstOrNull()?.trim()?.toIntOrNull()
         return out ?: -1
     }
 
-    /**
-     * 删除经 MediaStore 写入、仅 rm 文件仍会残留在图库里的索引（含 IS_PENDING 幽灵项）。
-     */
-    private fun deletePicturesMediaStoreEntries(ctx: Context): Int {
-        var deleted = 0
-        val collections = mutableListOf<Uri>()
+    private fun countAllPicturesFilesViaSu(): Int = countAllFilesViaSu(PUBLISH_POST_PICTURES_PATH)
+
+    private fun picturesMediaStoreCollections(): List<Uri> =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            collections.add(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY))
-            collections.add(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY))
+            listOf(
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            )
         } else {
             @Suppress("DEPRECATION")
-            collections.add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-            @Suppress("DEPRECATION")
-            collections.add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            listOf(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            )
         }
-        val resolver = ctx.contentResolver
+
+    /** 与发作品素材统计/写入范围一致的 Pictures 查询条件。 */
+    private fun picturesMediaStorePicturesSelection(): Pair<String, Array<String>> {
         val relativePathCol = MediaStore.MediaColumns.RELATIVE_PATH
         val dataCol = MediaStore.MediaColumns.DATA
-        val (selection, selectionArgs) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             (
                 "($relativePathCol LIKE ? OR $relativePathCol LIKE ? OR $relativePathCol = ?) " +
                     "OR $dataCol LIKE ? OR $dataCol LIKE ?"
@@ -7779,8 +7815,159 @@ class RealTraceExecutor(
         } else {
             "($dataCol LIKE ? OR $dataCol LIKE ?)" to arrayOf("%/Pictures/%", "%/emulated/0/Pictures/%")
         }
+    }
+
+    /** 系统相册 Camera 卷（DCIM/Camera）MediaStore 范围。 */
+    private fun dcimCameraMediaStoreSelection(): Pair<String, Array<String>> {
+        val relativePathCol = MediaStore.MediaColumns.RELATIVE_PATH
+        val dataCol = MediaStore.MediaColumns.DATA
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            (
+                "($relativePathCol LIKE ? OR $relativePathCol LIKE ? OR $relativePathCol = ?) " +
+                    "OR $dataCol LIKE ? OR $dataCol LIKE ?"
+                ) to arrayOf(
+                "DCIM/Camera/%",
+                "DCIM/Camera%",
+                "DCIM/Camera",
+                "%/DCIM/Camera/%",
+                "%/emulated/0/DCIM/Camera/%",
+            )
+        } else {
+            "($dataCol LIKE ? OR $dataCol LIKE ?)" to arrayOf(
+                "%/DCIM/Camera/%",
+                "%/emulated/0/DCIM/Camera/%",
+            )
+        }
+    }
+
+    private fun combineMediaStoreSelections(
+        vararg parts: Pair<String, Array<String>>,
+    ): Pair<String, Array<String>> {
+        if (parts.isEmpty()) return "1=0" to emptyArray()
+        if (parts.size == 1) return parts[0]
+        val selection = parts.joinToString(" OR ") { "(${it.first})" }
+        val args = parts.flatMap { it.second.toList() }.toTypedArray()
+        return selection to args
+    }
+
+    private fun galleryCleanupMediaStoreSelection(includeDcimCameraAlbum: Boolean): Pair<String, Array<String>> =
+        if (includeDcimCameraAlbum) {
+            combineMediaStoreSelections(
+                picturesMediaStorePicturesSelection(),
+                dcimCameraMediaStoreSelection(),
+            )
+        } else {
+            picturesMediaStorePicturesSelection()
+        }
+
+    private fun publishPostIsAutoTracesMediaPath(relativePath: String?, dataPath: String?): Boolean {
+        val rel = relativePath?.trim().orEmpty()
+        if (rel.equals(PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR, ignoreCase = true)) return true
+        if (rel.startsWith("${PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR}/", ignoreCase = true)) return true
+        val data = dataPath?.trim().orEmpty()
+        if (data.isEmpty()) return false
+        val marker = "/Pictures/${PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR}"
+        return data.contains("$marker/", ignoreCase = true) ||
+            data.endsWith(marker, ignoreCase = true)
+    }
+
+    /**
+     * 经 MediaStore 写入的素材（如 PC 去重下发）在部分设备 su 命名空间内 `find` 不可见；
+     * 发作品统计/清理日志以 ContentResolver 查询为准，并与 su find 取较大值。
+     */
+    private fun countPicturesMediaStoreEntries(
+        ctx: Context,
+        exts: List<String>? = null,
+        excludeAutoTraces: Boolean = false,
+    ): Int {
+        val extSet = exts?.map { it.lowercase(Locale.US) }?.toSet()
+        val resolver = ctx.contentResolver
+        val (selection, selectionArgs) = picturesMediaStorePicturesSelection()
+        val projection = arrayOf(
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.RELATIVE_PATH,
+            MediaStore.MediaColumns.DATA,
+        )
+        var count = 0
+        for (collection in picturesMediaStoreCollections()) {
+            resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val relCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+                while (cursor.moveToNext()) {
+                    val rel = cursor.getString(relCol)
+                    val data = cursor.getString(dataCol)
+                    if (excludeAutoTraces && publishPostIsAutoTracesMediaPath(rel, data)) continue
+                    val displayName = cursor.getString(nameCol)?.trim().orEmpty()
+                    if (displayName.isEmpty()) continue
+                    if (extSet != null) {
+                        val ext = displayName.substringAfterLast('.', "").lowercase(Locale.US)
+                        if (ext.isEmpty() || ext !in extSet) continue
+                    }
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    private fun countDcimCameraMediaStoreEntries(ctx: Context): Int =
+        countMediaStoreEntriesWithSelection(ctx, dcimCameraMediaStoreSelection(), exts = null)
+
+    private fun countMediaStoreEntriesWithSelection(
+        ctx: Context,
+        selectionPair: Pair<String, Array<String>>,
+        exts: List<String>?,
+    ): Int {
+        val extSet = exts?.map { it.lowercase(Locale.US) }?.toSet()
+        val resolver = ctx.contentResolver
+        val (selection, selectionArgs) = selectionPair
+        val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME)
+        var count = 0
+        for (collection in picturesMediaStoreCollections()) {
+            resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val displayName = cursor.getString(nameCol)?.trim().orEmpty()
+                    if (displayName.isEmpty()) continue
+                    if (extSet != null) {
+                        val ext = displayName.substringAfterLast('.', "").lowercase(Locale.US)
+                        if (ext.isEmpty() || ext !in extSet) continue
+                    }
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    private fun countGalleryCleanupMediaStoreEntries(ctx: Context, includeDcimCameraAlbum: Boolean): Int {
+        var total = countPicturesMediaStoreEntries(ctx)
+        if (includeDcimCameraAlbum) total += countDcimCameraMediaStoreEntries(ctx)
+        return total
+    }
+
+    private fun countGalleryCleanupFilesViaSu(includeDcimCameraAlbum: Boolean): Int {
+        var pictures = countAllPicturesFilesViaSu()
+        if (!includeDcimCameraAlbum) return pictures
+        val camera = countAllFilesViaSu(PUBLISH_POST_DCIM_CAMERA_PATH)
+        return when {
+            pictures < 0 && camera < 0 -> -1
+            pictures < 0 -> camera
+            camera < 0 -> pictures
+            else -> pictures + camera
+        }
+    }
+
+    /**
+     * 删除经 MediaStore 写入、仅 rm 文件仍会残留在图库里的索引（含 IS_PENDING 幽灵项）。
+     */
+    private fun deleteGalleryMediaStoreEntries(ctx: Context, includeDcimCameraAlbum: Boolean): Int {
+        var deleted = 0
+        val resolver = ctx.contentResolver
+        val (selection, selectionArgs) = galleryCleanupMediaStoreSelection(includeDcimCameraAlbum)
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        for (collection in collections) {
+        for (collection in picturesMediaStoreCollections()) {
             resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 while (cursor.moveToNext()) {
@@ -7793,61 +7980,85 @@ class RealTraceExecutor(
         return deleted
     }
 
-    private fun requestPicturesMediaRescan(ctx: Context, alias: String, logContext: String) {
-        MediaScannerConnection.scanFile(
-            ctx,
-            arrayOf(PUBLISH_POST_PICTURES_PATH),
-            null,
-        ) { path, uri ->
+    /** su 递归清空指定目录（与 adb `find … -delete` 一致）。 */
+    private fun deleteFilesystemGalleryDir(absolutePath: String) {
+        val quotedRoot = shellEscape(absolutePath)
+        runSuCommand("find $quotedRoot -type f -size 0 2>/dev/null -delete")
+        runSuCommand("find $quotedRoot -mindepth 1 -delete 2>/dev/null")
+        runSuCommand("find $quotedRoot -type f 2>/dev/null -delete")
+        runSuCommand("find $quotedRoot -depth -type d -mindepth 1 2>/dev/null -delete")
+    }
+
+    private fun requestGalleryPathsMediaRescan(
+        ctx: Context,
+        alias: String,
+        logContext: String,
+        paths: List<String>,
+    ) {
+        MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null) { path, uri ->
             devOp(alias, "$logContext：媒体库刷新 scan path=$path uri=$uri")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             runSuCommand("cmd media scan-volume external_primary 2>/dev/null")
         } else {
-            runSuCommand(
-                "am broadcast -a android.intent.action.MEDIA_MOUNTED " +
-                    "-d file://${PUBLISH_POST_PICTURES_PATH} 2>/dev/null",
-            )
+            for (path in paths) {
+                runSuCommand(
+                    "am broadcast -a android.intent.action.MEDIA_MOUNTED -d file://$path 2>/dev/null",
+                )
+            }
         }
     }
 
     /**
-     * 清理 Pictures：先删 MediaStore 索引，再 su 递归删磁盘（含 .thumbnails / 0 字节），最后触发媒体库扫描。
-     * 避免仅 rm 文件后图库仍显示透明幽灵项。
+     * 清理图库：先删 MediaStore 索引，再 su 递归删磁盘，最后触发媒体库扫描。
+     * [includeDcimCameraAlbum] 为 true 时额外清空 DCIM/Camera（发作品用）；修改基本资料为 false。
      */
-    private suspend fun deleteAllPicturesOnDevice(alias: String, logContext: String) {
+    private suspend fun deleteAllPicturesOnDevice(
+        alias: String,
+        logContext: String,
+        includeDcimCameraAlbum: Boolean = false,
+    ) {
         withContext(Dispatchers.IO) {
             val ctx = appContextProvider().applicationContext
-            val quotedRoot = shellEscape(PUBLISH_POST_PICTURES_PATH)
-            val beforeFs = countAllPicturesFilesViaSu()
-            val msDeletedFirst = runCatching { deletePicturesMediaStoreEntries(ctx) }
+            val fsPaths = buildList {
+                add(PUBLISH_POST_PICTURES_PATH)
+                if (includeDcimCameraAlbum) add(PUBLISH_POST_DCIM_CAMERA_PATH)
+            }
+            val scopeLabel = if (includeDcimCameraAlbum) {
+                "${PUBLISH_POST_PICTURES_PATH} + ${PUBLISH_POST_DCIM_CAMERA_PATH}"
+            } else {
+                PUBLISH_POST_PICTURES_PATH
+            }
+            val beforeMs = countGalleryCleanupMediaStoreEntries(ctx, includeDcimCameraAlbum)
+            val beforeFs = countGalleryCleanupFilesViaSu(includeDcimCameraAlbum)
+            val msDeletedFirst = runCatching { deleteGalleryMediaStoreEntries(ctx, includeDcimCameraAlbum) }
                 .getOrElse { ex ->
                     devOp(alias, "$logContext：MediaStore 清理异常 ${ex.message}")
                     0
                 }
-            runSuCommand("find $quotedRoot -type f -size 0 2>/dev/null -delete")
-            runSuCommand("find $quotedRoot -mindepth 1 -delete 2>/dev/null")
-            runSuCommand("find $quotedRoot -type f 2>/dev/null -delete")
-            runSuCommand("find $quotedRoot -depth -type d -mindepth 1 2>/dev/null -delete")
-            val msDeletedSecond = runCatching { deletePicturesMediaStoreEntries(ctx) }.getOrElse { 0 }
-            requestPicturesMediaRescan(ctx, alias, logContext)
+            for (path in fsPaths) {
+                deleteFilesystemGalleryDir(path)
+            }
+            val msDeletedSecond = runCatching {
+                deleteGalleryMediaStoreEntries(ctx, includeDcimCameraAlbum)
+            }.getOrElse { 0 }
+            requestGalleryPathsMediaRescan(ctx, alias, logContext, fsPaths)
             delay(800)
-            val afterFs = countAllPicturesFilesViaSu()
+            val afterMs = countGalleryCleanupMediaStoreEntries(ctx, includeDcimCameraAlbum)
+            val afterFs = countGalleryCleanupFilesViaSu(includeDcimCameraAlbum)
             val fsRemoved = if (beforeFs >= 0 && afterFs >= 0) (beforeFs - afterFs).coerceAtLeast(0) else beforeFs
+            val msRemoved = (beforeMs - afterMs).coerceAtLeast(0)
             devOp(
                 alias,
-                "$logContext：图库清理完成 MediaStore删=${msDeletedFirst + msDeletedSecond} " +
-                    "磁盘文件删前=$beforeFs 删后=$afterFs（约移除 $fsRemoved 个文件）",
+                "$logContext：图库清理完成（范围 $scopeLabel） " +
+                    "MediaStore 执行删除=${msDeletedFirst + msDeletedSecond} 条，清理前=$beforeMs 清理后剩余=$afterMs（已清 $msRemoved 条） " +
+                    "磁盘文件 清理前=$beforeFs 清理后剩余=$afterFs（已清 $fsRemoved 个）",
             )
         }
     }
 
-    private suspend fun publishPostDeleteAllPicturesAfterSuccess(alias: String) {
-        deleteAllPicturesOnDevice(alias, "发作品")
-    }
-
     /**
-     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTask` → 下载校验 → 写入 Pictures。
+     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTaskAndWaitReady` → 下载校验 → 写入 Pictures。
      * 同步等待完成，供发作品流程在清理图库后拉取新素材。
      */
     private suspend fun publishPostFetchMaterialsFromPc(
@@ -7860,10 +8071,10 @@ class RealTraceExecutor(
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
         devOp(
             alias,
-            "发作品：本机 POST /api/v1/tasks/request（count=$count，targetPath=$targetPath）→ PC tasks/create，开始拉取…",
+            "发作品：本机 POST /api/v1/tasks/request（count=$count，targetPath=$targetPath）→ PC tasks/create（异步轮询就绪），开始拉取…",
         )
         return try {
-            val task = CompanionApi.createTask(app, count, targetPath)
+            val task = CompanionApi.createTaskAndWaitReady(app, count, targetPath)
             if (task.files.isEmpty()) {
                 devOp(alias, "发作品：PC 返回任务无文件（taskId=${task.taskId}），素材拉取失败")
                 return false
@@ -7898,32 +8109,61 @@ class RealTraceExecutor(
     }
 
     override suspend fun clearDevicePicturesGallery(alias: String) {
-        deleteAllPicturesOnDevice(alias, "修改基本资料")
+        deleteAllPicturesOnDevice(alias, "修改基本资料", includeDcimCameraAlbum = false)
     }
 
     private fun publishPostCountPicturesImageVideoViaSu(): Pair<Int, Int> {
-        val images = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_IMAGE_EXTS)
-        val videos = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_VIDEO_EXTS)
-        if (images < 0 || videos < 0) {
-            val alias = PrefsStore.getAlias() ?: "unknown"
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val ctx = appContextProvider().applicationContext
+        val suImages = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_IMAGE_EXTS)
+        val suVideos = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_VIDEO_EXTS)
+        val msImages = countPicturesMediaStoreEntries(
+            ctx,
+            PUBLISH_POST_PICTURES_IMAGE_EXTS,
+            excludeAutoTraces = true,
+        )
+        val msVideos = countPicturesMediaStoreEntries(
+            ctx,
+            PUBLISH_POST_PICTURES_VIDEO_EXTS,
+            excludeAutoTraces = true,
+        )
+        fun resolved(su: Int, ms: Int): Int {
+            if (su < 0) return ms
+            return maxOf(su, ms)
+        }
+        val images = resolved(suImages, msImages)
+        val videos = resolved(suVideos, msVideos)
+        if (suImages < 0 || suVideos < 0) {
             devOp(
                 alias,
-                "发作品：su find 统计 Pictures 失败（images=$images videos=$videos），按 0 处理",
+                "发作品：su find 统计 Pictures 失败（images=$suImages videos=$suVideos），" +
+                    "MediaStore 补统计 images=$msImages videos=$msVideos",
             )
-            return 0 to 0
+        } else if ((suImages + suVideos) == 0 && (msImages + msVideos) > 0) {
+            devOp(
+                alias,
+                "发作品：su find 未见 Pictures 文件，MediaStore 统计 图片=$msImages 视频=$msVideos",
+            )
         }
         return images to videos
     }
 
     override fun countPicturesGalleryImageFiles(): Int {
-        if (PUBLISH_POST_PICTURES_IMAGE_EXTS.isEmpty()) return 0
-        val quotedRoot = shellEscape(PUBLISH_POST_PICTURES_PATH)
-        val findParts = PUBLISH_POST_PICTURES_IMAGE_EXTS.joinToString(" ; ") { ext ->
-            "find $quotedRoot -type f ! -path '*/.*' -iname '*.$ext'"
+        val ctx = appContextProvider().applicationContext
+        val suCount = if (PUBLISH_POST_PICTURES_IMAGE_EXTS.isEmpty()) {
+            0
+        } else {
+            publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_IMAGE_EXTS)
         }
-        val cmd = "{ $findParts; } 2>/dev/null | wc -l"
-        val out = runSuCommandWithOutput(cmd)?.trim().orEmpty()
-        return out.lineSequence().firstOrNull()?.trim()?.toIntOrNull() ?: -1
+        val msCount = countPicturesMediaStoreEntries(
+            ctx,
+            PUBLISH_POST_PICTURES_IMAGE_EXTS,
+            excludeAutoTraces = false,
+        )
+        return when {
+            suCount < 0 -> msCount
+            else -> maxOf(suCount, msCount)
+        }
     }
 
     private fun runSuCommandWithOutput(command: String): String? {

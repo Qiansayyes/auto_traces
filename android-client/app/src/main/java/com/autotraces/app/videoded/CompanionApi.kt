@@ -5,6 +5,7 @@ import android.util.Log
 import com.autotraces.app.PrefsStore
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -15,6 +16,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 object CompanionApi {
     private const val TAG = "CompanionApi"
@@ -29,8 +31,29 @@ object CompanionApi {
     private const val KEY_DEVICE_NAME = "device_name"
     private const val KEY_BACKEND_GROUP = "backend_group_name"
     private val gson = Gson()
-    private val client = OkHttpClient.Builder()
-        .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
+
+    private fun okhttpBuilder(): OkHttpClient.Builder =
+        OkHttpClient.Builder()
+            .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
+
+    /** createTask / ack 等 JSON 接口。 */
+    private val apiClient = okhttpBuilder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    /** PC 异步 compose 素材时轮询 GET /api/tasks/{id} 的最长等待。 */
+    private const val TASK_PREPARE_TIMEOUT_MS = 120_000L
+    private const val TASK_PREPARE_POLL_MS = 2_000L
+
+    private val terminalPcTaskStatuses = setOf("failed", "expired", "cancelled", "canceled")
+
+    /** 从 PC 流式下载素材；默认读超时 10s 会导致发作品「素材拉取异常 timeout」。 */
+    private val downloadClient = okhttpBuilder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(600, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
     private const val json = "application/json; charset=utf-8"
@@ -171,6 +194,82 @@ object CompanionApi {
         gson.fromJson(raw, CreateTaskResponse::class.java)
     }
 
+    /**
+     * 调用 PC `POST /api/tasks/create`（立即返回 taskId），再轮询 `GET /api/tasks/{taskId}` 直至文件列表就绪。
+     * 兼容旧版同步 create（响应已带 files）与新版后台 compose。
+     */
+    suspend fun createTaskAndWaitReady(
+        context: Context,
+        count: Int,
+        targetPath: String? = DEFAULT_MATERIAL_STORAGE_PATH,
+        pollTimeoutMs: Long = TASK_PREPARE_TIMEOUT_MS,
+        pollIntervalMs: Long = TASK_PREPARE_POLL_MS,
+    ): CreateTaskResponse = withContext(Dispatchers.IO) {
+        val created = createTask(context, count, targetPath)
+        val readyFiles = validTaskFiles(created.files)
+        if (readyFiles.isNotEmpty()) {
+            return@withContext created.copy(files = readyFiles)
+        }
+        Log.d(TAG, "createTaskAndWaitReady: taskId=${created.taskId} status=${created.status} files empty, polling…")
+        waitForTaskFiles(context, created.taskId, created.companionPullNotified, pollTimeoutMs, pollIntervalMs)
+    }
+
+    /** PC 已创建任务但 compose 未完成时，轮询直至 [PcTaskDetailDto.files] 可用。 */
+    suspend fun pollTaskUntilReady(
+        context: Context,
+        taskId: String,
+        pollTimeoutMs: Long = TASK_PREPARE_TIMEOUT_MS,
+        pollIntervalMs: Long = TASK_PREPARE_POLL_MS,
+    ): PcTaskDetailDto = withContext(Dispatchers.IO) {
+        val first = fetchTaskDetail(context, taskId)
+        val firstFiles = validTaskFiles(first?.files.orEmpty())
+        if (first != null && firstFiles.isNotEmpty()) {
+            return@withContext first.copy(files = firstFiles)
+        }
+        val deadline = System.currentTimeMillis() + pollTimeoutMs
+        var lastStatus = first?.status ?: "pending"
+        while (System.currentTimeMillis() < deadline) {
+            delay(pollIntervalMs)
+            val detail = fetchTaskDetail(context, taskId)
+            if (detail == null) {
+                Log.d(TAG, "pollTaskUntilReady: taskId=$taskId detail=null, retry")
+                continue
+            }
+            lastStatus = detail.status
+            val statusLower = detail.status.lowercase()
+            if (statusLower in terminalPcTaskStatuses) {
+                val err = detail.error?.trim().orEmpty().ifEmpty { "pc_task_$statusLower" }
+                error("task_prepare_failed: $err")
+            }
+            val files = validTaskFiles(detail.files.orEmpty())
+            if (files.isNotEmpty()) {
+                Log.d(TAG, "pollTaskUntilReady: taskId=$taskId ready status=$lastStatus files=${files.size}")
+                return@withContext detail.copy(files = files)
+            }
+            Log.d(TAG, "pollTaskUntilReady: taskId=$taskId status=$lastStatus files=0, continue")
+        }
+        error("task_prepare_timeout: taskId=$taskId lastStatus=$lastStatus")
+    }
+
+    private suspend fun waitForTaskFiles(
+        context: Context,
+        taskId: String,
+        companionPullNotified: Boolean?,
+        pollTimeoutMs: Long,
+        pollIntervalMs: Long,
+    ): CreateTaskResponse {
+        val detail = pollTaskUntilReady(context, taskId, pollTimeoutMs, pollIntervalMs)
+        return CreateTaskResponse(
+            taskId = detail.taskId,
+            status = detail.status,
+            files = detail.files.orEmpty(),
+            companionPullNotified = companionPullNotified,
+        )
+    }
+
+    private fun validTaskFiles(files: List<TaskFileInfo>): List<TaskFileInfo> =
+        files.filter { it.fileName.isNotBlank() && it.md5.isNotBlank() && it.sizeBytes >= 0L }
+
     suspend fun triggerAdbConnect(context: Context, target: String): String = withContext(Dispatchers.IO) {
         requestPcWirelessPipeline(context, target, launchMirror = false)
     }
@@ -272,7 +371,7 @@ object CompanionApi {
             .get()
             .build()
 
-        client.newCall(request).execute().use { response ->
+        downloadClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 val bodyText = response.body?.string().orEmpty()
                 Log.d(TAG, "downloadFileOnce <- code=${response.code} body=$bodyText")
@@ -323,7 +422,7 @@ object CompanionApi {
             .post(payload.toRequestBody(json.toMediaType()))
             .build()
 
-        client.newCall(request).execute().use { response ->
+        apiClient.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             Log.d(TAG, "POST $url <- code=${response.code} success=${response.isSuccessful} body=$text")
             if (!response.isSuccessful) error("request_failed_${response.code}: $text")
@@ -334,7 +433,7 @@ object CompanionApi {
     private fun get(url: String): String {
         Log.d(TAG, "GET $url")
         val request = Request.Builder().url(url).get().build()
-        client.newCall(request).execute().use { response ->
+        apiClient.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             Log.d(TAG, "GET $url <- code=${response.code} success=${response.isSuccessful} body=$text")
             if (!response.isSuccessful) error("request_failed_${response.code}: $text")
