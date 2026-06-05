@@ -3190,6 +3190,38 @@ def _prune_orphan_device_editor_rows(conn: sqlite3.Connection, owner_username: s
     return int(cur.rowcount or 0)
 
 
+def _shift_account_editor_row_indices_after_delete(
+    conn: sqlite3.Connection, owner_username: str, deleted_row_index: int, now: str | None = None
+) -> None:
+    """
+    删除一行后，将更大 row_index 顺次减 1。
+    必须按 row_index 从小到大逐条更新，避免 UPDATE 时主键 (owner_username, row_index) 冲突。
+    """
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return
+    ts = now or now_text()
+    deleted_row_index = int(deleted_row_index)
+    rows = conn.execute(
+        """
+        SELECT row_index FROM account_editor_rows
+        WHERE owner_username = ? AND row_index > ?
+        ORDER BY row_index ASC
+        """,
+        (owner, deleted_row_index),
+    ).fetchall()
+    for row in rows or []:
+        old_idx = int(row["row_index"])
+        conn.execute(
+            """
+            UPDATE account_editor_rows
+            SET row_index = ?, updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (old_idx - 1, ts, owner, old_idx),
+        )
+
+
 def _normalize_switch_highlight(value: object | None) -> str:
     """切号高亮：仅允许「是」或「否」，其余视为否。"""
     return "是" if str(value or "").strip() == "是" else "否"
@@ -8406,14 +8438,7 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
             (owner, row_index),
         )
         if int(account_cur.rowcount or 0) > 0:
-            conn.execute(
-                """
-                UPDATE account_editor_rows
-                SET row_index = row_index - 1, updated_at = ?
-                WHERE owner_username = ? AND row_index > ?
-                """,
-                (now_text(), owner, row_index),
-            )
+            _shift_account_editor_row_indices_after_delete(conn, owner, row_index)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         return {
