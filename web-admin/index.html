@@ -629,7 +629,7 @@
           <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;flex-wrap:wrap;">
             <h3 style="margin:0;">账号记录</h3>
             <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-              <input id="accountRecordsSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 邮箱 / 地区…" style="min-width:220px;max-width:320px;" autocomplete="off" />
+              <input id="accountRecordsSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 邮箱 / 地区…" style="min-width:220px;max-width:320px;" autocomplete="off" title="在各字段中按包含关系匹配（忽略大小写）" />
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#666;">
                 <input id="accountUnassignedOnlyToggle" type="checkbox" />
                 仅展示未分配别名
@@ -697,7 +697,7 @@
               <input id="backupArchiveImportFileInput" type="file" accept=".xlsx" style="display:none;" />
             </div>
             <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-              <input id="backupArchiveSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 备份名…" style="min-width:220px;max-width:320px;" autocomplete="off" title="模糊匹配；支持子序列匹配（如 uk6 可匹配 uk16）" />
+              <input id="backupArchiveSearchInput" type="search" class="ui-input" placeholder="搜索 username / 别名 / 备份名…" style="min-width:220px;max-width:320px;" autocomplete="off" title="在各字段中按包含关系匹配（忽略大小写）" />
               <button id="backupArchivePrevPageBtn" type="button" class="ghost">上一页</button>
               <span id="deviceAliasGroupsPager" class="hint">第 1 / 1 页</span>
               <button id="backupArchiveNextPageBtn" type="button" class="ghost">下一页</button>

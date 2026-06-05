@@ -8424,6 +8424,13 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
             "deleted_accounts": int(account_cur.rowcount or 0),
             "deleted_device_rows": deleted_device_rows,
         }
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
+        return {"code": 1, "msg": f"删除失败：{exc}"}
+    except Exception as exc:
+        print(f"[{now_text()}] account_rows.delete | owner={owner} row_index={row_index} EXC={exc}")
+        return {"code": 1, "msg": f"删除失败：{exc}"}
     finally:
         conn.close()
 

@@ -657,6 +657,9 @@ function humanizeRequestErrorMessage(error) {
   if (/网络请求失败|无法连接服务端|Failed to fetch|fetch failed/i.test(raw)) {
     return "无法连接服务器，请检查网络或联系管理员";
   }
+  if (/^Internal Server Error$/i.test(raw)) {
+    return "服务器内部错误，请确认后端已重启且查看服务端日志";
+  }
   return raw || "操作失败";
 }
 
@@ -1154,6 +1157,10 @@ function sanitizeApiBaseForCurrentPage(base) {
   const normalized = normalizeApiBaseForCurrentPage(base);
   if (!normalized) return "";
   if (!isCurrentPageLocalDevHost() && isLoopbackApiBase(normalized)) {
+    return defaultApiBase();
+  }
+  // 本地 8080 静态服务时，localStorage 里残留的 /api 会打到静态端口而非 8000 后端。
+  if (isCurrentPageLocalDevHost() && String(window.location.port || "") === "8080" && normalized === "/api") {
     return defaultApiBase();
   }
   return normalized;
@@ -6474,40 +6481,37 @@ function isAccountManagerActive() {
   return document.querySelector(".panel.active")?.id === "account-manager";
 }
 
-/** 模糊匹配：包含子串，或 needle 字符按顺序出现在 haystack 中（子序列） */
-function fuzzyMatchText(haystack, needle) {
-  const h = String(haystack || "").toLowerCase();
+/** 在多个字段中做包含匹配（忽略大小写），任一字段命中即返回 true */
+function matchesSearchInFields(needle, fields = []) {
   const n = String(needle || "").trim().toLowerCase();
   if (!n) return true;
-  if (!h) return false;
-  if (h.includes(n)) return true;
-  let hi = 0;
-  for (let i = 0; i < n.length; i += 1) {
-    hi = h.indexOf(n[i], hi);
-    if (hi === -1) return false;
-    hi += 1;
+  for (const field of fields) {
+    if (String(field ?? "").toLowerCase().includes(n)) return true;
   }
-  return true;
+  return false;
 }
 
-function accountRecordSearchHaystack(row = {}) {
-  return [
+function accountRecordMatchesSearch(row = {}) {
+  return matchesSearchInFields(accountRecordsSearchQuery, [
     row.username,
     row.password,
     row.email,
+    row.email_password,
     row.api,
     row.region,
     getEffectiveAccountAssignedAlias(row),
     row.login_time,
     row.video_count,
     row.follower_count,
-  ].filter(Boolean).join(" ");
+    row.follower_growth,
+  ]);
 }
 
-function backupArchiveRecordSearchHaystack(row = {}) {
+function backupArchiveRecordMatchesSearch(row = {}) {
+  if (!backupArchiveSearchQuery) return true;
   const username = String(row?.username || "").trim();
   const acct = username ? getAccountRecordByUsername(username) : null;
-  return [
+  return matchesSearchInFields(backupArchiveSearchQuery, [
     username,
     row.device_alias,
     row.assigned_alias,
@@ -6518,16 +6522,7 @@ function backupArchiveRecordSearchHaystack(row = {}) {
     row.backup_name,
     row.backup_path,
     row.region,
-  ].filter(Boolean).join(" ");
-}
-
-function accountRecordMatchesSearch(row = {}) {
-  return fuzzyMatchText(accountRecordSearchHaystack(row), accountRecordsSearchQuery);
-}
-
-function backupArchiveRecordMatchesSearch(row = {}) {
-  if (!backupArchiveSearchQuery) return true;
-  return fuzzyMatchText(backupArchiveRecordSearchHaystack(row), backupArchiveSearchQuery);
+  ]);
 }
 
 function resolveBackupArchiveDisplayAlias(item = {}) {
@@ -7586,13 +7581,17 @@ async function deleteEditorRow(scope, index) {
       const resp = await request(`${ACCOUNT_ROWS_API}/delete`, {
         method: "POST",
         body: JSON.stringify({
-          row_index: index,
+          row_index: resolveAccountRowIndex(deletedRow, index),
           username: deletedUsername,
           assigned_alias: deletedAlias,
         }),
       });
       const cleanedBackup = Number(resp?.deleted_device_rows || 0);
-      await loadEditorState();
+      try {
+        await loadEditorState();
+      } catch (reloadError) {
+        setStatus(`账号已删除，但刷新列表失败：${humanizeRequestErrorMessage(reloadError)}`, "warning");
+      }
       renderAccountEditorRows();
       renderDeviceEditorRows();
       const backupActive = document.getElementById("backup-section")?.classList.contains("active");
