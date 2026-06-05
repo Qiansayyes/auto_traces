@@ -484,7 +484,7 @@ class RealTraceExecutor(
         private const val PROFILE_EDIT_TEST_PART2_ONLY = false
 
         /** 临时跳过显示名(Name) 整段（点 Name→输入→Save→Confirm→终验）；测完其他功能后改回 false。 */
-        private const val PROFILE_EDIT_SKIP_NAME_STEP = true
+        private const val PROFILE_EDIT_SKIP_NAME_STEP = false
 
         /** Bio 后②：设置齿轮比例点（相对屏宽/高）。 */
         private const val PROFILE_EDIT_SETTINGS_GEAR_RATIO_X = 0.96f

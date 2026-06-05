@@ -198,6 +198,8 @@ const galleryLibraryRefreshBtn = document.getElementById("galleryLibraryRefreshB
 const galleryLibrarySelectAllBtn = document.getElementById("galleryLibrarySelectAllBtn");
 const galleryLibraryClearSelectionBtn = document.getElementById("galleryLibraryClearSelectionBtn");
 const GALLERY_LIBRARY_MAX_ITEMS = 100;
+// 单次 multipart 体积上限（需小于 Nginx client_max_body_size；未调大时默认约 1m）
+const GALLERY_UPLOAD_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 let galleryLibraryItems = [];
 const galleryLibrarySelectedIds = new Set();
 const galleryLibraryThumbUrls = new Map();
@@ -1414,10 +1416,16 @@ async function buildApiUrl(path) {
 async function parseFetchJsonResponse(response) {
   const text = await response.text();
   if (!text) return {};
+  if (response.status === 413) {
+    throw new Error("上传文件过大，超过服务器限制（413）。请减少单次数量，或联系管理员调大 Nginx client_max_body_size");
+  }
   try {
     return JSON.parse(text);
   } catch {
     if (/^\s*</.test(text)) {
+      if (/413|Request Entity Too Large|client_max_body/i.test(text)) {
+        throw new Error("上传文件过大，超过服务器限制。请减少单次数量，或联系管理员调大 Nginx client_max_body_size");
+      }
       throw new Error("服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）");
     }
     throw new Error(String(text).slice(0, 240) || "服务返回非 JSON 响应");
@@ -5379,6 +5387,60 @@ async function loadGalleryLibrary() {
   await renderGalleryLibraryGrid();
 }
 
+function chunkFilesForGalleryUpload(files, maxBatchBytes) {
+  const limit = Math.max(1, Number(maxBatchBytes) || GALLERY_UPLOAD_BATCH_MAX_BYTES);
+  const chunks = [];
+  let current = [];
+  let currentBytes = 0;
+  for (const file of files) {
+    const size = Math.max(0, Number(file?.size) || 0);
+    if (current.length > 0 && currentBytes + size > limit) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(file);
+    currentBytes += size;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+function isUploadPayloadTooLargeError(error) {
+  const msg = String(error?.message || "");
+  return /413|上传文件过大|client_max_body|Request Entity Too Large|HTML 页面而非 JSON/i.test(msg);
+}
+
+async function uploadGalleryLibraryBatches(files) {
+  const batches = chunkFilesForGalleryUpload(files, GALLERY_UPLOAD_BATCH_MAX_BYTES);
+  let uploaded = 0;
+  let lastMsg = "";
+  for (let i = 0; i < batches.length; i += 1) {
+    let batch = batches[i];
+    while (true) {
+      const formData = new FormData();
+      batch.forEach((file) => formData.append("files", file));
+      const batchLabel = batches.length > 1 ? `（第 ${i + 1}/${batches.length} 批，${batch.length} 张）` : "";
+      setStatus(`正在上传 ${files.length} 张图片到图库...${batchLabel}`, "info");
+      try {
+        const data = await fetchFormDataApi("/api/admin/gallery/library", formData);
+        uploaded += batch.length;
+        lastMsg = String(data?.msg || "").trim();
+        break;
+      } catch (error) {
+        if (isUploadPayloadTooLargeError(error) && batch.length > 1) {
+          const mid = Math.ceil(batch.length / 2);
+          batches.splice(i, 1, batch.slice(0, mid), batch.slice(mid));
+          batch = batches[i];
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+  return { uploaded, msg: lastMsg };
+}
+
 async function uploadGalleryLibraryFromInput() {
   const files = Array.from(galleryLibraryUploadInput?.files || []);
   if (!files.length) {
@@ -5394,13 +5456,10 @@ async function uploadGalleryLibraryFromInput() {
     setStatus(`图库剩余容量 ${remaining} 张，请减少本次选择数量`, "warning");
     return;
   }
-  const formData = new FormData();
-  files.forEach((file) => formData.append("files", file));
-  setStatus(`正在上传 ${files.length} 张图片到图库...`, "info");
-  const data = await fetchFormDataApi("/api/admin/gallery/library", formData);
+  const { uploaded, msg } = await uploadGalleryLibraryBatches(files);
   if (galleryLibraryUploadInput) galleryLibraryUploadInput.value = "";
   await loadGalleryLibrary();
-  setStatus(data.msg || `已上传 ${files.length} 张图片到图库`, "success");
+  setStatus(msg || `已上传 ${uploaded} 张图片到图库`, "success");
 }
 
 async function deleteGalleryLibraryItem(itemId) {

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.content.ContextCompat
+import com.autotraces.app.videoded.VideoDedDeviceService
 
 object WorkerServiceTracker {
     @Volatile
@@ -37,6 +38,7 @@ class WorkerService : Service() {
             NotificationHelper.buildForegroundNotification(this, notifyText),
         )
         LogCenter.op(PrefsStore.getAlias(), "后台服务已启动")
+        ContextCompat.startForegroundService(this, Intent(this, VideoDedDeviceService::class.java))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

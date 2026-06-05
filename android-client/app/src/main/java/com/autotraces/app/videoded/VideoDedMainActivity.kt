@@ -66,7 +66,7 @@ class VideoDedMainActivity : ComponentActivity() {
         Log.d(TAG, "onCreate start")
         startForegroundService(Intent(this, VideoDedDeviceService::class.java))
         buildUi()
-        lifecycleScope.launch { refreshRegistration() }
+        lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
         refreshHistorySummary()
         refreshApiSection()
         startPollingCurrentTask()
@@ -89,6 +89,7 @@ class VideoDedMainActivity : ComponentActivity() {
             val wifiIp = WifiUtils.getWifiIp(this).orEmpty()
             Log.d(TAG, "auto fill mirrorIpOverrideInput=$wifiIp")
             mirrorIpOverrideInput.setText(wifiIp)
+            lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
         }
         if (::mirrorAddrView.isInitialized) {
             refreshMirrorAddrLine()
@@ -138,7 +139,7 @@ class VideoDedMainActivity : ComponentActivity() {
         val saveSettingsButton = Button(this).apply {
             text = "保存设置并重新注册"
             setOnClickListener {
-                lifecycleScope.launch { saveAllSettingsAndRegister() }
+                lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = true) }
             }
         }
         section.addView(saveSettingsButton)
@@ -305,85 +306,70 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun saveAllSettingsAndRegister() {
+    private suspend fun autoSaveSettingsAndRegister(verbose: Boolean) {
         val port = adbTcpPortInput.text?.toString()?.toIntOrNull() ?: 5555
         val rawIp = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
         val windowsUrl = windowsUrlInput.text?.toString().orEmpty().trim()
-        Log.d(TAG, "save settings clicked port=$port rawIp=$rawIp windowsUrl=$windowsUrl")
-        appendLog("保存设置：PC=$windowsUrl · IP=${rawIp.ifEmpty { "自动" }} · ADB端口=$port")
+        Log.d(TAG, "autoSaveSettingsAndRegister port=$port rawIp=$rawIp windowsUrl=$windowsUrl verbose=$verbose")
         if (rawIp.isNotEmpty() && !ApiSettings.isPlausibleLanIpv4(rawIp)) {
             Log.w(TAG, "invalid mirror ip: $rawIp")
-            Toast.makeText(this@VideoDedMainActivity, "本机 IPv4 格式不正确，请检查或留空", Toast.LENGTH_LONG).show()
+            if (verbose) {
+                Toast.makeText(this@VideoDedMainActivity, "本机 IPv4 格式不正确，请检查或留空", Toast.LENGTH_LONG).show()
+            }
             appendLog("保存中止：IPv4 格式不正确")
             return
         }
-        ApiSettings.setAdbTcpipPort(this@VideoDedMainActivity, port)
-        ApiSettings.setMirrorIpOverride(this@VideoDedMainActivity, rawIp.ifEmpty { null })
-        CompanionApi.setWindowsBaseUrl(this@VideoDedMainActivity, windowsUrl)
+        val result = VideoDedSettingsRegistrar.saveAndRegister(
+            applicationContext,
+            input = VideoDedSettingsRegistrar.SaveInput(
+                windowsUrl = windowsUrl.ifEmpty { null },
+                mirrorIp = rawIp.ifEmpty { null },
+                adbPort = port,
+            ),
+            triggerWirelessIfNeeded = true,
+            retryRootAdbIfNeeded = true,
+            logSave = true,
+            logRegistration = true,
+        )
         windowsUrlInput.hint = "PC 服务地址"
         refreshMirrorAddrLine()
-        appendLog("正在向 PC 重新注册…")
-        refreshRegistration(verbose = true)
+        refreshDeviceNameLabels()
+        applyRegistrationUi(result, verbose)
     }
 
-    private suspend fun refreshRegistration(verbose: Boolean = false) {
-        try {
-            Log.d(TAG, "refreshRegistration start")
-            val reg = CompanionApi.ensureRegistered(applicationContext)
-            refreshDeviceNameLabels()
-            statusView.text = "状态：已连接 Windows 服务"
-            val mirrorStatus = MirrorStateProbe.currentMirrorStatus(this)
-            val mirrorHint = MirrorStateProbe.currentMirrorMessage(this)
-            val suOk = RootWifiAdbHelper.hasSu()
-            val port = ApiSettings.getAdbTcpipPort(this)
-            val tcpOpen = AdbRuntimeProbe.isAdbTcpPortOpen(this, port)
-            val pcAdbState = reg.optString("pcAdbState", "").trim()
-            val pcSerial = reg.optString("pcAdbSerial", "").trim()
-            appendLog(
-                "设备注册成功（本机：$mirrorStatus · 本机${port}=${if (tcpOpen) "已监听" else "未监听"} · PC端=${pcAdbState.ifEmpty { "—" }}）",
-            )
-            if (pcAdbState == "device") {
-                appendLog("PC 已无线连接${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}，可投屏；本机若仍写未监听，以 PC 为准")
-            } else {
-                mirrorHint?.let { appendLog("投屏说明：${mirrorHintForStatusLog(it)}") }
-            }
-            if (mirrorStatus != "ready" && pcAdbState != "device") {
-                if (ApiSettings.isRootAdbTcpipEnabled(this) && suOk && !tcpOpen) {
-                    appendLog("正在重试开启无线 ADB…")
-                    VideoDedDeviceService.enqueueTryRootAdbTcpip(this)
-                }
-                appendLog("正在请求 PC 无线授权流水线…")
-                runCatching {
-                    CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false)
-                }.onSuccess { appendLog("PC 已执行无线准备/连接") }
-                    .onFailure { appendLog("PC 流水线失败：${it.message}") }
-            }
-            if (verbose) {
-                val toast = when {
-                    mirrorStatus == "ready" || pcAdbState == "device" ->
-                        "注册成功，PC 已可投屏${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}"
-                    else -> buildString {
-                        append("注册成功，但投屏未就绪（$mirrorStatus）")
-                        if (!suOk && ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)) {
-                            append("\n请检查无线 ADB 辅助权限是否可用")
-                        } else if (!tcpOpen) {
-                            append("\n本机 $port 仍未监听，请看通知栏错误码")
-                        }
-                        mirrorHint?.let { append("\n${mirrorHintForStatusLog(it)}") }
-                    }
-                }
-                Toast.makeText(this@VideoDedMainActivity, toast, Toast.LENGTH_LONG).show()
-            }
-            Log.d(TAG, "refreshRegistration success")
-        } catch (t: Throwable) {
-            val reason = explainWindowsServiceFailure(t)
-            Log.e(TAG, "refreshRegistration failed reason=$reason", t)
+    private suspend fun applyRegistrationUi(result: VideoDedSettingsRegistrar.SaveAndRegisterResult, verbose: Boolean) {
+        if (result.error != null) {
+            val reason = explainWindowsServiceFailure(result.error)
+            Log.e(TAG, "registration failed reason=$reason", result.error)
             statusView.text = "状态：无法连接 Windows 服务（$reason）"
-            appendLog("注册失败：$reason")
             if (verbose) {
                 Toast.makeText(this@VideoDedMainActivity, "注册失败：$reason", Toast.LENGTH_LONG).show()
             }
+            return
         }
+        statusView.text = "状态：已连接 Windows 服务"
+        if (!verbose) return
+        val reg = result.registration ?: return
+        val mirrorStatus = MirrorStateProbe.currentMirrorStatus(this)
+        val mirrorHint = MirrorStateProbe.currentMirrorMessage(this)
+        val port = ApiSettings.getAdbTcpipPort(this)
+        val tcpOpen = AdbRuntimeProbe.isAdbTcpPortOpen(this, port)
+        val pcAdbState = reg.optString("pcAdbState", "").trim()
+        val pcSerial = reg.optString("pcAdbSerial", "").trim()
+        val toast = when {
+            mirrorStatus == "ready" || pcAdbState == "device" ->
+                "注册成功，PC 已可投屏${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}"
+            else -> buildString {
+                append("注册成功，但投屏未就绪（$mirrorStatus）")
+                if (!RootWifiAdbHelper.hasSu() && ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)) {
+                    append("\n请检查无线 ADB 辅助权限是否可用")
+                } else if (!tcpOpen) {
+                    append("\n本机 $port 仍未监听，请看通知栏错误码")
+                }
+                mirrorHint?.let { append("\n${mirrorHintForStatusLog(it)}") }
+            }
+        }
+        Toast.makeText(this@VideoDedMainActivity, toast, Toast.LENGTH_LONG).show()
     }
 
     private fun explainWindowsServiceFailure(t: Throwable): String {

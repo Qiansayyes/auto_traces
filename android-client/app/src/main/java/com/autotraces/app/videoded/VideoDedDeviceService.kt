@@ -27,9 +27,11 @@ class VideoDedDeviceService : Service() {
     private var apiServer: ApiServer? = null
     private var adbTcpipScheduleJob: Job? = null
     private var lastAdbTcpipRunAt = 0L
-    private var lastPcMirrorTriggerAt = 0L
     /** 与「已注册」合并展示，避免轮询把无线 ADB 提示刷掉 */
     private var lastAdbMirrorSummary: String? = null
+    /** 最近一次注册时 PC 端 ADB 状态；device 表示已可投屏，不再触发无线流水线 */
+    @Volatile
+    private var lastPcAdbState: String = ""
 
     private val wifiNetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -53,10 +55,12 @@ class VideoDedDeviceService : Service() {
             tryOneShotBootAdbTcpip()
         }
         scope.launch {
+            runSaveSettingsAndRegister(logSave = true, logRegistration = true)
+        }
+        scope.launch {
             while (true) {
                 try {
-                    CompanionApi.ensureRegistered(applicationContext)
-                    maybeRequestPcWirelessPipeline()
+                    runSaveSettingsAndRegister(logSave = false, logRegistration = false)
                     updateNotification(registrationNotifyText(ok = true))
                 } catch (_: Throwable) {
                     updateNotification(registrationNotifyText(ok = false))
@@ -78,6 +82,11 @@ class VideoDedDeviceService : Service() {
         when (intent?.action) {
             ACTION_TRY_ROOT_ADB_TCPIP -> {
                 scope.launch {
+                    val port = ApiSettings.getAdbTcpipPort(applicationContext)
+                    if (!VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) {
+                        updateNotification("无线 ADB 已在 $port 监听，跳过重启 adbd")
+                        return@launch
+                    }
                     val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                     val n = cm.activeNetwork
                     if (n != null && RootWifiAdbHelper.isWifiNetwork(applicationContext, n)) {
@@ -209,6 +218,7 @@ class VideoDedDeviceService : Service() {
         adbTcpipScheduleJob = scope.launch {
             delay(4000)
             if (!RootWifiAdbHelper.isWifiNetwork(applicationContext, network)) return@launch
+            runSaveSettingsAndRegister(logSave = false, logRegistration = false)
             runEnableAdbTcpipForNetwork(network, force = false)
         }
     }
@@ -217,6 +227,8 @@ class VideoDedDeviceService : Service() {
         if (!ApiSettings.isRootAdbTcpipEnabled(applicationContext)) return
         scope.launch {
             delay(2000)
+            val port = ApiSettings.getAdbTcpipPort(applicationContext)
+            if (!VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) return@launch
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val n = cm.activeNetwork ?: return@launch
             if (!RootWifiAdbHelper.isWifiNetwork(applicationContext, n)) return@launch
@@ -224,7 +236,26 @@ class VideoDedDeviceService : Service() {
         }
     }
 
+    private suspend fun runSaveSettingsAndRegister(logSave: Boolean, logRegistration: Boolean) {
+        val result = VideoDedSettingsRegistrar.saveAndRegister(
+            applicationContext,
+            triggerWirelessIfNeeded = lastPcAdbState != "device",
+            retryRootAdbIfNeeded = lastPcAdbState != "device",
+            logSave = logSave,
+            logRegistration = logRegistration,
+        )
+        lastPcAdbState = result.pcAdbState
+        if (result.error != null) throw result.error
+    }
+
     private fun runEnableAdbTcpipForNetwork(network: Network, force: Boolean) {
+        val port = ApiSettings.getAdbTcpipPort(applicationContext)
+        if (!force && !VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) {
+            val ip = RootWifiAdbHelper.getLanIpv4ForNetwork(applicationContext, network)
+                ?: ApiSettings.getEffectiveMirrorLanIpv4(applicationContext)
+            if (ip != null) lastAdbMirrorSummary = "$ip:$port"
+            return
+        }
         if (!force) {
             synchronized(this) {
                 val now = System.currentTimeMillis()
@@ -234,7 +265,6 @@ class VideoDedDeviceService : Service() {
         } else {
             synchronized(this) { lastAdbTcpipRunAt = System.currentTimeMillis() }
         }
-        val port = ApiSettings.getAdbTcpipPort(applicationContext)
         val err = RootWifiAdbHelper.enableAdbTcpip(port)
         val ip = RootWifiAdbHelper.getLanIpv4ForNetwork(applicationContext, network)
             ?: ApiSettings.getEffectiveMirrorLanIpv4(applicationContext)
@@ -248,19 +278,6 @@ class VideoDedDeviceService : Service() {
         updateNotification(line)
     }
 
-    private fun maybeRequestPcWirelessPipeline() {
-        if (MirrorStateProbe.currentMirrorStatus(applicationContext) == "ready") return
-        val now = System.currentTimeMillis()
-        synchronized(this) {
-            if (now - lastPcMirrorTriggerAt < 90_000) return
-            lastPcMirrorTriggerAt = now
-        }
-        scope.launch {
-            runCatching {
-                CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false)
-            }.onFailure { Log.w("DeviceService", "PC wireless pipeline failed", it) }
-        }
-    }
 
     private fun registrationNotifyText(ok: Boolean): String {
         val base = if (ok) "Registered and online" else "Waiting for Windows service"
