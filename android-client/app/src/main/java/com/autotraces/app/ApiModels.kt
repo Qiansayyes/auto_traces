@@ -222,6 +222,10 @@ data class DeviceOpPayload(
     val image_items: List<DeviceGalleryMediaPayload>? = null,
     /** 修改基本资料：云端图库随机头像（单张） */
     val avatar_media_item: DeviceGalleryMediaPayload? = null,
+    /** 发作品：云端指定本次目标发布条数（自动切号按 video_count 下发）。 */
+    val publish_count: Int? = null,
+    /** 发作品来源标记，如 auto_switch。 */
+    val source: String? = null,
 )
 
 data class GalleryLibraryRandomResponse(

@@ -986,6 +986,8 @@ class MemoryStore:
     auto_switch_enabled: bool = False
     auto_switch_align_on_next_tick: bool = True
     auto_switch_last_slot_keys: Dict[str, str] = field(default_factory=dict)
+    # bucket_key -> "{schedule_date}|{slot_index}|publish"：当日该时段自动发作品已下发
+    auto_switch_publish_done_keys: Dict[str, str] = field(default_factory=dict)
     backup_stats_full_query_enabled: bool = True
     backup_stats_full_query_last_run_date: str = ""
     backup_stats_full_query_in_flight: bool = False
@@ -1185,6 +1187,12 @@ def _load_persisted_runtime_state():
             with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_slots"):
                 store.auto_switch_last_slot_keys = {
                     str(k): str(v) for k, v in last_slots.items() if str(k).strip() and str(v).strip()
+                }
+        publish_done = blob.get("auto_switch_publish_done_keys")
+        if isinstance(publish_done, dict):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_done"):
+                store.auto_switch_publish_done_keys = {
+                    str(k): str(v) for k, v in publish_done.items() if str(k).strip() and str(v).strip()
                 }
         bs_enabled = blob.get("backup_stats_full_query_enabled")
         if isinstance(bs_enabled, bool):
@@ -1950,6 +1958,7 @@ def persist_runtime_state():
             "auto_start_enabled": store.auto_start_enabled,
             "auto_switch_enabled": bool(store.auto_switch_enabled),
             "auto_switch_last_slot_keys": dict(store.auto_switch_last_slot_keys),
+            "auto_switch_publish_done_keys": dict(store.auto_switch_publish_done_keys),
             "backup_stats_full_query_enabled": bool(store.backup_stats_full_query_enabled),
             "backup_stats_full_query_last_run_date": str(store.backup_stats_full_query_last_run_date or ""),
         }
@@ -3535,6 +3544,7 @@ def _auto_switch_row_dict(row: sqlite3.Row | tuple | dict) -> dict[str, Any]:
         "backup_path": row[5] if len(row) > 5 else "",
         "backup_name": row[6] if len(row) > 6 else "",
         "switch_highlight": row[7] if len(row) > 7 else "否",
+        "video_count": row[8] if len(row) > 8 else "",
     }
 
 
@@ -3547,7 +3557,7 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias,
-                   backup_path, backup_name, switch_highlight
+                   backup_path, backup_name, switch_highlight, video_count
             FROM device_editor_rows
             WHERE owner_username = ? AND TRIM(username) <> ''
             ORDER BY row_index ASC
@@ -3564,6 +3574,48 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
             continue
         buckets.setdefault(alias_key, []).append(item)
     return {k: v for k, v in buckets.items() if len(v) >= 2}
+
+
+def _auto_publish_count_for_video_count(video_count: int) -> int:
+    """自动切号发作品：按账号 video_count 决定本次下发条数。"""
+    vc = max(0, int(video_count))
+    if vc < 3:
+        return 1
+    if vc <= 9:
+        return 2
+    return 3
+
+
+def _random_auto_publish_minute(start_min: int, end_min: int) -> int | None:
+    """在时段开始 10 分钟后至切号前 10 分钟内随机取一分钟触发自动发作品。"""
+    window_start = int(start_min) + 10
+    window_end = int(end_min) - 10
+    if window_end <= window_start:
+        return None
+    return random.randint(window_start, window_end)
+
+
+def _format_beijing_minute(minute_of_day: int) -> str:
+    minute = max(0, min(int(minute_of_day), 1439))
+    h, mi = divmod(minute, 60)
+    return f"{h:02d}:{mi:02d}"
+
+
+def _ensure_auto_publish_minutes_in_plan(plan: dict[str, Any]) -> bool:
+    """为缺少 auto_publish_minute 的时段补齐随机发作品时间点；有变更则返回 True。"""
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    modified = False
+    for slot in slots:
+        if "auto_publish_minute" in slot:
+            continue
+        try:
+            start = int(slot.get("start_min") or 0)
+            end = int(slot.get("end_min") or 0)
+        except (TypeError, ValueError):
+            start, end = 0, 0
+        slot["auto_publish_minute"] = _random_auto_publish_minute(start, end)
+        modified = True
+    return modified
 
 
 def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, Any]:
@@ -3587,6 +3639,7 @@ def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, An
                 "end_min": end,
                 "row_index": int(row.get("row_index") or 0),
                 "username": str(row.get("username") or "").strip(),
+                "auto_publish_minute": _random_auto_publish_minute(start, end),
             }
         )
         start = end
@@ -3643,17 +3696,37 @@ def _save_auto_switch_daily_plan(owner_username: str, alias: str, schedule_date:
 def _ensure_auto_switch_daily_plan(owner_username: str, alias: str, rows: List[dict[str, Any]], schedule_date: str) -> dict[str, Any]:
     existing = _load_auto_switch_daily_plan(owner_username, alias, schedule_date)
     if existing and isinstance(existing.get("slots"), list) and len(existing["slots"]) == len(rows):
+        if _ensure_auto_publish_minutes_in_plan(existing):
+            _save_auto_switch_daily_plan(owner_username, alias, schedule_date, existing)
+            _auto_switch_log(
+                f"已补齐今日发作品随机时间点 | owner={owner_username} alias={alias} date={schedule_date}"
+            )
         return existing
     plan = _generate_auto_switch_daily_plan(rows)
     _save_auto_switch_daily_plan(owner_username, alias, schedule_date, plan)
     slot_desc = ", ".join(
-        f"{s.get('username') or '-'}[{int(s.get('start_min') or 0)//60:02d}:{int(s.get('start_min') or 0)%60:02d}-{int(s.get('end_min') or 0)//60:02d}:{int(s.get('end_min') or 0)%60:02d})"
-        for s in plan.get("slots") or []
+        _auto_switch_slot_plan_log_line(s) for s in plan.get("slots") or []
     )
     _auto_switch_log(
         f"已生成今日随机时段 | owner={owner_username} alias={alias} date={schedule_date} | {slot_desc}"
     )
     return plan
+
+
+def _auto_switch_slot_plan_log_line(slot: dict[str, Any]) -> str:
+    user = str(slot.get("username") or "-")
+    start = int(slot.get("start_min") or 0)
+    end = int(slot.get("end_min") or 0)
+    pub = slot.get("auto_publish_minute")
+    range_text = f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+    if pub is None:
+        pub_text = "发作品=跳过"
+    else:
+        try:
+            pub_text = f"发作品@{_format_beijing_minute(int(pub))}"
+        except (TypeError, ValueError):
+            pub_text = "发作品=跳过"
+    return f"{user}[{range_text},{pub_text}]"
 
 
 def _format_beijing_slot_range(start_min: int, end_min: int) -> str:
@@ -3692,12 +3765,21 @@ def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | 
                 end = int(slot.get("end_min") or 0)
             except (TypeError, ValueError):
                 start, end = 0, 0
+            pub_min = slot.get("auto_publish_minute")
+            pub_label = ""
+            if pub_min is not None:
+                try:
+                    pub_label = _format_beijing_minute(int(pub_min))
+                except (TypeError, ValueError):
+                    pub_label = ""
             entry = {
                 "slot_index": int(slot.get("slot_index") or 0),
                 "start_min": start,
                 "end_min": end,
                 "label": _format_beijing_slot_range(start, end),
                 "username": str(slot.get("username") or "").strip(),
+                "auto_publish_minute": pub_min,
+                "auto_publish_label": pub_label,
             }
             if row_index >= 0:
                 slots_by_row_index[str(row_index)] = entry
@@ -3795,6 +3877,127 @@ def _device_has_blocking_tiktok_ops(device_id: str) -> bool:
             if str(op.get("op_type") or "") in blocking:
                 return True
     return False
+
+
+def _device_has_pending_publish_post(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    with store.lock:
+        for op in store.pending_device_ops.get(did) or []:
+            if str(op.get("op_type") or "") == "publish_post_start":
+                return True
+    return False
+
+
+def _auto_switch_enqueue_publish(
+    owner_username: str,
+    alias: str,
+    device_id: str,
+    account_row: dict[str, Any],
+    publish_count: int,
+    schedule_date: str,
+    slot_key: str,
+    publish_minute: int,
+) -> bool:
+    alias_clean = _normalize_alias_key(alias)
+    did = str(device_id or "").strip()
+    if not did or not alias_clean:
+        return False
+    count = max(1, min(int(publish_count), 5))
+
+    auto_start_disabled = False
+    with store.lock:
+        dev = store.devices.get(did)
+        if dev and not dev.auto_start_opt_out:
+            dev.auto_start_opt_out = True
+            auto_start_disabled = True
+    if auto_start_disabled:
+        _persist_client_device_to_db(did)
+        _append_device_log(did, "自动切号发作品：云端已自动关闭该设备的自动开启程序")
+
+    _resume_device_for_cloud_op(
+        did,
+        f"[{now_text()}] 自动切号发作品 | 已下发（alias={alias_clean} publish_count={count} "
+        f"北京时间 {_format_beijing_minute(publish_minute)}）",
+    )
+    op_id = _enqueue_tiktok_device_op(
+        did,
+        "publish_post_start",
+        {
+            "device_id": did,
+            "alias": alias_clean,
+            "package_name": TIKTOK_PACKAGE_NAME,
+            "publish_count": count,
+            "source": "auto_switch",
+            "auto_switch_schedule_date": schedule_date,
+            "auto_switch_slot_key": slot_key,
+            "account_username": str(account_row.get("username") or "").strip(),
+        },
+    )
+    _append_device_log(
+        did,
+        f"[{now_text()}] 自动切号发作品 | op_id={op_id} publish_count={count} "
+        f"account={str(account_row.get('username') or '').strip() or '-'}",
+    )
+    return True
+
+
+def _auto_switch_maybe_enqueue_publish(
+    owner_username: str,
+    alias: str,
+    device_id: str,
+    target_slot: dict[str, Any],
+    target_row: dict[str, Any],
+    schedule_date: str,
+    slot_key: str,
+    bucket_key: str,
+    minute_of_day: int,
+) -> None:
+    pub_min = target_slot.get("auto_publish_minute")
+    if pub_min is None:
+        return
+    try:
+        pub_minute = int(pub_min)
+    except (TypeError, ValueError):
+        return
+    if int(minute_of_day) != pub_minute:
+        return
+
+    publish_done_key = f"{slot_key}|publish"
+    with store.lock:
+        if str(store.auto_switch_publish_done_keys.get(bucket_key) or "") == publish_done_key:
+            return
+
+    if _device_has_blocking_tiktok_ops(device_id):
+        _auto_switch_log(
+            f"跳过自动发作品：设备任务队列未空闲 device={device_id} alias={alias} slot={slot_key}"
+        )
+        return
+    if _device_has_pending_publish_post(device_id):
+        return
+
+    video_count = _parse_stat_int(target_row.get("video_count"))
+    publish_count = _auto_publish_count_for_video_count(video_count)
+    ok = _auto_switch_enqueue_publish(
+        owner_username,
+        alias,
+        device_id,
+        target_row,
+        publish_count,
+        schedule_date,
+        slot_key,
+        pub_minute,
+    )
+    if ok:
+        with store.lock:
+            store.auto_switch_publish_done_keys[bucket_key] = publish_done_key
+        persist_runtime_state()
+        _auto_switch_log(
+            f"已下发自动发作品 | owner={owner_username} alias={alias} slot={slot_key} "
+            f"time={_format_beijing_minute(pub_minute)} video_count={video_count} "
+            f"publish_count={publish_count} account={str(target_row.get('username') or '')}"
+        )
 
 
 def _auto_switch_enqueue_cut_switch(
@@ -3942,6 +4145,23 @@ def _auto_switch_tick() -> None:
             if current_ri == target_ri:
                 with store.lock:
                     store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                device_id_active = _resolve_device_id_for_owner_alias(
+                    owner,
+                    alias_key,
+                    str((highlighted or target_row).get("device_id") or ""),
+                )
+                if device_id_active:
+                    _auto_switch_maybe_enqueue_publish(
+                        owner_username=owner,
+                        alias=alias_key,
+                        device_id=device_id_active,
+                        target_slot=target_slot,
+                        target_row=target_row,
+                        schedule_date=schedule_date,
+                        slot_key=slot_key,
+                        bucket_key=bucket_key,
+                        minute_of_day=minute_of_day,
+                    )
                 continue
 
             with store.lock:

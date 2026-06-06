@@ -55,16 +55,13 @@ class VideoDedDeviceService : Service() {
             tryOneShotBootAdbTcpip()
         }
         scope.launch {
-            runSaveSettingsAndRegister(logSave = true, logRegistration = true)
+            val ok = runSaveSettingsAndRegister(logSave = true, logRegistration = true)
+            updateNotification(registrationNotifyText(ok = ok))
         }
         scope.launch {
             while (true) {
-                try {
-                    runSaveSettingsAndRegister(logSave = false, logRegistration = false)
-                    updateNotification(registrationNotifyText(ok = true))
-                } catch (_: Throwable) {
-                    updateNotification(registrationNotifyText(ok = false))
-                }
+                val ok = runSaveSettingsAndRegister(logSave = false, logRegistration = false)
+                updateNotification(registrationNotifyText(ok = ok))
                 delay(15_000)
             }
         }
@@ -236,7 +233,7 @@ class VideoDedDeviceService : Service() {
         }
     }
 
-    private suspend fun runSaveSettingsAndRegister(logSave: Boolean, logRegistration: Boolean) {
+    private suspend fun runSaveSettingsAndRegister(logSave: Boolean, logRegistration: Boolean): Boolean {
         val result = VideoDedSettingsRegistrar.saveAndRegister(
             applicationContext,
             triggerWirelessIfNeeded = lastPcAdbState != "device",
@@ -245,7 +242,10 @@ class VideoDedDeviceService : Service() {
             logRegistration = logRegistration,
         )
         lastPcAdbState = result.pcAdbState
-        if (result.error != null) throw result.error
+        if (result.error != null) {
+            Log.w("DeviceService", "PC registration failed: ${result.error.message}")
+        }
+        return result.error == null
     }
 
     private fun runEnableAdbTcpipForNetwork(network: Network, force: Boolean) {

@@ -131,8 +131,8 @@ interface TraceExecutor {
      * 假定 TikTok 已在前台且刚完成「资料入口」比例点点击：OCR 严格找「Edit」坐标→点击「Edit」→
      * OCR 在同一屏分别找「Change photo」「Name」「Bio」三词坐标并写日志（不点击）→
      * 同屏再严格找「Change photo」并首击（若无则整屏专段 OCR）→
-     * 整屏「Upload photo」→「Allow all」（未命中但已见 Recents 则跳过 Allow）→OCR「Recents」稳定（6×0.5s，仅探测）→
-     * 左上固定点→OCR「Next」×2（间隔 0.5s）→「Post this photo to Story」→「Save」→
+     * 整屏「Upload photo」或「Select from Gallery」→「Allow all」（未命中但已见 Recents 则跳过 Allow）→OCR「Recents」稳定（6×0.5s，仅探测）→
+     * 左上固定点→OCR「Next」×2（间隔 0.5s）→「Post this photo to Story」（至多 3 次，未命中跳过）→「Save」→
      * OCR 等待头像上传（含 uploading 则每 1s 轮询至消失；已见 Change photo 则跳过等待；逾时 60s 强停并重拉 TikTok）→
      * 最多 7 次 OCR 校验「Change photo」→Name→Bio 前 OCR 定位「TikTok」文案并点击复制（至多 3 次）→
      * Bio(模板；若已复制则先粘贴+uiautomator 读 @ 后与分配账号比对，不一致则上报云端更新 username)→
@@ -283,6 +283,7 @@ class RealTraceExecutor(
     private var autoLoginDontAllowHandledInThisChain: Boolean = false
     @Volatile
     private var lastInlineDontAllowTapAtMs: Long = 0L
+    private var lastViewerHistoryPopupDismissAtMs: Long = 0L
     @Volatile
     private var accountStatusRecoveryInProgress: Boolean = false
 
@@ -507,6 +508,8 @@ class RealTraceExecutor(
         private const val AUTO_LOGIN_DONT_ALLOW_OCR_MAX_PASSES = 16
         /** 通用 OCR 顺手点击 Don't allow 的冷却，避免同帧重复触发。 */
         private const val INLINE_DONT_ALLOW_TAP_COOLDOWN_MS = 1200L
+        /** Viewer history 弹窗：同屏见 Viewer history + Save 时顺手点 Save 的冷却。 */
+        private const val INLINE_VIEWER_HISTORY_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 登录入口 / Resend code 未命中：关开 TikTok 整链重来上限。 */
         private const val AUTO_LOGIN_MAX_CHAIN_RESTARTS = 3
         /** Account status 掉登录弹窗：点 OK 后最长等待（毫秒），期间 OCR 复核是否已关闭。 */
@@ -529,10 +532,13 @@ class RealTraceExecutor(
         /** 未见 Privacy 时最多复点次数（固定同坐标复点）。 */
         private const val PROFILE_EDIT_SETTINGS_GEAR_RETAP_MAX = 6
 
-        /** 修改基本资料：Upload photo 后整屏 OCR「Allow all」最多次数（未命中仅跳过）。 */
+        /** 修改基本资料：Upload photo / Select from Gallery 后整屏 OCR「Allow all」最多次数（未命中仅跳过）。 */
         private const val PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES = 3
 
-        /** Upload photo / Allow all 之后：OCR 确认「Recents」可见（相册界面稳定），仅探测不点击。 */
+        /** 修改基本资料：OCR「Post this photo to Story」最多次数（未命中仅跳过，不阻断后续 Save 等步骤）。 */
+        private const val PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES = 3
+
+        /** Upload photo / Select from Gallery / Allow all 之后：OCR 确认「Recents」可见（相册界面稳定），仅探测不点击。 */
         private const val PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES = 6
         private const val PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS = 500L
 
@@ -1309,9 +1315,32 @@ class RealTraceExecutor(
             maxOf(r1.bottom, r2.bottom, r3.bottom),
         )
 
-    /** 同一屏内独立「Change photo」「Name」/「name」「Bio」三词坐标（仅记录）。 */
+    /** 资料页头像入口文案：部分账号显示 Change photo，另一些为 Edit photo 或 Avatar。 */
+    private val PROFILE_EDIT_CHANGE_PHOTO_LABELS = listOf("Change photo", "Edit photo", "Avatar")
+
+    private fun findProfileEditChangePhotoMarkerHit(result: Text): Pair<StrictLabelHit, String>? {
+        for (label in PROFILE_EDIT_CHANGE_PHOTO_LABELS) {
+            findStrictExactLabelHit(result, label)?.let { return it to label }
+        }
+        return null
+    }
+
+    private fun findProfileEditChangePhotoMarkerSeen(result: Text): Boolean =
+        findProfileEditChangePhotoMarkerHit(result) != null
+
+    /** 点头像入口后选图方式：部分账号显示 Upload photo，另一些为 Select from Gallery。 */
+    private val PROFILE_EDIT_UPLOAD_PHOTO_LABELS = listOf("Upload photo", "Select from Gallery")
+
+    private fun findProfileEditUploadPhotoHit(result: Text): Pair<StrictLabelHit, String>? {
+        for (label in PROFILE_EDIT_UPLOAD_PHOTO_LABELS) {
+            findStrictExactLabelHit(result, label)?.let { return it to label }
+        }
+        return null
+    }
+
+    /** 同一屏内独立「Change photo」/「Edit photo」/「Avatar」「Name」/「name」「Bio」三词坐标（仅记录）。 */
     private fun findProfileEditChangePhotoNameBioTriple(result: Text): ProfileEditMenuTriple? {
-        val cp = findStrictExactLabelHit(result, "Change photo") ?: return null
+        val (cp, _) = findProfileEditChangePhotoMarkerHit(result) ?: return null
         val nm = findStrictExactLabelHit(result, "Name")
             ?: findStrictExactLabelHit(result, "name")
             ?: return null
@@ -1535,6 +1564,20 @@ class RealTraceExecutor(
                     )
                 }
             }
+            // 修改基本资料：同屏见 Viewer history + Save 时顺手点 Save 关弹窗，并令调用方重试 OCR（避免用过期 vision 误点）。
+            if (fileTag.startsWith("profile_edit_")) {
+                val logAlias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+                val dismissed = runCatching {
+                    tryDismissViewerHistoryPopupFromVision(
+                        ctx = ctx,
+                        alias = logAlias,
+                        vision = result,
+                        phaseLog = "「修改基本资料」OCR顺手",
+                        tapWithJitter = false,
+                    )
+                }.getOrDefault(false)
+                if (dismissed) return null to "viewer_history_popup_dismissed"
+            }
             result to "ok"
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
@@ -1564,6 +1607,46 @@ class RealTraceExecutor(
         lastInlineDontAllowTapAtMs = SystemClock.elapsedRealtime()
         if (markAutoLoginHandled) autoLoginDontAllowHandledInThisChain = true
         delay(250L)
+        return true
+    }
+
+    private fun visionHasViewerHistoryLabel(vision: Text): Boolean =
+        findStrictExactLabelHit(vision, "Viewer history") != null
+            || findStrictExactAcrossAdjacentLines(vision, "Viewer history") != null
+
+    /** 同屏同时见 Viewer history 与 Save 时视为弹窗，点最上方 Save 关闭。 */
+    private suspend fun tryDismissViewerHistoryPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasViewerHistoryLabel(vision)) return false
+        val saveHit = findTopmostStrictExactLabelHit(vision, "Save") ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见 Viewer history 但未同屏命中 Save，跳过弹窗处理")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastViewerHistoryPopupDismissAtMs < INLINE_VIEWER_HISTORY_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(saveHit.point, w, h)
+        } else {
+            coerceTapToScreen(saveHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Viewer history 弹窗，点 Save (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastViewerHistoryPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(350L)
         return true
     }
 
@@ -1698,10 +1781,11 @@ class RealTraceExecutor(
                     logAlias,
                     "「修改基本资料」发帖后上传等待第 $pollAttempts 次（约 ${elapsedSec}s）：摘要=$preview",
                 )
-                if (findStrictExactLabelHit(vision, "Change photo") != null) {
+                val uploadReadyHit = findProfileEditChangePhotoMarkerHit(vision)
+                if (uploadReadyHit != null) {
                     devOp(
                         logAlias,
-                        "「修改基本资料」发帖后上传等待：已 strict 定位「Change photo」（第 $pollAttempts 次），跳过后续 7 次校验",
+                        "「修改基本资料」发帖后上传等待：已 strict 定位「${uploadReadyHit.second}」（第 $pollAttempts 次），跳过后续 7 次校验",
                     )
                     return ProfileEditAvatarUploadWaitOutcome.ChangePhotoReady(pollAttempts)
                 }
@@ -1721,7 +1805,7 @@ class RealTraceExecutor(
                 } else {
                     devOp(
                         logAlias,
-                        "「修改基本资料」发帖后上传等待：未见 uploading、未见「Change photo」，1s 后继续 OCR",
+                        "「修改基本资料」发帖后上传等待：未见 uploading、未见 Change photo/Edit photo/Avatar，1s 后继续 OCR",
                     )
                 }
             }
@@ -1752,7 +1836,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 至多 [maxTries] 次，直到出现严格「Change photo」。
+     * 整屏 OCR 至多 [maxTries] 次，直到出现严格「Change photo」/「Edit photo」/「Avatar」。
      * @return first=是否命中，second=已执行 OCR 次数（含失败仍计数）
      */
     private suspend fun profileEditOcrUntilChangePhotoSeen(
@@ -1777,11 +1861,12 @@ class RealTraceExecutor(
             }
             val pv = buildProfileEditOcrPreview(vision).take(420)
             devOp(logAlias, "「修改基本资料」$humanPhase 第 $attempts/$maxTries 次：摘要=$pv")
-            if (findStrictExactLabelHit(vision, "Change photo") != null) {
-                devOp(logAlias, "「修改基本资料」$humanPhase：已定位「Change photo」（$attempts/$maxTries）")
+            val markerHit = findProfileEditChangePhotoMarkerHit(vision)
+            if (markerHit != null) {
+                devOp(logAlias, "「修改基本资料」$humanPhase：已定位「${markerHit.second}」（$attempts/$maxTries）")
                 return true to attempts
             }
-            devOp(logAlias, "「修改基本资料」$humanPhase 第 $attempts/$maxTries 次：未见「Change photo」")
+            devOp(logAlias, "「修改基本资料」$humanPhase 第 $attempts/$maxTries 次：未见 Change photo/Edit photo/Avatar")
         }
         return false to attempts
     }
@@ -2741,9 +2826,9 @@ class RealTraceExecutor(
             "「修改基本资料」OCR 链开始：屏=${w}x${h}px；步骤=OCR Edit 坐标→点击 Edit→" +
                 "OCR 分别记录「Change photo」「Name」「Bio」三词坐标（不点）→" +
                 "同屏严格「Change photo」首击（若无则专段整屏 OCR）→" +
-                "整屏「Upload photo」（OCR 最多 3 次）→「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；未见 Allow 但已见 Recents 则跳过）→" +
+                "整屏「Upload photo」或「Select from Gallery」（OCR 最多 3 次）→「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；未见 Allow 但已见 Recents 则跳过）→" +
                 "OCR「Recents」稳定（${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES}×${PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS}ms）→" +
-                "左上固定点→Next×2（间隔 0.5s）→Post this photo to Story→Save→" +
+                "左上固定点→Next×2（间隔 0.5s）→Post this photo to Story(≤${PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES}，未命中跳过)→Save→" +
                 "uploading 轮询(1s,≤60s,超时强停重拉)→OCR「Change photo」校验至多 7 次→Name→" +
                 "Bio 前 OCR 点 TikTok 文案(≤3)→Bio(模板+剪贴板比对)→" +
                 "①Save→终验→返回(至多3轮)→②比例点→【插入】Permissions+Save login info(2.5s)+返回→【旧】Permissions校验+Privacy→Comments(6)→下滑→Viewers→On/Off→Viewer history(7)→等3s",
@@ -2885,7 +2970,7 @@ class RealTraceExecutor(
             devOp(logAlias, "「修改基本资料」三项菜单 OCR 第 $changeAttempts/3 次：行摘要=${preview.take(500)}")
             val triple = findProfileEditChangePhotoNameBioTriple(vision)
             if (triple == null) {
-                val okCp = findStrictExactLabelHit(vision, "Change photo") != null
+                val okCp = findProfileEditChangePhotoMarkerSeen(vision)
                 val okNm =
                     findStrictExactLabelHit(vision, "Name") != null || findStrictExactLabelHit(vision, "name") != null
                 val okBio = findStrictExactLabelHit(vision, "Bio") != null
@@ -2935,19 +3020,20 @@ class RealTraceExecutor(
             delay(400)
             devOp(
                 logAlias,
-                "「修改基本资料」已齐三项菜单坐标；按流程在同屏内对「Change photo」执行首击（随后整屏 OCR「Upload photo」）",
+                "「修改基本资料」已齐三项菜单坐标；按流程在同屏内对「Change photo」执行首击（随后整屏 OCR「Upload photo」/「Select from Gallery」）",
             )
-            val samePassChange = findStrictExactLabelHit(menuVision, "Change photo")
-            if (samePassChange == null) {
+            val samePassChangePair = findProfileEditChangePhotoMarkerHit(menuVision)
+            if (samePassChangePair == null) {
                 devOp(
                     logAlias,
-                    "「修改基本资料」同屏异常：三词已齐但单独未解析出「Change photo」element/line，将启动专段整屏 OCR 查找「Change photo」",
+                    "「修改基本资料」同屏异常：三词已齐但单独未解析出 Change photo/Edit photo/Avatar element/line，将启动专段整屏 OCR",
                 )
             } else {
+                val (samePassChange, samePassLabel) = samePassChangePair
                 profileEditLogStrictHit(
                     logAlias,
                     "Change photo(菜单同屏)",
-                    "Change photo",
+                    samePassLabel,
                     samePassChange,
                     w,
                     h,
@@ -2985,12 +3071,13 @@ class RealTraceExecutor(
             val pv = buildProfileEditOcrPreview(vision)
             changePreviews.add("change_photo_strict:$pv")
             devOp(logAlias, "「修改基本资料」严格「Change photo」第 $changePhotoStrictAttempts/3 次：行摘要=${pv.take(500)}")
-            val hit = findStrictExactLabelHit(vision, "Change photo")
-            if (hit == null) {
-                devOp(logAlias, "「修改基本资料」严格「Change photo」第 $changePhotoStrictAttempts/3 次：未命中")
+            val hitPair = findProfileEditChangePhotoMarkerHit(vision)
+            if (hitPair == null) {
+                devOp(logAlias, "「修改基本资料」严格 Change photo/Edit photo/Avatar 第 $changePhotoStrictAttempts/3 次：未命中")
                 continue
             }
-            profileEditLogStrictHit(logAlias, "Change photo(专段整屏)", "Change photo", hit, w, h)
+            val (hit, hitLabel) = hitPair
+            profileEditLogStrictHit(logAlias, "Change photo(专段整屏)", hitLabel, hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             changePhotoTapPx = tap.x to tap.y
             devOp(logAlias, "「修改基本资料」Change photo(专段整屏)：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
@@ -3044,7 +3131,7 @@ class RealTraceExecutor(
         delay(600)
         devOp(
             logAlias,
-            "「修改基本资料」「Change photo」tap 已完成；短延迟后重新整屏 OCR，严格匹配「Upload photo」（命中坐标将写入日志）",
+            "「修改基本资料」「Change photo」tap 已完成；短延迟后重新整屏 OCR，严格匹配「Upload photo」/「Select from Gallery」（命中坐标将写入日志）",
         )
 
         val uploadPreviews = mutableListOf<String>()
@@ -3054,28 +3141,29 @@ class RealTraceExecutor(
         while (uploadAttempts < 3 && !uploadTapOk) {
             uploadAttempts++
             delay(600)
-            devOp(logAlias, "「修改基本资料」严格「Upload photo」OCR 第 $uploadAttempts/3 次…")
+            devOp(logAlias, "「修改基本资料」严格「Upload photo」/「Select from Gallery」OCR 第 $uploadAttempts/3 次…")
             val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_upload_photo_$uploadAttempts")
             if (vision == null) {
                 uploadPreviews.add("[$errTag]")
-                devOp(logAlias, "「修改基本资料」Upload photo 第 $uploadAttempts/3 次失败：$errTag")
+                devOp(logAlias, "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次失败：$errTag")
                 continue
             }
             val upPrev = buildProfileEditOcrPreview(vision)
             uploadPreviews.add(upPrev)
-            devOp(logAlias, "「修改基本资料」Upload photo 第 $uploadAttempts/3 次：行摘要=${upPrev.take(500)}")
-            val hit = findStrictExactLabelHit(vision, "Upload photo")
-            if (hit == null) {
-                devOp(logAlias, "「修改基本资料」Upload photo 第 $uploadAttempts/3 次：未命中严格文案")
+            devOp(logAlias, "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：行摘要=${upPrev.take(500)}")
+            val hitPair = findProfileEditUploadPhotoHit(vision)
+            if (hitPair == null) {
+                devOp(logAlias, "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：未命中严格文案")
                 continue
             }
-            profileEditLogStrictHit(logAlias, "Upload photo", "Upload photo", hit, w, h)
+            val (hit, matchedLabel) = hitPair
+            profileEditLogStrictHit(logAlias, "Upload photo/Select from Gallery", matchedLabel, hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             uploadTapPx = tap.x to tap.y
-            devOp(logAlias, "「修改基本资料」Upload photo：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」$matchedLabel：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
             uploadTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!uploadTapOk) {
-                devOp(logAlias, "「修改基本资料」失败：Upload photo 的 input tap 未成功（su）")
+                devOp(logAlias, "「修改基本资料」失败：Upload photo/Select from Gallery 的 input tap 未成功（su）")
                 return ProfileEditChainResult(
                     success = false,
                     failureStep = "upload_photo_tap_su_failed",
@@ -3102,7 +3190,7 @@ class RealTraceExecutor(
             }
         }
         if (!uploadTapOk) {
-            devOp(logAlias, "「修改基本资料」失败：严格「Upload photo」经 3 次 OCR 仍未完成有效点击")
+            devOp(logAlias, "「修改基本资料」失败：严格「Upload photo」/「Select from Gallery」经 3 次 OCR 仍未完成有效点击")
             return ProfileEditChainResult(
                 success = false,
                 failureStep = "upload_photo_ocr_3x_miss",
@@ -3130,7 +3218,7 @@ class RealTraceExecutor(
         delay(600)
         devOp(
             logAlias,
-            "「修改基本资料」「Upload photo」tap 已完成；短延迟后 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；" +
+            "「修改基本资料」选图入口 tap 已完成；短延迟后 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；" +
                 "未见 Allow all 但已见 Recents 则跳过 Allow；之后 OCR「Recents」确认界面稳定）",
         )
 
@@ -3319,12 +3407,18 @@ class RealTraceExecutor(
         // 这里不是发布作品链，而是“修改账户基本信息”流程中的确认/返回步骤。
         // 保留原始 OCR 文案，因为当前页面确实会出现这些确认按钮/文本。
         delay(550)
-        if (
-            !profileEditOcrTapByFinder(
-                ctx, logAlias, w, h, "profile_edit_post_story", "Post this photo to Story", "Post this photo to Story", 6,
-            ) { findStrictExactAcrossAdjacentLines(it, "Post this photo to Story") }
-        ) {
-            return chainBase(success = false, failureStep = "post_story_ocr_miss")
+        val postStoryOk = profileEditOcrTapByFinder(
+            ctx, logAlias, w, h, "profile_edit_post_story", "Post this photo to Story", "Post this photo to Story",
+            PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES,
+        ) { findStrictExactAcrossAdjacentLines(it, "Post this photo to Story") }
+        if (!postStoryOk) {
+            if (PrefsStore.isHardStopRequested()) {
+                return chainBase(success = false, failureStep = "hard_stop")
+            }
+            devOp(
+                logAlias,
+                "「修改基本资料」Post this photo to Story：${PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES} 次 OCR 均未命中，跳过点击，继续后续步骤",
+            )
         }
         delay(550)
         if (
@@ -4110,6 +4204,10 @@ class RealTraceExecutor(
             currentRootUsernameForLogs = trimmedUsername
             try {
                 if (hardStopOrNull(alias, "发作品入口 __publish_post__")) {
+                    val accountKeyForResume =
+                        PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
+                    PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
+                    PrefsStore.clearPublishPostTaskScope()
                     PrefsStore.setPublishPostPackageName(null)
                     PrefsStore.clearPublishPostState()
                     return "已硬停，跳过发作品入口"
@@ -4121,8 +4219,14 @@ class RealTraceExecutor(
                 val ok = runPublishPostEntryFlow(service, pkg, config)
                 if (ok) {
                     PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
+                    PrefsStore.clearPublishPostTaskScope()
                     PrefsStore.setPublishPostPending(false)
                     PrefsStore.setPublishPostRequested(false)
+                    PrefsStore.setPublishPostPackageName(null)
+                    PrefsStore.clearPublishPostState()
+                } else if (PrefsStore.isHardStopRequested()) {
+                    PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
+                    PrefsStore.clearPublishPostTaskScope()
                     PrefsStore.setPublishPostPackageName(null)
                     PrefsStore.clearPublishPostState()
                 } else {
@@ -7002,7 +7106,8 @@ class RealTraceExecutor(
      * 单条是否发布成功以底栏主导航 OCR（Home/Friends/Inbox/Profile 至少 2 类）为准。
      * 图库统计为 0 时不执行发布并返回 false。
      * 新任务（无续发断点）时：先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；**全部成功后不删图库**（素材保留至下次新任务开始前清理）。
-     * 中途失败时 [PrefsStore] 记录已成功条数，下次从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
+     * 中途失败时 [PrefsStore] 记录已成功条数，**仅在同一次云端 publish_post_start 指令内**从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
+     * 用户硬停或收到新的发作品指令时清除断点；断点不可跨指令复用。
      * 断点条数大于本次计划条数且图库仍有素材时，视为断点与图库不一致，清断点从第 1 条重发（不删图）。
      */
     private suspend fun runPublishPostEntryFlow(service: Context, packageName: String, config: AppConfig): Boolean =
@@ -7011,10 +7116,11 @@ class RealTraceExecutor(
         val accountKey =
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
         val resumeStartIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
+        val targetPublishCount = PrefsStore.getPublishPostTargetCount()
         if (resumeStartIdx <= 0) {
             devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
             deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
-            val fetchCount = config.publish_post_material_fetch_count.coerceIn(0, 20)
+            val fetchCount = (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
             if (fetchCount > 0) {
                 if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
                     return false
@@ -7023,7 +7129,10 @@ class RealTraceExecutor(
                 devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
             }
         } else {
-            devOp(alias, "发作品：续发断点已成功 $resumeStartIdx 条，跳过图库清理与素材拉取")
+            devOp(
+                alias,
+                "发作品：续发断点已成功 $resumeStartIdx 条（指令=${PrefsStore.getPublishPostTaskOpId()}），跳过图库清理与素材拉取",
+            )
         }
         val galleryStats = publishPostResolveGalleryMaterialStats()
         val galleryMaterialCount = galleryStats.resolvedCount
@@ -7036,7 +7145,8 @@ class RealTraceExecutor(
             )
             return false
         }
-        val publishRounds = minOf(galleryMaterialCount, PUBLISH_POST_MAX_ITEMS_PER_TASK)
+        val plannedMax = targetPublishCount ?: PUBLISH_POST_MAX_ITEMS_PER_TASK
+        val publishRounds = minOf(galleryMaterialCount, plannedMax.coerceAtLeast(1))
         val needsPerm = PrefsStore.shouldRunPublishPostFirstDailyPermissionOcr(accountKey)
         var startIdx = resumeStartIdx
         if (startIdx > publishRounds) {
@@ -7056,11 +7166,17 @@ class RealTraceExecutor(
             devOp(alias, "发作品：断点记录已达本次计划，视为本轮已完成（不删除图库，下次新任务开始前再清）")
             return true
         }
-        if (galleryMaterialCount > PUBLISH_POST_MAX_ITEMS_PER_TASK) {
+        val limitHint =
+            if (targetPublishCount != null) {
+                "云端指定 $targetPublishCount 条"
+            } else {
+                "上限 ${PUBLISH_POST_MAX_ITEMS_PER_TASK} 条"
+            }
+        if (galleryMaterialCount > publishRounds) {
             devOp(
                 alias,
                 "发作品：图库素材共 $galleryMaterialCount 个（图片=${galleryStats.picturesRootImageCount}，" +
-                    "视频=${galleryStats.picturesRootVideoCount}），本次仅发前 $publishRounds 条（上限 ${PUBLISH_POST_MAX_ITEMS_PER_TASK}）；" +
+                    "视频=${galleryStats.picturesRootVideoCount}），本次仅发前 $publishRounds 条（$limitHint）；" +
                     "当日首条权限 OCR=$needsPerm（账号键=$accountKey）；" +
                     if (startIdx > 0) "续发：已成功 $startIdx 条，从第 ${startIdx + 1} 条继续" else "续发：从第 1 条开始",
             )
@@ -7068,7 +7184,7 @@ class RealTraceExecutor(
             devOp(
                 alias,
                 "发作品：图库素材共 $galleryMaterialCount 个（图片=${galleryStats.picturesRootImageCount}，" +
-                    "视频=${galleryStats.picturesRootVideoCount}），本次发 $publishRounds 条；" +
+                    "视频=${galleryStats.picturesRootVideoCount}），本次发 $publishRounds 条（$limitHint）；" +
                     "当日首条权限 OCR=$needsPerm（账号键=$accountKey）；" +
                     if (startIdx > 0) "续发：已成功 $startIdx 条，从第 ${startIdx + 1} 条继续" else "续发：从第 1 条开始",
             )
@@ -11535,18 +11651,24 @@ class RealTraceExecutor(
             devOp(alias, "自动登录 OCR 失败：$errTag [$tag]")
         }
         if (vision != null) {
-            // 顺带处理：每次 autoLogin OCR 后，尝试点击下方 agree and / Don't allow（找不到就跳过，不重试）。
-            runCatching { autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision) }
+            // 顺带处理：每次 autoLogin OCR 后，尝试点击下方 agree and / Don't allow / Viewer history 弹窗。
+            val viewerHistoryDismissed = runCatching {
+                autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
+            }.getOrDefault(false)
+            if (viewerHistoryDismissed && !tag.endsWith("_vh_redo")) {
+                return autoLoginOcrOnce(ctx, alias, "${tag}_vh_redo")
+            }
         }
         return vision
     }
 
+    /** @return true 表示已处理 Viewer history 弹窗，调用方应重试 OCR。 */
     private suspend fun autoLoginTryDismissInlineOverlaysFromVision(
         ctx: Context,
         alias: String,
         vision: Text,
-    ) {
-        if (hardStopOrNull(alias, "自动登录-OCR顺带处理")) return
+    ): Boolean {
+        if (hardStopOrNull(alias, "自动登录-OCR顺带处理")) return false
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
@@ -11572,6 +11694,21 @@ class RealTraceExecutor(
             )
             if (tapped) autoLoginDelay(alias, 450L, "Don't allow 后")
         }
+
+        // 3) Viewer history 弹窗：同屏见 Viewer history + Save 时点 Save
+        if (
+            tryDismissViewerHistoryPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Viewer history 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Viewer history 弹窗 Save 后")
+            return true
+        }
+        return false
     }
 
     private fun findAddAnotherAccountTapHit(vision: Text): StrictLabelHit? =

@@ -1099,7 +1099,7 @@
           <div class="field">
             <label>发作品前拉取素材数量（配置键 publish_post_material_fetch_count）</label>
             <input name="publish_post_material_fetch_count" type="number" min="0" max="20" step="1" value="3" />
-            <div class="hint">设备执行发作品时，在<strong>清理图库之后</strong>调用本机 <code>POST /api/v1/tasks/request</code>（内部再调 PC <code>tasks/create</code>）拉取指定条数素材到 <code>Pictures</code>；填 <strong>0</strong> 则跳过拉取。续发断点（已成功部分条）时不重复清理/拉取。</div>
+            <div class="hint">设备执行发作品时，在<strong>清理图库之后</strong>调用本机 <code>POST /api/v1/tasks/request</code>（内部再调 PC <code>tasks/create</code>）拉取指定条数素材到 <code>Pictures</code>；填 <strong>0</strong> 则跳过拉取。续发断点（已成功部分条）<strong>仅在同一云端发作品指令内</strong>生效，不重复清理/拉取；用户硬停或再次下发新指令时会清除断点。</div>
           </div>
           <div class="field">
             <label>休息前拉取批次数（配置键 pull_batches_before_rest）</label>

@@ -22,19 +22,8 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="8dp"
         android:text="操作"
-        app:layout_constraintEnd_toStartOf="@id/showLogButton"
-        app:layout_constraintStart_toEndOf="@id/showSettingsButton"
-        app:layout_constraintTop_toTopOf="parent" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/showLogButton"
-        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:layout_marginStart="8dp"
-        android:text="日志"
         app:layout_constraintEnd_toStartOf="@id/showVideoDedButton"
-        app:layout_constraintStart_toEndOf="@id/showActionButton"
+        app:layout_constraintStart_toEndOf="@id/showSettingsButton"
         app:layout_constraintTop_toTopOf="parent" />
 
     <com.google.android.material.button.MaterialButton
@@ -44,8 +33,19 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="8dp"
         android:text="@string/nav_video_ded"
+        app:layout_constraintEnd_toStartOf="@id/showLogButton"
+        app:layout_constraintStart_toEndOf="@id/showActionButton"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/showLogButton"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:text="日志"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toEndOf="@id/showLogButton"
+        app:layout_constraintStart_toEndOf="@id/showVideoDedButton"
         app:layout_constraintTop_toTopOf="parent" />
 
     <LinearLayout

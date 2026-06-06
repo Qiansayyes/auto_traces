@@ -44,6 +44,8 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL = "publish_post_queued_after_mutual"
     /** 下发 publish_post_start 时写入，供 TraceExecutor 内 `__publish_post__` 使用（包名来自 payload） */
     private const val KEY_PUBLISH_POST_PACKAGE = "publish_post_package_name"
+    /** 自动切号发作品：云端按 video_count 下发的本次目标发布条数；0=未指定（沿用运行配置）。 */
+    private const val KEY_PUBLISH_POST_TARGET_COUNT = "publish_post_target_count"
     /**
      * 发作品：首条「Post Now / Don't allow / 底部 Cancel」权限类 OCR 按设备别名按自然日只跑一轮。
      * 值为上次完成该组操作的 yyyyMMdd（[Locale.US]）。
@@ -52,8 +54,12 @@ object PrefsStore {
     /**
      * 发作品断点续发：按账号键记录「下一条要发的 0-based 序号」（= 已成功条数）。
      * 第 N 条失败时不递增，下次仍从第 N+1 个图库坐标继续。
+     * 仅在同一次云端 [publish_post_start] 指令（[KEY_PUBLISH_POST_TASK_OP_ID]）内有效。
      */
     private const val KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX = "publish_post_resume_next_index_"
+    private const val KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX = "publish_post_resume_op_id_"
+    /** 当前进行中的发作品云端指令 op_id；新指令或硬停后清除，断点不再跨指令复用。 */
+    private const val KEY_PUBLISH_POST_TASK_OP_ID = "publish_post_task_op_id"
     /**
      * 发作品资料页进图库入口布局：按 [KEY_DEVICE_ID] 持久化（A=右下固定点，B=左侧备用点）。
      * 同设备不同账号发布时优先沿用，减少 A→B 全量试探。
@@ -208,6 +214,21 @@ object PrefsStore {
     fun getPublishPostPackageName(): String? =
         prefs.getString(KEY_PUBLISH_POST_PACKAGE, null)?.trim()?.takeIf { it.isNotEmpty() }
 
+    fun getPublishPostTargetCount(): Int? {
+        if (!prefs.contains(KEY_PUBLISH_POST_TARGET_COUNT)) return null
+        val v = prefs.getInt(KEY_PUBLISH_POST_TARGET_COUNT, 0)
+        return if (v > 0) v.coerceIn(1, 5) else null
+    }
+
+    fun setPublishPostTargetCount(count: Int?) {
+        val v = count?.coerceIn(1, 5) ?: 0
+        if (v > 0) {
+            prefs.edit().putInt(KEY_PUBLISH_POST_TARGET_COUNT, v).apply()
+        } else {
+            prefs.edit().remove(KEY_PUBLISH_POST_TARGET_COUNT).apply()
+        }
+    }
+
     private fun publishPostPermOcrPrefsKeyForAlias(alias: String): String =
         KEY_PUBLISH_POST_FIRST_DAILY_PERM_OCR_DAY_PREFIX + alias.trim().lowercase(Locale.US)
 
@@ -231,23 +252,52 @@ object PrefsStore {
     private fun publishPostResumeNextIndexKey(accountKey: String): String =
         KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX + accountKey.trim().lowercase(Locale.US)
 
-    /** 下一条待发作品的 0-based 序号（已成功 [返回值] 条）。 */
+    private fun publishPostResumeOpIdKey(accountKey: String): String =
+        KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX + accountKey.trim().lowercase(Locale.US)
+
+    fun getPublishPostTaskOpId(): String? =
+        prefs.getString(KEY_PUBLISH_POST_TASK_OP_ID, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setPublishPostTaskOpId(opId: String?) {
+        val v = opId?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_PUBLISH_POST_TASK_OP_ID).apply()
+        } else {
+            prefs.edit().putString(KEY_PUBLISH_POST_TASK_OP_ID, v).apply()
+        }
+    }
+
+    fun clearPublishPostTaskScope() {
+        prefs.edit().remove(KEY_PUBLISH_POST_TASK_OP_ID).apply()
+    }
+
+    /** 下一条待发作品的 0-based 序号（已成功 [返回值] 条）；非当前云端指令时恒为 0。 */
     fun getPublishPostResumeNextIndex(accountKey: String): Int {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return 0
+        val taskOpId = getPublishPostTaskOpId() ?: return 0
+        val resumeOpId = prefs.getString(publishPostResumeOpIdKey(a), null)?.trim().orEmpty()
+        if (resumeOpId != taskOpId) return 0
         return prefs.getInt(publishPostResumeNextIndexKey(a), 0).coerceAtLeast(0)
     }
 
     fun setPublishPostResumeNextIndex(accountKey: String, nextIndex: Int) {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
-        prefs.edit().putInt(publishPostResumeNextIndexKey(a), nextIndex.coerceAtLeast(0)).apply()
+        val taskOpId = getPublishPostTaskOpId() ?: return
+        prefs.edit()
+            .putInt(publishPostResumeNextIndexKey(a), nextIndex.coerceAtLeast(0))
+            .putString(publishPostResumeOpIdKey(a), taskOpId)
+            .apply()
     }
 
     fun clearPublishPostResumeProgress(accountKey: String) {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
-        prefs.edit().remove(publishPostResumeNextIndexKey(a)).apply()
+        prefs.edit()
+            .remove(publishPostResumeNextIndexKey(a))
+            .remove(publishPostResumeOpIdKey(a))
+            .apply()
     }
 
     private fun publishPostEntryLayoutPrefsKey(): String? {
@@ -283,6 +333,8 @@ object PrefsStore {
             .putBoolean(KEY_PUBLISH_POST_PENDING, false)
             .putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
             .remove(KEY_PUBLISH_POST_PACKAGE)
+            .remove(KEY_PUBLISH_POST_TASK_OP_ID)
+            .remove(KEY_PUBLISH_POST_TARGET_COUNT)
             .apply()
     }
 

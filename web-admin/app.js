@@ -637,6 +637,7 @@ const BACKUP_ARCHIVE_PAGE_KEY = "auto_traces_backup_archive_page_v1";
 const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
+let autoSwitchEnabledGlobal = false;
 let autoSwitchSaveInFlight = false;
 let backupStatsFullQuerySaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
@@ -4011,11 +4012,17 @@ async function saveSchedulerConfig() {
   }
 }
 
+function isAutoSwitchGloballyEnabled() {
+  if (autoSwitchEnabledToggle) return !!autoSwitchEnabledToggle.checked;
+  return autoSwitchEnabledGlobal;
+}
+
 async function loadAutoSwitchConfig() {
   try {
     const data = await request("/api/admin/auto_switch/config");
     const cfg = data.data || {};
-    if (autoSwitchEnabledToggle) autoSwitchEnabledToggle.checked = !!cfg.enabled;
+    autoSwitchEnabledGlobal = !!cfg.enabled;
+    if (autoSwitchEnabledToggle) autoSwitchEnabledToggle.checked = autoSwitchEnabledGlobal;
   } catch (_) {
     /* ignore */
   }
@@ -4064,11 +4071,15 @@ async function saveAutoSwitchConfig(options = {}) {
       method: "POST",
       body: JSON.stringify({ enabled }),
     });
+    autoSwitchEnabledGlobal = enabled;
     if (options.refreshStatus !== false) {
       await refreshTaskStatus();
     }
+    if (deviceAliasGroupsEl) {
+      void loadBackupArchiveRecords();
+    }
     setStatus(
-      enabled ? "自动切号已开启（将立即对齐当前时段账号）" : "自动切号已关闭",
+      enabled ? "自动切号已开启（将立即对齐当前时段账号；手动切号已禁用）" : "自动切号已关闭（可手动切号）",
       "success",
     );
   } catch (error) {
@@ -5122,6 +5133,10 @@ function backupArchiveBucketHasHighlightFromCards(cards) {
 
 async function runBackupArchiveAccountCutSwitch(clickedCard) {
   if (!(clickedCard instanceof HTMLElement)) return;
+  if (isAutoSwitchGloballyEnabled()) {
+    setStatus("已开启自动切号（全局），不可手动切号，请等待系统按时段安排", "warning");
+    return;
+  }
   const details = clickedCard.closest("details");
   const bucketSize = Number(clickedCard.getAttribute("data-bucket-size") || "") || (details ? details.querySelectorAll(".backup-archive-record").length : 0);
   const switchHlDb = normalizeSwitchHighlightField(clickedCard.getAttribute("data-switch-hl"));
@@ -7762,12 +7777,11 @@ function isMeaningfulBackupFieldValue(value) {
   return Boolean(text && text !== "-");
 }
 
-function buildBackupArchiveExtraSummary(stats = {}, backupName = "", backupPath = "", dailySlotLabel = "") {
+function buildBackupArchiveExtraSummary(stats = {}, backupName = "", backupPath = "") {
   const parts = [];
   if (isMeaningfulBackupFieldValue(stats.follower_count)) parts.push(`粉丝 ${stats.follower_count}`);
   if (isMeaningfulBackupFieldValue(stats.follower_growth)) parts.push(`增长 ${stats.follower_growth}`);
   if (isMeaningfulBackupFieldValue(stats.video_count)) parts.push(`视频 ${stats.video_count}`);
-  if (isMeaningfulBackupFieldValue(dailySlotLabel)) parts.push(`时段 ${dailySlotLabel}`);
   if (isMeaningfulBackupFieldValue(backupName)) {
     const shortName = backupName.length > 28 ? `${backupName.slice(0, 28)}…` : backupName;
     parts.push(`备份 ${shortName}`);
@@ -7846,11 +7860,16 @@ function renderBackupGroups(items = []) {
       const acct = username ? getAccountRecordByUsername(username) : null;
       const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
       const otherDisabled = switchActive ? "" : " disabled";
+      const autoSwitchBlocksManual = isAutoSwitchGloballyEnabled();
+      const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
+      const switchTitle = autoSwitchBlocksManual
+        ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
+        : "切号：高亮条目无需操作；无高亮时仅清理后还原/切高亮；有高亮时先备份当前再还原";
       const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
       const rowIndexNum = exportRowIndex ?? -1;
       const hasCutSwitchRow = exportRowIndex != null;
       const dailySlotLabel = resolveBackupRowDailySlot(alias, row) || (rows.length >= 2 ? "-" : "");
-      const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath, dailySlotLabel);
+      const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
       const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
       const exportSelectTitle = exportRowIndex != null
         ? "勾选后可点「导出已选 xlsx」"
@@ -7865,7 +7884,7 @@ function renderBackupGroups(items = []) {
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
               ${aliasBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
-              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}</span>
+              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}${dailySlotLabel ? ` · 今日时段 <strong>${escapeHtml(dailySlotLabel)}</strong>` : ""}</span>
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
@@ -7873,7 +7892,7 @@ function renderBackupGroups(items = []) {
               <button type="button" class="ghost"${otherDisabled} title="先备份，再清理设备内 TikTok 数据" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
               <button type="button" class="ghost"${otherDisabled} title="先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
               ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="高亮条目可点：下发后在设备完成修改链路；成功回传后云端自动将「基本资料已修改」标为「是」并关闭 TikTok" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
-              <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}" title="切号：高亮条目无需操作；无高亮时仅清理后还原/切高亮；有高亮时先备份当前再还原" data-account-switch="1">切号</button>
+              <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}"${switchDisabled} title="${escapeHtml(switchTitle)}" data-account-switch="1">切号</button>
             </div>
           </div>
           <details class="backup-archive-record-extra">
@@ -7883,7 +7902,6 @@ function renderBackupGroups(items = []) {
                 <div><label>video_count</label><div>${escapeHtml(stats.video_count)}</div></div>
                 <div><label>follower_count</label><div><strong>${escapeHtml(stats.follower_count)}</strong></div></div>
                 <div><label>follower_growth</label><div><strong>${escapeHtml(stats.follower_growth)}</strong></div></div>
-                <div><label>今日时段</label><div><strong>${escapeHtml(dailySlotLabel || "-")}</strong></div></div>
               </div>
               <div class="backup-archive-record-extra__grid backup-archive-record-extra__grid--backup">
                 <div class="backup-archive-record-extra__field backup-archive-record-extra__field--wide">
@@ -8374,6 +8392,10 @@ if (deviceAliasGroupsEl) {
     }
     if (target.hasAttribute("data-account-switch")) {
       event.preventDefault();
+      if (isAutoSwitchGloballyEnabled()) {
+        setStatus("已开启自动切号（全局），不可手动切号，请等待系统按时段安排", "warning");
+        return;
+      }
       const card = target.closest(".backup-archive-record");
       if (!(card instanceof HTMLElement)) {
         setStatus("未找到账号条目", "warning");
@@ -8478,8 +8500,7 @@ if (apiBaseInput) {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
       void loadBackupStatsFullQueryConfig();
-      void loadAutoSwitchConfig();
-      loadBackupArchiveRecords();
+      void loadAutoSwitchConfig().then(() => loadBackupArchiveRecords());
     }).catch((error) => {
       // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因
       const msg = error?.message || error?.toString?.() || "unknown";

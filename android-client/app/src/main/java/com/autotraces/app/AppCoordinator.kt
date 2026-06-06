@@ -66,6 +66,8 @@ object AppCoordinator {
         )
     }
     private val started = AtomicBoolean(false)
+    private const val PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS = 2_000L
+    private const val PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES = 12
 
     private val _config = MutableStateFlow(AppConfig())
     val config = _config.asStateFlow()
@@ -1006,6 +1008,93 @@ object AppCoordinator {
         }
     }
 
+    /** 还原子步骤（备份检查 / tar 解压 / 权限修复）失败时重试。 */
+    private suspend fun runRestoreShellStep(
+        logStep: (String) -> Unit,
+        stepLabel: String,
+        maxAttempts: Int = 2,
+        retryDelayMs: Long = 800,
+        block: () -> Boolean,
+    ): Boolean {
+        repeat(maxAttempts) { attempt ->
+            val label =
+                if (attempt == 0) stepLabel else "$stepLabel（重试 ${attempt + 1}/$maxAttempts）"
+            logStep(label)
+            if (block()) return true
+            if (attempt < maxAttempts - 1) delay(retryDelayMs)
+        }
+        return false
+    }
+
+    /** 切号还原失败后：按未登录账号强制自动登录，成功则恢复涨粉，失败则暂停。 */
+    private suspend fun finishCutSwitchAfterFailureFallback(
+        alias: String,
+        deviceId: String,
+        opId: String,
+    ) {
+        restoreCloudAutoStartParticipation(alias, deviceId, opId, "切号还原失败兜底")
+        PrefsStore.setHardStopRequested(false)
+        manuallyPaused = false
+
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        fetchConfig(logToUser = false)
+
+        if (shouldHonorUserHardStop() || manuallyPaused) {
+            LogCenter.op(alias, "[OP][$opId] 切号还原失败：硬停/手动暂停，不执行登录兜底")
+            return
+        }
+
+        val accountResp = fetchDeviceAssignedAccount(alias, deviceId)
+        if (accountResp == null) {
+            pauseGrowthAfterLoginFailure(alias, deviceId, "切号还原失败且拉取分配账号失败")
+            return
+        }
+        if (accountResp.code != 0) {
+            pauseGrowthAfterLoginFailure(
+                alias,
+                deviceId,
+                accountResp.msg?.takeIf { it.isNotBlank() } ?: "切号还原失败且无分配账号",
+            )
+            return
+        }
+
+        LogCenter.op(
+            alias,
+            "[OP][$opId] 切号还原失败：按未登录账号尝试自动登录（username=${accountResp.username.orEmpty()}）",
+        )
+        lastEnsureLoginPerformedFreshAutoLogin = false
+        val launched = executor.launchTikTokWithForegroundVerification(
+            ctx = appContext,
+            alias = alias,
+            tag = "切号还原失败兜底",
+            forceStopBeforeLaunch = true,
+            timingConfig = _config.value,
+        )
+        val loginOk = if (!launched) {
+            LogCenter.op(alias, "[OP][$opId] 切号还原失败：TikTok 拉起失败")
+            false
+        } else {
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                reason = "切号还原失败兜底",
+                strict = false,
+                forceRelogin = true,
+                resumeFromLoginEntryScreen = false,
+            )
+        }
+
+        if (loginOk) {
+            LogCenter.op(alias, "[OP][$opId] 切号还原失败兜底：自动登录成功，恢复涨粉")
+            forceStartRunningNow("切号还原失败，自动登录成功，恢复涨粉")
+            return
+        }
+
+        pauseGrowthAfterLoginFailure(alias, deviceId, "切号还原失败且自动登录未通过")
+    }
+
     /** 自动/手动切号全流程成功后：恢复自动开启、按需自动登录，再拉起涨粉。 */
     private suspend fun finishCutSwitchAfterSuccess(
         alias: String,
@@ -1536,11 +1625,30 @@ object AppCoordinator {
                 )
                 return
             }
+            val prevTaskOpId = PrefsStore.getPublishPostTaskOpId()
+            val publishAccountKey =
+                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
+            if (!prevTaskOpId.isNullOrBlank() && prevTaskOpId != opId) {
+                PrefsStore.clearPublishPostResumeProgress(publishAccountKey)
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] 新发作品指令，已清除上一指令（$prevTaskOpId）的断点续发",
+                )
+            }
+            PrefsStore.setPublishPostTaskOpId(opId)
             PrefsStore.setPublishPostPackageName(pubPkg)
+            val publishCount = payload?.publish_count
+            PrefsStore.setPublishPostTargetCount(publishCount)
             PrefsStore.setPublishPostRequested(true)
             PrefsStore.setPublishPostPending(true)
-            val lineQueued = "[OP][$opId] 发作品指令：互点切换任务执行中，发作品需排队在互点模式结束之后执行"
-            val lineStart = "[OP][$opId] 发作品指令已收到，准备切入发作品入口流程"
+            val countHint =
+                if (publishCount != null && publishCount > 0) "，目标发布 $publishCount 条" else ""
+            val autoSwitchHint =
+                if (payload?.source == "auto_switch") "（自动切号调度）" else ""
+            val lineQueued =
+                "[OP][$opId] 发作品指令$autoSwitchHint：互点切换任务执行中，发作品需排队在互点模式结束之后执行$countHint"
+            val lineStart =
+                "[OP][$opId] 发作品指令$autoSwitchHint 已收到，准备切入发作品入口流程$countHint"
             if (mutualSwitchJob?.isActive == true) {
                 PrefsStore.setPublishPostQueuedAfterMutual(true)
                 LogCenter.op(alias, lineQueued)
@@ -2279,33 +2387,40 @@ object AppCoordinator {
                     stopOk && runSu("pm clear $qPkg")
                 }
 
-                opStep(if (skipPmClear) "第2步：检查备份文件" else "第3步：检查备份文件")
-                val backupExists = clearOk && runSu("test -f $qBackupPath")
+                val backupCheckLabel =
+                    if (skipPmClear) "第2步：检查备份文件" else "第3步：检查备份文件"
+                val backupExists = clearOk && runRestoreShellStep(::opStep, backupCheckLabel) {
+                    runSu("test -f $qBackupPath")
+                }
 
-                opStep(if (skipPmClear) "第3步：恢复账号数据" else "第4步：恢复账号数据")
-                val restoreDataOk = backupExists && runSu("tar -xzf $qBackupPath -C /data/data")
+                val restoreDataLabel =
+                    if (skipPmClear) "第3步：恢复账号数据" else "第4步：恢复账号数据"
+                val restoreDataOk = backupExists && runRestoreShellStep(::opStep, restoreDataLabel) {
+                    runSu("tar -xzf $qBackupPath -C /data/data")
+                }
 
-                opStep(if (skipPmClear) "第4步：修复文件权限" else "第5步：修复文件权限")
-                val uidGid = if (restoreDataOk) {
-                    runSuWithOutput("stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'")
+                val permissionLabel =
+                    if (skipPmClear) "第4步：修复文件权限" else "第5步：修复文件权限"
+                val permissionOk = restoreDataOk && runRestoreShellStep(::opStep, permissionLabel) {
+                    val uidGid = runSuWithOutput(
+                        "stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'",
+                    )
                         ?.lineSequence()
                         ?.map { it.trim() }
                         ?.firstOrNull { it.contains(":") }
-                } else {
-                    null
+                    if (uidGid.isNullOrBlank()) return@runRestoreShellStep false
+                    val chownOk = runSu("chown -R $uidGid $sourceDir")
+                    if (!chownOk) return@runRestoreShellStep false
+                    val hasRestorecon = runSu("command -v restorecon >/dev/null 2>&1")
+                    val restoreconOk = if (hasRestorecon) {
+                        runSu("restorecon -RF $sourceDir")
+                    } else {
+                        true
+                    }
+                    restoreconOk && runSu("chmod -R 700 $sourceDir")
                 }
-                val chownOk = restoreDataOk && !uidGid.isNullOrBlank() && runSu("chown -R $uidGid $sourceDir")
-                val hasRestorecon = chownOk && runSu("command -v restorecon >/dev/null 2>&1")
-                val restoreconOk = if (!chownOk) {
-                    false
-                } else if (hasRestorecon) {
-                    runSu("restorecon -RF $sourceDir")
-                } else {
-                    true
-                }
-                val chmodOk = restoreconOk && runSu("chmod -R 700 $sourceDir")
 
-                val restoreOk = restoreDataOk && chownOk && restoreconOk && chmodOk
+                val restoreOk = restoreDataOk && permissionOk
                 if (restoreOk) {
                     payload?.username?.trim()?.takeIf { it.isNotEmpty() }?.let {
                         PrefsStore.setLogContextUsername(it)
@@ -2341,8 +2456,12 @@ object AppCoordinator {
                     message = if (restoreOk) "清理并还原完成" else "清理或还原失败",
                     data = restoreReport,
                 )
-                if (restoreOk && skipPmClear) {
-                    finishCutSwitchAfterSuccess(alias, deviceId, opId, restoreReportResp)
+                if (skipPmClear) {
+                    if (restoreOk) {
+                        finishCutSwitchAfterSuccess(alias, deviceId, opId, restoreReportResp)
+                    } else {
+                        finishCutSwitchAfterFailureFallback(alias, deviceId, opId)
+                    }
                 }
             }
 
@@ -2480,7 +2599,9 @@ object AppCoordinator {
                 "发作品切换任务准备执行特殊用户名 __publish_post__：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}",
             )
             val deviceIdForPublish = PrefsStore.getDeviceId().orEmpty()
-            var switchResult = runCatching {
+            val publishAccountKey =
+                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
+            suspend fun runPublishPostOnce(): String = runCatching {
                 executor.executeForUsername("__publish_post__", _config.value)
             }.getOrElse { err ->
                 when (err) {
@@ -2494,15 +2615,39 @@ object AppCoordinator {
                     else -> "发作品入口流程异常：${err.message ?: "unknown"}"
                 }
             }
+            var switchResult = runPublishPostOnce()
             if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
                 ensureAccountLoggedIn(
                     alias, deviceIdForPublish, "publish_safeguard", "发作品保障",
                     strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
                 )
-                switchResult = runCatching {
-                    executor.executeForUsername("__publish_post__", _config.value)
-                }.getOrElse { err ->
-                    "发作品入口流程异常：${err.message ?: "unknown"}"
+                switchResult = runPublishPostOnce()
+            }
+            var sameTaskPass = 1
+            while (
+                sameTaskPass < PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES &&
+                !switchResult.contains("已完成") &&
+                !shouldHonorUserHardStop() &&
+                PrefsStore.isPublishPostPending() &&
+                PrefsStore.isPublishPostRequested() &&
+                !PrefsStore.getPublishPostTaskOpId().isNullOrBlank()
+            ) {
+                val resumeIdx = PrefsStore.getPublishPostResumeNextIndex(publishAccountKey)
+                if (resumeIdx <= 0) break
+                LogCenter.op(
+                    alias,
+                    "发作品未完成，${PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS}ms 后同指令断点续发" +
+                        "（已成功 $resumeIdx 条，第 ${sameTaskPass + 1}/$PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES 次重入）",
+                )
+                if (!delayUnlessHardStop(PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS)) break
+                sameTaskPass++
+                switchResult = runPublishPostOnce()
+                if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
+                    ensureAccountLoggedIn(
+                        alias, deviceIdForPublish, "publish_safeguard", "发作品保障",
+                        strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
+                    )
+                    switchResult = runPublishPostOnce()
                 }
             }
             LogCenter.op(alias, switchResult)
@@ -3228,6 +3373,12 @@ object AppCoordinator {
         val deviceId = PrefsStore.getDeviceId()
         val alias = PrefsStore.getAlias()
         PrefsStore.setHardStopRequested(true)
+        val publishAccountKey =
+            PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias?.trim().orEmpty()
+        if (publishAccountKey.isNotBlank()) {
+            PrefsStore.clearPublishPostResumeProgress(publishAccountKey)
+        }
+        PrefsStore.clearPublishPostTaskScope()
         manuallyPaused = false
         started.set(false)
         pendingUsernames.clear()
