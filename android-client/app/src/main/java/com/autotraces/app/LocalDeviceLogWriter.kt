@@ -48,4 +48,25 @@ object LocalDeviceLogWriter {
             }
         }
     }
+
+    /** 读取今天与昨天的本地设备日志行（较新的在前）。 */
+    fun readRecentLines(maxLines: Int = 400): List<String> {
+        val ctx = runCatching { PrefsStore.applicationContext() }.getOrNull() ?: return emptyList()
+        val dir = File(ctx.filesDir, "logs")
+        if (!dir.isDirectory) return emptyList()
+        val today = LocalDate.now(ZoneId.systemDefault())
+        val days = listOf(today, today.minusDays(1))
+        val lines = mutableListOf<String>()
+        for (day in days) {
+            val file = File(dir, "${dayFormatter.format(day)}.txt")
+            if (!file.isFile) continue
+            runCatching {
+                file.readLines(Charsets.UTF_8).forEach { line ->
+                    if (line.isNotBlank()) lines.add(line)
+                }
+            }
+        }
+        if (lines.size <= maxLines) return lines
+        return lines.takeLast(maxLines)
+    }
 }

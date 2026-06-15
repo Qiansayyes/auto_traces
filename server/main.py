@@ -162,6 +162,29 @@ GALLERY_LIBRARY_MAX_ITEMS = 100
 GALLERY_LIBRARY_INDEX_FILENAME = "index.json"
 with contextlib.suppress(Exception):
     GALLERY_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+
+FAILURE_REPORTS_DIR = BASE_DIR / "failure_reports"
+FAILURE_REPORTS_MAX_ITEMS = 88
+FAILURE_REPORTS_INDEX_FILENAME = "index.json"
+with contextlib.suppress(Exception):
+    FAILURE_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+_failure_reports_lock = Lock()
+
+BATCH_STREAM_DIR = BASE_DIR / "batch_stream_sessions"
+with contextlib.suppress(Exception):
+    BATCH_STREAM_DIR.mkdir(parents=True, exist_ok=True)
+_batch_stream_session_lock = Lock()
+_batch_stream_sessions: Dict[str, Dict[str, Any]] = {}
+_batch_stream_device_active: Dict[str, str] = {}
+
+BATCH_STREAM_HEADER_ALIASES: Dict[str, tuple[str, ...]] = {
+    "username": ("username", "用户名", "user"),
+    "password": ("password", "密码", "tiktok_password"),
+    "email": ("email", "邮箱"),
+    "email_password": ("email_password", "邮箱密码", "email password", "email_pwd"),
+    "api": ("api", "api_address", "api地址", "api_url", "api url"),
+    "assigned_alias": ("分配别名", "assigned_alias", "别名", "alias", "device_alias"),
+}
 DB_PATH = BASE_DIR / "tiktok_fans.db"
 CV_TEMPLATE_ZIP_PATH = BASE_DIR / "server" / "cv_templates.zip"
 FOLLOW_SCRAPER_PATH = BASE_DIR / "tiktok_follow_scraper.py"
@@ -736,6 +759,7 @@ def init_autosearch_db():
             "ALTER TABLE device_editor_rows ADD COLUMN backup_time TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE device_editor_rows ADD COLUMN backup_status TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE device_editor_rows ADD COLUMN switch_highlight TEXT NOT NULL DEFAULT '否'",
+            "ALTER TABLE device_editor_rows ADD COLUMN env_status TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 conn.execute(ddl)
@@ -986,8 +1010,12 @@ class MemoryStore:
     auto_switch_enabled: bool = False
     auto_switch_align_on_next_tick: bool = True
     auto_switch_last_slot_keys: Dict[str, str] = field(default_factory=dict)
-    # bucket_key -> "{schedule_date}|{slot_index}|publish"：当日该时段自动发作品已下发
+    # bucket_key -> "{schedule_date}|{slot_index}|publish"：当日该时段自动发作品已成功
     auto_switch_publish_done_keys: Dict[str, str] = field(default_factory=dict)
+    # bucket_key -> "{schedule_date}|{slot_index}|publish_aborted"：本时段因未登录/时段切换等不再重试
+    auto_switch_publish_aborted_keys: Dict[str, str] = field(default_factory=dict)
+    # bucket_key -> "{schedule_date}|{slot_index}|{op_id}"：已下发、待设备回传结果
+    auto_switch_publish_inflight_keys: Dict[str, str] = field(default_factory=dict)
     backup_stats_full_query_enabled: bool = True
     backup_stats_full_query_last_run_date: str = ""
     backup_stats_full_query_in_flight: bool = False
@@ -1193,6 +1221,18 @@ def _load_persisted_runtime_state():
             with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_done"):
                 store.auto_switch_publish_done_keys = {
                     str(k): str(v) for k, v in publish_done.items() if str(k).strip() and str(v).strip()
+                }
+        publish_aborted = blob.get("auto_switch_publish_aborted_keys")
+        if isinstance(publish_aborted, dict):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_aborted"):
+                store.auto_switch_publish_aborted_keys = {
+                    str(k): str(v) for k, v in publish_aborted.items() if str(k).strip() and str(v).strip()
+                }
+        publish_inflight = blob.get("auto_switch_publish_inflight_keys")
+        if isinstance(publish_inflight, dict):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_inflight"):
+                store.auto_switch_publish_inflight_keys = {
+                    str(k): str(v) for k, v in publish_inflight.items() if str(k).strip() and str(v).strip()
                 }
         bs_enabled = blob.get("backup_stats_full_query_enabled")
         if isinstance(bs_enabled, bool):
@@ -1959,6 +1999,8 @@ def persist_runtime_state():
             "auto_switch_enabled": bool(store.auto_switch_enabled),
             "auto_switch_last_slot_keys": dict(store.auto_switch_last_slot_keys),
             "auto_switch_publish_done_keys": dict(store.auto_switch_publish_done_keys),
+            "auto_switch_publish_aborted_keys": dict(store.auto_switch_publish_aborted_keys),
+            "auto_switch_publish_inflight_keys": dict(store.auto_switch_publish_inflight_keys),
             "backup_stats_full_query_enabled": bool(store.backup_stats_full_query_enabled),
             "backup_stats_full_query_last_run_date": str(store.backup_stats_full_query_last_run_date or ""),
         }
@@ -2476,6 +2518,28 @@ class DeviceTikTokBackupClearRequest(BaseModel):
     cut_switch_target_row_index: int | None = Field(default=None, ge=0)
 
 
+class BatchStreamStartRequest(BaseModel):
+    session_id: str = Field(..., min_length=8, max_length=80)
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    hours_per_account: float = Field(..., gt=0, le=72)
+    package_name: str = Field(default=TIKTOK_PACKAGE_NAME, min_length=1, max_length=255)
+
+
+class BatchStreamStopRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+
+
+class BatchStreamReportRowRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    session_id: str = Field(..., min_length=8, max_length=80)
+    sheet_row: int = Field(..., ge=2, le=100000)
+    status_text: str = Field(..., min_length=1, max_length=255)
+    hours_active: float = Field(default=0, ge=0, le=72)
+
+
 class TikTokBackupSubmitRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     tiktok_password: str = Field(default="", max_length=255)
@@ -2499,6 +2563,11 @@ class DeviceTikTokRestoreRequest(BaseModel):
     skip_pm_clear: bool = Field(
         default=False,
         description="为 true 时设备端还原前跳过 pm clear（切号：前序已执行备份并清理）",
+    )
+    cut_switch_target_row_index: int | None = Field(
+        default=None,
+        ge=0,
+        description="切号入队时立即切换环境归属高亮到该行（失败不回滚）",
     )
 
 
@@ -3149,6 +3218,69 @@ def _device_editor_search_sql(search: str, *, table_alias: str = "device_editor_
     return sql, [pattern] * 9
 
 
+def _sync_account_assigned_alias_for_username(
+    conn: sqlite3.Connection,
+    owner_username: str,
+    username: str,
+    assigned_alias: str,
+    *,
+    only_if_empty: bool = True,
+) -> int:
+    """将设备档案中的有效别名写回账号记录（仅当账号侧尚未分配时）。"""
+    owner = str(owner_username or "").strip()
+    uname = _normalized_alias(username).lstrip("@")
+    alias = _normalized_alias(assigned_alias)
+    if not owner or not uname or not alias:
+        return 0
+    sql = """
+        UPDATE account_editor_rows
+        SET assigned_alias = ?, updated_at = ?
+        WHERE owner_username = ?
+          AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+    """
+    params: list[Any] = [alias, now_text(), owner, uname]
+    if only_if_empty:
+        sql += " AND TRIM(COALESCE(assigned_alias, '')) = ''"
+    cur = conn.execute(sql, params)
+    return int(cur.rowcount or 0)
+
+
+def _sync_device_aliases_to_account_rows(conn: sqlite3.Connection, owner_username: str) -> int:
+    """将设备备份档案中的有效别名同步回同 username 的账号记录（修复仅设备表有别名的情况）。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return 0
+    alias_expr = _backup_record_alias_expr()
+    rows = conn.execute(
+        f"""
+        SELECT username, {alias_expr} AS eff_alias
+        FROM device_editor_rows
+        WHERE owner_username = ?
+          AND TRIM(username) <> ''
+          AND TRIM({alias_expr}) <> ''
+        ORDER BY row_index ASC
+        """,
+        (owner,),
+    ).fetchall()
+    touched = 0
+    for row in rows or []:
+        uname = str(row["username"] or "").strip()
+        alias = _normalized_alias(row["eff_alias"])
+        if not uname or not alias:
+            continue
+        touched += _sync_account_assigned_alias_for_username(
+            conn, owner, uname, alias, only_if_empty=True
+        )
+    return touched
+
+
+def _reconcile_editor_alias_bindings(conn: sqlite3.Connection, owner_username: str) -> tuple[int, int]:
+    """双向对齐账号表与设备档案的分配别名（先设备→账号，再账号→设备）。"""
+    to_accounts = _sync_device_aliases_to_account_rows(conn, owner_username)
+    to_devices = _sync_account_aliases_to_device_rows(conn, owner_username)
+    return to_accounts, to_devices
+
+
 def _sync_account_aliases_to_device_rows(conn: sqlite3.Connection, owner_username: str) -> int:
     """将账号记录中的 assigned_alias 同步到同 username 的设备备份行（修复仅账号表有别名的情况）。"""
     owner = str(owner_username or "").strip()
@@ -3173,8 +3305,6 @@ def _sync_account_aliases_to_device_rows(conn: sqlite3.Connection, owner_usernam
         touched += _upsert_backup_record_for_account(
             owner, uname, alias, region, conn=conn, commit=False
         )
-    if touched:
-        conn.commit()
     return touched
 
 
@@ -3234,6 +3364,67 @@ def _shift_account_editor_row_indices_after_delete(
 def _normalize_switch_highlight(value: object | None) -> str:
     """切号高亮：仅允许「是」或「否」，其余视为否。"""
     return "是" if str(value or "").strip() == "是" else "否"
+
+
+ENV_STATUS_ACTIVE = "环境活跃"
+ENV_STATUS_RESTORE_FAILED = "还原失败"
+ENV_STATUS_PENDING = "待就绪"
+
+
+def _resolve_device_editor_row_index_for_restore(owner_username: str, data: dict) -> int:
+    """从设备还原/切号回传 data 解析目标 device_editor_rows.row_index。"""
+    owner = str(owner_username or "").strip()
+    if not owner or not isinstance(data, dict):
+        return -1
+    for key in ("restore_highlight_row_index", "cut_switch_target_row_index"):
+        try:
+            tid = int(data.get(key)) if data.get(key) is not None else -1
+        except (TypeError, ValueError):
+            tid = -1
+        if tid >= 0:
+            return tid
+    bn = str(data.get("backup_name") or "").strip()
+    if not bn:
+        return -1
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT row_index FROM device_editor_rows
+            WHERE owner_username = ? AND backup_name = ?
+            ORDER BY updated_at DESC, row_index DESC
+            LIMIT 1
+            """,
+            (owner, Path(bn).name if bn else ""),
+        ).fetchone()
+        return int(row[0]) if row else -1
+    finally:
+        conn.close()
+
+
+def _db_set_env_status(
+    conn: sqlite3.Connection,
+    owner_username: str,
+    row_index: int,
+    env_status: str,
+    now: str | None = None,
+) -> None:
+    owner = str(owner_username or "").strip()
+    try:
+        rid = int(row_index)
+    except (TypeError, ValueError):
+        return
+    if not owner or rid < 0:
+        return
+    ts = now or now_text()
+    conn.execute(
+        """
+        UPDATE device_editor_rows
+        SET env_status = ?, updated_at = ?
+        WHERE owner_username = ? AND row_index = ?
+        """,
+        (str(env_status or "").strip(), ts, owner, rid),
+    )
 
 
 def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, owner_username: str) -> None:
@@ -3340,8 +3531,68 @@ def _db_apply_switch_highlight_exclusive(conn: sqlite3.Connection, owner_usernam
     )
 
 
+def _apply_cut_switch_highlight_intent(owner_username: str, target_row_index: int) -> bool:
+    """切号任务入队时立即切换环境归属高亮；设备还原/登录成败不回滚。"""
+    owner = str(owner_username or "").strip()
+    try:
+        tid = int(target_row_index)
+    except (TypeError, ValueError):
+        return False
+    if not owner or tid < 0:
+        return False
+    conn = _get_db()
+    try:
+        now = now_text()
+        _db_apply_switch_highlight_exclusive(conn, owner, tid, now)
+        row = conn.execute(
+            """
+            SELECT assigned_alias, device_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            LIMIT 1
+            """,
+            (owner, tid),
+        ).fetchone()
+        if row:
+            bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
+            conn.execute(
+                f"""
+                UPDATE device_editor_rows
+                SET env_status = '', updated_at = ?
+                WHERE owner_username = ? AND LOWER(TRIM({_backup_record_alias_expr()})) = LOWER(TRIM(?))
+                  AND row_index <> ?
+                """,
+                (now, owner, bucket, tid),
+            )
+        _db_set_env_status(conn, owner, tid, ENV_STATUS_PENDING, now)
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _maybe_apply_cut_switch_highlight_on_enqueue(
+    owner_username: str,
+    cut_switch_after_backup: str,
+    cut_switch_target_row_index: int | None,
+) -> bool:
+    cs = str(cut_switch_after_backup or "").strip().lower()
+    if cs not in ("clear_source_for_restore", "exclusive_activate_target"):
+        return False
+    if cut_switch_target_row_index is None:
+        return False
+    try:
+        tid = int(cut_switch_target_row_index)
+    except (TypeError, ValueError):
+        return False
+    if tid < 0:
+        return False
+    return _apply_cut_switch_highlight_intent(owner_username, tid)
+
+
 def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -> None:
-    """设备回传「备份并清理」成功时，按切号意图更新 switch_highlight（不依赖管理台轮询）。"""
+    """设备回传「备份并清理/清理」成功时幂等确认切号高亮（入队时已切换归属，此处不回滚）。"""
     mode = str(data.get("cut_switch_after_backup") or "").strip().lower()
     if mode not in ("clear_source_for_restore", "exclusive_activate_target"):
         return
@@ -3363,6 +3614,13 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
                     """,
                     (now, owner_username, rid),
                 )
+            tr = data.get("cut_switch_target_row_index")
+            try:
+                tid = int(tr) if tr is not None else -1
+            except (TypeError, ValueError):
+                tid = -1
+            if tid >= 0:
+                _db_apply_switch_highlight_exclusive(conn, owner_username, tid, now)
         elif mode == "exclusive_activate_target":
             tr = data.get("cut_switch_target_row_index")
             try:
@@ -3371,6 +3629,7 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
                 tid = -1
             if tid >= 0:
                 _db_apply_switch_highlight_exclusive(conn, owner_username, tid, now)
+                _db_set_env_status(conn, owner_username, tid, ENV_STATUS_ACTIVE, now)
         _ensure_device_editor_switch_highlight_invariants(conn, owner_username)
         conn.commit()
     finally:
@@ -3378,36 +3637,36 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
 
 
 def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) -> None:
-    """设备回传「还原」成功时，将对应档案行设为切号高亮。"""
-    try:
-        tid = int(data.get("restore_highlight_row_index")) if data.get("restore_highlight_row_index") is not None else -1
-    except (TypeError, ValueError):
-        tid = -1
-    if tid < 0:
-        bn = str(data.get("backup_name") or "").strip()
-        if not bn:
-            return
-        conn = _get_db()
-        try:
-            row = conn.execute(
-                """
-                SELECT row_index FROM device_editor_rows
-                WHERE owner_username = ? AND backup_name = ?
-                ORDER BY updated_at DESC, row_index DESC
-                LIMIT 1
-                """,
-                (owner_username, Path(bn).name if bn else ""),
-            ).fetchone()
-            tid = int(row[0]) if row else -1
-        finally:
-            conn.close()
+    """设备回传「还原」成功时，幂等确认高亮并将环境标为活跃。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return
+    tid = _resolve_device_editor_row_index_for_restore(owner, data)
     if tid < 0:
         return
     conn = _get_db()
     try:
         now = now_text()
-        _db_apply_switch_highlight_exclusive(conn, owner_username, tid, now)
-        _ensure_device_editor_switch_highlight_invariants(conn, owner_username)
+        _db_apply_switch_highlight_exclusive(conn, owner, tid, now)
+        _db_set_env_status(conn, owner, tid, ENV_STATUS_ACTIVE, now)
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _device_ops_apply_restore_failure(owner_username: str, data: dict) -> None:
+    """设备回传「还原」失败时，环境归属不回滚，仅标记还原失败。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return
+    tid = _resolve_device_editor_row_index_for_restore(owner, data)
+    if tid < 0:
+        return
+    conn = _get_db()
+    try:
+        now = now_text()
+        _db_set_env_status(conn, owner, tid, ENV_STATUS_RESTORE_FAILED, now)
         conn.commit()
     finally:
         conn.close()
@@ -3772,8 +4031,9 @@ def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | 
                     pub_label = _format_beijing_minute(int(pub_min))
                 except (TypeError, ValueError):
                     pub_label = ""
+            slot_index = int(slot.get("slot_index") or 0)
             entry = {
-                "slot_index": int(slot.get("slot_index") or 0),
+                "slot_index": slot_index,
                 "start_min": start,
                 "end_min": end,
                 "label": _format_beijing_slot_range(start, end),
@@ -3781,6 +4041,17 @@ def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | 
                 "auto_publish_minute": pub_min,
                 "auto_publish_label": pub_label,
             }
+            entry.update(
+                _auto_switch_slot_publish_status_view(
+                    owner,
+                    alias_key,
+                    date_key,
+                    slot_index,
+                    pub_min,
+                    start,
+                    end,
+                )
+            )
             if row_index >= 0:
                 slots_by_row_index[str(row_index)] = entry
             user_key = str(slot.get("username") or "").strip().lower()
@@ -3890,6 +4161,189 @@ def _device_has_pending_publish_post(device_id: str) -> bool:
     return False
 
 
+def _auto_switch_publish_done_key(slot_key: str) -> str:
+    return f"{slot_key}|publish"
+
+
+def _auto_switch_publish_aborted_key(slot_key: str) -> str:
+    return f"{slot_key}|publish_aborted"
+
+
+def _auto_switch_publish_inflight_value(slot_key: str, op_id: str) -> str:
+    return f"{slot_key}|{op_id}"
+
+
+def _parse_auto_switch_publish_inflight(value: str) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if "|" not in text:
+        return "", ""
+    slot_key, op_id = text.rsplit("|", 1)
+    return slot_key.strip(), op_id.strip()
+
+
+def _auto_switch_slot_end_minute(target_slot: dict[str, Any]) -> int:
+    try:
+        return int(target_slot.get("end_min") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _auto_switch_slot_publish_status_view(
+    owner_username: str,
+    alias_key: str,
+    schedule_date: str,
+    slot_index: int,
+    pub_min: object,
+    start_min: int,
+    end_min: int,
+) -> dict[str, Any]:
+    """管理台展示：本时段自动发作品状态（未到时间/执行中/重试中/已成功/已放弃/无计划/时段已过）。"""
+    slot_key = f"{schedule_date}|{int(slot_index)}"
+    bucket_key = _auto_switch_bucket_key(owner_username, alias_key)
+    done_key = _auto_switch_publish_done_key(slot_key)
+    abort_key = _auto_switch_publish_aborted_key(slot_key)
+    minute = _beijing_minute_of_day()
+
+    if pub_min is None:
+        return {
+            "auto_publish_status": "none",
+            "auto_publish_status_label": "无发作品计划",
+            "auto_publish_status_title": "该时段可用窗口不足（<21 分钟），系统未安排自动发作品时间点",
+        }
+
+    try:
+        pub_minute = int(pub_min)
+        pub_label = _format_beijing_minute(pub_minute)
+    except (TypeError, ValueError):
+        return {
+            "auto_publish_status": "none",
+            "auto_publish_status_label": "无发作品计划",
+            "auto_publish_status_title": "发作品时间点无效",
+        }
+
+    with store.lock:
+        done = str(store.auto_switch_publish_done_keys.get(bucket_key) or "") == done_key
+        aborted = str(store.auto_switch_publish_aborted_keys.get(bucket_key) or "") == abort_key
+        inflight_raw = str(store.auto_switch_publish_inflight_keys.get(bucket_key) or "")
+    inflight_slot, inflight_op = _parse_auto_switch_publish_inflight(inflight_raw)
+    inflight = inflight_slot == slot_key
+
+    if done:
+        return {
+            "auto_publish_status": "done",
+            "auto_publish_status_label": "已成功",
+            "auto_publish_status_title": f"本时段已在 {pub_label} 起自动发作品并成功完成",
+        }
+    if aborted:
+        return {
+            "auto_publish_status": "aborted",
+            "auto_publish_status_label": "已放弃",
+            "auto_publish_status_title": (
+                f"本时段在 {pub_label} 起曾尝试自动发作品，但因账号未登录成功或时段已切换，已停止重试"
+            ),
+        }
+    if inflight:
+        op_hint = f"（op_id={inflight_op}）" if inflight_op else ""
+        return {
+            "auto_publish_status": "inflight",
+            "auto_publish_status_label": "执行中",
+            "auto_publish_status_title": f"设备正在执行自动发作品任务{op_hint}",
+        }
+    if minute < pub_minute:
+        return {
+            "auto_publish_status": "pending",
+            "auto_publish_status_label": "未到时间",
+            "auto_publish_status_title": f"计划于北京时间 {pub_label} 开始自动发作品（{_format_beijing_slot_range(start_min, end_min)}）",
+        }
+    if minute >= int(end_min):
+        return {
+            "auto_publish_status": "missed",
+            "auto_publish_status_label": "时段已过",
+            "auto_publish_status_title": (
+                f"本时段（{_format_beijing_slot_range(start_min, end_min)}）已结束，自动发作品未成功完成"
+            ),
+        }
+    return {
+        "auto_publish_status": "retrying",
+        "auto_publish_status_label": "重试中",
+        "auto_publish_status_title": (
+            f"已于 {pub_label} 触发，本时段内将持续重试直至成功或时段结束（当前在 {_format_beijing_slot_range(start_min, end_min)} 内）"
+        ),
+    }
+
+
+def _auto_switch_refresh_publish_slot_state(
+    bucket_key: str,
+    slot_key: str,
+    minute_of_day: int,
+    end_min: int,
+) -> None:
+    """时段切换或时段结束后清理过期的 inflight / aborted 标记，避免阻塞下一时段。"""
+    with store.lock:
+        inflight = store.auto_switch_publish_inflight_keys.get(bucket_key)
+        if inflight:
+            inflight_slot, _ = _parse_auto_switch_publish_inflight(str(inflight))
+            if inflight_slot != slot_key or int(minute_of_day) >= int(end_min):
+                store.auto_switch_publish_inflight_keys.pop(bucket_key, None)
+        aborted = str(store.auto_switch_publish_aborted_keys.get(bucket_key) or "")
+        if aborted:
+            aborted_slot = aborted.replace("|publish_aborted", "")
+            if aborted_slot != slot_key:
+                store.auto_switch_publish_aborted_keys.pop(bucket_key, None)
+
+
+def _auto_switch_apply_publish_outcome_report(
+    owner_username: str,
+    alias: str,
+    status: str,
+    data: dict[str, Any],
+) -> None:
+    """设备回传发作品最终结果：成功才记 publish_done；未登录/时段切换记 aborted 并停止本时段重试。"""
+    if str(data.get("op_type") or "") != "publish_post_start":
+        return
+    if not bool(data.get("publish_post_outcome_report")):
+        return
+    if str(data.get("source") or "").strip() != "auto_switch":
+        return
+    slot_key = str(data.get("auto_switch_slot_key") or "").strip()
+    if not slot_key:
+        return
+    bucket_key = _auto_switch_bucket_key(owner_username, alias)
+    done_key = _auto_switch_publish_done_key(slot_key)
+    abort_key = _auto_switch_publish_aborted_key(slot_key)
+    account = str(data.get("account_username") or "").strip()
+    login_failed = bool(data.get("auto_switch_publish_login_failed"))
+    account_changed = bool(data.get("auto_switch_publish_account_changed"))
+    completed = bool(data.get("publish_post_completed")) and str(status or "").strip().lower() == "success"
+
+    with store.lock:
+        store.auto_switch_publish_inflight_keys.pop(bucket_key, None)
+        if login_failed or account_changed:
+            store.auto_switch_publish_aborted_keys[bucket_key] = abort_key
+        elif completed:
+            store.auto_switch_publish_done_keys[bucket_key] = done_key
+
+    if login_failed or account_changed:
+        reason = "时段已切换" if account_changed else "账号未登录成功"
+        persist_runtime_state()
+        _auto_switch_log(
+            f"本时段自动发作品已停止重试（{reason}）| owner={owner_username} alias={alias} "
+            f"slot={slot_key} account={account or '-'}"
+        )
+        return
+    if completed:
+        persist_runtime_state()
+        _auto_switch_log(
+            f"自动发作品已成功，本时段标记完成 | owner={owner_username} alias={alias} "
+            f"slot={slot_key} account={account or '-'}"
+        )
+        return
+    _auto_switch_log(
+        f"自动发作品未完成，将在本时段内继续重试 | owner={owner_username} alias={alias} "
+        f"slot={slot_key} account={account or '-'}"
+    )
+
+
 def _auto_switch_enqueue_publish(
     owner_username: str,
     alias: str,
@@ -3899,11 +4353,11 @@ def _auto_switch_enqueue_publish(
     schedule_date: str,
     slot_key: str,
     publish_minute: int,
-) -> bool:
+) -> str | None:
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
     if not did or not alias_clean:
-        return False
+        return None
     count = max(1, min(int(publish_count), 5))
 
     auto_start_disabled = False
@@ -3940,7 +4394,7 @@ def _auto_switch_enqueue_publish(
         f"[{now_text()}] 自动切号发作品 | op_id={op_id} publish_count={count} "
         f"account={str(account_row.get('username') or '').strip() or '-'}",
     )
-    return True
+    return op_id
 
 
 def _auto_switch_maybe_enqueue_publish(
@@ -3961,25 +4415,38 @@ def _auto_switch_maybe_enqueue_publish(
         pub_minute = int(pub_min)
     except (TypeError, ValueError):
         return
-    if int(minute_of_day) != pub_minute:
+
+    minute = int(minute_of_day)
+    end_min = _auto_switch_slot_end_minute(target_slot)
+    if minute < pub_minute:
+        return
+    if minute >= end_min:
         return
 
-    publish_done_key = f"{slot_key}|publish"
+    _auto_switch_refresh_publish_slot_state(bucket_key, slot_key, minute, end_min)
+
+    done_key = _auto_switch_publish_done_key(slot_key)
+    abort_key = _auto_switch_publish_aborted_key(slot_key)
     with store.lock:
-        if str(store.auto_switch_publish_done_keys.get(bucket_key) or "") == publish_done_key:
+        if str(store.auto_switch_publish_done_keys.get(bucket_key) or "") == done_key:
             return
+        if str(store.auto_switch_publish_aborted_keys.get(bucket_key) or "") == abort_key:
+            return
+        if bucket_key in store.auto_switch_publish_inflight_keys:
+            return
+
+    if _device_has_pending_publish_post(device_id):
+        return
 
     if _device_has_blocking_tiktok_ops(device_id):
         _auto_switch_log(
-            f"跳过自动发作品：设备任务队列未空闲 device={device_id} alias={alias} slot={slot_key}"
+            f"自动发作品暂缓：切号任务排队中，下分钟重试 | device={device_id} alias={alias} slot={slot_key}"
         )
-        return
-    if _device_has_pending_publish_post(device_id):
         return
 
     video_count = _parse_stat_int(target_row.get("video_count"))
     publish_count = _auto_publish_count_for_video_count(video_count)
-    ok = _auto_switch_enqueue_publish(
+    op_id = _auto_switch_enqueue_publish(
         owner_username,
         alias,
         device_id,
@@ -3989,14 +4456,16 @@ def _auto_switch_maybe_enqueue_publish(
         slot_key,
         pub_minute,
     )
-    if ok:
+    if op_id:
         with store.lock:
-            store.auto_switch_publish_done_keys[bucket_key] = publish_done_key
+            store.auto_switch_publish_inflight_keys[bucket_key] = _auto_switch_publish_inflight_value(
+                slot_key, op_id
+            )
         persist_runtime_state()
         _auto_switch_log(
             f"已下发自动发作品 | owner={owner_username} alias={alias} slot={slot_key} "
             f"time={_format_beijing_minute(pub_minute)} video_count={video_count} "
-            f"publish_count={publish_count} account={str(target_row.get('username') or '')}"
+            f"publish_count={publish_count} account={str(target_row.get('username') or '')} op_id={op_id}"
         )
 
 
@@ -4018,6 +4487,8 @@ def _auto_switch_enqueue_cut_switch(
         return False
     if source_ri < 0 or target_ri < 0 or source_ri == target_ri:
         return False
+
+    _apply_cut_switch_highlight_intent(owner_username, target_ri)
 
     target_backup = str(target_row.get("backup_name") or "").strip()
     can_restore = bool(target_backup and target_backup != "-")
@@ -4051,6 +4522,7 @@ def _auto_switch_enqueue_cut_switch(
         backup_payload["previous_backup_path"] = prev_path
     if can_restore:
         backup_payload["cut_switch_after_backup"] = "clear_source_for_restore"
+        backup_payload["cut_switch_target_row_index"] = target_ri
     else:
         backup_payload["cut_switch_after_backup"] = "exclusive_activate_target"
         backup_payload["cut_switch_target_row_index"] = target_ri
@@ -6912,6 +7384,8 @@ def pull_username(
 
     if promoted:
         _persist_client_device_to_db(device_id)
+        with store.lock:
+            store.device_pull_rounds[device_id] = 0
 
     # 设备 owner 的运行配置（含模板合并/共享模板）应与 get_config 一致；
     # pull_username 用它来决定 pull_batch_size、休息前批次数与休息策略。
@@ -6959,14 +7433,22 @@ def pull_username(
     # 最短、最长均为 0：关闭休息（仍按批次数清零轮次，但不返回 code=2）
     rest_enabled = not (break_min_cfg == 0 and break_max_cfg == 0)
 
-    # ——按“拉取批次”触发休息：已完成 N 次成功拉取后，下一次拉取直接返回休息（不查库）——
+    account_logged_in = False
+    conn_login = _get_db()
+    try:
+        acct_row = _fetch_device_assigned_account_row(conn_login, device.owner_username, alias)
+        account_logged_in = bool(int((acct_row or {}).get("is_login") or 0))
+    finally:
+        conn_login.close()
+
+    # ——按“拉取批次”触发休息：已完成 N 次有效拉取后，下一次拉取直接返回休息（不查库）——
     with store.lock:
         rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
         batch_threshold_met = rounds >= batches_before_rest
         if batch_threshold_met:
             store.device_pull_rounds[device_id] = 0
 
-    if batch_threshold_met and rest_enabled:
+    if batch_threshold_met and rest_enabled and account_logged_in:
         bmin = max(0, min(break_min_cfg, 24 * 60))
         bmax = max(0, min(break_max_cfg, 24 * 60))
         bmin = max(1, bmin)
@@ -6981,10 +7463,11 @@ def pull_username(
             "force_stop_tiktok": True,
         }
 
-    def _finish_pull_username_response(payload: dict) -> dict:
-        """仅在本次拉取已成功完成 DB 读写后累计休息批次数（避免 500 虚增轮次）。"""
-        with store.lock:
-            store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
+    def _finish_pull_username_response(payload: dict, *, count_round: bool = False) -> dict:
+        """仅在本次拉取返回有效用户名后累计休息批次数（空拉取/未登录不计入）。"""
+        if count_round and account_logged_in:
+            with store.lock:
+                store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
         return payload
 
     consumed_mobile_pending = False
@@ -7002,7 +7485,7 @@ def pull_username(
             ).fetchall()
             selected = [r[0] for r in rows]
             if not selected:
-                return _finish_pull_username_response({"code": 1, "msg": "暂无主播访问数据"})
+                return {"code": 1, "msg": "暂无主播访问数据"}
             current_time = now_text()
             for username in selected:
                 conn.execute(
@@ -7018,7 +7501,7 @@ def pull_username(
             selected_rowids = [r[0] for r in rows]
             selected = [r[1] for r in rows]
             if not selected:
-                return _finish_pull_username_response({"code": 1, "msg": "暂无直客访问数据（follower_queue为空）"})
+                return {"code": 1, "msg": "暂无直客访问数据（follower_queue为空）"}
             consumed_at = now_text()
             conn.executemany(
                 "UPDATE follower_queue SET consume_status = 'sent', consumed_at = ?, consumed_mode = 'direct', consumed_by = ? WHERE rowid = ?",
@@ -7032,7 +7515,7 @@ def pull_username(
                 (safe_count,),
             ).fetchall()
             if not rows:
-                return _finish_pull_username_response({"code": 1, "msg": "暂无待执行的用户名"})
+                return {"code": 1, "msg": "暂无待执行的用户名"}
 
             selected_ids = [r[0] for r in rows]
             selected = [r[1] for r in rows]
@@ -7047,7 +7530,7 @@ def pull_username(
         conn.close()
 
     print(f"[{now_text()}] 设备别名：{alias} | 拉取用户名：{selected}")
-    return _finish_pull_username_response({"code": 0, "usernames": selected})
+    return _finish_pull_username_response({"code": 0, "usernames": selected}, count_round=True)
 
 
 @app.post("/api/report_mutual_copied_username")
@@ -7638,7 +8121,7 @@ def device_ops_report(payload: DeviceOpReportRequest):
             _pe_parts_ok = bool(_pe_p1) and bool(_pe_p2)
         else:
             _pe_parts_ok = _pe_ok
-        if _pe_op and _pe_ok and _pe_parts_ok:
+        if _pe_op and _pe_ok and _pe_parts_ok and not bool(data.get("skip_account_db_update")):
             owner_u = str(device.owner_username or "").strip()
             alias_key = _normalize_alias_key(payload.alias)
             if owner_u and alias_key:
@@ -7740,16 +8223,24 @@ def device_ops_report(payload: DeviceOpReportRequest):
             payload.alias or "",
             reason=f"op={op_type_reported} status={payload.status}",
         )
-    if payload.status == "success" and isinstance(data, dict):
-        owner_u = str(device.owner_username or "").strip()
+    owner_u = str(device.owner_username or "").strip()
+    if isinstance(data, dict) and owner_u:
+        _auto_switch_apply_publish_outcome_report(
+            owner_u,
+            payload.alias or "",
+            payload.status or "",
+            data,
+        )
         op_type = op_type_reported
-        if owner_u:
+        if payload.status == "success":
             if op_type in ("tiktok_backup_and_clear", "tiktok_clear"):
                 _device_ops_apply_cut_switch_after_backup(owner_u, data)
                 # 切号后自动登录与恢复涨粉由设备端 finishCutSwitchAfterSuccess 统一处理，
                 # 避免云端过早 pending_start 导致涨粉与自动登录并发。
             elif op_type == "tiktok_restore":
                 _device_ops_apply_cut_switch_after_restore(owner_u, data)
+        elif op_type == "tiktok_restore":
+            _device_ops_apply_restore_failure(owner_u, data)
 
     with store.lock:
         dev = store.devices.get(payload.device_id)
@@ -7873,6 +8364,9 @@ def _resume_device_for_cloud_op(device_id: str, log_line: str) -> None:
 
 
 def _enqueue_tiktok_device_op(device_id: str, op_type: str, payload: dict[str, Any]) -> str:
+    allowed_during_batch_stream = {"batch_stream_stop", "batch_stream_start"}
+    if _batch_stream_device_in_active(device_id) and op_type not in allowed_during_batch_stream:
+        raise HTTPException(status_code=409, detail=f"设备正在批量带流中，暂不可下发 {op_type}")
     op_id = f"op_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     _enqueue_device_op(
         device_id,
@@ -7914,6 +8408,16 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
     if payload.cut_switch_target_row_index is not None and int(payload.cut_switch_target_row_index) >= 0:
         op_payload["cut_switch_target_row_index"] = int(payload.cut_switch_target_row_index)
 
+    session = _current_session({"authorization": authorization} if authorization else {})
+    owner_username = str((session or {}).get("username") or "").strip()
+    highlight_applied = False
+    if owner_username:
+        highlight_applied = _maybe_apply_cut_switch_highlight_on_enqueue(
+            owner_username,
+            cs,
+            payload.cut_switch_target_row_index,
+        )
+
     _resume_device_for_cloud_op(
         payload.device_id,
         f"[{now_text()}] 云端后台 | 已入队清理 TikTok 任务，等待设备拉取（alias={payload.alias}）",
@@ -7929,6 +8433,7 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
         "code": 0,
         "msg": "已下发设备端任务：单独清理 TikTok 数据",
         "op_id": op_id,
+        "switch_highlight_applied": highlight_applied,
     }
 
 
@@ -7976,6 +8481,14 @@ def admin_device_tiktok_backup_and_clear(payload: DeviceTikTokBackupClearRequest
     if payload.cut_switch_target_row_index is not None and int(payload.cut_switch_target_row_index) >= 0:
         op_payload["cut_switch_target_row_index"] = int(payload.cut_switch_target_row_index)
 
+    highlight_applied = False
+    if owner_username:
+        highlight_applied = _maybe_apply_cut_switch_highlight_on_enqueue(
+            owner_username,
+            cs,
+            payload.cut_switch_target_row_index,
+        )
+
     _resume_device_for_cloud_op(
         payload.device_id,
         f"[{now_text()}] 云端后台 | 已入队备份并清理/切号任务，等待设备拉取（alias={payload.alias}）",
@@ -7995,6 +8508,7 @@ def admin_device_tiktok_backup_and_clear(payload: DeviceTikTokBackupClearRequest
         "msg": "已下发设备端任务：备份并一键清理 TikTok（已自动关闭该设备自动开启程序）" if auto_start_disabled else "已下发设备端任务：备份并一键清理 TikTok",
         "op_id": op_id,
         "auto_start_opt_out": True if auto_start_disabled else bool(getattr(_device, "auto_start_opt_out", False)),
+        "switch_highlight_applied": highlight_applied,
     }
 
 
@@ -8231,6 +8745,9 @@ def export_device_editor_backup_rows(authorization: str | None = Header(default=
         return err
     conn = _get_db()
     try:
+        owner = str(session["username"] or "").strip()
+        _reconcile_editor_alias_bindings(conn, owner)
+        conn.commit()
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at
@@ -8238,7 +8755,7 @@ def export_device_editor_backup_rows(authorization: str | None = Header(default=
             WHERE owner_username = ?
             ORDER BY row_index ASC
             """,
-            (session["username"],),
+            (owner,),
         ).fetchall()
         return {"code": 0, "items": [dict(r) for r in rows]}
     finally:
@@ -8492,6 +9009,9 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
         return {"code": 401, "msg": "请先登录"}
     conn = _get_db()
     try:
+        owner = str(session["username"] or "").strip()
+        _reconcile_editor_alias_bindings(conn, owner)
+        conn.commit()
         rows = conn.execute(
             """
             SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
@@ -8499,7 +9019,7 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
             WHERE owner_username = ?
             ORDER BY row_index ASC
             """,
-            (session["username"],),
+            (owner,),
         ).fetchall()
         return {"code": 0, "items": [dict(r) for r in rows]}
     finally:
@@ -8766,7 +9286,7 @@ def list_device_editor_rows(
         pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
         if pruned:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
-        _sync_account_aliases_to_device_rows(conn, owner)
+        _reconcile_editor_alias_bindings(conn, owner)
         if pruned:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
@@ -8803,7 +9323,7 @@ def list_device_editor_rows(
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
             f"""
-            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, video_count, follower_count, follower_growth, updated_at
+            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
             WHERE owner_username = ? AND {alias_expr} IN ({placeholders}){search_sql}
             ORDER BY {alias_expr} ASC, row_index ASC
@@ -9456,7 +9976,13 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
     conn = _get_db()
     try:
         now = now_text()
+        owner = str(session["username"] or "").strip()
+        row_index = int(payload.row_index)
+        device_alias = payload.device_alias.strip()
+        username = payload.username.strip()
         assigned_alias = _blank_if_none(payload.assigned_alias)
+        if not assigned_alias and device_alias:
+            assigned_alias = device_alias
         if assigned_alias:
             alias_row = conn.execute(
                 """
@@ -9465,8 +9991,21 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 WHERE owner_username = ? AND TRIM(assigned_alias) = TRIM(?)
                 LIMIT 1
                 """,
-                (session["username"], assigned_alias),
+                (owner, assigned_alias),
             ).fetchone()
+            if not alias_row and username:
+                _sync_account_assigned_alias_for_username(
+                    conn, owner, username, assigned_alias, only_if_empty=True
+                )
+                alias_row = conn.execute(
+                    """
+                    SELECT username
+                    FROM account_editor_rows
+                    WHERE owner_username = ? AND TRIM(assigned_alias) = TRIM(?)
+                    LIMIT 1
+                    """,
+                    (owner, assigned_alias),
+                ).fetchone()
             if not alias_row:
                 return {"code": 1, "msg": f"别名「{assigned_alias}」尚未在账号表单中分配，不能写入设备档案"}
 
@@ -9482,7 +10021,12 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 ip = excluded.ip,
                 region = excluded.region,
                 username = excluded.username,
-                assigned_alias = excluded.assigned_alias,
+                assigned_alias = CASE
+                    WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
+                    WHEN TRIM(device_editor_rows.assigned_alias) <> '' THEN device_editor_rows.assigned_alias
+                    WHEN TRIM(excluded.device_alias) <> '' THEN excluded.device_alias
+                    ELSE device_editor_rows.assigned_alias
+                END,
                 backup_path = excluded.backup_path,
                 backup_name = excluded.backup_name,
                 backup_time = excluded.backup_time,
@@ -9492,13 +10036,13 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 updated_at = excluded.updated_at
             """,
             (
-                session["username"],
-                int(payload.row_index),
-                payload.device_alias.strip(),
+                owner,
+                row_index,
+                device_alias,
                 payload.device_id.strip(),
                 payload.ip.strip(),
                 payload.region.strip(),
-                payload.username.strip(),
+                username,
                 assigned_alias,
                 payload.backup_path.strip(),
                 payload.backup_name.strip(),
@@ -9509,7 +10053,22 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 now,
             ),
         )
-        _ensure_device_editor_switch_highlight_invariants(conn, str(session["username"] or "").strip())
+        effective_alias = assigned_alias or device_alias
+        if username and effective_alias:
+            _sync_account_assigned_alias_for_username(
+                conn, owner, username, effective_alias, only_if_empty=True
+            )
+            conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET assigned_alias = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                  AND TRIM(COALESCE(assigned_alias, '')) = ''
+                  AND TRIM(?) <> ''
+                """,
+                (effective_alias, now, owner, row_index, effective_alias),
+            )
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         return {"code": 0, "msg": "设备记录已保存", "row_index": payload.row_index}
     finally:
@@ -9652,6 +10211,16 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
         return {"code": 401, "msg": "请先登录"}
 
     backup_name = Path(payload.backup_name).name
+    owner = str(session["username"] or "").strip()
+    cut_target_ri = (
+        int(payload.cut_switch_target_row_index)
+        if payload.cut_switch_target_row_index is not None and int(payload.cut_switch_target_row_index) >= 0
+        else -1
+    )
+    highlight_applied = False
+    if owner and cut_target_ri >= 0:
+        highlight_applied = _apply_cut_switch_highlight_intent(owner, cut_target_ri)
+
     conn = _get_db()
     try:
         row = conn.execute(
@@ -9665,6 +10234,8 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
             (backup_name, session["username"]),
         ).fetchone()
         record_row_index = int(row[0]) if row else -1
+        if record_row_index < 0 and cut_target_ri >= 0:
+            record_row_index = cut_target_ri
         backup_path = str(row[1] or "").strip() if row else ""
         record_username = str(row[2] or "").strip() if row else ""
         record_mobile_alias = str(row[3] or "").strip() if row else ""
@@ -9674,6 +10245,14 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
         record_new_follower_count = None
     finally:
         conn.close()
+
+    if owner and record_row_index >= 0 and cut_target_ri < 0:
+        conn = _get_db()
+        try:
+            _db_set_env_status(conn, owner, record_row_index, ENV_STATUS_PENDING, now_text())
+            conn.commit()
+        finally:
+            conn.close()
 
     op_id = f"op_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     restore_payload: dict[str, Any] = {
@@ -9719,7 +10298,379 @@ def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorizati
         "backup_path": backup_path or backup_name,
         "record_username": record_username,
         "record_mobile_alias": record_mobile_alias,
+        "switch_highlight_applied": highlight_applied,
     }
+
+
+def _batch_stream_normalize_header_cell(value: object | None) -> str:
+    text = _xlsx_cell_str(value).lower().replace(" ", "").replace("_", "")
+    return text
+
+
+def _batch_stream_match_header_key(header_cell: str) -> str | None:
+    norm = _batch_stream_normalize_header_cell(header_cell)
+    if not norm:
+        return None
+    for key, aliases in BATCH_STREAM_HEADER_ALIASES.items():
+        for alias in aliases:
+            alias_norm = alias.lower().replace(" ", "").replace("_", "")
+            if norm == alias_norm:
+                return key
+    return None
+
+
+def _batch_stream_parse_workbook(file_path: Path) -> tuple[Dict[str, int], int, List[Dict[str, Any]]]:
+    if load_workbook is None:
+        raise RuntimeError("缺少 openpyxl 依赖，无法解析 xlsx")
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            raise ValueError("Excel 首行表头为空")
+        header_map: Dict[str, int] = {}
+        status_col = -1
+        for idx, cell in enumerate(header_row):
+            key = _batch_stream_match_header_key(_xlsx_cell_str(cell))
+            if key and key not in header_map:
+                header_map[key] = idx
+            elif not _xlsx_cell_str(cell) and status_col < 0:
+                status_col = idx
+        required = ("username", "password", "email", "email_password", "api", "assigned_alias")
+        missing = [k for k in required if k not in header_map]
+        if missing:
+            raise ValueError(f"Excel 缺少必要列：{', '.join(missing)}")
+        if status_col < 0:
+            status_col = max(header_map.values()) + 1
+        rows: List[Dict[str, Any]] = []
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row:
+                continue
+            alias_idx = header_map["assigned_alias"]
+            alias_val = _xlsx_cell_str(row[alias_idx] if alias_idx < len(row) else "")
+            username_val = _xlsx_cell_str(row[header_map["username"]] if header_map["username"] < len(row) else "")
+            if not alias_val and not username_val:
+                continue
+            item = {
+                "sheet_row": row_idx,
+                "username": username_val,
+                "password": _xlsx_cell_str(row[header_map["password"]] if header_map["password"] < len(row) else ""),
+                "email": _xlsx_cell_str(row[header_map["email"]] if header_map["email"] < len(row) else ""),
+                "email_password": _xlsx_cell_str(
+                    row[header_map["email_password"]] if header_map["email_password"] < len(row) else ""
+                ),
+                "api": _xlsx_cell_str(row[header_map["api"]] if header_map["api"] < len(row) else ""),
+                "assigned_alias": alias_val,
+                "status": _xlsx_cell_str(row[status_col] if status_col < len(row) else ""),
+            }
+            rows.append(item)
+        return header_map, status_col, rows
+    finally:
+        wb.close()
+
+
+def _batch_stream_rows_for_alias(session: Dict[str, Any], alias: str) -> List[Dict[str, Any]]:
+    alias_key = _normalize_alias_key(alias)
+    out: List[Dict[str, Any]] = []
+    for row in session.get("rows") or []:
+        row_alias = _normalize_alias_key(str(row.get("assigned_alias") or ""))
+        if row_alias != alias_key:
+            continue
+        if str(row.get("status") or "").strip():
+            continue
+        out.append(row)
+    return out
+
+
+def _batch_stream_write_status(file_path: Path, sheet_row: int, status_col: int, status_text: str) -> None:
+    if load_workbook is None:
+        raise RuntimeError("缺少 openpyxl 依赖，无法写入 xlsx")
+    wb = load_workbook(file_path)
+    try:
+        ws = wb.worksheets[0]
+        ws.cell(row=sheet_row, column=status_col + 1, value=status_text)
+        wb.save(file_path)
+    finally:
+        wb.close()
+
+
+def _batch_stream_get_session(session_id: str, owner: str = "") -> Dict[str, Any] | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    with _batch_stream_session_lock:
+        session = _batch_stream_sessions.get(sid)
+        if not session:
+            return None
+        if owner and str(session.get("owner") or "").strip() != owner:
+            return None
+        return session
+
+
+def _batch_stream_device_in_active(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    with _batch_stream_session_lock:
+        return did in _batch_stream_device_active
+
+
+def _batch_stream_format_status_text(hours_active: float) -> str:
+    now_bj = datetime.now(BEIJING_TZ)
+    month = now_bj.month
+    day = now_bj.day
+    hours_text = str(int(hours_active)) if float(hours_active).is_integer() else f"{hours_active:.1f}".rstrip("0").rstrip(".")
+    return f"{month}月{day}日已活跃{hours_text}小时"
+
+
+@app.post("/api/admin/batch_stream/upload")
+async def admin_batch_stream_upload(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法处理 xlsx"}
+    owner = str(session.get("username") or "").strip()
+    filename = str(file.filename or "").strip()
+    if not filename.lower().endswith(".xlsx"):
+        return {"code": 1, "msg": "请上传 .xlsx 文件"}
+    session_id = f"bs_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    owner_dir = (BATCH_STREAM_DIR / re.sub(r"[^\w\-.@]+", "_", owner or "unknown")).resolve()
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    dest = owner_dir / f"{session_id}.xlsx"
+    try:
+        content = await file.read()
+        dest.write_bytes(content)
+        header_map, status_col, rows = _batch_stream_parse_workbook(dest)
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            dest.unlink(missing_ok=True)
+        return {"code": 1, "msg": f"解析 Excel 失败：{exc}"}
+    with _batch_stream_session_lock:
+        _batch_stream_sessions[session_id] = {
+            "session_id": session_id,
+            "owner": owner,
+            "file_path": str(dest),
+            "status_col": status_col,
+            "header_map": header_map,
+            "rows": rows,
+            "created_at": now_text(),
+            "devices": {},
+        }
+    alias_counts: Dict[str, int] = {}
+    for row in rows:
+        ak = _normalize_alias_key(str(row.get("assigned_alias") or ""))
+        if ak:
+            alias_counts[ak] = alias_counts.get(ak, 0) + 1
+    return {
+        "code": 0,
+        "msg": "Excel 已上传",
+        "session_id": session_id,
+        "row_count": len(rows),
+        "alias_counts": alias_counts,
+        "status_column_index": status_col,
+    }
+
+
+@app.get("/api/admin/batch_stream/status")
+def admin_batch_stream_status(session_id: str, authorization: str | None = Header(default=None)):
+    err, session_login = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session_login.get("username") or "").strip()
+    session = _batch_stream_get_session(session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "会话不存在或无权访问"}
+    devices = session.get("devices") or {}
+    pending_by_alias: Dict[str, int] = {}
+    done_by_alias: Dict[str, int] = {}
+    alias_key = ""
+    for row in session.get("rows") or []:
+        ak = _normalize_alias_key(str(row.get("assigned_alias") or ""))
+        if not ak:
+            continue
+        if str(row.get("status") or "").strip():
+            done_by_alias[ak] = done_by_alias.get(ak, 0) + 1
+        else:
+            pending_by_alias[ak] = pending_by_alias.get(ak, 0) + 1
+    return {
+        "code": 0,
+        "msg": "ok",
+        "session_id": session_id,
+        "created_at": session.get("created_at"),
+        "row_count": len(session.get("rows") or []),
+        "devices": devices,
+        "pending_by_alias": pending_by_alias,
+        "done_by_alias": done_by_alias,
+    }
+
+
+@app.get("/api/admin/batch_stream/download/{session_id}")
+def admin_batch_stream_download(session_id: str, authorization: str | None = Header(default=None)):
+    err, session_login = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session_login.get("username") or "").strip()
+    session = _batch_stream_get_session(session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "会话不存在或无权访问"}
+    file_path = Path(str(session.get("file_path") or ""))
+    if not file_path.is_file():
+        return {"code": 1, "msg": "会话文件不存在"}
+    return FileResponse(
+        path=file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"batch_stream_{session_id}.xlsx",
+    )
+
+
+@app.post("/api/admin/batch_stream/start")
+def admin_batch_stream_start(payload: BatchStreamStartRequest, authorization: str | None = Header(default=None)):
+    err, device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    if err:
+        return err
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    session = _batch_stream_get_session(payload.session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "批量带流会话不存在或无权访问"}
+    if _batch_stream_device_in_active(payload.device_id):
+        return {"code": 1, "msg": "该设备已在批量带流中，请先停止"}
+    rows = _batch_stream_rows_for_alias(session, payload.alias)
+    if not rows:
+        return {"code": 1, "msg": f"Excel 中未找到别名「{payload.alias}」的待处理行（或均已写入活跃记录）"}
+    hours = float(payload.hours_per_account)
+    op_payload: dict[str, Any] = {
+        "device_id": payload.device_id,
+        "alias": payload.alias,
+        "package_name": payload.package_name.strip() or TIKTOK_PACKAGE_NAME,
+        "session_id": payload.session_id,
+        "hours_per_account": hours,
+        "status_column": int(session.get("status_col") or 0),
+        "rows": [
+            {
+                "sheet_row": int(r.get("sheet_row") or 0),
+                "username": str(r.get("username") or "").strip(),
+                "password": str(r.get("password") or "").strip(),
+                "email": str(r.get("email") or "").strip(),
+                "email_password": str(r.get("email_password") or "").strip(),
+                "api": str(r.get("api") or "").strip(),
+            }
+            for r in rows
+        ],
+    }
+    with _batch_stream_session_lock:
+        _batch_stream_device_active[payload.device_id] = payload.session_id
+        dev_state = session.setdefault("devices", {})
+        dev_state[payload.device_id] = {
+            "alias": payload.alias,
+            "status": "running",
+            "hours_per_account": hours,
+            "started_at": now_text(),
+            "total_rows": len(rows),
+            "completed_rows": 0,
+            "stop_requested": False,
+        }
+    auto_start_disabled = False
+    with store.lock:
+        dev = store.devices.get(payload.device_id)
+        if dev and not dev.auto_start_opt_out:
+            dev.auto_start_opt_out = True
+            auto_start_disabled = True
+    if auto_start_disabled:
+        _persist_client_device_to_db(payload.device_id)
+        _append_device_log(payload.device_id, "批量带流：云端已自动关闭该设备的自动开启程序")
+    _resume_device_for_cloud_op(
+        payload.device_id,
+        f"[{now_text()}] 云端后台 | 已入队批量带流任务（alias={payload.alias} rows={len(rows)} hours={hours}）",
+    )
+    op_id = _enqueue_tiktok_device_op(payload.device_id, "batch_stream_start", op_payload)
+    _append_device_log(
+        payload.device_id,
+        f"[{now_text()}] 批量带流已入队 op_id={op_id} session={payload.session_id} rows={len(rows)}",
+    )
+    return {
+        "code": 0,
+        "msg": f"已下发批量带流：{len(rows)} 个账号，每台活跃 {hours} 小时",
+        "op_id": op_id,
+        "session_id": payload.session_id,
+        "row_count": len(rows),
+    }
+
+
+@app.post("/api/admin/batch_stream/stop")
+def admin_batch_stream_stop(payload: BatchStreamStopRequest, authorization: str | None = Header(default=None)):
+    err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    if err:
+        return err
+    session_id = ""
+    with _batch_stream_session_lock:
+        session_id = str(_batch_stream_device_active.get(payload.device_id) or "")
+        if session_id:
+            session = _batch_stream_sessions.get(session_id)
+            if session:
+                dev_state = (session.get("devices") or {}).get(payload.device_id) or {}
+                dev_state["stop_requested"] = True
+                dev_state["status"] = "stopping"
+                session.setdefault("devices", {})[payload.device_id] = dev_state
+    op_id = _enqueue_tiktok_device_op(
+        payload.device_id,
+        "batch_stream_stop",
+        {"device_id": payload.device_id, "alias": payload.alias, "session_id": session_id},
+    )
+    _append_device_log(payload.device_id, f"[{now_text()}] 批量带流停止指令已入队 op_id={op_id}")
+    return {"code": 0, "msg": "已下发停止批量带流指令", "op_id": op_id, "session_id": session_id}
+
+
+@app.post("/api/device/batch_stream/report_row")
+def device_batch_stream_report_row(payload: BatchStreamReportRowRequest):
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    session = _batch_stream_get_session(payload.session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "批量带流会话不存在"}
+    status_text = str(payload.status_text or "").strip() or _batch_stream_format_status_text(payload.hours_active)
+    file_path = Path(str(session.get("file_path") or ""))
+    status_col = int(session.get("status_col") or 0)
+    try:
+        _batch_stream_write_status(file_path, int(payload.sheet_row), status_col, status_text)
+    except Exception as exc:
+        return {"code": 1, "msg": f"写入 Excel 失败：{exc}"}
+    with _batch_stream_session_lock:
+        for row in session.get("rows") or []:
+            if int(row.get("sheet_row") or 0) == int(payload.sheet_row):
+                row["status"] = status_text
+                break
+        dev_state = (session.get("devices") or {}).get(payload.device_id) or {}
+        dev_state["completed_rows"] = int(dev_state.get("completed_rows") or 0) + 1
+        session.setdefault("devices", {})[payload.device_id] = dev_state
+    _append_device_log(
+        payload.device_id,
+        f"[{now_text()}] 批量带流 | 行 {payload.sheet_row} 已写入 Excel：{status_text}",
+    )
+    return {"code": 0, "msg": "已写入 Excel", "status_text": status_text}
+
+
+@app.post("/api/device/batch_stream/complete")
+def device_batch_stream_complete(payload: BatchStreamStopRequest):
+    error, _device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    with _batch_stream_session_lock:
+        session_id = str(_batch_stream_device_active.pop(payload.device_id, "") or "")
+        if session_id:
+            session = _batch_stream_sessions.get(session_id)
+            if session:
+                dev_state = (session.get("devices") or {}).get(payload.device_id) or {}
+                dev_state["status"] = "done"
+                dev_state["finished_at"] = now_text()
+                session.setdefault("devices", {})[payload.device_id] = dev_state
+    _append_device_log(payload.device_id, f"[{now_text()}] 批量带流已全部完成，设备已退出带流模式")
+    return {"code": 0, "msg": "批量带流已结束", "session_id": session_id}
 
 
 def _gallery_library_owner_dir(owner: str) -> Path:
@@ -9947,6 +10898,236 @@ def admin_gallery_library_file(
     media_type = str(meta.get("content_type") or "image/jpeg")
     filename = str(meta.get("filename") or file_path.name)
     return FileResponse(path=str(file_path), media_type=media_type, filename=filename)
+
+
+def _failure_reports_index_path() -> Path:
+    return FAILURE_REPORTS_DIR / FAILURE_REPORTS_INDEX_FILENAME
+
+
+def _failure_reports_read_index() -> list[dict[str, Any]]:
+    path = _failure_reports_index_path()
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [it for it in raw if isinstance(it, dict)]
+
+
+def _failure_reports_write_index(items: list[dict[str, Any]]) -> None:
+    path = _failure_reports_index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _failure_reports_dedup_key(owner: str, alias: str, business: str, error_type: str) -> str:
+    parts = [
+        str(owner or "").strip().lower(),
+        _normalize_alias_key(alias),
+        str(business or "").strip().lower(),
+        str(error_type or "").strip().lower(),
+    ]
+    return "|".join(parts)
+
+
+def _failure_reports_zip_path(report_id: str) -> Path | None:
+    rid = str(report_id or "").strip()
+    if not rid or not re.fullmatch(r"[0-9a-f]{32}", rid):
+        return None
+    return FAILURE_REPORTS_DIR / f"{rid}.zip"
+
+
+def _failure_reports_find_duplicate(
+    items: list[dict[str, Any]],
+    dedup_key: str,
+) -> dict[str, Any] | None:
+    key = str(dedup_key or "").strip()
+    if not key:
+        return None
+    for item in items:
+        if str(item.get("dedup_key") or "").strip() == key:
+            return item
+    return None
+
+
+def _failure_reports_visible_items(_session: dict) -> list[dict[str, Any]]:
+    return _failure_reports_read_index()
+
+
+@app.post("/api/failure_reports/upload")
+async def device_failure_reports_upload(
+    device_id: str = Form(...),
+    alias: str = Form(...),
+    business: str = Form(...),
+    error_type: str = Form(...),
+    summary: str = Form(default=""),
+    ocr_related: str = Form(default="false"),
+    file: UploadFile = File(...),
+):
+    """设备端上报失败采集压缩包（日志 + 可选 OCR 截图）。"""
+    did = str(device_id or "").strip()
+    al = str(alias or "").strip()
+    biz = str(business or "").strip()
+    err_type = str(error_type or "").strip()
+    if not did or not al or not biz or not err_type:
+        return {"code": 1, "msg": "device_id、alias、business、error_type 不能为空"}
+    auth_err, device = auth_or_error(did, al)
+    if auth_err:
+        return auth_err
+    owner = str(device.owner_username or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联用户，无法上报失败采集"}
+
+    raw = await file.read()
+    if not raw:
+        return {"code": 1, "msg": "压缩包为空"}
+    max_zip_size = 25 * 1024 * 1024
+    if len(raw) > max_zip_size:
+        return {"code": 1, "msg": "压缩包超过 25MB 上限"}
+
+    dedup_key = _failure_reports_dedup_key(owner, al, biz, err_type)
+    report_id = uuid.uuid4().hex
+    zip_path = _failure_reports_zip_path(report_id)
+    if not zip_path:
+        return {"code": 1, "msg": "生成报告 ID 失败"}
+
+    with _failure_reports_lock:
+        items = _failure_reports_read_index()
+        if _failure_reports_find_duplicate(items, dedup_key):
+            return {"code": 2, "msg": "相同业务相同失败类型已上报，跳过", "dedup_key": dedup_key}
+        if len(items) >= FAILURE_REPORTS_MAX_ITEMS:
+            return {
+                "code": 3,
+                "msg": f"云端失败采集已满（最多 {FAILURE_REPORTS_MAX_ITEMS} 条），请处理后再上传",
+                "count": len(items),
+                "max_items": FAILURE_REPORTS_MAX_ITEMS,
+            }
+        zip_path.write_bytes(raw)
+        entry = {
+            "id": report_id,
+            "owner_username": owner,
+            "device_id": did,
+            "alias": al,
+            "business": biz,
+            "error_type": err_type,
+            "summary": str(summary or "").strip()[:2000],
+            "ocr_related": str(ocr_related or "").strip().lower() in ("1", "true", "yes", "on"),
+            "dedup_key": dedup_key,
+            "filename": (file.filename or f"{report_id}.zip").replace("\x00", "").strip() or f"{report_id}.zip",
+            "size": len(raw),
+            "created_at": now_text(),
+        }
+        items.append(entry)
+        _failure_reports_write_index(items)
+
+    _append_device_log(did, f"[失败采集] 已上传 business={biz} error_type={err_type}")
+    return {
+        "code": 0,
+        "msg": "失败采集已上传",
+        "report_id": report_id,
+        "count": len(items),
+        "max_items": FAILURE_REPORTS_MAX_ITEMS,
+    }
+
+
+@app.get("/api/admin/failure_reports")
+def admin_failure_reports_list(
+    owner_username: str = "",
+    alias: str = "",
+    error_type: str = "",
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    items = _failure_reports_visible_items(session)
+    owner_filter = str(owner_username or "").strip()
+    alias_filter = _normalize_alias_key(alias)
+    err_filter = str(error_type or "").strip().lower()
+
+    owners = sorted({str(it.get("owner_username") or "").strip() for it in items if str(it.get("owner_username") or "").strip()})
+    aliases = sorted(
+        {str(it.get("alias") or "").strip() for it in items if str(it.get("alias") or "").strip()},
+        key=lambda x: _normalize_alias_key(x),
+    )
+    error_types = sorted(
+        {str(it.get("error_type") or "").strip() for it in items if str(it.get("error_type") or "").strip()},
+    )
+
+    if owner_filter:
+        items = [it for it in items if str(it.get("owner_username") or "").strip() == owner_filter]
+    if alias_filter:
+        items = [
+            it for it in items if _normalize_alias_key(str(it.get("alias") or "")) == alias_filter
+        ]
+    if err_filter:
+        items = [it for it in items if str(it.get("error_type") or "").strip().lower() == err_filter]
+    items.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    grouped: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+    for it in items:
+        o = str(it.get("owner_username") or "").strip() or "-"
+        a = str(it.get("alias") or "").strip() or "-"
+        e = str(it.get("error_type") or "").strip() or "-"
+        grouped.setdefault(o, {}).setdefault(a, {}).setdefault(e, []).append(it)
+
+    all_items = _failure_reports_read_index()
+    return {
+        "code": 0,
+        "items": items,
+        "grouped": grouped,
+        "count": len(items),
+        "total_count": len(all_items),
+        "max_items": FAILURE_REPORTS_MAX_ITEMS,
+        "owners": owners,
+        "aliases": aliases,
+        "error_types": error_types,
+    }
+
+
+@app.delete("/api/admin/failure_reports/{report_id}")
+def admin_failure_reports_delete(
+    report_id: str,
+    authorization: str | None = Header(default=None),
+):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    rid = str(report_id or "").strip()
+    zip_path = _failure_reports_zip_path(rid)
+    with _failure_reports_lock:
+        items = _failure_reports_read_index()
+        target = next((it for it in items if str(it.get("id") or "").strip() == rid), None)
+        if not target:
+            return {"code": 1, "msg": "失败采集记录不存在"}
+        next_items = [it for it in items if str(it.get("id") or "").strip() != rid]
+        _failure_reports_write_index(next_items)
+    if zip_path and zip_path.is_file():
+        zip_path.unlink(missing_ok=True)
+    return {"code": 0, "msg": "已删除", "count": len(next_items)}
+
+
+@app.get("/api/admin/failure_reports/{report_id}/download")
+def admin_failure_reports_download(
+    report_id: str,
+    authorization: str | None = Header(default=None),
+):
+    err, _session = _require_admin({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    rid = str(report_id or "").strip()
+    items = _failure_reports_read_index()
+    target = next((it for it in items if str(it.get("id") or "").strip() == rid), None)
+    if not target:
+        return {"code": 1, "msg": "失败采集记录不存在"}
+    zip_path = _failure_reports_zip_path(rid)
+    if not zip_path or not zip_path.is_file():
+        return {"code": 1, "msg": "压缩包文件不存在"}
+    filename = str(target.get("filename") or f"{rid}.zip")
+    return FileResponse(path=str(zip_path), media_type="application/zip", filename=filename)
 
 
 @app.post("/api/admin/device_gallery/upload")

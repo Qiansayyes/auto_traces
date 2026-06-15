@@ -3,10 +3,13 @@ package com.autotraces.app
 import android.content.Intent
 import android.content.ContentValues
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
 import java.io.File
 import java.io.IOException
+import java.util.Calendar
+import java.util.TimeZone
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
@@ -66,8 +69,6 @@ object AppCoordinator {
         )
     }
     private val started = AtomicBoolean(false)
-    private const val PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS = 2_000L
-    private const val PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES = 12
 
     private val _config = MutableStateFlow(AppConfig())
     val config = _config.asStateFlow()
@@ -85,6 +86,11 @@ object AppCoordinator {
     private var deviceLogSyncJob: Job? = null
     private var mutualSwitchJob: Job? = null
     private var publishPostSwitchJob: Job? = null
+    private var batchStreamJob: Job? = null
+    @Volatile
+    private var batchStreamStopRequested: Boolean = false
+    @Volatile
+    private var batchStreamGrowthPhase: Boolean = false
     @Volatile
     private var autoLoginActive: Boolean = false
 
@@ -94,7 +100,8 @@ object AppCoordinator {
     /**
      * 云端下发/切换到涨粉模式后，在涨粉拉取循环中执行**一次**登录状态保障（非每轮拉取前）。
      * 登录状态保障 = TikTok 界面 OCR 判定是否可继续；与云端 `is_login` 无关。
-     * 仍保留：切号完成、互点冷启、发作品冷启；已取消：每轮涨粉拉取前、每用户名任务开始、
+     * is_login=否 时仅自动登录（持续重试）；发作品/互点前同样先完成登录。
+     * 仍保留：切号完成、互点/发作品 OCR 掉登录后续登；已取消：每轮涨粉拉取前、每用户名任务开始、
      * 修改基本资料外轮、云端设备指令前。
      */
     @Volatile
@@ -104,11 +111,20 @@ object AppCoordinator {
 
     private fun isMutualSwitchActive(): Boolean = mutualSwitchJob?.isActive == true
 
+    private fun isBatchStreamActive(): Boolean = batchStreamJob?.isActive == true
+
     private fun isAutoLoginActive(): Boolean = autoLoginActive
 
-    /** 发作品、互点切换或切号后自动登录占用 TikTok 时，不启动涨粉拉取循环。 */
-    private fun canStartPullLoopNow(): Boolean =
-        !isAutoLoginActive() && !isPublishPostSwitchActive() && !isMutualSwitchActive()
+    /** 发作品、互点切换、批量带流或切号后自动登录占用 TikTok 时，不启动常规涨粉拉取循环。 */
+    private fun canStartPullLoopNow(): Boolean {
+        if (batchStreamGrowthPhase) {
+            return !isAutoLoginActive()
+        }
+        return !isAutoLoginActive() &&
+            !isPublishPostSwitchActive() &&
+            !isMutualSwitchActive() &&
+            !isBatchStreamActive()
+    }
 
     /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常。 */
     private fun isPullLoopJobCancellation(err: Throwable): Boolean {
@@ -693,6 +709,14 @@ object AppCoordinator {
                 PrefsStore.getLogContextUsername(),
             )
             if (response.code == 2) {
+                if (!isAssignedAccountLoggedIn(alias, deviceId)) {
+                    LogCenter.op(
+                        alias,
+                        "云端要求休息但账号未登录，跳过休息（未执行有效涨粉任务）",
+                    )
+                    updateRuntime(lastMessage = "未登录，跳过休息")
+                    return
+                }
                 val minutes = (response.rest_minutes ?: 0).coerceAtLeast(1)
                 val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
                 LogCenter.op(
@@ -768,6 +792,32 @@ object AppCoordinator {
     private fun logFailedSummaryIfAny(alias: String) {
         if (failedTracker.isEmpty()) return
         LogCenter.op(alias, "近期失败 ${failedTracker.size} 条（详情已记入队列）")
+    }
+
+    /** 运行期业务失败时异步上传失败采集包（同业务同错误类型仅上报一次）。 */
+    private fun scheduleFailureReport(
+        business: String,
+        errorType: String,
+        summary: String,
+        ocrRelated: Boolean? = null,
+    ) {
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isEmpty() || alias.isEmpty()) return
+        scope.launch {
+            runCatching {
+                FailureReportUploader.tryUpload(
+                    deviceId = deviceId,
+                    alias = alias,
+                    business = business.trim(),
+                    errorType = errorType,
+                    summary = summary,
+                    ocrRelated = ocrRelated,
+                )
+            }.onFailure { err ->
+                LogCenter.op(alias, "失败采集上传异常：${err.message}")
+            }
+        }
     }
 
     private fun startDeviceOpsLoop() {
@@ -1092,7 +1142,11 @@ object AppCoordinator {
             return
         }
 
-        pauseGrowthAfterLoginFailure(alias, deviceId, "切号还原失败且自动登录未通过")
+        if (!loginOk) {
+            LogCenter.op(alias, "[OP][$opId] 切号还原失败兜底：自动登录未通过，交由涨粉循环持续重试")
+            forceStartRunningNow("切号还原失败，自动登录重试中")
+            return
+        }
     }
 
     /** 自动/手动切号全流程成功后：恢复自动开启、按需自动登录，再拉起涨粉。 */
@@ -1258,9 +1312,8 @@ object AppCoordinator {
         }.getOrNull()
 
     /**
-     * 涨粉拉取循环门禁：校验云端分配账号；**不在每轮拉取前**做登录状态保障。
+     * 涨粉拉取循环门禁：校验云端分配账号；is_login=否 时持续自动登录重试（不暂停涨粉）。
      * 登录状态保障仅在云端下发/切换到涨粉模式时执行一次（[growthModeLoginSafeguardPending]）。
-     * 这与服务端 `is_login` 无关；单用户任务是否执行见 [handleUsername] 内的 `is_login` 判断。
      */
     private suspend fun ensureAssignedAccountReadyForGrowthPull(
         alias: String,
@@ -1282,6 +1335,11 @@ object AppCoordinator {
         accountResp.username?.trim()?.takeIf { it.isNotBlank() }?.let {
             PrefsStore.setLogContextUsername(it)
         }
+        if (accountResp.is_login != true) {
+            if (!ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "涨粉拉取前")) {
+                return false
+            }
+        }
         if (!growthModeLoginSafeguardPending) {
             return true
         }
@@ -1296,8 +1354,10 @@ object AppCoordinator {
             strict = true,
         )
         if (!safeguardOk) {
-            pauseGrowthAfterLoginFailure(alias, deviceId, "登录状态保障或自动登录失败")
-            return false
+            if (!ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "登录状态保障失败后续登")) {
+                return false
+            }
+            return true
         }
         if (PrefsStore.getLocalStatus() != "running") {
             resumeRunningAfterGrowthAutoLogin(alias, deviceId)
@@ -1306,13 +1366,138 @@ object AppCoordinator {
     }
 
     private suspend fun resumeRunningAfterGrowthAutoLogin(alias: String, deviceId: String) {
+        resumeRunningForCloudTask(alias, deviceId, "自动登录成功，继续涨粉")
+    }
+
+    private suspend fun resumeRunningForCloudTask(alias: String, deviceId: String, reason: String) {
         if (shouldHonorUserHardStop() || manuallyPaused) return
         PrefsStore.saveLocalStatus("running")
-        updateRuntime(localStatus = "running", lastMessage = "自动登录成功，继续涨粉")
+        updateRuntime(localStatus = "running", lastMessage = reason)
         runCatching {
             ApiService.syncStatus(deviceId, alias, "running")
         }.onFailure { err ->
-            LogCenter.op(alias, "涨粉：自动登录后同步 running 失败：${err.message}")
+            LogCenter.op(alias, "同步 running 失败：${err.message}")
+        }
+    }
+
+    private enum class AccountLoginRetryOutcome {
+        LoggedIn,
+        Aborted,
+        /** 自动切号：分配账号已切换，本账号时段结束 */
+        AccountChanged,
+    }
+
+    /**
+     * 云端 is_login=否 时持续重试自动登录。
+     * @param expectedUsername 自动切号场景：分配账号 username 变化时停止重试（等待云端切号）。
+     */
+    private suspend fun ensureAccountLoggedInWithRetry(
+        alias: String,
+        deviceId: String,
+        reason: String,
+        expectedUsername: String? = null,
+        resumeRunningOnSuccess: Boolean = true,
+        forceRelogin: Boolean = false,
+        resumeFromLoginEntryScreen: Boolean = false,
+    ): AccountLoginRetryOutcome {
+        val expected = expectedUsername?.trim()?.takeIf { it.isNotEmpty() }
+        var nextForceRelogin = forceRelogin
+        var nextResumeFromEntry = resumeFromLoginEntryScreen
+        while (true) {
+            if (shouldHonorUserHardStop() || manuallyPaused) {
+                return AccountLoginRetryOutcome.Aborted
+            }
+            if (expected != null) {
+                val current = fetchDeviceAssignedAccount(alias, deviceId)?.username?.trim().orEmpty()
+                if (current.isNotBlank() && !current.equals(expected, ignoreCase = true)) {
+                    LogCenter.op(
+                        alias,
+                        "自动登录重试中止：分配账号已切换（期望=$expected 当前=$current，$reason）",
+                    )
+                    return AccountLoginRetryOutcome.AccountChanged
+                }
+            }
+            if (isAssignedAccountLoggedIn(alias, deviceId) && !nextForceRelogin) {
+                if (resumeRunningOnSuccess) {
+                    resumeRunningForCloudTask(alias, deviceId, "自动登录成功（$reason）")
+                }
+                return AccountLoginRetryOutcome.LoggedIn
+            }
+            LogCenter.op(alias, "云端 is_login=否，尝试自动登录（$reason）")
+            val loginOk = ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = "login_retry_${System.currentTimeMillis()}",
+                reason = reason,
+                strict = true,
+                forceRelogin = nextForceRelogin,
+                resumeFromLoginEntryScreen = nextResumeFromEntry,
+            )
+            if (loginOk) {
+                if (resumeRunningOnSuccess) {
+                    resumeRunningForCloudTask(alias, deviceId, "自动登录成功（$reason）")
+                }
+                return AccountLoginRetryOutcome.LoggedIn
+            }
+            nextForceRelogin = false
+            nextResumeFromEntry = false
+            resumeRunningForCloudTask(alias, deviceId, "自动登录重试中（$reason）")
+            val waitMs = Random.nextLong(15_000L, 30_000L)
+            LogCenter.op(alias, "自动登录失败，${waitMs / 1000} 秒后重试（$reason）")
+            if (!delayUnlessHardStop(waitMs)) {
+                return AccountLoginRetryOutcome.Aborted
+            }
+        }
+    }
+
+    /**
+     * 云端 is_login=否 时持续重试自动登录，不因单次失败暂停涨粉。
+     * @return true 已可继续涨粉；false 硬停、手动暂停或自动切号账号已切换
+     */
+    private suspend fun ensureGrowthAccountLoggedInWithRetry(
+        alias: String,
+        deviceId: String,
+        reason: String,
+    ): Boolean {
+        return when (ensureAccountLoggedInWithRetry(alias, deviceId, reason)) {
+            AccountLoginRetryOutcome.LoggedIn -> true
+            AccountLoginRetryOutcome.AccountChanged -> false
+            AccountLoginRetryOutcome.Aborted -> false
+        }
+    }
+
+    /** 发作品/互点等独占任务前：未登录则先自动登录（含重试），成功后才可执行业务流程。 */
+    private suspend fun ensureLoggedInBeforeExclusiveTask(
+        alias: String,
+        deviceId: String,
+        taskLabel: String,
+        clearPublishOnAccountChange: Boolean = false,
+    ): Boolean {
+        if (isAssignedAccountLoggedIn(alias, deviceId)) {
+            return true
+        }
+        val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+        return when (
+            ensureAccountLoggedInWithRetry(
+                alias = alias,
+                deviceId = deviceId,
+                reason = "${taskLabel}前",
+                expectedUsername = expectedUser,
+            )
+        ) {
+            AccountLoginRetryOutcome.LoggedIn -> true
+            AccountLoginRetryOutcome.AccountChanged -> {
+                LogCenter.op(alias, "$taskLabel：自动切号时段已切换，跳过（is_login 未就绪）")
+                if (clearPublishOnAccountChange) {
+                    PrefsStore.clearPublishPostState()
+                }
+                PrefsStore.clearAutoSwitchPublishContext()
+                false
+            }
+            AccountLoginRetryOutcome.Aborted -> {
+                LogCenter.op(alias, "$taskLabel：自动登录中止，跳过（is_login 未就绪）")
+                false
+            }
         }
     }
 
@@ -1406,6 +1591,26 @@ object AppCoordinator {
             reason = "掉登录恢复($source)",
             strict = true,
             forceRelogin = true,
+        )
+    }
+
+    /**
+     * Account status 弹窗路径会先点 OK 并冷启；Add another account / 登录状态保障路径则直接从当前登录入口续接。
+     */
+    private suspend fun recoverFromSafeguardStyleLogout(alias: String, deviceId: String, source: String): Boolean {
+        LogCenter.op(
+            alias,
+            "掉登录恢复（登录状态保障路径）：终止当前步骤，从登录入口续接自动登录（来源=$source）",
+        )
+        val opId = "safeguard_logout_${System.currentTimeMillis()}"
+        return ensureAccountLoggedIn(
+            alias = alias,
+            deviceId = deviceId,
+            opId = opId,
+            reason = "掉登录恢复($source)",
+            strict = true,
+            forceRelogin = true,
+            resumeFromLoginEntryScreen = true,
         )
     }
 
@@ -1555,7 +1760,110 @@ object AppCoordinator {
 
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
         val opId = op.op_id
+        if (
+            isBatchStreamActive() &&
+            op.op_type !in setOf("batch_stream_stop", "batch_stream_start")
+        ) {
+            LogCenter.op(alias, "[OP][$opId] 批量带流进行中，已屏蔽 ${op.op_type}")
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "failed",
+                message = "设备正在批量带流，暂不接受其它指令",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "blocked_by_batch_stream" to true,
+                ),
+            )
+            return
+        }
         val payload = op.payload
+        if (op.op_type == "batch_stream_start") {
+            val sessionId = payload?.session_id?.trim().orEmpty()
+            val hours = payload?.hours_per_account ?: 0.0
+            val rows = payload?.rows.orEmpty()
+            val pkg = payload?.package_name?.trim().orEmpty()
+                .ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
+            if (sessionId.isBlank() || hours <= 0.0 || rows.isEmpty()) {
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = "failed",
+                    message = "批量带流参数无效（session/时长/行数据）",
+                    data = mapOf("op_type" to op.op_type, "device_id" to deviceId),
+                )
+                return
+            }
+            if (isBatchStreamActive()) {
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = "failed",
+                    message = "设备已在批量带流中",
+                    data = mapOf("op_type" to op.op_type, "device_id" to deviceId),
+                )
+                return
+            }
+            batchStreamStopRequested = false
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = true)
+                }
+            }
+            val startLine = "[OP][$opId] 批量带流已启动：${rows.size} 个账号，每台 ${hours} 小时"
+            LogCenter.op(alias, startLine)
+            batchStreamJob = scope.launch {
+                runBatchStreamSession(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = opId,
+                    sessionId = sessionId,
+                    packageName = pkg,
+                    hoursPerAccount = hours,
+                    rows = rows,
+                )
+            }
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "success",
+                message = "批量带流任务已启动",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "session_id" to sessionId,
+                    "row_count" to rows.size,
+                    "hours_per_account" to hours,
+                    "operation_logs" to listOf(startLine),
+                ),
+            )
+            return
+        }
+        if (op.op_type == "batch_stream_stop") {
+            batchStreamStopRequested = true
+            val line = "[OP][$opId] 收到停止批量带流指令"
+            LogCenter.op(alias, line)
+            ApiService.reportDeviceOp(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "success",
+                message = "已请求停止批量带流",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "operation_logs" to listOf(line),
+                ),
+            )
+            return
+        }
         val packageNameEarly = payload?.package_name?.trim().orEmpty()
         val isDestructive = op.op_type in destructiveTikTokOps
         val isExclusiveUi = op.op_type in exclusiveTikTokUiOps
@@ -1641,6 +1949,13 @@ object AppCoordinator {
             PrefsStore.setPublishPostTargetCount(publishCount)
             PrefsStore.setPublishPostRequested(true)
             PrefsStore.setPublishPostPending(true)
+            if (payload?.source == "auto_switch") {
+                PrefsStore.setAutoSwitchPublishAccountUsername(payload.account_username)
+                PrefsStore.setAutoSwitchPublishSlotKey(payload.auto_switch_slot_key)
+                PrefsStore.setPublishPostSource("auto_switch")
+            } else {
+                PrefsStore.clearAutoSwitchPublishContext()
+            }
             val countHint =
                 if (publishCount != null && publishCount > 0) "，目标发布 $publishCount 条" else ""
             val autoSwitchHint =
@@ -2165,6 +2480,14 @@ object AppCoordinator {
                         "operation_logs" to operationLogs,
                     ),
                 )
+                if (!successOverall && chain?.failureStep != "hard_stop") {
+                    scheduleFailureReport(
+                        business = "profile_edit",
+                        errorType = chain?.failureStep ?: "unknown",
+                        summary = chain?.failureStep ?: "profile_edit_failed",
+                        ocrRelated = true,
+                    )
+                }
                 } finally {
                     if (profileEditGalleryClearedBefore || profileEditAvatarImported) {
                         opStep("修改基本资料：清理设备图库（流程结束）")
@@ -2520,6 +2843,10 @@ object AppCoordinator {
                     fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL)
                 }
                 val deviceIdForMutual = deviceId.orEmpty()
+                if (deviceIdForMutual.isNotBlank() && !ensureLoggedInBeforeExclusiveTask(alias, deviceIdForMutual, "互点切换")) {
+                    LogCenter.op(alias, "互点切换：is_login 未就绪，已跳过互点入口流程")
+                    return@launch
+                }
                 var switchResult = runCatching {
                     executor.executeForUsername("__mutual_switch__", _config.value)
                 }.getOrElse { err ->
@@ -2535,14 +2862,21 @@ object AppCoordinator {
                     }
                 }
                 if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForMutual.isNotBlank()) {
-                    ensureAccountLoggedIn(
-                        alias, deviceIdForMutual, "mutual_safeguard", "互点保障",
-                        strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
-                    )
-                    switchResult = runCatching {
-                        executor.executeForUsername("__mutual_switch__", _config.value)
-                    }.getOrElse { err ->
-                        "互点流程切换异常：${err.message ?: "unknown"}"
+                    val loginReady = ensureAccountLoggedInWithRetry(
+                        alias = alias,
+                        deviceId = deviceIdForMutual,
+                        reason = "互点保障",
+                        forceRelogin = true,
+                        resumeFromLoginEntryScreen = true,
+                    ) == AccountLoginRetryOutcome.LoggedIn
+                    if (loginReady) {
+                        switchResult = runCatching {
+                            executor.executeForUsername("__mutual_switch__", _config.value)
+                        }.getOrElse { err ->
+                            "互点流程切换异常：${err.message ?: "unknown"}"
+                        }
+                    } else {
+                        switchResult = "互点：登录保障后仍未登录"
                     }
                 }
                 if (!deviceId.isNullOrBlank()) {
@@ -2577,6 +2911,49 @@ object AppCoordinator {
         }
     }
 
+    private suspend fun reportAutoSwitchPublishOutcomeIfNeeded(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        completed: Boolean,
+        loginFailed: Boolean,
+        accountChanged: Boolean,
+        message: String,
+    ) {
+        if (!PrefsStore.isAutoSwitchPublishTask()) return
+        val slotKey = PrefsStore.getAutoSwitchPublishSlotKey().orEmpty()
+        if (slotKey.isBlank() || opId.isBlank()) return
+        val account = PrefsStore.getAutoSwitchPublishAccountUsername().orEmpty()
+        val status = if (completed) "success" else "failed"
+        runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.reportDeviceOp(
+                    deviceId = deviceId,
+                    alias = alias,
+                    opId = opId,
+                    status = status,
+                    message = message,
+                    data = mapOf(
+                        "op_type" to "publish_post_start",
+                        "device_id" to deviceId,
+                        "source" to "auto_switch",
+                        "auto_switch_slot_key" to slotKey,
+                        "account_username" to account,
+                        "publish_post_outcome_report" to true,
+                        "publish_post_completed" to completed,
+                        "auto_switch_publish_login_failed" to loginFailed,
+                        "auto_switch_publish_account_changed" to accountChanged,
+                    ),
+                )
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "自动切号发作品结果上报失败：${err.message}")
+        }
+        if (completed || loginFailed || accountChanged) {
+            PrefsStore.clearAutoSwitchPublishContext()
+        }
+    }
+
     private fun triggerPublishPostNow(alias: String) {
         if (publishPostSwitchJob?.isActive == true) {
             LogCenter.op(alias, "发作品切换任务已在执行中，忽略重复触发")
@@ -2599,9 +2976,56 @@ object AppCoordinator {
                 "发作品切换任务准备执行特殊用户名 __publish_post__：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}",
             )
             val deviceIdForPublish = PrefsStore.getDeviceId().orEmpty()
-            val publishAccountKey =
-                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
-            suspend fun runPublishPostOnce(): String = runCatching {
+            val publishOpId = PrefsStore.getPublishPostTaskOpId().orEmpty()
+            if (deviceIdForPublish.isBlank()) {
+                LogCenter.op(alias, "发作品切换任务：未绑定 deviceId，已跳过")
+                return@launch
+            }
+            if (!isAssignedAccountLoggedIn(alias, deviceIdForPublish)) {
+                val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+                when (
+                    ensureAccountLoggedInWithRetry(
+                        alias = alias,
+                        deviceId = deviceIdForPublish,
+                        reason = "发作品前",
+                        expectedUsername = expectedUser,
+                    )
+                ) {
+                    AccountLoginRetryOutcome.LoggedIn -> { /* continue */ }
+                    AccountLoginRetryOutcome.AccountChanged -> {
+                        LogCenter.op(alias, "发作品：自动切号时段已切换，已跳过发作品入口流程")
+                        if (publishOpId.isNotBlank()) {
+                            reportAutoSwitchPublishOutcomeIfNeeded(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = false,
+                                accountChanged = true,
+                                message = "自动切号时段已切换，停止本时段发作品",
+                            )
+                        }
+                        PrefsStore.clearPublishPostState()
+                        return@launch
+                    }
+                    AccountLoginRetryOutcome.Aborted -> {
+                        LogCenter.op(alias, "发作品：自动登录中止，已跳过发作品入口流程")
+                        if (publishOpId.isNotBlank()) {
+                            reportAutoSwitchPublishOutcomeIfNeeded(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = false,
+                                accountChanged = false,
+                                message = "发作品自动登录中止，将在本时段内重试",
+                            )
+                        }
+                        return@launch
+                    }
+                }
+            }
+            var switchResult = runCatching {
                 executor.executeForUsername("__publish_post__", _config.value)
             }.getOrElse { err ->
                 when (err) {
@@ -2615,43 +3039,65 @@ object AppCoordinator {
                     else -> "发作品入口流程异常：${err.message ?: "unknown"}"
                 }
             }
-            var switchResult = runPublishPostOnce()
             if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
-                ensureAccountLoggedIn(
-                    alias, deviceIdForPublish, "publish_safeguard", "发作品保障",
-                    strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
-                )
-                switchResult = runPublishPostOnce()
-            }
-            var sameTaskPass = 1
-            while (
-                sameTaskPass < PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES &&
-                !switchResult.contains("已完成") &&
-                !shouldHonorUserHardStop() &&
-                PrefsStore.isPublishPostPending() &&
-                PrefsStore.isPublishPostRequested() &&
-                !PrefsStore.getPublishPostTaskOpId().isNullOrBlank()
-            ) {
-                val resumeIdx = PrefsStore.getPublishPostResumeNextIndex(publishAccountKey)
-                if (resumeIdx <= 0) break
-                LogCenter.op(
-                    alias,
-                    "发作品未完成，${PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS}ms 后同指令断点续发" +
-                        "（已成功 $resumeIdx 条，第 ${sameTaskPass + 1}/$PUBLISH_POST_SAME_TASK_RESUME_MAX_PASSES 次重入）",
-                )
-                if (!delayUnlessHardStop(PUBLISH_POST_SAME_TASK_RESUME_DELAY_MS)) break
-                sameTaskPass++
-                switchResult = runPublishPostOnce()
-                if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
-                    ensureAccountLoggedIn(
-                        alias, deviceIdForPublish, "publish_safeguard", "发作品保障",
-                        strict = true, forceRelogin = true, resumeFromLoginEntryScreen = true,
-                    )
-                    switchResult = runPublishPostOnce()
+                val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+                val loginReady = ensureAccountLoggedInWithRetry(
+                    alias = alias,
+                    deviceId = deviceIdForPublish,
+                    reason = "发作品保障",
+                    expectedUsername = expectedUser,
+                    forceRelogin = true,
+                    resumeFromLoginEntryScreen = true,
+                ) == AccountLoginRetryOutcome.LoggedIn
+                if (loginReady) {
+                    switchResult = runCatching {
+                        executor.executeForUsername("__publish_post__", _config.value)
+                    }.getOrElse { err ->
+                        "发作品入口流程异常：${err.message ?: "unknown"}"
+                    }
+                } else {
+                    switchResult = "发作品：登录保障后仍未登录"
+                    if (publishOpId.isNotBlank()) {
+                        reportAutoSwitchPublishOutcomeIfNeeded(
+                            alias = alias,
+                            deviceId = deviceIdForPublish,
+                            opId = publishOpId,
+                            completed = false,
+                            loginFailed = true,
+                            accountChanged = false,
+                            message = switchResult,
+                        )
+                    }
+                    LogCenter.op(alias, switchResult)
+                    updateRuntime(lastMessage = switchResult)
+                    return@launch
                 }
+            }
+            val publishCompleted = switchResult.contains("已完成")
+            if (PrefsStore.isAutoSwitchPublishTask() && publishOpId.isNotBlank()) {
+                reportAutoSwitchPublishOutcomeIfNeeded(
+                    alias = alias,
+                    deviceId = deviceIdForPublish,
+                    opId = publishOpId,
+                    completed = publishCompleted,
+                    loginFailed = false,
+                    accountChanged = false,
+                    message = switchResult,
+                )
             }
             LogCenter.op(alias, switchResult)
             updateRuntime(lastMessage = switchResult)
+            if (
+                switchResult.contains("异常") ||
+                switchResult.contains("失败") ||
+                switchResult.contains("掉登录")
+            ) {
+                scheduleFailureReport(
+                    business = "publish_post",
+                    errorType = FailureReportUploader.normalizeErrorType(switchResult),
+                    summary = switchResult,
+                )
+            }
             LogCenter.op(
                 alias,
                 "发作品切换任务结束：hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
@@ -2685,6 +3131,7 @@ object AppCoordinator {
         parentOpId: String,
         skipOuterWarmup: Boolean,
         profileEditTrigger: String,
+        skipAccountDbUpdate: Boolean = false,
     ) {
         val profileOpId = "${parentOpId}_profile_${System.currentTimeMillis()}"
         val packageName = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
@@ -2966,8 +3413,20 @@ object AppCoordinator {
                     "profile_edit_gallery_cleared_before" to profileEditGalleryClearedBefore,
                     "profile_edit_avatar_imported" to profileEditAvatarImported,
                     "operation_logs" to operationLogs,
-                ),
+                ).also { map ->
+                    if (skipAccountDbUpdate) {
+                        map["skip_account_db_update"] = true
+                    }
+                },
             )
+            if (!successOverall && chain.failureStep != "hard_stop") {
+                scheduleFailureReport(
+                    business = "profile_edit",
+                    errorType = chain.failureStep.ifBlank { "unknown" },
+                    summary = "cut_switch:$profileEditTrigger step=${chain.failureStep}",
+                    ocrRelated = true,
+                )
+            }
         } finally {
             if (profileEditGalleryClearedBefore || profileEditAvatarImported) {
                 opLog("修改基本资料：清理设备图库（流程结束）")
@@ -3126,7 +3585,8 @@ object AppCoordinator {
             return
         }
         if (!isAssignedAccountLoggedIn(alias, deviceId)) {
-            LogCenter.op(alias, "涨粉：云端 is_login=否，跳过 $username（非登录状态保障）")
+            pendingUsernames.add(0, username)
+            ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "执行任务前")
             return
         }
         ExecutionScope.enter()
@@ -3166,6 +3626,11 @@ object AppCoordinator {
                 if (isFailedResult) {
                     LogCenter.op(alias, "任务失败：$username（第 $attempt/$maxAttempts 次）— $lastMessage")
                     failedTracker.add("$username | $lastMessage")
+                    scheduleFailureReport(
+                        business = "${queueRunMode()}_task",
+                        errorType = FailureReportUploader.normalizeErrorType(lastMessage),
+                        summary = "$username | $lastMessage",
+                    )
                     if (attempt == maxAttempts) {
                         break
                     }
@@ -3183,14 +3648,19 @@ object AppCoordinator {
             }
 
             val errThrowable = result.exceptionOrNull()
+            if (errThrowable is LoginSafeguardRequiresAutoLoginException) {
+                LogCenter.op(
+                    alias,
+                    "涨粉：OCR 见 Add another account（与登录状态保障一致），终止 $username 并从登录入口续接自动登录",
+                )
+                pendingUsernames.add(0, username)
+                ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "掉登录后")
+                return
+            }
             if (errThrowable is AccountStatusLoggedOutException) {
                 LogCenter.op(alias, "涨粉：掉登录，终止 $username：${errThrowable.message}")
-                val recovered = recoverFromAccountStatusLogout(alias, deviceId, "涨粉执行")
-                if (recovered) {
-                    resumeRunningAfterGrowthAutoLogin(alias, deviceId)
-                } else {
-                    pauseGrowthAfterLoginFailure(alias, deviceId, "掉登录后自动登录失败")
-                }
+                pendingUsernames.add(0, username)
+                ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "掉登录后")
                 return
             }
             if (errThrowable != null && isPullLoopJobCancellation(errThrowable)) {
@@ -3207,6 +3677,11 @@ object AppCoordinator {
             if (err.contains("FATAL_DEBUG_STOP")) {
                 LogCenter.op(alias, "致命错误，已停止：$username — $err")
                 failedTracker.add("$username | $err")
+                scheduleFailureReport(
+                    business = "${queueRunMode()}_task",
+                    errorType = "fatal_debug_stop",
+                    summary = "$username | $err",
+                )
                 updateRuntime(lastMessage = "致命诊断触发，已停止任务")
                 reportWithRetry("异常：用户名 $username 触发致命诊断，已停止任务，$err")
                 stopAllWork()
@@ -3237,6 +3712,11 @@ object AppCoordinator {
 
             if (attempt == maxAttempts) {
                 lastMessage = "异常：用户名 $username 执行失败，$err"
+                scheduleFailureReport(
+                    business = "${queueRunMode()}_task",
+                    errorType = FailureReportUploader.normalizeErrorType(err),
+                    summary = "$username | $err",
+                )
             }
         }
 
@@ -3483,6 +3963,162 @@ object AppCoordinator {
         }
         if (WorkerServiceTracker.isRunning && !PrefsStore.isHardStopRequested() && !manuallyPaused) {
             ensureLoopsRunning()
+        }
+    }
+
+    private fun batchStreamStatusText(hours: Double): String {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"))
+        val month = cal.get(Calendar.MONTH) + 1
+        val day = cal.get(Calendar.DAY_OF_MONTH)
+        val hoursText = if (hours % 1.0 == 0.0) {
+            hours.toInt().toString()
+        } else {
+            String.format(java.util.Locale.US, "%.1f", hours).trimEnd('0').trimEnd('.')
+        }
+        return "${month}月${day}日已活跃${hoursText}小时"
+    }
+
+    private suspend fun batchStreamAutoLogin(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        row: BatchStreamRowPayload,
+    ): Boolean {
+        val username = row.username?.trim().orEmpty()
+        val password = row.password?.trim().orEmpty()
+        val email = row.email?.trim().orEmpty()
+        val api = row.api?.trim().orEmpty()
+        if (username.isBlank() || password.isBlank() || email.isBlank() || api.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 批量带流行 ${row.sheet_row}：登录字段不完整，跳过")
+            return false
+        }
+        username.let { PrefsStore.setLogContextUsername(it) }
+        fetchConfig(logToUser = true)
+        autoLoginActive = true
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = "批量带流：自动登录 $username")
+        runCatching { ApiService.syncStatus(deviceId, alias, "paused") }
+        LogCenter.op(alias, "[OP][$opId] 批量带流：自动登录 $username（行 ${row.sheet_row}）")
+        val loginOk = runCatching {
+            executor.runAutoLoginAfterCutSwitch(
+                appContext,
+                TikTokAutoLoginCredentials(
+                    username = username,
+                    email = email,
+                    password = password,
+                    apiUrl = api,
+                ),
+                resumeFromLoginEntryScreen = false,
+            )
+        }.getOrElse { err ->
+            LogCenter.op(alias, "[OP][$opId] 批量带流自动登录异常：${err.message}")
+            false
+        }
+        autoLoginActive = false
+        return loginOk
+    }
+
+    private suspend fun runBatchStreamSession(
+        alias: String,
+        deviceId: String,
+        parentOpId: String,
+        sessionId: String,
+        packageName: String,
+        hoursPerAccount: Double,
+        rows: List<BatchStreamRowPayload>,
+    ) {
+        try {
+            LogCenter.op(alias, "[OP][$parentOpId] 批量带流会话开始 session=$sessionId rows=${rows.size}")
+            updateRuntime(lastMessage = "批量带流运行中（${rows.size} 个账号）")
+            for ((index, row) in rows.withIndex()) {
+                if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) {
+                    LogCenter.op(alias, "[OP][$parentOpId] 批量带流已请求停止，剩余 ${rows.size - index} 个账号未执行")
+                    break
+                }
+                val sheetRow = row.sheet_row ?: 0
+                val username = row.username?.trim().orEmpty()
+                LogCenter.op(
+                    alias,
+                    "[OP][$parentOpId] 批量带流 ${index + 1}/${rows.size}：$username（行 $sheetRow）",
+                )
+                val loginOk = batchStreamAutoLogin(alias, deviceId, parentOpId, row)
+                if (!loginOk) {
+                    LogCenter.op(alias, "[OP][$parentOpId] 批量带流：$username 自动登录失败，跳过本行")
+                    continue
+                }
+                runProfileEditAfterCutSwitch(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = parentOpId,
+                    skipOuterWarmup = true,
+                    profileEditTrigger = "batch_stream",
+                    skipAccountDbUpdate = true,
+                )
+                if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) break
+
+                batchStreamGrowthPhase = true
+                growthModeLoginSafeguardPending = false
+                fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+                forceStartRunningNow("批量带流：涨粉 ${hoursPerAccount} 小时（$username）")
+                startPullLoop()
+                val growthMs = (hoursPerAccount * 3600.0 * 1000.0).toLong().coerceAtLeast(60_000L)
+                val endAt = SystemClock.elapsedRealtime() + growthMs
+                while (SystemClock.elapsedRealtime() < endAt) {
+                    if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) break
+                    delay(30_000)
+                }
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                batchStreamGrowthPhase = false
+                PrefsStore.saveLocalStatus("paused")
+                updateRuntime(localStatus = "paused", lastMessage = "批量带流：账号 $username 活跃结束")
+                runCatching { ApiService.syncStatus(deviceId, alias, "paused") }
+
+                if (sheetRow >= 2) {
+                    val statusText = batchStreamStatusText(hoursPerAccount)
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            ApiService.reportBatchStreamRow(
+                                deviceId = deviceId,
+                                alias = alias,
+                                sessionId = sessionId,
+                                sheetRow = sheetRow,
+                                statusText = statusText,
+                                hoursActive = hoursPerAccount,
+                            )
+                        }
+                    }.onSuccess {
+                        LogCenter.op(alias, "[OP][$parentOpId] 批量带流：行 $sheetRow 已回写 Excel（$statusText）")
+                    }.onFailure { err ->
+                        LogCenter.op(alias, "[OP][$parentOpId] 批量带流：回写 Excel 失败 ${err.message}")
+                    }
+                }
+
+                val hasNext = index < rows.lastIndex
+                if (hasNext && !batchStreamStopRequested && !PrefsStore.isHardStopRequested()) {
+                    LogCenter.op(alias, "[OP][$parentOpId] 批量带流：清理 TikTok，准备下一账号")
+                    runExecutorSu("am force-stop $packageName")
+                    delay(1200)
+                    runExecutorSu("pm clear $packageName")
+                    delay(1500)
+                }
+            }
+        } finally {
+            batchStreamGrowthPhase = false
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            batchStreamStopRequested = false
+            restoreCloudAutoStartParticipation(alias, deviceId, parentOpId, "批量带流结束")
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ApiService.completeBatchStream(deviceId, alias)
+                }
+            }
+            batchStreamJob = null
+            PrefsStore.saveLocalStatus("paused")
+            updateRuntime(localStatus = "paused", lastMessage = "批量带流已结束，设备恢复常规状态")
+            runCatching { ApiService.syncStatus(deviceId, alias, "paused") }
+            LogCenter.op(alias, "[OP][$parentOpId] 批量带流会话结束，已自动退出带流模式")
         }
     }
 

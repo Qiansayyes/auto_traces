@@ -1,6 +1,7 @@
 package com.autotraces.app.videoded
 
 import android.content.Context
+import android.provider.Settings
 import android.util.Log
 import com.autotraces.app.PrefsStore
 import com.google.gson.Gson
@@ -58,13 +59,45 @@ object CompanionApi {
 
     private const val json = "application/json; charset=utf-8"
 
+    /**
+     * PC 素材/任务接口使用的 deviceId（与 [video_ded] Companion 一致）。
+     * 优先读本机已存 ID（注册后 PC 返回的 canonical UUID）；首次启动用 `vd-{ANDROID_ID}`。
+     * 注册成功后由 [adoptCanonicalDeviceId] 写入 PC 合并后的 ID，**不得**每次调用强行覆盖。
+     * 投屏走 ADB/Serial，与此 ID 无关。
+     */
     fun deviceId(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val stored = prefs.getString(KEY_DEVICE_ID, null)
-        if (stored != null) return stored
-        val created = UUID.randomUUID().toString()
-        prefs.edit().putString(KEY_DEVICE_ID, created).apply()
-        return created
+        val stored = prefs.getString(KEY_DEVICE_ID, null)?.trim().orEmpty()
+        if (stored.isNotEmpty()) {
+            return stored
+        }
+        val stable = stableDeviceId(context)
+        prefs.edit().putString(KEY_DEVICE_ID, stable).apply()
+        return stable
+    }
+
+    fun hardwareKey(context: Context): String? =
+        stableDeviceId(context).takeIf { it.startsWith("vd-") }
+
+    private fun stableDeviceId(context: Context): String {
+        val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+            ?.trim()
+            .orEmpty()
+        if (androidId.isNotEmpty() && androidId != "9774d56d682e549c") {
+            return "vd-$androidId"
+        }
+        return UUID.randomUUID().toString()
+    }
+
+    private fun adoptCanonicalDeviceId(context: Context, reg: org.json.JSONObject) {
+        val serverId = reg.optString("deviceId", "").trim()
+        if (serverId.isEmpty()) return
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val local = prefs.getString(KEY_DEVICE_ID, null)?.trim().orEmpty()
+        if (serverId != local) {
+            Log.i(TAG, "adopt canonical deviceId $local -> $serverId")
+            prefs.edit().putString(KEY_DEVICE_ID, serverId).apply()
+        }
     }
 
     fun getDeviceName(context: Context): String {
@@ -113,7 +146,13 @@ object CompanionApi {
     fun formatDeviceNameLine(context: Context): String {
         val name = getDeviceName(context)
         val group = getBackendGroupName(context) ?: "未分组"
-        return "设备名称：$name · $group"
+        val id = deviceId(context)
+        val hw = hardwareKey(context)
+        return if (hw != null && !hw.equals(id, ignoreCase = true)) {
+            "设备名称：$name · $group · ID=$id · hw=$hw"
+        } else {
+            "设备名称：$name · $group · ID=$id"
+        }
     }
 
     private fun parseGroupNameFromRegistration(reg: org.json.JSONObject): String? {
@@ -172,24 +211,39 @@ object CompanionApi {
             adbTcpPort = ApiSettings.getAdbTcpipPort(context),
             companionApiPort = ApiSettings.getListenPort(context),
             companionApiToken = ApiSettings.getToken(context),
+            hardwareKey = hardwareKey(context),
+            groupName = getBackendGroupName(context),
         )
         val url = "${windowsBaseUrl(context)}/api/devices/register"
         Log.d(TAG, "ensureRegistered -> $url request=$request")
         val reg = org.json.JSONObject(postJson(url, request))
+        adoptCanonicalDeviceId(context, reg)
         setBackendGroupName(context, parseGroupNameFromRegistration(reg))
         reg
     }
+
+    private fun isDeviceNotFoundError(t: Throwable): Boolean =
+        t.message?.contains("device_not_found", ignoreCase = true) == true
 
     suspend fun createTask(
         context: Context,
         count: Int,
         targetPath: String? = DEFAULT_MATERIAL_STORAGE_PATH,
     ): CreateTaskResponse = withContext(Dispatchers.IO) {
+        ensureRegistered(context)
         val resolved = resolvedTargetPath(targetPath)
         val req = CreateTaskRequest(deviceId(context), count, resolved)
         val url = "${windowsBaseUrl(context)}/api/tasks/create"
         Log.d(TAG, "createTask -> $url count=$count targetPath=$resolved request=$req")
-        val raw = postJson(url, req)
+        val raw =
+            try {
+                postJson(url, req)
+            } catch (t: Throwable) {
+                if (!isDeviceNotFoundError(t)) throw t
+                Log.w(TAG, "createTask device_not_found, re-register and retry once")
+                ensureRegistered(context)
+                postJson(url, CreateTaskRequest(deviceId(context), count, resolved))
+            }
         Log.d(TAG, "createTask <- response=$raw")
         gson.fromJson(raw, CreateTaskResponse::class.java)
     }

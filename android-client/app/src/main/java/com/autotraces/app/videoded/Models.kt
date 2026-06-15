@@ -15,6 +15,10 @@ data class DeviceRegistrationRequest(
     val companionApiPort: Int? = null,
     /** Companion 本地 API Token（X-Api-Token），注册时上报给 PC。 */
     val companionApiToken: String? = null,
+    /** 稳定硬件标识（vd-{ANDROID_ID}），用于 PC 端合并同一部手机的多条记录。 */
+    val hardwareKey: String? = null,
+    /** 上次在 PC 端设置的分组，重启后随注册带回，避免合并时丢失。 */
+    val groupName: String? = null,
 )
 
 data class CreateTaskRequest(

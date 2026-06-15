@@ -226,6 +226,43 @@ data class DeviceOpPayload(
     val publish_count: Int? = null,
     /** 发作品来源标记，如 auto_switch。 */
     val source: String? = null,
+    /** 自动切号发作品：当日计划日期（YYYY-MM-DD，北京时间）。 */
+    val auto_switch_schedule_date: String? = null,
+    /** 自动切号发作品：时段键 `{date}|{slot_index}`。 */
+    val auto_switch_slot_key: String? = null,
+    /** 自动切号发作品：本时段目标账号 username。 */
+    val account_username: String? = null,
+    /** 批量带流：会话 ID */
+    val session_id: String? = null,
+    /** 批量带流：单账号活跃时长（小时） */
+    val hours_per_account: Double? = null,
+    /** 批量带流：Excel 状态列索引（0-based） */
+    val status_column: Int? = null,
+    /** 批量带流：本设备待处理行 */
+    val rows: List<BatchStreamRowPayload>? = null,
+)
+
+data class BatchStreamRowPayload(
+    val sheet_row: Int? = null,
+    val username: String? = null,
+    val password: String? = null,
+    val email: String? = null,
+    val email_password: String? = null,
+    val api: String? = null,
+)
+
+data class BatchStreamReportRowRequest(
+    val device_id: String,
+    val alias: String,
+    val session_id: String,
+    val sheet_row: Int,
+    val status_text: String,
+    val hours_active: Double,
+)
+
+data class BatchStreamCompleteRequest(
+    val device_id: String,
+    val alias: String,
 )
 
 data class GalleryLibraryRandomResponse(
@@ -425,4 +462,11 @@ data class ReportMutualCopiedUsernameResponse(
     val msg: String,
     val username: String? = null,
     val usage_count: Int? = null,
+)
+
+data class FailureReportUploadResponse(
+    val code: Int,
+    val msg: String,
+    val report_id: String? = null,
+    val dedup_key: String? = null,
 )

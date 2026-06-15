@@ -60,6 +60,12 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX = "publish_post_resume_op_id_"
     /** 当前进行中的发作品云端指令 op_id；新指令或硬停后清除，断点不再跨指令复用。 */
     private const val KEY_PUBLISH_POST_TASK_OP_ID = "publish_post_task_op_id"
+    /** 自动切号发作品：时段键 `{date}|{slot_index}`，用于回传结果。 */
+    private const val KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY = "auto_switch_publish_slot_key"
+    /** 自动切号发作品：本指令对应账号 username，用于登录重试时段门禁。 */
+    private const val KEY_AUTO_SWITCH_PUBLISH_ACCOUNT = "auto_switch_publish_account_username"
+    /** 发作品来源：auto_switch 等。 */
+    private const val KEY_PUBLISH_POST_SOURCE = "publish_post_source"
     /**
      * 发作品资料页进图库入口布局：按 [KEY_DEVICE_ID] 持久化（A=右下固定点，B=左侧备用点）。
      * 同设备不同账号发布时优先沿用，减少 A→B 全量试探。
@@ -71,6 +77,8 @@ object PrefsStore {
      * 与设备编辑表「切号高亮」及本机分配账号下拉当前选中一致，用于本地 txt 日志行首 username。
      */
     private const val KEY_LOG_CONTEXT_USERNAME = "log_context_username"
+    /** 失败采集：已上传的 business|error_type 去重键集合 */
+    private const val KEY_FAILURE_REPORT_UPLOADED = "failure_report_uploaded_keys"
 
     private lateinit var appContext: Context
     private lateinit var prefs: SharedPreferences
@@ -327,6 +335,57 @@ object PrefsStore {
         prefs.edit().remove(key).apply()
     }
 
+    fun setAutoSwitchPublishAccountUsername(username: String?) {
+        val v = username?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT, v).apply()
+        }
+    }
+
+    fun getAutoSwitchPublishAccountUsername(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun clearAutoSwitchPublishAccountUsername() {
+        prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT).apply()
+    }
+
+    fun setAutoSwitchPublishSlotKey(slotKey: String?) {
+        val v = slotKey?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY, v).apply()
+        }
+    }
+
+    fun getAutoSwitchPublishSlotKey(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setPublishPostSource(source: String?) {
+        val v = source?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_PUBLISH_POST_SOURCE).apply()
+        } else {
+            prefs.edit().putString(KEY_PUBLISH_POST_SOURCE, v).apply()
+        }
+    }
+
+    fun getPublishPostSource(): String? =
+        prefs.getString(KEY_PUBLISH_POST_SOURCE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun clearAutoSwitchPublishContext() {
+        prefs.edit()
+            .remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT)
+            .remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY)
+            .remove(KEY_PUBLISH_POST_SOURCE)
+            .apply()
+    }
+
+    fun isAutoSwitchPublishTask(): Boolean =
+        getPublishPostSource() == "auto_switch" && getAutoSwitchPublishSlotKey() != null
+
     fun clearPublishPostState() {
         prefs.edit()
             .putBoolean(KEY_PUBLISH_POST_REQUESTED, false)
@@ -335,6 +394,9 @@ object PrefsStore {
             .remove(KEY_PUBLISH_POST_PACKAGE)
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)
+            .remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT)
+            .remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY)
+            .remove(KEY_PUBLISH_POST_SOURCE)
             .apply()
     }
 
@@ -474,5 +536,27 @@ object PrefsStore {
         val next = current + 1
         prefs.edit().putInt(countKey(action), next).apply()
         return next
+    }
+
+    private fun failureReportDedupKey(business: String, errorType: String): String {
+        val b = business.trim().lowercase(Locale.US)
+        val e = errorType.trim().lowercase(Locale.US)
+        return "$b|$e"
+    }
+
+    @Synchronized
+    fun isFailureReportUploaded(business: String, errorType: String): Boolean {
+        val key = failureReportDedupKey(business, errorType)
+        if (key == "|") return false
+        return prefs.getStringSet(KEY_FAILURE_REPORT_UPLOADED, emptySet())?.contains(key) == true
+    }
+
+    @Synchronized
+    fun markFailureReportUploaded(business: String, errorType: String) {
+        val key = failureReportDedupKey(business, errorType)
+        if (key == "|") return
+        val set = prefs.getStringSet(KEY_FAILURE_REPORT_UPLOADED, emptySet())?.toMutableSet() ?: mutableSetOf()
+        set.add(key)
+        prefs.edit().putStringSet(KEY_FAILURE_REPORT_UPLOADED, set).apply()
     }
 }

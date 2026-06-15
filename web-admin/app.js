@@ -197,6 +197,12 @@ const galleryLibraryUploadBtn = document.getElementById("galleryLibraryUploadBtn
 const galleryLibraryRefreshBtn = document.getElementById("galleryLibraryRefreshBtn");
 const galleryLibrarySelectAllBtn = document.getElementById("galleryLibrarySelectAllBtn");
 const galleryLibraryClearSelectionBtn = document.getElementById("galleryLibraryClearSelectionBtn");
+const failureReportsCountEl = document.getElementById("failureReportsCount");
+const failureReportsOwnerFilterEl = document.getElementById("failureReportsOwnerFilter");
+const failureReportsAliasFilterEl = document.getElementById("failureReportsAliasFilter");
+const failureReportsErrorFilterEl = document.getElementById("failureReportsErrorFilter");
+const failureReportsRefreshBtn = document.getElementById("failureReportsRefreshBtn");
+const failureReportsTableBodyEl = document.getElementById("failureReportsTableBody");
 const GALLERY_LIBRARY_MAX_ITEMS = 100;
 // 单次 multipart 体积上限（需小于 Nginx client_max_body_size；未调大时默认约 1m）
 const GALLERY_UPLOAD_BATCH_MAX_BYTES = 8 * 1024 * 1024;
@@ -213,6 +219,14 @@ const accountBatchInputEl = document.getElementById("accountBatchInput");
 const accountBatchRegionInputEl = document.getElementById("accountBatchRegionInput");
 const accountBatchRejectEmptyToggleEl = document.getElementById("accountBatchRejectEmptyToggle");
 const importAccountBatchBtn = document.getElementById("importAccountBatchBtn");
+const batchStreamAliasSelect = document.getElementById("batchStreamAliasSelect");
+const batchStreamHoursInput = document.getElementById("batchStreamHoursInput");
+const batchStreamFileInput = document.getElementById("batchStreamFileInput");
+const batchStreamUploadHint = document.getElementById("batchStreamUploadHint");
+const batchStreamStartBtn = document.getElementById("batchStreamStartBtn");
+const batchStreamStopBtn = document.getElementById("batchStreamStopBtn");
+const batchStreamDownloadBtn = document.getElementById("batchStreamDownloadBtn");
+const batchStreamStatusHint = document.getElementById("batchStreamStatusHint");
 const accountUnassignedOnlyToggle = document.getElementById("accountUnassignedOnlyToggle");
 const accountRecordsSearchInput = document.getElementById("accountRecordsSearchInput");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
@@ -227,6 +241,8 @@ let deviceEditorRows = [];
 let backupArchiveRows = [];
 let backupAliasByUsername = new Map();
 let accountFilterUnassignedOnly = false;
+let batchStreamSessionId = "";
+let batchStreamBusy = false;
 let accountRecordsSearchQuery = "";
 let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
@@ -1311,12 +1327,20 @@ function applyRolePermissions() {
   }
 }
 
+function isAdminOnlySection(sectionId) {
+  const section = document.getElementById(sectionId);
+  return Boolean(section?.classList.contains("admin-only"));
+}
+
 async function switchSection(id, options = {}) {
   const { persist = true } = options;
   const hasTargetSection = Array.from(sections).some((section) => section.id === id);
-  const nextSectionId = hasTargetSection ? id : "overview";
+  let nextSectionId = hasTargetSection ? id : "overview";
   if (!hasTargetSection && id) {
     setStatus(`页面不存在：${id}，已自动跳回设备概览`, "warning");
+  }
+  if (currentUser?.role !== "admin" && isAdminOnlySection(nextSectionId)) {
+    nextSectionId = "overview";
   }
   sections.forEach((section) => {
     section.classList.toggle("active", section.id === nextSectionId);
@@ -1364,6 +1388,14 @@ async function switchSection(id, options = {}) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
+  if (nextSectionId === "batch-stream") {
+    try {
+      await loadBoundDeviceAliases();
+      renderBatchStreamAliasOptions();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
   if (nextSectionId === "backup-section") {
     try {
       await loadBoundDeviceAliases();
@@ -1389,6 +1421,13 @@ async function switchSection(id, options = {}) {
       await loadGalleryLibrary();
     } catch (error) {
       setStatus(humanizeRequestErrorMessage(error) || "加载图库失败", "error");
+    }
+  }
+  if (nextSectionId === "failure-reports") {
+    try {
+      await loadFailureReports();
+    } catch (error) {
+      setStatus(humanizeRequestErrorMessage(error) || "加载失败采集失败", "error");
     }
   }
 }
@@ -4911,6 +4950,7 @@ async function submitAndWaitTikTokDeviceOp(path, body, options = {}) {
   const successText = options.successText || "设备操作完成";
   const errorText = options.errorText || "设备操作失败";
   const shouldRefresh = options.refreshAfter !== false;
+  const refreshOnEnqueue = options.refreshOnEnqueue === true;
   const pollTimeoutRaw = Number(options.pollTimeoutMs);
   const pollTimeoutMs = Number.isFinite(pollTimeoutRaw) && pollTimeoutRaw > 5000 ? pollTimeoutRaw : 120000;
   const graceRaw = Number(options.graceAfterTimeoutMs);
@@ -4922,6 +4962,13 @@ async function submitAndWaitTikTokDeviceOp(path, body, options = {}) {
       body: JSON.stringify(body),
     });
     const opId = submit.op_id;
+    if (refreshOnEnqueue || submit?.switch_highlight_applied) {
+      try {
+        await loadBackupArchiveRecords();
+      } catch (_) {
+        /* ignore */
+      }
+    }
     if (!opId) {
       if (submit?.code === 0) {
         setStatus(successText, "success");
@@ -4956,6 +5003,7 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
     graceAfterTimeoutMs,
     cutSwitchAfterBackup,
     cutSwitchTargetRowIndex,
+    refreshOnEnqueue,
   } = execOptions;
   const identity = resolveLiveDeviceIdentityForArchive(alias, deviceId);
   if (!identity) return;
@@ -4980,6 +5028,7 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
     refreshAfter,
     pollTimeoutMs,
     graceAfterTimeoutMs,
+    refreshOnEnqueue,
   });
   if (result?.status !== "success") {
     throw new Error(result?.message || "备份并清理失败");
@@ -4995,6 +5044,7 @@ async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
     graceAfterTimeoutMs,
     cutSwitchAfterBackup,
     cutSwitchTargetRowIndex,
+    refreshOnEnqueue,
   } = execOptions;
   const identity = deviceId
     ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
@@ -5016,6 +5066,7 @@ async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
     refreshAfter,
     pollTimeoutMs,
     graceAfterTimeoutMs,
+    refreshOnEnqueue,
   });
   if (result?.status !== "success") {
     throw new Error(result?.message || "清理 TikTok 数据失败");
@@ -5078,6 +5129,8 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     refreshAfter = true,
     pollTimeoutMs,
     graceAfterTimeoutMs,
+    cutSwitchTargetRowIndex,
+    refreshOnEnqueue,
   } = execOptions;
   const normalizedBackupName = String(backupName || "").trim();
   if (!normalizedBackupName) {
@@ -5092,6 +5145,9 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     backup_name: normalizedBackupName,
     skip_pm_clear: Boolean(skipPmClear),
   };
+  if (cutSwitchTargetRowIndex != null && Number.isFinite(Number(cutSwitchTargetRowIndex)) && Number(cutSwitchTargetRowIndex) >= 0) {
+    payload.cut_switch_target_row_index = Number(cutSwitchTargetRowIndex);
+  }
   if (
     !skipConfirm
     && !confirmTikTokAction(
@@ -5110,6 +5166,7 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     refreshAfter,
     pollTimeoutMs,
     graceAfterTimeoutMs,
+    refreshOnEnqueue,
   });
   if (result?.status !== "success") {
     throw new Error(result?.message || "清理并还原失败");
@@ -5159,6 +5216,7 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   const cutSwitchWait = {
     pollTimeoutMs: 300000,
     graceAfterTimeoutMs: 120000,
+    refreshOnEnqueue: true,
   };
 
   if (bucketSize > 1 && !bucketHasHighlight) {
@@ -5167,12 +5225,14 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     const detailLines = canRestoreToDevice
       ? [
         `设备别名：${actionAlias}`,
-        "当前别名桶无切号高亮，将【仅清理 TikTok】后还原目标账号备份（不备份）。",
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "将【仅清理 TikTok】后还原目标账号备份（不备份）。",
         `目标 username：${targetUser || "-"}`,
       ]
       : [
         `设备别名：${actionAlias}`,
-        "当前别名桶无切号高亮，将【仅清理 TikTok】后切换高亮到目标（目标无备份元数据，不还原）。",
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "将【仅清理 TikTok】（目标无备份元数据，不还原）。",
         `目标 username：${targetUser || "-"}`,
       ];
     if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
@@ -5182,20 +5242,22 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
         refreshAfter: false,
         ...cutSwitchWait,
         cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
-        cutSwitchTargetRowIndex: canRestoreToDevice ? undefined : targetRi,
+        cutSwitchTargetRowIndex: targetRi,
       });
       if (canRestoreToDevice) {
         await handleRestoreClick(actionAlias, targetBackup, opsIdentity.device_id, {
           skipConfirm: true,
           skipPmClear: true,
           refreshAfter: false,
+          cutSwitchTargetRowIndex: targetRi,
           ...cutSwitchWait,
+          refreshOnEnqueue: false,
         });
       }
       setStatus(
         canRestoreToDevice
-          ? "切号设备任务已完成（含还原；设备将自动登录 is_login=否 的账号，请刷新列表核对）"
-          : "切号设备任务已完成（设备将自动登录 is_login=否 的账号，请刷新列表核对）",
+          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
+          : "切号：环境归属已切换；设备清理任务已完成",
         "success",
       );
     } catch (e) {
@@ -5203,8 +5265,8 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       const timedOut = /超时/.test(msg);
       setStatus(
         timedOut
-          ? `${msg} 切号高亮将在设备回传成功时由服务端更新，请稍后点击「刷新数据」查看。`
-          : msg,
+          ? `${msg} 环境归属已在入队时切换；设备任务可能仍在执行，请查看设备日志后刷新。`
+          : `${msg}（环境归属已在入队时切换，失败不回滚）`,
         timedOut ? "warning" : "error",
       );
     } finally {
@@ -5233,12 +5295,14 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   const detailLines = canRestoreToDevice
     ? [
       `设备别名：${actionAlias}`,
+      "确认后将立即切换环境归属高亮到目标账号。",
       "将对当前「切号高亮」账号执行【备份并清理】，再对目标账号执行【还原备份】。",
       `目标 username：${targetUser || "-"}`,
     ]
     : [
       `设备别名：${actionAlias}`,
-      "将对当前「切号高亮」账号执行【备份并清理】；目标条目无备份元数据，不做还原，仅将高亮切到目标。",
+      "确认后将立即切换环境归属高亮到目标账号。",
+      "将对当前「切号高亮」账号执行【备份并清理】；目标无备份元数据，不做还原。",
       `目标 username：${targetUser || "-"}`,
     ];
   if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
@@ -5254,20 +5318,22 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       refreshAfter: false,
       ...cutSwitchWait,
       cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
-      cutSwitchTargetRowIndex: canRestoreToDevice ? undefined : targetRi,
+      cutSwitchTargetRowIndex: targetRi,
     });
     if (canRestoreToDevice) {
       await handleRestoreClick(actionAlias, targetBackup, sid.device_id, {
         skipConfirm: true,
         skipPmClear: true,
         refreshAfter: false,
+        cutSwitchTargetRowIndex: targetRi,
         ...cutSwitchWait,
+        refreshOnEnqueue: false,
       });
     }
     setStatus(
       canRestoreToDevice
-        ? "切号设备任务已完成（含还原；设备将自动登录 is_login=否 的账号，请刷新列表核对）"
-        : "切号设备任务已完成（设备将自动登录 is_login=否 的账号，请刷新列表核对）",
+        ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
+        : "切号：环境归属已切换；设备备份并清理任务已完成",
       "success",
     );
   } catch (e) {
@@ -5275,8 +5341,8 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     const timedOut = /超时/.test(msg);
     setStatus(
       timedOut
-        ? `${msg} 切号高亮将在设备回传成功时由服务端更新，请稍后点击「刷新数据」查看。`
-        : msg,
+        ? `${msg} 环境归属已在入队时切换；设备任务可能仍在执行，请查看设备日志后刷新。`
+        : `${msg}（环境归属已在入队时切换，失败不回滚）`,
       timedOut ? "warning" : "error",
     );
   } finally {
@@ -5485,6 +5551,132 @@ async function deleteGalleryLibraryItem(itemId) {
   galleryLibrarySelectedIds.delete(id);
   await loadGalleryLibrary();
   setStatus("已从图库删除", "success");
+}
+
+function formatFailureReportBytes(size) {
+  const n = Number(size) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function fillFailureReportsSelect(selectEl, values, placeholder) {
+  if (!selectEl) return;
+  const current = String(selectEl.value || "");
+  selectEl.innerHTML = "";
+  const allOpt = document.createElement("option");
+  allOpt.value = "";
+  allOpt.textContent = placeholder;
+  selectEl.appendChild(allOpt);
+  (values || []).forEach((value) => {
+    const v = String(value || "").trim();
+    if (!v) return;
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    selectEl.appendChild(opt);
+  });
+  if (current && Array.from(selectEl.options).some((o) => o.value === current)) {
+    selectEl.value = current;
+  }
+}
+
+function renderFailureReportsTable(items) {
+  if (!failureReportsTableBodyEl) return;
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    failureReportsTableBodyEl.innerHTML =
+      '<tr><td colspan="9" class="failure-reports-empty">暂无失败采集数据</td></tr>';
+    return;
+  }
+  failureReportsTableBodyEl.innerHTML = rows
+    .map((item) => {
+      const id = String(item?.id || "").trim();
+      const owner = escapeHtml(String(item?.owner_username || "-"));
+      const alias = escapeHtml(String(item?.alias || "-"));
+      const business = escapeHtml(String(item?.business || "-"));
+      const errorType = escapeHtml(String(item?.error_type || "-"));
+      const summary = escapeHtml(String(item?.summary || "").slice(0, 240));
+      const ocr = item?.ocr_related ? "是" : "否";
+      const createdAt = escapeHtml(String(item?.created_at || "-"));
+      const size = formatFailureReportBytes(item?.size);
+      return `<tr data-report-id="${escapeHtml(id)}">
+        <td>${owner}</td>
+        <td>${alias}</td>
+        <td>${business}</td>
+        <td><code>${errorType}</code></td>
+        <td class="failure-reports-summary" title="${summary}">${summary || "-"}</td>
+        <td>${ocr}</td>
+        <td>${createdAt}</td>
+        <td>${size}</td>
+        <td class="failure-reports-actions">
+          <button type="button" class="ghost failure-report-download-btn" data-id="${escapeHtml(id)}">下载</button>
+          <button type="button" class="danger failure-report-delete-btn" data-id="${escapeHtml(id)}">删除</button>
+        </td>
+      </tr>`;
+    })
+    .join("");
+}
+
+async function loadFailureReports() {
+  if (currentUser?.role !== "admin") return;
+  const owner = String(failureReportsOwnerFilterEl?.value || "").trim();
+  const alias = String(failureReportsAliasFilterEl?.value || "").trim();
+  const errorType = String(failureReportsErrorFilterEl?.value || "").trim();
+  const qs = new URLSearchParams();
+  if (owner) qs.set("owner_username", owner);
+  if (alias) qs.set("alias", alias);
+  if (errorType) qs.set("error_type", errorType);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const data = await request(`/api/admin/failure_reports${suffix}`);
+  const totalCount = Number(data.total_count ?? data.count ?? 0);
+  const maxItems = Number(data.max_items ?? 88);
+  if (failureReportsCountEl) {
+    failureReportsCountEl.textContent = `${totalCount} / ${maxItems}`;
+  }
+  fillFailureReportsSelect(failureReportsOwnerFilterEl, data.owners || [], "全部用户");
+  fillFailureReportsSelect(failureReportsAliasFilterEl, data.aliases || [], "全部别名");
+  fillFailureReportsSelect(failureReportsErrorFilterEl, data.error_types || [], "全部类型");
+  if (owner) failureReportsOwnerFilterEl.value = owner;
+  if (alias) failureReportsAliasFilterEl.value = alias;
+  if (errorType) failureReportsErrorFilterEl.value = errorType;
+  renderFailureReportsTable(data.items || []);
+}
+
+async function downloadFailureReport(reportId) {
+  const id = String(reportId || "").trim();
+  if (!id) return;
+  const url = await buildApiUrl(`/api/admin/failure_reports/${encodeURIComponent(id)}/download`);
+  const headers = {};
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text.slice(0, 200) || `下载失败 HTTP ${response.status}`);
+  }
+  const blob = await response.blob();
+  const cd = response.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(cd);
+  const filename = match?.[1] || `failure_report_${id}.zip`;
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+  setStatus("失败采集包已开始下载", "success");
+}
+
+async function deleteFailureReport(reportId) {
+  const id = String(reportId || "").trim();
+  if (!id) return;
+  if (!window.confirm("确定删除这条失败采集记录？压缩包将一并移除。")) return;
+  await request(`/api/admin/failure_reports/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await loadFailureReports();
+  setStatus("已删除失败采集记录", "success");
 }
 
 async function resolveGalleryDispatchFiles() {
@@ -6505,6 +6697,40 @@ if (galleryLibraryRefreshBtn) {
     });
   });
 }
+if (failureReportsRefreshBtn) {
+  failureReportsRefreshBtn.addEventListener("click", () => {
+    loadFailureReports().catch((error) => {
+      setStatus(error?.message || "刷新失败采集失败", "error");
+    });
+  });
+}
+[failureReportsOwnerFilterEl, failureReportsAliasFilterEl, failureReportsErrorFilterEl].forEach((el) => {
+  if (!el) return;
+  el.addEventListener("change", () => {
+    loadFailureReports().catch((error) => {
+      setStatus(error?.message || "筛选失败采集失败", "error");
+    });
+  });
+});
+if (failureReportsTableBodyEl) {
+  failureReportsTableBodyEl.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const id = String(target.dataset.id || "").trim();
+    if (!id) return;
+    if (target.classList.contains("failure-report-download-btn")) {
+      downloadFailureReport(id).catch((error) => {
+        setStatus(error?.message || "下载失败", "error");
+      });
+      return;
+    }
+    if (target.classList.contains("failure-report-delete-btn")) {
+      deleteFailureReport(id).catch((error) => {
+        setStatus(error?.message || "删除失败", "error");
+      });
+    }
+  });
+}
 if (galleryLibrarySelectAllBtn) {
   galleryLibrarySelectAllBtn.addEventListener("click", () => {
     galleryLibraryItems.forEach((item) => {
@@ -6964,6 +7190,44 @@ function normalizeSwitchHighlightField(value) {
   return String(value || "").trim() === "是" ? "是" : "否";
 }
 
+const ENV_STATUS_ACTIVE = "环境活跃";
+const ENV_STATUS_RESTORE_FAILED = "还原失败";
+const ENV_STATUS_PENDING = "待就绪";
+
+function normalizeEnvStatusField(value) {
+  const raw = String(value || "").trim();
+  if (raw === ENV_STATUS_ACTIVE || raw === ENV_STATUS_RESTORE_FAILED || raw === ENV_STATUS_PENDING) {
+    return raw;
+  }
+  return "";
+}
+
+function resolveBackupArchiveEnvRuntimeMeta(envStatus) {
+  const status = normalizeEnvStatusField(envStatus);
+  if (status === ENV_STATUS_ACTIVE) {
+    return {
+      label: ENV_STATUS_ACTIVE,
+      className: "backup-archive-env-badge--env-active",
+      title: "备份已还原到设备，环境处于活跃可用状态",
+    };
+  }
+  if (status === ENV_STATUS_RESTORE_FAILED) {
+    return {
+      label: ENV_STATUS_RESTORE_FAILED,
+      className: "backup-archive-env-badge--env-restore-failed",
+      title: "环境归属未变，但最近一次还原失败",
+    };
+  }
+  if (status === ENV_STATUS_PENDING) {
+    return {
+      label: ENV_STATUS_PENDING,
+      className: "backup-archive-env-badge--env-pending",
+      title: "环境归属已切换，设备任务尚未完成（清理/还原进行中）",
+    };
+  }
+  return null;
+}
+
 function normalizeBasicProfileModifiedField(value) {
   return String(value || "").trim() === "是" ? "是" : "否";
 }
@@ -7089,6 +7353,185 @@ function getDeviceRowTemplate(source = {}) {
   };
 }
 
+function renderBatchStreamAliasOptions() {
+  if (!batchStreamAliasSelect) return;
+  const options = buildAliasDevicePairs();
+  const previous = String(batchStreamAliasSelect.value || "").trim();
+  batchStreamAliasSelect.innerHTML = [
+    '<option value="">选择设备别名</option>',
+    ...options.map((item) => `<option value="${escapeHtml(item.device_alias)}" data-device-id="${escapeHtml(item.device_id)}">${escapeHtml(item.device_alias)} | ${escapeHtml(item.device_id || "-")}</option>`),
+  ].join("");
+  if (previous && options.some((item) => item.device_alias === previous)) {
+    batchStreamAliasSelect.value = previous;
+  }
+}
+
+function resolveBatchStreamDeviceSelection() {
+  const alias = normalizeAliasValue(batchStreamAliasSelect?.value);
+  if (!alias) return null;
+  const option = Array.from(batchStreamAliasSelect?.options || []).find((it) => it.value === alias);
+  const deviceId = String(option?.dataset?.deviceId || "").trim();
+  const pair = buildAliasDevicePairs().find((item) => item.device_alias === alias);
+  return {
+    alias,
+    device_id: deviceId || String(pair?.device_id || "").trim(),
+  };
+}
+
+function setBatchStreamUiBusy(busy) {
+  batchStreamBusy = busy;
+  if (batchStreamStartBtn) batchStreamStartBtn.disabled = busy;
+  if (batchStreamStopBtn) batchStreamStopBtn.disabled = busy;
+  if (batchStreamFileInput) batchStreamFileInput.disabled = busy;
+}
+
+function updateBatchStreamUploadHint(text) {
+  if (batchStreamUploadHint) batchStreamUploadHint.textContent = text;
+}
+
+async function uploadBatchStreamXlsx(file) {
+  if (!file) return;
+  const name = String(file.name || "").toLowerCase();
+  if (!name.endsWith(".xlsx")) {
+    setStatus("批量带流：请选择 .xlsx 文件", "warning");
+    return;
+  }
+  setBatchStreamUiBusy(true);
+  try {
+    const token = authToken();
+    const form = new FormData();
+    form.append("file", file);
+    setStatus("正在上传批量带流 Excel...", "info");
+    const response = await fetch(await buildApiUrl("/api/admin/batch_stream/upload"), {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || `上传失败 (HTTP ${response.status})`));
+    }
+    batchStreamSessionId = String(data?.session_id || "").trim();
+    const rowCount = Number(data?.row_count || 0);
+    const aliasCounts = data?.alias_counts || {};
+    const aliasSummary = Object.entries(aliasCounts)
+      .map(([alias, count]) => `${alias}:${count}`)
+      .join("，");
+    updateBatchStreamUploadHint(
+      batchStreamSessionId
+        ? `已上传 ${file.name}（会话 ${batchStreamSessionId}，共 ${rowCount} 行${aliasSummary ? `；${aliasSummary}` : ""}）`
+        : "上传完成",
+    );
+    if (batchStreamDownloadBtn) batchStreamDownloadBtn.disabled = !batchStreamSessionId;
+    setStatus(`批量带流 Excel 已上传：${rowCount} 行`, "success");
+  } finally {
+    setBatchStreamUiBusy(false);
+  }
+}
+
+async function startBatchStreamOnDevice() {
+  if (batchStreamBusy) return;
+  const target = resolveBatchStreamDeviceSelection();
+  if (!target?.alias || !target?.device_id) {
+    setStatus("请先选择已绑定的设备别名", "warning");
+    return;
+  }
+  if (!batchStreamSessionId) {
+    setStatus("请先上传批量带流 Excel", "warning");
+    return;
+  }
+  const hours = Number(batchStreamHoursInput?.value || 0);
+  if (!Number.isFinite(hours) || hours <= 0) {
+    setStatus("请填写有效的单账号活跃时长（小时）", "warning");
+    return;
+  }
+  setBatchStreamUiBusy(true);
+  try {
+    setStatus(`正在向 ${target.alias} 下发批量带流...`, "info");
+    const data = await request("/api/admin/batch_stream/start", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: batchStreamSessionId,
+        device_id: target.device_id,
+        alias: target.alias,
+        hours_per_account: hours,
+        package_name: (backupPackageNameInput?.value || "").trim() || "com.zhiliaoapp.musically",
+      }),
+    });
+    if (Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || "下发失败"));
+    }
+    if (batchStreamStatusHint) {
+      batchStreamStatusHint.textContent = `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每台 ${hours} 小时。设备进入独占模式。`;
+    }
+    setStatus(String(data?.msg || "批量带流已启动"), "success");
+  } catch (e) {
+    setStatus(e.message || "批量带流启动失败", "error");
+  } finally {
+    setBatchStreamUiBusy(false);
+  }
+}
+
+async function stopBatchStreamOnDevice() {
+  if (batchStreamBusy) return;
+  const target = resolveBatchStreamDeviceSelection();
+  if (!target?.alias || !target?.device_id) {
+    setStatus("请先选择要停止的设备别名", "warning");
+    return;
+  }
+  setBatchStreamUiBusy(true);
+  try {
+    const data = await request("/api/admin/batch_stream/stop", {
+      method: "POST",
+      body: JSON.stringify({
+        device_id: target.device_id,
+        alias: target.alias,
+      }),
+    });
+    if (Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || "停止失败"));
+    }
+    if (batchStreamStatusHint) {
+      batchStreamStatusHint.textContent = `已向 ${target.alias} 下发停止指令，设备将退出带流模式。`;
+    }
+    setStatus(String(data?.msg || "已请求停止批量带流"), "success");
+  } catch (e) {
+    setStatus(e.message || "停止批量带流失败", "error");
+  } finally {
+    setBatchStreamUiBusy(false);
+  }
+}
+
+async function downloadBatchStreamXlsx() {
+  if (!batchStreamSessionId || batchStreamBusy) return;
+  setBatchStreamUiBusy(true);
+  try {
+    const token = authToken();
+    const url = await buildApiUrl(`/api/admin/batch_stream/download/${encodeURIComponent(batchStreamSessionId)}`);
+    const response = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(String(data?.msg || `下载失败 (HTTP ${response.status})`));
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = `batch_stream_${batchStreamSessionId}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+    setStatus("批量带流 Excel 已下载", "success");
+  } catch (e) {
+    setStatus(e.message || "下载 Excel 失败", "error");
+  } finally {
+    setBatchStreamUiBusy(false);
+  }
+}
+
 function buildAliasDevicePairs() {
   if (boundDeviceAliasPairs.length) {
     return boundDeviceAliasPairs.slice();
@@ -7137,6 +7580,7 @@ function renderDeviceAliasPresetOptions() {
   if (previous && options.some((item) => item.device_alias === previous)) {
     deviceAliasPresetSelect.value = previous;
   }
+  renderBatchStreamAliasOptions();
   if (galleryTargetAliasesSelect) {
     const selectedBefore = new Set(Array.from(galleryTargetAliasesSelect.selectedOptions || []).map((it) => it.value));
     galleryTargetAliasesSelect.innerHTML = options
@@ -7391,7 +7835,7 @@ function renderLinkedAccountInfo(row = {}) {
       <div><strong>is_login：</strong>${matched.is_login ? "是" : "否"}</div>
       <div><strong>login_time：</strong>${matched.login_time || "-"}</div>
       <div><strong>region：</strong>${matched.region || "-"}</div>
-      <div><strong>分配别名：</strong>${normalizeAliasValue(matched.assigned_alias) || "无"}</div>
+      <div><strong>分配别名：</strong>${normalizeAliasValue(getEffectiveAccountAssignedAlias(matched)) || "无"}</div>
       <div><strong>video_count：</strong>${stats.video_count}</div>
       <div><strong>follower_count：</strong>${stats.follower_count}</div>
       <div><strong>follower_growth：</strong>${stats.follower_growth}</div>
@@ -7432,6 +7876,13 @@ function renderDeviceEditorRows() {
     const firstDeviceId = String(items[0]?.row?.device_id || "").trim() || "-";
     const rowsHtml = items.map(({ row, idx }) => {
       const linkedAccountInfo = renderLinkedAccountInfo(row);
+      const username = String(row?.username || "").trim();
+      const acct = username ? getAccountRecordByUsername(username) : null;
+      const switchActive = items.length <= 1 || normalizeSwitchHighlightField(row?.switch_highlight) === "是";
+      const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
+      const envHintText = switchActive
+        ? "当前高亮：该账号是这条设备环境的归属目标"
+        : "非高亮：需切号后才可操作备份/还原";
       return `
       <div class="panel-card" style="margin:0 0 10px 0;background:#fff;border:1px solid #eef2ff;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
@@ -7443,6 +7894,10 @@ function renderDeviceEditorRows() {
             <button class="ghost" data-account-restore="${row.device_alias || ""}" data-device-id="${row.device_id || ""}" data-account-backup-name="${row.backup_name || ""}" data-account-id="${row.row_index != null && row.row_index !== "" ? row.row_index : ""}">清理并还原该备份</button>
             <button class="ghost" data-editor-delete="device" data-editor-index="${idx}">删除</button>
           </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 2px;">
+          ${envStatusBadge}
+          <span class="hint">${escapeHtml(envHintText)}</span>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;">
           <div class="field"><label>device_alias</label><input list="deviceAliasOptions" data-editor-scope="device" data-editor-field="device_alias" data-editor-index="${idx}" value="${row.device_alias}" /></div>
@@ -7792,22 +8247,72 @@ function buildBackupArchiveExtraSummary(stats = {}, backupName = "", backupPath 
 }
 
 function resolveBackupRowDailySlot(alias, row) {
+  const info = resolveBackupRowSlotInfo(alias, row);
+  return info?.label || "";
+}
+
+function resolveBackupRowSlotInfo(alias, row) {
   const aliasKey = alias === "__EMPTY_ALIAS__"
     ? normalizeAliasValue(row?.mobile_alias || row?.assigned_alias || row?.device_alias)
     : normalizeAliasValue(alias);
-  if (!aliasKey) return "";
+  if (!aliasKey) return null;
   const bucket = autoSwitchDailyPlansByAlias[aliasKey];
-  if (!bucket) return "";
+  if (!bucket) return null;
   const ri = Number(row?.row_index ?? row?.id);
+  let hit = null;
   if (Number.isFinite(ri) && bucket.slots_by_row_index) {
-    const hit = bucket.slots_by_row_index[String(ri)] ?? bucket.slots_by_row_index[ri];
-    if (hit?.label) return String(hit.label);
+    hit = bucket.slots_by_row_index[String(ri)] ?? bucket.slots_by_row_index[ri];
   }
-  const user = String(row?.username || "").trim().toLowerCase();
-  if (user && bucket.slots_by_username?.[user]?.label) {
-    return String(bucket.slots_by_username[user].label);
+  if (!hit) {
+    const user = String(row?.username || "").trim().toLowerCase();
+    if (user && bucket.slots_by_username?.[user]) {
+      hit = bucket.slots_by_username[user];
+    }
   }
-  return "";
+  if (!hit) return null;
+  return {
+    label: hit.label ? String(hit.label) : "",
+    publishAt: hit.auto_publish_label ? String(hit.auto_publish_label) : "",
+    publishStatus: String(hit.auto_publish_status || "none"),
+    publishStatusLabel: String(hit.auto_publish_status_label || ""),
+    publishStatusTitle: String(hit.auto_publish_status_title || ""),
+  };
+}
+
+function renderAutoSwitchPublishStatusBadge(slotInfo) {
+  if (!slotInfo) return "";
+  const status = String(slotInfo.publishStatus || "none");
+  if (status === "none") return "";
+  const label = String(slotInfo.publishStatusLabel || "").trim() || status;
+  const title = String(slotInfo.publishStatusTitle || "").trim()
+    || (slotInfo.publishAt ? `计划发作品 ${slotInfo.publishAt}` : "自动切号发作品状态");
+  const cls = `backup-archive-publish-badge backup-archive-publish-badge--${status}`;
+  return `<span class="${cls}" title="${escapeHtml(title)}">发作品·${escapeHtml(label)}</span>`;
+}
+
+function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}) {
+  if (!switchActive) {
+    return `<span class="backup-archive-env-badge backup-archive-env-badge--idle" title="该账号不是此设备别名的当前环境归属；需先切号后才可操作备份/还原等">非当前环境</span>`;
+  }
+  const envMeta = resolveBackupArchiveEnvRuntimeMeta(row?.env_status);
+  const loginKnown = Boolean(acct);
+  const loginOk = loginKnown && Boolean(acct.is_login);
+  const loginLabel = loginKnown ? (loginOk ? "已登录" : "未登录") : "登录未知";
+  const loginClass = loginOk
+    ? "backup-archive-env-badge--logged-in"
+    : (loginKnown ? "backup-archive-env-badge--logged-out" : "backup-archive-env-badge--unknown");
+  const runtimeLabel = envMeta?.label || "";
+  const runtimeClass = envMeta?.className || "";
+  const runtimeTitle = envMeta?.title || "环境就绪状态未知（可能尚未执行切号/还原）";
+  const textParts = ["环境归属"];
+  if (runtimeLabel) textParts.push(runtimeLabel);
+  textParts.push(loginLabel);
+  const titleParts = [
+    "高亮=该设备别名当前环境归属此账号",
+    runtimeLabel ? runtimeTitle : "尚未记录环境就绪状态",
+    "登录状态来自账号 is_login（环境内结果，失败不回滚归属）",
+  ];
+  return `<span class="backup-archive-env-badge backup-archive-env-badge--highlighted ${runtimeClass} ${loginClass}" title="${escapeHtml(titleParts.join("；"))}">${escapeHtml(textParts.join(" · "))}</span>`;
 }
 
 function renderBackupGroups(items = []) {
@@ -7864,11 +8369,20 @@ function renderBackupGroups(items = []) {
       const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
       const switchTitle = autoSwitchBlocksManual
         ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
-        : "切号：高亮条目无需操作；无高亮时仅清理后还原/切高亮；有高亮时先备份当前再还原";
+        : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
+      const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
+      const envHintText = switchActive
+        ? "当前高亮：该账号是这条设备环境的归属目标"
+        : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用";
       const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
       const rowIndexNum = exportRowIndex ?? -1;
       const hasCutSwitchRow = exportRowIndex != null;
-      const dailySlotLabel = resolveBackupRowDailySlot(alias, row) || (rows.length >= 2 ? "-" : "");
+      const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
+      const dailySlotLabel = dailySlotInfo?.label || (rows.length >= 2 ? "-" : "");
+      const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
+      const dailyPublishAtHint = dailySlotInfo?.publishAt
+        ? ` · 计划 ${escapeHtml(dailySlotInfo.publishAt)}`
+        : "";
       const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
       const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
       const exportSelectTitle = exportRowIndex != null
@@ -7883,8 +8397,10 @@ function renderBackupGroups(items = []) {
               </label>
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
               ${aliasBadge}
+              ${envStatusBadge}
+              ${dailyPublishBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
-              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}${dailySlotLabel ? ` · 今日时段 <strong>${escapeHtml(dailySlotLabel)}</strong>` : ""}</span>
+              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}${dailySlotLabel ? ` · 今日时段 <strong>${escapeHtml(dailySlotLabel)}</strong>${dailyPublishAtHint}` : ""}${switchActive ? ` · ${escapeHtml(envHintText)}` : ""}</span>
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
@@ -8175,6 +8691,7 @@ async function loadBackupArchiveRecords() {
       follower_count: row?.follower_count || "",
       follower_growth: row?.follower_growth || "",
       switch_highlight: normalizeSwitchHighlightField(row?.switch_highlight),
+      env_status: normalizeEnvStatusField(row?.env_status),
     }));
     updateBackupArchivePagerUi();
     renderBackupGroups(items);
@@ -8196,6 +8713,28 @@ if (addBlankRecordBtn) {
 if (importAccountBatchBtn) {
   importAccountBatchBtn.addEventListener("click", () => {
     importAccountBatchFromText().catch((e) => setStatus(e.message || "批量导入失败", "error"));
+  });
+}
+if (batchStreamFileInput) {
+  batchStreamFileInput.addEventListener("change", () => {
+    const file = batchStreamFileInput.files?.[0];
+    if (!file) return;
+    uploadBatchStreamXlsx(file).catch((e) => setStatus(e.message || "上传 Excel 失败", "error"));
+  });
+}
+if (batchStreamStartBtn) {
+  batchStreamStartBtn.addEventListener("click", () => {
+    startBatchStreamOnDevice().catch((e) => setStatus(e.message || "启动批量带流失败", "error"));
+  });
+}
+if (batchStreamStopBtn) {
+  batchStreamStopBtn.addEventListener("click", () => {
+    stopBatchStreamOnDevice().catch((e) => setStatus(e.message || "停止批量带流失败", "error"));
+  });
+}
+if (batchStreamDownloadBtn) {
+  batchStreamDownloadBtn.addEventListener("click", () => {
+    downloadBatchStreamXlsx().catch((e) => setStatus(e.message || "下载 Excel 失败", "error"));
   });
 }
 if (addDeviceBlankRecordBtn) {

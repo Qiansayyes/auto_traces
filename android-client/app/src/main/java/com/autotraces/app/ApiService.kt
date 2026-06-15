@@ -293,6 +293,32 @@ object ApiService {
         includeAuth = true,
     )
 
+    suspend fun reportBatchStreamRow(
+        deviceId: String,
+        alias: String,
+        sessionId: String,
+        sheetRow: Int,
+        statusText: String,
+        hoursActive: Double,
+    ): BaseResponse = post(
+        path = "/api/device/batch_stream/report_row",
+        body = BatchStreamReportRowRequest(
+            device_id = deviceId,
+            alias = alias,
+            session_id = sessionId,
+            sheet_row = sheetRow,
+            status_text = statusText,
+            hours_active = hoursActive,
+        ),
+        clazz = BaseResponse::class.java,
+    )
+
+    suspend fun completeBatchStream(deviceId: String, alias: String): BaseResponse = post(
+        path = "/api/device/batch_stream/complete",
+        body = BatchStreamCompleteRequest(device_id = deviceId, alias = alias),
+        clazz = BaseResponse::class.java,
+    )
+
     private suspend fun <T> get(
         path: String,
         clazz: Class<T>,

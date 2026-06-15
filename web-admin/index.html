@@ -3,9 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>Auto Traces 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-size='28' font-family='Arial,Helvetica,sans-serif' fill='white'%3EAT%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=20260603-3" />
+  <link rel="stylesheet" href="styles.css?v=20260609-2" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -69,8 +72,10 @@
         <button class="nav-item" data-section="config">运行配置</button>
         <div class="nav-group-title">账号管理模块</div>
         <button class="nav-item" data-section="account-manager">账号表单与账号记录</button>
+        <button class="nav-item" data-section="batch-stream">批量带流</button>
         <button class="nav-item" data-section="backup-section">TikTok设备备份档案</button>
         <button class="nav-item" data-section="gallery-dispatch">图库素材下发</button>
+        <button class="nav-item admin-only" data-section="failure-reports">失败采集</button>
         <button class="nav-item admin-only" data-section="usernames">用户名队列</button>
         <div class="nav-group-title admin-only">数据管理模块</div>
         <button class="nav-item admin-only" data-section="tiktok-roots">根用户管理</button>
@@ -675,6 +680,7 @@
           <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
               <h3 style="margin:0;">设备备份档案</h3>
+              <span class="hint" title="切号确认后立即切换高亮；高亮=环境归属；还原成功=环境活跃">高亮=环境归属 · 还原成功=环境活跃 · 标签含登录状态</span>
               <select id="backupArchiveGroupSelect" class="ui-select ui-select--toolbar" style="min-width:180px;">
                 <option value="">全部分组</option>
                 <option value="__ungrouped__">未分组</option>
@@ -743,6 +749,81 @@
           </div>
           <button id="uploadGalleryBtn" class="primary" type="button">一对一下发（优先图库已选）</button>
           <pre id="galleryDispatchLogs" style="white-space:pre-wrap;max-height:220px;overflow:auto;margin-top:10px;">暂无日志</pre>
+        </div>
+      </section>
+
+      <section id="failure-reports" class="panel admin-only">
+        <header>
+          <h2>失败采集</h2>
+          <p>设备运行失败时自动上传日志压缩包（OCR 相关失败附带截图）。相同业务 + 相同错误类型仅保留一条；云端最多 88 条，处理完请删除。</p>
+        </header>
+        <div class="panel-card failure-reports-card">
+          <div class="failure-reports-toolbar">
+            <span id="failureReportsCount" class="gallery-library-count">0 / 88</span>
+            <label class="toolbar-field-label" for="failureReportsOwnerFilter">用户</label>
+            <select id="failureReportsOwnerFilter" class="ui-select">
+              <option value="">全部用户</option>
+            </select>
+            <label class="toolbar-field-label" for="failureReportsAliasFilter">手机别名</label>
+            <select id="failureReportsAliasFilter" class="ui-select">
+              <option value="">全部别名</option>
+            </select>
+            <label class="toolbar-field-label" for="failureReportsErrorFilter">错误类型</label>
+            <select id="failureReportsErrorFilter" class="ui-select">
+              <option value="">全部类型</option>
+            </select>
+            <button id="failureReportsRefreshBtn" type="button">刷新</button>
+          </div>
+          <div id="failureReportsTableWrap" class="failure-reports-table-wrap">
+            <table class="failure-reports-table">
+              <thead>
+                <tr>
+                  <th>用户</th>
+                  <th>手机别名</th>
+                  <th>业务</th>
+                  <th>错误类型</th>
+                  <th>摘要</th>
+                  <th>OCR</th>
+                  <th>时间</th>
+                  <th>大小</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="failureReportsTableBody">
+                <tr><td colspan="9" class="failure-reports-empty">暂无失败采集数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="batch-stream" class="panel">
+        <header>
+          <h2>批量带流</h2>
+          <p>选定设备别名后进入独占带流模式：仅执行自动登录 → 修改基本资料 → 涨粉；进度只写入 Excel，不写数据库。</p>
+        </header>
+        <div class="panel-card">
+          <div class="field" style="max-width:320px;margin-bottom:8px;">
+            <label>目标设备别名</label>
+            <select id="batchStreamAliasSelect" class="ui-select" style="min-width:220px;">
+              <option value="">选择设备别名</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:200px;margin-bottom:8px;">
+            <label>单账号活跃时长（小时）</label>
+            <input id="batchStreamHoursInput" type="number" class="pager-size-input" min="0.5" max="72" step="0.5" value="2" />
+          </div>
+          <div class="field" style="margin-bottom:8px;">
+            <label>带流 Excel（首 sheet 需含 username、password、email、email_password、api、分配别名）</label>
+            <input id="batchStreamFileInput" type="file" accept=".xlsx" />
+            <div id="batchStreamUploadHint" class="hint" style="margin-top:6px;">尚未上传 Excel</div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
+            <button id="batchStreamStartBtn" class="primary" type="button">启动批量带流</button>
+            <button id="batchStreamStopBtn" class="ghost" type="button">停止带流</button>
+            <button id="batchStreamDownloadBtn" class="ghost" type="button" disabled>下载已更新 Excel</button>
+          </div>
+          <div id="batchStreamStatusHint" class="hint" style="margin-top:10px;">带流进行中时，该设备其它功能将被屏蔽，直至全部账号完成或手动停止。</div>
         </div>
       </section>
 
@@ -1385,6 +1466,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260605-2"></script>
+  <script src="app.js?v=20260609-2"></script>
 </body>
 </html>
