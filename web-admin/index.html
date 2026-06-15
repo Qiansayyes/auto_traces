@@ -8,7 +8,7 @@
   <meta http-equiv="Expires" content="0" />
   <title>Auto Traces 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-size='28' font-family='Arial,Helvetica,sans-serif' fill='white'%3EAT%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=20260609-2" />
+  <link rel="stylesheet" href="styles.css?v=20260616-1" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -77,6 +77,13 @@
         <button class="nav-item" data-section="gallery-dispatch">图库素材下发</button>
         <button class="nav-item admin-only" data-section="failure-reports">失败采集</button>
         <button class="nav-item admin-only" data-section="usernames">用户名队列</button>
+        <div class="nav-group-title">邮箱管理模块</div>
+        <button class="nav-item" data-section="mail-module" data-mail-route="email">邮箱账户管理</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="sender-groups">发件人分类</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="template-manager">邮件模板管理</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="project-api">项目接口</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="project-mailboxes">项目接码邮箱</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="api-docs">邮箱接口文档</button>
         <div class="nav-group-title admin-only">数据管理模块</div>
         <button class="nav-item admin-only" data-section="tiktok-roots">根用户管理</button>
         <button class="nav-item admin-only" data-section="live-customers">主播访问数据</button>
@@ -644,6 +651,20 @@
           </div>
           <div id="accountEditorList" style="margin-top:14px;"></div>
         </div>
+      </section>
+
+      <section id="mail-module" class="panel panel-mail-module">
+        <div id="mailModulePlaceholder" class="mail-module-placeholder hidden">
+          <h3>邮箱管理页面加载失败</h3>
+          <p class="hint">请确认后端已启动（默认 <code>http://127.0.0.1:8000</code>），且左下角 API Base 指向 <code>http://127.0.0.1:8000/api</code>。</p>
+          <p class="hint" id="mailModuleTargetHint"></p>
+        </div>
+        <iframe
+          id="mailModuleFrame"
+          class="mail-module-frame"
+          title="Outlook 邮箱管理"
+          referrerpolicy="same-origin"
+        ></iframe>
       </section>
 
       <section id="backup-section" class="panel">
@@ -1466,6 +1487,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260609-2"></script>
+  <script src="app.js?v=20260616-1"></script>
 </body>
 </html>

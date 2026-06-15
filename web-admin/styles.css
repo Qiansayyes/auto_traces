@@ -184,6 +184,50 @@ nav {
   flex-direction: column;
 }
 
+.content.content--mail-module {
+  padding: 0;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.app.app--mail-module {
+  height: 100vh;
+  overflow: hidden;
+}
+
+.panel-mail-module {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.mail-module-placeholder {
+  position: absolute;
+  inset: 24px;
+  z-index: 2;
+  display: grid;
+  place-content: center;
+  gap: 10px;
+  padding: 28px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+}
+
+.mail-module-placeholder code {
+  font-size: 12px;
+}
+
+.mail-module-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: calc(100vh - 0px);
+  border: 0;
+  background: #f6f7fb;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

@@ -645,6 +645,7 @@ const USER_CACHE_KEY = "auto_traces_auth_user_v1";
 const RUN_MODE_KEY = "auto_traces_run_mode_v1";
 const LAST_TEMPLATE_KEY = "auto_traces_last_template_v1";
 const LAST_SECTION_KEY = "auto_traces_last_section_v1";
+const MAIL_ROUTE_KEY = "auto_traces_mail_route_v1";
 const DEVICE_GROUP_FILTER_KEY = "auto_traces_device_group_filter_v1";
 const DEVICE_GROUP_CUSTOM_KEY = "auto_traces_device_group_custom_v1";
 const OVERVIEW_PAGE_KEY = "auto_traces_overview_page_v1";
@@ -1332,8 +1333,72 @@ function isAdminOnlySection(sectionId) {
   return Boolean(section?.classList.contains("admin-only"));
 }
 
+function mailAdminOrigin() {
+  const api = String(apiBase() || defaultApiBase()).trim().replace(/\/$/, "");
+  if (/^https?:\/\//i.test(api)) {
+    return api.replace(/\/api$/i, "");
+  }
+  if (isCurrentPageLocalDevHost() && String(window.location.port || "") === "8080") {
+    const { protocol, hostname } = window.location;
+    return `${protocol}//${hostname || "127.0.0.1"}:8000`;
+  }
+  return window.location.origin;
+}
+
+function mailAdminUrl(route = "email") {
+  const safeRoute = String(route || "email").replace(/^\/+/, "");
+  return `${mailAdminOrigin()}/mail-admin/${safeRoute}?embed=1`;
+}
+
+function pushMailAuthToFrame(frame) {
+  if (!frame?.contentWindow) return;
+  const origin = mailAdminOrigin();
+  try {
+    frame.contentWindow.postMessage(
+      { type: "auto_traces_auth_token", token: authToken() },
+      origin,
+    );
+  } catch (_) {
+    // 忽略跨域或 iframe 未就绪
+  }
+}
+
+function navigateMailModuleFrame(route = "email") {
+  const frame = document.getElementById("mailModuleFrame");
+  const placeholder = document.getElementById("mailModulePlaceholder");
+  if (!frame) return;
+  const safeRoute = String(route || "email").replace(/^\/+/, "");
+  const target = mailAdminUrl(safeRoute);
+  placeholder?.classList.add("hidden");
+
+  const onLoad = () => {
+    pushMailAuthToFrame(frame);
+    placeholder?.classList.add("hidden");
+  };
+  const onError = () => {
+    placeholder?.classList.remove("hidden");
+  };
+
+  frame.addEventListener("load", onLoad, { once: true });
+  frame.addEventListener("error", onError, { once: true });
+  frame.dataset.mailRoute = safeRoute;
+  frame.src = target;
+  pushMailAuthToFrame(frame);
+}
+
+function syncMailModuleSection(route) {
+  const safeRoute = String(route || localStorage.getItem(MAIL_ROUTE_KEY) || "email").replace(/^\/+/, "");
+  localStorage.setItem(MAIL_ROUTE_KEY, safeRoute);
+  contentShell?.classList.add("content--mail-module");
+  const hint = document.getElementById("mailModuleTargetHint");
+  if (hint) {
+    hint.textContent = `加载地址：${mailAdminUrl(safeRoute)}`;
+  }
+  navigateMailModuleFrame(safeRoute);
+}
+
 async function switchSection(id, options = {}) {
-  const { persist = true } = options;
+  const { persist = true, mailRoute = "" } = options;
   const hasTargetSection = Array.from(sections).some((section) => section.id === id);
   let nextSectionId = hasTargetSection ? id : "overview";
   if (!hasTargetSection && id) {
@@ -1345,9 +1410,21 @@ async function switchSection(id, options = {}) {
   sections.forEach((section) => {
     section.classList.toggle("active", section.id === nextSectionId);
   });
+  const activeMailRoute = mailRoute || localStorage.getItem(MAIL_ROUTE_KEY) || "email";
   navItems.forEach((item) => {
-    item.classList.toggle("active", item.dataset.section === nextSectionId);
+    const sameSection = item.dataset.section === nextSectionId;
+    const mailItemRoute = item.dataset.mailRoute || "";
+    const matchesMailRoute = nextSectionId !== "mail-module"
+      ? true
+      : (mailItemRoute ? mailItemRoute === activeMailRoute : false);
+    item.classList.toggle("active", sameSection && matchesMailRoute);
   });
+  if (nextSectionId !== "mail-module") {
+    contentShell?.classList.remove("content--mail-module");
+    document.querySelector(".app")?.classList.remove("app--mail-module");
+  } else {
+    document.querySelector(".app")?.classList.add("app--mail-module");
+  }
   if (persist) {
     localStorage.setItem(LAST_SECTION_KEY, nextSectionId);
   }
@@ -1430,11 +1507,18 @@ async function switchSection(id, options = {}) {
       setStatus(humanizeRequestErrorMessage(error) || "加载失败采集失败", "error");
     }
   }
+  if (nextSectionId === "mail-module") {
+    syncMailModuleSection(mailRoute || activeMailRoute);
+  }
 }
 
 navItems.forEach((item) => {
   item.addEventListener("click", () => {
-    void switchSection(item.dataset.section);
+    const mailRoute = item.dataset.mailRoute || "";
+    if (mailRoute) {
+      localStorage.setItem(MAIL_ROUTE_KEY, mailRoute);
+    }
+    void switchSection(item.dataset.section, { mailRoute });
   });
 });
 

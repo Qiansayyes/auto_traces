@@ -243,7 +243,7 @@ object AppCoordinator {
             }
             enqueuePendingReports()
             PrefsStore.saveLocalStatus("running")
-            updateRuntime(localStatus = "running", lastMessage = reason)
+            updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = reason)
             if (!WorkerServiceTracker.isRunning) {
                 runCatching { WorkerService.start(appContext) }
                     .onFailure {
@@ -607,6 +607,13 @@ object AppCoordinator {
                     continue
                 }
 
+                // 未登录：仅自动登录，不拉取用户名、不执行任务、不进入休息
+                if (!isAssignedAccountLoggedIn(alias, deviceId)) {
+                    updateRuntime(lastMessage = "未登录，仅自动登录")
+                    ensureAccountLoggedInWithRetry(alias, deviceId, "涨粉")
+                    continue
+                }
+
                 if (!ensureAssignedAccountReadyForGrowthPull(alias, deviceId)) {
                     continue
                 }
@@ -698,6 +705,11 @@ object AppCoordinator {
 
     private suspend fun fetchUsernamesOnce(alias: String, deviceId: String) {
         try {
+            if (!isAssignedAccountLoggedIn(alias, deviceId)) {
+                LogCenter.op(alias, "未登录，跳过拉取用户名（仅自动登录）")
+                updateRuntime(lastMessage = "未登录，仅自动登录")
+                return
+            }
             // 配置与批次拉取绑定：每次拉一批用户名前先拉一次最新配置。
             fetchConfig()
             val pullN = _config.value.pull_batch_size.let { if (it < 1) 5 else it }.coerceIn(1, 100)
@@ -709,14 +721,6 @@ object AppCoordinator {
                 PrefsStore.getLogContextUsername(),
             )
             if (response.code == 2) {
-                if (!isAssignedAccountLoggedIn(alias, deviceId)) {
-                    LogCenter.op(
-                        alias,
-                        "云端要求休息但账号未登录，跳过休息（未执行有效涨粉任务）",
-                    )
-                    updateRuntime(lastMessage = "未登录，跳过休息")
-                    return
-                }
                 val minutes = (response.rest_minutes ?: 0).coerceAtLeast(1)
                 val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
                 LogCenter.op(
@@ -778,6 +782,9 @@ object AppCoordinator {
     }
 
     private suspend fun reportOnlineBeforePull(alias: String, deviceId: String) {
+        if (shouldAbortPullExecution()) {
+            return
+        }
         try {
             // 拉取循环内本地已是 running，必须向服务端同步为 running，
             // 若同步为 online 会覆盖服务端状态，导致 pull_username 返回「设备未启动」
@@ -1312,8 +1319,7 @@ object AppCoordinator {
         }.getOrNull()
 
     /**
-     * 涨粉拉取循环门禁：校验云端分配账号；is_login=否 时持续自动登录重试（不暂停涨粉）。
-     * 登录状态保障仅在云端下发/切换到涨粉模式时执行一次（[growthModeLoginSafeguardPending]）。
+     * 涨粉拉取循环门禁（已登录前提下）：校验分配账号、执行一次性登录状态保障。
      */
     private suspend fun ensureAssignedAccountReadyForGrowthPull(
         alias: String,
@@ -1335,11 +1341,6 @@ object AppCoordinator {
         accountResp.username?.trim()?.takeIf { it.isNotBlank() }?.let {
             PrefsStore.setLogContextUsername(it)
         }
-        if (accountResp.is_login != true) {
-            if (!ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "涨粉拉取前")) {
-                return false
-            }
-        }
         if (!growthModeLoginSafeguardPending) {
             return true
         }
@@ -1354,10 +1355,8 @@ object AppCoordinator {
             strict = true,
         )
         if (!safeguardOk) {
-            if (!ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "登录状态保障失败后续登")) {
-                return false
-            }
-            return true
+            pauseGrowthAfterLoginFailure(alias, deviceId, "登录状态保障失败")
+            return false
         }
         if (PrefsStore.getLocalStatus() != "running") {
             resumeRunningAfterGrowthAutoLogin(alias, deviceId)
@@ -3585,8 +3584,12 @@ object AppCoordinator {
             return
         }
         if (!isAssignedAccountLoggedIn(alias, deviceId)) {
+            if (shouldAbortPullExecution()) {
+                LogCenter.op(alias, "硬停/暂停中：未登录，跳过 $username")
+                return
+            }
             pendingUsernames.add(0, username)
-            ensureGrowthAccountLoggedInWithRetry(alias, deviceId, "执行任务前")
+            LogCenter.op(alias, "涨粉：未登录，$username 已放回队列（等待自动登录）")
             return
         }
         ExecutionScope.enter()
@@ -3862,6 +3865,8 @@ object AppCoordinator {
         manuallyPaused = false
         started.set(false)
         pendingUsernames.clear()
+        pullLoopJob?.cancel()
+        pullLoopJob = null
         PrefsStore.saveLocalStatus("paused")
         updateRuntime(
             localStatus = "paused",

@@ -43,6 +43,12 @@ build/
 coverage/
 .npm/
 *.log
+server/mail_module/node_modules/
+server/mail_module/logs/
+server/mail_module/data/*.sqlite*
+server/mail_module/web/MS_OAuth2API_Next_Web/node_modules/
+!web-mail-admin/
+!web-mail-admin/**
 
 # Logs / temp
 *.log

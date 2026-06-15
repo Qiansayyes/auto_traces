@@ -7441,6 +7441,10 @@ def pull_username(
     finally:
         conn_login.close()
 
+    # 未登录：不拉取用户名、不触发休息、不计休息轮次
+    if not account_logged_in:
+        return {"code": 1, "msg": "账号未登录，请先完成自动登录"}
+
     # ——按“拉取批次”触发休息：已完成 N 次有效拉取后，下一次拉取直接返回休息（不查库）——
     with store.lock:
         rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
@@ -7448,7 +7452,7 @@ def pull_username(
         if batch_threshold_met:
             store.device_pull_rounds[device_id] = 0
 
-    if batch_threshold_met and rest_enabled and account_logged_in:
+    if batch_threshold_met and rest_enabled:
         bmin = max(0, min(break_min_cfg, 24 * 60))
         bmax = max(0, min(break_max_cfg, 24 * 60))
         bmin = max(1, bmin)
@@ -7464,8 +7468,8 @@ def pull_username(
         }
 
     def _finish_pull_username_response(payload: dict, *, count_round: bool = False) -> dict:
-        """仅在本次拉取返回有效用户名后累计休息批次数（空拉取/未登录不计入）。"""
-        if count_round and account_logged_in:
+        """仅在本次拉取返回有效用户名后累计休息批次数。"""
+        if count_round:
             with store.lock:
                 store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
         return payload
@@ -12710,3 +12714,12 @@ def admin_logs_snapshot(
 _start_auto_switch_worker()
 _start_backup_stats_full_query_worker()
 _start_mobile_pending_auto_refill_worker()
+
+try:
+    from mail_integration import attach_mail_module
+
+    attach_mail_module(app)
+except Exception as _mail_module_exc:
+    import logging as _mail_logging
+
+    _mail_logging.getLogger("mail_integration").warning("Mail module not attached: %s", _mail_module_exc)

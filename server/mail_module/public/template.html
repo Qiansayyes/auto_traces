@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>模板管理器 - MS_OAuth2API</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+:root{
+  --bg:#0f0f1a;--bg2:#161625;--bg3:#1e1e32;--bg4:#282845;
+  --accent:#6c5ce7;--accent2:#a29bfe;--accent3:#00cec9;
+  --text:#e8e8f0;--text2:#9b9bb5;--text3:#6b6b85;
+  --border:#2a2a42;--danger:#ff6b6b;--success:#00b894;
+  --glass:rgba(30,30,50,0.7);
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at 30% 40%,rgba(108,92,231,0.06) 0%,transparent 50%),radial-gradient(circle at 70% 60%,rgba(0,206,201,0.04) 0%,transparent 50%);z-index:0;pointer-events:none;}
+
+.container{max-width:1400px;margin:0 auto;padding:20px;position:relative;z-index:1;}
+h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,var(--accent2),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;}
+.subtitle{color:var(--text2);font-size:0.85rem;margin-bottom:24px;}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-bottom:24px;background:var(--bg2);border-radius:12px;padding:4px;border:1px solid var(--border);}
+.tab{padding:10px 24px;border-radius:10px;cursor:pointer;font-size:0.85rem;font-weight:500;color:var(--text2);transition:all .2s;user-select:none;}
+.tab:hover{color:var(--text);}
+.tab.active{background:var(--accent);color:#fff;box-shadow:0 2px 12px rgba(108,92,231,0.3);}
+
+/* Panels */
+.panel{display:none;animation:fadeIn .3s ease;}
+.panel.active{display:block;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+
+/* Cards */
+.card{background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px;transition:all .2s;}
+.card:hover{border-color:rgba(108,92,231,0.3);}
+.card-title{font-size:0.95rem;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
+.card-title .icon{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;}
+
+/* Layout */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;}
+@media(max-width:900px){.grid-2,.grid-3{grid-template-columns:1fr;}}
+
+/* Form */
+.form-group{margin-bottom:14px;}
+.form-label{display:block;font-size:0.78rem;color:var(--text2);margin-bottom:5px;font-weight:500;text-transform:uppercase;letter-spacing:0.5px;}
+.form-input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:0.85rem;font-family:inherit;transition:all .2s;outline:none;}
+.form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(108,92,231,0.15);}
+.form-input::placeholder{color:var(--text3);}
+textarea.form-input{resize:vertical;min-height:60px;}
+select.form-input{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239b9bb5' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'%3E%3C/path%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+
+/* Buttons */
+.btn{padding:10px 20px;border:none;border-radius:10px;font-size:0.85rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s;display:inline-flex;align-items:center;gap:6px;}
+.btn:active{transform:scale(0.97);}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#8b7cf7);color:#fff;box-shadow:0 2px 12px rgba(108,92,231,0.25);}
+.btn-primary:hover{box-shadow:0 4px 20px rgba(108,92,231,0.4);transform:translateY(-1px);}
+.btn-secondary{background:var(--bg3);color:var(--text);border:1px solid var(--border);}
+.btn-secondary:hover{border-color:var(--accent);}
+.btn-danger{background:rgba(255,107,107,0.15);color:var(--danger);border:1px solid rgba(255,107,107,0.2);}
+.btn-danger:hover{background:rgba(255,107,107,0.25);}
+.btn-success{background:linear-gradient(135deg,var(--success),#00e6b8);color:#fff;}
+.btn-sm{padding:6px 14px;font-size:0.78rem;border-radius:8px;}
+.btn-group{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;}
+
+/* Email list */
+.email-list{max-height:500px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent;}
+.email-item{padding:14px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:all .15s;display:grid;grid-template-columns:1fr auto;gap:6px;}
+.email-item:hover{background:rgba(108,92,231,0.06);}
+.email-item.selected{background:rgba(108,92,231,0.12);border-left:3px solid var(--accent);}
+.email-item:last-child{border-bottom:none;}
+.email-sender{font-size:0.82rem;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.email-subject{font-size:0.82rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;grid-column:1/-1;}
+.email-date{font-size:0.72rem;color:var(--text3);white-space:nowrap;}
+.email-body-preview{font-size:0.78rem;color:var(--text3);margin-top:4px;grid-column:1/-1;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+
+/* Template list */
+.template-item{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--border);transition:all .15s;}
+.template-item:last-child{border-bottom:none;}
+.template-item:hover{background:rgba(108,92,231,0.06);}
+.template-info{flex:1;min-width:0;}
+.template-name{font-weight:600;font-size:0.88rem;}
+.template-desc{font-size:0.78rem;color:var(--text2);margin-top:2px;}
+.template-meta{display:flex;gap:12px;margin-top:6px;flex-wrap:wrap;}
+.template-tag{font-size:0.7rem;padding:3px 8px;border-radius:6px;background:var(--bg);border:1px solid var(--border);}
+.template-tag.sender{border-color:rgba(108,92,231,0.3);color:var(--accent2);}
+.template-tag.subject{border-color:rgba(0,206,201,0.3);color:var(--accent3);}
+.template-tag.pattern{border-color:rgba(255,107,107,0.3);color:var(--danger);}
+
+/* Wizard steps */
+.wizard{counter-reset:step;}
+.wizard-step{position:relative;padding:16px 16px 16px 52px;margin-bottom:12px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;transition:all .2s;}
+.wizard-step.active{border-color:var(--accent);background:rgba(108,92,231,0.04);}
+.wizard-step.done{border-color:var(--success);opacity:0.7;}
+.wizard-step::before{counter-increment:step;content:counter(step);position:absolute;left:16px;top:18px;width:24px;height:24px;border-radius:50%;background:var(--bg3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--text2);}
+.wizard-step.active::before{background:var(--accent);color:#fff;border-color:var(--accent);}
+.wizard-step.done::before{content:'✓';background:var(--success);color:#fff;border-color:var(--success);}
+.wizard-title{font-size:0.88rem;font-weight:600;margin-bottom:8px;}
+
+/* Highlight */
+.highlight-area{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:16px;font-size:0.82rem;line-height:1.7;max-height:300px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;scrollbar-width:thin;scrollbar-color:var(--border) transparent;user-select:text;}
+.highlight-hint{font-size:0.75rem;color:var(--accent2);margin-top:6px;font-style:italic;}
+
+/* Status */
+.status{padding:10px 16px;border-radius:10px;font-size:0.82rem;margin-bottom:12px;display:none;align-items:center;gap:8px;animation:fadeIn .3s;}
+.status.show{display:flex;}
+.status.info{background:rgba(108,92,231,0.1);border:1px solid rgba(108,92,231,0.2);color:var(--accent2);}
+.status.success{background:rgba(0,184,148,0.1);border:1px solid rgba(0,184,148,0.2);color:var(--success);}
+.status.error{background:rgba(255,107,107,0.1);border:1px solid rgba(255,107,107,0.2);color:var(--danger);}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.empty{text-align:center;padding:40px 20px;color:var(--text3);font-size:0.85rem;}
+.empty .icon{font-size:2rem;margin-bottom:10px;opacity:0.5;}
+
+/* Preview card for selected email */
+.preview-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px;}
+.preview-row{display:flex;gap:8px;margin-bottom:6px;font-size:0.82rem;}
+.preview-label{color:var(--text3);min-width:50px;flex-shrink:0;}
+.preview-value{color:var(--text);word-break:break-all;}
+
+/* Pattern test */
+.test-result{padding:10px 14px;border-radius:8px;font-size:0.82rem;margin-top:10px;}
+.test-result.match{background:rgba(0,184,148,0.1);border:1px solid rgba(0,184,148,0.2);color:var(--success);}
+.test-result.no-match{background:rgba(255,107,107,0.1);border:1px solid rgba(255,107,107,0.2);color:var(--danger);}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📧 模板管理器</h1>
+  <p class="subtitle">从收到的邮件创建提取模板，自动识别和提取验证码</p>
+
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('create')">📝 从邮件创建模板</div>
+    <div class="tab" onclick="switchTab('manage')">📋 管理模板</div>
+  </div>
+
+  <!-- ============ CREATE PANEL ============ -->
+  <div id="panel-create" class="panel active">
+    <div id="status-msg" class="status"></div>
+
+    <div class="wizard">
+      <!-- Step 1: Fetch -->
+      <div class="wizard-step active" id="ws1">
+        <div class="wizard-title">获取邮件</div>
+        <div class="grid-3">
+          <div class="form-group">
+            <label class="form-label">Refresh Token</label>
+            <input class="form-input" id="inp-rt" placeholder="refresh_token">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Client ID</label>
+            <input class="form-input" id="inp-cid" placeholder="client_id">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email</label>
+            <input class="form-input" id="inp-email" placeholder="your@outlook.com">
+          </div>
+        </div>
+        <div class="grid-3">
+          <div class="form-group">
+            <label class="form-label">邮箱文件夹</label>
+            <select class="form-input" id="inp-mailbox">
+              <option value="INBOX">收件箱 (INBOX)</option>
+              <option value="Junk">垃圾邮件 (Junk)</option>
+              <option value="Sent">已发送 (Sent)</option>
+              <option value="Drafts">草稿 (Drafts)</option>
+              <option value="Archive">存档 (Archive)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">获取数量</label>
+            <input class="form-input" id="inp-top" type="number" value="20" min="1" max="100">
+          </div>
+          <div class="form-group">
+            <label class="form-label">代理 (可选)</label>
+            <input class="form-input" id="inp-proxy" placeholder="socks5://ip:port 或 http://ip:port">
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="fetchEmails()">🔄 获取邮件</button>
+        </div>
+      </div>
+
+      <!-- Step 2: Select email -->
+      <div class="wizard-step" id="ws2">
+        <div class="wizard-title">选择一封邮件作为样本</div>
+        <div class="card" style="padding:0;overflow:hidden;">
+          <div class="email-list" id="email-list">
+            <div class="empty"><div class="icon">📭</div>请先获取邮件</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 3: Define template -->
+      <div class="wizard-step" id="ws3">
+        <div class="wizard-title">定义提取规则</div>
+        <div id="selected-preview" style="display:none;">
+          <div class="preview-card">
+            <div class="preview-row"><span class="preview-label">发件人</span><span class="preview-value" id="pv-sender">—</span></div>
+            <div class="preview-row"><span class="preview-label">主题</span><span class="preview-value" id="pv-subject">—</span></div>
+            <div class="preview-row"><span class="preview-label">时间</span><span class="preview-value" id="pv-date">—</span></div>
+          </div>
+
+          <div class="form-label" style="margin-bottom:6px;">邮件正文 <span style="color:var(--accent2)">— 选中你想提取的文本（如验证码），系统会自动生成正则</span></div>
+          <div class="highlight-area" id="email-body" onmouseup="onTextSelect()"></div>
+          <div class="highlight-hint" id="select-hint">💡 用鼠标选中邮件内容中的验证码或目标文字</div>
+
+          <div style="margin-top:16px;" class="grid-2">
+            <div class="form-group">
+              <label class="form-label">模板名称</label>
+              <input class="form-input" id="tpl-name" placeholder="例如: github_verify">
+            </div>
+            <div class="form-group">
+              <label class="form-label">描述 (可选)</label>
+              <input class="form-input" id="tpl-desc" placeholder="描述此模板的用途">
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label">发件人匹配 <span style="font-weight:400;text-transform:none;letter-spacing:0">(包含匹配)</span></label>
+              <input class="form-input" id="tpl-sender" placeholder="例如: noreply@github.com">
+            </div>
+            <div class="form-group">
+              <label class="form-label">主题匹配 <span style="font-weight:400;text-transform:none;letter-spacing:0">(包含匹配，可留空)</span></label>
+              <input class="form-input" id="tpl-subject" placeholder="例如: verification">
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label class="form-label">提取正则表达式 <span style="font-weight:400;text-transform:none;letter-spacing:0">(捕获组 1 为结果)</span></label>
+              <input class="form-input" id="tpl-pattern" placeholder="例如: (\d{6})">
+            </div>
+            <div class="form-group">
+              <label class="form-label">提取来源</label>
+              <select class="form-input" id="tpl-field">
+                <option value="text">纯文本 (text)</option>
+                <option value="html">HTML</option>
+              </select>
+            </div>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-secondary" onclick="testPattern()">🧪 测试正则</button>
+            <button class="btn btn-success" onclick="saveNewTemplate()">💾 保存模板</button>
+          </div>
+          <div id="test-result"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MANAGE PANEL ============ -->
+  <div id="panel-manage" class="panel">
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div id="template-list">
+        <div class="empty"><div class="icon">📄</div>暂无模板</div>
+      </div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" onclick="loadTemplates()">🔄 刷新</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let emailsData = [];
+let selectedEmail = null;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    t.classList.toggle('active', (name==='create'&&i===0)||(name==='manage'&&i===1));
+  });
+  document.getElementById('panel-create').classList.toggle('active', name==='create');
+  document.getElementById('panel-manage').classList.toggle('active', name==='manage');
+  if (name === 'manage') loadTemplates();
+}
+
+function showStatus(msg, type='info', loading=false) {
+  const el = document.getElementById('status-msg');
+  el.className = 'status show ' + type;
+  el.innerHTML = (loading ? '<div class="spinner"></div>' : '') + msg;
+}
+function hideStatus() {
+  document.getElementById('status-msg').className = 'status';
+}
+
+function extractAddr(s) {
+  if (!s) return '';
+  const m = s.match(/<([^>]+)>/);
+  return m ? m[1] : s.trim();
+}
+
+async function fetchEmails() {
+  const rt = document.getElementById('inp-rt').value.trim();
+  const cid = document.getElementById('inp-cid').value.trim();
+  const email = document.getElementById('inp-email').value.trim();
+  const mailbox = document.getElementById('inp-mailbox').value;
+  const top = document.getElementById('inp-top').value || 20;
+  const proxy = document.getElementById('inp-proxy').value.trim();
+
+  if (!rt || !cid || !email) {
+    showStatus('❌ 请填写 Refresh Token、Client ID 和 Email', 'error');
+    return;
+  }
+
+  showStatus('正在获取邮件...', 'info', true);
+
+  try {
+    const params = new URLSearchParams({
+      refresh_token: rt, client_id: cid, email, mailbox, top
+    });
+    if (proxy.startsWith('socks5')) params.set('socks5', proxy);
+    else if (proxy) params.set('http', proxy);
+
+    const res = await fetch('/api/mail_new?' + params.toString());
+    const json = await res.json();
+
+    if (json.code === '200' || json.code === 200) {
+      const data = Array.isArray(json.data) ? json.data : (json.data?.emails || []);
+      emailsData = data;
+      renderEmailList(data);
+      showStatus(`✅ 成功获取 ${data.length} 封邮件`, 'success');
+      document.getElementById('ws1').classList.replace('active','done');
+      document.getElementById('ws2').classList.add('active');
+      setTimeout(hideStatus, 2000);
+    } else {
+      showStatus('❌ ' + (json.error || json.message || '获取失败'), 'error');
+    }
+  } catch (e) {
+    showStatus('❌ 请求失败: ' + e.message, 'error');
+  }
+}
+
+function renderEmailList(emails) {
+  const el = document.getElementById('email-list');
+  if (!emails.length) {
+    el.innerHTML = '<div class="empty"><div class="icon">📭</div>没有找到邮件</div>';
+    return;
+  }
+  el.innerHTML = emails.map((e, i) => `
+    <div class="email-item" onclick="selectEmail(${i})" id="ei-${i}">
+      <span class="email-sender">${esc(e.send || '未知发件人')}</span>
+      <span class="email-date">${formatDate(e.date)}</span>
+      <span class="email-subject">${esc(e.subject || '(无主题)')}</span>
+      <span class="email-body-preview">${esc((e.text || '').substring(0, 120))}</span>
+    </div>
+  `).join('');
+}
+
+function selectEmail(idx) {
+  selectedEmail = emailsData[idx];
+  document.querySelectorAll('.email-item').forEach(e => e.classList.remove('selected'));
+  document.getElementById('ei-' + idx).classList.add('selected');
+
+  // Fill preview
+  document.getElementById('selected-preview').style.display = 'block';
+  document.getElementById('pv-sender').textContent = selectedEmail.send || '—';
+  document.getElementById('pv-subject').textContent = selectedEmail.subject || '—';
+  document.getElementById('pv-date').textContent = formatDate(selectedEmail.date);
+  document.getElementById('email-body').textContent = selectedEmail.text || selectedEmail.html || '(无内容)';
+
+  // Auto-fill sender
+  document.getElementById('tpl-sender').value = extractAddr(selectedEmail.send);
+  document.getElementById('tpl-subject').value = '';
+  document.getElementById('tpl-pattern').value = '';
+  document.getElementById('tpl-name').value = '';
+  document.getElementById('test-result').innerHTML = '';
+
+  document.getElementById('ws2').classList.replace('active','done');
+  document.getElementById('ws3').classList.add('active');
+
+  // Scroll to step 3
+  document.getElementById('ws3').scrollIntoView({ behavior:'smooth', block:'center' });
+}
+
+function onTextSelect() {
+  const sel = window.getSelection();
+  const text = sel.toString().trim();
+  if (!text) return;
+
+  const hint = document.getElementById('select-hint');
+
+  // Try to auto-generate a regex pattern
+  let pattern = '';
+  if (/^\d+$/.test(text)) {
+    pattern = `(\\d{${text.length}})`;
+    hint.textContent = `✅ 检测到 ${text.length} 位数字验证码: "${text}" → 正则: ${pattern}`;
+  } else if (/^[a-zA-Z0-9]+$/.test(text)) {
+    pattern = `([a-zA-Z0-9]{${text.length}})`;
+    hint.textContent = `✅ 检测到 ${text.length} 位字母数字码: "${text}" → 正则: ${pattern}`;
+  } else {
+    // Escape and use as literal with a capturing group 
+    const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    pattern = `(${escaped})`;
+    hint.textContent = `✅ 选中文本: "${text}" → 已生成字面匹配正则`;
+  }
+
+  document.getElementById('tpl-pattern').value = pattern;
+  hint.style.color = 'var(--success)';
+}
+
+function testPattern() {
+  const pattern = document.getElementById('tpl-pattern').value.trim();
+  const field = document.getElementById('tpl-field').value;
+  const el = document.getElementById('test-result');
+
+  if (!pattern) {
+    el.innerHTML = '<div class="test-result no-match">请先输入正则表达式</div>';
+    return;
+  }
+  if (!selectedEmail) {
+    el.innerHTML = '<div class="test-result no-match">请先选择一封邮件</div>';
+    return;
+  }
+
+  const content = field === 'html' ? selectedEmail.html : selectedEmail.text;
+  if (!content) {
+    el.innerHTML = '<div class="test-result no-match">邮件没有' + (field === 'html' ? 'HTML' : '文本') + '内容</div>';
+    return;
+  }
+
+  try {
+    const regex = new RegExp(pattern);
+    const result = regex.exec(content);
+    if (result && result[1]) {
+      el.innerHTML = `<div class="test-result match">✅ 匹配成功！提取结果: <strong>${esc(result[1])}</strong></div>`;
+    } else if (result) {
+      el.innerHTML = `<div class="test-result no-match">⚠️ 正则匹配了但没有捕获组。请确保用括号 () 包裹要提取的部分。</div>`;
+    } else {
+      el.innerHTML = `<div class="test-result no-match">❌ 未匹配到内容，请调整正则表达式</div>`;
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="test-result no-match">❌ 正则语法错误: ${esc(e.message)}</div>`;
+  }
+}
+
+async function saveNewTemplate() {
+  const name = document.getElementById('tpl-name').value.trim();
+  const desc = document.getElementById('tpl-desc').value.trim();
+  const sender = document.getElementById('tpl-sender').value.trim();
+  const subject = document.getElementById('tpl-subject').value.trim();
+  const pattern = document.getElementById('tpl-pattern').value.trim();
+  const field = document.getElementById('tpl-field').value;
+
+  if (!name) { showStatus('❌ 请输入模板名称', 'error'); return; }
+  if (!pattern) { showStatus('❌ 请输入提取正则表达式', 'error'); return; }
+
+  showStatus('正在保存模板...', 'info', true);
+
+  try {
+    const res = await fetch('/api/template/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name, description: desc,
+        match: { sender: sender || null, subject: subject || null },
+        extract: { type: 'regex', pattern, field }
+      })
+    });
+    const json = await res.json();
+    if (json.code === '200' || json.code === 200) {
+      showStatus(`✅ 模板 "${name}" 保存成功！`, 'success');
+      setTimeout(hideStatus, 3000);
+    } else {
+      showStatus('❌ ' + (json.message || '保存失败'), 'error');
+    }
+  } catch (e) {
+    showStatus('❌ 保存失败: ' + e.message, 'error');
+  }
+}
+
+async function loadTemplates() {
+  const el = document.getElementById('template-list');
+  el.innerHTML = '<div style="padding:20px;text-align:center;"><div class="spinner" style="margin:0 auto;"></div></div>';
+
+  try {
+    const res = await fetch('/api/template/list');
+    const json = await res.json();
+    const data = json.data || [];
+    if (!data.length) {
+      el.innerHTML = '<div class="empty"><div class="icon">📄</div>暂无模板<br><small style="color:var(--text3)">切换到「从邮件创建模板」标签页创建第一个模板</small></div>';
+      return;
+    }
+    el.innerHTML = data.map(t => `
+      <div class="template-item">
+        <div class="template-info">
+          <div class="template-name">${esc(t.name)}</div>
+          ${t.description ? `<div class="template-desc">${esc(t.description)}</div>` : ''}
+          <div class="template-meta">
+            ${t.match?.sender ? `<span class="template-tag sender">📧 ${esc(t.match.sender)}</span>` : ''}
+            ${t.match?.subject ? `<span class="template-tag subject">📋 ${esc(t.match.subject)}</span>` : ''}
+            <span class="template-tag pattern">🔍 ${esc(t.extract?.pattern || '')}</span>
+          </div>
+        </div>
+        <button class="btn btn-danger btn-sm" onclick="deleteTemplate('${esc(t.name)}')">删除</button>
+      </div>
+    `).join('');
+  } catch (e) {
+    el.innerHTML = `<div class="empty">❌ 加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+async function deleteTemplate(name) {
+  if (!confirm(`确定删除模板 "${name}" 吗？`)) return;
+  try {
+    await fetch('/api/template/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    loadTemplates();
+  } catch (e) {
+    alert('删除失败: ' + e.message);
+  }
+}
+
+function formatDate(d) {
+  if (!d) return '—';
+  try {
+    const dt = new Date(d);
+    return dt.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+  } catch { return d; }
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>
