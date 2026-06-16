@@ -2675,7 +2675,8 @@ class MutualClickRequest(BaseModel):
 class DeviceTikTokEmailCodeRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
-    api_url: str = Field(..., min_length=1, max_length=2048)
+    email: str = Field(default="", max_length=255)
+    api_url: str = Field(default="", max_length=2048)
 
 
 class DeviceAssignedAccountMarkLoginRequest(BaseModel):
@@ -7665,8 +7666,53 @@ def _fetch_tiktok_email_code_from_api(api_url: str) -> tuple[int, str, str | Non
     return 0, "ok", code
 
 
-def _tiktok_email_code_response(device_id: str, alias: str, api_url: str) -> dict:
-    code, msg, email_code = _fetch_tiktok_email_code_from_api(api_url)
+def _try_fetch_tiktok_email_code_via_mail_module(owner_username: str, email: str) -> tuple[int, str, str | None]:
+    try:
+        from mail_integration import fetch_tiktok_email_code_via_mail_module, mail_module_can_fetch_code
+    except ImportError:
+        return 1, "邮箱管理模块未集成", None
+    if not mail_module_can_fetch_code(owner_username, email):
+        return 1, "邮箱管理模块未配置该邮箱或令牌无效", None
+    return fetch_tiktok_email_code_via_mail_module(
+        owner_username,
+        email,
+        _extract_tiktok_email_code,
+    )
+
+
+def _tiktok_email_code_response(
+    device_id: str,
+    alias: str,
+    api_url: str,
+    *,
+    owner_username: str | None = None,
+    account_email: str | None = None,
+) -> dict:
+    owner = str(owner_username or "").strip()
+    email = str(account_email or "").strip()
+
+    if owner and email:
+        mail_code, mail_msg, mail_email_code = _try_fetch_tiktok_email_code_via_mail_module(owner, email)
+        if mail_code == 0 and mail_email_code:
+            print(
+                f"[{now_text()}] device_tiktok.email_code | ok_mail_module | device={device_id} "
+                f"alias={alias} email={email} | code={mail_email_code}"
+            )
+            return {"code": 0, "msg": "ok", "email_code": mail_email_code, "source": "mail_module"}
+        print(
+            f"[{now_text()}] device_tiktok.email_code | mail_module_fallback | device={device_id} "
+            f"alias={alias} email={email} | {mail_msg}"
+        )
+
+    legacy_url = (api_url or "").strip()
+    if not legacy_url:
+        return {
+            "code": 1,
+            "msg": "邮箱管理模块不可用且 API 为空，无法获取验证码",
+            "email_code": None,
+        }
+
+    code, msg, email_code = _fetch_tiktok_email_code_from_api(legacy_url)
     if code != 0 or not email_code:
         print(
             f"[{now_text()}] device_tiktok.email_code | failed | device={device_id} "
@@ -7674,10 +7720,10 @@ def _tiktok_email_code_response(device_id: str, alias: str, api_url: str) -> dic
         )
         return {"code": code, "msg": msg, "email_code": None}
     print(
-        f"[{now_text()}] device_tiktok.email_code | ok | device={device_id} "
+        f"[{now_text()}] device_tiktok.email_code | ok_api | device={device_id} "
         f"alias={alias} | code={email_code}"
     )
-    return {"code": 0, "msg": "ok", "email_code": email_code}
+    return {"code": 0, "msg": "ok", "email_code": email_code, "source": "api"}
 
 
 def _effective_device_editor_alias(row: dict[str, Any]) -> str:
@@ -7762,18 +7808,27 @@ def device_assigned_account(device_id: str, alias: str):
         row = _fetch_device_assigned_account_row(conn, owner, alias)
         if not row:
             return {"code": 1, "msg": "未找到该别名分配的 TikTok 账号"}
+        account_email = str(row.get("email") or "").strip()
+        mail_module_code_available = False
+        try:
+            from mail_integration import mail_module_can_fetch_code
+
+            mail_module_code_available = mail_module_can_fetch_code(owner, account_email)
+        except ImportError:
+            mail_module_code_available = False
         return {
             "code": 0,
             "msg": "ok",
             "row_index": int(row.get("row_index") or 0),
             "username": str(row.get("username") or "").strip(),
-            "email": str(row.get("email") or "").strip(),
+            "email": account_email,
             "password": str(row.get("password") or "").strip(),
             "email_password": str(row.get("email_password") or "").strip(),
             "api": str(row.get("api") or "").strip(),
             "is_login": bool(int(row.get("is_login") or 0)),
             "login_time": str(row.get("login_time") or "").strip(),
             "basic_profile_modified": _normalize_switch_highlight(row.get("basic_profile_modified")),
+            "mail_module_code_available": mail_module_code_available,
         }
     finally:
         conn.close()
@@ -7910,11 +7965,18 @@ def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdate
 
 @app.post("/api/device/tiktok/email_code")
 def device_tiktok_email_code(payload: DeviceTikTokEmailCodeRequest):
-    """设备端直连邮箱 API 失败时，由服务端代拉并解析 6 位 TikTok 验证码（仅需设备绑定）。"""
-    error, _device = auth_or_error(payload.device_id, payload.alias)
+    """设备端拉取 TikTok 邮箱验证码：优先邮箱管理模块，失败则回退旧 API 链接。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
     if error:
         return error
-    return _tiktok_email_code_response(payload.device_id, payload.alias, payload.api_url)
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    return _tiktok_email_code_response(
+        payload.device_id,
+        payload.alias,
+        payload.api_url,
+        owner_username=owner,
+        account_email=payload.email,
+    )
 
 
 @app.post("/api/admin/device_tiktok/email_code")
@@ -7923,10 +7985,17 @@ def admin_device_tiktok_email_code(
     authorization: str | None = Header(default=None),
 ):
     """管理台/已登录用户代设备拉取 TikTok 邮箱验证码。"""
-    err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    err, device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
-    return _tiktok_email_code_response(payload.device_id, payload.alias, payload.api_url)
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    return _tiktok_email_code_response(
+        payload.device_id,
+        payload.alias,
+        payload.api_url,
+        owner_username=owner,
+        account_email=payload.email,
+    )
 
 
 @app.post("/api/admin/device_tiktok/mutual_click_start")

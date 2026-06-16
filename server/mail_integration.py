@@ -12,11 +12,12 @@ import asyncio
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import APIRouter, Request, Response
@@ -29,6 +30,7 @@ logger = logging.getLogger("mail_integration")
 SERVER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SERVER_DIR.parent
 MAIL_MODULE_DIR = SERVER_DIR / "mail_module"
+MAIL_ACCOUNTS_DB_PATH = MAIL_MODULE_DIR / "data" / "accounts.sqlite"
 MAIL_WEB_DIST = PROJECT_ROOT / "web-mail-admin"
 if not MAIL_WEB_DIST.exists():
     MAIL_WEB_DIST = MAIL_MODULE_DIR / "web" / "MS_OAuth2API_Next_Web" / "dist"
@@ -96,6 +98,194 @@ def _mail_module_ready() -> bool:
         return resp.status_code < 500
     except Exception:
         return False
+
+
+def is_mail_module_ready() -> bool:
+    """邮箱管理 Node 子服务是否可用。"""
+    return MAIL_MODULE_ENABLED and _mail_module_ready()
+
+
+def _normalize_mail_email(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def get_mail_account_record(owner_username: str, email: str) -> dict[str, Any] | None:
+    """从邮箱管理模块 SQLite 读取账户（含 OAuth 令牌）。"""
+    owner = str(owner_username or "").strip()
+    account_email = _normalize_mail_email(email)
+    if not owner or not account_email or "@" not in account_email:
+        return None
+    if not MAIL_ACCOUNTS_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(MAIL_ACCOUNTS_DB_PATH), timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """
+                SELECT record_key, email, password, client_id, refresh_token, status, owner_username, updated_at
+                FROM account_records
+                WHERE lower(email) = lower(?)
+                  AND owner_username = ?
+                  AND status = 'active'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (account_email, owner),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("Failed to read mail account record for %s: %s", account_email, exc)
+        return None
+    return dict(row) if row else None
+
+
+def mail_account_has_valid_token(record: dict[str, Any] | None) -> bool:
+    if not record:
+        return False
+    if str(record.get("status") or "").strip().lower() != "active":
+        return False
+    client_id = str(record.get("client_id") or "").strip()
+    refresh_token = str(record.get("refresh_token") or "").strip()
+    email = str(record.get("email") or "").strip()
+    return bool(email and client_id and refresh_token)
+
+
+def mail_module_can_fetch_code(owner_username: str, email: str) -> bool:
+    """邮箱管理模块是否已配置该邮箱且令牌齐全。"""
+    if not is_mail_module_ready():
+        return False
+    record = get_mail_account_record(owner_username, email)
+    return mail_account_has_valid_token(record)
+
+
+def _internal_mail_headers(owner_username: str) -> dict[str, str]:
+    return {
+        "X-Mail-Internal-Secret": MAIL_INTERNAL_SECRET,
+        "X-Mail-Owner": str(owner_username or "").strip(),
+        "Content-Type": "application/json",
+    }
+
+
+def _extract_mail_messages(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        emails = payload.get("emails")
+        if isinstance(emails, list):
+            return [item for item in emails if isinstance(item, dict)]
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            nested = data.get("emails")
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+def _mail_message_sort_key(mail: dict[str, Any]) -> float:
+    raw = str(mail.get("date") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(time.mktime(time.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        pass
+    try:
+        return float(time.mktime(time.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")))
+    except Exception:
+        return 0.0
+
+
+def fetch_mails_via_mail_module(
+    owner_username: str,
+    account: dict[str, Any],
+    *,
+    mailbox: str = "INBOX",
+    top: int = 30,
+    timeout_sec: float = 60.0,
+) -> list[dict[str, Any]]:
+    """通过内部接口拉取邮箱最近邮件（不经过 FastAPI 代理层）。"""
+    owner = str(owner_username or "").strip()
+    email = str(account.get("email") or "").strip()
+    client_id = str(account.get("client_id") or "").strip()
+    refresh_token = str(account.get("refresh_token") or "").strip()
+    if not owner or not email or not client_id or not refresh_token:
+        return []
+    if not is_mail_module_ready():
+        return []
+
+    payload = {
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "email": email,
+        "mailbox": mailbox,
+        "top": max(1, min(int(top or 30), 200)),
+    }
+    try:
+        resp = httpx.post(
+            f"{_mail_upstream_base()}/api/mail_new",
+            headers=_internal_mail_headers(owner),
+            json=payload,
+            timeout=timeout_sec,
+        )
+    except httpx.RequestError as exc:
+        logger.warning("Mail module mail_new failed for %s/%s: %s", email, mailbox, exc)
+        return []
+    if resp.status_code != 200:
+        logger.warning(
+            "Mail module mail_new HTTP %s for %s/%s: %s",
+            resp.status_code,
+            email,
+            mailbox,
+            (resp.text or "")[:200],
+        )
+        return []
+    try:
+        body = resp.json()
+    except ValueError:
+        return []
+    if str(body.get("code") or "") not in {"200", 200}:
+        return []
+    return _extract_mail_messages(body.get("data"))
+
+
+def fetch_tiktok_email_code_via_mail_module(
+    owner_username: str,
+    email: str,
+    extract_code: Callable[[str], str],
+    *,
+    top: int = 30,
+) -> tuple[int, str, str | None]:
+    """优先从邮箱管理模块拉信并解析 TikTok 6 位验证码。"""
+    record = get_mail_account_record(owner_username, email)
+    if not mail_account_has_valid_token(record):
+        return 1, "邮箱管理模块未配置该邮箱或令牌无效", None
+    if not is_mail_module_ready():
+        return 1, "邮箱管理模块未就绪", None
+
+    collected: list[dict[str, Any]] = []
+    for mailbox in ("INBOX", "Junk"):
+        collected.extend(fetch_mails_via_mail_module(owner_username, record or {}, mailbox=mailbox, top=top))
+
+    if not collected:
+        return 1, "邮箱管理模块未拉取到邮件", None
+
+    collected.sort(key=_mail_message_sort_key, reverse=True)
+    for mail in collected:
+        for field in ("subject", "text", "html"):
+            chunk = str(mail.get(field) or "").strip()
+            if not chunk:
+                continue
+            try:
+                code = extract_code(chunk)
+            except ValueError:
+                continue
+            if code:
+                return 0, "ok", code
+    return 1, "邮箱管理模块邮件中未识别到 6 位验证码", None
 
 
 def _wait_for_mail_module() -> bool:

@@ -13091,13 +13091,14 @@ class RealTraceExecutor(
         h: Int,
         deviceId: String,
         apiUrl: String,
+        email: String,
     ): AutoLoginStepOutcome {
         val startedAt = System.currentTimeMillis()
         var resendRetries = 0
         var ocrPass = 0
 
         suspend fun fetchAndInputCode(focusVision: Text? = null): Boolean {
-            val codeResult = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl)
+            val codeResult = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl, email)
             val fetched = codeResult.getOrNull()
             if (fetched.isNullOrBlank()) {
                 devOp(alias, "自动登录：获取验证码失败：${codeResult.exceptionOrNull()?.message}")
@@ -13341,13 +13342,13 @@ class RealTraceExecutor(
                 return false
             }
 
-            if (apiUrl.isBlank()) {
-                devOp(alias, "自动登录：需要验证码但 API 为空")
+            if (apiUrl.isBlank() && email.isBlank()) {
+                devOp(alias, "自动登录：需要验证码但 API 与邮箱均为空")
                 return false
             }
             var reachedInterestAfterCode = false
             var reachedHomeAfterCode = false
-            when (autoLoginEnterVerificationCode(ctx, alias, w, h, deviceId, apiUrl)) {
+            when (autoLoginEnterVerificationCode(ctx, alias, w, h, deviceId, apiUrl, email)) {
                 AutoLoginStepOutcome.Ok -> Unit
                 AutoLoginStepOutcome.ReachedInterest -> reachedInterestAfterCode = true
                 AutoLoginStepOutcome.ReachedHome -> reachedHomeAfterCode = true

@@ -624,7 +624,7 @@
           </div>
           <div class="panel-card" style="margin-top:12px;background:#f8faff;">
             <h4 style="margin:0 0 8px;">账号文本批量导入</h4>
-            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 分隔。列顺序：username、password、email、email_password、(忽略)、(忽略)、api。</div>
+            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持两种列格式：① 5 列 username、password、email、email_password、api；② 7 列 username、password、email、email_password、(忽略)、(忽略)、api。已存在的 username 会合并更新空字段。</div>
             <div class="field" style="max-width:280px;margin-bottom:8px;">
               <label>统一国家地区（必填）</label>
               <input id="accountBatchRegionInput" type="text" placeholder="例如：MX / US" required autocomplete="off" />
@@ -633,7 +633,7 @@
               <input id="accountBatchRejectEmptyToggle" type="checkbox" checked />
               空值也允许导入（username、password、email、email_password、api）
             </label>
-            <textarea id="accountBatchInput" placeholder="支持两种格式：1) username[TAB]password[TAB]email[TAB]email_password[TAB]ignore[TAB]ignore[TAB]api  2) username----password----email----email_password----ignore----ignore----api"></textarea>
+            <textarea id="accountBatchInput" placeholder="5列：username[TAB]password[TAB]email[TAB]email_password[TAB]api  或 7列：username[TAB]password[TAB]email[TAB]email_password[TAB]ignore[TAB]ignore[TAB]api"></textarea>
             <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
               <button id="importAccountBatchBtn" class="primary">批量导入账号</button>
             </div>

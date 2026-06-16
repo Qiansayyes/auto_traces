@@ -194,10 +194,16 @@ object ApiService {
         clazz = DeviceAssignedAccountUpdateUsernameResponse::class.java,
     )
 
-    suspend fun getTikTokEmailCodeFromServer(deviceId: String, alias: String, apiUrl: String): TikTokEmailCodeResponse {
+    suspend fun getTikTokEmailCodeFromServer(
+        deviceId: String,
+        alias: String,
+        apiUrl: String,
+        email: String,
+    ): TikTokEmailCodeResponse {
         val body = mapOf(
             "device_id" to deviceId,
             "alias" to alias,
+            "email" to email,
             "api_url" to apiUrl,
         )
         val paths = listOf(

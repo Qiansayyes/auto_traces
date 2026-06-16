@@ -7124,6 +7124,57 @@ async function saveAccountRow(index, options = {}) {
   }
 }
 
+function hasMeaningfulAccountValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  return !["ignore", "ignored", "null", "none", "n/a", "na", "-", "--", "_"].includes(normalized);
+}
+
+function mergeAccountImportRow(existing, incoming) {
+  const merged = { ...existing };
+  for (const field of ["password", "email", "email_password", "api", "region"]) {
+    const incomingValue = String(incoming?.[field] || "").trim();
+    if (hasMeaningfulAccountValue(incomingValue)) {
+      merged[field] = incomingValue;
+    }
+  }
+  return merged;
+}
+
+const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "api", "region"];
+
+function hasAccountImportRowChanges(existing, incoming) {
+  const merged = mergeAccountImportRow(existing, incoming);
+  return ACCOUNT_IMPORT_MERGE_FIELDS.some((field) => {
+    return String(existing?.[field] || "").trim() !== String(merged?.[field] || "").trim();
+  });
+}
+
+function getAccountImportOverwriteChanges(existing, incoming) {
+  const changes = [];
+  for (const field of ACCOUNT_IMPORT_MERGE_FIELDS) {
+    const before = String(existing?.[field] || "").trim();
+    const after = String(incoming?.[field] || "").trim();
+    if (!hasMeaningfulAccountValue(after)) continue;
+    if (!hasMeaningfulAccountValue(before)) continue;
+    if (before !== after) {
+      changes.push({ field, before, after });
+    }
+  }
+  return changes;
+}
+
+function buildAccountImportOverwriteConfirmMessage(overwriteSummaries) {
+  const lines = overwriteSummaries.map(({ username, changes }) => {
+    const fieldLines = changes
+      .map((item) => `  - ${item.field}: 「${item.before}」→「${item.after}」`)
+      .join("\n");
+    return `${username}:\n${fieldLines}`;
+  });
+  return `以下账号将覆盖已有非空字段，确认继续导入？\n\n${lines.join("\n\n")}`;
+}
+
 function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const raw = String(line || "").trim();
   if (!raw) return null;
@@ -7155,19 +7206,13 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   } else {
     api = String(normalizedCols[4] || "").trim();
   }
-  const hasMeaningfulValue = (value) => {
-    const text = String(value || "").trim();
-    if (!text) return false;
-    const normalized = text.toLowerCase();
-    return !["ignore", "ignored", "null", "none", "n/a", "na", "-", "--", "_"].includes(normalized);
-  };
   if (rejectEmpty) {
     const missingFields = [];
-    if (!hasMeaningfulValue(username)) missingFields.push("username");
-    if (!hasMeaningfulValue(password)) missingFields.push("password");
-    if (!hasMeaningfulValue(email)) missingFields.push("email");
-    if (!hasMeaningfulValue(emailPassword)) missingFields.push("email_password");
-    if (!hasMeaningfulValue(api)) missingFields.push("api");
+    if (!hasMeaningfulAccountValue(username)) missingFields.push("username");
+    if (!hasMeaningfulAccountValue(password)) missingFields.push("password");
+    if (!hasMeaningfulAccountValue(email)) missingFields.push("email");
+    if (!hasMeaningfulAccountValue(emailPassword)) missingFields.push("email_password");
+    if (!hasMeaningfulAccountValue(api)) missingFields.push("api");
     if (missingFields.length) {
       throw new Error(`存在空值字段：${missingFields.join("、")}`);
     }
@@ -7207,13 +7252,16 @@ async function importAccountBatchFromText() {
     }
   }).filter(Boolean);
   const normalizeUsername = (value) => String(value || "").trim().toLowerCase();
-  const existingUsernames = new Set(
-    (accountEditorRows || [])
-      .map((row) => normalizeUsername(row?.username))
-      .filter(Boolean)
-  );
+  const existingUsernameIndex = new Map();
+  (accountEditorRows || []).forEach((row, index) => {
+    const normalized = normalizeUsername(row?.username);
+    if (normalized && !existingUsernameIndex.has(normalized)) {
+      existingUsernameIndex.set(normalized, index);
+    }
+  });
   const seenInBatch = new Set();
   const rowsToImport = [];
+  const rowsToUpdate = [];
   const skippedDuplicateUsernames = [];
   for (const row of parsedRows) {
     const normalizedUsername = normalizeUsername(row?.username);
@@ -7222,21 +7270,51 @@ async function importAccountBatchFromText() {
       skippedDuplicateUsernames.push(String(row?.username || "").trim());
       continue;
     }
-    if (existingUsernames.has(normalizedUsername)) {
-      skippedDuplicateUsernames.push(String(row?.username || "").trim());
+    seenInBatch.add(normalizedUsername);
+    const existingIndex = existingUsernameIndex.get(normalizedUsername);
+    if (existingIndex != null) {
+      const existing = accountEditorRows[existingIndex];
+      if (!hasAccountImportRowChanges(existing, row)) continue;
+      rowsToUpdate.push({ index: existingIndex, row });
       continue;
     }
-    seenInBatch.add(normalizedUsername);
     rowsToImport.push(row);
   }
-  if (!rowsToImport.length) {
-    const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
-    throw new Error(`没有可导入的新账号：检测到重复 username 共 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
+  if (!rowsToImport.length && !rowsToUpdate.length) {
+    if (skippedDuplicateUsernames.length) {
+      const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
+      throw new Error(`没有可导入的账号：检测到文件内重复 username 共 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
+    }
+    throw new Error("没有可导入的账号：所有记录已存在且字段无需更新");
+  }
+  const overwriteSummaries = rowsToUpdate
+    .map(({ index, row }) => {
+      const existing = accountEditorRows[index];
+      const changes = getAccountImportOverwriteChanges(existing, row);
+      if (!changes.length) return null;
+      return {
+        username: String(existing?.username || "").trim(),
+        changes,
+      };
+    })
+    .filter(Boolean);
+  if (overwriteSummaries.length) {
+    if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
+      setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
+      return;
+    }
   }
   rowsToImport.forEach((row) => accountEditorRows.push(row));
+  rowsToUpdate.forEach(({ index, row }) => {
+    accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
+  });
+  const saveIndexes = [
+    ...rowsToUpdate.map(({ index }) => index),
+    ...rowsToImport.map((_, offset) => startIndex + offset),
+  ];
   try {
-    for (let i = startIndex; i < accountEditorRows.length; i += 1) {
-      await saveAccountRow(i, { skipReload: true });
+    for (const index of saveIndexes) {
+      await saveAccountRow(index, { skipReload: true });
     }
   } catch (error) {
     accountEditorRows.splice(startIndex, accountEditorRows.length - startIndex);
@@ -7249,12 +7327,15 @@ async function importAccountBatchFromText() {
   renderAccountEditorRows();
   renderDeviceEditorRows();
   if (accountBatchInputEl) accountBatchInputEl.value = "";
+  const statusParts = [];
+  if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
+  if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
   if (skippedDuplicateUsernames.length) {
     const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
-    setStatus(`批量导入完成：新增 ${rowsToImport.length} 条，自动跳过重复 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`, "warning");
-  } else {
-    setStatus(`批量导入成功：新增 ${rowsToImport.length} 条账号记录`, "success");
+    statusParts.push(`跳过文件内重复 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
   }
+  const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
+  setStatus(`批量导入完成：${statusParts.join("，")}`, hasChanges ? "success" : "warning");
 }
 
 function isUsernameUsedElsewhere(username, currentIndex) {

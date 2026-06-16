@@ -14,26 +14,29 @@ object TikTokEmailCodeFetcher {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    suspend fun fetchCode(deviceId: String, alias: String, apiUrl: String): Result<String> {
+    suspend fun fetchCode(deviceId: String, alias: String, apiUrl: String, email: String): Result<String> {
         val url = apiUrl.trim()
-        if (url.isBlank()) {
-            return Result.failure(IllegalStateException("API 为空"))
+        val accountEmail = email.trim()
+        if (url.isNotBlank()) {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                return Result.failure(IllegalStateException("API 链接无效"))
+            }
+            val local = withContext(Dispatchers.IO) { fetchFromApiUrl(url) }
+            if (local.isSuccess) return local
+            val localErr = local.exceptionOrNull()!!
+            if (deviceId.isBlank() || alias.isBlank()) {
+                return Result.failure(
+                    IllegalStateException(
+                        "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；设备未绑定，无法云端代取",
+                    ),
+                )
+            }
+        } else if (deviceId.isBlank() || alias.isBlank()) {
+            return Result.failure(IllegalStateException("API 为空且设备未绑定，无法云端代取"))
         }
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            return Result.failure(IllegalStateException("API 链接无效"))
-        }
-        val local = withContext(Dispatchers.IO) { fetchFromApiUrl(url) }
-        if (local.isSuccess) return local
-        val localErr = local.exceptionOrNull()!!
-        if (deviceId.isBlank() || alias.isBlank()) {
-            return Result.failure(
-                IllegalStateException(
-                    "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；设备未绑定，无法云端代取",
-                ),
-            )
-        }
+
         return runCatching {
-            val resp = ApiService.getTikTokEmailCodeFromServer(deviceId, alias, url)
+            val resp = ApiService.getTikTokEmailCodeFromServer(deviceId, alias, url, accountEmail)
             if (resp.code != 0) {
                 throw IllegalStateException(resp.msg.ifBlank { "云端代取失败" })
             }

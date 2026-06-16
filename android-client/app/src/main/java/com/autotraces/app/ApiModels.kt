@@ -411,6 +411,8 @@ data class DeviceAssignedAccountResponse(
     val login_time: String? = null,
     /** 「是」= 已完成基本资料修改；「否」或未返回时视为待修改。 */
     val basic_profile_modified: String? = null,
+    /** 服务端邮箱管理模块是否可用该邮箱 OAuth 拉取验证码。 */
+    val mail_module_code_available: Boolean? = null,
 )
 
 data class DeviceAssignedAccountMarkLoginRequest(

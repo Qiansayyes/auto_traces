@@ -306,27 +306,36 @@ class MainActivity : AppCompatActivity() {
         binding.fetchTikTokCodeButton.setOnClickListener {
             lifecycleScope.launch {
                 val apiUrl = binding.assignedApiInput.text?.toString().orEmpty().trim()
-                if (apiUrl.isBlank()) {
-                    binding.assignedCopyStatusText.text = "API 为空：无法获取验证码"
+                val accountEmail = binding.assignedEmailInput.text?.toString().orEmpty().trim()
+                val deviceId = PrefsStore.getDeviceId().orEmpty()
+                val alias = PrefsStore.getAlias().orEmpty().trim()
+
+                if (apiUrl.isBlank() && accountEmail.isBlank()) {
+                    binding.assignedCopyStatusText.text = "邮箱为空且 API 为空：无法获取验证码"
                     return@launch
                 }
-                if (!apiUrl.startsWith("http://") && !apiUrl.startsWith("https://")) {
+                if (apiUrl.isBlank() && (deviceId.isBlank() || alias.isBlank())) {
+                    binding.assignedCopyStatusText.text = "API 为空且设备未绑定：无法获取验证码"
+                    return@launch
+                }
+                if (apiUrl.isNotBlank() && !apiUrl.startsWith("http://") && !apiUrl.startsWith("https://")) {
                     binding.assignedCopyStatusText.text = "API 链接无效：$apiUrl"
                     return@launch
                 }
 
-                val deviceId = PrefsStore.getDeviceId().orEmpty()
-                val alias = PrefsStore.getAlias().orEmpty().trim()
-
                 binding.fetchTikTokCodeButton.isEnabled = false
-                binding.assignedCopyStatusText.text = "正在设备端获取验证码..."
+                binding.assignedCopyStatusText.text = if (apiUrl.isBlank()) {
+                    "正在通过云端邮箱管理模块获取验证码..."
+                } else {
+                    "正在设备端获取验证码..."
+                }
                 val result = withContext(Dispatchers.IO) {
-                    val first = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl)
+                    val first = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl, accountEmail)
                     if (first.isSuccess) {
                         first
                     } else {
                         val err = first.exceptionOrNull()
-                        if (deviceId.isNotBlank() && alias.isNotBlank()) {
+                        if (deviceId.isNotBlank() && alias.isNotBlank() && apiUrl.isNotBlank()) {
                             withContext(Dispatchers.Main) {
                                 binding.assignedCopyStatusText.text =
                                     "设备端失败，正在云端代取…（${err?.message ?: "未知错误"}）"

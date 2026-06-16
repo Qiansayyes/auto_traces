@@ -1654,8 +1654,10 @@ object AppCoordinator {
             return !strict
         }
         if (api.isBlank()) {
-            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：api 为空，无法拉取邮箱验证码")
-            return !strict
+            LogCenter.op(
+                alias,
+                "[OP][$opId] 自动登录($reason)：api 为空，将尝试通过邮箱管理模块获取验证码",
+            )
         }
         username.let { PrefsStore.setLogContextUsername(it) }
         fetchConfig(logToUser = true)
@@ -3993,9 +3995,12 @@ object AppCoordinator {
         val password = row.password?.trim().orEmpty()
         val email = row.email?.trim().orEmpty()
         val api = row.api?.trim().orEmpty()
-        if (username.isBlank() || password.isBlank() || email.isBlank() || api.isBlank()) {
+        if (username.isBlank() || password.isBlank() || email.isBlank()) {
             LogCenter.op(alias, "[OP][$opId] 批量带流行 ${row.sheet_row}：登录字段不完整，跳过")
             return false
+        }
+        if (api.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 批量带流行 ${row.sheet_row}：api 为空，将尝试通过邮箱管理模块获取验证码")
         }
         username.let { PrefsStore.setLogContextUsername(it) }
         fetchConfig(logToUser = true)
