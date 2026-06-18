@@ -2,6 +2,9 @@ package com.autotraces.app
 
 import android.content.Intent
 import android.content.ContentValues
+import android.content.pm.PackageManager
+import android.Manifest
+import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -282,6 +285,99 @@ object AppCoordinator {
                 (m.invoke(this, command) as? Boolean) == true
             }
         }.getOrDefault(false)
+    }
+
+    private fun runExecutorSuWithOutput(command: String): String? {
+        return runCatching {
+            executor.run {
+                val m = javaClass.getDeclaredMethod("runSuCommandWithOutput", String::class.java)
+                m.isAccessible = true
+                (m.invoke(this, command) as? String)?.trim()
+            }
+        }.getOrNull()
+    }
+
+    /** 打开 App 或云端登录成功后调用：检测 TikTok 图库权限未开放则 root 授予。 */
+    fun ensureTikTokGalleryPermissionIfNeeded() {
+        if (PrefsStore.getAuthToken().isNullOrBlank()) return
+        scope.launch {
+            ensureTikTokGalleryPermissionGrantedIfNeeded()
+        }
+    }
+
+    private fun tiktokGalleryRuntimePermissions(): List<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            listOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+            )
+        } else {
+            listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+
+    private fun isTikTokGalleryPermissionGranted(): Boolean {
+        val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        val pm = appContext.packageManager
+        return tiktokGalleryRuntimePermissions().all { perm ->
+            pm.checkPermission(perm, pkg) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    /**
+     * 已登录云端时：检测 TikTok 图库相关 runtime 权限，未开放则 root 授予，避免发布流程卡在系统授权弹窗。
+     */
+    private suspend fun ensureTikTokGalleryPermissionGrantedIfNeeded() {
+        if (PrefsStore.getAuthToken().isNullOrBlank()) return
+        val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        val alias = PrefsStore.getAlias()?.takeIf { it.isNotBlank() } ?: "SYSTEM"
+        val packageInstalled = runCatching {
+            @Suppress("DEPRECATION")
+            appContext.packageManager.getPackageInfo(pkg, 0)
+            true
+        }.getOrElse { err ->
+            if (err is PackageManager.NameNotFoundException) {
+                LogCenter.op(alias, "TikTok 未安装，跳过图库权限检测")
+            } else {
+                LogCenter.op(alias, "读取 TikTok 安装信息失败：${err.message}")
+            }
+            false
+        }
+        if (!packageInstalled) return
+        if (isTikTokGalleryPermissionGranted()) return
+
+        LogCenter.op(alias, "TikTok 图库权限未开放，开始 root 授予…")
+        val commands = listOf(
+            "pm grant $pkg android.permission.READ_MEDIA_IMAGES",
+            "pm grant $pkg android.permission.READ_MEDIA_VIDEO",
+            "pm grant $pkg android.permission.READ_EXTERNAL_STORAGE",
+            "pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE",
+            "appops set $pkg READ_MEDIA_IMAGES allow",
+            "appops set $pkg READ_MEDIA_VIDEO allow",
+            "appops set $pkg READ_EXTERNAL_STORAGE allow",
+            "appops set $pkg WRITE_EXTERNAL_STORAGE allow",
+            "appops set $pkg LEGACY_STORAGE allow",
+        )
+        var failed = 0
+        val failLogs = mutableListOf<String>()
+        for (command in commands) {
+            val ok = runExecutorSu(command)
+            if (!ok) {
+                failed++
+                val output = runExecutorSuWithOutput("$command 2>&1 || true").orEmpty().take(220)
+                failLogs += "$command | ${if (output.isBlank()) "no output" else output}"
+            }
+        }
+        if (failed == 0) {
+            LogCenter.op(alias, "TikTok 图库权限开放完成")
+        } else {
+            LogCenter.op(alias, "TikTok 图库权限开放存在失败：$failed/${commands.size}")
+            failLogs.take(4).forEach { item ->
+                LogCenter.op(alias, "TikTok 权限开放失败命令：$item")
+            }
+            if (failLogs.size > 4) {
+                LogCenter.op(alias, "TikTok 权限开放失败明细省略 ${failLogs.size - 4} 条")
+            }
+        }
     }
 
     suspend fun syncOnline(retries: Int = 1) {
@@ -2499,13 +2595,18 @@ object AppCoordinator {
 
             "tiktok_clear" -> {
                 val isCutSwitch = !payload?.cut_switch_after_backup.isNullOrBlank()
-                opStep(if (isCutSwitch) "切号：开始清理 TikTok 数据" else "开始清理 TikTok 数据")
-                opStep("正在清空 TikTok 应用数据")
+                if (isCutSwitch) {
+                    opStep("切号步骤1")
+                    opStep("切号步骤2")
+                } else {
+                    opStep("开始清理 TikTok 数据")
+                    opStep("正在清空 TikTok 应用数据")
+                }
                 val clearOk = runSu("pm clear $packageName")
                 opDone(
                     clearOk,
-                    if (isCutSwitch) "切号：TikTok 数据清理完成" else "TikTok 数据清理完成",
-                    if (isCutSwitch) "切号：TikTok 数据清理失败" else "TikTok 数据清理失败",
+                    if (isCutSwitch) "切号步骤完成" else "TikTok 数据清理完成",
+                    if (isCutSwitch) "切号步骤失败" else "TikTok 数据清理失败",
                 )
 
                 val clearReport = mutableMapOf<String, Any>(
@@ -2526,9 +2627,9 @@ object AppCoordinator {
                     opId = opId,
                     status = if (clearOk) "success" else "failed",
                     message = if (clearOk) {
-                        if (isCutSwitch) "切号：TikTok 数据清理完成" else "TikTok 数据清理完成"
+                        if (isCutSwitch) "切号步骤完成" else "TikTok 数据清理完成"
                     } else {
-                        if (isCutSwitch) "切号：TikTok 数据清理失败" else "TikTok 数据清理失败"
+                        if (isCutSwitch) "切号步骤失败" else "TikTok 数据清理失败"
                     },
                     data = clearReport,
                 )
@@ -2554,18 +2655,18 @@ object AppCoordinator {
                 )
                 if (backupName == null) {
                     val isCutSwitchEarly = !payload?.cut_switch_after_backup.isNullOrBlank()
-                    opStep("缺少有效 username，无法生成备份包名（包名须包含 username）")
+                    opStep(if (isCutSwitchEarly) "切号步骤1" else "缺少有效 username，无法生成备份包名（包名须包含 username）")
                     opDone(
                         false,
-                        if (isCutSwitchEarly) "切号：备份失败（缺少 username）" else "备份失败（缺少 username）",
-                        if (isCutSwitchEarly) "切号：备份失败（缺少 username）" else "备份失败（缺少 username）",
+                        if (isCutSwitchEarly) "切号步骤失败" else "备份失败（缺少 username）",
+                        if (isCutSwitchEarly) "切号步骤失败" else "备份失败（缺少 username）",
                     )
                     ApiService.reportDeviceOp(
                         deviceId = deviceId,
                         alias = alias,
                         opId = opId,
                         status = "failed",
-                        message = "备份失败：下发任务未带 username，无法生成与账号绑定的包名",
+                        message = if (isCutSwitchEarly) "切号步骤失败" else "备份失败：下发任务未带 username，无法生成与账号绑定的包名",
                         data = mapOf(
                             "op_type" to "tiktok_backup_and_clear",
                             "device_id" to deviceId,
@@ -2581,58 +2682,79 @@ object AppCoordinator {
                 val sourceDir = "/data/data/$packageName"
 
                 val isCutSwitch = !payload?.cut_switch_after_backup.isNullOrBlank()
-                opStep(if (isCutSwitch) "切号：开始备份当前账号" else "开始备份并清理")
-
-                opStep("第1步：关闭 TikTok")
-                val stopOk = runSu("am force-stop $packageName")
-
-                opStep("第2步：检测数据目录大小")
-                val dataDirKb = if (stopOk) {
-                    runSuWithOutput(DeviceBackupShell.measureDataDirKbCommand(sourceDir))
-                        ?.lineSequence()
-                        ?.map { it.trim() }
-                        ?.firstOrNull { it.isNotEmpty() }
-                        ?.toLongOrNull()
-                } else {
-                    null
+                var cutSwitchStep = 0
+                val cutStepLabel: (String) -> String = { normal ->
+                    if (isCutSwitch) {
+                        cutSwitchStep += 1
+                        "切号步骤$cutSwitchStep"
+                    } else {
+                        normal
+                    }
                 }
-                val backupSkipped = stopOk &&
-                    (dataDirKb == null || dataDirKb < DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP)
+                var ok = false
+                var backupSkipped = false
+                var dataDirKb: Long? = null
+                val wholeAttempts = 2
+                for (attempt in 1..wholeAttempts) {
+                    cutSwitchStep = 0
+                    opStep(cutStepLabel(if (isCutSwitch) "切号：开始备份当前账号" else "开始备份并清理"))
 
-                val backupOk = if (!stopOk) {
-                    false
-                } else if (backupSkipped) {
-                    opStep(
-                        "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份",
-                    )
-                    true
-                } else {
-                    opStep("第3步：备份账号数据")
-                    runSu(
-                        DeviceBackupShell.tiktokStyleDataTarCommand(
-                            dataPackageName = packageName,
-                            quotedBackupDir = qBackupDir,
-                            quotedOutputTarPath = qBackupPath,
-                        ),
-                    )
+                    opStep(cutStepLabel("第1步：关闭 TikTok"))
+                    val stopOk = runSu("am force-stop $packageName")
+
+                    opStep(cutStepLabel("第2步：检测数据目录大小"))
+                    dataDirKb = if (stopOk) {
+                        runSuWithOutput(DeviceBackupShell.measureDataDirKbCommand(sourceDir))
+                            ?.lineSequence()
+                            ?.map { it.trim() }
+                            ?.firstOrNull { it.isNotEmpty() }
+                            ?.toLongOrNull()
+                    } else {
+                        null
+                    }
+                    backupSkipped = stopOk &&
+                        (dataDirKb == null || dataDirKb < DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP)
+
+                    val backupOk = if (!stopOk) {
+                        false
+                    } else if (backupSkipped) {
+                        opStep(
+                            cutStepLabel("数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份"),
+                        )
+                        true
+                    } else {
+                        opStep(cutStepLabel("第3步：备份账号数据"))
+                        runSu(
+                            DeviceBackupShell.tiktokStyleDataTarCommand(
+                                dataPackageName = packageName,
+                                quotedBackupDir = qBackupDir,
+                                quotedOutputTarPath = qBackupPath,
+                            ),
+                        )
+                    }
+
+                    val clearOk = if (backupOk) {
+                        opStep(cutStepLabel(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据"))
+                        runSu("pm clear $packageName")
+                    } else {
+                        opStep(cutStepLabel("备份未成功，已跳过清理以免误删数据"))
+                        false
+                    }
+
+                    ok = stopOk && backupOk && clearOk
+                    if (ok) break
+                    if (attempt < wholeAttempts) {
+                        opStep(cutStepLabel("本轮失败，自动重试"))
+                        delay(1000)
+                    }
                 }
-
-                val clearOk = if (backupOk) {
-                    opStep(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据")
-                    runSu("pm clear $packageName")
-                } else {
-                    opStep("备份未成功，已跳过清理以免误删数据")
-                    false
-                }
-
-                val ok = stopOk && backupOk && clearOk
 
                 if (ok && !backupSkipped) {
                     val prevRaw = payload?.previous_backup_path?.trim().orEmpty()
                     if (prevRaw.isNotEmpty() && prevRaw != backupPath &&
                         UnifiedBackupPaths.isSafeToDeleteOldBackup(appContext, prevRaw, backupPath)
                     ) {
-                        opStep("正在删除旧备份文件")
+                        opStep(cutStepLabel("正在删除旧备份文件"))
                         val qPrev = DeviceBackupShell.shellQuote(prevRaw)
                         runSu("rm -f $qPrev")
                     }
@@ -2640,13 +2762,13 @@ object AppCoordinator {
                 opDone(
                     ok,
                     when {
-                        !ok -> if (isCutSwitch) "切号：当前账号备份或清理失败" else "备份或清理失败"
-                        backupSkipped && isCutSwitch -> "切号：数据过小已跳过备份，清理完成"
+                        !ok -> if (isCutSwitch) "切号步骤失败" else "备份或清理失败"
+                        backupSkipped && isCutSwitch -> "切号步骤完成"
                         backupSkipped -> "数据过小已跳过备份，清理完成"
-                        isCutSwitch -> "切号：当前账号备份并清理完成"
+                        isCutSwitch -> "切号步骤完成"
                         else -> "备份并清理完成"
                     },
-                    if (isCutSwitch) "切号：当前账号备份或清理失败" else "备份或清理失败",
+                    if (isCutSwitch) "切号步骤失败" else "备份或清理失败",
                 )
 
                 val reportBackupRecordId = payload?.backup_record_id
@@ -2676,8 +2798,9 @@ object AppCoordinator {
                     opId = opId,
                     status = if (ok) "success" else "failed",
                     message = when {
-                        !ok -> "备份或清理失败"
-                        backupSkipped -> "数据过小已跳过备份，清理完成"
+                        !ok -> if (isCutSwitch) "切号步骤失败" else "备份或清理失败"
+                        backupSkipped -> if (isCutSwitch) "切号步骤完成" else "数据过小已跳过备份，清理完成"
+                        isCutSwitch -> "切号步骤完成"
                         else -> "备份并清理完成"
                     },
                     data = reportData,
@@ -2699,52 +2822,71 @@ object AppCoordinator {
                 val qPkg = DeviceBackupShell.shellQuote(packageName)
                 val skipPmClear = payload?.skip_pm_clear == true
 
-                opStep(if (skipPmClear) "切号：开始还原目标账号" else "开始还原备份")
-
-                opStep("第1步：关闭 TikTok")
-                val stopOk = runSu("am force-stop $packageName")
-
-                val clearOk = if (skipPmClear) {
-                    stopOk
-                } else {
-                    opStep("第2步：清空 TikTok 旧数据")
-                    stopOk && runSu("pm clear $qPkg")
-                }
-
-                val backupCheckLabel =
-                    if (skipPmClear) "第2步：检查备份文件" else "第3步：检查备份文件"
-                val backupExists = clearOk && runRestoreShellStep(::opStep, backupCheckLabel) {
-                    runSu("test -f $qBackupPath")
-                }
-
-                val restoreDataLabel =
-                    if (skipPmClear) "第3步：恢复账号数据" else "第4步：恢复账号数据"
-                val restoreDataOk = backupExists && runRestoreShellStep(::opStep, restoreDataLabel) {
-                    runSu("tar -xzf $qBackupPath -C /data/data")
-                }
-
-                val permissionLabel =
-                    if (skipPmClear) "第4步：修复文件权限" else "第5步：修复文件权限"
-                val permissionOk = restoreDataOk && runRestoreShellStep(::opStep, permissionLabel) {
-                    val uidGid = runSuWithOutput(
-                        "stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'",
-                    )
-                        ?.lineSequence()
-                        ?.map { it.trim() }
-                        ?.firstOrNull { it.contains(":") }
-                    if (uidGid.isNullOrBlank()) return@runRestoreShellStep false
-                    val chownOk = runSu("chown -R $uidGid $sourceDir")
-                    if (!chownOk) return@runRestoreShellStep false
-                    val hasRestorecon = runSu("command -v restorecon >/dev/null 2>&1")
-                    val restoreconOk = if (hasRestorecon) {
-                        runSu("restorecon -RF $sourceDir")
+                var restoreCutSwitchStep = 0
+                val restoreStepLabel: (String) -> String = { normal ->
+                    if (skipPmClear) {
+                        restoreCutSwitchStep += 1
+                        "切号步骤$restoreCutSwitchStep"
                     } else {
-                        true
+                        normal
                     }
-                    restoreconOk && runSu("chmod -R 700 $sourceDir")
                 }
+                val wholeAttempts = 2
+                var restoreOk = false
+                for (attempt in 1..wholeAttempts) {
+                    restoreCutSwitchStep = 0
+                    if (attempt > 1) {
+                        opStep(restoreStepLabel("本轮失败，自动重试"))
+                    }
+                    opStep(restoreStepLabel(if (skipPmClear) "切号：开始还原目标账号" else "开始还原备份"))
 
-                val restoreOk = restoreDataOk && permissionOk
+                    opStep(restoreStepLabel("第1步：关闭 TikTok"))
+                    val stopOk = runSu("am force-stop $packageName")
+
+                    val clearOk = if (skipPmClear) {
+                        stopOk
+                    } else {
+                        opStep("第2步：清空 TikTok 旧数据")
+                        stopOk && runSu("pm clear $qPkg")
+                    }
+
+                    val backupCheckLabel =
+                        if (skipPmClear) restoreStepLabel("第2步：检查备份文件") else "第3步：检查备份文件"
+                    val backupExists = clearOk && runRestoreShellStep(::opStep, backupCheckLabel) {
+                        runSu("test -f $qBackupPath")
+                    }
+
+                    val restoreDataLabel =
+                        if (skipPmClear) restoreStepLabel("第3步：恢复账号数据") else "第4步：恢复账号数据"
+                    val restoreDataOk = backupExists && runRestoreShellStep(::opStep, restoreDataLabel) {
+                        runSu("tar -xzf $qBackupPath -C /data/data")
+                    }
+
+                    val permissionLabel =
+                        if (skipPmClear) restoreStepLabel("第4步：修复文件权限") else "第5步：修复文件权限"
+                    val permissionOk = restoreDataOk && runRestoreShellStep(::opStep, permissionLabel) {
+                        val uidGid = runSuWithOutput(
+                            "stat -c '%u:%g' $sourceDir 2>/dev/null || ls -ldn $sourceDir 2>/dev/null | tr -s ' ' | cut -d ' ' -f3,4 | tr ' ' ':'",
+                        )
+                            ?.lineSequence()
+                            ?.map { it.trim() }
+                            ?.firstOrNull { it.contains(":") }
+                        if (uidGid.isNullOrBlank()) return@runRestoreShellStep false
+                        val chownOk = runSu("chown -R $uidGid $sourceDir")
+                        if (!chownOk) return@runRestoreShellStep false
+                        val hasRestorecon = runSu("command -v restorecon >/dev/null 2>&1")
+                        val restoreconOk = if (hasRestorecon) {
+                            runSu("restorecon -RF $sourceDir")
+                        } else {
+                            true
+                        }
+                        restoreconOk && runSu("chmod -R 700 $sourceDir")
+                    }
+
+                    restoreOk = restoreDataOk && permissionOk
+                    if (restoreOk) break
+                    if (attempt < wholeAttempts) delay(1000)
+                }
                 if (restoreOk) {
                     payload?.username?.trim()?.takeIf { it.isNotEmpty() }?.let {
                         PrefsStore.setLogContextUsername(it)
@@ -2753,8 +2895,8 @@ object AppCoordinator {
                 }
                 opDone(
                     restoreOk,
-                    if (skipPmClear) "切号：目标账号还原完成" else "还原完成",
-                    if (skipPmClear) "切号：目标账号还原失败" else "还原失败",
+                    if (skipPmClear) "切号步骤完成" else "还原完成",
+                    if (skipPmClear) "切号步骤失败" else "还原失败",
                 )
 
                 val restoreReport = mutableMapOf<String, Any>(
@@ -2769,6 +2911,7 @@ object AppCoordinator {
                 if (skipPmClear) {
                     restoreReport["skip_pm_clear"] = true
                 }
+                payload?.backup_record_id?.let { restoreReport["backup_record_id"] = it }
                 payload?.restore_highlight_row_index?.let { restoreReport["restore_highlight_row_index"] = it }
                 restoreReport.withDeviceOpReportFlags()
 
@@ -2777,7 +2920,11 @@ object AppCoordinator {
                     alias = alias,
                     opId = opId,
                     status = if (restoreOk) "success" else "failed",
-                    message = if (restoreOk) "清理并还原完成" else "清理或还原失败",
+                    message = if (skipPmClear) {
+                        if (restoreOk) "切号步骤完成" else "切号步骤失败"
+                    } else {
+                        if (restoreOk) "清理并还原完成" else "清理或还原失败"
+                    },
                     data = restoreReport,
                 )
                 if (skipPmClear) {

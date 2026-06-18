@@ -2679,6 +2679,15 @@ class DeviceTikTokEmailCodeRequest(BaseModel):
     api_url: str = Field(default="", max_length=2048)
 
 
+class DeviceTkPendingAcquireRequest(DeviceAuthModel):
+    email: str = Field(default="", max_length=255)
+
+
+class DeviceTkPendingCompleteRequest(DeviceAuthModel):
+    email: str = Field(default="", max_length=255)
+    claim_id: str = Field(default="", max_length=80)
+
+
 class DeviceAssignedAccountMarkLoginRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
@@ -3673,6 +3682,35 @@ def _device_ops_apply_restore_failure(owner_username: str, data: dict) -> None:
         conn.close()
 
 
+def _resolve_cut_switch_source_row_index(data: dict) -> int:
+    if not isinstance(data, dict):
+        return -1
+    try:
+        rid = int(data.get("backup_record_id")) if data.get("backup_record_id") is not None else -1
+    except (TypeError, ValueError):
+        rid = -1
+    return rid if rid >= 0 else -1
+
+
+def _device_ops_rollback_cut_switch_highlight(owner_username: str, data: dict) -> None:
+    """切号失败时回溯高亮到源账号（backup_record_id）。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return
+    source_row = _resolve_cut_switch_source_row_index(data)
+    if source_row < 0:
+        return
+    conn = _get_db()
+    try:
+        now = now_text()
+        _db_apply_switch_highlight_exclusive(conn, owner, source_row, now)
+        _db_set_env_status(conn, owner, source_row, ENV_STATUS_ACTIVE, now)
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _ensure_device_auto_start_after_cut_switch(
     device_id: str,
     alias: str = "",
@@ -4551,6 +4589,7 @@ def _auto_switch_enqueue_cut_switch(
             "assigned_alias": str(target_row.get("assigned_alias") or "").strip() or alias_clean,
             "skip_pm_clear": True,
             "restore_highlight_row_index": target_ri,
+            "backup_record_id": source_ri,
         }
         _enqueue_tiktok_device_op(did, "tiktok_restore", restore_payload)
         _append_device_log(
@@ -7998,6 +8037,69 @@ def admin_device_tiktok_email_code(
     )
 
 
+@app.post("/api/device/tk_pending/acquire")
+def device_tk_pending_acquire(payload: DeviceTkPendingAcquireRequest):
+    """设备端：从待注册 TK 邮箱池领取一个邮箱，并立即转入邮箱账户管理。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    try:
+        from mail_integration import take_pending_tk_account_via_mail_module
+    except ImportError:
+        return {"code": 1, "msg": "邮箱管理模块未集成"}
+    code, msg, data = take_pending_tk_account_via_mail_module(owner, payload.email)
+    if code != 0 or not data:
+        return {"code": 1, "msg": msg, "available": False, "promoted": False}
+    account = data.get("account") if isinstance(data.get("account"), dict) else {}
+    return {
+        "code": 0,
+        "msg": "已领取并转入邮箱账户管理",
+        "available": True,
+        "promoted": True,
+        "taken": True,
+        "email": str(account.get("email") or data.get("email") or "").strip(),
+        "password": str(account.get("password") or "").strip(),
+        "client_id": str(account.get("client_id") or "").strip(),
+        "refresh_token": str(account.get("refresh_token") or "").strip(),
+    }
+
+
+@app.post("/api/device/tk_pending/complete")
+def device_tk_pending_complete(payload: DeviceTkPendingCompleteRequest):
+    """设备端：TK 注册成功后，将待注册邮箱转入邮箱账户管理。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    claim_id = str(payload.claim_id or "").strip()
+    email = str(payload.email or "").strip()
+    if not claim_id and not email:
+        return {"code": 1, "msg": "claim_id 或 email 不能为空"}
+    try:
+        from mail_integration import complete_pending_tk_account_via_mail_module
+    except ImportError:
+        return {"code": 1, "msg": "邮箱管理模块未集成"}
+    code, msg, data = complete_pending_tk_account_via_mail_module(
+        owner,
+        email=email,
+        claim_id=claim_id,
+    )
+    if code != 0 or not data:
+        return {"code": 1, "msg": msg, "promoted": False}
+    return {
+        "code": 0,
+        "msg": "已转入邮箱账户管理",
+        "promoted": True,
+        "email": str(data.get("email") or email).strip(),
+        "claim_id": str(data.get("claimId") or data.get("claim_id") or claim_id).strip(),
+    }
+
+
 @app.post("/api/admin/device_tiktok/mutual_click_start")
 def admin_device_tiktok_mutual_click_start(payload: MutualClickRequest, authorization: str | None = Header(default=None)):
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
@@ -8312,8 +8414,11 @@ def device_ops_report(payload: DeviceOpReportRequest):
                 # 避免云端过早 pending_start 导致涨粉与自动登录并发。
             elif op_type == "tiktok_restore":
                 _device_ops_apply_cut_switch_after_restore(owner_u, data)
-        elif op_type == "tiktok_restore":
-            _device_ops_apply_restore_failure(owner_u, data)
+        else:
+            if op_type == "tiktok_restore":
+                _device_ops_apply_restore_failure(owner_u, data)
+            if op_type in ("tiktok_backup_and_clear", "tiktok_restore", "tiktok_clear"):
+                _device_ops_rollback_cut_switch_highlight(owner_u, data)
 
     with store.lock:
         dev = store.devices.get(payload.device_id)
@@ -9136,6 +9241,12 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
             return {"code": 1, "msg": "该账号已分配别名，不能修改别名；删除账号记录将同步清理设备备份档案"}
         persisted_alias = existing_assigned_alias or incoming_alias
         new_username = payload.username.strip()
+        if not persisted_alias:
+            recover_username = new_username or existing_username
+            if recover_username:
+                persisted_alias = _recover_assigned_alias_for_account_username(
+                    conn, owner, recover_username
+                )
         conn.execute(
             """
             INSERT INTO account_editor_rows
@@ -9146,7 +9257,10 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 password = excluded.password,
                 email = excluded.email,
                 email_password = excluded.email_password,
-                api = excluded.api,
+                api = CASE
+                    WHEN TRIM(excluded.api) <> '' THEN excluded.api
+                    ELSE account_editor_rows.api
+                END,
                 is_login = excluded.is_login,
                 login_time = excluded.login_time,
                 region = excluded.region,

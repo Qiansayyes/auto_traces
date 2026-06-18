@@ -79,6 +79,7 @@
         <button class="nav-item admin-only" data-section="usernames">用户名队列</button>
         <div class="nav-group-title">邮箱管理模块</div>
         <button class="nav-item" data-section="mail-module" data-mail-route="email">邮箱账户管理</button>
+        <button class="nav-item" data-section="mail-module" data-mail-route="tk-pending">待注册TK账号</button>
         <button class="nav-item" data-section="mail-module" data-mail-route="sender-groups">发件人分类</button>
         <button class="nav-item" data-section="mail-module" data-mail-route="template-manager">邮件模板管理</button>
         <button class="nav-item" data-section="mail-module" data-mail-route="project-api">项目接口</button>
@@ -624,7 +625,7 @@
           </div>
           <div class="panel-card" style="margin-top:12px;background:#f8faff;">
             <h4 style="margin:0 0 8px;">账号文本批量导入</h4>
-            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持两种列格式：① 5 列 username、password、email、email_password、api；② 7 列 username、password、email、email_password、(忽略)、(忽略)、api。已存在的 username 会合并更新空字段。</div>
+            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持三种列格式：① 5 列 … api；② 6 列 … (忽略/空)、api；③ 7 列 … (忽略)、(忽略)、api。已存在的 username 会合并更新空字段，已有别名不会被清除。</div>
             <div class="field" style="max-width:280px;margin-bottom:8px;">
               <label>统一国家地区（必填）</label>
               <input id="accountBatchRegionInput" type="text" placeholder="例如：MX / US" required autocomplete="off" />

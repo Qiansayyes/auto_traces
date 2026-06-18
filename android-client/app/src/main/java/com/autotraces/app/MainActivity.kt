@@ -151,6 +151,7 @@ class MainActivity : AppCompatActivity() {
             renderDeviceInfo()
             return
         }
+        AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
         lifecycleScope.launch {
             val recovered = BindingRecovery.tryRecoverFromCloud(this@MainActivity)
             if (recovered) {
@@ -451,6 +452,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderDeviceInfo() {
         binding.deviceInfoText.text = buildString {
+            appendLine("版本: ${AppInfo.versionLabel()}")
             appendLine("Alias: ${PrefsStore.getAlias()}")
             appendLine("Device ID: ${PrefsStore.getDeviceId()}")
             appendLine("Local Status: ${PrefsStore.getLocalStatus()}")

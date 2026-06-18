@@ -471,6 +471,123 @@ const controller = {
     }
   },
 
+  async accounts_delete(ctx) {
+    try {
+      const { emails, email, deleteAll } = ctx.request.body || {};
+      const targets = Array.isArray(emails)
+        ? emails
+        : (email ? [email] : []);
+      const data = database.deleteAccounts(ownerCtx(ctx, {
+        emails: targets,
+        deleteAll,
+      }));
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to delete accounts', err)
+      ctx.throw(500, 'Failed to delete accounts')
+    }
+  },
+
+  async tk_pending_import(ctx) {
+    try {
+      const { records, lines, splitSymbol, source } = ctx.request.body;
+      const input = Array.isArray(records)
+        ? records
+        : String(lines || '').split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+
+      const data = database.importPendingTkAccounts(input, ownerCtx(ctx, {
+        splitSymbol: splitSymbol || '----',
+        source: source || 'tk_pending_ui',
+      }));
+
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to import pending tk accounts', err)
+      ctx.throw(500, 'Failed to import pending tk accounts')
+    }
+  },
+
+  async tk_pending_list(ctx) {
+    try {
+      const { page, pageSize, search, poolStatus, status } = ctx.method === "GET" ? ctx.query : ctx.request.body;
+      ctx.body = {
+        code: "200",
+        data: database.listPendingTkAccounts(ownerCtx(ctx, {
+          page,
+          pageSize,
+          search,
+          poolStatus,
+          status,
+        })),
+      };
+    } catch (err) {
+      logger.error('Failed to list pending tk accounts', err)
+      ctx.throw(500, 'Failed to list pending tk accounts')
+    }
+  },
+
+  async tk_pending_delete(ctx) {
+    try {
+      const { emails, email, deleteAll, onlyAvailable } = ctx.request.body || {};
+      const targets = Array.isArray(emails)
+        ? emails
+        : (email ? [email] : []);
+      const data = database.deletePendingTkAccounts(ownerCtx(ctx, {
+        emails: targets,
+        deleteAll,
+        onlyAvailable,
+      }));
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to delete pending tk accounts', err)
+      ctx.throw(500, 'Failed to delete pending tk accounts')
+    }
+  },
+
+  async tk_pending_acquire(ctx) {
+    try {
+      const params = requestData(ctx);
+      const data = database.acquirePendingTkAccount(ownerCtx(ctx, {
+        email: params.email,
+        includeRaw: params.includeRaw,
+      }));
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to acquire pending tk account', err)
+      ctx.throw(400, err.message || 'Failed to acquire pending tk account')
+    }
+  },
+
+  async tk_pending_take(ctx) {
+    try {
+      const params = requestData(ctx);
+      const data = database.takePendingTkAccount(ownerCtx(ctx, {
+        email: params.email,
+        includeRaw: params.includeRaw,
+        source: params.source,
+      }));
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to take pending tk account', err)
+      ctx.throw(400, err.message || 'Failed to take pending tk account')
+    }
+  },
+
+  async tk_pending_complete(ctx) {
+    try {
+      const params = requestData(ctx);
+      const data = database.completePendingTkAccount(ownerCtx(ctx, {
+        email: params.email,
+        claimId: params.claimId || params.claim_id,
+        source: params.source,
+      }));
+      ctx.body = { code: "200", data };
+    } catch (err) {
+      logger.error('Failed to complete pending tk account', err)
+      ctx.throw(400, err.message || 'Failed to complete pending tk account')
+    }
+  },
+
   async mail_cache_import(ctx) {
     try {
       const { email, accountEmail, mailbox, emails } = ctx.request.body;

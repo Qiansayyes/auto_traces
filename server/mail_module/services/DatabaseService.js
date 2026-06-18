@@ -165,6 +165,25 @@ accountsDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_account_records_status ON account_records(status);
   CREATE INDEX IF NOT EXISTS idx_account_records_status_email_updated ON account_records(status, email, updated_at);
   CREATE INDEX IF NOT EXISTS idx_account_records_updated_at ON account_records(updated_at);
+
+  CREATE TABLE IF NOT EXISTS pending_tk_account_records (
+    record_key TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    password TEXT NOT NULL DEFAULT '',
+    client_id TEXT NOT NULL DEFAULT '',
+    refresh_token TEXT NOT NULL DEFAULT '',
+    raw_line TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    pool_status TEXT NOT NULL DEFAULT 'available',
+    claim_id TEXT NOT NULL DEFAULT '',
+    claimed_at TEXT NOT NULL DEFAULT '',
+    imported_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_username TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pending_tk_owner_status ON pending_tk_account_records(owner_username, pool_status, imported_at);
+  CREATE INDEX IF NOT EXISTS idx_pending_tk_email ON pending_tk_account_records(email);
 `);
 
 mailDb.exec(`
@@ -441,6 +460,421 @@ const importAccounts = (records, options = {}) => {
     skipped_records: skipped,
     database: ACCOUNTS_DB_PATH,
   };
+};
+
+const normalizePendingTkPoolStatus = (value = '') => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (['available', 'pending', 'new', '待注册', '可用'].includes(raw)) return 'available';
+  if (['claimed', 'in_use', 'using', '注册中', '已领取'].includes(raw)) return 'claimed';
+  return '';
+};
+
+const buildPendingTkAccountPayload = (row, { includeRaw = false } = {}) => {
+  if (!row) return null;
+  return {
+    email: normalizeEmail(row.email),
+    password: row.password || '',
+    client_id: row.client_id || '',
+    refresh_token: row.refresh_token || '',
+    source: row.source || '',
+    poolStatus: row.pool_status || 'available',
+    claimId: row.claim_id || '',
+    claimedAt: row.claimed_at || '',
+    importedAt: row.imported_at || '',
+    updatedAt: row.updated_at || '',
+    ...(includeRaw ? { rawLine: row.raw_line || '' } : {}),
+  };
+};
+
+const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => {
+  accountsDb.prepare(`
+    INSERT INTO account_records (
+      record_key, email, password, client_id, refresh_token, raw_line, source, status, imported_at, updated_at, owner_username
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    ON CONFLICT(record_key) DO UPDATE SET
+      email = excluded.email,
+      password = excluded.password,
+      client_id = excluded.client_id,
+      refresh_token = excluded.refresh_token,
+      raw_line = excluded.raw_line,
+      source = excluded.source,
+      status = 'active',
+      updated_at = excluded.updated_at,
+      owner_username = excluded.owner_username
+  `).run(
+    buildRecordKey(ownerUsername, row.raw_line),
+    normalizeEmail(row.email),
+    row.password || '',
+    row.client_id || '',
+    row.refresh_token || '',
+    row.raw_line || '',
+    source,
+    timestamp,
+    timestamp,
+    ownerUsername,
+  );
+};
+
+const importPendingTkAccounts = (records, options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const splitSymbol = options.splitSymbol || '----';
+  const source = options.source || 'tk_pending_ui';
+  const rows = Array.isArray(records) ? records : [];
+  const parsed = [];
+  let skipped = 0;
+  let skippedExistingMain = 0;
+  let skippedClaimed = 0;
+
+  for (const row of rows) {
+    const record = toAccountRecord(row, splitSymbol);
+    if (!record) {
+      skipped += 1;
+      continue;
+    }
+    parsed.push(record);
+  }
+
+  const timestamp = nowIso();
+  const upsert = accountsDb.prepare(`
+    INSERT INTO pending_tk_account_records (
+      record_key, email, password, client_id, refresh_token, raw_line, source,
+      pool_status, claim_id, claimed_at, imported_at, updated_at, owner_username
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'available', '', '', ?, ?, ?)
+    ON CONFLICT(record_key) DO UPDATE SET
+      email = excluded.email,
+      password = excluded.password,
+      client_id = excluded.client_id,
+      refresh_token = excluded.refresh_token,
+      raw_line = excluded.raw_line,
+      source = excluded.source,
+      updated_at = excluded.updated_at,
+      owner_username = excluded.owner_username
+    WHERE pending_tk_account_records.pool_status = 'available'
+  `);
+
+  let insertedOrUpdated = 0;
+  runTransaction(accountsDb, () => {
+    for (const item of parsed) {
+      const recordKey = buildRecordKey(ownerUsername, item.raw_line);
+      const existsMain = accountsDb.prepare(`
+        SELECT 1
+        FROM account_records
+        WHERE record_key = ? AND owner_username = ? AND status = 'active'
+        LIMIT 1
+      `).get(recordKey, ownerUsername);
+      if (existsMain) {
+        skippedExistingMain += 1;
+        skipped += 1;
+        continue;
+      }
+
+      const existingPending = accountsDb.prepare(`
+        SELECT pool_status
+        FROM pending_tk_account_records
+        WHERE record_key = ? AND owner_username = ?
+        LIMIT 1
+      `).get(recordKey, ownerUsername);
+      if (existingPending?.pool_status === 'claimed') {
+        skippedClaimed += 1;
+        skipped += 1;
+        continue;
+      }
+
+      const result = upsert.run(
+        recordKey,
+        item.email,
+        item.password,
+        item.client_id,
+        item.refresh_token,
+        item.raw_line,
+        source,
+        timestamp,
+        timestamp,
+        ownerUsername,
+      );
+      if ((result.changes || 0) > 0) {
+        insertedOrUpdated += 1;
+      } else {
+        skipped += 1;
+      }
+    }
+  });
+
+  return {
+    source,
+    total_lines: rows.length,
+    valid_records: parsed.length,
+    inserted_or_updated: insertedOrUpdated,
+    skipped_records: skipped,
+    skipped_existing_main: skippedExistingMain,
+    skipped_claimed: skippedClaimed,
+    database: ACCOUNTS_DB_PATH,
+  };
+};
+
+const listPendingTkAccounts = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const page = Math.max(1, Number(options.page) || 1);
+  const pageSize = Math.min(500, Math.max(1, Number(options.pageSize) || 50));
+  const offset = (page - 1) * pageSize;
+  const search = String(options.search || '').trim().toLowerCase();
+  const poolStatus = normalizePendingTkPoolStatus(options.poolStatus || options.status || '');
+
+  const whereParts = [`owner_username = ?`];
+  const params = [ownerUsername];
+  if (search) {
+    whereParts.push(`lower(email) LIKE ?`);
+    params.push(`%${search}%`);
+  }
+  if (poolStatus) {
+    whereParts.push(`pool_status = ?`);
+    params.push(poolStatus);
+  }
+
+  const total = accountsDb.prepare(`
+    SELECT COUNT(*) AS total
+    FROM pending_tk_account_records
+    WHERE ${whereParts.join(' AND ')}
+  `).get(...params)?.total || 0;
+
+  const records = accountsDb.prepare(`
+    SELECT record_key, email, password, client_id, refresh_token, source, pool_status, claim_id, claimed_at, imported_at, updated_at
+    FROM pending_tk_account_records
+    WHERE ${whereParts.join(' AND ')}
+    ORDER BY imported_at DESC, email ASC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, offset).map((row) => buildPendingTkAccountPayload(row));
+
+  const statsRow = accountsDb.prepare(`
+    SELECT
+      SUM(CASE WHEN pool_status = 'available' THEN 1 ELSE 0 END) AS available_count,
+      SUM(CASE WHEN pool_status = 'claimed' THEN 1 ELSE 0 END) AS claimed_count,
+      COUNT(*) AS total_count
+    FROM pending_tk_account_records
+    WHERE owner_username = ?
+  `).get(ownerUsername);
+
+  return {
+    records,
+    page,
+    pageSize,
+    total,
+    stats: {
+      available: Number(statsRow?.available_count) || 0,
+      claimed: Number(statsRow?.claimed_count) || 0,
+      total: Number(statsRow?.total_count) || 0,
+    },
+  };
+};
+
+const deletePendingTkAccounts = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const emails = [...new Set((Array.isArray(options.emails) ? options.emails : [])
+    .map((item) => normalizeEmail(item))
+    .filter(Boolean))];
+  const deleteAll = parseBoolean(options.deleteAll);
+  const onlyAvailable = options.onlyAvailable !== false && options.onlyAvailable !== 'false' && options.onlyAvailable !== '0';
+
+  if (!deleteAll && emails.length === 0) {
+    return { deleted: 0, reason: 'no_targets' };
+  }
+
+  const whereParts = [`owner_username = ?`];
+  const params = [ownerUsername];
+  if (onlyAvailable) {
+    whereParts.push(`pool_status = 'available'`);
+  }
+  if (!deleteAll) {
+    whereParts.push(`email IN (${emails.map(() => '?').join(', ')})`);
+    params.push(...emails);
+  }
+
+  const result = accountsDb.prepare(`
+    DELETE FROM pending_tk_account_records
+    WHERE ${whereParts.join(' AND ')}
+  `).run(...params);
+
+  return { deleted: Number(result.changes) || 0 };
+};
+
+const acquirePendingTkAccount = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const requestedEmail = normalizeEmail(options.email || '');
+  const includeRaw = parseBoolean(options.includeRaw);
+  const timestamp = nowIso();
+  const claimId = crypto.randomUUID();
+
+  return runTransaction(accountsDb, () => {
+    const params = [ownerUsername];
+    let selector = `
+      SELECT record_key, email, password, client_id, refresh_token, raw_line, source, pool_status, claim_id, claimed_at, imported_at, updated_at
+      FROM pending_tk_account_records
+      WHERE owner_username = ? AND pool_status = 'available'
+    `;
+    if (requestedEmail) {
+      selector += ` AND lower(email) = lower(?)`;
+      params.push(requestedEmail);
+    }
+    selector += ` ORDER BY imported_at ASC, email ASC LIMIT 1`;
+
+    const row = accountsDb.prepare(selector).get(...params);
+    if (!row) {
+      return {
+        available: false,
+        claimed: false,
+        account: null,
+        reason: requestedEmail ? 'email_not_available' : 'pool_empty',
+      };
+    }
+
+    const updated = accountsDb.prepare(`
+      UPDATE pending_tk_account_records
+      SET pool_status = 'claimed', claim_id = ?, claimed_at = ?, updated_at = ?
+      WHERE record_key = ? AND owner_username = ? AND pool_status = 'available'
+    `).run(claimId, timestamp, timestamp, row.record_key, ownerUsername);
+
+    if ((updated.changes || 0) < 1) {
+      return {
+        available: false,
+        claimed: false,
+        account: null,
+        reason: 'race_conflict',
+      };
+    }
+
+    return {
+      available: true,
+      claimed: true,
+      claimId,
+      claimedAt: timestamp,
+      account: buildPendingTkAccountPayload({
+        ...row,
+        pool_status: 'claimed',
+        claim_id: claimId,
+        claimed_at: timestamp,
+        updated_at: timestamp,
+      }, { includeRaw }),
+    };
+  });
+};
+
+const takePendingTkAccount = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const requestedEmail = normalizeEmail(options.email || '');
+  const includeRaw = parseBoolean(options.includeRaw);
+  const source = String(options.source || 'tk_pending_taken').trim() || 'tk_pending_taken';
+  const timestamp = nowIso();
+
+  return runImmediateTransaction(accountsDb, () => {
+    const params = [ownerUsername];
+    let selector = `
+      SELECT *
+      FROM pending_tk_account_records
+      WHERE owner_username = ? AND pool_status = 'available'
+    `;
+    if (requestedEmail) {
+      selector += ` AND lower(email) = lower(?)`;
+      params.push(requestedEmail);
+    }
+    selector += ` ORDER BY imported_at ASC, email ASC LIMIT 1`;
+
+    const row = accountsDb.prepare(selector).get(...params);
+    if (!row) {
+      return {
+        taken: false,
+        available: false,
+        promoted: false,
+        reason: requestedEmail ? 'email_not_available' : 'pool_empty',
+        account: null,
+      };
+    }
+
+    upsertMainAccountFromPending(ownerUsername, row, source, timestamp);
+    const deleted = accountsDb.prepare(`
+      DELETE FROM pending_tk_account_records
+      WHERE record_key = ? AND owner_username = ? AND pool_status = 'available'
+    `).run(row.record_key, ownerUsername);
+
+    if ((deleted.changes || 0) < 1) {
+      return {
+        taken: false,
+        available: false,
+        promoted: false,
+        reason: 'race_conflict',
+        account: null,
+      };
+    }
+
+    return {
+      taken: true,
+      available: true,
+      promoted: true,
+      email: normalizeEmail(row.email),
+      source,
+      takenAt: timestamp,
+      account: buildPendingTkAccountPayload(row, { includeRaw }),
+    };
+  });
+};
+
+const completePendingTkAccount = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const email = normalizeEmail(options.email || '');
+  const claimId = String(options.claimId || options.claim_id || '').trim();
+  const source = String(options.source || 'tk_pending_registered').trim() || 'tk_pending_registered';
+
+  if (!email && !claimId) {
+    const error = new Error('email or claim_id is required');
+    error.status = 400;
+    throw error;
+  }
+
+  return runTransaction(accountsDb, () => {
+    let row;
+    if (claimId) {
+      row = accountsDb.prepare(`
+        SELECT *
+        FROM pending_tk_account_records
+        WHERE owner_username = ? AND claim_id = ? AND pool_status = 'claimed'
+        LIMIT 1
+      `).get(ownerUsername, claimId);
+    } else {
+      row = accountsDb.prepare(`
+        SELECT *
+        FROM pending_tk_account_records
+        WHERE owner_username = ? AND lower(email) = lower(?) AND pool_status = 'claimed'
+        LIMIT 1
+      `).get(ownerUsername, email);
+    }
+
+    if (!row) {
+      return {
+        ok: false,
+        promoted: false,
+        reason: 'not_found_or_not_claimed',
+        email: email || '',
+      };
+    }
+
+    const timestamp = nowIso();
+    upsertMainAccountFromPending(ownerUsername, row, source, timestamp);
+    accountsDb.prepare(`
+      DELETE FROM pending_tk_account_records
+      WHERE record_key = ? AND owner_username = ?
+    `).run(row.record_key, ownerUsername);
+
+    return {
+      ok: true,
+      promoted: true,
+      email: normalizeEmail(row.email),
+      claimId: row.claim_id || claimId,
+      source,
+      completedAt: timestamp,
+      account: buildPendingTkAccountPayload(row),
+    };
+  });
 };
 
 const listAccountEmails = (options = {}) => {
@@ -3122,6 +3556,12 @@ module.exports = {
     accountsDb: ACCOUNTS_DB_PATH,
   },
   importAccounts,
+  importPendingTkAccounts,
+  listPendingTkAccounts,
+  deletePendingTkAccounts,
+  acquirePendingTkAccount,
+  takePendingTkAccount,
+  completePendingTkAccount,
   listAccounts,
   listAccountsForFetch,
   getFetchableAccountCount,

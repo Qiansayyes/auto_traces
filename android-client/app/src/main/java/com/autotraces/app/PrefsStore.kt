@@ -79,6 +79,8 @@ object PrefsStore {
     private const val KEY_LOG_CONTEXT_USERNAME = "log_context_username"
     /** 失败采集：已上传的 business|error_type 去重键集合 */
     private const val KEY_FAILURE_REPORT_UPLOADED = "failure_report_uploaded_keys"
+    /** TikTok 安装后 root 图库权限一键开放：记录已处理的 lastUpdateTime（0=未处理）。 */
+    private const val KEY_TIKTOK_MEDIA_PERMISSION_GRANT_INSTALL_TOKEN = "tiktok_media_permission_grant_install_token"
 
     private lateinit var appContext: Context
     private lateinit var prefs: SharedPreferences
@@ -558,5 +560,12 @@ object PrefsStore {
         val set = prefs.getStringSet(KEY_FAILURE_REPORT_UPLOADED, emptySet())?.toMutableSet() ?: mutableSetOf()
         set.add(key)
         prefs.edit().putStringSet(KEY_FAILURE_REPORT_UPLOADED, set).apply()
+    }
+
+    fun getTikTokMediaPermissionGrantInstallToken(): Long =
+        prefs.getLong(KEY_TIKTOK_MEDIA_PERMISSION_GRANT_INSTALL_TOKEN, 0L)
+
+    fun setTikTokMediaPermissionGrantInstallToken(token: Long) {
+        prefs.edit().putLong(KEY_TIKTOK_MEDIA_PERMISSION_GRANT_INSTALL_TOKEN, token.coerceAtLeast(0L)).apply()
     }
 }

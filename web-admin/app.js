@@ -6982,14 +6982,31 @@ async function loadEditorState() {
     ? devicesResp.items.map((item) => getDeviceRowTemplate(item))
     : [];
   backupArchiveRows = Array.isArray(backupResp.items) ? backupResp.items : [];
+  rebuildBackupAliasByUsername();
+  syncAccountAliasFromDeviceRows();
+  enrichAccountStatsFromDeviceRows();
+}
+
+function rebuildBackupAliasByUsername() {
   backupAliasByUsername = new Map();
-  backupArchiveRows.forEach((row) => {
+  const ingest = (row) => {
     const username = String(row?.username || "").trim().toLowerCase();
     const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
     if (!username || !alias) return;
     if (!backupAliasByUsername.has(username)) backupAliasByUsername.set(username, alias);
+  };
+  (backupArchiveRows || []).forEach(ingest);
+  (deviceEditorRows || []).forEach(ingest);
+}
+
+/** 账号表 assigned_alias 为空时，从设备档案反查别名用于展示与保存 */
+function syncAccountAliasFromDeviceRows() {
+  (accountEditorRows || []).forEach((row) => {
+    if (normalizeAliasValue(row?.assigned_alias)) return;
+    const username = String(row?.username || "").trim().toLowerCase();
+    if (!username || !backupAliasByUsername.has(username)) return;
+    row.assigned_alias = backupAliasByUsername.get(username) || "";
   });
-  enrichAccountStatsFromDeviceRows();
 }
 
 /** 历史数据：备份档案已有统计而账号表为空时，加载后用于展示（不写库，等下次回写会持久化） */
@@ -7102,8 +7119,8 @@ async function ensureBackupArchiveEntryForAccount(row, assignedAlias) {
 async function saveAccountRow(index, options = {}) {
   const row = accountEditorRows[index];
   if (!row) return;
-  const { skipReload = false } = options || {};
-  const effectiveAlias = getEffectiveAccountAssignedAlias(row);
+  const { skipReload = false, skipBackupEnsure = false } = options || {};
+  const effectiveAlias = getEffectiveAccountAssignedAlias(row) || normalizeAliasValue(row?.assigned_alias);
   if (effectiveAlias) row.assigned_alias = effectiveAlias;
   await request(`${ACCOUNT_ROWS_API}/upsert`, {
     method: "POST",
@@ -7114,7 +7131,7 @@ async function saveAccountRow(index, options = {}) {
     }),
   });
   const persistedAlias = effectiveAlias || normalizeAliasValue(row.assigned_alias);
-  if (persistedAlias) {
+  if (!skipBackupEnsure && persistedAlias) {
     await ensureBackupArchiveEntryForAccount(row, persistedAlias);
   }
   if (!skipReload) {
@@ -7131,18 +7148,47 @@ function hasMeaningfulAccountValue(value) {
   return !["ignore", "ignored", "null", "none", "n/a", "na", "-", "--", "_"].includes(normalized);
 }
 
+const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "api", "region"];
+
 function mergeAccountImportRow(existing, incoming) {
+  const preservedAlias = getEffectiveAccountAssignedAlias(existing)
+    || normalizeAliasValue(existing?.assigned_alias);
   const merged = { ...existing };
-  for (const field of ["password", "email", "email_password", "api", "region"]) {
+  for (const field of ACCOUNT_IMPORT_MERGE_FIELDS) {
     const incomingValue = String(incoming?.[field] || "").trim();
     if (hasMeaningfulAccountValue(incomingValue)) {
       merged[field] = incomingValue;
     }
   }
+  merged.assigned_alias = preservedAlias;
   return merged;
 }
 
-const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "api", "region"];
+function looksLikeAccountApiValue(value) {
+  const text = String(value || "").trim();
+  if (!hasMeaningfulAccountValue(text)) return false;
+  return /^https?:\/\//i.test(text) || /\/api\b/i.test(text) || /pickup/i.test(text) || /^[\w.-]+:\d+\//.test(text);
+}
+
+function resolveAccountBatchApi(normalizedCols) {
+  if (normalizedCols.length <= 4) return "";
+  const tailCols = normalizedCols.slice(4).map((item) => String(item || "").trim());
+  for (let i = tailCols.length - 1; i >= 0; i -= 1) {
+    if (looksLikeAccountApiValue(tailCols[i])) return tailCols[i];
+  }
+  if (normalizedCols.length >= 7) {
+    const stdApi = String(normalizedCols[6] || "").trim();
+    if (hasMeaningfulAccountValue(stdApi)) return stdApi;
+  }
+  if (normalizedCols.length === 5) {
+    const compactApi = String(normalizedCols[4] || "").trim();
+    if (hasMeaningfulAccountValue(compactApi)) return compactApi;
+  }
+  const meaningfulTail = tailCols.filter(hasMeaningfulAccountValue);
+  if (meaningfulTail.length === 1) return meaningfulTail[0];
+  if (meaningfulTail.length > 1) return meaningfulTail[meaningfulTail.length - 1];
+  return "";
+}
 
 function hasAccountImportRowChanges(existing, incoming) {
   const merged = mergeAccountImportRow(existing, incoming);
@@ -7179,7 +7225,7 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const raw = String(line || "").trim();
   if (!raw) return null;
   const cols = raw.includes("\t")
-    ? raw.split("\t")
+    ? raw.split(/\t+/)
     : (raw.includes("----") ? raw.split(/-{4,}/) : [raw]);
   if (cols.length < 4) {
     throw new Error(`格式错误：至少需要4列（username、password、email、email_password）。支持 TAB 或 ---- 分隔，实际 ${cols.length} 列`);
@@ -7192,20 +7238,11 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const password = String(normalizedCols[1] || "").trim();
   const email = String(normalizedCols[2] || "").trim();
   const emailPassword = String(normalizedCols[3] || "").trim();
-  // 支持两种格式：
+  // 支持三种格式：
   // 1) 7列标准：username,password,email,email_password,ignore,ignore,api
   // 2) 5列紧凑：username,password,email,email_password,api
-  // 6列是缺少 api 的异常输入，不能把第5列误当作 api。
-  let api = "";
-  if (normalizedCols.length >= 7) {
-    api = String(normalizedCols[6] || "").trim();
-  } else if (normalizedCols.length === 5) {
-    api = String(normalizedCols[4] || "").trim();
-  } else if (normalizedCols.length === 6) {
-    api = "";
-  } else {
-    api = String(normalizedCols[4] || "").trim();
-  }
+  // 3) 6列常见：username,password,email,email_password,(忽略/空),api
+  const api = resolveAccountBatchApi(normalizedCols);
   if (rejectEmpty) {
     const missingFields = [];
     if (!hasMeaningfulAccountValue(username)) missingFields.push("username");
@@ -7242,10 +7279,14 @@ async function importAccountBatchFromText() {
   if (!lines.length) {
     throw new Error("请先粘贴批量数据（每行一条）");
   }
+  syncAccountAliasFromDeviceRows();
   const startIndex = accountEditorRows.length;
+  let parsedWithoutApi = 0;
   const parsedRows = lines.map((line, idx) => {
     try {
-      return parseAccountBatchLine(line, sharedRegion, rejectEmpty);
+      const row = parseAccountBatchLine(line, sharedRegion, rejectEmpty);
+      if (row && !hasMeaningfulAccountValue(row.api)) parsedWithoutApi += 1;
+      return row;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`第 ${idx + 1} 行解析失败：${message}`);
@@ -7314,10 +7355,9 @@ async function importAccountBatchFromText() {
   ];
   try {
     for (const index of saveIndexes) {
-      await saveAccountRow(index, { skipReload: true });
+      await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
     }
   } catch (error) {
-    accountEditorRows.splice(startIndex, accountEditorRows.length - startIndex);
     await loadEditorState();
     renderAccountEditorRows();
     renderDeviceEditorRows();
@@ -7330,12 +7370,14 @@ async function importAccountBatchFromText() {
   const statusParts = [];
   if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
   if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
+  if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
   if (skippedDuplicateUsernames.length) {
     const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
     statusParts.push(`跳过文件内重复 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
   }
   const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
-  setStatus(`批量导入完成：${statusParts.join("，")}`, hasChanges ? "success" : "warning");
+  const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
+  setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
 }
 
 function isUsernameUsedElsewhere(username, currentIndex) {
@@ -8113,13 +8155,13 @@ async function syncEditorField(scope, index, field, value, checked = false) {
   if (scope === "account") {
     const row = accountEditorRows[index];
     if (!row) return;
+    const preservedAlias = getEffectiveAccountAssignedAlias(row);
     if (field === "username") {
-      const preservedAlias = getEffectiveAccountAssignedAlias(row);
       row[field] = value;
-      if (preservedAlias) row.assigned_alias = preservedAlias;
     } else {
       row[field] = field === "is_login" ? (String(value) === "true" || checked) : value;
     }
+    if (preservedAlias) row.assigned_alias = preservedAlias;
     await saveAccountRow(index);
     if (field === "region" || field === "is_login" || field === "username") {
       renderDeviceRegionPresetOptions();

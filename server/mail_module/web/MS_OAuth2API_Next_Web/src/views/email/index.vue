@@ -665,6 +665,42 @@ const importAccountsToDatabase = async (records: Email[], source = 'ui') => {
     return payload.data
 }
 
+const deleteAccountsFromDatabase = async (emails: string[], deleteAll = false) => {
+    const response = await fetch('/api/accounts/delete', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            password: toolForm.value.apiPassword,
+            emails,
+            deleteAll,
+        })
+    })
+    const payload = await response.json()
+    if (!(payload.code === '200' || payload.code === 200)) {
+        throw new Error(payload.message || payload.error || '账号删除失败')
+    }
+    const deleted = Number(payload.data?.deleted || 0)
+    if (deleted < 1) {
+        throw new Error(deleteAll ? '未删除任何账号' : '未找到可删除的账号，请刷新列表后重试')
+    }
+    return payload.data
+}
+
+const removeEmailsFromLocalCache = (emails: string[]) => {
+    const targets = new Set(emails.map((item) => item.trim().toLowerCase()).filter(Boolean))
+    if (targets.size === 0) return
+
+    const cached = localStorageMailList().filter((item) => !targets.has(item.email.trim().toLowerCase()))
+    localStorage.setItem('localMailList', JSON.stringify(cached))
+
+    for (const email of targets) {
+        localStorage.removeItem(`${email}INBOX`)
+        localStorage.removeItem(`${email}Junk`)
+    }
+}
+
 const syncAccountsToDatabase = async (records: Email[], source = 'localStorage_sync') => {
     try {
         await importAccountsToDatabase(records, source)
@@ -737,6 +773,7 @@ const loadAccountsPage = async (showMessage = false) => {
         if (payload.code === '200' || payload.code === 200) {
             mailList.value = payload.data?.records || []
             tablePagination.value.total = payload.data?.total || 0
+            localStorage.setItem('localMailList', JSON.stringify(mailList.value))
             syncActiveMobileEmail()
             if (showMessage) {
                 ElMessage.success(`已加载 ${mailList.value.length} / ${tablePagination.value.total} 个邮箱`)
@@ -862,9 +899,6 @@ const updateAllHeights = () => {
 }
 
 onMounted(() => {
-    const browserRecords = localStorageMailList()
-    void syncAccountsToDatabase(browserRecords, 'startup_localStorage')
-    void syncCachedMailToDatabase(browserRecords)
     if (toolForm.value.apiPassword) {
         void loadSenderFilterOptions()
     }
@@ -927,13 +961,18 @@ const handleBatchDelete = () => {
         confirmButtonText: '确定',
         cancelButtonText: '取消',
         type: 'warning'
-    }).then(() => {
-        mailList.value = mailList.value.filter(item => !multipleSelection.value.includes(item))
-        tablePagination.value.total = mailList.value.length
-        localStorage.setItem('localMailList', JSON.stringify(mailList.value))
-        toggleSelection()
-        syncActiveMobileEmail()
-        ElMessage.success('删除成功')
+    }).then(async () => {
+        const emails = multipleSelection.value.map((item) => item.email)
+        try {
+            const result = await deleteAccountsFromDatabase(emails)
+            removeEmailsFromLocalCache(emails)
+            toggleSelection()
+            syncActiveMobileEmail()
+            await loadAccountsPage()
+            ElMessage.success(`删除成功，已删除 ${result.deleted} 条`)
+        } catch (error: any) {
+            ElMessage.error(error?.message || '删除失败')
+        }
     }).catch(() => {
         ElMessage.info('已取消删除')
     })
@@ -945,13 +984,17 @@ const handleDeleteAll = () => {
         confirmButtonText: '确定',
         cancelButtonText: '取消',
         type: 'warning'
-    }).then(() => {
-        mailList.value = []
-        tablePagination.value.total = 0
-        localStorage.setItem('localMailList', JSON.stringify(mailList.value))
-        toggleSelection()
-        activeMobileEmail.value = null
-        ElMessage.success('删除成功')
+    }).then(async () => {
+        try {
+            const result = await deleteAccountsFromDatabase([], true)
+            localStorage.setItem('localMailList', JSON.stringify([]))
+            toggleSelection()
+            activeMobileEmail.value = null
+            await loadAccountsPage()
+            ElMessage.success(`删除成功，已删除 ${result.deleted} 条`)
+        } catch (error: any) {
+            ElMessage.error(error?.message || '删除失败')
+        }
     }).catch(() => {
         ElMessage.info('已取消删除')
     })
@@ -1090,12 +1133,16 @@ const handleDelete = (row: Email, index: number) => {
         confirmButtonText: '确定',
         cancelButtonText: '取消',
         type: 'warning'
-    }).then(() => {
-        mailList.value.splice(index, 1)
-        localStorage.setItem('localMailList', JSON.stringify(mailList.value))
-        tablePagination.value.total = mailList.value.length
-        syncActiveMobileEmail()
-        ElMessage.success('删除成功')
+    }).then(async () => {
+        try {
+            const result = await deleteAccountsFromDatabase([row.email])
+            removeEmailsFromLocalCache([row.email])
+            await loadAccountsPage()
+            syncActiveMobileEmail()
+            ElMessage.success(`删除成功，已删除 ${result.deleted} 条`)
+        } catch (error: any) {
+            ElMessage.error(error?.message || '删除失败')
+        }
     }).catch(() => {
         ElMessage.info('已取消删除')
     })

@@ -37,6 +37,11 @@ const router = createRouter({
           component: () => import('@/views/project-mailboxes/index.vue'),
         },
         {
+          path: '/tk-pending',
+          name: 'tk-pending',
+          component: () => import('@/views/tk-pending/index.vue'),
+        },
+        {
           path: '/api-docs',
           name: 'api-docs',
           component: () => import('@/views/api-docs/index.vue'),

@@ -19,6 +19,7 @@ class SettingsActivity : AppCompatActivity() {
         binding.cloudUsernameInput.setText(PrefsStore.getAuthUsername().orEmpty())
         binding.cloudPasswordInput.setText(PrefsStore.getAuthPassword().orEmpty())
         renderDeviceInfo()
+        binding.versionText.text = AppInfo.versionLabel()
 
         binding.showSettingsButton.setOnClickListener {
             // 当前页即设置页，保持不跳转
@@ -52,6 +53,7 @@ class SettingsActivity : AppCompatActivity() {
                         if (resp.code == 0 && !resp.token.isNullOrBlank()) {
                             PrefsStore.saveAuthToken(resp.token!!, resp.username ?: u)
                             PrefsStore.saveAuthPassword(p)
+                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
                             binding.statusText.text = "登录成功"
                         } else {
                             binding.statusText.text = resp.msg
@@ -99,6 +101,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun renderDeviceInfo() {
         binding.deviceInfoText.text = buildString {
+            appendLine("版本: ${AppInfo.versionLabel()}")
             appendLine("Alias: ${PrefsStore.getAlias() ?: "-"}")
             appendLine("Device ID: ${PrefsStore.getDeviceId() ?: "-"}")
             appendLine("Local Status: ${PrefsStore.getLocalStatus()}")

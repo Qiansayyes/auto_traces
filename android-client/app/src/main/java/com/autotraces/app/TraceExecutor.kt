@@ -907,7 +907,7 @@ class RealTraceExecutor(
 
     private data class StrictLabelHit(val point: Point, val rect: Rect)
 
-    /** 修改基本资料专用：把 OCR 命中的文案与 bbox、点击中心写入设备日志（经 LogCenter 同步云端）。 */
+    /** 修改基本资料：命中目标文案时不写 OCR 摘要（仅未命中时由 [logOcrReadTextOnMiss] 输出读取文案）。 */
     private fun profileEditLogStrictHit(
         alias: String,
         phase: String,
@@ -926,6 +926,31 @@ class RealTraceExecutor(
             .filter { it.isNotEmpty() }
             .take(maxLines)
             .joinToString(" | ")
+
+    /** OCR 未匹配目标文案时：输出本次读到的屏幕文案（每次未命中一条，便于区分定位 vs 解析）。 */
+    private fun logOcrReadTextOnMiss(
+        alias: String,
+        phaseLabel: String,
+        attempt: Int,
+        maxAttempts: Int,
+        readTextPreview: String,
+        maxChars: Int = 500,
+    ) {
+        val attemptLabel =
+            if (maxAttempts in 1..999) "第 $attempt/$maxAttempts 次：" else "第 $attempt 次："
+        devOp(alias, "$phaseLabel ${attemptLabel}读取到文案 ${readTextPreview.take(maxChars)}")
+    }
+
+    private fun logOcrReadTextOnMiss(
+        alias: String,
+        phaseLabel: String,
+        attempt: Int,
+        maxAttempts: Int,
+        vision: Text,
+        maxChars: Int = 500,
+    ) {
+        logOcrReadTextOnMiss(alias, phaseLabel, attempt, maxAttempts, buildProfileEditOcrPreview(vision), maxChars)
+    }
 
     /**
      * Confirm 步骤调试用：按 element 打印 `文案@(l,t,r,b)`，便于对照真机 UI 补规则。
@@ -1077,16 +1102,20 @@ class RealTraceExecutor(
                 devOp(logAlias, "「修改基本资料」Bio 前 TikTok 文案 OCR 第 $attempt/3 次失败：$errTag")
                 return@repeat
             }
-            val preview = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」Bio 前 TikTok 文案 OCR 第 $attempt/3 次：行摘要=$preview")
             val hitPair = findProfileEditTikTokTextHit(vision)
             if (hitPair == null) {
-                devOp(logAlias, "「修改基本资料」Bio 前 TikTok 文案 OCR 第 $attempt/3 次：未定位到含 tiktok 的文案")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Bio 前 TikTok 文案",
+                    attempt,
+                    3,
+                    vision,
+                    420,
+                )
                 return@repeat
             }
             val (hit, matchedText) = hitPair
             profileEditLogStrictHit(logAlias, "TikTok文案(复制)", matchedText, hit, w, h)
-            devOp(logAlias, "「修改基本资料」Bio 前：OCR 命中 tiktok 文案「$matchedText」")
             val tap = coerceTapToScreen(hit.point, w, h)
             devOp(logAlias, "「修改基本资料」Bio 前：点击 TikTok 文案 (${tap.x},${tap.y}) 以复制到剪贴板")
             if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
@@ -1758,11 +1787,16 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(480)
-            devOp(logAlias, "「修改基本资料」$phaseLog 第 $pass/$maxPasses 次：行摘要=$pv")
             val hit = findHit(vision)
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」$phaseLog 第 $pass/$maxPasses 次：未命中")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」$phaseLog",
+                    pass,
+                    maxPasses,
+                    vision,
+                    480,
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, phaseLog, strictLabelForLog, hit, w, h)
@@ -1857,16 +1891,11 @@ class RealTraceExecutor(
                 )
                 if (err == "hard_stop") return ProfileEditAvatarUploadWaitOutcome.HardStop
             } else {
-                val preview = buildProfileEditOcrPreview(vision).take(420)
-                devOp(
-                    logAlias,
-                    "「修改基本资料」发帖后上传等待第 $pollAttempts 次（约 ${elapsedSec}s）：摘要=$preview",
-                )
                 val uploadReadyHit = findProfileEditChangePhotoMarkerHit(vision)
                 if (uploadReadyHit != null) {
                     devOp(
                         logAlias,
-                        "「修改基本资料」发帖后上传等待：已 strict 定位「${uploadReadyHit.second}」（第 $pollAttempts 次），跳过后续 7 次校验",
+                        "「修改基本资料」发帖后上传等待：已定位「${uploadReadyHit.second}」（第 $pollAttempts 次），跳过后续 7 次校验",
                     )
                     return ProfileEditAvatarUploadWaitOutcome.ChangePhotoReady(pollAttempts)
                 }
@@ -1884,9 +1913,13 @@ class RealTraceExecutor(
                     )
                     return ProfileEditAvatarUploadWaitOutcome.NeedChangePhotoVerify(pollAttempts)
                 } else {
-                    devOp(
+                    logOcrReadTextOnMiss(
                         logAlias,
-                        "「修改基本资料」发帖后上传等待：未见 uploading、未见 Change photo/Edit photo/Avatar，1s 后继续 OCR",
+                        "「修改基本资料」发帖后上传等待（约 ${elapsedSec}s）",
+                        pollAttempts,
+                        (PROFILE_EDIT_AVATAR_UPLOAD_WAIT_MAX_MS / PROFILE_EDIT_AVATAR_UPLOAD_POLL_MS).toInt(),
+                        vision,
+                        480,
                     )
                 }
             }
@@ -1940,14 +1973,19 @@ class RealTraceExecutor(
                 if (err == "hard_stop") return false to attempts
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」$humanPhase 第 $attempts/$maxTries 次：摘要=$pv")
             val markerHit = findProfileEditChangePhotoMarkerHit(vision)
             if (markerHit != null) {
                 devOp(logAlias, "「修改基本资料」$humanPhase：已定位「${markerHit.second}」（$attempts/$maxTries）")
                 return true to attempts
             }
-            devOp(logAlias, "「修改基本资料」$humanPhase 第 $attempts/$maxTries 次：未见 Change photo/Edit photo/Avatar")
+            logOcrReadTextOnMiss(
+                logAlias,
+                "「修改基本资料」$humanPhase",
+                attempts,
+                maxTries,
+                vision,
+                480,
+            )
         }
         return false to attempts
     }
@@ -2035,11 +2073,16 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(480)
-            devOp(logAlias, "「修改基本资料」$phaseLog 第 $pass/$maxPasses 次：行摘要=$pv")
             val hit = findHit(vision)
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」$phaseLog 第 $pass/$maxPasses 次：未命中")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」$phaseLog",
+                    pass,
+                    maxPasses,
+                    vision,
+                    480,
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, phaseLog, strictLabelForLog, hit, w, h)
@@ -2271,15 +2314,14 @@ class RealTraceExecutor(
                     if (errTag == "hard_stop") return false to "hard_stop"
                     continue
                 }
-                val pv = buildProfileEditOcrPreview(vision).take(420)
-                devOp(
-                    logAlias,
-                    "「修改基本资料」设置菜单探针 OCR $ocrPass/${PROFILE_EDIT_SETTINGS_PRIVACY_OCR_PER_TAP}（第 $tapAttempt 次点击）摘要=$pv",
-                )
                 if (!profileEditSettingsGearSidebarProbeVisible(vision)) {
-                    devOp(
+                    logOcrReadTextOnMiss(
                         logAlias,
-                        "「修改基本资料」设置菜单探针 OCR $ocrPass/${PROFILE_EDIT_SETTINGS_PRIVACY_OCR_PER_TAP}（第 $tapAttempt 次点击）：未见 Settings and privacy",
+                        "「修改基本资料」设置菜单探针（第 $tapAttempt 次点击）",
+                        ocrPass,
+                        PROFILE_EDIT_SETTINGS_PRIVACY_OCR_PER_TAP,
+                        vision,
+                        420,
                     )
                     continue
                 }
@@ -2354,16 +2396,15 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false
                 continue
             }
-            val preview = buildProfileEditOcrPreview(vision).take(480)
-            devOp(
-                logAlias,
-                "「修改基本资料」Recents 稳定 第 $pass/${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES} 次：行摘要=$preview",
-            )
             val hit = findStrictExactLabelHit(vision, "Recents")
             if (hit == null) {
-                devOp(
+                logOcrReadTextOnMiss(
                     logAlias,
-                    "「修改基本资料」Recents 稳定 第 $pass/${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES} 次：未命中",
+                    "「修改基本资料」Recents 稳定",
+                    pass,
+                    PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES,
+                    vision,
+                    480,
                 )
                 continue
             }
@@ -2411,13 +2452,15 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false to "hard_stop"
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」插入段 Permissions OCR $pass/$maxPermissionsPasses：摘要=$pv")
             val marker = findProfileEditPermissionsScreenMarkerHit(vision)
             if (marker == null) {
-                devOp(
+                logOcrReadTextOnMiss(
                     logAlias,
-                    "「修改基本资料」插入段 Permissions $pass/$maxPermissionsPasses：未见 Permissions / Security and permissions",
+                    "「修改基本资料」插入段 Permissions",
+                    pass,
+                    maxPermissionsPasses,
+                    vision,
+                    420,
                 )
                 continue
             }
@@ -2490,13 +2533,15 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false to "hard_stop"
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」Permissions 校验 OCR $pass/$maxPasses：摘要=$pv")
             val marker = findProfileEditPermissionsScreenMarkerHit(vision)
             if (marker == null) {
-                devOp(
+                logOcrReadTextOnMiss(
                     logAlias,
-                    "「修改基本资料」Permissions 校验 $pass/$maxPasses：未见 Permissions / Security and permissions（Settings and privacy 可能未点中）",
+                    "「修改基本资料」Permissions 校验",
+                    pass,
+                    maxPasses,
+                    vision,
+                    420,
                 )
                 continue
             }
@@ -2505,7 +2550,14 @@ class RealTraceExecutor(
             devOp(logAlias, "「修改基本资料」已见 $markerLabel：验证 Settings and privacy 点击成功（仅校验，不点击）")
             val privacyBottom = findBottommostStrictExactLabelHit(vision, "Privacy")
             if (privacyBottom == null) {
-                devOp(logAlias, "「修改基本资料」Permissions 校验 $pass/$maxPasses：屏内未见 Privacy")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Permissions 校验（屏内 Privacy）",
+                    pass,
+                    maxPasses,
+                    vision,
+                    420,
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, "Privacy(屏内最下)", "Privacy", privacyBottom, w, h)
@@ -2616,11 +2668,6 @@ class RealTraceExecutor(
                     "「修改基本资料」Viewers OCR（下滑后第 $scrollPass 屏）失败：$errTag",
                 )
             } else {
-                val pv = buildProfileEditOcrPreview(vision).take(420)
-                devOp(
-                    logAlias,
-                    "「修改基本资料」Viewers OCR（下滑后第 $scrollPass 屏）行摘要=$pv",
-                )
                 val hit = findProfileEditViewersHit(vision)
                 if (hit != null) {
                     profileEditLogStrictHit(logAlias, "Viewers", "Viewers", hit, w, h)
@@ -2629,7 +2676,14 @@ class RealTraceExecutor(
                     devOp(logAlias, "「修改基本资料」已定位「Viewers」（第 $scrollPass 屏）")
                     break
                 }
-                devOp(logAlias, "「修改基本资料」Viewers OCR（下滑后第 $scrollPass 屏）：未命中")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Viewers（下滑后第 $scrollPass 屏）",
+                    scrollPass,
+                    2,
+                    vision,
+                    420,
+                )
             }
             if (scrollPass == 1) {
                 devOp(logAlias, "「修改基本资料」未见 Viewers，再下滑一次后重试 OCR")
@@ -2696,7 +2750,7 @@ class RealTraceExecutor(
         if (bioHit != null) {
             profileEditLogStrictHit(logAlias, "Bio重聚焦($tag)", "Bio", bioHit, w, h)
             val tap = coerceTapToScreen(bioHit.point, w, h)
-            devOp(logAlias, "「修改基本资料」Bio重聚焦($tag)：同屏 OCR 命中 Bio，input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」Bio重聚焦($tag)：同屏已定位 Bio，input tap (${tap.x},${tap.y})")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                 delay(450)
                 profileEditClearFocusedNameField(logAlias)
@@ -2715,12 +2769,19 @@ class RealTraceExecutor(
             }
             val hit = findStrictExactLabelHit(ocrVision, "Bio")
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」Bio重聚焦($tag) 第 $attempt/2 次：未命中 Bio")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Bio重聚焦($tag)",
+                    attempt,
+                    2,
+                    ocrVision,
+                    420,
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, "Bio重聚焦($tag)", "Bio", hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
-            devOp(logAlias, "「修改基本资料」Bio重聚焦($tag)：OCR 命中 Bio，input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」Bio重聚焦($tag)：已定位 Bio，input tap (${tap.x},${tap.y})")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                 delay(450)
                 profileEditClearFocusedNameField(logAlias)
@@ -2731,7 +2792,7 @@ class RealTraceExecutor(
         if (fallbackTapPx != null) {
             devOp(
                 logAlias,
-                "「修改基本资料」Bio重聚焦($tag)：OCR 均未命中 Bio，回退菜单坐标 (${fallbackTapPx.first},${fallbackTapPx.second})",
+                "「修改基本资料」Bio重聚焦($tag)：2 次均未定位 Bio，回退菜单坐标 (${fallbackTapPx.first},${fallbackTapPx.second})",
             )
             if (runSuCommand("input tap ${fallbackTapPx.first} ${fallbackTapPx.second}")) {
                 delay(450)
@@ -2760,11 +2821,16 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return null
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」Save 第 $pass/6 次：行摘要=$pv")
             val hit = findTopmostStrictExactLabelHit(vision, "Save")
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」Save 第 $pass/6 次：未命中（多命中时取 bbox.top 最小）")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Save",
+                    pass,
+                    6,
+                    vision,
+                    420,
+                )
                 val bioText = bioTextForRecovery?.trim().orEmpty()
                 if (bioText.isNotEmpty()) {
                     profileEditRefocusBioAndReinput(
@@ -2806,13 +2872,6 @@ class RealTraceExecutor(
                 if (errTag == "hard_stop") return false
                 continue
             }
-            val pv = buildProfileEditOcrPreview(vision).take(420)
-            devOp(logAlias, "「修改基本资料」Confirm OCR 第 $pass/$maxPasses 次：行摘要=$pv")
-            val elDump = buildProfileEditOcrElementDump(vision, 96)
-            devOp(
-                logAlias,
-                "「修改基本资料」Confirm OCR 第 $pass/$maxPasses 次：element 采样（供对勾/文案校准，至多 96 段）=$elDump",
-            )
             val syncRow = findProfileEditSyncOrUsernameRowHit(vision)
             if (syncRow != null) {
                 profileEditLogStrictHit(
@@ -2848,14 +2907,21 @@ class RealTraceExecutor(
             }
             val hit = findStrictExactLabelHit(vision, "Confirm")
             if (hit == null) {
-                devOp(logAlias, "「修改基本资料」Confirm 第 $pass/$maxPasses 次：未命中严格文案")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Confirm",
+                    pass,
+                    maxPasses,
+                    vision,
+                    480,
+                )
                 continue
             }
             profileEditLogStrictHit(logAlias, "Confirm", "Confirm", hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             devOp(logAlias, "「修改基本资料」Confirm：input tap (${tap.x},${tap.y})")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                devOp(logAlias, "「修改基本资料」Confirm：第 $pass/$maxPasses 次命中并完成 tap（本步成功）")
+                devOp(logAlias, "「修改基本资料」Confirm：第 $pass/$maxPasses 次 tap 完成（本步成功）")
                 return true
             }
             devOp(logAlias, "「修改基本资料」Confirm 第 $pass/$maxPasses 次 tap 失败（su）")
@@ -2920,15 +2986,18 @@ class RealTraceExecutor(
                 }
                 continue
             }
-            if (!compactLog) {
-                val pv = buildProfileEditOcrPreview(vision).take(480)
-                line("$phaseLog 第 $pass/$passes 次：行摘要=$pv [$logSuffix]")
-            }
             val hit = findDismissHit(vision)
             if (hit == null) {
                 missCount++
                 if (!compactLog) {
-                    line("$phaseLog 第 $pass/$passes 次：未命中 [$logSuffix]")
+                    logOcrReadTextOnMiss(
+                        logAlias,
+                        "$phaseLog [$logSuffix]",
+                        pass,
+                        passes,
+                        vision,
+                        480,
+                    )
                 }
                 continue
             }
@@ -3031,14 +3100,20 @@ class RealTraceExecutor(
             lastEditVision = vision
             val preview = buildProfileEditOcrPreview(vision)
             editPreviews.add(preview)
-            devOp(logAlias, "「修改基本资料」Edit OCR 第 $editAttempts/3 次：行摘要=${preview.take(500)}")
             editPoint = findStrictEditTapPoint(vision)
             if (editPoint == null) {
-                devOp(logAlias, "「修改基本资料」Edit OCR 第 $editAttempts/3 次：未命中严格文案「Edit」")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Edit",
+                    editAttempts,
+                    3,
+                    preview,
+                    500,
+                )
             }
         }
         if (editPoint == null) {
-            devOp(logAlias, "「修改基本资料」失败：Edit 经 3 次 OCR 仍未命中")
+            devOp(logAlias, "「修改基本资料」失败：Edit 经 3 次 OCR 仍未定位")
             return ProfileEditChainResult(
                 success = false,
                 failureStep = "edit_ocr_3x_miss",
@@ -3049,7 +3124,7 @@ class RealTraceExecutor(
         }
         val editVision = lastEditVision
         if (editVision == null) {
-            devOp(logAlias, "「修改基本资料」失败：Edit 命中但内部未缓存最后一次 OCR 结果")
+            devOp(logAlias, "「修改基本资料」失败：Edit 已定位但内部未缓存最后一次 OCR 结果")
             return ProfileEditChainResult(
                 success = false,
                 failureStep = "edit_internal_no_vision",
@@ -3127,16 +3202,15 @@ class RealTraceExecutor(
             }
             val preview = buildProfileEditOcrPreview(vision)
             changePreviews.add("menu:$preview")
-            devOp(logAlias, "「修改基本资料」三项菜单 OCR 第 $changeAttempts/3 次：行摘要=${preview.take(500)}")
             val triple = findProfileEditChangePhotoNameBioTriple(vision)
             if (triple == null) {
-                val okCp = findProfileEditChangePhotoMarkerSeen(vision)
-                val okNm =
-                    findStrictExactLabelHit(vision, "Name") != null || findStrictExactLabelHit(vision, "name") != null
-                val okBio = findStrictExactLabelHit(vision, "Bio") != null
-                devOp(
+                logOcrReadTextOnMiss(
                     logAlias,
-                    "「修改基本资料」三项菜单 OCR 第 $changeAttempts/3 次：未三词齐全（Change photo=$okCp，Name/name=$okNm，Bio=$okBio）。行摘要仅供浏览，命中以逐项 element/line trim 全等为准",
+                    "「修改基本资料」三项菜单",
+                    changeAttempts,
+                    3,
+                    preview,
+                    500,
                 )
             } else {
                 profileEditLogStrictHit(logAlias, "菜单项(仅记录)", "Change photo", triple.changePhoto, w, h)
@@ -3202,7 +3276,7 @@ class RealTraceExecutor(
                 changePhotoTapPx = tapMenuPass.x to tapMenuPass.y
                 devOp(
                     logAlias,
-                    "「修改基本资料」Change photo(菜单同屏)：严格文案坐标已打印于上条；执行 input tap (${tapMenuPass.x},${tapMenuPass.y})",
+                    "「修改基本资料」Change photo(菜单同屏)：执行 input tap (${tapMenuPass.x},${tapMenuPass.y})",
                 )
                 changePhotoTapOk = runSuCommand("input tap ${tapMenuPass.x} ${tapMenuPass.y}")
                 changePhotoStrictAttempts = 1
@@ -3230,17 +3304,23 @@ class RealTraceExecutor(
             }
             val pv = buildProfileEditOcrPreview(vision)
             changePreviews.add("change_photo_strict:$pv")
-            devOp(logAlias, "「修改基本资料」严格「Change photo」第 $changePhotoStrictAttempts/3 次：行摘要=${pv.take(500)}")
             val hitPair = findProfileEditChangePhotoMarkerHit(vision)
             if (hitPair == null) {
-                devOp(logAlias, "「修改基本资料」严格 Change photo/Edit photo/Avatar 第 $changePhotoStrictAttempts/3 次：未命中")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Change photo/Edit photo/Avatar",
+                    changePhotoStrictAttempts,
+                    3,
+                    pv,
+                    500,
+                )
                 continue
             }
             val (hit, hitLabel) = hitPair
             profileEditLogStrictHit(logAlias, "Change photo(专段整屏)", hitLabel, hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             changePhotoTapPx = tap.x to tap.y
-            devOp(logAlias, "「修改基本资料」Change photo(专段整屏)：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」Change photo(专段整屏)：执行 input tap (${tap.x},${tap.y})")
             changePhotoTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!changePhotoTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Change photo(专段整屏) 的 input tap 未成功（su）")
@@ -3310,17 +3390,23 @@ class RealTraceExecutor(
             }
             val upPrev = buildProfileEditOcrPreview(vision)
             uploadPreviews.add(upPrev)
-            devOp(logAlias, "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：行摘要=${upPrev.take(500)}")
             val hitPair = findProfileEditUploadPhotoHit(vision)
             if (hitPair == null) {
-                devOp(logAlias, "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：未命中严格文案")
+                logOcrReadTextOnMiss(
+                    logAlias,
+                    "「修改基本资料」Upload photo/Select from Gallery",
+                    uploadAttempts,
+                    3,
+                    upPrev,
+                    500,
+                )
                 continue
             }
             val (hit, matchedLabel) = hitPair
             profileEditLogStrictHit(logAlias, "Upload photo/Select from Gallery", matchedLabel, hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             uploadTapPx = tap.x to tap.y
-            devOp(logAlias, "「修改基本资料」$matchedLabel：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」$matchedLabel：执行 input tap (${tap.x},${tap.y})")
             uploadTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!uploadTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Upload photo/Select from Gallery 的 input tap 未成功（su）")
@@ -3409,10 +3495,6 @@ class RealTraceExecutor(
             }
             val ap = buildProfileEditOcrPreview(vision)
             allowPreviews.add(ap)
-            devOp(
-                logAlias,
-                "「修改基本资料」Allow all 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次：行摘要=${ap.take(500)}",
-            )
             val hit = findStrictExactLabelHit(vision, "Allow all")
             if (hit == null) {
                 val recentsHit = findStrictExactLabelHit(vision, "Recents")
@@ -3426,17 +3508,20 @@ class RealTraceExecutor(
                     allowSkippedBecauseRecentsVisible = true
                     break
                 }
-                devOp(
+                logOcrReadTextOnMiss(
                     logAlias,
-                    "「修改基本资料」Allow all 第 $allowAttempts/${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次：" +
-                        "未命中 Allow all，且未见 Recents",
+                    "「修改基本资料」Allow all",
+                    allowAttempts,
+                    PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES,
+                    ap,
+                    500,
                 )
                 continue
             }
             profileEditLogStrictHit(logAlias, "Allow all", "Allow all", hit, w, h)
             val tap = coerceTapToScreen(hit.point, w, h)
             allowTapPx = tap.x to tap.y
-            devOp(logAlias, "「修改基本资料」Allow all：严格文案坐标已打印于上条；执行 input tap (${tap.x},${tap.y})")
+            devOp(logAlias, "「修改基本资料」Allow all：执行 input tap (${tap.x},${tap.y})")
             allowTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!allowTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Allow all 的 input tap 未成功（su）")
@@ -3472,7 +3557,7 @@ class RealTraceExecutor(
         if (!allowTapOk && !allowSkippedBecauseRecentsVisible) {
             devOp(
                 logAlias,
-                "「修改基本资料」Allow all：${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次 OCR 均未命中 Allow all，且未见 Recents；" +
+                "「修改基本资料」Allow all：${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次 OCR 均未定位 Allow all，且未见 Recents；" +
                     "跳过 Allow all 点击，继续等待 Recents 稳定",
             )
         }
@@ -4082,7 +4167,7 @@ class RealTraceExecutor(
         val commandNoise = listOf(
             "am force-stop", "am start", "monkey -p", "pm clear", "pkill", "killall",
             "input tap", "input text", "input swipe", "input keyevent", "screencap",
-            "uiautomator", "执行启动命令", "启动命令[", "强停命令", "行摘要=", "OCR 摘要=",
+            "uiautomator", "执行启动命令", "启动命令[", "强停命令", "行摘要=", "OCR 摘要=", "摘要=",
             "su tap", "（su）", "bbox(", "拟 tap=", "点击中心=",
             "dumpsys", "top=", "forceStopWaitMs=", "launchWaitMs=",
             "startActivity ", "distance=", "startY=", "endY=",
@@ -4090,7 +4175,7 @@ class RealTraceExecutor(
         )
         if (commandNoise.any { s.contains(it, ignoreCase = true) }) return true
         if (Regex("""第\s*\d+\s*/\s*\d+\s*次[：:]""").containsMatchIn(s)) {
-            val keep = listOf("失败", "成功", "完成", "已定位", "已点", "已见", "命中", "上限")
+            val keep = listOf("失败", "成功", "完成", "已定位", "已点", "已见", "读取到文案", "上限")
             if (keep.none { s.contains(it) }) return true
         }
         val launchNoise = listOf(

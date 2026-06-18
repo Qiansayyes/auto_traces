@@ -65,6 +65,7 @@ MAIL_API_PREFIXES = (
     "/api/mail/cache/",
     "/api/database/stats",
     "/api/project/",
+    "/api/tk-pending/",
     "/api/server_time",
 )
 
@@ -286,6 +287,85 @@ def fetch_tiktok_email_code_via_mail_module(
             if code:
                 return 0, "ok", code
     return 1, "邮箱管理模块邮件中未识别到 6 位验证码", None
+
+
+def _post_mail_module_json(owner_username: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, str, dict[str, Any] | None]:
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return 1, "owner 为空", None
+    if not is_mail_module_ready():
+        return 1, "邮箱管理模块未就绪", None
+    try:
+        resp = httpx.post(
+            f"{_mail_upstream_base()}{path}",
+            headers=_internal_mail_headers(owner),
+            json=payload or {},
+            timeout=30.0,
+        )
+    except httpx.RequestError as exc:
+        return 1, f"邮箱管理模块请求失败: {exc}", None
+    try:
+        body = resp.json()
+    except ValueError:
+        return 1, f"邮箱管理模块返回非 JSON（HTTP {resp.status_code}）", None
+    if resp.status_code >= 400 or str(body.get("code") or "") not in {"200", 200}:
+        err = str(body.get("error") or body.get("message") or f"HTTP {resp.status_code}").strip()
+        return 1, err or "邮箱管理模块请求失败", body.get("data") if isinstance(body.get("data"), dict) else None
+    data = body.get("data")
+    return 0, "ok", data if isinstance(data, dict) else {}
+
+
+def acquire_pending_tk_account_via_mail_module(owner_username: str, email: str = "") -> tuple[int, str, dict[str, Any] | None]:
+    payload: dict[str, Any] = {}
+    account_email = str(email or "").strip()
+    if account_email:
+        payload["email"] = account_email
+    code, msg, data = _post_mail_module_json(owner_username, "/api/tk-pending/accounts/acquire", payload)
+    if code != 0:
+        return code, msg, data
+    if not data or not data.get("available") or not data.get("account"):
+        reason = str((data or {}).get("reason") or "无可用待注册邮箱")
+        return 1, reason, data
+    return 0, "ok", data
+
+
+def take_pending_tk_account_via_mail_module(owner_username: str, email: str = "") -> tuple[int, str, dict[str, Any] | None]:
+    """从待注册池领取邮箱，并立即转入邮箱账户管理。"""
+    payload: dict[str, Any] = {}
+    account_email = str(email or "").strip()
+    if account_email:
+        payload["email"] = account_email
+    code, msg, data = _post_mail_module_json(owner_username, "/api/tk-pending/accounts/take", payload)
+    if code != 0:
+        return code, msg, data
+    if not data or not data.get("taken") or not data.get("account"):
+        reason = str((data or {}).get("reason") or "无可用待注册邮箱")
+        return 1, reason, data
+    return 0, "ok", data
+
+
+def complete_pending_tk_account_via_mail_module(
+    owner_username: str,
+    *,
+    email: str = "",
+    claim_id: str = "",
+) -> tuple[int, str, dict[str, Any] | None]:
+    payload: dict[str, Any] = {}
+    account_email = str(email or "").strip()
+    claim = str(claim_id or "").strip()
+    if claim:
+        payload["claim_id"] = claim
+    if account_email:
+        payload["email"] = account_email
+    if not payload:
+        return 1, "email 或 claim_id 不能为空", None
+    code, msg, data = _post_mail_module_json(owner_username, "/api/tk-pending/accounts/complete", payload)
+    if code != 0:
+        return code, msg, data
+    if not data or not data.get("promoted"):
+        reason = str((data or {}).get("reason") or "注册完成入库失败")
+        return 1, reason, data
+    return 0, "ok", data
 
 
 def _wait_for_mail_module() -> bool:
@@ -521,6 +601,7 @@ def attach_mail_module(app) -> None:
                 "template-manager",
                 "project-api",
                 "project-mailboxes",
+                "tk-pending",
                 "api-docs",
             }
             if page and page not in allowed:

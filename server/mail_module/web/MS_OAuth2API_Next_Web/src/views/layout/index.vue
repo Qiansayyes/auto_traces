@@ -71,6 +71,7 @@ import {
   Menu as MenuIcon,
   Message,
   Tickets,
+  User,
 } from '@element-plus/icons-vue'
 import router from '@/router'
 import { isEmbedded, isLoggedIn } from '@/utils/auth'
@@ -87,6 +88,7 @@ interface MenuItem {
 
 const menuItems = ref<MenuItem[]>([
   { index: '1', title: '邮箱管理', routeName: 'email', icon: Message },
+  { index: '7', title: '待注册TK账号', routeName: 'tk-pending', icon: User },
   { index: '2', title: '发件人分类', routeName: 'sender-groups', icon: Connection },
   { index: '3', title: '模板管理', routeName: 'template-manager', icon: Tickets },
   { index: '4', title: '项目接口', routeName: 'project-api', icon: Link },
