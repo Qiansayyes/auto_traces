@@ -236,6 +236,8 @@ _AUTH_SESSION_CACHE: dict[str, tuple[dict, float]] = {}
 _AUTH_SESSION_CACHE_TTL_SEC = 20.0
 _DEVICE_EDITOR_PRUNE_INTERVAL_SEC = 120.0
 _device_editor_prune_last_at: dict[str, float] = {}
+_DEVICE_EDITOR_RECONCILE_INTERVAL_SEC = 300.0
+_device_editor_reconcile_last_at: dict[str, float] = {}
 _DEVICE_OPS_POLL_MIN_INTERVAL_SEC = 10.0
 _device_ops_poll_last_at: dict[str, float] = {}
 
@@ -358,6 +360,26 @@ def _maybe_prune_orphan_device_editor_rows(conn: sqlite3.Connection, owner_usern
         if _is_db_lock_error(exc):
             print(f"[{now_text()}] device_editor.prune | skipped_db_busy | owner={owner}")
             return 0
+        raise
+
+
+def _maybe_reconcile_editor_alias_bindings(conn: sqlite3.Connection, owner_username: str) -> tuple[int, int]:
+    """读接口用：限频双向对齐，避免每次打开管理台都全表扫描+逐条 upsert 拖垮 SQLite。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return 0, 0
+    now = time.monotonic()
+    last = _device_editor_reconcile_last_at.get(owner, 0.0)
+    if now - last < _DEVICE_EDITOR_RECONCILE_INTERVAL_SEC:
+        return 0, 0
+    try:
+        result = _reconcile_editor_alias_bindings(conn, owner)
+        _device_editor_reconcile_last_at[owner] = now
+        return result
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            print(f"[{now_text()}] device_editor.reconcile | skipped_db_busy | owner={owner}")
+            return 0, 0
         raise
 
 
@@ -4271,7 +4293,12 @@ def _format_beijing_slot_range(start_min: int, end_min: int) -> str:
     return f"{fmt(start)}-{fmt(end)}"
 
 
-def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | None = None) -> dict[str, Any]:
+def _auto_switch_plans_view_for_owner(
+    owner_username: str,
+    schedule_date: str | None = None,
+    *,
+    ensure: bool = True,
+) -> dict[str, Any]:
     owner = str(owner_username or "").strip()
     date_key = str(schedule_date or "").strip() or _beijing_date_str()
     if not owner:
@@ -4281,7 +4308,12 @@ def _auto_switch_plans_view_for_owner(owner_username: str, schedule_date: str | 
     for alias_key, rows in buckets.items():
         if len(rows) < 2:
             continue
-        plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, date_key)
+        if ensure:
+            plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, date_key)
+        else:
+            plan = _load_auto_switch_daily_plan(owner, alias_key, date_key)
+            if not plan or not isinstance(plan.get("slots"), list):
+                continue
         slots_by_row_index: Dict[str, dict[str, Any]] = {}
         slots_by_username: Dict[str, dict[str, Any]] = {}
         for slot in plan.get("slots") if isinstance(plan.get("slots"), list) else []:
@@ -9413,8 +9445,9 @@ def export_device_editor_backup_rows(authorization: str | None = Header(default=
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        _reconcile_editor_alias_bindings(conn, owner)
-        conn.commit()
+        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
+        if to_accounts or to_devices:
+            conn.commit()
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at
@@ -9438,8 +9471,9 @@ def search_tiktok_backup_records(username: str = "", mobile_alias: str = "", lim
     try:
         owner = str(session.get("username") or "").strip()
         if owner:
-            _prune_orphan_device_editor_rows(conn, owner)
-            conn.commit()
+            pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
+            if pruned:
+                conn.commit()
         clauses = []
         params: List[Any] = []
         if username.strip():
@@ -9677,8 +9711,9 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        _reconcile_editor_alias_bindings(conn, owner)
-        conn.commit()
+        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
+        if to_accounts or to_devices:
+            conn.commit()
         rows = conn.execute(
             """
             SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
@@ -9958,14 +9993,11 @@ def list_device_editor_rows(
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        _ensure_device_editor_switch_highlight_invariants(conn, owner)
         pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
-        if pruned:
+        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
+        if pruned or to_accounts or to_devices:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
-        _reconcile_editor_alias_bindings(conn, owner)
-        if pruned:
-            _ensure_device_editor_switch_highlight_invariants(conn, owner)
-        conn.commit()
+            conn.commit()
         count_row = conn.execute(
             f"""
             SELECT COUNT(DISTINCT {alias_expr})
@@ -12995,7 +13027,14 @@ def get_auto_switch_daily_plans(
         return err
     owner = str(session.get("username") or "").strip()
     date_key = str(schedule_date or "").strip() or _beijing_date_str()
-    view = _auto_switch_plans_view_for_owner(owner, date_key)
+    with store.lock:
+        auto_switch_on = bool(store.auto_switch_enabled)
+    if not auto_switch_on:
+        return {
+            "code": 0,
+            "data": {"schedule_date": date_key, "plans_by_alias": {}},
+        }
+    view = _auto_switch_plans_view_for_owner(owner, date_key, ensure=False)
     return {"code": 0, "data": view}
 
 

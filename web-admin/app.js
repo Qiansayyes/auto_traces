@@ -9259,9 +9259,12 @@ async function loadBackupArchiveRecords() {
     if (group) params.set("device_group", group);
     const searchQ = String(backupArchiveSearchQuery || "").trim();
     if (searchQ) params.set("search", searchQ);
+    const plansPromise = isAutoSwitchGloballyEnabled()
+      ? request("/api/admin/auto_switch/daily_plans").catch(() => ({ data: {} }))
+      : Promise.resolve({ data: {} });
     const [data, plansResp] = await Promise.all([
       request(`/api/admin/editor/device_rows?${params.toString()}`),
-      request("/api/admin/auto_switch/daily_plans").catch(() => ({ data: {} })),
+      plansPromise,
     ]);
     const plansPayload = plansResp?.data || {};
     autoSwitchDailyPlansByAlias = plansPayload.plans_by_alias || {};
@@ -9660,11 +9663,11 @@ if (apiBaseInput) {
     loadAccounts();
     loadDbTablePage();
     loadAdminUsers();
+    void loadAutoSwitchConfig().then(() => loadBackupArchiveRecords());
     loadEditorState().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
       void loadBackupStatsFullQueryConfig();
-      void loadAutoSwitchConfig().then(() => loadBackupArchiveRecords());
     }).catch((error) => {
       // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因
       const msg = error?.message || error?.toString?.() || "unknown";
