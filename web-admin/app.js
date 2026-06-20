@@ -76,7 +76,7 @@ let mobilePendingExportInFlight = false;
 
 const deviceTable = document.getElementById("deviceTable");
 
-/** 云端「绑定设备自行拉起程序」开关，由 overview / logs_snapshot 同步 */
+/** 云端「绑定设备自行拉起程序」开关，由 overview 同步 */
 let adminAutoStartEnabled = false;
 
 const configForm = document.getElementById("configForm");
@@ -608,7 +608,7 @@ let tiktokRootsTotalPages = 1;
 let selectedTiktokRootIds = new Set();
 let tiktokRootsUseServerPaging = false;
 let overviewAutoRefreshInFlight = false;
-let logsAutoRefreshInFlight = false;
+let deviceLogsFetchInFlight = false;
 let taskStatusRefreshInFlight = false;
 let backupStatsFullQueryInFlight = false;
 let lastGalleryDispatchLogLine = "";
@@ -1084,6 +1084,35 @@ function compactDeviceLogLines(lines = []) {
     }
   }
   return folded;
+}
+
+function getDeviceLogTargetIds() {
+  const selectedFromDropdown = (deviceLogDeviceSelect?.value || "").trim();
+  if (selectedFromDropdown) return [selectedFromDropdown];
+  const selected = selectedDeviceIds();
+  if (selected.length) return selected;
+  return [];
+}
+
+async function refreshVisibleDeviceLogs() {
+  const ids = getDeviceLogTargetIds();
+  if (!ids.length) {
+    renderDeviceExecLogs(latestDeviceLogs);
+    return;
+  }
+  if (deviceLogsFetchInFlight) return;
+  deviceLogsFetchInFlight = true;
+  try {
+    const qs = new URLSearchParams({ device_ids: ids.join(",") });
+    const data = await request(`/api/admin/device_logs?${qs}`);
+    const incoming = data?.device_logs && typeof data.device_logs === "object" ? data.device_logs : {};
+    latestDeviceLogs = { ...latestDeviceLogs, ...incoming };
+    renderDeviceExecLogs(latestDeviceLogs);
+  } catch (_) {
+    /* 按需拉取失败静默，用户可切换设备或点刷新重试 */
+  } finally {
+    deviceLogsFetchInFlight = false;
+  }
 }
 
 function renderDeviceExecLogs(deviceLogs = {}) {
@@ -2422,7 +2451,12 @@ function syncSelectAll() {
 function bindDeviceSelection() {
   const checkboxes = document.querySelectorAll(".device-check");
   checkboxes.forEach((checkbox) => {
-    checkbox.addEventListener("change", updateStartHint);
+    checkbox.addEventListener("change", () => {
+      updateStartHint();
+      if (!(deviceLogDeviceSelect?.value || "").trim()) {
+        void refreshVisibleDeviceLogs();
+      }
+    });
   });
   updateStartHint();
 }
@@ -2980,6 +3014,7 @@ async function loadOverview() {
   }
 
   void startedAt;
+  await refreshVisibleDeviceLogs();
 }
 
 function isOverviewActive() {
@@ -3002,20 +3037,6 @@ async function pollOverviewSnapshot() {
     // 静默失败，避免频繁提示；用户可手动刷新查看错误信息。
   } finally {
     overviewAutoRefreshInFlight = false;
-  }
-}
-
-async function pollDeviceLogsSnapshot() {
-  if (logsAutoRefreshInFlight) return;
-  logsAutoRefreshInFlight = true;
-  try {
-    const data = await request(`/api/admin/logs_snapshot?${overviewQueryString()}`);
-    // 轮询仅更新设备/日志，不覆盖用户当前正在查看或编辑的运行配置表单。
-    applyDevicesAndLogsPayload(data, { syncRunMode: false, syncConfigForm: false });
-  } catch (_) {
-    /* 轮询失败静默，避免刷屏；用户可手动点刷新数据 */
-  } finally {
-    logsAutoRefreshInFlight = false;
   }
 }
 
@@ -8918,7 +8939,7 @@ async function loadBackupArchiveRecords() {
 
 if (deviceLogDeviceSelect) {
   deviceLogDeviceSelect.addEventListener("change", () => {
-    renderDeviceExecLogs(latestDeviceLogs || {});
+    void refreshVisibleDeviceLogs();
   });
 }
 if (addBlankRecordBtn) {
@@ -9264,8 +9285,6 @@ if (apiBaseInput) {
     });
     setInterval(refreshTaskStatus, 2000);
     refreshTaskStatus();
-    setInterval(pollDeviceLogsSnapshot, 4000);
-    pollDeviceLogsSnapshot();
     setInterval(pollOverviewSnapshot, 6000);
     pollOverviewSnapshot();
   } else {

@@ -906,21 +906,124 @@ def _device_group_filter_sql(device_group: str, alias_expr: str) -> tuple[str, l
     )
 
 
+def _client_devices_visible_owner(session: dict) -> str:
+    return str(session.get("username") or "").strip()
+
+
+def _client_devices_group_where_clause(device_group: str) -> tuple[str, list[Any]]:
+    """client_devices 表上的 device_group 过滤片段（不含 owner）。"""
+    group = str(device_group or "").strip()
+    if not group:
+        return "", []
+    if group == "__ungrouped__":
+        return " AND COALESCE(TRIM(device_group), '') = ''", []
+    return " AND COALESCE(TRIM(device_group), '') = ?", [group]
+
+
+def _device_row_to_overview_entry(row: Any, session: dict) -> dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "alias": str(row["alias"] or "").strip(),
+        "device_group": str(row["device_group"] or "").strip(),
+        "status": str(row["status"] or "offline"),
+        "pending_start": bool(int(row["pending_start"] or 0)),
+        "auto_start_opt_out": bool(int(row["auto_start_opt_out"] or 0)),
+    }
+    if session.get("role") == "admin":
+        entry["owner_username"] = str(row["owner_username"])
+    return entry
+
+
+def _device_stats_from_db(session: dict, *, device_group: str = "") -> dict[str, int]:
+    """全量设备状态统计（SQL 聚合，不拉取设备列表）。"""
+    owner = _client_devices_visible_owner(session)
+    stats = {"online": 0, "running": 0, "error": 0, "pending_start": 0}
+    if not owner:
+        return stats
+    group_sql, group_params = _client_devices_group_where_clause(device_group)
+    conn = _get_db()
+    try:
+        status_rows = conn.execute(
+            f"""
+            SELECT status, COUNT(1) AS cnt
+            FROM client_devices
+            WHERE owner_username = ?{group_sql}
+            GROUP BY status
+            """,
+            [owner, *group_params],
+        ).fetchall()
+        for row in status_rows:
+            st = str(row["status"] or "offline")
+            if st in stats:
+                stats[st] = int(row["cnt"] or 0)
+        pending_row = conn.execute(
+            f"""
+            SELECT COUNT(1) FROM client_devices
+            WHERE owner_username = ?{group_sql} AND pending_start = 1
+            """,
+            [owner, *group_params],
+        ).fetchone()
+        stats["pending_start"] = int(pending_row[0] if pending_row else 0)
+        return stats
+    finally:
+        conn.close()
+
+
+def _load_visible_devices_page_from_db(
+    session: dict,
+    *,
+    device_group: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[dict[str, Any], int]:
+    """按权限分页读取可见设备（SQL LIMIT/OFFSET，按别名排序）。"""
+    owner = _client_devices_visible_owner(session)
+    if not owner:
+        return {}, 0
+    safe_page = max(1, int(page or 1))
+    safe_size = max(1, min(int(page_size or 50), 500))
+    offset = (safe_page - 1) * safe_size
+    group_sql, group_params = _client_devices_group_where_clause(device_group)
+    conn = _get_db()
+    try:
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(1) FROM client_devices WHERE owner_username = ?{group_sql}",
+                [owner, *group_params],
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out
+            FROM client_devices
+            WHERE owner_username = ?{group_sql}
+            ORDER BY LOWER(TRIM(alias)), device_id
+            LIMIT ? OFFSET ?
+            """,
+            [owner, *group_params, safe_size, offset],
+        ).fetchall()
+        devices = {
+            str(row["device_id"]): _device_row_to_overview_entry(row, session)
+            for row in rows
+        }
+        return devices, total
+    finally:
+        conn.close()
+
+
 def _list_distinct_device_groups(session: dict) -> list[str]:
-    allowed = _session_device_ids(session, lock_wait_sec=4.0)
-    if not allowed:
+    owner = _client_devices_visible_owner(session)
+    if not owner:
         return []
-    placeholders = ",".join("?" for _ in allowed)
     conn = _get_db()
     try:
         rows = conn.execute(
-            f"""
+            """
             SELECT DISTINCT TRIM(device_group) AS grp
             FROM client_devices
-            WHERE device_id IN ({placeholders}) AND COALESCE(TRIM(device_group), '') <> ''
+            WHERE owner_username = ? AND COALESCE(TRIM(device_group), '') <> ''
             ORDER BY grp ASC
             """,
-            list(allowed),
+            (owner,),
         ).fetchall()
         return [str(r[0]) for r in rows if str(r[0] or "").strip()]
     finally:
@@ -12873,42 +12976,6 @@ def admin_table_page(table: str, page: int = 1, page_size: int = 100, search_fie
         conn.close()
 
 
-def _load_visible_devices_from_db(session: dict, *, device_group: str = "") -> Dict[str, Any]:
-    """按权限从 client_devices 读取可见设备列表，可按 device_group 过滤。"""
-    allowed = _session_device_ids(session, lock_wait_sec=4.0)
-    group_filter = str(device_group or "").strip()
-    conn = _get_db()
-    try:
-        rows = conn.execute(
-            "SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out FROM client_devices"
-        ).fetchall()
-        devices: Dict[str, Any] = {}
-        for row in rows:
-            device_id = str(row["device_id"])
-            if device_id not in allowed:
-                continue
-            alias = str(row["alias"] or "").strip()
-            row_group = str(row["device_group"] or "").strip()
-            if group_filter == "__ungrouped__":
-                if row_group:
-                    continue
-            elif group_filter and row_group != group_filter:
-                continue
-            entry: Dict[str, Any] = {
-                "alias": alias,
-                "device_group": row_group,
-                "status": str(row["status"] or "offline"),
-                "pending_start": bool(int(row["pending_start"] or 0)),
-                "auto_start_opt_out": bool(int(row["auto_start_opt_out"] or 0)),
-            }
-            if session.get("role") == "admin":
-                entry["owner_username"] = str(row["owner_username"])
-            devices[device_id] = entry
-        return devices
-    finally:
-        conn.close()
-
-
 def _overview_queue_payload_from_db(*, preview_limit: int = 200) -> dict[str, Any]:
     """不持有 store.lock：概览降级时仍返回真实队列计数与待下发预览（避免误显示为 0）。"""
     conn = _get_db()
@@ -12969,35 +13036,29 @@ def admin_overview(
         return err
     t_auth = _mark("auth", started)
 
-    allowed = _session_device_ids(session, lock_wait_sec=4.0)
-    t_allowed = _mark(f"session_devices(count={len(allowed)})", t_auth)
-
     try:
         auto_start_enabled = _user_auto_start_enabled(session["username"])
     except Exception as exc:
         auto_start_enabled = False
         print(f"[{now_text()}] overview.step | auto_start_load_failed | {exc}")
-    t_auto_start = _mark("auto_start", t_allowed)
+    t_auto_start = _mark("auto_start", t_auth)
 
     preview_limit = 200
     safe_page = max(1, int(page or 1))
     safe_size = max(1, min(int(page_size or 50), 500))
     group_filter = str(device_group or "").strip()
     snapshot_started = time.perf_counter()
+    devices, devices_total = _load_visible_devices_page_from_db(
+        session,
+        device_group=group_filter,
+        page=safe_page,
+        page_size=safe_size,
+    )
+    device_stats = _device_stats_from_db(session, device_group=group_filter)
+    config_snapshot = dict(store.config)
+    run_mode_snapshot = _user_run_mode(session["username"])
     conn = _get_db()
     try:
-        all_devices = _load_visible_devices_from_db(session, device_group=group_filter)
-        all_values = list(all_devices.values())
-        device_stats = {
-            "online": sum(1 for d in all_values if d.get("status") == "online"),
-            "running": sum(1 for d in all_values if d.get("status") == "running"),
-            "error": sum(1 for d in all_values if d.get("status") == "error"),
-            "pending_start": sum(1 for d in all_values if d.get("pending_start")),
-        }
-        devices, devices_total = _paginate_dict_items(all_devices, safe_page, safe_size)
-        device_logs = _device_logs_dict_for_ids(list(devices.keys()), 120)
-        config_snapshot = dict(store.config)
-        run_mode_snapshot = _user_run_mode(session["username"])
         follow_total = conn.execute("SELECT COUNT(1) FROM follower_queue").fetchone()[0]
         follow_unprocessed = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 0").fetchone()[0]
         follow_done = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 1").fetchone()[0]
@@ -13027,7 +13088,6 @@ def admin_overview(
         "page_size": safe_size,
         "device_group": group_filter,
         "device_groups": _list_distinct_device_groups(session),
-        "device_logs": device_logs,
         "list_preview_limit": preview_limit,
         "config": config_snapshot,
         "run_mode": run_mode_snapshot,
@@ -13048,7 +13108,6 @@ def admin_overview(
     _overview_fallback_snapshot.update(
         {
             "devices": devices,
-            "device_logs": device_logs,
             "list_preview_limit": preview_limit,
             "config": config_snapshot,
             "run_mode": run_mode_snapshot,
@@ -13066,24 +13125,25 @@ def admin_logs_snapshot(
     device_group: str = "",
     authorization: str | None = Header(default=None),
 ):
-    """轻量轮询：仅设备状态与执行日志，不查库、不覆盖管理台未保存的其它状态。"""
+    """轻量轮询：仅当前页设备状态与任务日志；设备执行日志请用 /api/admin/device_logs 按需拉取。"""
     err, session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
-    allowed = _session_device_ids(session, lock_wait_sec=4.0)
     auto_start_enabled = _user_auto_start_enabled(session["username"])
     group_filter = str(device_group or "").strip()
     safe_page = max(1, int(page or 1))
     safe_size = max(1, min(int(page_size or 50), 500))
 
-    all_devices = _load_visible_devices_from_db(session, device_group=group_filter)
-    devices, devices_total = _paginate_dict_items(all_devices, safe_page, safe_size)
-    snapshot_log_device_ids = list(devices.keys())
+    devices, devices_total = _load_visible_devices_page_from_db(
+        session,
+        device_group=group_filter,
+        page=safe_page,
+        page_size=safe_size,
+    )
     with store.lock:
         _trim_task_log_keys_unlocked()
         task_logs = {k: v[-120:] for k, v in store.task_logs.items()}
     mode = _user_run_mode(session["username"])
-    device_logs = _device_logs_dict_for_ids(snapshot_log_device_ids, 120)
     return {
         "code": 0,
         "devices": devices,
@@ -13091,10 +13151,45 @@ def admin_logs_snapshot(
         "page": safe_page,
         "page_size": safe_size,
         "device_group": group_filter,
-        "device_logs": device_logs,
         "task_logs": task_logs,
         "run_mode": mode,
         "auto_start_enabled": auto_start_enabled,
+    }
+
+
+@app.get("/api/admin/device_logs")
+def admin_device_logs(
+    device_id: str = "",
+    device_ids: str = "",
+    max_lines: int = 120,
+    authorization: str | None = Header(default=None),
+):
+    """按需读取设备执行日志（仅允许当前用户可见设备）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+
+    raw_ids: list[str] = []
+    single = str(device_id or "").strip()
+    if single:
+        raw_ids.append(single)
+    for part in str(device_ids or "").split(","):
+        piece = part.strip()
+        if piece:
+            raw_ids.append(piece)
+    unique_ids = list(dict.fromkeys(raw_ids))
+    if not unique_ids:
+        return {"code": 1, "msg": "请指定 device_id 或 device_ids"}
+
+    allowed = _session_device_ids(session, lock_wait_sec=4.0)
+    safe_ids = [did for did in unique_ids if did in allowed]
+    if not safe_ids:
+        return {"code": 403, "msg": "无权查看这些设备日志"}
+
+    safe_lines = max(1, min(int(max_lines or 120), 500))
+    return {
+        "code": 0,
+        "device_logs": _device_logs_dict_for_ids(safe_ids, safe_lines),
     }
 
 
