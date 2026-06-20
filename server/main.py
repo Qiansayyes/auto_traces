@@ -193,6 +193,8 @@ TIKTOK_PACKAGE_NAME = "com.zhiliaoapp.musically"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 AUTO_SWITCH_TASK_LOG_KEY = "auto_account_switch"
 AUTO_SWITCH_TICK_INTERVAL_SEC = 60
+# 单次调度最多下发切号/初始对齐条数，避免开启自动切号时瞬时打满设备队列与数据库写锁。
+_AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK = 8
 BACKUP_STATS_FULL_QUERY_LOG_KEY = "backup_stats_full_query"
 BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
@@ -1130,7 +1132,8 @@ class MemoryStore:
     scheduler_task_interval_sec: Dict[str, int] = field(default_factory=dict)
     scheduler_task_last_run_at: Dict[str, str] = field(default_factory=dict)
     auto_switch_enabled: bool = False
-    auto_switch_align_on_next_tick: bool = True
+    # 仅用户显式开启自动切号时置 True；重启默认为 False，避免每次启动全量对齐拖垮 SQLite/HTTP。
+    auto_switch_align_on_next_tick: bool = False
     auto_switch_last_slot_keys: Dict[str, str] = field(default_factory=dict)
     # bucket_key -> "{schedule_date}|{slot_index}|publish"：当日该时段自动发作品已成功
     auto_switch_publish_done_keys: Dict[str, str] = field(default_factory=dict)
@@ -5059,6 +5062,9 @@ def _auto_switch_tick() -> None:
     schedule_date = _beijing_date_str()
     minute_of_day = _beijing_minute_of_day()
     owners = _auto_switch_list_owners_with_buckets()
+    state_dirty = False
+    switch_ops_this_tick = 0
+    align_deferred = False
 
     for owner in owners:
         if not _auto_switch_enabled_now():
@@ -5135,19 +5141,30 @@ def _auto_switch_tick() -> None:
                 if len(rows) <= 1:
                     _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
                     continue
+                if not align_now:
+                    continue
+                if switch_ops_this_tick >= _AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK:
+                    align_deferred = True
+                    continue
                 if not _auto_switch_enabled_now():
                     return
                 ok = _auto_switch_enqueue_bootstrap_cut_switch(
                     owner, alias_key, device_id, target_row
                 )
                 if ok:
+                    switch_ops_this_tick += 1
                     with store.lock:
                         store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                    state_dirty = True
                     _auto_switch_log(
                         f"无高亮桶初始对齐 | owner={owner} alias={alias_key} slot={slot_key} "
                         f"→ {str(target_row.get('username') or '')}"
                     )
-                    persist_runtime_state()
+                continue
+
+            if switch_ops_this_tick >= _AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK:
+                if align_now:
+                    align_deferred = True
                 continue
 
             if not _auto_switch_enabled_now():
@@ -5155,20 +5172,33 @@ def _auto_switch_tick() -> None:
 
             ok = _auto_switch_enqueue_cut_switch(owner, alias_key, device_id, highlighted, target_row)
             if ok:
+                switch_ops_this_tick += 1
                 with store.lock:
                     store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                state_dirty = True
                 _auto_switch_log(
                     f"已下发切号 | owner={owner} alias={alias_key} slot={slot_key} "
                     f"{str(highlighted.get('username') or '')} → {str(target_row.get('username') or '')}"
                 )
-                persist_runtime_state()
 
-    if align_now:
+    if align_deferred:
+        with store.lock:
+            store.auto_switch_align_on_next_tick = True
+        state_dirty = True
+        _auto_switch_log(
+            f"自动切号对齐未完成（本 tick 已下发 {switch_ops_this_tick} 条，"
+            f"上限 {_AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK}），下一轮继续"
+        )
+
+    if state_dirty:
         persist_runtime_state()
 
 
 def _auto_switch_worker_loop() -> None:
     _auto_switch_log("自动切号调度线程已启动（北京时间，每分钟检查）")
+    # 重启后稍候再跑首轮调度，避免与首屏 HTTP / SQLite 恢复争抢写锁。
+    if _interruptible_worker_sleep(8):
+        return
     while not _APP_SHUTDOWN_EVENT.is_set():
         try:
             _auto_switch_tick()
