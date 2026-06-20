@@ -103,6 +103,12 @@ const splitByStandardDelimiter = (rawLine) => {
   return parts.length >= 4 ? parts : null;
 };
 
+const splitByTab = (rawLine) => {
+  if (!String(rawLine || '').includes('\t')) return null;
+  const parts = String(rawLine || '').split('\t').map((item) => item.trim()).filter(Boolean);
+  return parts.length >= 4 ? parts : null;
+};
+
 const splitBySpaces = (rawLine) => {
   const normalized = String(rawLine || '').replace(/\s+/g, ' ').trim();
   const parts = normalized.split(' ').map((item) => item.trim()).filter(Boolean);
@@ -116,6 +122,11 @@ const splitLineParts = (line) => {
   const dashParts = splitByStandardDelimiter(rawLine);
   if (dashParts) {
     return { parts: dashParts, joiner: STANDARD_DELIMITER };
+  }
+
+  const tabParts = splitByTab(rawLine);
+  if (tabParts) {
+    return { parts: tabParts, joiner: '\t' };
   }
 
   const spaceParts = splitBySpaces(rawLine);
@@ -133,7 +144,7 @@ const parseByOrderedParts = (parts, joiner = STANDARD_DELIMITER) => {
     email: parts[0],
     password: parts[1],
     client_id: parts[2],
-    refresh_token: parts.slice(3).join(joiner === ' ' ? ' ' : STANDARD_DELIMITER),
+    refresh_token: parts.slice(3).join(joiner === ' ' ? ' ' : (joiner === '\t' ? '\t' : STANDARD_DELIMITER)),
   };
   const validated = validateAccountFields(candidate);
   return validated.ok ? validated.record : null;
@@ -258,9 +269,39 @@ const parseAccountLine = (line, splitSymbol = STANDARD_DELIMITER) => {
   }
 
   return {
-    error: '无法识别完整账号信息（需包含邮箱、密码、client_id、refresh_token，仅支持 ---- 或空格分隔）',
+    error: '无法识别完整账号信息（需包含邮箱、密码、client_id、refresh_token，支持 ----、Tab 或空格分隔）',
     rawLine,
   };
+};
+
+const looksLikeCompoundAccountLine = (text = '') => {
+  const raw = String(text || '').trim();
+  if (!raw || !raw.includes('@')) return false;
+  if (raw.includes(STANDARD_DELIMITER)) {
+    return raw.split(STANDARD_DELIMITER).map((item) => item.trim()).filter(Boolean).length >= 4;
+  }
+  if (raw.includes('\t')) {
+    return raw.split('\t').map((item) => item.trim()).filter(Boolean).length >= 4;
+  }
+  return raw.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean).length >= 4;
+};
+
+const collectRawLineCandidates = (record = {}) => {
+  const values = [
+    record.raw_line,
+    record.rawLine,
+    record.line,
+    record.email,
+  ];
+  const seen = new Set();
+  const candidates = [];
+  for (const value of values) {
+    const text = String(value || '').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    candidates.push(text);
+  }
+  return candidates;
 };
 
 const toAccountRecord = (record, splitSymbol = STANDARD_DELIMITER) => {
@@ -273,14 +314,23 @@ const toAccountRecord = (record, splitSymbol = STANDARD_DELIMITER) => {
   }
 
   const validated = validateAccountFields(record);
-  if (!validated.ok) {
-    return { error: validated.reason, rawLine: String(record.email || '') };
+  if (validated.ok) {
+    return {
+      ...validated.record,
+      raw_line: buildRawLine(validated.record, splitSymbol),
+    };
   }
 
-  return {
-    ...validated.record,
-    raw_line: buildRawLine(validated.record, splitSymbol),
-  };
+  // 兼容旧版前端：客户端用 ---- 预拆 Tab/空格行失败时，会把整行塞进 email 字段。
+  for (const candidate of collectRawLineCandidates(record)) {
+    if (!looksLikeCompoundAccountLine(candidate)) continue;
+    const reparsed = parseAccountLine(candidate, splitSymbol);
+    if (!reparsed.error) {
+      return reparsed;
+    }
+  }
+
+  return { error: validated.reason, rawLine: String(record.email || '') };
 };
 
 const buildAccountEmailRecordKey = (owner, email) => {

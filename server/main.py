@@ -230,6 +230,21 @@ _AUTH_SESSION_CACHE: dict[str, tuple[dict, float]] = {}
 _AUTH_SESSION_CACHE_TTL_SEC = 20.0
 _DEVICE_EDITOR_PRUNE_INTERVAL_SEC = 120.0
 _device_editor_prune_last_at: dict[str, float] = {}
+_DEVICE_OPS_POLL_MIN_INTERVAL_SEC = 10.0
+_device_ops_poll_last_at: dict[str, float] = {}
+
+
+def _device_ops_poll_try_acquire(device_id: str) -> bool:
+    """同一 device_id 冷却期内跳过 poll，避免设备密集轮询拖垮管理台接口。"""
+    did = str(device_id or "").strip()
+    if not did:
+        return True
+    now = time.monotonic()
+    last = _device_ops_poll_last_at.get(did, 0.0)
+    if now - last < _DEVICE_OPS_POLL_MIN_INTERVAL_SEC:
+        return False
+    _device_ops_poll_last_at[did] = now
+    return True
 
 
 def _is_db_lock_error(exc: BaseException) -> bool:
@@ -7829,6 +7844,8 @@ def report_result(payload: ReportResultRequest):
 
 @app.post("/api/device_ops/poll")
 def device_ops_poll(payload: DeviceOpPollRequest):
+    if not _device_ops_poll_try_acquire(payload.device_id):
+        return {"code": 1, "msg": "暂无待执行设备任务"}
     print(f"[{now_text()}] device_ops.poll | enter | device_id={payload.device_id} alias={payload.alias}")
     error, _device = auth_or_error(payload.device_id, payload.alias)
     if error:

@@ -323,6 +323,17 @@ object AppCoordinator {
         }
     }
 
+    /** 图库授权等 root 操作前：多方案强停 TikTok 并等待进程收尾，避免后台残留触发系统授权弹窗。 */
+    private suspend fun forceStopTikTokCleanly(pkg: String, alias: String, reason: String) {
+        LogCenter.op(alias, "$reason：先关闭 TikTok 后台…")
+        runExecutorSu("am force-stop $pkg")
+        runExecutorSu("pkill -f $pkg || killall $pkg || true")
+        runExecutorSu("for p in \$(pidof $pkg 2>/dev/null); do kill -9 \$p; done || true")
+        val waitMs = _config.value.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
+        delay(waitMs)
+        LogCenter.op(alias, "$reason：TikTok 后台已关闭（等待 ${waitMs}ms）")
+    }
+
     /**
      * 已登录云端时：检测 TikTok 图库相关 runtime 权限，未开放则 root 授予，避免发布流程卡在系统授权弹窗。
      */
@@ -345,6 +356,7 @@ object AppCoordinator {
         if (!packageInstalled) return
         if (isTikTokGalleryPermissionGranted()) return
 
+        forceStopTikTokCleanly(pkg, alias, "TikTok 图库权限未开放")
         LogCenter.op(alias, "TikTok 图库权限未开放，开始 root 授予…")
         val commands = listOf(
             "pm grant $pkg android.permission.READ_MEDIA_IMAGES",
@@ -935,9 +947,10 @@ object AppCoordinator {
                     continue
                 }
 
+                // 空闲轮询降频，减轻云端 SQLite/锁竞争（与服务端 10s 限流对齐）。
                 val pollDelay = when {
-                    idleRounds >= 3 -> 10_000L
-                    else -> 5_000L
+                    idleRounds >= 3 -> 30_000L
+                    else -> 15_000L
                 }
 
                 var pollOk = false

@@ -2,6 +2,7 @@ const assert = require('assert');
 const {
   parseAccountLine,
   validateAccountFields,
+  toAccountRecord,
 } = require('../utils/accountParser');
 
 const SAMPLE = {
@@ -38,5 +39,15 @@ const missingPassword = validateAccountFields({
   refresh_token: SAMPLE.refresh_token,
 });
 assert.ok(!missingPassword.ok, 'missing password should fail validation');
+
+const legacyUiRecord = {
+  email: formats[2],
+  password: '',
+  client_id: '',
+  refresh_token: '',
+};
+const reparsedLegacy = toAccountRecord(legacyUiRecord);
+assert.ok(!reparsedLegacy.error, `legacy UI record should reparsed: ${reparsedLegacy.error}`);
+assert.strictEqual(reparsedLegacy.email, SAMPLE.email);
 
 console.log('account parser tests passed');

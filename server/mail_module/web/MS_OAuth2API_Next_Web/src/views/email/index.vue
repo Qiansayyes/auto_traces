@@ -277,9 +277,9 @@
         </div>
 
         <el-dialog v-model="dialogCopyVisible" title="粘贴导入" width="800">
-            <el-text class="mx-1" type="warning">请粘贴邮箱地址（每个邮箱地址占一行）</el-text>
+            <el-text class="mx-1" type="warning">每行一条账号：邮箱、密码、client_id、refresh_token（支持 ----、Tab 或空格分隔）</el-text>
             <div class="copy-textarea-container">
-                <el-input v-model="copyTextarea" style="width: 100%" :rows="20" type="textarea" placeholder="请粘贴邮箱地址" />
+                <el-input v-model="copyTextarea" style="width: 100%" :rows="20" type="textarea" placeholder="例如：test@outlook.com----password----uuid----refresh_token" />
             </div>
             <template #footer>
                 <div class="dialog-footer">
