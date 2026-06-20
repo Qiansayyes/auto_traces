@@ -4937,6 +4937,102 @@ def _auto_switch_enqueue_cut_switch(
     return True
 
 
+def _auto_switch_enqueue_bootstrap_cut_switch(
+    owner_username: str,
+    alias: str,
+    device_id: str,
+    target_row: dict[str, Any],
+) -> bool:
+    """无切号高亮的多账号桶：仅清理 TikTok 后还原目标（不备份源），对齐到当前时段账号。"""
+    if not _auto_switch_enabled_now():
+        return False
+    alias_clean = _normalize_alias_key(alias)
+    did = str(device_id or "").strip()
+    if not did or not alias_clean:
+        return False
+    try:
+        target_ri = int(target_row.get("row_index") or -1)
+    except (TypeError, ValueError):
+        return False
+    if target_ri < 0:
+        return False
+
+    conn = _get_db()
+    try:
+        target_user = str(target_row.get("username") or "").strip()
+        if not target_user:
+            _auto_switch_log(
+                f"跳过初始对齐：目标账号用户名为空 | owner={owner_username} alias={alias_clean}"
+            )
+            return False
+        alias_err = _validate_username_device_effective_alias(
+            conn, owner_username, target_user, alias_clean
+        )
+        if alias_err:
+            _auto_switch_log(
+                f"跳过初始对齐：目标账号分配别名不一致 | owner={owner_username} alias={alias_clean} | {alias_err}"
+            )
+            return False
+    finally:
+        conn.close()
+
+    _apply_cut_switch_highlight_intent(owner_username, target_ri)
+
+    target_backup = str(target_row.get("backup_name") or "").strip()
+    can_restore = bool(target_backup and target_backup != "-")
+    cut_mode = "clear_source_for_restore" if can_restore else "exclusive_activate_target"
+
+    auto_start_disabled = False
+    with store.lock:
+        dev = store.devices.get(did)
+        if dev and not dev.auto_start_opt_out:
+            dev.auto_start_opt_out = True
+            auto_start_disabled = True
+    if auto_start_disabled:
+        _persist_client_device_to_db(did)
+        _append_device_log(did, "自动切号：云端已自动关闭该设备的自动开启程序")
+
+    clear_payload: dict[str, Any] = {
+        "device_id": did,
+        "alias": alias_clean,
+        "package_name": TIKTOK_PACKAGE_NAME,
+        "cut_switch_after_backup": cut_mode,
+        "cut_switch_target_row_index": target_ri,
+        "source": "auto_switch",
+    }
+    _resume_device_for_cloud_op(
+        did,
+        f"[{now_text()}] 自动切号 | 无高亮桶初始对齐：已入队清理（alias={alias_clean} → {target_user or target_ri}）",
+    )
+    clear_op_id = _enqueue_tiktok_device_op(did, "tiktok_clear", clear_payload)
+    _append_device_log(
+        did,
+        f"[{now_text()}] 自动切号 | op_id={clear_op_id} 初始对齐 clear target={target_user or target_ri}",
+    )
+
+    if can_restore:
+        backup_name = Path(target_backup).name
+        restore_payload: dict[str, Any] = {
+            "device_id": did,
+            "alias": alias_clean,
+            "package_name": TIKTOK_PACKAGE_NAME,
+            "backup_name": backup_name,
+            "backup_path": str(target_row.get("backup_path") or "").strip() or backup_name,
+            "username": target_user,
+            "mobile_alias": alias_clean,
+            "assigned_alias": str(target_row.get("assigned_alias") or "").strip() or alias_clean,
+            "skip_pm_clear": True,
+            "restore_highlight_row_index": target_ri,
+            "source": "auto_switch",
+        }
+        _enqueue_tiktok_device_op(did, "tiktok_restore", restore_payload)
+        _append_device_log(
+            did,
+            f"[{now_text()}] 自动切号 | 已入队还原 target={target_user or target_ri} backup={backup_name}",
+        )
+    return True
+
+
 def _auto_switch_list_owners_with_buckets() -> List[str]:
     conn = _get_db()
     try:
@@ -5036,7 +5132,22 @@ def _auto_switch_tick() -> None:
                 continue
 
             if not highlighted:
-                _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
+                if len(rows) <= 1:
+                    _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
+                    continue
+                if not _auto_switch_enabled_now():
+                    return
+                ok = _auto_switch_enqueue_bootstrap_cut_switch(
+                    owner, alias_key, device_id, target_row
+                )
+                if ok:
+                    with store.lock:
+                        store.auto_switch_last_slot_keys[bucket_key] = slot_key
+                    _auto_switch_log(
+                        f"无高亮桶初始对齐 | owner={owner} alias={alias_key} slot={slot_key} "
+                        f"→ {str(target_row.get('username') or '')}"
+                    )
+                    persist_runtime_state()
                 continue
 
             if not _auto_switch_enabled_now():
