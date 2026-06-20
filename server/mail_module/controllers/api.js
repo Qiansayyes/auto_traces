@@ -415,8 +415,17 @@ const controller = {
         source: source || 'ui',
       }))
 
-      ctx.body = { code: "200", data }
+      ctx.body = { code: "200", data };
     } catch (err) {
+      if (err.status === 400) {
+        ctx.status = 400;
+        ctx.body = {
+          code: '400',
+          error: err.message,
+          data: err.details || null,
+        };
+        return;
+      }
       logger.error('Failed to import accounts', err)
       ctx.throw(500, 'Failed to import accounts')
     }
@@ -483,8 +492,13 @@ const controller = {
       }));
       ctx.body = { code: "200", data };
     } catch (err) {
+      if (err.status === 400 || err.status === 401) {
+        ctx.status = err.status;
+        ctx.body = { code: String(err.status), error: err.message };
+        return;
+      }
       logger.error('Failed to delete accounts', err)
-      ctx.throw(500, 'Failed to delete accounts')
+      ctx.throw(500, err.message || 'Failed to delete accounts')
     }
   },
 

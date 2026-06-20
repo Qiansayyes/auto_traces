@@ -10,7 +10,7 @@
     <string name="hint_alias">请输入设备别名</string>
     <string name="hint_server_url">请输入服务端地址</string>
     <string name="action_bind">绑定设备</string>
-    <string name="server_base_url">http://192.168.100.249:8000</string>
+    <string name="server_base_url">http://43.165.168.45</string>
     <string name="device_info">设备信息</string>
     <string name="log_title">实时日志</string>
     <string name="action_refresh_config">重新拉取配置</string>

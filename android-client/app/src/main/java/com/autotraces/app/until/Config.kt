@@ -13,7 +13,7 @@ object Config {
         "com.tiktok.android",
     )
     // 云端服务器基础地址
-    const val SERVER_BASE_URL = "http://192.168.100.249:8000"
+    const val SERVER_BASE_URL = "http://43.165.168.45"
     
     // TikTok界面控件文本（国际版英文）
     const val TEXT_SEARCH = "Search"

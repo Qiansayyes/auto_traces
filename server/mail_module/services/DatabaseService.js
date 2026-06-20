@@ -8,9 +8,16 @@ const {
   normalizeOwner,
   requireOwner,
   buildRecordKey,
+  buildAccountEmailRecordKey,
   scopeProjectKey,
   unscopeProjectKey,
 } = require('../utils/ownerContext');
+const {
+  parseAccountLine: parseAccountLineSmart,
+  toAccountRecord: toAccountRecordSmart,
+  buildRawLine,
+  normalizeSplitSymbol,
+} = require('../utils/accountParser');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const MAIL_DB_PATH = path.join(DATA_DIR, 'mail.sqlite');
@@ -358,56 +365,75 @@ if (mailDb.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name
 }
 
 const parseAccountLine = (line, splitSymbol = '----') => {
-  const rawLine = String(line || '').trim();
-  if (!rawLine) return null;
-
-  const parts = rawLine.split(splitSymbol);
-  const email = normalizeEmail(parts[0]);
-  if (!email || !email.includes('@')) return null;
-
-  return {
-    email,
-    password: parts[1] || '',
-    client_id: parts[2] || '',
-    refresh_token: parts.slice(3).join(splitSymbol) || '',
-    raw_line: rawLine,
-  };
+  const parsed = parseAccountLineSmart(line, splitSymbol);
+  if (parsed.error) return null;
+  return parsed;
 };
 
 const toAccountRecord = (record, splitSymbol = '----') => {
-  if (typeof record === 'string') {
-    return parseAccountLine(record, splitSymbol);
-  }
+  const parsed = toAccountRecordSmart(record, splitSymbol);
+  if (parsed.error) return null;
+  return parsed;
+};
 
-  const email = normalizeEmail(record?.email);
-  if (!email || !email.includes('@')) return null;
+const parseAccountInput = (record, splitSymbol = '----') => (
+  toAccountRecordSmart(record, splitSymbol)
+);
 
-  const password = String(record?.password || '');
-  const client_id = String(record?.client_id || '');
-  const refresh_token = String(record?.refresh_token || '');
-
-  return {
-    email,
-    password,
-    client_id,
-    refresh_token,
-    raw_line: [email, password, client_id, refresh_token].join(splitSymbol),
-  };
+const removeDuplicateAccountRecords = (ownerUsername, email, keepRecordKey) => {
+  accountsDb.prepare(`
+    DELETE FROM account_records
+    WHERE owner_username = ?
+      AND lower(email) = lower(?)
+      AND record_key <> ?
+  `).run(ownerUsername, email, keepRecordKey);
 };
 
 const importAccounts = (records, options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
-  const splitSymbol = options.splitSymbol || '----';
+  const splitSymbol = normalizeSplitSymbol(options.splitSymbol);
   const source = options.source || 'manual';
   const rows = Array.isArray(records) ? records : [];
   const parsed = [];
+  const rejected = [];
   let skipped = 0;
 
   for (const row of rows) {
-    const record = toAccountRecord(row, splitSymbol);
-    if (record) parsed.push(record);
-    else skipped += 1;
+    const result = parseAccountInput(row, splitSymbol);
+    if (result.error) {
+      skipped += 1;
+      rejected.push({
+        line: String(typeof row === 'string' ? row : row?.email || '').slice(0, 200),
+        reason: result.error,
+      });
+      continue;
+    }
+    parsed.push(result);
   }
+
+  if (skipped > 0) {
+    const error = new Error(`导入被拒绝：${skipped} 条记录信息不完整或无法识别，请修正后重试`);
+    error.status = 400;
+    error.details = {
+      rejected_records: rejected,
+      valid_records: parsed.length,
+      total_lines: rows.length,
+    };
+    throw error;
+  }
+
+  if (rows.length > 0 && parsed.length === 0) {
+    const error = new Error('所有记录均无法识别，请确认每行包含邮箱、密码、client_id、refresh_token');
+    error.status = 400;
+    error.details = { rejected_records: rejected };
+    throw error;
+  }
+
+  const latestByEmail = new Map();
+  for (const item of parsed) {
+    latestByEmail.set(item.email, item);
+  }
+  const uniqueParsed = [...latestByEmail.values()];
 
   const timestamp = nowIso();
   const upsert = accountsDb.prepare(`
@@ -423,19 +449,22 @@ const importAccounts = (records, options = {}) => {
       raw_line = excluded.raw_line,
       source = excluded.source,
       status = 'active',
+      imported_at = excluded.imported_at,
       updated_at = excluded.updated_at,
       owner_username = excluded.owner_username
   `);
 
   runTransaction(accountsDb, () => {
-    for (const item of parsed) {
+    for (const item of uniqueParsed) {
+      const recordKey = buildAccountEmailRecordKey(ownerUsername, item.email);
+      removeDuplicateAccountRecords(ownerUsername, item.email, recordKey);
       upsert.run(
-        buildRecordKey(ownerUsername, item.raw_line),
+        recordKey,
         item.email,
         item.password,
         item.client_id,
         item.refresh_token,
-        item.raw_line,
+        item.raw_line || buildRawLine(item, splitSymbol),
         source,
         timestamp,
         timestamp,
@@ -450,14 +479,15 @@ const importAccounts = (records, options = {}) => {
     )
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
-  insertBatch.run(source, rows.length, parsed.length, parsed.length, skipped, timestamp, ownerUsername);
+  insertBatch.run(source, rows.length, uniqueParsed.length, uniqueParsed.length, skipped, timestamp, ownerUsername);
 
   return {
     source,
     total_lines: rows.length,
-    valid_records: parsed.length,
-    inserted_or_updated: parsed.length,
+    valid_records: uniqueParsed.length,
+    inserted_or_updated: uniqueParsed.length,
     skipped_records: skipped,
+    rejected_records: rejected,
     database: ACCOUNTS_DB_PATH,
   };
 };
@@ -487,6 +517,9 @@ const buildPendingTkAccountPayload = (row, { includeRaw = false } = {}) => {
 };
 
 const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => {
+  const email = normalizeEmail(row.email);
+  const recordKey = buildAccountEmailRecordKey(ownerUsername, email);
+  removeDuplicateAccountRecords(ownerUsername, email, recordKey);
   accountsDb.prepare(`
     INSERT INTO account_records (
       record_key, email, password, client_id, refresh_token, raw_line, source, status, imported_at, updated_at, owner_username
@@ -500,11 +533,12 @@ const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => 
       raw_line = excluded.raw_line,
       source = excluded.source,
       status = 'active',
+      imported_at = excluded.imported_at,
       updated_at = excluded.updated_at,
       owner_username = excluded.owner_username
   `).run(
-    buildRecordKey(ownerUsername, row.raw_line),
-    normalizeEmail(row.email),
+    recordKey,
+    email,
     row.password || '',
     row.client_id || '',
     row.refresh_token || '',
@@ -518,7 +552,7 @@ const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => 
 
 const importPendingTkAccounts = (records, options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
-  const splitSymbol = options.splitSymbol || '----';
+  const splitSymbol = normalizeSplitSymbol(options.splitSymbol);
   const source = options.source || 'tk_pending_ui';
   const rows = Array.isArray(records) ? records : [];
   const parsed = [];
@@ -527,12 +561,12 @@ const importPendingTkAccounts = (records, options = {}) => {
   let skippedClaimed = 0;
 
   for (const row of rows) {
-    const record = toAccountRecord(row, splitSymbol);
-    if (!record) {
+    const result = parseAccountInput(row, splitSymbol);
+    if (result.error) {
       skipped += 1;
       continue;
     }
-    parsed.push(record);
+    parsed.push(result);
   }
 
   const timestamp = nowIso();
@@ -693,6 +727,40 @@ const deletePendingTkAccounts = (options = {}) => {
 
   const result = accountsDb.prepare(`
     DELETE FROM pending_tk_account_records
+    WHERE ${whereParts.join(' AND ')}
+  `).run(...params);
+
+  return { deleted: Number(result.changes) || 0 };
+};
+
+const deleteAccounts = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const emails = [...new Set((Array.isArray(options.emails) ? options.emails : [])
+    .map((item) => normalizeEmail(item))
+    .filter(Boolean))];
+  const deleteAll = parseBoolean(options.deleteAll);
+
+  if (!deleteAll && emails.length === 0) {
+    const error = new Error('未指定要删除的邮箱');
+    error.status = 400;
+    throw error;
+  }
+
+  const whereParts = [`status = 'active'`];
+  const params = [];
+
+  if (deleteAll) {
+    whereParts.push(`(owner_username = ? OR owner_username = '')`);
+    params.push(ownerUsername);
+  } else {
+    whereParts.push(`lower(email) IN (${emails.map(() => '?').join(', ')})`);
+    params.push(...emails);
+    whereParts.push(`(owner_username = ? OR owner_username = '')`);
+    params.push(ownerUsername);
+  }
+
+  const result = accountsDb.prepare(`
+    DELETE FROM account_records
     WHERE ${whereParts.join(' AND ')}
   `).run(...params);
 
@@ -1041,16 +1109,36 @@ const listAccounts = (options = {}) => {
   }
 
   const where = `WHERE ${whereParts.join(' AND ')}`;
+  const rankedCte = `
+    WITH ranked_accounts AS (
+      SELECT
+        ar.record_key,
+        ar.email,
+        ar.password,
+        ar.client_id,
+        ar.refresh_token,
+        ar.source,
+        ar.updated_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY lower(ar.email)
+          ORDER BY ar.updated_at DESC, ar.imported_at DESC, ar.record_key DESC
+        ) AS row_rank
+      FROM accounts_db.account_records ar
+      ${where}
+    )
+  `;
   const total = mailDb.prepare(`
+    ${rankedCte}
     SELECT COUNT(*) AS total
-    FROM accounts_db.account_records ar
-    ${where}
+    FROM ranked_accounts
+    WHERE row_rank = 1
   `).get(...params)?.total || 0;
   const records = mailDb.prepare(`
-    SELECT ar.record_key, ar.email, ar.password, ar.client_id, ar.refresh_token, ar.source, ar.updated_at
-    FROM accounts_db.account_records ar
-    ${where}
-    ORDER BY ar.email ASC, ar.updated_at DESC
+    ${rankedCte}
+    SELECT record_key, email, password, client_id, refresh_token, source, updated_at
+    FROM ranked_accounts
+    WHERE row_rank = 1
+    ORDER BY email ASC, updated_at DESC
     LIMIT ? OFFSET ?
   `).all(...params, pageSize, offset);
 
@@ -3556,6 +3644,7 @@ module.exports = {
     accountsDb: ACCOUNTS_DB_PATH,
   },
   importAccounts,
+  deleteAccounts,
   importPendingTkAccounts,
   listPendingTkAccounts,
   deletePendingTkAccounts,

@@ -17,6 +17,15 @@ const buildRecordKey = (owner, rawLine) => {
   return crypto.createHash('sha256').update(`${normalizedOwner}|${String(rawLine || '')}`).digest('hex');
 };
 
+const buildAccountEmailRecordKey = (owner, email) => {
+  const normalizedOwner = requireOwner(owner);
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) {
+    throw new Error('email is required for account record key');
+  }
+  return crypto.createHash('sha256').update(`${normalizedOwner}|email|${normalizedEmail}`).digest('hex');
+};
+
 const scopeProjectKey = (owner, projectKey = '') => {
   const normalizedOwner = requireOwner(owner);
   const key = String(projectKey || '').trim();
@@ -46,6 +55,7 @@ module.exports = {
   normalizeOwner,
   requireOwner,
   buildRecordKey,
+  buildAccountEmailRecordKey,
   scopeProjectKey,
   unscopeProjectKey,
   ownerAccountExistsSql,

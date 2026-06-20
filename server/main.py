@@ -1420,6 +1420,78 @@ def _device_editor_effective_alias(row: dict) -> str:
     return _normalize_alias_key(row.get("device_alias"))
 
 
+def _pick_device_editor_bucket_row(matched: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """同别名桶内解析当前账号行：仅接受唯一切号高亮；单条桶可回退该行；多条且无明确高亮返回 None。"""
+    if not matched:
+        return None
+    yes_rows = [r for r in matched if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
+    if len(yes_rows) == 1:
+        return yes_rows[0]
+    if len(matched) == 1:
+        return matched[0]
+    if len(yes_rows) > 1:
+        return min(yes_rows, key=lambda r: int(r.get("row_index") or 0))
+    return None
+
+
+def _account_assigned_alias_key(
+    conn: sqlite3.Connection, owner_username: str, username: str
+) -> str:
+    """账号表 assigned_alias（为空时从设备档案反查）。"""
+    owner = str(owner_username or "").strip()
+    uname = _normalized_alias(username).lstrip("@")
+    if not owner or not uname:
+        return ""
+    row = conn.execute(
+        """
+        SELECT assigned_alias
+        FROM account_editor_rows
+        WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+        LIMIT 1
+        """,
+        (owner, uname),
+    ).fetchone()
+    if not row:
+        return ""
+    alias = str(row["assigned_alias"] or "").strip()
+    if alias:
+        return _normalize_alias_key(alias)
+    recovered = _recover_assigned_alias_for_account_username(conn, owner, uname)
+    return _normalize_alias_key(recovered) if recovered else ""
+
+
+def _validate_username_device_effective_alias(
+    conn: sqlite3.Connection,
+    owner_username: str,
+    username: str,
+    effective_alias: str,
+) -> str | None:
+    """校验账号表分配别名与设备档案有效别名一致；通过返回 None，否则返回错误说明。"""
+    owner = str(owner_username or "").strip()
+    uname = _normalized_alias(username).lstrip("@")
+    eff = _normalize_alias_key(effective_alias)
+    if not owner or not uname or not eff:
+        return None
+    acct = conn.execute(
+        """
+        SELECT 1 FROM account_editor_rows
+        WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+        LIMIT 1
+        """,
+        (owner, uname),
+    ).fetchone()
+    if not acct:
+        return f"账号「{uname}」不存在于账号表单，请先添加账号记录"
+    acct_alias = _account_assigned_alias_key(conn, owner, uname)
+    if acct_alias and acct_alias != eff:
+        display_alias = _normalized_alias(effective_alias)
+        return (
+            f"账号「{uname}」在账号表单中的分配别名为「{acct_alias}」，"
+            f"与设备档案有效别名「{display_alias}」不一致，请先在账号表单修正分配关系"
+        )
+    return None
+
+
 def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -> str:
     """按 device_editor_rows 切号高亮解析该别名桶内当前 TikTok 账号。"""
     owner = str(owner_username or "").strip()
@@ -1430,7 +1502,7 @@ def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -
     try:
         rows = conn.execute(
             """
-            SELECT username, switch_highlight, device_alias, assigned_alias
+            SELECT row_index, username, switch_highlight, device_alias, assigned_alias
             FROM device_editor_rows
             WHERE owner_username = ?
             """,
@@ -1441,18 +1513,16 @@ def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -
     matched: list[dict] = []
     for row in rows or []:
         item = {
-            "username": str(row[0] or "").strip(),
-            "switch_highlight": _normalize_switch_highlight(row[1]),
-            "device_alias": str(row[2] or "").strip(),
-            "assigned_alias": str(row[3] or "").strip(),
+            "row_index": int(row[0]) if row[0] is not None else 0,
+            "username": str(row[1] or "").strip(),
+            "switch_highlight": _normalize_switch_highlight(row[2]),
+            "device_alias": str(row[3] or "").strip(),
+            "assigned_alias": str(row[4] or "").strip(),
         }
         if _device_editor_effective_alias(item) != alias_clean:
             continue
         matched.append(item)
-    if not matched:
-        return ""
-    highlighted = [r for r in matched if r.get("switch_highlight") == "是"]
-    pick = highlighted[0] if len(highlighted) == 1 else (matched[0] if len(matched) == 1 else None)
+    pick = _pick_device_editor_bucket_row(matched)
     if not pick:
         return ""
     return _normalize_tiktok_username_key(pick.get("username"))
@@ -1490,7 +1560,7 @@ def _get_highlight_account_stats(owner_username: str, alias: str) -> dict[str, o
     try:
         rows = conn.execute(
             """
-            SELECT username, switch_highlight, device_alias, assigned_alias,
+            SELECT row_index, username, switch_highlight, device_alias, assigned_alias,
                    video_count, follower_count
             FROM device_editor_rows
             WHERE owner_username = ?
@@ -1502,20 +1572,20 @@ def _get_highlight_account_stats(owner_username: str, alias: str) -> dict[str, o
     matched: list[dict] = []
     for row in rows or []:
         item = {
-            "username": str(row[0] or "").strip(),
-            "switch_highlight": _normalize_switch_highlight(row[1]),
-            "device_alias": str(row[2] or "").strip(),
-            "assigned_alias": str(row[3] or "").strip(),
-            "video_count": row[4] if len(row) > 4 else "",
-            "follower_count": row[5] if len(row) > 5 else "",
+            "row_index": int(row[0]) if row[0] is not None else 0,
+            "username": str(row[1] or "").strip(),
+            "switch_highlight": _normalize_switch_highlight(row[2]),
+            "device_alias": str(row[3] or "").strip(),
+            "assigned_alias": str(row[4] or "").strip(),
+            "video_count": row[5] if len(row) > 5 else "",
+            "follower_count": row[6] if len(row) > 6 else "",
         }
         if _device_editor_effective_alias(item) != alias_clean:
             continue
         matched.append(item)
     if not matched:
         return empty
-    highlighted = [r for r in matched if r.get("switch_highlight") == "是"]
-    pick = highlighted[0] if len(highlighted) == 1 else (matched[0] if len(matched) == 1 else None)
+    pick = _pick_device_editor_bucket_row(matched)
     if not pick:
         return empty
     return {
@@ -4447,6 +4517,8 @@ def _auto_switch_maybe_enqueue_publish(
     bucket_key: str,
     minute_of_day: int,
 ) -> None:
+    if not _auto_switch_enabled_now():
+        return
     pub_min = target_slot.get("auto_publish_minute")
     if pub_min is None:
         return
@@ -4476,6 +4548,22 @@ def _auto_switch_maybe_enqueue_publish(
 
     if _device_has_pending_publish_post(device_id):
         return
+
+    target_user = str(target_row.get("username") or "").strip()
+    if target_user:
+        conn = _get_db()
+        try:
+            alias_err = _validate_username_device_effective_alias(
+                conn, owner_username, target_user, alias
+            )
+        finally:
+            conn.close()
+        if alias_err:
+            _auto_switch_log(
+                f"跳过自动发作品：账号分配别名不一致 | owner={owner_username} alias={alias} "
+                f"account={target_user} | {alias_err}"
+            )
+            return
 
     if _device_has_blocking_tiktok_ops(device_id):
         _auto_switch_log(
@@ -4508,6 +4596,76 @@ def _auto_switch_maybe_enqueue_publish(
         )
 
 
+def _auto_switch_enabled_now() -> bool:
+    with store.lock:
+        return bool(store.auto_switch_enabled)
+
+
+def _device_op_payload(op: dict[str, Any]) -> dict[str, Any]:
+    raw = op.get("payload")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _is_pending_auto_switch_device_op(op: dict[str, Any]) -> bool:
+    return str(_device_op_payload(op).get("source") or "").strip() == "auto_switch"
+
+
+def _cancel_pending_auto_switch_device_ops() -> int:
+    """关闭自动切号时撤销队列中尚未被设备拉取的自动切号/自动发作品任务。"""
+    rollback_items: list[tuple[str, dict[str, Any]]] = []
+    removed_op_ids: set[str] = set()
+    removed = 0
+    with store.lock:
+        for device_id, queue in list(store.pending_device_ops.items()):
+            if not queue:
+                continue
+            owner = ""
+            dev = store.devices.get(device_id)
+            if dev:
+                owner = str(dev.owner_username or "").strip()
+            kept: list[dict[str, Any]] = []
+            for op in queue:
+                if not _is_pending_auto_switch_device_op(op):
+                    kept.append(op)
+                    continue
+                removed += 1
+                op_id = str(op.get("op_id") or "").strip()
+                if op_id:
+                    removed_op_ids.add(op_id)
+                payload = _device_op_payload(op)
+                op_type = str(op.get("op_type") or "")
+                if owner and op_type in (
+                    "tiktok_backup_and_clear",
+                    "tiktok_restore",
+                    "tiktok_clear",
+                ):
+                    if _resolve_cut_switch_source_row_index(payload) >= 0:
+                        rollback_items.append((owner, dict(payload)))
+            if kept:
+                store.pending_device_ops[device_id] = kept
+            else:
+                store.pending_device_ops.pop(device_id, None)
+
+        if removed_op_ids:
+            for bucket_key, inflight in list(store.auto_switch_publish_inflight_keys.items()):
+                _slot, op_id = _parse_auto_switch_publish_inflight(str(inflight))
+                if op_id in removed_op_ids:
+                    store.auto_switch_publish_inflight_keys.pop(bucket_key, None)
+
+    seen_rollback: set[tuple[str, int]] = set()
+    for owner, data in rollback_items:
+        src = _resolve_cut_switch_source_row_index(data)
+        key = (owner, src)
+        if src < 0 or key in seen_rollback:
+            continue
+        seen_rollback.add(key)
+        _device_ops_rollback_cut_switch_highlight(owner, data)
+
+    if removed:
+        persist_runtime_state()
+    return removed
+
+
 def _auto_switch_enqueue_cut_switch(
     owner_username: str,
     alias: str,
@@ -4515,6 +4673,8 @@ def _auto_switch_enqueue_cut_switch(
     source_row: dict[str, Any],
     target_row: dict[str, Any],
 ) -> bool:
+    if not _auto_switch_enabled_now():
+        return False
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
     if not did or not alias_clean:
@@ -4526,6 +4686,24 @@ def _auto_switch_enqueue_cut_switch(
         return False
     if source_ri < 0 or target_ri < 0 or source_ri == target_ri:
         return False
+
+    conn = _get_db()
+    try:
+        for label, row in (("源", source_row), ("目标", target_row)):
+            user = str(row.get("username") or "").strip()
+            if not user:
+                _auto_switch_log(
+                    f"跳过切号：{label}账号用户名为空 | owner={owner_username} alias={alias_clean}"
+                )
+                return False
+            alias_err = _validate_username_device_effective_alias(conn, owner_username, user, alias_clean)
+            if alias_err:
+                _auto_switch_log(
+                    f"跳过切号：{label}账号分配别名不一致 | owner={owner_username} alias={alias_clean} | {alias_err}"
+                )
+                return False
+    finally:
+        conn.close()
 
     _apply_cut_switch_highlight_intent(owner_username, target_ri)
 
@@ -4556,6 +4734,7 @@ def _auto_switch_enqueue_cut_switch(
         "package_name": TIKTOK_PACKAGE_NAME,
         "backup_record_id": source_ri,
         "username": source_user,
+        "source": "auto_switch",
     }
     if prev_path:
         backup_payload["previous_backup_path"] = prev_path
@@ -4590,6 +4769,7 @@ def _auto_switch_enqueue_cut_switch(
             "skip_pm_clear": True,
             "restore_highlight_row_index": target_ri,
             "backup_record_id": source_ri,
+            "source": "auto_switch",
         }
         _enqueue_tiktok_device_op(did, "tiktok_restore", restore_payload)
         _append_device_log(
@@ -4627,8 +4807,12 @@ def _auto_switch_tick() -> None:
     owners = _auto_switch_list_owners_with_buckets()
 
     for owner in owners:
+        if not _auto_switch_enabled_now():
+            return
         buckets = _list_device_editor_buckets(owner)
         for alias_key, rows in buckets.items():
+            if not _auto_switch_enabled_now():
+                return
             plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, schedule_date)
             target_slot = _auto_switch_target_row(plan, minute_of_day)
             if not target_slot:
@@ -4696,6 +4880,9 @@ def _auto_switch_tick() -> None:
             if not highlighted:
                 _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
                 continue
+
+            if not _auto_switch_enabled_now():
+                return
 
             ok = _auto_switch_enqueue_cut_switch(owner, alias_key, device_id, highlighted, target_row)
             if ok:
@@ -7772,7 +7959,7 @@ def _effective_device_editor_alias(row: dict[str, Any]) -> str:
 
 
 def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username: str, alias: str) -> dict[str, Any] | None:
-    """按设备别名桶解析当前分配账号（优先 switch_highlight=是）。"""
+    """按设备别名桶解析当前分配账号（须有唯一切号高亮，或桶内仅一条记录）。"""
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     if not owner or not alias_key:
@@ -7791,19 +7978,14 @@ def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username:
         for r in dev_rows
         if _normalize_alias_key(_effective_device_editor_alias(dict(r))) == alias_key
     ]
-    if not matched:
+    pick = _pick_device_editor_bucket_row(matched)
+    if not pick:
         return None
-    yes_rows = [r for r in matched if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
-    if len(yes_rows) == 1:
-        pick = yes_rows[0]
-    elif len(matched) == 1:
-        pick = matched[0]
-    elif len(yes_rows) > 1:
-        pick = min(yes_rows, key=lambda r: int(r["row_index"]))
-    else:
-        pick = min(matched, key=lambda r: int(r["row_index"]))
     username = str(pick.get("username") or "").strip()
     if not username:
+        return None
+    alias_err = _validate_username_device_effective_alias(conn, owner, username, alias_key)
+    if alias_err:
         return None
     acct = conn.execute(
         """
@@ -7846,7 +8028,10 @@ def device_assigned_account(device_id: str, alias: str):
     try:
         row = _fetch_device_assigned_account_row(conn, owner, alias)
         if not row:
-            return {"code": 1, "msg": "未找到该别名分配的 TikTok 账号"}
+            return {
+                "code": 1,
+                "msg": "未找到该别名下已高亮的分配账号（同桶多条时需有且仅有一条切号高亮，且账号分配别名须一致）",
+            }
         account_email = str(row.get("email") or "").strip()
         mail_module_code_available = False
         try:
@@ -10170,7 +10355,14 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
         assigned_alias = _blank_if_none(payload.assigned_alias)
         if not assigned_alias and device_alias:
             assigned_alias = device_alias
-        if assigned_alias:
+        effective_alias = assigned_alias or device_alias
+        if username and effective_alias:
+            alias_err = _validate_username_device_effective_alias(
+                conn, owner, username, effective_alias
+            )
+            if alias_err:
+                return {"code": 1, "msg": alias_err}
+        elif effective_alias:
             alias_row = conn.execute(
                 """
                 SELECT username
@@ -10178,23 +10370,10 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 WHERE owner_username = ? AND TRIM(assigned_alias) = TRIM(?)
                 LIMIT 1
                 """,
-                (owner, assigned_alias),
+                (owner, effective_alias),
             ).fetchone()
-            if not alias_row and username:
-                _sync_account_assigned_alias_for_username(
-                    conn, owner, username, assigned_alias, only_if_empty=True
-                )
-                alias_row = conn.execute(
-                    """
-                    SELECT username
-                    FROM account_editor_rows
-                    WHERE owner_username = ? AND TRIM(assigned_alias) = TRIM(?)
-                    LIMIT 1
-                    """,
-                    (owner, assigned_alias),
-                ).fetchone()
             if not alias_row:
-                return {"code": 1, "msg": f"别名「{assigned_alias}」尚未在账号表单中分配，不能写入设备档案"}
+                return {"code": 1, "msg": f"别名「{effective_alias}」尚未在账号表单中分配，不能写入设备档案"}
 
         sh = _normalize_switch_highlight(payload.switch_highlight)
         conn.execute(
@@ -10240,7 +10419,6 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 now,
             ),
         )
-        effective_alias = assigned_alias or device_alias
         if username and effective_alias:
             _sync_account_assigned_alias_for_username(
                 conn, owner, username, effective_alias, only_if_empty=True
@@ -12497,18 +12675,27 @@ def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | No
     if err:
         return err
     turning_on = False
+    turning_off = False
     with store.lock:
         if payload.enabled is not None:
             next_enabled = bool(payload.enabled)
             turning_on = next_enabled and not store.auto_switch_enabled
+            turning_off = (not next_enabled) and bool(store.auto_switch_enabled)
             store.auto_switch_enabled = next_enabled
             if turning_on:
                 store.auto_switch_align_on_next_tick = True
+            elif not next_enabled:
+                store.auto_switch_align_on_next_tick = False
     persist_runtime_state()
+    cancelled_ops = 0
+    if turning_off:
+        cancelled_ops = _cancel_pending_auto_switch_device_ops()
     if turning_on:
         _auto_switch_log("自动切号总开关已开启，将在下一轮调度立即对齐当前时段账号")
-    elif payload.enabled is not None and not payload.enabled:
-        _auto_switch_log("自动切号总开关已关闭")
+    elif turning_off:
+        _auto_switch_log(
+            f"自动切号总开关已关闭（已撤销队列中 {cancelled_ops} 个待执行任务）"
+        )
     return {
         "code": 0,
         "msg": "自动切号配置已更新",

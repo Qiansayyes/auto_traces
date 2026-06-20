@@ -6,7 +6,12 @@
                     <div class="toolbar-section-title">基础设置</div>
                     <div class="toolbar-fields">
                         <el-form-item class="toolbar-form-item" label="分隔符" label-width="58px">
-                            <el-input v-model="toolForm.splitSymbol" class="split-input" />
+                            <el-input
+                                v-model="toolForm.splitSymbol"
+                                class="split-input"
+                                disabled
+                                placeholder="固定 ----，空格/Tab 自动识别"
+                            />
                         </el-form-item>
                         <el-form-item class="toolbar-form-item password-item" label="接口密码" label-width="72px">
                             <el-input
@@ -485,12 +490,15 @@ const parseFileContent = (file: UploadRawFile) => {
                 return
             }
 
-            const matches = content.split('\n');
+            const matches = content
+                .split(/\r?\n/)
+                .map((item) => item.trim())
+                .filter((item) => item !== '');
 
-            if (matches) {
+            if (matches.length > 0) {
                 emailList.value = matches
             } else {
-                ElMessage.warning('未在文件中找到邮箱地址')
+                ElMessage.warning('文件中没有可导入的账号行')
                 emailList.value = []
             }
         } catch (error) {
@@ -631,20 +639,58 @@ const parseAccountLines = (lines: string[]) => {
     return lines
         .map(item => item.trim())
         .filter(item => item !== '')
-        .map(item => {
-            const tempArr = item.split(toolForm.value.splitSymbol)
-            return {
-                email: (tempArr[0] || '').trim().toLowerCase(),
-                password: tempArr[1] || '',
-                client_id: tempArr[2] || '',
-                refresh_token: tempArr.slice(3).join(toolForm.value.splitSymbol) || ''
-            }
-        })
-        .filter(item => item.email.includes('@'))
 }
 
-const importAccountsToDatabase = async (records: Email[], source = 'ui') => {
-    if (records.length === 0) return null
+const normalizeSplitSymbol = () => '----'
+
+const hasAccountCredentials = (account?: Partial<Email> | null) => {
+    const clientId = String(account?.client_id || '').trim()
+    const refreshToken = String(account?.refresh_token || '').trim()
+    return Boolean(clientId && refreshToken)
+}
+
+const resolveAccountForFetch = async (target: Email): Promise<Email | null> => {
+    if (hasAccountCredentials(target)) {
+        return target
+    }
+
+    const cached = mailList.value.find((item) => item.email === target.email)
+    if (cached && hasAccountCredentials(cached)) {
+        return cached
+    }
+
+    await loadAccountsPage()
+    const refreshed = mailList.value.find((item) => item.email === target.email)
+    if (refreshed && hasAccountCredentials(refreshed)) {
+        return refreshed
+    }
+
+    return null
+}
+
+const formatImportResultMessage = (result: {
+    valid_records?: number
+    inserted_or_updated?: number
+    skipped_records?: number
+    rejected_records?: Array<{ line?: string; reason?: string }>
+} | null, fallbackCount = 0) => {
+    const imported = result?.inserted_or_updated ?? result?.valid_records ?? fallbackCount
+    const skipped = result?.skipped_records || 0
+    const rejected = result?.rejected_records || []
+    let message = `邮箱导入完成，成功 ${imported} 条`
+    if (skipped > 0) {
+        message += `，拒绝 ${skipped} 条`
+    }
+    if (rejected.length > 0) {
+        const preview = rejected.slice(0, 2).map((item) => item.reason || '格式无效').join('；')
+        message += `（${preview}${rejected.length > 2 ? '…' : ''}）`
+    }
+    return message
+}
+
+const importAccountsToDatabase = async (lines: string[], source = 'ui') => {
+    const normalizedLines = lines.map((item) => item.trim()).filter(Boolean)
+    if (normalizedLines.length === 0) return null
 
     const response = await fetch('/api/accounts/import', {
         method: 'POST',
@@ -653,14 +699,18 @@ const importAccountsToDatabase = async (records: Email[], source = 'ui') => {
         },
         body: JSON.stringify({
             password: toolForm.value.apiPassword,
-            records,
-            splitSymbol: toolForm.value.splitSymbol,
+            lines: normalizedLines,
+            splitSymbol: normalizeSplitSymbol(toolForm.value.splitSymbol),
             source
         })
     })
     const payload = await response.json()
     if (!(payload.code === '200' || payload.code === 200)) {
-        throw new Error(payload.message || payload.error || '账号入库失败')
+        const rejected = payload.data?.rejected_records || payload.details?.rejected_records
+        const rejectedHint = Array.isArray(rejected) && rejected.length > 0
+            ? `；首条错误：${rejected[0].reason}`
+            : ''
+        throw new Error((payload.error || payload.message || '账号入库失败') + rejectedHint)
     }
     return payload.data
 }
@@ -703,7 +753,13 @@ const removeEmailsFromLocalCache = (emails: string[]) => {
 
 const syncAccountsToDatabase = async (records: Email[], source = 'localStorage_sync') => {
     try {
-        await importAccountsToDatabase(records, source)
+        const lines = records.map((item) => [
+            item.email,
+            item.password,
+            item.client_id,
+            item.refresh_token,
+        ].join('----'))
+        await importAccountsToDatabase(lines, source)
     } catch (error) {
         console.warn('同步账号数据库失败:', error)
     }
@@ -1002,22 +1058,17 @@ const handleDeleteAll = () => {
 
 // 添加邮箱
 const handleAdd = async () => {
-    if (emailList.value.length === 0) {
-        ElMessage.warning('请先选择文件解析')
-        return
-    }
-
-    const parsedAccounts = parseAccountLines(emailList.value)
-    if (parsedAccounts.length === 0) {
-        ElMessage.warning('未解析到有效邮箱记录')
+    const lines = parseAccountLines(emailList.value)
+    if (lines.length === 0) {
+        ElMessage.warning('请先选择文件或粘贴账号信息')
         return
     }
 
     try {
-        const result = await importAccountsToDatabase(parsedAccounts, 'ui_import')
+        const result = await importAccountsToDatabase(lines, 'ui_import')
         tablePagination.value.currentPage = 1
         await loadAccountsPage()
-        ElMessage.success(`邮箱地址添加成功，共 ${parsedAccounts.length} 条，已入库 ${result?.inserted_or_updated || 0} 条`)
+        ElMessage.success(formatImportResultMessage(result, lines.length))
     } catch (error: any) {
         ElMessage.error(`账号入库失败：${error.message}`)
         return
@@ -1045,7 +1096,7 @@ const buildAccountExportContent = (records: Email[]) => {
             item.password,
             item.client_id,
             item.refresh_token,
-        ].join(toolForm.value.splitSymbol))
+        ].join('----'))
         .join('\n')
 }
 
@@ -1682,14 +1733,21 @@ const handleReceive = async (target: Email = nowPost.value) => {
         return
     }
 
-    const { email, password, client_id, refresh_token } = target
+    const account = await resolveAccountForFetch(target)
+    if (!account) {
+        ElMessage.error('该邮箱缺少 client_id 或 refresh_token，请删除后重新粘贴完整账号信息导入')
+        return
+    }
+
+    const { email, password, client_id, refresh_token } = account
     if (!email) {
         return
     }
 
+    nowPost.value = account
     await refreshMailboxPair(email, password, client_id, refresh_token, true)
     loadCombinedPosts(email)
-    mailList.value = mailList.value.map(item => item.email === email ? { ...item } : item)
+    mailList.value = mailList.value.map(item => item.email === email ? { ...account } : item)
 }
 
 const getRequestPassword = () => {

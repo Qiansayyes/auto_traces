@@ -291,6 +291,13 @@ class RealTraceExecutor(
     @Volatile
     private var accountStatusOcrWatchDepth: Int = 0
 
+    /** [runLoginSafeguardMeasure] 执行期间：其内所有 OCR（含 auto_login_* 预处理）也探测掉登录信号。 */
+    @Volatile
+    private var loginSafeguardLogoutProbeActive: Boolean = false
+
+    private fun isLogoutProbeContextActive(): Boolean =
+        isAccountStatusOcrWatchActive() || loginSafeguardLogoutProbeActive
+
     /** 任务执行中掉登录类异常须上浮至 [AppCoordinator]，勿在局部 OCR catch 吞掉。 */
     private fun rethrowTaskLogoutIfNeeded(ex: Throwable) {
         when (ex) {
@@ -312,8 +319,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 自动登录链与修改基本资料 OCR 不观察 Account status。
-     * 互点/发作品冷启里的 [runLoginSafeguardMeasure] 使用 `login_safeguard_*`，不在此排除列表内。
+     * 自动登录链与修改基本资料 OCR 不观察 Account status（[loginSafeguardLogoutProbeActive] 时除外 auto_login）。
+     * 互点/发作品冷启里的 [runLoginSafeguardMeasure] 使用 `login_safeguard_*`。
      */
     private fun isAccountStatusOcrExcludedTag(fileTag: String): Boolean {
         val t = fileTag.trim()
@@ -321,8 +328,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 登录状态保障会主动 OCR「Add another account」做判定，任务执行中见该文案则须中止并自动登录，
-     * 二者不可共用同一 OCR tag。
+     * 登录状态保障会主动 OCR「Add another account」做判定；任务执行中见该文案则须中止并自动登录。
+     * 登录保障期间由 [loginSafeguardLogoutProbeActive] 统一走掉登录探测，不再单独排除 tag。
      */
     private fun isAddAnotherAccountLogoutOcrExcludedTag(fileTag: String): Boolean {
         val t = fileTag.trim()
@@ -332,13 +339,19 @@ class RealTraceExecutor(
     }
 
     private fun shouldObserveAccountStatusOnOcr(fileTag: String?): Boolean {
-        if (!isAccountStatusOcrWatchActive()) return false
+        if (!isLogoutProbeContextActive()) return false
+        if (loginSafeguardLogoutProbeActive) {
+            return fileTag == null || !fileTag.trim().startsWith("profile_edit")
+        }
         if (fileTag != null && isAccountStatusOcrExcludedTag(fileTag)) return false
         return true
     }
 
     private fun shouldObserveAddAnotherAccountLogoutOnOcr(fileTag: String?): Boolean {
-        if (!isAccountStatusOcrWatchActive()) return false
+        if (!isLogoutProbeContextActive()) return false
+        if (loginSafeguardLogoutProbeActive) {
+            return fileTag == null || !fileTag.trim().startsWith("profile_edit")
+        }
         if (fileTag != null && isAddAnotherAccountLogoutOcrExcludedTag(fileTag)) return false
         return true
     }
@@ -348,14 +361,9 @@ class RealTraceExecutor(
         vision: Text,
         fileTag: String?,
     ) {
-        if (!isAccountStatusOcrWatchActive()) return
+        if (!isLogoutProbeContextActive()) return
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
-        if (shouldObserveAccountStatusOnOcr(fileTag)) {
-            maybeHandleAccountStatusLogoutFromVision(ctx, alias, vision)
-        }
-        if (shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)) {
-            maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
-        }
+        probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
     }
 
     /** 裁切 OCR 前对整屏截图观察掉登录信号（弹窗常在画面中部，裁切 OCR 可能漏检）。 */
@@ -364,7 +372,7 @@ class RealTraceExecutor(
         bitmap: Bitmap,
         fileTag: String,
     ) {
-        if (!isAccountStatusOcrWatchActive()) return
+        if (!isLogoutProbeContextActive()) return
         if (accountStatusRecoveryInProgress) return
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
         val image = InputImage.fromBitmap(bitmap, 0)
@@ -375,12 +383,7 @@ class RealTraceExecutor(
                     .addOnSuccessListener { cont.resume(it) }
                     .addOnFailureListener { cont.resumeWithException(it) }
             }
-            if (shouldObserveAccountStatusOnOcr(fileTag)) {
-                maybeHandleAccountStatusLogoutFromVision(ctx, alias, result)
-            }
-            if (shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)) {
-                maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, result, fileTag)
-            }
+            probeAndHandleLogoutSignalsFromVision(ctx, alias, result, fileTag)
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -515,6 +518,8 @@ class RealTraceExecutor(
         private const val FOR_YOU_WARMUP_BOTTOM_NAV_CHECK_EVERY_SWIPES = 10
         /** For You 预滑底栏 OCR：单次校验内最多次数。 */
         private const val FOR_YOU_WARMUP_BOTTOM_NAV_OCR_MAX_ATTEMPTS = 3
+        /** For You 预滑：总时长均分为该段数，每段开始前做一次掉登录 OCR 探测。 */
+        private const val FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES = 3
         /** 发作品全部完成后的收尾：OCR 点底栏 Home（顺手处理 Don't allow）。 */
         private const val PUBLISH_POST_FINAL_HOME_TAP_MAX_PASSES = 8
         private const val PUBLISH_POST_FINAL_HOME_TAP_RETRY_DELAY_MS = 500L
@@ -1531,6 +1536,13 @@ class RealTraceExecutor(
             pass++
             val probe = accountStatusRecoveryOcrOnce(ctx, "account_status_ok_verify_$pass") ?: continue
             if (!visionShowsAccountStatusLogoutDialog(probe)) {
+                if (visionShowsWelcomeBackLogoutScreen(probe)) {
+                    devOp(
+                        alias,
+                        "掉登录：OK 后见 Add another account / Welcome back（第 $pass 次复核 OCR），从登录入口续接自动登录",
+                    )
+                    throw LoginSafeguardRequiresAutoLoginException()
+                }
                 devOp(alias, "掉登录：OK 已生效，Account status 弹窗已消失（第 $pass 次复核 OCR）")
                 return
             }
@@ -1582,14 +1594,31 @@ class RealTraceExecutor(
         throw AccountStatusLoggedOutException("Account status 掉登录已处理，需重新自动登录")
     }
 
-    private suspend fun maybeHandleAccountStatusLogoutFromVision(
+    /** 点 OK 后的 Welcome back 等：同屏见 Add another account / another account（Account status 弹窗已消失）。 */
+    private fun visionShowsWelcomeBackLogoutScreen(vision: Text): Boolean =
+        findAddAnotherAccountTapHit(vision) != null
+
+    /**
+     * 统一掉登录探测：Account status 弹窗 + Welcome back（Add another account / another account）。
+     * 凡开启 Account status 观测的节点，同帧也检测 Add another account；后者走 [LoginSafeguardRequiresAutoLoginException]。
+     */
+    private suspend fun probeAndHandleLogoutSignalsFromVision(
         ctx: Context,
         alias: String,
         vision: Text,
+        fileTag: String?,
     ) {
         if (accountStatusRecoveryInProgress) return
-        if (!visionShowsAccountStatusLogoutDialog(vision)) return
-        performAccountStatusLogoutRecovery(ctx, alias, vision)
+        val observeAccountStatus = shouldObserveAccountStatusOnOcr(fileTag)
+        val observeAddAnother = shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)
+        if (!observeAccountStatus && !observeAddAnother) return
+
+        if (observeAccountStatus && visionShowsAccountStatusLogoutDialog(vision)) {
+            performAccountStatusLogoutRecovery(ctx, alias, vision)
+        }
+        if ((observeAccountStatus || observeAddAnother) && visionShowsWelcomeBackLogoutScreen(vision)) {
+            maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
+        }
     }
 
     /**
@@ -4395,10 +4424,21 @@ class RealTraceExecutor(
         val startedAt = System.currentTimeMillis()
 
         devOp(alias, "For You 预滑开始：总时长=${totalMs}ms")
+        val logoutProbeAtMs = LongArray(FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES) { phase ->
+            (totalMs * phase / FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES).coerceIn(0L, totalMs)
+        }
+        var logoutProbesDone = 0
         var swipeCount = 0
         while (System.currentTimeMillis() - startedAt < totalMs) {
             if (hardStopOrNull(alias, "For You 预滑")) return
             if (mutualClickOrNull(alias, "For You 预滑")) return
+            val elapsedBeforeSegment = System.currentTimeMillis() - startedAt
+            while (logoutProbesDone < FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES &&
+                 elapsedBeforeSegment >= logoutProbeAtMs[logoutProbesDone]
+            ) {
+                probeForYouWarmupLogoutSignalsAtPhaseStart(service, alias, logoutProbesDone + 1)
+                logoutProbesDone++
+            }
             val planWatchMs =
                 if (watchMaxMs > watchMinMs) Random.nextLong(watchMinMs, watchMaxMs + 1) else watchMinMs
             val elapsed = System.currentTimeMillis() - startedAt
@@ -6509,6 +6549,25 @@ class RealTraceExecutor(
         val hasHome = hasBottomBandContaining(result, screenH, "home")
         val hasProfile = hasBottomBandContaining(result, screenH, "profile")
         return "底栏Home+Profile( home=$hasHome, profile=$hasProfile )"
+    }
+
+    /**
+     * For You 预滑：每段开始前整屏 OCR，探测 Account status / Add another account 并走既有掉登录分支。
+     */
+    private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
+        ctx: Context,
+        alias: String,
+        phase: Int,
+    ) {
+        devOp(
+            alias,
+            "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 时间段开始前掉登录检测（Account status / Add another account）",
+        )
+        val tag = "for_you_warmup_logout_probe_$phase"
+        val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)
+        if (vision == null) {
+            devOp(alias, "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 段掉登录检测 OCR 失败：$err")
+        }
     }
 
     /**
@@ -12811,7 +12870,7 @@ class RealTraceExecutor(
         return SafeguardProfileScreenKind.Unknown
     }
 
-    /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面（不含 Account status，由全局 OCR 处理）。 */
+    /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Account status / Welcome back 由 [probeAndHandleLogoutSignalsFromVision] 处理。 */
     private fun safeguardVisionNeedsAutoLogin(vision: Text, screenH: Int): Boolean {
         if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
         if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
@@ -12859,6 +12918,15 @@ class RealTraceExecutor(
     }
 
     override suspend fun runLoginSafeguardMeasure(ctx: Context, sourceTag: String): LoginSafeguardOutcome {
+        loginSafeguardLogoutProbeActive = true
+        try {
+            return runLoginSafeguardMeasureCore(ctx, sourceTag)
+        } finally {
+            loginSafeguardLogoutProbeActive = false
+        }
+    }
+
+    private suspend fun runLoginSafeguardMeasureCore(ctx: Context, sourceTag: String): LoginSafeguardOutcome {
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
         if (hardStopOrNull(alias, "登录状态保障")) return LoginSafeguardOutcome.Failed
 
@@ -12936,10 +13004,18 @@ class RealTraceExecutor(
     private suspend fun runLoginSafeguardMeasureOrAbortMessage(
         ctx: Context,
         sourceTag: String,
-    ): String? = when (runLoginSafeguardMeasure(ctx, sourceTag)) {
-        LoginSafeguardOutcome.Ready -> null
-        LoginSafeguardOutcome.RequiresAutoLogin -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
-        LoginSafeguardOutcome.Failed -> "失败：登录状态保障未通过"
+    ): String? {
+        return try {
+            when (runLoginSafeguardMeasure(ctx, sourceTag)) {
+                LoginSafeguardOutcome.Ready -> null
+                LoginSafeguardOutcome.RequiresAutoLogin -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                LoginSafeguardOutcome.Failed -> "失败：登录状态保障未通过"
+            }
+        } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+        } catch (logout: AccountStatusLoggedOutException) {
+            throw logout
+        }
     }
 
     private suspend fun autoLoginWaitForContinueOrUsername(

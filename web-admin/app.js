@@ -4188,13 +4188,17 @@ async function saveBackupStatsFullQueryConfig(options = {}) {
 async function saveAutoSwitchConfig(options = {}) {
   if (autoSwitchSaveInFlight) return;
   autoSwitchSaveInFlight = true;
-  const enabled = !!autoSwitchEnabledToggle?.checked;
   try {
-    await request("/api/admin/auto_switch/config", {
-      method: "POST",
-      body: JSON.stringify({ enabled }),
-    });
-    autoSwitchEnabledGlobal = enabled;
+    let enabled = !!autoSwitchEnabledToggle?.checked;
+    do {
+      enabled = !!autoSwitchEnabledToggle?.checked;
+      await request("/api/admin/auto_switch/config", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      autoSwitchEnabledGlobal = enabled;
+    } while (enabled !== !!autoSwitchEnabledToggle?.checked);
+
     if (options.refreshStatus !== false) {
       await refreshTaskStatus();
     }
@@ -4210,6 +4214,9 @@ async function saveAutoSwitchConfig(options = {}) {
     setStatus(error.message || "保存自动切号配置失败", "error");
   } finally {
     autoSwitchSaveInFlight = false;
+    if (!!autoSwitchEnabledToggle?.checked !== autoSwitchEnabledGlobal) {
+      void saveAutoSwitchConfig(options);
+    }
   }
 }
 

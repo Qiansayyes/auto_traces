@@ -1628,28 +1628,51 @@ object AppCoordinator {
         strict: Boolean = true,
     ): Boolean {
         fetchConfig(logToUser = false)
-        when (executor.runLoginSafeguardMeasure(appContext, source)) {
-            LoginSafeguardOutcome.Ready -> {
-                LogCenter.op(alias, "登录状态保障($source)：界面可继续，已回 Home")
-                return true
+        return try {
+            when (executor.runLoginSafeguardMeasure(appContext, source)) {
+                LoginSafeguardOutcome.Ready -> {
+                    LogCenter.op(alias, "登录状态保障($source)：界面可继续，已回 Home")
+                    true
+                }
+                LoginSafeguardOutcome.RequiresAutoLogin -> {
+                    LogCenter.op(alias, "登录状态保障($source)：界面需登录，启动自动登录")
+                    val opId = "safeguard_${System.currentTimeMillis()}"
+                    ensureAccountLoggedIn(
+                        alias = alias,
+                        deviceId = deviceId,
+                        opId = opId,
+                        reason = "登录状态保障($source)",
+                        strict = strict,
+                        forceRelogin = true,
+                        resumeFromLoginEntryScreen = true,
+                    )
+                }
+                LoginSafeguardOutcome.Failed -> {
+                    LogCenter.op(alias, "登录状态保障($source)：执行失败")
+                    false
+                }
             }
-            LoginSafeguardOutcome.RequiresAutoLogin -> {
-                LogCenter.op(alias, "登录状态保障($source)：界面需登录，启动自动登录")
-                val opId = "safeguard_${System.currentTimeMillis()}"
-                return ensureAccountLoggedIn(
-                    alias = alias,
-                    deviceId = deviceId,
-                    opId = opId,
-                    reason = "登录状态保障($source)",
-                    strict = strict,
-                    forceRelogin = true,
-                    resumeFromLoginEntryScreen = true,
-                )
-            }
-            LoginSafeguardOutcome.Failed -> {
-                LogCenter.op(alias, "登录状态保障($source)：执行失败")
-                return false
-            }
+        } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            LogCenter.op(alias, "登录状态保障($source)：OCR 见 Add another account，从登录入口续接自动登录")
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = "safeguard_add_account_${System.currentTimeMillis()}",
+                reason = "登录状态保障($source)-Add another account",
+                strict = strict,
+                forceRelogin = true,
+                resumeFromLoginEntryScreen = true,
+            )
+        } catch (logout: AccountStatusLoggedOutException) {
+            LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = "safeguard_acct_status_${System.currentTimeMillis()}",
+                reason = "登录状态保障($source)-Account status",
+                strict = strict,
+                forceRelogin = true,
+            )
         }
     }
 
