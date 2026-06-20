@@ -302,7 +302,7 @@
         <div class="tiktok-roots-bottom">
           <div class="panel-card scheduler-controls-card">
             <h3>定时任务控制</h3>
-            <p class="hint">点击即可立即触发对应任务；右侧为实时日志（每 2 秒刷新）。</p>
+            <p class="hint">点击即可立即触发对应任务；右侧日志空闲约 10 秒、有任务运行约 5 秒刷新；切到后台标签页时暂停轮询。</p>
             <label>环境ID（每行一个，可选）</label>
             <textarea id="taskContainerIds" placeholder="每行一个环境ID"></textarea>
             <label>并行数量（可选）</label>
@@ -650,6 +650,13 @@
               <div class="hint">支持直接编辑、删除。</div>
             </div>
           </div>
+          <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
+            <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
+            <button id="accountRecordsNextPageBtn" type="button" class="ghost">下一页</button>
+            <label class="pager-size-label" for="accountRecordsPageSizeInput">每页</label>
+            <input id="accountRecordsPageSizeInput" type="number" class="pager-size-input" min="1" max="200" value="50" title="单页账号记录条数" />
+          </div>
           <div id="accountEditorList" style="margin-top:14px;"></div>
         </div>
       </section>
@@ -835,6 +842,10 @@
             <label>单账号活跃时长（小时）</label>
             <input id="batchStreamHoursInput" type="number" class="pager-size-input" min="0.5" max="72" step="0.5" value="2" />
           </div>
+          <div class="field" style="max-width:200px;margin-bottom:8px;">
+            <label>活跃轮数</label>
+            <input id="batchStreamRoundsInput" type="number" class="pager-size-input" min="1" max="20" step="1" value="1" title="全部账号完成一轮活跃后，可重复执行多轮；Excel 写入累计活跃时长" />
+          </div>
           <div class="field" style="margin-bottom:8px;">
             <label>带流 Excel（首 sheet 需含 username、password、email、email_password、api、分配别名）</label>
             <input id="batchStreamFileInput" type="file" accept=".xlsx" />
@@ -846,6 +857,34 @@
             <button id="batchStreamDownloadBtn" class="ghost" type="button" disabled>下载已更新 Excel</button>
           </div>
           <div id="batchStreamStatusHint" class="hint" style="margin-top:10px;">带流进行中时，该设备其它功能将被屏蔽，直至全部账号完成或手动停止。</div>
+        </div>
+        <div id="batchStreamProgressCard" class="panel-card" style="margin-top:12px;display:none;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <h3 style="margin:0;">带流进度</h3>
+            <div id="batchStreamProgressSummary" class="hint">—</div>
+          </div>
+          <div id="batchStreamProgressBarWrap" style="margin-top:10px;display:none;">
+            <div class="batch-stream-progress-track">
+              <div id="batchStreamProgressBar" class="batch-stream-progress-fill" style="width:0%;"></div>
+            </div>
+            <div id="batchStreamProgressPercent" class="hint" style="margin-top:6px;">0%</div>
+          </div>
+          <div class="table-mini-wrap" style="margin-top:10px;">
+            <table class="mini-table">
+              <thead>
+                <tr>
+                  <th>行号</th>
+                  <th>用户名</th>
+                  <th>邮箱</th>
+                  <th>分配别名</th>
+                  <th>活跃状态</th>
+                </tr>
+              </thead>
+              <tbody id="batchStreamTableBody">
+                <tr><td colspan="5" style="padding:10px;color:#666;">上传 Excel 后将在此显示账号列表与进度</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 

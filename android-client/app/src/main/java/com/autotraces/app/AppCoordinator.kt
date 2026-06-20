@@ -1916,6 +1916,7 @@ object AppCoordinator {
         if (op.op_type == "batch_stream_start") {
             val sessionId = payload?.session_id?.trim().orEmpty()
             val hours = payload?.hours_per_account ?: 0.0
+            val activityRounds = (payload?.activity_rounds ?: 1).coerceIn(1, 20)
             val rows = payload?.rows.orEmpty()
             val pkg = payload?.package_name?.trim().orEmpty()
                 .ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
@@ -1949,7 +1950,11 @@ object AppCoordinator {
                     ApiService.reportDeviceAutoStartOptOut(deviceId = deviceId, alias = alias, optOut = true)
                 }
             }
-            val startLine = "[OP][$opId] 批量带流已启动：${rows.size} 个账号，每台 ${hours} 小时"
+            val startLine = if (activityRounds > 1) {
+                "[OP][$opId] 批量带流已启动：${rows.size} 个账号，每轮 ${hours} 小时，共 ${activityRounds} 轮"
+            } else {
+                "[OP][$opId] 批量带流已启动：${rows.size} 个账号，每台 ${hours} 小时"
+            }
             LogCenter.op(alias, startLine)
             batchStreamJob = scope.launch {
                 runBatchStreamSession(
@@ -1959,6 +1964,7 @@ object AppCoordinator {
                     sessionId = sessionId,
                     packageName = pkg,
                     hoursPerAccount = hours,
+                    activityRounds = activityRounds,
                     rows = rows,
                 )
             }
@@ -1974,6 +1980,7 @@ object AppCoordinator {
                     "session_id" to sessionId,
                     "row_count" to rows.size,
                     "hours_per_account" to hours,
+                    "activity_rounds" to activityRounds,
                     "operation_logs" to listOf(startLine),
                 ),
             )
@@ -4218,12 +4225,25 @@ object AppCoordinator {
         sessionId: String,
         packageName: String,
         hoursPerAccount: Double,
+        activityRounds: Int,
         rows: List<BatchStreamRowPayload>,
     ) {
+        val rounds = activityRounds.coerceIn(1, 20)
+        val totalHoursPerAccount = hoursPerAccount * rounds
         try {
-            LogCenter.op(alias, "[OP][$parentOpId] 批量带流会话开始 session=$sessionId rows=${rows.size}")
-            updateRuntime(lastMessage = "批量带流运行中（${rows.size} 个账号）")
-            for ((index, row) in rows.withIndex()) {
+            LogCenter.op(
+                alias,
+                "[OP][$parentOpId] 批量带流会话开始 session=$sessionId rows=${rows.size} rounds=$rounds",
+            )
+            updateRuntime(lastMessage = "批量带流运行中（${rows.size} 个账号，${rounds} 轮）")
+            for (roundIndex in 0 until rounds) {
+                val roundNum = roundIndex + 1
+                if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) break
+                if (rounds > 1) {
+                    LogCenter.op(alias, "[OP][$parentOpId] 批量带流第 ${roundNum}/${rounds} 轮开始")
+                    updateRuntime(lastMessage = "批量带流第 ${roundNum}/${rounds} 轮（${rows.size} 个账号）")
+                }
+                for ((index, row) in rows.withIndex()) {
                 if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) {
                     LogCenter.op(alias, "[OP][$parentOpId] 批量带流已请求停止，剩余 ${rows.size - index} 个账号未执行")
                     break
@@ -4232,27 +4252,34 @@ object AppCoordinator {
                 val username = row.username?.trim().orEmpty()
                 LogCenter.op(
                     alias,
-                    "[OP][$parentOpId] 批量带流 ${index + 1}/${rows.size}：$username（行 $sheetRow）",
+                    "[OP][$parentOpId] 批量带流 ${index + 1}/${rows.size}：$username（行 $sheetRow${if (rounds > 1) "，第 ${roundNum}/${rounds} 轮" else ""}）",
                 )
                 val loginOk = batchStreamAutoLogin(alias, deviceId, parentOpId, row)
                 if (!loginOk) {
                     LogCenter.op(alias, "[OP][$parentOpId] 批量带流：$username 自动登录失败，跳过本行")
                     continue
                 }
-                runProfileEditAfterCutSwitch(
-                    alias = alias,
-                    deviceId = deviceId,
-                    parentOpId = parentOpId,
-                    skipOuterWarmup = true,
-                    profileEditTrigger = "batch_stream",
-                    skipAccountDbUpdate = true,
-                )
+                if (roundIndex == 0) {
+                    runProfileEditAfterCutSwitch(
+                        alias = alias,
+                        deviceId = deviceId,
+                        parentOpId = parentOpId,
+                        skipOuterWarmup = true,
+                        profileEditTrigger = "batch_stream",
+                        skipAccountDbUpdate = true,
+                    )
+                }
                 if (batchStreamStopRequested || PrefsStore.isHardStopRequested()) break
 
                 batchStreamGrowthPhase = true
                 growthModeLoginSafeguardPending = false
                 fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
-                forceStartRunningNow("批量带流：涨粉 ${hoursPerAccount} 小时（$username）")
+                val growthLabel = if (rounds > 1) {
+                    "批量带流：涨粉 ${hoursPerAccount} 小时（$username，第 ${roundNum}/${rounds} 轮）"
+                } else {
+                    "批量带流：涨粉 ${hoursPerAccount} 小时（$username）"
+                }
+                forceStartRunningNow(growthLabel)
                 startPullLoop()
                 val growthMs = (hoursPerAccount * 3600.0 * 1000.0).toLong().coerceAtLeast(60_000L)
                 val endAt = SystemClock.elapsedRealtime() + growthMs
@@ -4267,8 +4294,8 @@ object AppCoordinator {
                 updateRuntime(localStatus = "paused", lastMessage = "批量带流：账号 $username 活跃结束")
                 runCatching { ApiService.syncStatus(deviceId, alias, "paused") }
 
-                if (sheetRow >= 2) {
-                    val statusText = batchStreamStatusText(hoursPerAccount)
+                if (roundIndex == rounds - 1 && sheetRow >= 2) {
+                    val statusText = batchStreamStatusText(totalHoursPerAccount)
                     runCatching {
                         withContext(Dispatchers.IO) {
                             ApiService.reportBatchStreamRow(
@@ -4277,7 +4304,7 @@ object AppCoordinator {
                                 sessionId = sessionId,
                                 sheetRow = sheetRow,
                                 statusText = statusText,
-                                hoursActive = hoursPerAccount,
+                                hoursActive = totalHoursPerAccount,
                             )
                         }
                     }.onSuccess {
@@ -4287,13 +4314,18 @@ object AppCoordinator {
                     }
                 }
 
-                val hasNext = index < rows.lastIndex
-                if (hasNext && !batchStreamStopRequested && !PrefsStore.isHardStopRequested()) {
+                val hasNextInRound = index < rows.lastIndex
+                val hasNextRound = roundIndex < rounds - 1
+                if ((hasNextInRound || hasNextRound) && !batchStreamStopRequested && !PrefsStore.isHardStopRequested()) {
                     LogCenter.op(alias, "[OP][$parentOpId] 批量带流：清理 TikTok，准备下一账号")
                     runExecutorSu("am force-stop $packageName")
                     delay(1200)
                     runExecutorSu("pm clear $packageName")
                     delay(1500)
+                }
+                }
+                if (roundIndex < rounds - 1 && !batchStreamStopRequested && !PrefsStore.isHardStopRequested()) {
+                    LogCenter.op(alias, "[OP][$parentOpId] 批量带流第 ${roundNum} 轮完成，开始下一轮")
                 }
             }
         } finally {

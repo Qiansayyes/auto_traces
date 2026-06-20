@@ -9,6 +9,7 @@ Node 子服务运行在 server/mail_module/，本模块负责：
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -434,12 +435,22 @@ def _stop_node_process() -> None:
     if proc is None:
         return
     if proc.poll() is None:
-        proc.terminate()
+        # Windows 上 Node 对 terminate 响应慢，关闭时直接 kill 避免 uvicorn 卡住。
+        if sys.platform.startswith("win"):
+            proc.kill()
+        else:
+            proc.terminate()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=3)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=2)
+
+
+def stop_mail_module_process() -> None:
+    """供主服务 shutdown 钩子调用，快速终止 Node 子进程。"""
+    _stop_node_process()
 
 
 def _resolve_mail_owner(request: Request) -> tuple[str | None, JSONResponse | None]:
@@ -621,6 +632,11 @@ def attach_mail_module(app) -> None:
 
     @app.on_event("shutdown")
     async def _mail_module_shutdown() -> None:
-        _stop_node_process()
+        stop_mail_module_process()
         if _http_client is not None:
-            await _http_client.aclose()
+            try:
+                await asyncio.wait_for(_http_client.aclose(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Mail module HTTP client close timed out during shutdown")
+            except Exception as exc:
+                logger.warning("Mail module HTTP client close failed during shutdown: %s", exc)

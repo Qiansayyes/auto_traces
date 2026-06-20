@@ -221,14 +221,25 @@ const accountBatchRejectEmptyToggleEl = document.getElementById("accountBatchRej
 const importAccountBatchBtn = document.getElementById("importAccountBatchBtn");
 const batchStreamAliasSelect = document.getElementById("batchStreamAliasSelect");
 const batchStreamHoursInput = document.getElementById("batchStreamHoursInput");
+const batchStreamRoundsInput = document.getElementById("batchStreamRoundsInput");
 const batchStreamFileInput = document.getElementById("batchStreamFileInput");
 const batchStreamUploadHint = document.getElementById("batchStreamUploadHint");
 const batchStreamStartBtn = document.getElementById("batchStreamStartBtn");
 const batchStreamStopBtn = document.getElementById("batchStreamStopBtn");
 const batchStreamDownloadBtn = document.getElementById("batchStreamDownloadBtn");
 const batchStreamStatusHint = document.getElementById("batchStreamStatusHint");
+const batchStreamProgressCard = document.getElementById("batchStreamProgressCard");
+const batchStreamProgressSummary = document.getElementById("batchStreamProgressSummary");
+const batchStreamProgressBarWrap = document.getElementById("batchStreamProgressBarWrap");
+const batchStreamProgressBar = document.getElementById("batchStreamProgressBar");
+const batchStreamProgressPercent = document.getElementById("batchStreamProgressPercent");
+const batchStreamTableBody = document.getElementById("batchStreamTableBody");
 const accountUnassignedOnlyToggle = document.getElementById("accountUnassignedOnlyToggle");
 const accountRecordsSearchInput = document.getElementById("accountRecordsSearchInput");
+const accountRecordsPrevPageBtn = document.getElementById("accountRecordsPrevPageBtn");
+const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPageBtn");
+const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
+const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
@@ -243,7 +254,10 @@ let backupAliasByUsername = new Map();
 let accountFilterUnassignedOnly = false;
 let batchStreamSessionId = "";
 let batchStreamBusy = false;
+let batchStreamLastSnapshot = "";
 let accountRecordsSearchQuery = "";
+let currentAccountRecordsPage = 1;
+let accountRecordsFilteredTotal = 0;
 let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
@@ -254,8 +268,10 @@ let currentBackupArchivePage = 1;
 let backupArchiveAliasTotal = 0;
 const DEFAULT_OVERVIEW_PAGE_SIZE = 20;
 const DEFAULT_BACKUP_ARCHIVE_PAGE_SIZE = 20;
+const DEFAULT_ACCOUNT_RECORDS_PAGE_SIZE = 50;
 const MAX_OVERVIEW_PAGE_SIZE = 500;
 const MAX_BACKUP_ARCHIVE_PAGE_SIZE = 200;
+const MAX_ACCOUNT_RECORDS_PAGE_SIZE = 200;
 const DEFAULT_DEVICE_ASSIGN_COUNT = 1;
 const MAX_DEVICE_ASSIGN_COUNT = 50;
 
@@ -615,6 +631,18 @@ let lastGalleryDispatchLogLine = "";
 let overviewAutoRefreshCooldownUntil = 0;
 let logsAutoRefreshCooldownUntil = 0;
 let taskStatusRefreshCooldownUntil = 0;
+let taskStatusPollBusy = false;
+let taskStatusPollTimer = null;
+let batchStreamPollTimer = null;
+let overviewPollTimer = null;
+let taskStatusPollingEnabled = false;
+let overviewPollingEnabled = false;
+let batchStreamPollingEnabled = false;
+
+const TASK_STATUS_POLL_IDLE_MS = 10000;
+const TASK_STATUS_POLL_BUSY_MS = 5000;
+const BATCH_STREAM_POLL_MS = 2500;
+const OVERVIEW_POLL_MS = 6000;
 
 function appendGalleryDispatchLog(line, reset = false) {
   if (!galleryDispatchLogsEl) return;
@@ -652,6 +680,7 @@ const OVERVIEW_PAGE_KEY = "auto_traces_overview_page_v1";
 const OVERVIEW_PAGE_SIZE_KEY = "auto_traces_overview_page_size_v1";
 const BACKUP_ARCHIVE_PAGE_KEY = "auto_traces_backup_archive_page_v1";
 const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
+const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
 let autoSwitchEnabledGlobal = false;
@@ -1498,9 +1527,14 @@ async function switchSection(id, options = {}) {
     try {
       await loadBoundDeviceAliases();
       renderBatchStreamAliasOptions();
+      updateBatchStreamProgressVisibility();
+      await pollBatchStreamStatus();
+      scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
     } catch (_) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
+  } else {
+    clearBatchStreamPollTimer();
   }
   if (nextSectionId === "backup-section") {
     try {
@@ -2348,6 +2382,12 @@ function getBackupArchivePageSize() {
   return clampPageSize(fromInput ?? fromStorage, DEFAULT_BACKUP_ARCHIVE_PAGE_SIZE, MAX_BACKUP_ARCHIVE_PAGE_SIZE);
 }
 
+function getAccountRecordsPageSize() {
+  const fromInput = accountRecordsPageSizeInput?.value;
+  const fromStorage = localStorage.getItem(ACCOUNT_RECORDS_PAGE_SIZE_KEY);
+  return clampPageSize(fromInput ?? fromStorage, DEFAULT_ACCOUNT_RECORDS_PAGE_SIZE, MAX_ACCOUNT_RECORDS_PAGE_SIZE);
+}
+
 function persistOverviewPageSize() {
   const size = getOverviewPageSize();
   try {
@@ -2370,6 +2410,17 @@ function persistBackupArchivePageSize() {
   return size;
 }
 
+function persistAccountRecordsPageSize() {
+  const size = getAccountRecordsPageSize();
+  try {
+    localStorage.setItem(ACCOUNT_RECORDS_PAGE_SIZE_KEY, String(size));
+  } catch (_) {}
+  if (accountRecordsPageSizeInput && String(accountRecordsPageSizeInput.value) !== String(size)) {
+    accountRecordsPageSizeInput.value = String(size);
+  }
+  return size;
+}
+
 function onOverviewPageSizeChanged() {
   persistOverviewPageSize();
   currentOverviewPage = 1;
@@ -2380,6 +2431,24 @@ function onBackupArchivePageSizeChanged() {
   persistBackupArchivePageSize();
   currentBackupArchivePage = 1;
   void loadBackupArchiveRecords();
+}
+
+function onAccountRecordsPageSizeChanged() {
+  persistAccountRecordsPageSize();
+  currentAccountRecordsPage = 1;
+  renderAccountEditorRows();
+}
+
+function updateAccountRecordsPagerUi() {
+  const pageSize = getAccountRecordsPageSize();
+  const totalPages = Math.max(1, Math.ceil(accountRecordsFilteredTotal / pageSize));
+  if (currentAccountRecordsPage > totalPages) currentAccountRecordsPage = totalPages;
+  if (currentAccountRecordsPage < 1) currentAccountRecordsPage = 1;
+  if (accountRecordsPagerEl) {
+    accountRecordsPagerEl.textContent = `第 ${currentAccountRecordsPage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${accountRecordsFilteredTotal} 条`;
+  }
+  if (accountRecordsPrevPageBtn) accountRecordsPrevPageBtn.disabled = currentAccountRecordsPage <= 1;
+  if (accountRecordsNextPageBtn) accountRecordsNextPageBtn.disabled = currentAccountRecordsPage >= totalPages;
 }
 
 function overviewQueryString() {
@@ -4088,12 +4157,109 @@ async function triggerTaskWithOptions(path, successText, options = {}) {
   }
 }
 
+function isAdminPageVisible() {
+  return document.visibilityState !== "hidden";
+}
+
+function taskStatusResponseBusy(data = {}) {
+  const runningTasks = Array.isArray(data.running_tasks) ? data.running_tasks : [];
+  if (runningTasks.some((item) => item && item.running !== false)) return true;
+  if (Boolean(data.backup_stats_full_query_in_flight)) return true;
+  return false;
+}
+
+function getTaskStatusPollDelayMs() {
+  return taskStatusPollBusy ? TASK_STATUS_POLL_BUSY_MS : TASK_STATUS_POLL_IDLE_MS;
+}
+
+function clearTaskStatusPollTimer() {
+  if (taskStatusPollTimer != null) {
+    clearTimeout(taskStatusPollTimer);
+    taskStatusPollTimer = null;
+  }
+}
+
+function scheduleTaskStatusPoll(delayMs) {
+  clearTaskStatusPollTimer();
+  if (!taskStatusPollingEnabled || !isAdminPageVisible()) return;
+  const wait = Number.isFinite(delayMs) ? Math.max(0, delayMs) : getTaskStatusPollDelayMs();
+  taskStatusPollTimer = setTimeout(async () => {
+    taskStatusPollTimer = null;
+    if (!taskStatusPollingEnabled || !isAdminPageVisible()) return;
+    await refreshTaskStatus();
+  }, wait);
+}
+
+function clearBatchStreamPollTimer() {
+  if (batchStreamPollTimer != null) {
+    clearTimeout(batchStreamPollTimer);
+    batchStreamPollTimer = null;
+  }
+}
+
+function scheduleBatchStreamPoll(delayMs = BATCH_STREAM_POLL_MS) {
+  clearBatchStreamPollTimer();
+  if (!batchStreamPollingEnabled || !isAdminPageVisible()) return;
+  if (!isBatchStreamSectionActive() || !batchStreamSessionId) return;
+  const wait = Number.isFinite(delayMs) ? Math.max(0, delayMs) : BATCH_STREAM_POLL_MS;
+  batchStreamPollTimer = setTimeout(async () => {
+    batchStreamPollTimer = null;
+    if (!batchStreamPollingEnabled || !isAdminPageVisible()) return;
+    if (!isBatchStreamSectionActive() || !batchStreamSessionId) return;
+    await pollBatchStreamStatus();
+    scheduleBatchStreamPoll();
+  }, wait);
+}
+
+function clearOverviewPollTimer() {
+  if (overviewPollTimer != null) {
+    clearTimeout(overviewPollTimer);
+    overviewPollTimer = null;
+  }
+}
+
+function scheduleOverviewPoll(delayMs = OVERVIEW_POLL_MS) {
+  clearOverviewPollTimer();
+  if (!overviewPollingEnabled || !isAdminPageVisible()) return;
+  const wait = Number.isFinite(delayMs) ? Math.max(0, delayMs) : OVERVIEW_POLL_MS;
+  overviewPollTimer = setTimeout(async () => {
+    overviewPollTimer = null;
+    if (!overviewPollingEnabled || !isAdminPageVisible()) return;
+    if (isOverviewActive()) {
+      await pollOverviewSnapshot();
+    }
+    scheduleOverviewPoll();
+  }, wait);
+}
+
+function stopAdminBackgroundPollers() {
+  taskStatusPollingEnabled = false;
+  overviewPollingEnabled = false;
+  batchStreamPollingEnabled = false;
+  clearTaskStatusPollTimer();
+  clearBatchStreamPollTimer();
+  clearOverviewPollTimer();
+}
+
+function startAdminBackgroundPollers() {
+  if (!isAdminPageVisible()) return;
+  taskStatusPollingEnabled = true;
+  overviewPollingEnabled = true;
+  batchStreamPollingEnabled = true;
+  void refreshTaskStatus();
+  scheduleOverviewPoll(OVERVIEW_POLL_MS);
+  if (isBatchStreamSectionActive() && batchStreamSessionId) {
+    scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
+  }
+}
+
 async function refreshTaskStatus() {
   if (taskStatusRefreshInFlight) return;
   if (Date.now() < taskStatusRefreshCooldownUntil) return;
   taskStatusRefreshInFlight = true;
   try {
     const data = await request("/api/admin/tasks/status");
+    taskStatusPollBusy = taskStatusResponseBusy(data);
     const schedulerTasks = data.scheduler_tasks || {};
     const taskLogs = data.task_logs || {};
     const runningTasks = Array.isArray(data.running_tasks) ? data.running_tasks : [];
@@ -4139,6 +4305,9 @@ async function refreshTaskStatus() {
     }
   } finally {
     taskStatusRefreshInFlight = false;
+    if (taskStatusPollingEnabled && isAdminPageVisible()) {
+      scheduleTaskStatusPoll(getTaskStatusPollDelayMs());
+    }
   }
 }
 
@@ -7624,6 +7793,143 @@ function updateBatchStreamUploadHint(text) {
   if (batchStreamUploadHint) batchStreamUploadHint.textContent = text;
 }
 
+function isBatchStreamSectionActive() {
+  return document.getElementById("batch-stream")?.classList.contains("active");
+}
+
+function updateBatchStreamProgressVisibility() {
+  if (batchStreamProgressCard) {
+    batchStreamProgressCard.style.display = batchStreamSessionId ? "" : "none";
+  }
+}
+
+function batchStreamRowStatusBadge(status) {
+  const text = String(status || "").trim();
+  if (!text) return '<span class="badge pending">待处理</span>';
+  return `<span class="badge online">${escapeHtml(text)}</span>`;
+}
+
+function resolveBatchStreamDeviceState(devices, deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did || !devices || typeof devices !== "object") return null;
+  return devices[did] || null;
+}
+
+function buildBatchStreamProgressSnapshot(data, deviceState) {
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  return JSON.stringify({
+    done: Number(data?.done_count || 0),
+    pending: Number(data?.pending_count || 0),
+    total: rows.length,
+    device: deviceState
+      ? {
+          status: String(deviceState.status || ""),
+          completed: Number(deviceState.completed_rows || 0),
+          total: Number(deviceState.total_rows || 0),
+        }
+      : null,
+    rows: rows.map((row) => [
+      Number(row?.sheet_row || 0),
+      String(row?.username || ""),
+      String(row?.status || ""),
+    ]),
+  });
+}
+
+function renderBatchStreamProgress(data) {
+  if (!batchStreamTableBody) return;
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  const target = resolveBatchStreamDeviceSelection();
+  const deviceState = resolveBatchStreamDeviceState(data?.devices, target?.device_id);
+  const snapshot = buildBatchStreamProgressSnapshot(data, deviceState);
+  if (snapshot === batchStreamLastSnapshot) return;
+  batchStreamLastSnapshot = snapshot;
+
+  const filteredTotal = rows.length;
+  const doneCount = Number(data?.done_count || 0);
+  const pendingCount = Number(data?.pending_count || 0);
+  const filterAlias = String(data?.filtered_alias || "").trim();
+  const summaryParts = [];
+  if (filterAlias) {
+    summaryParts.push(`别名 ${filterAlias}：已完成 ${doneCount} / ${filteredTotal}，待处理 ${pendingCount}`);
+  } else {
+    summaryParts.push(`全部账号：已完成 ${doneCount} / ${filteredTotal}，待处理 ${pendingCount}`);
+  }
+  if (deviceState) {
+    const devStatus = String(deviceState.status || "running");
+    const devDone = Number(deviceState.completed_rows || 0);
+    const devTotal = Number(deviceState.total_rows || 0);
+    const statusLabel = devStatus === "done"
+      ? "已完成"
+      : devStatus === "stopping"
+        ? "停止中"
+        : devStatus === "running"
+          ? "进行中"
+          : devStatus;
+    summaryParts.push(`设备 ${statusLabel}：${devDone}/${devTotal}`);
+  }
+  if (batchStreamProgressSummary) {
+    batchStreamProgressSummary.textContent = summaryParts.join("；");
+  }
+
+  let progressPct = 0;
+  if (deviceState && Number(deviceState.total_rows || 0) > 0) {
+    progressPct = Math.min(100, Math.round((Number(deviceState.completed_rows || 0) / Number(deviceState.total_rows || 1)) * 100));
+  } else if (filteredTotal > 0) {
+    progressPct = Math.min(100, Math.round((doneCount / filteredTotal) * 100));
+  }
+  if (batchStreamProgressBarWrap) {
+    batchStreamProgressBarWrap.style.display = filteredTotal > 0 ? "" : "none";
+  }
+  if (batchStreamProgressBar) {
+    batchStreamProgressBar.style.width = `${progressPct}%`;
+  }
+  if (batchStreamProgressPercent) {
+    batchStreamProgressPercent.textContent = filteredTotal > 0 ? `${progressPct}%（${doneCount}/${filteredTotal}）` : "0%";
+  }
+
+  if (!rows.length) {
+    batchStreamTableBody.innerHTML =
+      '<tr><td colspan="5" style="padding:10px;color:#666;">当前筛选下暂无账号行</td></tr>';
+    return;
+  }
+
+  const firstPendingRow = rows.find((row) => !String(row?.status || "").trim())?.sheet_row;
+  batchStreamTableBody.innerHTML = rows
+    .map((row) => {
+      const sheetRow = Number(row?.sheet_row || 0);
+      const username = escapeHtml(String(row?.username || "-"));
+      const email = escapeHtml(String(row?.email || "-"));
+      const alias = escapeHtml(String(row?.assigned_alias || "-"));
+      const status = String(row?.status || "").trim();
+      const isDone = Boolean(status);
+      const isActive = !isDone && firstPendingRow != null && sheetRow === Number(firstPendingRow);
+      const rowClass = isActive ? "batch-stream-row--active" : isDone ? "batch-stream-row--done" : "";
+      return `<tr class="${rowClass}">
+        <td>${sheetRow || "-"}</td>
+        <td>${username}</td>
+        <td>${email}</td>
+        <td>${alias}</td>
+        <td>${batchStreamRowStatusBadge(status)}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+async function pollBatchStreamStatus() {
+  if (!batchStreamSessionId || !isBatchStreamSectionActive()) return;
+  const target = resolveBatchStreamDeviceSelection();
+  const qs = new URLSearchParams({ session_id: batchStreamSessionId });
+  if (target?.alias) qs.set("alias", target.alias);
+  try {
+    const data = await request(`/api/admin/batch_stream/status?${qs.toString()}`);
+    if (Number(data?.code) !== 0) return;
+    renderBatchStreamProgress(data);
+  } catch (_) {
+    // 轮询失败时保持静默，避免打断操作。
+  }
+}
+
 async function uploadBatchStreamXlsx(file) {
   if (!file) return;
   const name = String(file.name || "").toLowerCase();
@@ -7658,6 +7964,12 @@ async function uploadBatchStreamXlsx(file) {
         : "上传完成",
     );
     if (batchStreamDownloadBtn) batchStreamDownloadBtn.disabled = !batchStreamSessionId;
+    batchStreamLastSnapshot = "";
+    updateBatchStreamProgressVisibility();
+    await pollBatchStreamStatus();
+    if (isBatchStreamSectionActive()) {
+      scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
+    }
     setStatus(`批量带流 Excel 已上传：${rowCount} 行`, "success");
   } finally {
     setBatchStreamUiBusy(false);
@@ -7680,6 +7992,11 @@ async function startBatchStreamOnDevice() {
     setStatus("请填写有效的单账号活跃时长（小时）", "warning");
     return;
   }
+  const rounds = Math.max(1, Math.min(20, Math.floor(Number(batchStreamRoundsInput?.value || 1))));
+  if (!Number.isFinite(rounds) || rounds < 1) {
+    setStatus("请填写有效的活跃轮数（1~20）", "warning");
+    return;
+  }
   setBatchStreamUiBusy(true);
   try {
     setStatus(`正在向 ${target.alias} 下发批量带流...`, "info");
@@ -7690,15 +8007,22 @@ async function startBatchStreamOnDevice() {
         device_id: target.device_id,
         alias: target.alias,
         hours_per_account: hours,
+        activity_rounds: rounds,
         package_name: (backupPackageNameInput?.value || "").trim() || "com.zhiliaoapp.musically",
       }),
     });
     if (Number(data?.code) !== 0) {
       throw new Error(String(data?.msg || "下发失败"));
     }
+    const totalHours = hours * rounds;
     if (batchStreamStatusHint) {
-      batchStreamStatusHint.textContent = `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每台 ${hours} 小时。设备进入独占模式。`;
+      batchStreamStatusHint.textContent = rounds > 1
+        ? `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每轮 ${hours} 小时，共 ${rounds} 轮（累计 ${totalHours} 小时/账号）。设备进入独占模式。`
+        : `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每台 ${hours} 小时。设备进入独占模式。`;
     }
+    batchStreamLastSnapshot = "";
+    await pollBatchStreamStatus();
+    scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
     setStatus(String(data?.msg || "批量带流已启动"), "success");
   } catch (e) {
     setStatus(e.message || "批量带流启动失败", "error");
@@ -7729,6 +8053,8 @@ async function stopBatchStreamOnDevice() {
     if (batchStreamStatusHint) {
       batchStreamStatusHint.textContent = `已向 ${target.alias} 下发停止指令，设备将退出带流模式。`;
     }
+    batchStreamLastSnapshot = "";
+    await pollBatchStreamStatus();
     setStatus(String(data?.msg || "已请求停止批量带流"), "success");
   } catch (e) {
     setStatus(e.message || "停止批量带流失败", "error");
@@ -7931,6 +8257,12 @@ function renderAccountEditorRows() {
   if (accountRecordsSearchQuery) {
     visibleRows = visibleRows.filter(({ row }) => accountRecordMatchesSearch(row));
   }
+  accountRecordsFilteredTotal = visibleRows.length;
+  updateAccountRecordsPagerUi();
+  const pageSize = getAccountRecordsPageSize();
+  const totalPages = Math.max(1, Math.ceil(accountRecordsFilteredTotal / pageSize));
+  const start = (currentAccountRecordsPage - 1) * pageSize;
+  const pageRows = visibleRows.slice(start, start + pageSize);
   if (!visibleRows.length) {
     const emptyHint = accountRecordsSearchQuery
       ? `未找到匹配「${accountRecordsSearchQuery}」的账号记录`
@@ -7939,7 +8271,7 @@ function renderAccountEditorRows() {
     return;
   }
   try {
-    const bodyHtml = visibleRows.map(({ row, idx }) => {
+    const bodyHtml = pageRows.map(({ row, idx }, localIdx) => {
       const aliasLocked = isAccountAliasLocked(row);
       const aliasCell = aliasLocked
         ? `<span class="account-editor-table__alias-locked" title="已分配别名不可改；删除记录将同步删除备份档案">${escapeHtml(getEffectiveAccountAssignedAlias(row))}</span>`
@@ -7954,8 +8286,9 @@ function renderAccountEditorRows() {
         "basic_profile_modified",
         `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`
       );
+      const displayNum = start + localIdx + 1;
       return `<tr>
-        <td class="account-editor-table__num">${idx + 1}</td>
+        <td class="account-editor-table__num">${displayNum}</td>
         <td>${accountEditorCellInput(idx, "username", row.username)}</td>
         <td>${accountEditorCellInput(idx, "password", row.password)}</td>
         <td>${accountEditorCellInput(idx, "email", row.email)}</td>
@@ -8550,80 +8883,68 @@ function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}) {
   return `<span class="backup-archive-env-badge backup-archive-env-badge--highlighted ${runtimeClass} ${loginClass}" title="${escapeHtml(titleParts.join("；"))}">${escapeHtml(textParts.join(" · "))}</span>`;
 }
 
-function renderBackupGroups(items = []) {
-  if (!deviceAliasGroupsEl) return;
-  if (!Array.isArray(items) || !items.length) {
-    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
-    return;
+/** 同别名组：默认只展示高亮记录，其余放入折叠区 */
+function partitionBackupArchiveGroupRows(rows = []) {
+  if (!Array.isArray(rows) || rows.length <= 1) {
+    return { primary: rows || [], secondary: [] };
   }
-  const filteredItems = backupArchiveSearchQuery
-    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
-    : items;
-  if (!filteredItems.length) {
-    const emptyHint = backupArchiveSearchQuery
-      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
-      : "暂无备份档案";
-    deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
-    return;
+  const highlighted = rows.filter((row) => isBackupArchiveRowEffectivelyHighlighted(rows, row));
+  if (highlighted.length === 1) {
+    return {
+      primary: highlighted,
+      secondary: rows.filter((row) => !isBackupArchiveRowEffectivelyHighlighted(rows, row)),
+    };
   }
-  const groups = new Map();
-  filteredItems.forEach((item) => {
-    const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
-    if (!groups.has(alias)) groups.set(alias, []);
-    groups.get(alias).push(item);
-  });
-  const planDateHint = autoSwitchDailyPlanDate
-    ? `<span class="hint" style="font-weight:400;">（北京 ${escapeHtml(autoSwitchDailyPlanDate)}）</span>`
+  return { primary: [rows[0]], secondary: rows.slice(1) };
+}
+
+function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
+  const username = String(row?.username || "").trim();
+  const displayAlias = resolveBackupArchiveDisplayAlias(row);
+  const mobileAlias = String(row?.mobile_alias || row?.device_alias || "").trim();
+  const accountAlias = normalizeAliasValue(row?.account_assigned_alias)
+    || (username ? normalizeAliasValue(getAccountRecordByUsername(username)?.assigned_alias) : "");
+  const aliasBadge = displayAlias
+    ? `<span class="backup-archive-record__alias-badge" title="分配别名">${escapeHtml(displayAlias)}</span>`
+    : (accountAlias ? `<span class="backup-archive-record__alias-badge backup-archive-record__alias-badge--account" title="账号记录中的分配别名">${escapeHtml(accountAlias)}</span>` : "");
+  const backupName = String(row?.backup_name || "").trim();
+  const backupPath = String(row?.backup_path || "").trim();
+  const updatedAt = String(row?.updated_at || row?.created_at || "").trim();
+  const backupRecordId = Number(row?.row_index ?? row?.id ?? 0);
+  const deviceRowIndex = Number(row?.row_index);
+  const deviceId = String(row?.device_id || "").trim();
+  const actionAlias = displayAlias || (alias === "__EMPTY_ALIAS__" ? mobileAlias : alias);
+  const linkedAccountInfo = renderLinkedAccountInfo({ username, ...row });
+  const stats = resolveBackupRowStats(row);
+  const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
+  const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
+  const acct = username ? getAccountRecordByUsername(username) : null;
+  const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
+  const otherDisabled = switchActive ? "" : " disabled";
+  const autoSwitchBlocksManual = isAutoSwitchGloballyEnabled();
+  const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
+  const switchTitle = autoSwitchBlocksManual
+    ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
+    : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
+  const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
+  const envHintText = switchActive
+    ? "当前高亮：该账号是这条设备环境的归属目标"
+    : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用";
+  const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
+  const rowIndexNum = exportRowIndex ?? -1;
+  const hasCutSwitchRow = exportRowIndex != null;
+  const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
+  const dailySlotLabel = dailySlotInfo?.label || (rows.length >= 2 ? "-" : "");
+  const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
+  const dailyPublishAtHint = dailySlotInfo?.publishAt
+    ? ` · 计划 ${escapeHtml(dailySlotInfo.publishAt)}`
     : "";
-  deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
-    const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
-    const body = rows.map((row, idx) => {
-      const username = String(row?.username || "").trim();
-      const displayAlias = resolveBackupArchiveDisplayAlias(row);
-      const mobileAlias = String(row?.mobile_alias || row?.device_alias || "").trim();
-      const accountAlias = normalizeAliasValue(row?.account_assigned_alias)
-        || (username ? normalizeAliasValue(getAccountRecordByUsername(username)?.assigned_alias) : "");
-      const aliasBadge = displayAlias
-        ? `<span class="backup-archive-record__alias-badge" title="分配别名">${escapeHtml(displayAlias)}</span>`
-        : (accountAlias ? `<span class="backup-archive-record__alias-badge backup-archive-record__alias-badge--account" title="账号记录中的分配别名">${escapeHtml(accountAlias)}</span>` : "");
-      const backupName = String(row?.backup_name || "").trim();
-      const backupPath = String(row?.backup_path || "").trim();
-      const updatedAt = String(row?.updated_at || row?.created_at || "").trim();
-      const backupRecordId = Number(row?.row_index ?? row?.id ?? 0);
-      const deviceRowIndex = Number(row?.row_index);
-      const deviceId = String(row?.device_id || "").trim();
-      const actionAlias = displayAlias || (alias === "__EMPTY_ALIAS__" ? mobileAlias : alias);
-      const linkedAccountInfo = renderLinkedAccountInfo({ username, ...row });
-      const stats = resolveBackupRowStats(row);
-      const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
-      const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
-      const acct = username ? getAccountRecordByUsername(username) : null;
-      const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
-      const otherDisabled = switchActive ? "" : " disabled";
-      const autoSwitchBlocksManual = isAutoSwitchGloballyEnabled();
-      const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
-      const switchTitle = autoSwitchBlocksManual
-        ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
-        : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
-      const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
-      const envHintText = switchActive
-        ? "当前高亮：该账号是这条设备环境的归属目标"
-        : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用";
-      const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
-      const rowIndexNum = exportRowIndex ?? -1;
-      const hasCutSwitchRow = exportRowIndex != null;
-      const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
-      const dailySlotLabel = dailySlotInfo?.label || (rows.length >= 2 ? "-" : "");
-      const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
-      const dailyPublishAtHint = dailySlotInfo?.publishAt
-        ? ` · 计划 ${escapeHtml(dailySlotInfo.publishAt)}`
-        : "";
-      const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
-      const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
-      const exportSelectTitle = exportRowIndex != null
-        ? "勾选后可点「导出已选 xlsx」"
-        : "该记录缺少 row_index，暂无法参与导出";
-      return `
+  const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
+  const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
+  const exportSelectTitle = exportRowIndex != null
+    ? "勾选后可点「导出已选 xlsx」"
+    : "该记录缺少 row_index，暂无法参与导出";
+  return `
         <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
           <div class="backup-archive-record__head">
             <div class="backup-archive-record__title">
@@ -8674,7 +8995,44 @@ function renderBackupGroups(items = []) {
           </details>
         </div>
       `;
-    }).join("");
+}
+
+function renderBackupGroups(items = []) {
+  if (!deviceAliasGroupsEl) return;
+  if (!Array.isArray(items) || !items.length) {
+    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
+    return;
+  }
+  const filteredItems = backupArchiveSearchQuery
+    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
+    : items;
+  if (!filteredItems.length) {
+    const emptyHint = backupArchiveSearchQuery
+      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
+      : "暂无备份档案";
+    deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
+    return;
+  }
+  const groups = new Map();
+  filteredItems.forEach((item) => {
+    const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
+    if (!groups.has(alias)) groups.set(alias, []);
+    groups.get(alias).push(item);
+  });
+  const planDateHint = autoSwitchDailyPlanDate
+    ? `<span class="hint" style="font-weight:400;">（北京 ${escapeHtml(autoSwitchDailyPlanDate)}）</span>`
+    : "";
+  deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
+    const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
+    const { primary, secondary } = partitionBackupArchiveGroupRows(rows);
+    const primaryHtml = primary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, idx, alias)).join("");
+    const secondaryHtml = secondary.length
+      ? `<details class="backup-archive-group-fold">
+          <summary class="backup-archive-group-fold__summary">其它 ${secondary.length} 条记录（点击展开）</summary>
+          <div class="backup-archive-group-fold__body">${secondary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, primary.length + idx, alias)).join("")}</div>
+        </details>`
+      : "";
+    const body = `${primaryHtml}${secondaryHtml}`;
     const groupRowIndices = rows
       .map((row) => resolveBackupArchiveExportRowIndex(row))
       .filter((n) => n != null);
@@ -8957,6 +9315,16 @@ if (batchStreamFileInput) {
     uploadBatchStreamXlsx(file).catch((e) => setStatus(e.message || "上传 Excel 失败", "error"));
   });
 }
+if (batchStreamAliasSelect) {
+  batchStreamAliasSelect.addEventListener("change", () => {
+    batchStreamLastSnapshot = "";
+    void pollBatchStreamStatus().then(() => {
+      if (isBatchStreamSectionActive() && batchStreamSessionId) {
+        scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
+      }
+    });
+  });
+}
 if (batchStreamStartBtn) {
   batchStreamStartBtn.addEventListener("click", () => {
     startBatchStreamOnDevice().catch((e) => setStatus(e.message || "启动批量带流失败", "error"));
@@ -8980,6 +9348,7 @@ if (addDeviceBlankRecordBtn) {
 if (accountUnassignedOnlyToggle) {
   accountUnassignedOnlyToggle.addEventListener("change", (event) => {
     accountFilterUnassignedOnly = Boolean(event?.target?.checked);
+    currentAccountRecordsPage = 1;
     renderAccountEditorRows();
   });
 }
@@ -8987,9 +9356,30 @@ if (accountRecordsSearchInput) {
   let accountSearchTimer = null;
   accountRecordsSearchInput.addEventListener("input", () => {
     accountRecordsSearchQuery = String(accountRecordsSearchInput.value || "").trim();
+    currentAccountRecordsPage = 1;
     clearTimeout(accountSearchTimer);
     accountSearchTimer = setTimeout(() => renderAccountEditorRows(), 200);
   });
+}
+if (accountRecordsPrevPageBtn) {
+  accountRecordsPrevPageBtn.addEventListener("click", () => {
+    if (currentAccountRecordsPage <= 1) return;
+    currentAccountRecordsPage -= 1;
+    renderAccountEditorRows();
+  });
+}
+if (accountRecordsNextPageBtn) {
+  accountRecordsNextPageBtn.addEventListener("click", () => {
+    const totalPages = Math.max(1, Math.ceil(accountRecordsFilteredTotal / getAccountRecordsPageSize()));
+    if (currentAccountRecordsPage >= totalPages) return;
+    currentAccountRecordsPage += 1;
+    renderAccountEditorRows();
+  });
+}
+if (accountRecordsPageSizeInput) {
+  persistAccountRecordsPageSize();
+  accountRecordsPageSizeInput.addEventListener("change", onAccountRecordsPageSizeChanged);
+  accountRecordsPageSizeInput.addEventListener("blur", onAccountRecordsPageSizeChanged);
 }
 if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
@@ -9283,10 +9673,7 @@ if (apiBaseInput) {
       }
       setStatus(msg, "error");
     });
-    setInterval(refreshTaskStatus, 2000);
-    refreshTaskStatus();
-    setInterval(pollOverviewSnapshot, 6000);
-    pollOverviewSnapshot();
+    startAdminBackgroundPollers();
   } else {
     authShell?.classList.remove("hidden");
     appShell?.classList.add("hidden");
@@ -9295,7 +9682,9 @@ if (apiBaseInput) {
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
-    void pollOverviewSnapshot();
     void syncAssignableAliasOptionsIfNeeded();
+    startAdminBackgroundPollers();
+  } else {
+    stopAdminBackgroundPollers();
   }
 });

@@ -1048,6 +1048,39 @@ button:disabled,
 }
 
 /* 设备备份档案：切号占位 — 当前标记为手机正在使用的记录 */
+.backup-archive-group-fold {
+  margin-top: 10px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #f8fafc;
+}
+
+.backup-archive-group-fold__summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+  list-style: none;
+}
+
+.backup-archive-group-fold__summary::-webkit-details-marker {
+  display: none;
+}
+
+.backup-archive-group-fold__summary::before {
+  content: "▸ ";
+  display: inline-block;
+}
+
+.backup-archive-group-fold[open] .backup-archive-group-fold__summary::before {
+  content: "▾ ";
+}
+
+.backup-archive-group-fold__body {
+  margin-top: 10px;
+}
+
 .backup-archive-record--active {
   outline: 2px solid var(--primary, #2563eb);
   outline-offset: 2px;
@@ -1191,6 +1224,28 @@ button.danger {
   top: 0;
   background: #fafafa;
   z-index: 1;
+}
+
+.batch-stream-progress-track {
+  height: 8px;
+  background: #eef2f7;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.batch-stream-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.mini-table tr.batch-stream-row--active td {
+  background: #eff6ff;
+}
+
+.mini-table tr.batch-stream-row--done td {
+  color: #475467;
 }
 
 .tiktok-roots-layout {

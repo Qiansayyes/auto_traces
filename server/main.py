@@ -198,6 +198,10 @@ BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
 MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
 MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD = 5000
+
+# 应用关闭信号：后台调度线程与 shutdown 钩子共享，避免 uvicorn 长时间卡在 Shutting down。
+_APP_SHUTDOWN_EVENT = Event()
+_app_shutting_down = False
 MOBILE_PENDING_AUTO_REFILL_DEFAULT_COOLDOWN_SEC = 600
 DEFAULT_PROCESS_QUEUE_BATCH_SIZE = int(BASE_DEFAULT_CONFIG.get("process_queue_batch_size", 100))
 DEVICE_LOG_DEDUP_WINDOW_SEC = 5.0
@@ -2367,11 +2371,42 @@ def _should_suppress_windows_accept_noise(exc: BaseException | None, context: di
         message = str(context.get("message") or "")
         task_repr = str(context.get("task") or "")
     raw = f"{message}\n{task_repr}\n{exc or ''}".lower()
-    return (
-        isinstance(exc, OSError)
-        and getattr(exc, "winerror", None) == 64
-        and ("accept_coro" in raw or "finish_accept" in raw or "specified network name is no longer available" in raw or "指定的网络名不可再用" in raw)
-    )
+    winerror = getattr(exc, "winerror", None)
+    if not isinstance(exc, OSError):
+        return False
+    if winerror == 64 and (
+        "accept_coro" in raw
+        or "finish_accept" in raw
+        or "specified network name is no longer available" in raw
+        or "指定的网络名不可再用" in raw
+    ):
+        return True
+    # Windows 关闭连接时 Proactor 偶发 WinError 10022，不影响业务。
+    if winerror == 10022 and ("connection_lost" in raw or "_call_connection_lost" in raw):
+        return True
+    return False
+
+
+def _interruptible_worker_sleep(seconds: float) -> bool:
+    """等待指定秒数；若收到关闭信号则提前返回 True。"""
+    return _APP_SHUTDOWN_EVENT.wait(max(0.05, float(seconds)))
+
+
+@app.on_event("shutdown")
+async def _on_app_shutdown() -> None:
+    global _app_shutting_down
+    _app_shutting_down = True
+    _APP_SHUTDOWN_EVENT.set()
+    with contextlib.suppress(Exception):
+        store.scheduler_stop_event.set()
+    with contextlib.suppress(Exception):
+        _stop_all_task_processes()
+    with contextlib.suppress(Exception):
+        from mail_integration import stop_mail_module_process
+
+        await asyncio.to_thread(stop_mail_module_process)
+    print(f"[{now_text()}] app shutdown | background workers signaled")
+
 
 @app.on_event("startup")
 async def install_asyncio_exception_filter() -> None:
@@ -2404,10 +2439,14 @@ if __name__ == "__main__":
         port=port,
         reload=False,
         log_level="info",
+        timeout_graceful_shutdown=5,
+        timeout_keep_alive=5,
     )
 
 @app.middleware("http")
 async def log_request_timing(request: Request, call_next):
+    if _app_shutting_down:
+        return JSONResponse(status_code=503, content={"code": 1, "msg": "服务正在关闭"})
     started = time.perf_counter()
     path = request.url.path
     print(f"[{now_text()}] HTTP {request.method} {path} | enter")
@@ -2711,6 +2750,7 @@ class BatchStreamStartRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
     hours_per_account: float = Field(..., gt=0, le=72)
+    activity_rounds: int = Field(default=1, ge=1, le=20)
     package_name: str = Field(default=TIKTOK_PACKAGE_NAME, min_length=1, max_length=255)
 
 
@@ -2725,7 +2765,7 @@ class BatchStreamReportRowRequest(BaseModel):
     session_id: str = Field(..., min_length=8, max_length=80)
     sheet_row: int = Field(..., ge=2, le=100000)
     status_text: str = Field(..., min_length=1, max_length=255)
-    hours_active: float = Field(default=0, ge=0, le=72)
+    hours_active: float = Field(default=0, ge=0, le=1440)
 
 
 class TikTokBackupSubmitRequest(BaseModel):
@@ -5018,12 +5058,13 @@ def _auto_switch_tick() -> None:
 
 def _auto_switch_worker_loop() -> None:
     _auto_switch_log("自动切号调度线程已启动（北京时间，每分钟检查）")
-    while True:
+    while not _APP_SHUTDOWN_EVENT.is_set():
         try:
             _auto_switch_tick()
         except Exception as exc:
             _auto_switch_log(f"调度异常: {exc}")
-        time.sleep(AUTO_SWITCH_TICK_INTERVAL_SEC)
+        if _interruptible_worker_sleep(AUTO_SWITCH_TICK_INTERVAL_SEC):
+            break
 
 
 def _start_auto_switch_worker() -> None:
@@ -5175,12 +5216,13 @@ def _backup_stats_full_query_tick() -> None:
 
 def _backup_stats_full_query_worker_loop() -> None:
     _backup_stats_full_query_log("每日全量查询调度线程已启动（北京时间 0:00 自动执行）")
-    while True:
+    while not _APP_SHUTDOWN_EVENT.is_set():
         try:
             _backup_stats_full_query_tick()
         except Exception as exc:
             _backup_stats_full_query_log(f"调度异常: {exc}")
-        time.sleep(BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC)
+        if _interruptible_worker_sleep(BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC):
+            break
 
 
 def _start_backup_stats_full_query_worker() -> None:
@@ -5284,13 +5326,14 @@ def _mobile_pending_auto_refill_worker_loop() -> None:
     _mobile_pending_auto_refill_log(
         f"调度已启动：待下发 < {MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD} 时自动将全部根用户加入待下发队列"
     )
-    while True:
+    while not _APP_SHUTDOWN_EVENT.is_set():
         try:
             _mobile_pending_auto_refill_tick()
         except Exception as exc:
             _mobile_pending_auto_refill_log(f"调度异常: {exc}")
             print(f"[{now_text()}] mobile_pending_auto_refill | tick_exc | {exc}")
-        time.sleep(MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC)
+        if _interruptible_worker_sleep(MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC):
+            break
 
 
 def _start_mobile_pending_auto_refill_worker() -> None:
@@ -10961,7 +11004,11 @@ async def admin_batch_stream_upload(
 
 
 @app.get("/api/admin/batch_stream/status")
-def admin_batch_stream_status(session_id: str, authorization: str | None = Header(default=None)):
+def admin_batch_stream_status(
+    session_id: str,
+    alias: str = "",
+    authorization: str | None = Header(default=None),
+):
     err, session_login = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
@@ -10972,21 +11019,39 @@ def admin_batch_stream_status(session_id: str, authorization: str | None = Heade
     devices = session.get("devices") or {}
     pending_by_alias: Dict[str, int] = {}
     done_by_alias: Dict[str, int] = {}
-    alias_key = ""
+    alias_filter = _normalize_alias_key(alias)
+    rows_out: List[Dict[str, Any]] = []
     for row in session.get("rows") or []:
         ak = _normalize_alias_key(str(row.get("assigned_alias") or ""))
-        if not ak:
+        if ak:
+            if str(row.get("status") or "").strip():
+                done_by_alias[ak] = done_by_alias.get(ak, 0) + 1
+            else:
+                pending_by_alias[ak] = pending_by_alias.get(ak, 0) + 1
+        if alias_filter and ak != alias_filter:
             continue
-        if str(row.get("status") or "").strip():
-            done_by_alias[ak] = done_by_alias.get(ak, 0) + 1
-        else:
-            pending_by_alias[ak] = pending_by_alias.get(ak, 0) + 1
+        rows_out.append(
+            {
+                "sheet_row": int(row.get("sheet_row") or 0),
+                "username": str(row.get("username") or "").strip(),
+                "email": str(row.get("email") or "").strip(),
+                "assigned_alias": str(row.get("assigned_alias") or "").strip(),
+                "status": str(row.get("status") or "").strip(),
+            }
+        )
+    done_count = sum(1 for item in rows_out if item.get("status"))
+    pending_count = len(rows_out) - done_count
     return {
         "code": 0,
         "msg": "ok",
         "session_id": session_id,
         "created_at": session.get("created_at"),
         "row_count": len(session.get("rows") or []),
+        "filtered_row_count": len(rows_out),
+        "done_count": done_count,
+        "pending_count": pending_count,
+        "filtered_alias": str(alias or "").strip(),
+        "rows": rows_out,
         "devices": devices,
         "pending_by_alias": pending_by_alias,
         "done_by_alias": done_by_alias,
@@ -11027,12 +11092,14 @@ def admin_batch_stream_start(payload: BatchStreamStartRequest, authorization: st
     if not rows:
         return {"code": 1, "msg": f"Excel 中未找到别名「{payload.alias}」的待处理行（或均已写入活跃记录）"}
     hours = float(payload.hours_per_account)
+    activity_rounds = int(payload.activity_rounds or 1)
     op_payload: dict[str, Any] = {
         "device_id": payload.device_id,
         "alias": payload.alias,
         "package_name": payload.package_name.strip() or TIKTOK_PACKAGE_NAME,
         "session_id": payload.session_id,
         "hours_per_account": hours,
+        "activity_rounds": activity_rounds,
         "status_column": int(session.get("status_col") or 0),
         "rows": [
             {
@@ -11053,6 +11120,7 @@ def admin_batch_stream_start(payload: BatchStreamStartRequest, authorization: st
             "alias": payload.alias,
             "status": "running",
             "hours_per_account": hours,
+            "activity_rounds": activity_rounds,
             "started_at": now_text(),
             "total_rows": len(rows),
             "completed_rows": 0,
@@ -11069,16 +11137,17 @@ def admin_batch_stream_start(payload: BatchStreamStartRequest, authorization: st
         _append_device_log(payload.device_id, "批量带流：云端已自动关闭该设备的自动开启程序")
     _resume_device_for_cloud_op(
         payload.device_id,
-        f"[{now_text()}] 云端后台 | 已入队批量带流任务（alias={payload.alias} rows={len(rows)} hours={hours}）",
+        f"[{now_text()}] 云端后台 | 已入队批量带流任务（alias={payload.alias} rows={len(rows)} hours={hours} rounds={activity_rounds}）",
     )
     op_id = _enqueue_tiktok_device_op(payload.device_id, "batch_stream_start", op_payload)
     _append_device_log(
         payload.device_id,
-        f"[{now_text()}] 批量带流已入队 op_id={op_id} session={payload.session_id} rows={len(rows)}",
+        f"[{now_text()}] 批量带流已入队 op_id={op_id} session={payload.session_id} rows={len(rows)} rounds={activity_rounds}",
     )
+    rounds_msg = f"，共 {activity_rounds} 轮" if activity_rounds > 1 else ""
     return {
         "code": 0,
-        "msg": f"已下发批量带流：{len(rows)} 个账号，每台活跃 {hours} 小时",
+        "msg": f"已下发批量带流：{len(rows)} 个账号，每轮活跃 {hours} 小时{rounds_msg}",
         "op_id": op_id,
         "session_id": payload.session_id,
         "row_count": len(rows),

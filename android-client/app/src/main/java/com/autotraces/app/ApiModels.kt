@@ -236,6 +236,8 @@ data class DeviceOpPayload(
     val session_id: String? = null,
     /** 批量带流：单账号活跃时长（小时） */
     val hours_per_account: Double? = null,
+    /** 批量带流：活跃轮数（全部账号完成一轮后可重复执行） */
+    val activity_rounds: Int? = null,
     /** 批量带流：Excel 状态列索引（0-based） */
     val status_column: Int? = null,
     /** 批量带流：本设备待处理行 */
