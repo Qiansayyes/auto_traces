@@ -685,6 +685,7 @@ let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
 let autoSwitchEnabledGlobal = false;
 let autoSwitchSaveInFlight = false;
+let backupStatsFullQueryScheduleAvailable = false;
 let backupStatsFullQuerySaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
 const DB_SEARCH_FIELD_KEY = "auto_traces_db_search_field_v1";
@@ -1264,7 +1265,7 @@ async function probeAuthMeStatus(base) {
     authState: "未知",
   };
   try {
-    const response = await fetch(`${base}/auth/me`, {
+    const response = await fetch(`${base}/health`, {
       method: "GET",
       cache: "no-store",
       signal: controller.signal,
@@ -4267,6 +4268,13 @@ async function refreshTaskStatus() {
     if (backupStatsFullQueryEnabledToggle) {
       backupStatsFullQueryEnabledToggle.checked = !!data.backup_stats_full_query_enabled;
     }
+    applyBackupStatsFullQueryScheduleUi({
+      available: data.backup_stats_full_query_schedule_available !== false,
+      enabled: !!data.backup_stats_full_query_enabled,
+      disabled_reason: data.backup_stats_full_query_schedule === "暂时不可用"
+        ? "每日定时全量查询暂时不可用"
+        : "",
+    });
     if (taskStatusEl) {
       const runningLabel = runningTasks.length
         ? runningTasks.map((item) => item?.name || item).join(", ")
@@ -4275,7 +4283,9 @@ async function refreshTaskStatus() {
       const bj = data.auto_switch_beijing_time
         ? `${data.auto_switch_beijing_date || ""} ${data.auto_switch_beijing_time}`.trim()
         : "";
-      const bsq = data.backup_stats_full_query_enabled ? "开" : "关";
+      const bsq = data.backup_stats_full_query_schedule_available === false
+        ? "暂不可用"
+        : (data.backup_stats_full_query_enabled ? "开" : "关");
       const bsqLast = data.backup_stats_full_query_last_run_date || "-";
       const bsqRun = data.backup_stats_full_query_in_flight ? "执行中" : "空闲";
       taskStatusEl.textContent = [
@@ -4341,20 +4351,39 @@ async function loadAutoSwitchConfig() {
   }
 }
 
+function applyBackupStatsFullQueryScheduleUi(cfg = {}) {
+  backupStatsFullQueryScheduleAvailable = cfg.available !== false;
+  const available = backupStatsFullQueryScheduleAvailable;
+  const label = backupStatsFullQueryEnabledToggle?.closest("label");
+  if (backupStatsFullQueryEnabledToggle) {
+    backupStatsFullQueryEnabledToggle.checked = available && !!cfg.enabled;
+    backupStatsFullQueryEnabledToggle.disabled = !available;
+  }
+  if (label) {
+    label.style.opacity = available ? "" : "0.55";
+    label.title = available
+      ? "每天北京时间 0:00 自动对全部 owner 的备份档案执行全量查询并落库（不限分组）"
+      : (String(cfg.disabled_reason || "").trim() || "每日定时全量查询暂时不可用");
+  }
+}
+
 async function loadBackupStatsFullQueryConfig() {
   try {
     const data = await request("/api/admin/backup_stats_full_query/config");
     const cfg = data.data || {};
-    if (backupStatsFullQueryEnabledToggle) {
-      backupStatsFullQueryEnabledToggle.checked = cfg.enabled !== false;
-    }
+    applyBackupStatsFullQueryScheduleUi(cfg);
   } catch (_) {
-    /* ignore */
+    applyBackupStatsFullQueryScheduleUi({ available: false, enabled: false });
   }
 }
 
 async function saveBackupStatsFullQueryConfig(options = {}) {
   if (backupStatsFullQuerySaveInFlight) return;
+  if (!backupStatsFullQueryScheduleAvailable) {
+    setStatus("每日定时全量查询暂时不可用", "warning");
+    applyBackupStatsFullQueryScheduleUi({ available: false, enabled: false });
+    return;
+  }
   backupStatsFullQuerySaveInFlight = true;
   const enabled = !!backupStatsFullQueryEnabledToggle?.checked;
   try {
@@ -9661,8 +9690,8 @@ if (apiBaseInput) {
     await switchSection("overview", { persist: false }).catch(() => {});
     handleRefresh();
     loadAccounts();
-    loadDbTablePage();
-    loadAdminUsers();
+    void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
+    void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
     void loadAutoSwitchConfig().then(() => loadBackupArchiveRecords());
     loadEditorState().then(() => {
       renderAccountEditorRows();

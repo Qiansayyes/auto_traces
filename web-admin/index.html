@@ -715,9 +715,9 @@
                 <option value="__ungrouped__">未分组</option>
               </select>
               <button id="fetchTiktokStatsFull" class="ghost" type="button" title="按上方分组筛选，批量查询该分组下全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）">全量查询并落库</button>
-              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;" title="每天北京时间 0:00 自动对全部 owner 的备份档案执行全量查询并落库（不限分组）">
-                <input id="backupStatsFullQueryEnabledToggle" type="checkbox" checked />
-                每日0点自动全量查询
+              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;opacity:.55;" title="暂时不可用：每日 0 点自动全量查询已关闭，请使用上方「全量查询并落库」按分组手动执行">
+                <input id="backupStatsFullQueryEnabledToggle" type="checkbox" disabled />
+                每日0点自动全量查询（暂不可用）
               </label>
               <label style="display:flex;align-items:center;gap:8px;margin-left:4px;" title="北京时间 0:00 起按别名账号数随机均分 24 小时，到点自动切号；开启后立即对齐当前时段">
                 <input id="autoSwitchEnabledToggle" type="checkbox" />

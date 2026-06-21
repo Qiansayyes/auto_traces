@@ -196,6 +196,8 @@ AUTO_SWITCH_TICK_INTERVAL_SEC = 60
 # 单次调度最多下发切号/初始对齐条数，避免开启自动切号时瞬时打满设备队列与数据库写锁。
 _AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK = 8
 BACKUP_STATS_FULL_QUERY_LOG_KEY = "backup_stats_full_query"
+# 暂时关闭「每日 0 点自动全量查询」；恢复时改 True 并重启服务。
+BACKUP_STATS_FULL_QUERY_SCHEDULE_AVAILABLE = False
 BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
 MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
@@ -227,10 +229,10 @@ def _new_session_token() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
 
-_DB_GUARD = RLock()
+
 _sqlite_wal_ready = False
-_DB_BUSY_TIMEOUT_MS = 30_000
-_DB_RETRY_ATTEMPTS = 10
+_DB_BUSY_TIMEOUT_MS = 8_000
+_DB_RETRY_ATTEMPTS = 6
 _DB_RETRY_BASE_SEC = 0.03
 _AUTH_SESSION_CACHE: dict[str, tuple[dict, float]] = {}
 _AUTH_SESSION_CACHE_TTL_SEC = 20.0
@@ -305,23 +307,23 @@ def _invalidate_auth_session_cache(token: str | None = None) -> None:
 
 
 class _DbConn:
-    """包装 sqlite3 连接：进程内串行化访问，避免线程池并发 handler 触发 database is locked。"""
+    """包装 sqlite3 连接：WAL + busy_timeout + 单语句重试；不再进程级串行化，避免后台任务拖死 HTTP。"""
 
     __slots__ = ("_conn",)
 
     def __init__(self) -> None:
-        _DB_GUARD.acquire()
-        self._conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+        self._conn = sqlite3.connect(str(DB_PATH), timeout=8.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        try:
-            _apply_sqlite_pragmas(self._conn)
-        except Exception:
-            self._conn.close()
-            _DB_GUARD.release()
-            raise
+        _apply_sqlite_pragmas(self._conn)
 
     def execute(self, *args, **kwargs):
-        return _db_retry_call(lambda: self._conn.execute(*args, **kwargs))
+        started = time.perf_counter()
+        try:
+            return _db_retry_call(lambda: self._conn.execute(*args, **kwargs))
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= 800:
+                print(f"[{now_text()}] db.slow_execute | {elapsed_ms:.0f}ms | sql={str(args[0] if args else '')[:120]}")
 
     def executemany(self, *args, **kwargs):
         return _db_retry_call(lambda: self._conn.executemany(*args, **kwargs))
@@ -333,10 +335,7 @@ class _DbConn:
         return getattr(self._conn, name)
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        finally:
-            _DB_GUARD.release()
+        self._conn.close()
 
 
 def _get_db() -> sqlite3.Connection:
@@ -1163,7 +1162,7 @@ class MemoryStore:
     auto_switch_publish_aborted_keys: Dict[str, str] = field(default_factory=dict)
     # bucket_key -> "{schedule_date}|{slot_index}|{op_id}"：已下发、待设备回传结果
     auto_switch_publish_inflight_keys: Dict[str, str] = field(default_factory=dict)
-    backup_stats_full_query_enabled: bool = True
+    backup_stats_full_query_enabled: bool = False
     backup_stats_full_query_last_run_date: str = ""
     backup_stats_full_query_in_flight: bool = False
     mobile_pending_auto_refill_last_run_ts: float = 0.0
@@ -2238,6 +2237,24 @@ _load_client_devices_from_db()
 _load_persisted_runtime_state()
 
 
+def _backup_stats_full_query_schedule_available() -> bool:
+    return bool(BACKUP_STATS_FULL_QUERY_SCHEDULE_AVAILABLE)
+
+
+def _ensure_backup_stats_full_query_schedule_off() -> None:
+    """定时全量查询暂不可用时：强制关闭并停止 in_flight 标记（不中断已跑的手动任务线程）。"""
+    if _backup_stats_full_query_schedule_available():
+        return
+    dirty = False
+    with store.lock:
+        if store.backup_stats_full_query_enabled:
+            store.backup_stats_full_query_enabled = False
+            dirty = True
+    if dirty:
+        persist_runtime_state()
+        _backup_stats_full_query_log(f"[{now_text()}] 每日定时全量查询已强制关闭（功能暂时不可用）")
+
+
 def bump_usage_for_usernames(conn: sqlite3.Connection, usernames: List[str]):
     if not usernames:
         return
@@ -2477,7 +2494,7 @@ async def log_request_timing(request: Request, call_next):
     print(f"[{now_text()}] HTTP {request.method} {path} | enter")
     try:
         # 管理台核心接口：避免因数据库锁/偶发阻塞导致前端长期 pending。
-        if path in ("/api/admin/overview", "/api/auth/me"):
+        if path in ("/api/admin/overview", "/api/auth/me", "/api/health"):
             print(f"[{now_text()}] HTTP {request.method} {path} | call_next_start | timeout=20s")
             response = await asyncio.wait_for(call_next(request), timeout=20.0)
             print(f"[{now_text()}] HTTP {request.method} {path} | call_next_done")
@@ -3227,27 +3244,27 @@ def _current_session(headers: dict | None = None) -> dict | None:
         _AUTH_SESSION_CACHE.pop(token, None)
     conn = _get_db()
     try:
-        print(f"[{now_text()}] auth.session | lookup_start")
         row = conn.execute(
             "SELECT token, username, role, expires_at FROM auth_sessions WHERE token = ?",
             (token,),
         ).fetchone()
         if not row:
-            print(f"[{now_text()}] auth.session | token_not_found | {(time.perf_counter() - started) * 1000:.1f}ms")
+            if (time.perf_counter() - started) * 1000 >= 200:
+                print(f"[{now_text()}] auth.session | token_not_found | {(time.perf_counter() - started) * 1000:.1f}ms")
             return None
         if str(row[3] or '') < now_text():
             conn.execute("DELETE FROM auth_sessions WHERE token = ?", (token,))
             conn.commit()
-            print(f"[{now_text()}] auth.session | expired | {(time.perf_counter() - started) * 1000:.1f}ms")
             return None
         user = conn.execute(
             "SELECT username, role, is_active FROM auth_users WHERE username = ?",
             (row[1],),
         ).fetchone()
         if not user or int(user[2] or 0) != 1:
-            print(f"[{now_text()}] auth.session | user_inactive | {(time.perf_counter() - started) * 1000:.1f}ms")
             return None
-        print(f"[{now_text()}] auth.session | ok | {(time.perf_counter() - started) * 1000:.1f}ms user={row[1]}")
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= 200:
+            print(f"[{now_text()}] auth.session | slow | {elapsed_ms:.1f}ms user={row[1]}")
         session = {"token": row[0], "username": row[1], "role": row[2]}
         _AUTH_SESSION_CACHE[token] = (session, time.monotonic() + _AUTH_SESSION_CACHE_TTL_SEC)
         return dict(session)
@@ -5084,6 +5101,7 @@ def _auto_switch_list_owners_with_buckets() -> List[str]:
 
 
 def _auto_switch_tick() -> None:
+    tick_started = time.perf_counter()
     with store.lock:
         if not store.auto_switch_enabled:
             return
@@ -5225,6 +5243,10 @@ def _auto_switch_tick() -> None:
     if state_dirty:
         persist_runtime_state()
 
+    elapsed_ms = (time.perf_counter() - tick_started) * 1000
+    if elapsed_ms >= 1500:
+        _auto_switch_log(f"本轮调度耗时 {elapsed_ms:.0f}ms（owners={len(owners)} switch_ops={switch_ops_this_tick}）")
+
 
 def _auto_switch_worker_loop() -> None:
     _auto_switch_log("自动切号调度线程已启动（北京时间，每分钟检查）")
@@ -5359,6 +5381,8 @@ def _backup_stats_full_query_worker() -> None:
 
 
 def _backup_stats_full_query_tick() -> None:
+    if not _backup_stats_full_query_schedule_available():
+        return
     with store.lock:
         if not store.backup_stats_full_query_enabled:
             return
@@ -7060,6 +7084,12 @@ def auth_login_legacy(payload: dict):
 def auth_login_legacy_get():
     """兼容误发起的 GET /api/login，避免前端控制台出现 404。"""
     return {"code": 1, "msg": "请使用 POST /api/auth/login"}
+
+
+@app.get("/api/health")
+def api_health():
+    """轻量探活：不访问 SQLite，供管理台/Nginx 检测后端是否仍可响应。"""
+    return {"code": 0, "msg": "ok", "ts": now_text()}
 
 
 @app.get("/api/auth/me")
@@ -12940,12 +12970,13 @@ def get_backup_stats_full_query_config(authorization: str | None = Header(defaul
     if err:
         return err
     with store.lock:
-        enabled = bool(store.backup_stats_full_query_enabled)
+        enabled = bool(store.backup_stats_full_query_enabled) if _backup_stats_full_query_schedule_available() else False
         last_run_date = str(store.backup_stats_full_query_last_run_date or "")
         in_flight = bool(store.backup_stats_full_query_in_flight)
     return {
         "code": 0,
         "data": {
+            "available": _backup_stats_full_query_schedule_available(),
             "enabled": enabled,
             "last_run_date": last_run_date,
             "in_flight": in_flight,
@@ -12953,6 +12984,10 @@ def get_backup_stats_full_query_config(authorization: str | None = Header(defaul
             "scope": "全部 owner 下所有备份档案 username（不限分组）",
             "beijing_date": _beijing_date_str(),
             "beijing_time": _beijing_now().strftime("%H:%M:%S"),
+            "disabled_reason": (
+                "" if _backup_stats_full_query_schedule_available()
+                else "每日定时全量查询暂时不可用，请使用分组「全量查询并落库」手动执行"
+            ),
         },
     }
 
@@ -12965,8 +13000,14 @@ def config_backup_stats_full_query(
     err, _session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
+    if not _backup_stats_full_query_schedule_available():
+        _ensure_backup_stats_full_query_schedule_off()
+        if payload.enabled:
+            return {"code": 1, "msg": "每日定时全量查询暂时不可用"}
     with store.lock:
         if payload.enabled is not None:
+            if payload.enabled and not _backup_stats_full_query_schedule_available():
+                return {"code": 1, "msg": "每日定时全量查询暂时不可用"}
             store.backup_stats_full_query_enabled = bool(payload.enabled)
         enabled = bool(store.backup_stats_full_query_enabled)
     persist_runtime_state()
@@ -13155,10 +13196,19 @@ def task_status():
         "auto_switch_enabled": auto_switch_enabled,
         "auto_switch_beijing_date": _beijing_date_str(),
         "auto_switch_beijing_time": _beijing_now().strftime("%H:%M:%S"),
-        "backup_stats_full_query_enabled": backup_stats_full_query_enabled,
+        "backup_stats_full_query_enabled": (
+            backup_stats_full_query_enabled
+            if _backup_stats_full_query_schedule_available()
+            else False
+        ),
+        "backup_stats_full_query_schedule_available": _backup_stats_full_query_schedule_available(),
         "backup_stats_full_query_last_run_date": backup_stats_full_query_last_run_date,
         "backup_stats_full_query_in_flight": backup_stats_full_query_in_flight,
-        "backup_stats_full_query_schedule": "每天北京时间 00:00",
+        "backup_stats_full_query_schedule": (
+            "每天北京时间 00:00"
+            if _backup_stats_full_query_schedule_available()
+            else "暂时不可用"
+        ),
     }
 
 
@@ -13443,7 +13493,11 @@ def admin_device_logs(
 
 
 _start_auto_switch_worker()
-_start_backup_stats_full_query_worker()
+_ensure_backup_stats_full_query_schedule_off()
+if _backup_stats_full_query_schedule_available():
+    _start_backup_stats_full_query_worker()
+else:
+    _backup_stats_full_query_log("每日定时全量查询调度未启动（功能暂时不可用）")
 _start_mobile_pending_auto_refill_worker()
 
 try:
