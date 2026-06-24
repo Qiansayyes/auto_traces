@@ -516,6 +516,15 @@ const controller = {
 
       ctx.body = { code: "200", data };
     } catch (err) {
+      if (err.status === 400) {
+        ctx.status = 400;
+        ctx.body = {
+          code: '400',
+          error: err.message,
+          data: err.details || null,
+        };
+        return;
+      }
       logger.error('Failed to import pending tk accounts', err)
       ctx.throw(500, 'Failed to import pending tk accounts')
     }

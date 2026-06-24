@@ -107,6 +107,15 @@ def is_mail_module_ready() -> bool:
     return MAIL_MODULE_ENABLED and _mail_module_ready()
 
 
+def ensure_mail_module_ready() -> bool:
+    """拉信前确保 Node 子服务已就绪（未启动则尝试拉起）。"""
+    if not MAIL_MODULE_ENABLED:
+        return False
+    if _mail_module_ready():
+        return True
+    return _start_node_process()
+
+
 def _normalize_mail_email(value: str) -> str:
     return str(value or "").strip().lower()
 
@@ -128,12 +137,14 @@ def get_mail_account_record(owner_username: str, email: str) -> dict[str, Any] |
                 SELECT record_key, email, password, client_id, refresh_token, status, owner_username, updated_at
                 FROM account_records
                 WHERE lower(email) = lower(?)
-                  AND owner_username = ?
                   AND status = 'active'
-                ORDER BY updated_at DESC
+                  AND (owner_username = ? OR owner_username = '')
+                ORDER BY
+                  CASE WHEN owner_username = ? THEN 0 ELSE 1 END,
+                  updated_at DESC
                 LIMIT 1
                 """,
-                (account_email, owner),
+                (account_email, owner, owner),
             ).fetchone()
         finally:
             conn.close()
@@ -254,29 +265,11 @@ def fetch_mails_via_mail_module(
     return _extract_mail_messages(body.get("data"))
 
 
-def fetch_tiktok_email_code_via_mail_module(
-    owner_username: str,
-    email: str,
+def _extract_code_from_mails(
+    mails: list[dict[str, Any]],
     extract_code: Callable[[str], str],
-    *,
-    top: int = 30,
-) -> tuple[int, str, str | None]:
-    """优先从邮箱管理模块拉信并解析 TikTok 6 位验证码。"""
-    record = get_mail_account_record(owner_username, email)
-    if not mail_account_has_valid_token(record):
-        return 1, "邮箱管理模块未配置该邮箱或令牌无效", None
-    if not is_mail_module_ready():
-        return 1, "邮箱管理模块未就绪", None
-
-    collected: list[dict[str, Any]] = []
-    for mailbox in ("INBOX", "Junk"):
-        collected.extend(fetch_mails_via_mail_module(owner_username, record or {}, mailbox=mailbox, top=top))
-
-    if not collected:
-        return 1, "邮箱管理模块未拉取到邮件", None
-
-    collected.sort(key=_mail_message_sort_key, reverse=True)
-    for mail in collected:
+) -> str | None:
+    for mail in sorted(mails, key=_mail_message_sort_key, reverse=True):
         for field in ("subject", "text", "html"):
             chunk = str(mail.get(field) or "").strip()
             if not chunk:
@@ -286,7 +279,35 @@ def fetch_tiktok_email_code_via_mail_module(
             except ValueError:
                 continue
             if code:
-                return 0, "ok", code
+                return code
+    return None
+
+
+def fetch_tiktok_email_code_via_mail_module(
+    owner_username: str,
+    email: str,
+    extract_code: Callable[[str], str],
+    *,
+    top: int = 30,
+) -> tuple[int, str, str | None]:
+    """优先从邮箱管理模块拉信并解析 TikTok 6 位验证码。"""
+    if not ensure_mail_module_ready():
+        return 1, "邮箱管理模块未就绪", None
+    record = get_mail_account_record(owner_username, email)
+    if not mail_account_has_valid_token(record):
+        return 1, "邮箱管理模块未配置该邮箱或 OAuth 令牌缺失", None
+
+    found_any = False
+    for mailbox in ("INBOX", "Junk"):
+        mails = fetch_mails_via_mail_module(owner_username, record or {}, mailbox=mailbox, top=top)
+        if not mails:
+            continue
+        found_any = True
+        code = _extract_code_from_mails(mails, extract_code)
+        if code:
+            return 0, "ok", code
+    if not found_any:
+        return 1, "邮箱管理模块未拉取到邮件", None
     return 1, "邮箱管理模块邮件中未识别到 6 位验证码", None
 
 

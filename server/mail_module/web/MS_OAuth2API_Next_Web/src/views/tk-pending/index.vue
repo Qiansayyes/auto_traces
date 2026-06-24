@@ -32,7 +32,7 @@
     <section class="toolbar-band">
       <div class="section-title">导入</div>
       <div class="button-row">
-        <el-upload :limit="1" :show-file-list="false" :auto-upload="false" :on-change="handleFileChange" accept=".txt,.csv">
+        <el-upload :limit="1" :show-file-list="false" :auto-upload="false" :on-change="handleFileChange" accept=".txt,.csv,.xlsx">
           <template #trigger>
             <el-button type="primary">{{ fileName || '选择文件' }}</el-button>
           </template>
@@ -98,18 +98,47 @@
     </section>
 
     <el-dialog v-model="dialogPasteVisible" title="粘贴导入" width="640px">
-      <el-input v-model="pasteText" type="textarea" :rows="12" placeholder="每行一个邮箱，格式与邮箱账户管理一致" />
+      <el-input
+        v-model="pasteText"
+        type="textarea"
+        :rows="12"
+        placeholder="每行一条账号，格式与邮箱账户管理一致；也可上传 xlsx，前 4 列依次为邮箱/密码/client_id/token"
+      />
       <template #footer>
         <el-button @click="dialogPasteVisible = false">取消</el-button>
-        <el-button type="primary" :loading="loading.import" @click="importFromPaste">导入</el-button>
+        <el-button type="primary" :loading="loading.import" @click="importFromPaste">预览</el-button>
       </template>
     </el-dialog>
+
+    <MailImportPreviewDialog
+      v-model="importPreviewVisible"
+      :items="importPreviewItems"
+      :confirm-loading="loading.import"
+      title="待注册 TK 账号导入预览"
+      hint="确认后将自动导入全部可导入记录并写入待注册池。xlsx 前 4 列依次为邮箱/密码/client_id/token；失败记录可下载查看原因。"
+      @confirm="handleImportPreviewConfirm"
+      @closed="handleImportPreviewClosed"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import MailImportPreviewDialog from '@/components/MailImportPreviewDialog.vue'
+import {
+  buildMailImportPreviewItems,
+  downloadMailImportFailedXlsx,
+  failedRowsFromPreviewItems,
+  failedRowsFromRejectedRecords,
+  mergeFailedRows,
+  parseMailAccountTextLines,
+  parseMailAccountXlsxFile,
+  selectedPreviewRecords,
+  type MailAccountFailedRow,
+  type MailAccountRecord,
+  type MailImportPreviewItem,
+} from '@/utils/mailAccountImport'
 
 interface PendingAccount {
   email: string
@@ -139,9 +168,13 @@ const stats = reactive({
 const rows = ref<PendingAccount[]>([])
 const selectedEmails = ref<string[]>([])
 const fileName = ref('')
-const fileLines = ref<string[]>([])
+const pendingImportRecords = ref<MailAccountRecord[]>([])
+const pendingImportFailedRows = ref<MailAccountFailedRow[]>([])
 const pasteText = ref('')
 const dialogPasteVisible = ref(false)
+const importPreviewVisible = ref(false)
+const importPreviewItems = ref<MailImportPreviewItem[]>([])
+const importPreviewSource = ref('tk_pending_file')
 
 const pagination = reactive({
   page: 1,
@@ -163,26 +196,75 @@ const postJson = async (path: string, body: Record<string, unknown>) => {
   })
   const payload = await response.json()
   if (!(payload.code === '200' || payload.code === 200)) {
-    throw new Error(payload.error || payload.message || '请求失败')
+    const error = new Error(payload.error || payload.message || '请求失败') as Error & {
+      data?: any
+      rejected_records?: any[]
+    }
+    error.data = payload.data
+    error.rejected_records = payload.data?.rejected_records || []
+    throw error
   }
   return payload.data
 }
 
-const parseLines = (lines: string[]) => lines
-  .map((item) => item.trim())
-  .filter(Boolean)
-  .map((line) => {
-    const parts = line.split(form.splitSymbol)
-    return {
-      email: (parts[0] || '').trim().toLowerCase(),
-      password: parts[1] || '',
-      client_id: parts[2] || '',
-      refresh_token: parts.slice(3).join(form.splitSymbol) || '',
-    }
-  })
-  .filter((item) => item.email.includes('@'))
+const recordsToPayload = (records: MailAccountRecord[]) => records.map((item) => ({
+  email: item.email,
+  password: item.password,
+  client_id: item.client_id,
+  refresh_token: item.refresh_token,
+}))
 
-const importRecords = async (records: Array<Record<string, string>>, source: string) => {
+const openImportPreview = (records: MailAccountRecord[], source: string) => {
+  if (!records.length) {
+    if (pendingImportFailedRows.value.length) {
+      downloadMailImportFailedXlsx(pendingImportFailedRows.value)
+      ElMessage.warning(`没有可导入记录，已下载 ${pendingImportFailedRows.value.length} 条失败记录`)
+    } else {
+      ElMessage.warning('没有可预览的邮箱')
+    }
+    return
+  }
+  importPreviewSource.value = source
+  importPreviewItems.value = buildMailImportPreviewItems(records)
+  const validCount = importPreviewItems.value.filter((item) => item.kind === 'valid').length
+  if (!validCount) {
+    const allFailed = mergeFailedRows(
+      pendingImportFailedRows.value,
+      failedRowsFromPreviewItems(importPreviewItems.value),
+    )
+    downloadMailImportFailedXlsx(allFailed)
+    ElMessage.warning(`没有可导入的有效记录，已下载 ${allFailed.length} 条失败记录`)
+    return
+  }
+  importPreviewVisible.value = true
+}
+
+const handleImportPreviewClosed = () => {
+  importPreviewItems.value = []
+  pendingImportFailedRows.value = []
+}
+
+const downloadMergedImportFailures = (
+  previewItems: MailImportPreviewItem[],
+  rejectedRecords: Array<{
+    email?: string
+    password?: string
+    client_id?: string
+    refresh_token?: string
+    reason?: string
+  }> = [],
+) => {
+  const allFailed = mergeFailedRows(
+    pendingImportFailedRows.value,
+    failedRowsFromPreviewItems(previewItems),
+    failedRowsFromRejectedRecords(rejectedRecords),
+  )
+  if (!allFailed.length) return 0
+  downloadMailImportFailedXlsx(allFailed, '待注册导入失败记录.xlsx')
+  return allFailed.length
+}
+
+const importRecords = async (records: MailAccountRecord[], source: string, previewItems: MailImportPreviewItem[] = []) => {
   if (records.length === 0) {
     ElMessage.warning('没有可导入的邮箱')
     return
@@ -190,40 +272,88 @@ const importRecords = async (records: Array<Record<string, string>>, source: str
   loading.import = true
   try {
     const data = await postJson('/api/tk-pending/accounts/import', {
-      records,
+      records: recordsToPayload(records),
       splitSymbol: form.splitSymbol,
       source,
     })
-    ElMessage.success(`导入完成：成功 ${data.inserted_or_updated || 0}，跳过 ${data.skipped_records || 0}`)
+    const failedCount = downloadMergedImportFailures(previewItems, data.rejected_records || [])
+    const message = `导入完成：成功 ${data.inserted_or_updated || 0}，失败 ${data.skipped_records || 0}`
+    if (failedCount > 0) {
+      ElMessage.warning(`${message}，已下载 ${failedCount} 条失败记录表格`)
+    } else {
+      ElMessage.success(message)
+    }
+    importPreviewVisible.value = false
     dialogPasteVisible.value = false
     pasteText.value = ''
+    pendingImportRecords.value = []
+    pendingImportFailedRows.value = []
+    fileName.value = ''
     await loadList(true)
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '导入失败')
+    const failedCount = downloadMergedImportFailures(
+      previewItems,
+      (error as { rejected_records?: any[] })?.rejected_records || [],
+    )
+    const suffix = failedCount > 0 ? `，已下载 ${failedCount} 条失败记录表格` : ''
+    ElMessage.error(`${error instanceof Error ? error.message : '导入失败'}${suffix}`)
   } finally {
     loading.import = false
   }
 }
 
-// Element Plus upload on-change: (uploadFile, uploadFiles)
-const handleFileChange = (uploadFile: any) => {
+const handleImportPreviewConfirm = async (items: MailImportPreviewItem[]) => {
+  const records = selectedPreviewRecords(items)
+  if (!records.length) {
+    ElMessage.warning('没有可导入的有效记录')
+    return
+  }
+  await importRecords(records, importPreviewSource.value, items)
+}
+
+const handleFileChange = async (uploadFile: any) => {
   fileName.value = String(uploadFile?.name || '')
   const raw: File | undefined = uploadFile?.raw
   if (!raw) return
-  const reader = new FileReader()
-  reader.onload = () => {
-    const text = String(reader.result || '')
-    fileLines.value = text.split(/\r?\n/)
+  pendingImportFailedRows.value = []
+  try {
+    if (raw.name.endsWith('.xlsx')) {
+      const { records, failedRows } = await parseMailAccountXlsxFile(raw)
+      pendingImportRecords.value = records
+      pendingImportFailedRows.value = failedRows
+      if (!records.length && !failedRows.length) {
+        ElMessage.warning('xlsx 中没有可解析的账号行')
+        return
+      }
+      if (!records.length && failedRows.length) {
+        downloadMailImportFailedXlsx(failedRows, '待注册导入失败记录.xlsx')
+        ElMessage.warning(`xlsx 解析失败 ${failedRows.length} 条，已下载失败记录表格`)
+        return
+      }
+      if (failedRows.length) {
+        ElMessage.warning(`xlsx 解析完成：可导入 ${records.length} 条，失败 ${failedRows.length} 条`)
+      }
+    } else {
+      const text = await raw.text()
+      pendingImportRecords.value = parseMailAccountTextLines(text.split(/\r?\n/), form.splitSymbol)
+      if (!pendingImportRecords.value.length) {
+        ElMessage.warning('文件中没有可导入的账号行')
+      }
+    }
+  } catch (error) {
+    pendingImportRecords.value = []
+    pendingImportFailedRows.value = []
+    ElMessage.error(error instanceof Error ? error.message : '解析文件失败')
   }
-  reader.readAsText(raw)
 }
 
 const importFromFile = async () => {
-  await importRecords(parseLines(fileLines.value), 'tk_pending_file')
+  openImportPreview(pendingImportRecords.value, 'tk_pending_file')
 }
 
 const importFromPaste = async () => {
-  await importRecords(parseLines(pasteText.value.split(/\r?\n/)), 'tk_pending_paste')
+  const records = parseMailAccountTextLines(pasteText.value.split(/\r?\n/), form.splitSymbol)
+  openImportPreview(records, 'tk_pending_paste')
 }
 
 const loadList = async (resetPage = false) => {

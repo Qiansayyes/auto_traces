@@ -402,24 +402,34 @@ const importAccounts = (records, options = {}) => {
     const result = parseAccountInput(row, splitSymbol);
     if (result.error) {
       skipped += 1;
-      rejected.push({
-        line: String(typeof row === 'string' ? row : row?.email || '').slice(0, 200),
-        reason: result.error,
-      });
+      if (row && typeof row === 'object') {
+        rejected.push({
+          email: String(row.email || '').trim(),
+          password: String(row.password || '').trim(),
+          client_id: String(row.client_id || '').trim(),
+          refresh_token: String(row.refresh_token || row.token || '').trim(),
+          line: String(row.email || '').slice(0, 200),
+          reason: result.error,
+        });
+      } else {
+        const rawLine = String(row || '');
+        const splitResult = rawLine.includes('----')
+          ? rawLine.split('----').map((item) => item.trim())
+          : rawLine.includes('\t')
+            ? rawLine.split('\t').map((item) => item.trim())
+            : rawLine.split(/\s+/).map((item) => item.trim());
+        rejected.push({
+          email: splitResult[0] || rawLine.slice(0, 200),
+          password: splitResult[1] || '',
+          client_id: splitResult[2] || '',
+          refresh_token: splitResult.slice(3).join('----') || '',
+          line: rawLine.slice(0, 200),
+          reason: result.error,
+        });
+      }
       continue;
     }
     parsed.push(result);
-  }
-
-  if (skipped > 0) {
-    const error = new Error(`导入被拒绝：${skipped} 条记录信息不完整或无法识别，请修正后重试`);
-    error.status = 400;
-    error.details = {
-      rejected_records: rejected,
-      valid_records: parsed.length,
-      total_lines: rows.length,
-    };
-    throw error;
   }
 
   if (rows.length > 0 && parsed.length === 0) {
@@ -556,6 +566,7 @@ const importPendingTkAccounts = (records, options = {}) => {
   const source = options.source || 'tk_pending_ui';
   const rows = Array.isArray(records) ? records : [];
   const parsed = [];
+  const rejected = [];
   let skipped = 0;
   let skippedExistingMain = 0;
   let skippedClaimed = 0;
@@ -564,6 +575,29 @@ const importPendingTkAccounts = (records, options = {}) => {
     const result = parseAccountInput(row, splitSymbol);
     if (result.error) {
       skipped += 1;
+      if (row && typeof row === 'object') {
+        rejected.push({
+          email: String(row.email || '').trim(),
+          password: String(row.password || '').trim(),
+          client_id: String(row.client_id || '').trim(),
+          refresh_token: String(row.refresh_token || row.token || '').trim(),
+          reason: result.error,
+        });
+      } else {
+        const rawLine = String(row || '');
+        const splitResult = rawLine.includes('----')
+          ? rawLine.split('----').map((item) => item.trim())
+          : rawLine.includes('\t')
+            ? rawLine.split('\t').map((item) => item.trim())
+            : rawLine.split(/\s+/).map((item) => item.trim());
+        rejected.push({
+          email: splitResult[0] || rawLine.slice(0, 200),
+          password: splitResult[1] || '',
+          client_id: splitResult[2] || '',
+          refresh_token: splitResult.slice(3).join('----') || '',
+          reason: result.error,
+        });
+      }
       continue;
     }
     parsed.push(result);
@@ -595,12 +629,19 @@ const importPendingTkAccounts = (records, options = {}) => {
       const existsMain = accountsDb.prepare(`
         SELECT 1
         FROM account_records
-        WHERE record_key = ? AND owner_username = ? AND status = 'active'
+        WHERE owner_username = ? AND status = 'active' AND lower(email) = lower(?)
         LIMIT 1
-      `).get(recordKey, ownerUsername);
+      `).get(ownerUsername, item.email);
       if (existsMain) {
         skippedExistingMain += 1;
         skipped += 1;
+        rejected.push({
+          email: item.email,
+          password: item.password,
+          client_id: item.client_id,
+          refresh_token: item.refresh_token,
+          reason: '已存在于邮箱账户管理',
+        });
         continue;
       }
 
@@ -613,6 +654,13 @@ const importPendingTkAccounts = (records, options = {}) => {
       if (existingPending?.pool_status === 'claimed') {
         skippedClaimed += 1;
         skipped += 1;
+        rejected.push({
+          email: item.email,
+          password: item.password,
+          client_id: item.client_id,
+          refresh_token: item.refresh_token,
+          reason: '已被领取（注册中）',
+        });
         continue;
       }
 
@@ -644,6 +692,7 @@ const importPendingTkAccounts = (records, options = {}) => {
     skipped_records: skipped,
     skipped_existing_main: skippedExistingMain,
     skipped_claimed: skippedClaimed,
+    rejected_records: rejected,
     database: ACCOUNTS_DB_PATH,
   };
 };

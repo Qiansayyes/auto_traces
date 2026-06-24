@@ -66,6 +66,16 @@ def test_mail_account_lookup_and_token_check():
             assert missing is None
 
 
+def test_mail_account_lookup_legacy_empty_owner():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "accounts.sqlite"
+        _create_accounts_db(db_path, "", "legacy@outlook.com", with_token=True)
+        with patch.object(mi, "MAIL_ACCOUNTS_DB_PATH", db_path), patch.object(mi, "is_mail_module_ready", return_value=True):
+            record = mi.get_mail_account_record("alice", "legacy@outlook.com")
+            assert record is not None
+            assert mi.mail_module_can_fetch_code("alice", "legacy@outlook.com")
+
+
 def test_fetch_tiktok_email_code_via_mail_module_extracts_code():
     sample_mails = [
         {"subject": "TikTok verification", "text": "Your 6-digit code is 123456", "date": "2026-06-16T10:00:00"},
@@ -125,9 +135,28 @@ def test_main_tiktok_email_code_falls_back_to_api():
         assert resp.get("source") == "api"
 
 
+def test_main_tiktok_email_code_surfaces_mail_module_error_when_api_empty():
+    import main as app_main
+
+    with patch.object(
+        app_main, "_try_fetch_tiktok_email_code_via_mail_module", return_value=(1, "邮箱管理模块未配置该邮箱或 OAuth 令牌缺失", None)
+    ):
+        resp = app_main._tiktok_email_code_response(
+            "dev_1",
+            "A1",
+            "",
+            owner_username="alice",
+            account_email="user@outlook.com",
+        )
+        assert resp["code"] == 1
+        assert "邮箱管理模块未配置该邮箱或 OAuth 令牌缺失" in resp["msg"]
+
+
 if __name__ == "__main__":
     test_mail_account_lookup_and_token_check()
+    test_mail_account_lookup_legacy_empty_owner()
     test_fetch_tiktok_email_code_via_mail_module_extracts_code()
     test_main_tiktok_email_code_prefers_mail_module()
     test_main_tiktok_email_code_falls_back_to_api()
+    test_main_tiktok_email_code_surfaces_mail_module_error_when_api_empty()
     print("mail module email code tests passed")

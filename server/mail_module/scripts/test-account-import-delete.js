@@ -29,6 +29,22 @@ if (listed.total !== 1) {
   throw new Error(`expected 1 account, got ${listed.total}`);
 }
 
+const mixed = database.importAccounts([line, 'bad-line'], {
+  ownerUsername: owner,
+  source: 'test-mixed',
+});
+if (mixed.inserted_or_updated !== 1) {
+  throw new Error(`partial import should keep valid row, got ${mixed.inserted_or_updated}`);
+}
+if (mixed.skipped_records !== 1 || !mixed.rejected_records?.length) {
+  throw new Error('partial import should report rejected row');
+}
+
+const listedAfterMixed = database.listAccounts({ ownerUsername: owner, page: 1, pageSize: 10 });
+if (listedAfterMixed.total !== 1) {
+  throw new Error(`expected 1 account after mixed import, got ${listedAfterMixed.total}`);
+}
+
 const deleted = database.deleteAccounts({
   ownerUsername: owner,
   emails: ['parser-test@outlook.com'],

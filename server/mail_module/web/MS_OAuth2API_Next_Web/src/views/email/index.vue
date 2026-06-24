@@ -83,7 +83,7 @@
                     <div class="toolbar-section-title">导入</div>
                     <div class="toolbar-button-row">
                         <el-upload ref="upload" :limit="1" :show-file-list="false" :on-exceed="handleExceed"
-                            :auto-upload="false" :on-change="handleFileChange" accept=".txt,.csv" class="custom-upload">
+                            :auto-upload="false" :on-change="handleFileChange" accept=".txt,.csv,.xlsx" class="custom-upload">
                             <template #trigger>
                                 <el-button class="toolbar-action-button" type="primary">
                                     <el-icon>
@@ -277,19 +277,29 @@
         </div>
 
         <el-dialog v-model="dialogCopyVisible" title="粘贴导入" width="800">
-            <el-text class="mx-1" type="warning">每行一条账号：邮箱、密码、client_id、refresh_token（支持 ----、Tab 或空格分隔）</el-text>
+            <el-text class="mx-1" type="warning">每行一条账号：邮箱、密码、client_id、token（支持 ----、Tab 或空格分隔；也可直接上传 xlsx，前 4 列依次为邮箱/密码/client_id/token）</el-text>
             <div class="copy-textarea-container">
                 <el-input v-model="copyTextarea" style="width: 100%" :rows="20" type="textarea" placeholder="例如：test@outlook.com----password----uuid----refresh_token" />
             </div>
             <template #footer>
                 <div class="dialog-footer">
                     <el-button @click="dialogCopyVisible = false">取消</el-button>
-                    <el-button type="primary" @click="handlePasteAdd">
-                        导入
+                    <el-button type="primary" @click="handlePastePreview">
+                        预览
                     </el-button>
                 </div>
             </template>
         </el-dialog>
+
+        <MailImportPreviewDialog
+            v-model="importPreviewVisible"
+            :items="importPreviewItems"
+            :confirm-loading="importPreviewLoading"
+            title="邮箱导入预览"
+            hint="确认后将自动导入全部可导入记录并写入邮箱账户管理。xlsx 前 4 列依次为邮箱/密码/client_id/token；失败记录可下载查看原因。"
+            @confirm="handleImportPreviewConfirm"
+            @closed="handleImportPreviewClosed"
+        />
 
         <el-dialog v-model="dialogEditVisible" title="编辑" width="800">
 
@@ -440,10 +450,31 @@ import {
 } from '@element-plus/icons-vue'
 
 import type { UploadInstance, UploadProps, UploadRawFile } from 'element-plus'
+import MailImportPreviewDialog from '@/components/MailImportPreviewDialog.vue'
+import {
+    buildMailImportPreviewItems,
+    downloadMailImportFailedXlsx,
+    failedRowsFromPreviewItems,
+    failedRowsFromRejectedRecords,
+    mergeFailedRows,
+    parseMailAccountTextLines,
+    parseMailAccountXlsxFile,
+    recordToImportLine,
+    selectedPreviewRecords,
+    type MailAccountFailedRow,
+    type MailImportPreviewItem,
+    type MailAccountRecord,
+} from '@/utils/mailAccountImport'
 
 const upload = ref<UploadInstance>()
 const emailList = ref<string[]>([])
 const fileName = ref<string>('')
+const pendingImportRecords = ref<MailAccountRecord[]>([])
+const pendingImportFailedRows = ref<MailAccountFailedRow[]>([])
+const importPreviewVisible = ref(false)
+const importPreviewLoading = ref(false)
+const importPreviewItems = ref<MailImportPreviewItem[]>([])
+const importPreviewSource = ref('ui_import')
 
 const handleExceed: UploadProps['onExceed'] = (files) => {
     upload.value!.clearFiles()
@@ -467,8 +498,9 @@ const handleFileChange: UploadProps['onChange'] = (file, fileList = []) => {
 
     if (!rawFile.type.match(/text\/(plain|csv)/) &&
         !rawFile.name.endsWith('.txt') &&
-        !rawFile.name.endsWith('.csv')) {
-        ElMessage.error('请上传 .txt 或 .csv 格式的文件')
+        !rawFile.name.endsWith('.csv') &&
+        !rawFile.name.endsWith('.xlsx')) {
+        ElMessage.error('请上传 .txt、.csv 或 .xlsx 格式的文件')
         upload.value!.clearFiles()
         fileName.value = ''
         return
@@ -476,43 +508,87 @@ const handleFileChange: UploadProps['onChange'] = (file, fileList = []) => {
 
     fileName.value = rawFile.name.length > 10 ? rawFile.name.slice(0, 10) + '...' : rawFile.name
 
-    parseFileContent(rawFile)
+    void parseFileContent(rawFile)
 }
 
-const parseFileContent = (file: UploadRawFile) => {
-    const reader = new FileReader()
-
-    reader.onload = (e) => {
-        try {
-            const content = e.target?.result as string
-            if (!content) {
-                ElMessage.error('文件内容为空')
+const parseFileContent = async (file: UploadRawFile) => {
+    pendingImportFailedRows.value = []
+    try {
+        if (file.name.endsWith('.xlsx')) {
+            const { records, failedRows } = await parseMailAccountXlsxFile(file)
+            pendingImportFailedRows.value = failedRows
+            if (!records.length && !failedRows.length) {
+                ElMessage.warning('xlsx 中没有可解析的账号行（前 4 列应为邮箱/密码/client_id/token）')
+                pendingImportRecords.value = []
+                emailList.value = []
                 return
             }
-
-            const matches = content
-                .split(/\r?\n/)
-                .map((item) => item.trim())
-                .filter((item) => item !== '');
-
-            if (matches.length > 0) {
-                emailList.value = matches
-            } else {
-                ElMessage.warning('文件中没有可导入的账号行')
+            if (!records.length && failedRows.length) {
+                downloadMailImportFailedXlsx(failedRows)
+                ElMessage.warning(`xlsx 解析失败 ${failedRows.length} 条，已下载失败记录表格`)
+                pendingImportRecords.value = []
                 emailList.value = []
+                return
             }
-        } catch (error) {
-            console.error('解析文件失败:', error)
-            ElMessage.error('解析文件失败，请检查文件格式')
+            pendingImportRecords.value = records
+            emailList.value = records.map((item) => recordToImportLine(item, normalizeSplitSymbol()))
+            if (failedRows.length) {
+                ElMessage.warning(`xlsx 解析完成：可导入 ${records.length} 条，失败 ${failedRows.length} 条`)
+            }
+            return
         }
-    }
 
-    reader.onerror = () => {
-        ElMessage.error('读取文件失败')
-    }
+        const content = await file.text()
+        if (!content) {
+            ElMessage.error('文件内容为空')
+            return
+        }
 
-    // 读取文件内容
-    reader.readAsText(file)
+        const lines = content
+            .split(/\r?\n/)
+            .map((item) => item.trim())
+            .filter((item) => item !== '')
+
+        if (lines.length > 0) {
+            emailList.value = lines
+            pendingImportRecords.value = parseMailAccountTextLines(lines, normalizeSplitSymbol())
+        } else {
+            ElMessage.warning('文件中没有可导入的账号行')
+            emailList.value = []
+            pendingImportRecords.value = []
+        }
+    } catch (error) {
+        console.error('解析文件失败:', error)
+        ElMessage.error('解析文件失败，请检查文件格式')
+    }
+}
+
+const openImportPreview = (records: MailAccountRecord[], source = 'ui_import') => {
+    if (!records.length) {
+        if (pendingImportFailedRows.value.length) {
+            downloadMailImportFailedXlsx(pendingImportFailedRows.value)
+            ElMessage.warning(`没有可导入记录，已下载 ${pendingImportFailedRows.value.length} 条失败记录`)
+        } else {
+            ElMessage.warning('没有可预览的账号记录')
+        }
+        return
+    }
+    importPreviewSource.value = source
+    importPreviewItems.value = buildMailImportPreviewItems(records)
+    const validCount = importPreviewItems.value.filter((item) => item.kind === 'valid').length
+    if (!validCount) {
+        const previewFailed = failedRowsFromPreviewItems(importPreviewItems.value)
+        const allFailed = mergeFailedRows(pendingImportFailedRows.value, previewFailed)
+        downloadMailImportFailedXlsx(allFailed)
+        ElMessage.warning(`没有可导入的有效记录，已下载 ${allFailed.length} 条失败记录`)
+        return
+    }
+    importPreviewVisible.value = true
+}
+
+const handleImportPreviewClosed = () => {
+    importPreviewItems.value = []
+    pendingImportFailedRows.value = []
 }
 
 const toolForm = ref({
@@ -672,14 +748,21 @@ const formatImportResultMessage = (result: {
     valid_records?: number
     inserted_or_updated?: number
     skipped_records?: number
-    rejected_records?: Array<{ line?: string; reason?: string }>
+    rejected_records?: Array<{
+        email?: string
+        password?: string
+        client_id?: string
+        refresh_token?: string
+        line?: string
+        reason?: string
+    }>
 } | null, fallbackCount = 0) => {
     const imported = result?.inserted_or_updated ?? result?.valid_records ?? fallbackCount
     const skipped = result?.skipped_records || 0
     const rejected = result?.rejected_records || []
     let message = `邮箱导入完成，成功 ${imported} 条`
     if (skipped > 0) {
-        message += `，拒绝 ${skipped} 条`
+        message += `，失败 ${skipped} 条`
     }
     if (rejected.length > 0) {
         const preview = rejected.slice(0, 2).map((item) => item.reason || '格式无效').join('；')
@@ -688,9 +771,29 @@ const formatImportResultMessage = (result: {
     return message
 }
 
-const importAccountsToDatabase = async (lines: string[], source = 'ui') => {
-    const normalizedLines = lines.map((item) => item.trim()).filter(Boolean)
-    if (normalizedLines.length === 0) return null
+const downloadMergedImportFailures = (
+    previewItems: MailImportPreviewItem[],
+    rejectedRecords: Array<{
+        email?: string
+        password?: string
+        client_id?: string
+        refresh_token?: string
+        line?: string
+        reason?: string
+    }> = [],
+) => {
+    const allFailed = mergeFailedRows(
+        pendingImportFailedRows.value,
+        failedRowsFromPreviewItems(previewItems),
+        failedRowsFromRejectedRecords(rejectedRecords),
+    )
+    if (!allFailed.length) return 0
+    downloadMailImportFailedXlsx(allFailed)
+    return allFailed.length
+}
+
+const importAccountsToDatabase = async (records: MailAccountRecord[], source = 'ui') => {
+    if (!records.length) return null
 
     const response = await fetch('/api/accounts/import', {
         method: 'POST',
@@ -699,18 +802,22 @@ const importAccountsToDatabase = async (lines: string[], source = 'ui') => {
         },
         body: JSON.stringify({
             password: toolForm.value.apiPassword,
-            lines: normalizedLines,
-            splitSymbol: normalizeSplitSymbol(toolForm.value.splitSymbol),
+            records,
+            splitSymbol: normalizeSplitSymbol(),
             source
         })
     })
     const payload = await response.json()
+    if (payload.code === '400' || payload.code === 400) {
+        const rejected = payload.data?.rejected_records || []
+        const error = new Error(payload.error || payload.message || '账号入库失败') as Error & {
+            rejected_records?: typeof rejected
+        }
+        error.rejected_records = rejected
+        throw error
+    }
     if (!(payload.code === '200' || payload.code === 200)) {
-        const rejected = payload.data?.rejected_records || payload.details?.rejected_records
-        const rejectedHint = Array.isArray(rejected) && rejected.length > 0
-            ? `；首条错误：${rejected[0].reason}`
-            : ''
-        throw new Error((payload.error || payload.message || '账号入库失败') + rejectedHint)
+        throw new Error(payload.error || payload.message || '账号入库失败')
     }
     return payload.data
 }
@@ -753,13 +860,12 @@ const removeEmailsFromLocalCache = (emails: string[]) => {
 
 const syncAccountsToDatabase = async (records: Email[], source = 'localStorage_sync') => {
     try {
-        const lines = records.map((item) => [
-            item.email,
-            item.password,
-            item.client_id,
-            item.refresh_token,
-        ].join('----'))
-        await importAccountsToDatabase(lines, source)
+        await importAccountsToDatabase(records.map((item) => ({
+            email: item.email,
+            password: item.password,
+            client_id: item.client_id,
+            refresh_token: item.refresh_token,
+        })), source)
     } catch (error) {
         console.warn('同步账号数据库失败:', error)
     }
@@ -1058,35 +1164,68 @@ const handleDeleteAll = () => {
 
 // 添加邮箱
 const handleAdd = async () => {
-    const lines = parseAccountLines(emailList.value)
-    if (lines.length === 0) {
-        ElMessage.warning('请先选择文件或粘贴账号信息')
+    const records = pendingImportRecords.value.length
+        ? pendingImportRecords.value
+        : parseMailAccountTextLines(parseAccountLines(emailList.value), normalizeSplitSymbol())
+    openImportPreview(records, 'ui_import')
+}
+
+const commitImportRecords = async (records: MailAccountRecord[], source: string, previewItems: MailImportPreviewItem[] = []) => {
+    if (!records.length) {
+        ElMessage.warning('请先选择要导入的记录')
         return
     }
-
     try {
-        const result = await importAccountsToDatabase(lines, 'ui_import')
+        importPreviewLoading.value = true
+        const result = await importAccountsToDatabase(records, source)
+        const failedCount = downloadMergedImportFailures(
+            previewItems,
+            result?.rejected_records || [],
+        )
         tablePagination.value.currentPage = 1
         await loadAccountsPage()
-        ElMessage.success(formatImportResultMessage(result, lines.length))
+        const message = formatImportResultMessage(result, records.length)
+        if (failedCount > 0) {
+            ElMessage.warning(`${message}，已下载 ${failedCount} 条失败记录表格`)
+        } else {
+            ElMessage.success(message)
+        }
+        importPreviewVisible.value = false
+        emailList.value = []
+        pendingImportRecords.value = []
+        pendingImportFailedRows.value = []
+        copyTextarea.value = ''
+        dialogCopyVisible.value = false
+        fileName.value = ''
+        upload.value!.clearFiles()
     } catch (error: any) {
-        ElMessage.error(`账号入库失败：${error.message}`)
+        const failedCount = downloadMergedImportFailures(
+            previewItems,
+            error?.rejected_records || [],
+        )
+        const suffix = failedCount > 0 ? `，已下载 ${failedCount} 条失败记录表格` : ''
+        ElMessage.error(`账号入库失败：${error.message}${suffix}`)
+    } finally {
+        importPreviewLoading.value = false
+    }
+}
+
+const handleImportPreviewConfirm = async (items: MailImportPreviewItem[]) => {
+    const records = selectedPreviewRecords(items)
+    if (!records.length) {
+        ElMessage.warning('没有可导入的有效记录')
         return
     }
-
-    emailList.value = []
-    copyTextarea.value = ''
-    dialogCopyVisible.value = false
-    fileName.value = ''
-    upload.value!.clearFiles()
+    await commitImportRecords(records, importPreviewSource.value, items)
 }
 
 // 粘贴添加邮箱
 const dialogCopyVisible = ref(false)
 const copyTextarea = ref('')
-const handlePasteAdd = async () => {
-    emailList.value = copyTextarea.value.split('\n').map(item => item.trim()).filter(item => item !== '')
-    await handleAdd()
+const handlePastePreview = async () => {
+    const lines = copyTextarea.value.split('\n').map(item => item.trim()).filter(item => item !== '')
+    const records = parseMailAccountTextLines(lines, normalizeSplitSymbol())
+    openImportPreview(records, 'ui_paste')
 }
 
 const buildAccountExportContent = (records: Email[]) => {
