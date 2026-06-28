@@ -3961,13 +3961,48 @@ def _backup_record_alias_expr() -> str:
     return "COALESCE(NULLIF(TRIM(assigned_alias), ''), device_alias)"
 
 
-def _device_editor_search_sql(search: str, *, table_alias: str = "device_editor_rows") -> tuple[str, list[Any]]:
-    """备份档案列表模糊筛选：username / 别名 / 备份名 / 路径及关联账号字段。"""
+def _device_editor_search_sql(
+    search: str,
+    *,
+    search_field: str = "",
+    table_alias: str = "device_editor_rows",
+) -> tuple[str, list[Any]]:
+    """备份档案列表模糊筛选：可按 alias / username / region 或全字段。"""
     q = str(search or "").strip().lower()
     if not q:
         return "", []
     pattern = f"%{q}%"
     ta = table_alias
+    field = str(search_field or "").strip().lower()
+    if field == "username":
+        return f" AND LOWER(TRIM({ta}.username)) LIKE ?", [pattern]
+    if field == "region":
+        sql = f"""
+        AND (
+            LOWER(TRIM({ta}.region)) LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM account_editor_rows a
+                WHERE a.owner_username = {ta}.owner_username
+                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND LOWER(TRIM(a.region)) LIKE ?
+            )
+        )
+        """
+        return sql, [pattern, pattern]
+    if field == "alias":
+        sql = f"""
+        AND (
+            LOWER(TRIM({ta}.device_alias)) LIKE ?
+            OR LOWER(TRIM({ta}.assigned_alias)) LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM account_editor_rows a
+                WHERE a.owner_username = {ta}.owner_username
+                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND LOWER(TRIM(a.assigned_alias)) LIKE ?
+            )
+        )
+        """
+        return sql, [pattern, pattern, pattern]
     sql = f"""
         AND (
             LOWER(TRIM({ta}.username)) LIKE ?
@@ -11153,6 +11188,7 @@ def list_device_editor_rows(
     page_size: int = 20,
     device_group: str = "",
     search: str = "",
+    search_field: str = "",
     authorization: str | None = Header(default=None),
 ):
     session = _current_session({"authorization": authorization} if authorization else {})
@@ -11163,7 +11199,10 @@ def list_device_editor_rows(
     offset = (safe_page - 1) * safe_size
     alias_expr = _backup_record_alias_expr()
     group_sql, group_params = _device_group_filter_sql(str(device_group or "").strip(), alias_expr)
-    search_sql, search_params = _device_editor_search_sql(search)
+    safe_search_field = str(search_field or "").strip().lower()
+    if safe_search_field not in {"", "alias", "username", "region"}:
+        return {"code": 1, "msg": f"不支持的搜索字段: {search_field}"}
+    search_sql, search_params = _device_editor_search_sql(search, search_field=safe_search_field)
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
@@ -11201,6 +11240,7 @@ def list_device_editor_rows(
                 "total": total_aliases,
                 "alias_page_aliases": [],
                 "search": str(search or "").strip(),
+                "search_field": safe_search_field,
             }
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
@@ -11257,6 +11297,7 @@ def list_device_editor_rows(
             "alias_page_aliases": page_aliases,
             "device_groups": _list_distinct_device_groups(session),
             "search": str(search or "").strip(),
+            "search_field": safe_search_field,
         }
     finally:
         conn.close()

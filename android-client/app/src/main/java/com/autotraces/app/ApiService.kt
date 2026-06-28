@@ -52,6 +52,13 @@ object ApiService {
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    /** 设备日志同步可能携带数百行 JSON，写超时需长于默认 15s。 */
+    private val deviceLogSyncClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
     private lateinit var defaultBaseUrl: String
 
     fun init(context: Context) {
@@ -319,7 +326,8 @@ object ApiService {
         alias: String,
         logs: List<String>,
         replace: Boolean = false,
-    ): BaseResponse = post(
+    ): BaseResponse = postWithClient(
+        deviceLogSyncClient,
         path = "/api/device_logs/sync",
         body = DeviceLogsSyncRequest(deviceId, alias, logs, replace),
         clazz = BaseResponse::class.java,

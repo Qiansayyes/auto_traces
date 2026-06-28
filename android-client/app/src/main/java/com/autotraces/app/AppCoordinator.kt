@@ -915,7 +915,7 @@ object AppCoordinator {
     }
 
     /** 启动/恢复运行后向云端同步 running，不把本地状态降回 online。 */
-    private suspend fun syncRunningToCloud(retries: Int = 1) {
+    private suspend fun syncRunningToCloud(retries: Int = 3) {
         syncStatusToCloud("running", retries)
     }
 
@@ -1648,7 +1648,12 @@ object AppCoordinator {
                 try {
                     val sinceId = PrefsStore.getLastModeEventId()
                     val resp = ApiService.modeWait(deviceId, alias, sinceId, timeoutSec = 120)
-                    uploadDeviceLogsIfPullRequested(alias, deviceId, resp.log_pull_requested == true)
+                    uploadDeviceLogsIfPullRequested(
+                        alias,
+                        deviceId,
+                        resp.log_pull_requested == true,
+                        resp.log_pull_max_lines,
+                    )
                     if (resp.code != 0) {
                         authErrorRounds++
                         if (
@@ -1899,16 +1904,22 @@ object AppCoordinator {
         }
     }
 
-    private suspend fun uploadDeviceLogsIfPullRequested(alias: String, deviceId: String, pullRequested: Boolean) {
+    private suspend fun uploadDeviceLogsIfPullRequested(
+        alias: String,
+        deviceId: String,
+        pullRequested: Boolean,
+        maxLines: Int? = null,
+    ) {
         if (!pullRequested) return
-        val lines = LocalDeviceLogWriter.readTodayFileLines()
+        val cap = (maxLines ?: 400).coerceIn(1, 500)
+        val lines = LocalDeviceLogWriter.readTodayFileTail(cap)
         runCatching {
             ApiService.syncDeviceLogs(deviceId, alias, lines, replace = true)
         }.onSuccess {
             if (lines.isEmpty()) {
                 LogCenter.op(alias, "已响应管理台日志拉取（今日暂无本地日志）")
             } else {
-                LogCenter.op(alias, "已响应管理台日志拉取（今日 ${lines.size} 行）")
+                LogCenter.op(alias, "已响应管理台日志拉取（今日尾部 ${lines.size} 行，上限 $cap）")
             }
         }.onFailure { err ->
             LogCenter.op(alias, "响应管理台日志拉取失败：${err.message}")
@@ -1916,7 +1927,12 @@ object AppCoordinator {
     }
 
     private suspend fun uploadDeviceLogsIfRequested(alias: String, deviceId: String, response: CheckStartResponse) {
-        uploadDeviceLogsIfPullRequested(alias, deviceId, response.log_pull_requested == true)
+        uploadDeviceLogsIfPullRequested(
+            alias,
+            deviceId,
+            response.log_pull_requested == true,
+            response.log_pull_max_lines,
+        )
     }
 
     /**

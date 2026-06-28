@@ -255,11 +255,13 @@ const batchStreamProgressPercent = document.getElementById("batchStreamProgressP
 const batchStreamTableBody = document.getElementById("batchStreamTableBody");
 const accountUnassignedOnlyToggle = document.getElementById("accountUnassignedOnlyToggle");
 const accountRecordsSearchInput = document.getElementById("accountRecordsSearchInput");
+const accountRecordsSearchFieldSelect = document.getElementById("accountRecordsSearchFieldSelect");
 const accountRecordsPrevPageBtn = document.getElementById("accountRecordsPrevPageBtn");
 const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPageBtn");
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
+const backupArchiveSearchFieldSelect = document.getElementById("backupArchiveSearchFieldSelect");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
 const DEVICE_EDITOR_STORAGE_KEY = "auto_traces_device_editor_rows_v1";
@@ -277,9 +279,11 @@ let batchStreamSessionId = "";
 let batchStreamBusy = false;
 let batchStreamLastSnapshot = "";
 let accountRecordsSearchQuery = "";
+let accountRecordsSearchField = "";
 let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
 let backupArchiveSearchQuery = "";
+let backupArchiveSearchField = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
 let currentDeviceGroupFilter = "";
@@ -7833,7 +7837,30 @@ function matchesSearchInFields(needle, fields = []) {
   return false;
 }
 
+const ACCOUNT_RECORDS_SEARCH_FIELD_LABELS = {
+  alias: "别名",
+  username: "username",
+  region: "地区分类",
+};
+
+function formatAccountRecordsSearchHint(query, field = "") {
+  const q = String(query || "").trim();
+  if (!q) return "";
+  const fieldLabel = ACCOUNT_RECORDS_SEARCH_FIELD_LABELS[String(field || "").trim()] || "全部字段";
+  return `未找到在「${fieldLabel}」中匹配「${q}」的账号记录`;
+}
+
 function accountRecordMatchesSearch(row = {}) {
+  const field = String(accountRecordsSearchField || "").trim();
+  if (field === "alias") {
+    return matchesSearchInFields(accountRecordsSearchQuery, [getEffectiveAccountAssignedAlias(row)]);
+  }
+  if (field === "username") {
+    return matchesSearchInFields(accountRecordsSearchQuery, [row.username]);
+  }
+  if (field === "region") {
+    return matchesSearchInFields(accountRecordsSearchQuery, [row.region]);
+  }
   return matchesSearchInFields(accountRecordsSearchQuery, [
     row.username,
     row.password,
@@ -7853,6 +7880,22 @@ function backupArchiveRecordMatchesSearch(row = {}) {
   if (!backupArchiveSearchQuery) return true;
   const username = String(row?.username || "").trim();
   const acct = username ? getAccountRecordByUsername(username) : null;
+  const field = String(backupArchiveSearchField || "").trim();
+  if (field === "alias") {
+    return matchesSearchInFields(backupArchiveSearchQuery, [
+      row.device_alias,
+      row.assigned_alias,
+      row.mobile_alias,
+      row.account_assigned_alias,
+      acct?.assigned_alias,
+    ]);
+  }
+  if (field === "username") {
+    return matchesSearchInFields(backupArchiveSearchQuery, [username]);
+  }
+  if (field === "region") {
+    return matchesSearchInFields(backupArchiveSearchQuery, [row.region, acct?.region]);
+  }
   return matchesSearchInFields(backupArchiveSearchQuery, [
     username,
     row.device_alias,
@@ -9225,7 +9268,7 @@ function renderAccountEditorRows() {
   const pageRows = visibleRows.slice(start, start + pageSize);
   if (!visibleRows.length) {
     const emptyHint = accountRecordsSearchQuery
-      ? `未找到匹配「${accountRecordsSearchQuery}」的账号记录`
+      ? formatAccountRecordsSearchHint(accountRecordsSearchQuery, accountRecordsSearchField)
       : "暂无记录，点击“新增空白记录”开始";
     accountEditorListEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
     return;
@@ -9993,8 +10036,9 @@ function renderBackupGroups(items = []) {
     ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
     : items;
   if (!filteredItems.length) {
+    const searchFieldLabel = ACCOUNT_RECORDS_SEARCH_FIELD_LABELS[backupArchiveSearchField] || "全部字段";
     const emptyHint = backupArchiveSearchQuery
-      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
+      ? `未找到在「${searchFieldLabel}」中匹配「${backupArchiveSearchQuery}」的备份档案`
       : "暂无备份档案";
     deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
     return;
@@ -10292,6 +10336,8 @@ async function loadBackupArchiveRecords() {
     if (group) params.set("device_group", group);
     const searchQ = String(backupArchiveSearchQuery || "").trim();
     if (searchQ) params.set("search", searchQ);
+    const searchField = String(backupArchiveSearchField || "").trim();
+    if (searchField) params.set("search_field", searchField);
     // 今日时段是云端预分配信息，与“当前是否已开启自动切号”无关；
     // 始终拉取，避免设备未开启时只显示 "--" 造成误解。
     const plansPromise = request("/api/admin/auto_switch/daily_plans")
@@ -10476,12 +10522,17 @@ if (accountUnassignedOnlyToggle) {
 }
 if (accountRecordsSearchInput) {
   let accountSearchTimer = null;
-  accountRecordsSearchInput.addEventListener("input", () => {
+  const onAccountRecordsSearchChanged = () => {
     accountRecordsSearchQuery = String(accountRecordsSearchInput.value || "").trim();
+    accountRecordsSearchField = String(accountRecordsSearchFieldSelect?.value || "").trim();
     currentAccountRecordsPage = 1;
     clearTimeout(accountSearchTimer);
     accountSearchTimer = setTimeout(() => renderAccountEditorRows(), 200);
-  });
+  };
+  accountRecordsSearchInput.addEventListener("input", onAccountRecordsSearchChanged);
+  if (accountRecordsSearchFieldSelect) {
+    accountRecordsSearchFieldSelect.addEventListener("change", onAccountRecordsSearchChanged);
+  }
 }
 if (accountRecordsPrevPageBtn) {
   accountRecordsPrevPageBtn.addEventListener("click", () => {
@@ -10505,14 +10556,19 @@ if (accountRecordsPageSizeInput) {
 }
 if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
-  backupArchiveSearchInput.addEventListener("input", () => {
+  const onBackupArchiveSearchChanged = () => {
     backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
+    backupArchiveSearchField = String(backupArchiveSearchFieldSelect?.value || "").trim();
     clearTimeout(backupSearchTimer);
     backupSearchTimer = setTimeout(() => {
       currentBackupArchivePage = 1;
       void loadBackupArchiveRecords();
     }, 300);
-  });
+  };
+  backupArchiveSearchInput.addEventListener("input", onBackupArchiveSearchChanged);
+  if (backupArchiveSearchFieldSelect) {
+    backupArchiveSearchFieldSelect.addEventListener("change", onBackupArchiveSearchChanged);
+  }
 }
 if (accountEditorListEl) {
   accountEditorListEl.addEventListener("input", (event) => {
