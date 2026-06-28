@@ -236,7 +236,7 @@ def _new_session_token() -> str:
 
 _sqlite_wal_ready = False
 _DB_BUSY_TIMEOUT_MS = 8_000
-_DB_RETRY_ATTEMPTS = 6
+_DB_RETRY_ATTEMPTS = 3
 _DB_RETRY_BASE_SEC = 0.03
 _AUTH_SESSION_CACHE: dict[str, tuple[dict, float]] = {}
 _AUTH_SESSION_CACHE_TTL_SEC = 20.0
@@ -1613,9 +1613,15 @@ def _persist_client_device_to_db(device_id: str, *, force: bool = False) -> None
         snapshot = _device_persist_row_snapshot(dev)
     now_mono = time.monotonic()
     if not force:
-        last_snap = _device_persist_last_written.get(did)
         last_at = _device_persist_last_at.get(did, 0.0)
+        last_snap = _device_persist_last_written.get(did)
+        # 快照未变：完全跳过（内存与 DB 已一致）
         if last_snap == snapshot and (now_mono - last_at) < _DEVICE_PERSIST_MIN_INTERVAL_SEC:
+            return
+        # 快照已变但距上次落库不足间隔：仅标记 dirty，由 worker 在间隔到期后合并写入
+        if (now_mono - last_at) < _DEVICE_PERSIST_MIN_INTERVAL_SEC:
+            with _device_persist_lock:
+                _device_persist_pending.add(did)
             return
     if force:
         _write_client_devices_batch([did])
@@ -1646,9 +1652,19 @@ def _device_persist_worker_loop() -> None:
         with _device_persist_lock:
             if not _device_persist_pending:
                 continue
-            batch = list(_device_persist_pending)
-            _device_persist_pending.clear()
-        _write_client_devices_batch(batch)
+            pending = list(_device_persist_pending)
+        now_mono = time.monotonic()
+        eligible = [
+            did
+            for did in pending
+            if (now_mono - _device_persist_last_at.get(did, 0.0)) >= _DEVICE_PERSIST_MIN_INTERVAL_SEC
+        ]
+        if not eligible:
+            continue
+        with _device_persist_lock:
+            for did in eligible:
+                _device_persist_pending.discard(did)
+        _write_client_devices_batch(eligible)
 
 
 def _start_device_persist_worker() -> None:
