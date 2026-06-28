@@ -310,6 +310,40 @@ def _invalidate_auth_session_cache(token: str | None = None) -> None:
     _AUTH_SESSION_CACHE.pop(token, None)
 
 
+_AUTH_DB_LOCK_TIMEOUT_SEC = 3.0
+
+
+@contextlib.contextmanager
+def _auth_db_conn():
+    """登录专用短超时连接：写锁拥堵时快速返回 503，避免前端 30s 超时无响应。"""
+    conn = sqlite3.connect(str(DB_PATH), timeout=_AUTH_DB_LOCK_TIMEOUT_SEC, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=2000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _touch_auth_last_login_async(username: str) -> None:
+    owner = str(username or "").strip()
+    if not owner:
+        return
+
+    def _run() -> None:
+        conn = _get_db()
+        try:
+            conn.execute("UPDATE auth_users SET last_login_at = ? WHERE username = ?", (now_text(), owner))
+            conn.commit()
+        except Exception as exc:
+            print(f"[{now_text()}] 登录审计写入失败（last_login_at）：{exc}")
+        finally:
+            conn.close()
+
+    Thread(target=_run, name="auth_last_login", daemon=True).start()
+
+
 class _DbConn:
     """包装 sqlite3 连接：WAL + busy_timeout + 单语句重试；不再进程级串行化，避免后台任务拖死 HTTP。"""
 
@@ -3026,6 +3060,7 @@ async def _on_app_shutdown() -> None:
 
 @app.on_event("startup")
 async def install_asyncio_exception_filter() -> None:
+    print(f"[{now_text()}] 系统 | HTTP 服务就绪（main 模块已加载，开始接受请求）")
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
 
@@ -8153,27 +8188,31 @@ def admin_upsert_template_grant(payload: TemplateGrantUpsertRequest, authorizati
 def auth_login(payload: dict):
     username = str(payload.get('username') or '').strip()
     password = str(payload.get('password') or '')
-    conn = _get_db()
+    token = ""
+    role = ""
     try:
-        row = conn.execute("SELECT username, password_hash, role, is_active FROM auth_users WHERE username = ?", (username,)).fetchone()
-        if not row or int(row[3] or 0) != 1 or not _verify_password(password, row[1]):
-            return {"code": 1, "msg": "用户名或密码错误"}
-        token = _new_session_token()
-        expires = (datetime.now().replace(microsecond=0)).isoformat(sep=' ')
-        # last_login_at 仅用于审计，失败不应拖慢或阻断登录主流程。
-        try:
-            conn.execute("UPDATE auth_users SET last_login_at = ? WHERE username = ?", (now_text(), username))
-        except Exception as exc:
-            print(f"[{now_text()}] 登录审计写入失败（last_login_at）：{exc}")
-        conn.execute(
-            "INSERT INTO auth_sessions (token, username, role, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (token, username, row[2], now_text(), "2999-12-31 23:59:59"),
-        )
-        conn.commit()
-        _invalidate_auth_session_cache()
-        return {"code": 0, "msg": "登录成功", "token": token, "role": row[2], "username": username}
-    finally:
-        conn.close()
+        with _auth_db_conn() as conn:
+            row = conn.execute(
+                "SELECT username, password_hash, role, is_active FROM auth_users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if not row or int(row[3] or 0) != 1 or not _verify_password(password, row[1]):
+                return {"code": 1, "msg": "用户名或密码错误"}
+            token = _new_session_token()
+            role = str(row[2] or "")
+            conn.execute(
+                "INSERT INTO auth_sessions (token, username, role, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (token, username, role, now_text(), "2999-12-31 23:59:59"),
+            )
+            conn.commit()
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            print(f"[{now_text()}] auth.login | db_busy | user={username} err={exc}")
+            return {"code": 1, "msg": "服务繁忙，请稍后重试"}
+        raise
+    _touch_auth_last_login_async(username)
+    _invalidate_auth_session_cache()
+    return {"code": 0, "msg": "登录成功", "token": token, "role": role, "username": username}
 
 
 @app.post("/api/login")
