@@ -29,8 +29,10 @@ object ApiService {
 
     private val longTimeoutClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(120, TimeUnit.SECONDS)
+        // mode_wait 是长轮询（默认 120s）。readTimeout 需要留足余量，否则会把“正常长轮询结束”
+        // 误判成 SocketTimeoutException，导致日志里频繁出现 timeout。
+        .readTimeout(180, TimeUnit.SECONDS)
+        .writeTimeout(180, TimeUnit.SECONDS)
         .build()
 
     /** 绑定接口应快速返回；过长读超时会导致界面长期停在「正在绑定...」。 */
@@ -38,6 +40,16 @@ object ApiService {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(35, TimeUnit.SECONDS)
         .writeTimeout(35, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * auto_switch/bundle 会为桶内每个账号做智能模板解析，账号多时服务端常 >15s；
+     * 若仍用默认 readTimeout=15s，设备端会误报 timeout（服务端其实已 200）。
+     */
+    private val autoSwitchBundleClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private lateinit var defaultBaseUrl: String
@@ -213,7 +225,8 @@ object ApiService {
         var lastError: Exception? = null
         for (path in paths) {
             try {
-                return post(
+                return postWithClient(
+                    longTimeoutClient,
                     path = path,
                     body = body,
                     clazz = TikTokEmailCodeResponse::class.java,
@@ -237,6 +250,50 @@ object ApiService {
         clazz = DeviceOpPollResponse::class.java,
     )
 
+    suspend fun modeWait(
+        deviceId: String,
+        alias: String,
+        sinceEventId: Int = 0,
+        timeoutSec: Int = 120,
+    ): DeviceModeWaitResponse = getWithClient(
+        longTimeoutClient,
+        path = "/api/device/mode_wait?device_id=${encode(deviceId)}&alias=${encode(alias)}"
+            + "&since_event_id=${sinceEventId.coerceAtLeast(0)}&timeout_sec=${timeoutSec.coerceIn(5, 180)}",
+        clazz = DeviceModeWaitResponse::class.java,
+    )
+
+    suspend fun modeAck(
+        deviceId: String,
+        alias: String,
+        eventId: Int,
+        phase: String,
+        sessionId: String,
+    ): BaseResponse = post(
+        path = "/api/device/mode_ack",
+        body = DeviceModeAckRequest(deviceId, alias, eventId, phase, sessionId),
+        clazz = BaseResponse::class.java,
+    )
+
+    suspend fun fetchAutoSwitchBundle(
+        deviceId: String,
+        alias: String,
+        sessionId: String = "",
+        revision: Int = 0,
+    ): AutoSwitchBundleResponse = getWithClient(
+        autoSwitchBundleClient,
+        path = "/api/auto_switch/bundle?device_id=${encode(deviceId)}&alias=${encode(alias)}"
+            + "&session_id=${encode(sessionId)}&revision=${revision.coerceAtLeast(0)}",
+        clazz = AutoSwitchBundleResponse::class.java,
+    )
+
+    suspend fun postAutoSwitchSessionSummary(
+        body: AutoSwitchSessionSummaryRequest,
+    ): AutoSwitchSessionSummaryResponse = post(
+        path = "/api/auto_switch/session_summary",
+        body = body,
+        clazz = AutoSwitchSessionSummaryResponse::class.java,
+    )
+
     suspend fun reportDeviceOp(
         deviceId: String,
         alias: String,
@@ -257,9 +314,14 @@ object ApiService {
         includeAuth = true,
     )
 
-    suspend fun syncDeviceLogs(deviceId: String, alias: String, logs: List<String>): BaseResponse = post(
+    suspend fun syncDeviceLogs(
+        deviceId: String,
+        alias: String,
+        logs: List<String>,
+        replace: Boolean = false,
+    ): BaseResponse = post(
         path = "/api/device_logs/sync",
-        body = DeviceLogsSyncRequest(deviceId, alias, logs),
+        body = DeviceLogsSyncRequest(deviceId, alias, logs, replace),
         clazz = BaseResponse::class.java,
     )
 

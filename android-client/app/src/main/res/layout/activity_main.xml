@@ -60,18 +60,11 @@
         app:layout_constraintTop_toBottomOf="@id/showVideoDedButton">
 
         <TextView
-            android:id="@+id/deviceInfoTitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="设备信息"
-            android:textSize="20sp"
-            android:textStyle="bold" />
-
-        <TextView
             android:id="@+id/deviceInfoText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp" />
+            android:textSize="12sp"
+            android:textColor="@android:color/darker_gray" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -112,12 +105,21 @@
                 android:textColor="@android:color/darker_gray" />
         </ScrollView>
 
-        <TextView
-            android:id="@+id/runtimeStateText"
+        <ScrollView
+            android:id="@+id/runtimeStateScroll"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:textColor="@android:color/darker_gray" />
+            android:layout_marginTop="8dp"
+            android:maxHeight="132dp"
+            android:scrollbars="vertical">
+
+            <TextView
+                android:id="@+id/runtimeStateText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="12sp" />
+        </ScrollView>
     </LinearLayout>
 
     <ScrollView

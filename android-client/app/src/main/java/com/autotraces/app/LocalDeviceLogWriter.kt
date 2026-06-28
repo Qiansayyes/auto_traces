@@ -49,6 +49,19 @@ object LocalDeviceLogWriter {
         }
     }
 
+    /** 读取今天本地日志文件的全部行（管理台「下载今日日志」用）。 */
+    fun readTodayFileLines(): List<String> {
+        val ctx = runCatching { PrefsStore.applicationContext() }.getOrNull() ?: return emptyList()
+        val dir = File(ctx.filesDir, "logs")
+        if (!dir.isDirectory) return emptyList()
+        val today = LocalDate.now(ZoneId.systemDefault())
+        val file = File(dir, "${dayFormatter.format(today)}.txt")
+        if (!file.isFile) return emptyList()
+        return runCatching {
+            file.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
+        }.getOrElse { emptyList() }
+    }
+
     /** 读取今天与昨天的本地设备日志行（较新的在前）。 */
     fun readRecentLines(maxLines: Int = 400): List<String> {
         val ctx = runCatching { PrefsStore.applicationContext() }.getOrNull() ?: return emptyList()

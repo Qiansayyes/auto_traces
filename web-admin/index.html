@@ -32,6 +32,31 @@
   </div>
 
 
+  <div id="accountBatchPreviewModal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-card modal-card--wide modal-card--import-preview">
+      <div class="modal-header">
+        <h3>批量导入预览</h3>
+        <button id="closeAccountBatchPreviewBtn" type="button" class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-hint">解析结果如下。请勾选要导入的记录，可在上方批量分配别名，确认后再写入账号记录表。</p>
+      <div class="import-preview-toolbar">
+        <label class="import-preview-select-all">
+          <input id="accountBatchPreviewSelectAll" type="checkbox" checked />
+          全选
+        </label>
+        <label class="toolbar-field-label" for="accountBatchPreviewBulkAlias">批量分配别名</label>
+        <select id="accountBatchPreviewBulkAlias" class="ui-select ui-select--modal"></select>
+        <button id="accountBatchPreviewApplyAliasBtn" type="button" class="ghost">应用到选中</button>
+        <span id="accountBatchPreviewSummary" class="hint"></span>
+      </div>
+      <div id="accountBatchPreviewTableWrap" class="import-preview-table-wrap"></div>
+      <div class="modal-actions">
+        <button id="cancelAccountBatchPreviewBtn" type="button" class="ghost">取消</button>
+        <button id="confirmAccountBatchPreviewBtn" type="button" class="primary">确定导入</button>
+      </div>
+    </div>
+  </div>
+
   <div id="groupMoveModal" class="modal-overlay hidden" aria-hidden="true">
     <div class="modal-card modal-card--wide">
       <div class="modal-header">
@@ -120,7 +145,7 @@
             <button id="cvModeBtn" class="ghost">直客访问模式</button>
             <button id="mutualStartSelectedBtn" class="ghost" title="下发互点会话：模板勾选「互点-仅关注」时走仅关注分支，否则走引流（评论/作者区/Followers）；与模板三项互斥">启动所选设备互点（引流）</button>
             <button id="mutualFollowOnlySelectedBtn" class="ghost" type="button" title="互点分支：强制下发仅关注会话（与模板中评论/作者区/Followers 三项互斥，不可同时勾选）">互点-仅关注</button>
-            <button id="publishPostStartSelectedBtn" class="ghost" type="button" title="对勾选设备下发：关闭云端自动开启→关开 TikTok→屏中点→OCR「While using the app」；互点/引流会话进行中设备端会自动排队">发布作品</button>
+            <button id="publishPostStartSelectedBtn" class="ghost" type="button" title="对勾选设备下发：临时关闭云端自动起号策略参与→关开 TikTok→屏中点→OCR「While using the app」；互点/引流会话进行中设备端会自动排队">发布作品</button>
             <button id="startSelected" class="primary">启动所选设备</button>
             <button id="startAll" class="ghost">启动全部在线设备</button>
             <button id="stopSelected" class="ghost">停止所选设备</button>
@@ -128,7 +153,7 @@
               <option value="default">default</option>
             </select>
             <button id="applyTemplateSelected" class="ghost">批量修改模板</button>
-            <button id="autoStartToggleBtn" type="button" class="ghost">自动开启程序：关</button>
+            <button id="autoStartToggleBtn" type="button" class="ghost" title="云端自动起号策略（与“自动切号自治”不同）：开启后，已绑定且未暂停、且未在列表中选择退出的设备，会在 App 轮询到策略时自行拉起后台">自动起号策略：关</button>
           </div>
           <div class="toolbar-filters">
             <div class="search-input search-input--compact">
@@ -142,7 +167,7 @@
             <button id="manageDeviceGroupsBtn" type="button" class="ghost">设置分组</button>
           </div>
         </div>
-        <p id="startHint" class="hint toolbar-hint">请选择在线设备后再启动。开启「自动开启程序」后，已绑定且未暂停的设备会在 App 轮询到策略时自行拉起后台（无需每次点启动）。</p>
+        <p id="startHint" class="hint toolbar-hint">请选择在线设备后再启动。开启「自动起号策略」后，已绑定且未暂停、且未选择退出的设备会在 App 轮询到策略时自行拉起后台（无需每次点启动）。</p>
         <div class="cards">
           <div class="card">
             <h3>在线设备</h3>
@@ -182,7 +207,7 @@
                 <th>模板（当前模式）</th>
                 <th>状态</th>
                 <th>待启动</th>
-                <th>自动开启</th>
+                <th title="云端自动起号策略（auto_start）；与“自动切号自治（auto_switch）”不同">自动起号</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -204,7 +229,8 @@
               <select id="deviceLogDeviceSelect" style="padding:4px 8px;min-width:220px;">
                 <option value="">全部设备</option>
               </select>
-              <small style="color:#666;">约每 4 秒拉取；手机上报有延迟，需 App 后台运行</small>
+              <button id="deviceLogPullBtn" type="button" class="ghost">下载今日日志</button>
+              <small style="color:#666;">向设备请求今日本地日志文件，回传后自动下载；设备需后台运行，约 20～30 秒</small>
             </div>
           </div>
           <pre id="deviceExecLogs" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin-top:10px;">暂无日志</pre>
@@ -625,7 +651,7 @@
           </div>
           <div class="panel-card" style="margin-top:12px;background:#f8faff;">
             <h4 style="margin:0 0 8px;">账号文本批量导入</h4>
-            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持三种列格式：① 5 列 … api；② 6 列 … (忽略/空)、api；③ 7 列 … (忽略)、(忽略)、api。已存在的 username 会合并更新空字段，已有别名不会被清除。</div>
+            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持三种列格式：① 5 列 … api；② 6 列 … (忽略/空)、api；③ 7 列 … (忽略)、(忽略)、api。点击导入后会先弹出预览，可勾选记录并批量分配别名，确认后再写入账号记录表。</div>
             <div class="field" style="max-width:280px;margin-bottom:8px;">
               <label>统一国家地区（必填）</label>
               <input id="accountBatchRegionInput" type="text" placeholder="例如：MX / US" required autocomplete="off" />
@@ -719,10 +745,10 @@
                 <input id="backupStatsFullQueryEnabledToggle" type="checkbox" disabled />
                 每日0点自动全量查询（暂不可用）
               </label>
-              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;" title="北京时间 0:00 起按别名账号数随机均分 24 小时，到点自动切号；开启后立即对齐当前时段">
-                <input id="autoSwitchEnabledToggle" type="checkbox" />
-                自动切号（全局）
-              </label>
+              <button id="autoSwitchSelectAllEnableBtn" type="button" class="ghost" title="为当前账号下全部设备开启自动切号（无需逐个勾选）">全选并开启</button>
+              <button id="autoSwitchEnableSelectedBtn" type="button" class="ghost" title="为勾选的别名组/备份记录对应设备开启自动切号（本机自治调度）">开启选中设备自动切号</button>
+              <button id="autoSwitchDisableSelectedBtn" type="button" class="ghost" title="关闭勾选别名组/记录对应设备的自动切号">关闭选中设备自动切号</button>
+              <span id="autoSwitchEnabledCountHint" class="hint"></span>
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>
               <button id="backupArchiveSelectAllPageBtn" type="button" class="ghost" title="勾选当前页全部备份记录">全选本页</button>
               <button id="backupArchiveClearSelectionBtn" type="button" class="ghost" title="取消全部勾选">取消选择</button>
@@ -740,6 +766,17 @@
               <input id="backupArchivePageSizeInput" type="number" class="pager-size-input" min="1" max="200" value="20" title="单页别名组数" />
             </div>
           </div>
+          <details id="autoSwitchSessionSummariesPanel" class="panel-card auto-switch-summaries-panel" style="margin-bottom:12px;">
+            <summary>自动切号会话总结 <span id="autoSwitchSessionSummariesHint" class="hint"></span></summary>
+            <div class="auto-switch-summaries-toolbar">
+              <label for="autoSwitchSessionSummariesAliasSelect">按别名</label>
+              <select id="autoSwitchSessionSummariesAliasSelect" class="ui-select" style="min-width:180px;" title="仅展示所选设备别名的会话总结">
+                <option value="">全部别名</option>
+              </select>
+              <button id="autoSwitchSessionSummariesRefreshBtn" type="button" class="ghost">刷新</button>
+            </div>
+            <div id="autoSwitchSessionSummariesEl" class="auto-switch-summaries-list hint">加载中…</div>
+          </details>
           <div id="deviceAliasGroups" class="backup-archive-list">加载中...</div>
         </div>
       </section>
@@ -1261,7 +1298,11 @@
                 <input id="cfg-break-max" name="break_max" type="number" min="0" />
               </div>
             </div>
-            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。<strong>最短、最长均为 0 时不触发休息</strong>。设备 App 默认连续完成 <strong>5 批</strong>拉取并执行完毕后进入休息（由「休息前拉取批次数 <code>pull_batches_before_rest</code>」控制，默认 5）。</div>
+            <label class="checkbox-inline" id="noRestToggleLabel" style="margin-top: 10px">
+              <input id="cfg-no-rest" name="no_rest" type="checkbox" />
+              <span class="checkbox-inline__text"><strong>不休息</strong>（开启后，绑定本模板的设备永不进入批次休息）</span>
+            </label>
+            <div class="hint">触发休息后，实际休息分钟数在<strong>最短~最长</strong>之间随机。<strong>开启「不休息」后忽略休息时长</strong>；未开启时<strong>最短、最长均为 0</strong>也不触发休息。设备 App 默认连续完成 <strong>5 批</strong>拉取并执行完毕后进入休息（由「休息前拉取批次数 <code>pull_batches_before_rest</code>」控制，默认 5）。</div>
           </div>
           <div class="field">
             <label>访问延迟（秒，随机区间）</label>
@@ -1527,6 +1568,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260616-1"></script>
+  <script src="app.js?v=20260627-1"></script>
 </body>
 </html>

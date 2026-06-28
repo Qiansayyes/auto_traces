@@ -59,7 +59,12 @@ object ConfigDisplay {
         appendSection("拉取与休息") {
             appendLine("单次拉取用户名数量 pull_batch_size：${config.pull_batch_size}")
             appendLine("发作品前拉取素材 publish_post_material_fetch_count：${config.publish_post_material_fetch_count}（0=不拉取）")
-            appendLine("休息时长 break_min ~ break_max：${formatRangeMin(config.break_min, config.break_max)}")
+            if (config.no_rest) {
+                appendLine("休息策略 no_rest：不休息（模板强制关闭，永不进入批次休息）")
+            } else {
+                appendLine("休息策略 no_rest：关闭")
+                appendLine("休息时长 break_min ~ break_max：${formatRangeMin(config.break_min, config.break_max)}")
+            }
         }
 
         appendSection("访问与作品停留") {

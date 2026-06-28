@@ -21,6 +21,36 @@ object DeviceBackupShell {
 
     fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
+    fun forceStopCommand(dataPackageName: String): String =
+        "am force-stop ${shellQuote(dataPackageName.trim())}"
+
+    /** 进程仍存在时 stdout 非空；无匹配进程时通常为空。 */
+    fun pidofCommand(dataPackageName: String): String =
+        "pidof ${shellQuote(dataPackageName.trim())} 2>/dev/null"
+
+    /**
+     * 按 ps 进程名（NAME 列）列出目标包 pid，含 `:push` 等多进程。
+     * 不用 `pgrep -f 包名`：会把 `am force-stop 包名` 的 sh/am 误判为 TikTok，导致永远杀不干净。
+     */
+    fun listPackageProcessPidsCommand(dataPackageName: String): String {
+        val q = shellQuote(dataPackageName.trim())
+        return "ps -A -o PID=,NAME= 2>/dev/null | awk -v p=$q '\$2==p || index(\$2,p\":\")==1 {printf \"%s \",\$1}' | sed 's/ *\$//'"
+    }
+
+    /** @see listPackageProcessPidsCommand */
+    fun pgrepPackageCommand(dataPackageName: String): String =
+        listPackageProcessPidsCommand(dataPackageName)
+
+    /**
+     * 补充强停：仅对 ps NAME 匹配包名（含 :push）的 pid 执行 kill -9。
+     * 切号/备份前与 [AppCoordinator.forceStopTikTokCleanly] 共用此命令，避免两套杀进程逻辑漂移。
+     */
+    fun supplementalKillCommand(dataPackageName: String): String {
+        val q = shellQuote(dataPackageName.trim())
+        return "for p in \$(pidof $q 2>/dev/null) \$(ps -A -o PID=,NAME= 2>/dev/null | awk -v p=$q '\$2==p || index(\$2,p\":\")==1 {print \$1}'); do " +
+            "kill -9 \$p 2>/dev/null; done; true"
+    }
+
     /** 返回 KB（与 `du -sk` 第一列一致）；目录不存在或 du 失败时返回 null。 */
     fun measureDataDirKbCommand(absoluteDataDir: String): String =
         "du -sk ${shellQuote(absoluteDataDir)} 2>/dev/null | awk '{print \$1}'"

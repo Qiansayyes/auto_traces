@@ -1,4 +1,6 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260605-2";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260623-1";
+
+{
 
 const authShell = document.getElementById("authShell");
 const appShell = document.getElementById("appShell");
@@ -132,7 +134,14 @@ const schedulerTaskSettingsEl = document.getElementById("schedulerTaskSettings")
 const schedulerTaskLogsEl = document.getElementById("schedulerTaskLogs");
 const schedulerLogsFollowToggle = document.getElementById("schedulerLogsFollow");
 const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrollBottom");
-const autoSwitchEnabledToggle = document.getElementById("autoSwitchEnabledToggle");
+const autoSwitchSelectAllEnableBtn = document.getElementById("autoSwitchSelectAllEnableBtn");
+const autoSwitchEnableSelectedBtn = document.getElementById("autoSwitchEnableSelectedBtn");
+const autoSwitchDisableSelectedBtn = document.getElementById("autoSwitchDisableSelectedBtn");
+const autoSwitchEnabledCountHint = document.getElementById("autoSwitchEnabledCountHint");
+const autoSwitchSessionSummariesEl = document.getElementById("autoSwitchSessionSummariesEl");
+const autoSwitchSessionSummariesHint = document.getElementById("autoSwitchSessionSummariesHint");
+const autoSwitchSessionSummariesAliasSelect = document.getElementById("autoSwitchSessionSummariesAliasSelect");
+const autoSwitchSessionSummariesRefreshBtn = document.getElementById("autoSwitchSessionSummariesRefreshBtn");
 const backupStatsFullQueryEnabledToggle = document.getElementById("backupStatsFullQueryEnabledToggle");
 const LOG_SCROLL_THRESHOLD = 48;
 const taskContainerIdsInput = document.getElementById("taskContainerIds");
@@ -210,6 +219,7 @@ let galleryLibraryItems = [];
 const galleryLibrarySelectedIds = new Set();
 const galleryLibraryThumbUrls = new Map();
 const deviceLogDeviceSelect = document.getElementById("deviceLogDeviceSelect");
+const deviceLogPullBtn = document.getElementById("deviceLogPullBtn");
 const deviceExecLogsEl = document.getElementById("deviceExecLogs");
 const backupCloudInfoEl = document.getElementById("backupCloudInfo");
 const addBlankRecordBtn = document.getElementById("addBlankRecordBtn");
@@ -219,6 +229,15 @@ const accountBatchInputEl = document.getElementById("accountBatchInput");
 const accountBatchRegionInputEl = document.getElementById("accountBatchRegionInput");
 const accountBatchRejectEmptyToggleEl = document.getElementById("accountBatchRejectEmptyToggle");
 const importAccountBatchBtn = document.getElementById("importAccountBatchBtn");
+const accountBatchPreviewModalEl = document.getElementById("accountBatchPreviewModal");
+const closeAccountBatchPreviewBtn = document.getElementById("closeAccountBatchPreviewBtn");
+const cancelAccountBatchPreviewBtn = document.getElementById("cancelAccountBatchPreviewBtn");
+const confirmAccountBatchPreviewBtn = document.getElementById("confirmAccountBatchPreviewBtn");
+const accountBatchPreviewSelectAllEl = document.getElementById("accountBatchPreviewSelectAll");
+const accountBatchPreviewBulkAliasEl = document.getElementById("accountBatchPreviewBulkAlias");
+const accountBatchPreviewApplyAliasBtn = document.getElementById("accountBatchPreviewApplyAliasBtn");
+const accountBatchPreviewSummaryEl = document.getElementById("accountBatchPreviewSummary");
+const accountBatchPreviewTableWrapEl = document.getElementById("accountBatchPreviewTableWrap");
 const batchStreamAliasSelect = document.getElementById("batchStreamAliasSelect");
 const batchStreamHoursInput = document.getElementById("batchStreamHoursInput");
 const batchStreamRoundsInput = document.getElementById("batchStreamRoundsInput");
@@ -250,6 +269,8 @@ const DEVICE_ROWS_API = "/api/admin/editor/device_rows";
 let accountEditorRows = [];
 let deviceEditorRows = [];
 let backupArchiveRows = [];
+/** 当前备份档案分页接口返回的原始行，用于把勾选 row_index 解析为 device_id。 */
+let backupArchivePageItems = [];
 let backupAliasByUsername = new Map();
 let accountFilterUnassignedOnly = false;
 let batchStreamSessionId = "";
@@ -625,6 +646,9 @@ let selectedTiktokRootIds = new Set();
 let tiktokRootsUseServerPaging = false;
 let overviewAutoRefreshInFlight = false;
 let deviceLogsFetchInFlight = false;
+let deviceLogsPullInFlight = false;
+const DEVICE_LOG_PULL_POLL_MS = 2500;
+const DEVICE_LOG_PULL_TIMEOUT_MS = 40000;
 let taskStatusRefreshInFlight = false;
 let backupStatsFullQueryInFlight = false;
 let lastGalleryDispatchLogLine = "";
@@ -675,6 +699,7 @@ const LAST_TEMPLATE_KEY = "auto_traces_last_template_v1";
 const LAST_SECTION_KEY = "auto_traces_last_section_v1";
 const MAIL_ROUTE_KEY = "auto_traces_mail_route_v1";
 const DEVICE_GROUP_FILTER_KEY = "auto_traces_device_group_filter_v1";
+const AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY = "auto_traces_auto_switch_session_summaries_alias_v1";
 const DEVICE_GROUP_CUSTOM_KEY = "auto_traces_device_group_custom_v1";
 const OVERVIEW_PAGE_KEY = "auto_traces_overview_page_v1";
 const OVERVIEW_PAGE_SIZE_KEY = "auto_traces_overview_page_size_v1";
@@ -683,7 +708,9 @@ const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
-let autoSwitchEnabledGlobal = false;
+let backupArchiveSlotHighlightTimer = null;
+let autoSwitchDevicesById = new Map();
+let autoSwitchPickDeviceIds = new Set();
 let autoSwitchSaveInFlight = false;
 let backupStatsFullQueryScheduleAvailable = false;
 let backupStatsFullQuerySaveInFlight = false;
@@ -1124,22 +1151,147 @@ function getDeviceLogTargetIds() {
   return [];
 }
 
-async function refreshVisibleDeviceLogs() {
+async function fetchCachedDeviceLogs(ids, maxLines = 120) {
+  if (!ids.length) return { device_logs: {}, pull_pending: [] };
+  const qs = new URLSearchParams({ device_ids: ids.join(","), max_lines: String(maxLines) });
+  const data = await request(`/api/admin/device_logs?${qs}`);
+  const incoming = data?.device_logs && typeof data.device_logs === "object" ? data.device_logs : {};
+  latestDeviceLogs = { ...latestDeviceLogs, ...incoming };
+  return {
+    device_logs: incoming,
+    pull_pending: Array.isArray(data?.pull_pending) ? data.pull_pending : [],
+  };
+}
+
+async function requestDeviceLogPull(ids, maxLines = 400) {
+  if (!ids.length) return { requested: [] };
+  const data = await request("/api/admin/device_logs/request_pull", {
+    method: "POST",
+    body: JSON.stringify({ device_ids: ids, max_lines: maxLines }),
+  });
+  return {
+    requested: Array.isArray(data?.requested) ? data.requested : ids,
+  };
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function downloadDeviceLogFile(deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did) return false;
+  const url = await buildApiUrl(`/api/admin/device_logs/download?device_id=${encodeURIComponent(did)}`);
+  const headers = {};
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers, cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text();
+    let msg = text.slice(0, 200) || `下载失败 HTTP ${response.status}`;
+    try {
+      const data = JSON.parse(text);
+      if (data?.msg) msg = String(data.msg);
+    } catch {
+      /* 非 JSON 时沿用原始文本 */
+    }
+    const err = new Error(msg);
+    err.httpStatus = response.status;
+    throw err;
+  }
+  const blob = await response.blob();
+  const cd = response.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(cd);
+  const filename = match?.[1] || `device_${did}_${new Date().toISOString().slice(0, 10)}.txt`;
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+  return true;
+}
+
+async function pullDeviceLogsFromDevices(ids) {
+  if (!ids.length) {
+    renderDeviceExecLogs(latestDeviceLogs);
+    setStatus("请先选择要下载日志的设备", "error");
+    return;
+  }
+  if (deviceLogsPullInFlight) return;
+  deviceLogsPullInFlight = true;
+  if (deviceLogPullBtn) {
+    deviceLogPullBtn.disabled = true;
+    deviceLogPullBtn.textContent = "等待设备回传…";
+  }
+  try {
+    await requestDeviceLogPull(ids, 400);
+    const deadline = Date.now() + DEVICE_LOG_PULL_TIMEOUT_MS;
+    let lastPending = ids.slice();
+    while (Date.now() < deadline) {
+      const { pull_pending } = await fetchCachedDeviceLogs(ids, 400);
+      renderDeviceExecLogs(latestDeviceLogs);
+      lastPending = pull_pending;
+      if (!pull_pending.length) break;
+      await sleepMs(DEVICE_LOG_PULL_POLL_MS);
+    }
+    if (lastPending.length) {
+      appendDebugLog("DEVICE_LOG_PULL", { pending: lastPending, note: "timeout_or_offline" });
+      setStatus("设备未在时限内回传日志，请确认 App 在后台运行后重试", "error");
+      return;
+    }
+    let downloaded = 0;
+    let emptyToday = 0;
+    for (const did of ids) {
+      try {
+        const ok = await downloadDeviceLogFile(did);
+        if (ok) downloaded += 1;
+      } catch (err) {
+        if (err?.httpStatus === 404) {
+          emptyToday += 1;
+          continue;
+        }
+        appendDebugLog("DEVICE_LOG_DOWNLOAD", { device_id: did, error: String(err?.message || err) });
+        setStatus(err?.message || "下载日志文件失败", "error");
+        return;
+      }
+    }
+    if (downloaded > 0) {
+      setStatus(`已下载 ${downloaded} 台设备今日日志`, "success");
+    } else if (emptyToday > 0) {
+      setStatus("设备已回传，但今日暂无本地日志文件", "info");
+    }
+  } catch (err) {
+    appendDebugLog("DEVICE_LOG_PULL", { error: String(err?.message || err) });
+    setStatus(err?.message || "请求设备上传日志失败", "error");
+  } finally {
+    deviceLogsPullInFlight = false;
+    if (deviceLogPullBtn) {
+      deviceLogPullBtn.disabled = false;
+      deviceLogPullBtn.textContent = "下载今日日志";
+    }
+  }
+}
+
+async function refreshVisibleDeviceLogs({ requestPull = false } = {}) {
   const ids = getDeviceLogTargetIds();
   if (!ids.length) {
     renderDeviceExecLogs(latestDeviceLogs);
     return;
   }
+  if (requestPull) {
+    await pullDeviceLogsFromDevices(ids);
+    return;
+  }
   if (deviceLogsFetchInFlight) return;
   deviceLogsFetchInFlight = true;
   try {
-    const qs = new URLSearchParams({ device_ids: ids.join(",") });
-    const data = await request(`/api/admin/device_logs?${qs}`);
-    const incoming = data?.device_logs && typeof data.device_logs === "object" ? data.device_logs : {};
-    latestDeviceLogs = { ...latestDeviceLogs, ...incoming };
+    await fetchCachedDeviceLogs(ids, 400);
     renderDeviceExecLogs(latestDeviceLogs);
   } catch (_) {
-    /* 按需拉取失败静默，用户可切换设备或点刷新重试 */
+    /* 读取缓存失败静默，用户可点「下载今日日志」重试 */
   } finally {
     deviceLogsFetchInFlight = false;
   }
@@ -1543,6 +1695,7 @@ async function switchSection(id, options = {}) {
       await loadEditorState();
       renderDeviceRegionPresetOptions();
       renderDeviceAliasPresetOptions();
+      await loadAutoSwitchConfig({ refreshArchive: false });
       await loadBackupArchiveRecords();
     } catch (_) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
@@ -1844,13 +1997,16 @@ function renderDeviceRow(deviceId, info, context = {}) {
         data-action="toggle-device-auto-start"
         data-device="${deviceId}"
         data-optout="${optOut ? "1" : "0"}"
-        title="${adminAutoStartEnabled ? "点击切换该设备是否参与自动开启" : "当前总开关关闭，设备自动开启不会生效"}"
+        title="${adminAutoStartEnabled ? "点击切换该设备是否参与自动起号策略" : "当前总开关关闭，设备自动起号策略不会生效"}"
       >
         ${autoStartLabel}
       </button>
     </td>
   `;
-  const publishOneDisabled = !alias || info?.status === "offline" ? "disabled" : "";
+  const publishOneDisabled = !alias || info?.status === "offline" || isAutoSwitchEnabledForDeviceId(deviceId) ? "disabled" : "";
+  const publishOneTitle = isAutoSwitchEnabledForDeviceId(deviceId)
+    ? AUTO_SWITCH_MANUAL_BLOCK_HINT
+    : "本行单台下发发作品入口（与上方批量「发布作品」相同接口）";
   const opsCell = `
     <td style="white-space:nowrap;">
       <button
@@ -1861,7 +2017,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
         data-device="${deviceId}"
         data-alias="${alias}"
         ${publishOneDisabled}
-        title="本行单台下发发作品入口（与上方批量「发布作品」相同接口）"
+        title="${publishOneTitle}"
       >
         发布作品
       </button>
@@ -1927,6 +2083,7 @@ function renderDevices(devices, options = {}) {
   } else {
     deviceTable.innerHTML = rowHtml.join("");
   }
+  applyAutoSwitchManualOpsUi();
   if (!options.skipSmartPreview) {
     void refreshSmartTemplatePreviews(visibleRows);
   }
@@ -1941,7 +2098,7 @@ function renderDevices(devices, options = {}) {
       const opt = el?.dataset?.optout === "1";
       if (!did) return;
       try {
-        setStatus("正在更新单设备自动开启策略...", "info");
+      setStatus("正在更新单设备自动起号策略...", "info");
         const data = await request("/api/admin/device_auto_start_opt_out", {
           method: "POST",
           body: JSON.stringify({ device_id: did, opt_out: !opt }),
@@ -1952,7 +2109,7 @@ function renderDevices(devices, options = {}) {
         }
         renderDevices(latestDevices);
         bindDeviceSelection();
-        setStatus("已更新单设备自动开启策略", "success");
+        setStatus("已更新单设备自动起号策略", "success");
       } catch (error) {
         setStatus(error.message || "更新失败", "error");
       }
@@ -1963,6 +2120,7 @@ function renderDevices(devices, options = {}) {
       const el = e.currentTarget;
       const did = String(el?.dataset?.device || "").trim();
       const alias = String(el?.dataset?.alias || "").trim();
+      if (!guardAutoSwitchManualOps("发作品", did)) return;
       if (!did || !alias || el.disabled) return;
       const oldText = String(el.textContent || "发布作品").trim() || "发布作品";
       el.disabled = true;
@@ -1976,7 +2134,7 @@ function renderDevices(devices, options = {}) {
         });
         await loadOverview();
         bindDeviceSelection();
-        setStatus(`发作品入口已下发：${alias}（云端已关闭该设备自动开启程序）`, "success");
+        setStatus(`发作品入口已下发：${alias}（云端已关闭该设备自动起号策略参与）`, "success");
       } catch (error) {
         setStatus(error.message || "发作品下发失败", "error");
       } finally {
@@ -2177,6 +2335,27 @@ function mutualTrafficActionCheckboxEls() {
   return { followOnlyEl, actionEls };
 }
 
+function syncNoRestUi() {
+  const noRestEl = configForm?.querySelector("[name='no_rest']");
+  if (!noRestEl) return;
+  const disabled = Boolean(noRestEl.checked);
+  ["break_min", "break_max"].forEach((name) => {
+    const input = configForm?.querySelector(`[name='${name}']`);
+    if (!input) return;
+    input.disabled = disabled;
+    input.closest(".range-half")?.classList.toggle("checkbox-inline--disabled", disabled);
+  });
+}
+
+function setupNoRestToggleListeners() {
+  if (!configForm || configForm.dataset.noRestBound === "1") return;
+  configForm.dataset.noRestBound = "1";
+  const noRestEl = configForm.querySelector("[name='no_rest']");
+  if (!noRestEl) return;
+  noRestEl.addEventListener("change", syncNoRestUi);
+  syncNoRestUi();
+}
+
 /** 「互点-仅关注」与评论/作者区/Followers 三项互斥。 */
 function syncMutualTrafficActionMutex(changedInput = null) {
   const { followOnlyEl, actionEls } = mutualTrafficActionCheckboxEls();
@@ -2295,6 +2474,7 @@ function fillConfigForm(config, mode = currentRunMode) {
   }
   syncCvQualityFilterInputsFromConfig(cfg);
   syncMutualTrafficActionMutex();
+  syncNoRestUi();
 }
 
 function persistCommentTextsToLocal() {
@@ -2524,7 +2704,7 @@ function bindDeviceSelection() {
     checkbox.addEventListener("change", () => {
       updateStartHint();
       if (!(deviceLogDeviceSelect?.value || "").trim()) {
-        void refreshVisibleDeviceLogs();
+        void refreshVisibleDeviceLogs({ requestPull: false });
       }
     });
   });
@@ -2742,6 +2922,9 @@ async function deleteCurrentDeviceAliasGroup() {
 }
 
 async function startDevices(deviceIds) {
+  for (const id of deviceIds) {
+    if (!guardAutoSwitchManualOps("启动设备", id)) return;
+  }
   if (!deviceIds.length) {
     setStatus("请选择需要启动的设备", "warning");
     return;
@@ -2763,6 +2946,9 @@ async function startDevices(deviceIds) {
 }
 
 async function stopDevices(deviceIds) {
+  for (const id of deviceIds) {
+    if (!guardAutoSwitchManualOps("停止设备", id)) return;
+  }
   if (!deviceIds.length) {
     setStatus("请选择需要停止的设备", "warning");
     return;
@@ -2869,6 +3055,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    no_rest: false,
     publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
@@ -2913,6 +3100,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    no_rest: false,
     publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
@@ -2956,6 +3144,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     skip_post_click_prob: 0,
     pull_batch_size: 5,
     pull_batches_before_rest: 5,
+    no_rest: false,
     publish_post_material_fetch_count: 3,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
@@ -2977,8 +3166,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
 function updateAutoStartToggleUi() {
   if (!autoStartToggleBtn) return;
   autoStartToggleBtn.textContent = adminAutoStartEnabled
-    ? "自动开启程序：开"
-    : "自动开启程序：关";
+    ? "自动起号策略：开"
+    : "自动起号策略：关";
   autoStartToggleBtn.classList.toggle("primary", adminAutoStartEnabled);
   autoStartToggleBtn.classList.toggle("ghost", !adminAutoStartEnabled);
 }
@@ -3084,7 +3273,7 @@ async function loadOverview() {
   }
 
   void startedAt;
-  await refreshVisibleDeviceLogs();
+  await refreshVisibleDeviceLogs({ requestPull: false });
 }
 
 function isOverviewActive() {
@@ -3423,6 +3612,7 @@ function collectConfig() {
     if (value === "") continue;
     if (
       key === "action_single" ||
+      key === "no_rest" ||
       key === "mutual_traffic_comment" ||
       key === "mutual_traffic_author_follow" ||
       key === "mutual_traffic_followers_follow" ||
@@ -3453,6 +3643,8 @@ function collectConfig() {
     }
   }
   for (const key of [
+    "action_single",
+    "no_rest",
     "mutual_traffic_comment",
     "mutual_traffic_comment_daily_limit",
     "mutual_traffic_author_follow",
@@ -4335,19 +4527,453 @@ async function saveSchedulerConfig() {
   }
 }
 
-function isAutoSwitchGloballyEnabled() {
-  if (autoSwitchEnabledToggle) return !!autoSwitchEnabledToggle.checked;
-  return autoSwitchEnabledGlobal;
+function sessionAllowedDeviceIdSet() {
+  const ids = new Set();
+  buildAliasDevicePairs().forEach((item) => {
+    const did = String(item?.device_id || "").trim();
+    if (did) ids.add(did);
+  });
+  return ids;
 }
 
-async function loadAutoSwitchConfig() {
+function filterAutoSwitchDeviceIds(deviceIds) {
+  const allowed = sessionAllowedDeviceIdSet();
+  const cleaned = Array.from(new Set((deviceIds || []).map((d) => String(d || "").trim()).filter(Boolean)));
+  if (!allowed.size) return cleaned;
+  return cleaned.filter((d) => allowed.has(d));
+}
+
+function resolveDeviceIdForArchiveAlias(alias, rowDeviceId = "") {
+  const aliasKey = normalizeAliasKey(alias);
+  const allowed = sessionAllowedDeviceIdSet();
+  const accept = (did) => {
+    const id = String(did || "").trim();
+    if (!id) return "";
+    if (!allowed.size || allowed.has(id)) return id;
+    return "";
+  };
+  if (aliasKey && aliasKey !== "__empty_alias__") {
+    const fromPairs = resolveDeviceIdByAlias(alias);
+    const paired = accept(fromPairs);
+    if (paired) return paired;
+    const fromDevices = Object.entries(latestDevices || {}).find(([, info]) =>
+      normalizeAliasKey(info?.alias) === aliasKey,
+    );
+    const fromOverview = accept(fromDevices ? fromDevices[0] : "");
+    if (fromOverview) return fromOverview;
+  }
+  return accept(rowDeviceId);
+}
+
+function resolveDeviceIdForArchiveDetails(detailsEl) {
+  if (!(detailsEl instanceof HTMLElement)) return "";
+  const alias = String(detailsEl.dataset.archiveAlias || "").trim();
+  const fromAttr = String(detailsEl.dataset.archiveDeviceId || "").trim();
+  return resolveDeviceIdForArchiveAlias(alias, fromAttr);
+}
+
+function aliasGroupHasSelectedExportRows(detailsEl) {
+  if (!(detailsEl instanceof HTMLElement)) return false;
+  return Array.from(
+    detailsEl.querySelectorAll(".backup-archive-export-select, .backup-archive-group-select-all"),
+  ).some((el) => el instanceof HTMLInputElement && el.checked);
+}
+
+/** 收集待开启/关闭自动切号的 device_id（勾选记录 / 本组全选 / 程序化全选）。 */
+function collectAutoSwitchTargetDeviceIds() {
+  const ids = new Set(autoSwitchPickDeviceIds);
+  if (backupArchiveSelectedRowIndices.size && Array.isArray(backupArchivePageItems)) {
+    backupArchivePageItems.forEach((row) => {
+      const idx = resolveBackupArchiveExportRowIndex(row);
+      if (idx == null || !backupArchiveSelectedRowIndices.has(idx)) return;
+      const alias = resolveBackupArchiveDisplayAlias(row);
+      const did = resolveDeviceIdForArchiveAlias(alias, row?.device_id);
+      if (did) ids.add(did);
+    });
+  }
+  if (deviceAliasGroupsEl) {
+    deviceAliasGroupsEl.querySelectorAll("details.panel-card[data-archive-alias]").forEach((details) => {
+      if (!(details instanceof HTMLElement)) return;
+      const hasExportPick = Array.from(
+        details.querySelectorAll(".backup-archive-export-select, .backup-archive-group-select-all"),
+      ).some((el) => el instanceof HTMLInputElement && el.checked);
+      if (!hasExportPick) return;
+      const did = resolveDeviceIdForArchiveDetails(details);
+      if (did) ids.add(did);
+    });
+  }
+  return filterAutoSwitchDeviceIds(Array.from(ids));
+}
+
+function syncAutoSwitchPickForAliasGroup(detailsEl, checked = true) {
+  if (!(detailsEl instanceof HTMLElement)) return "";
+  const did = resolveDeviceIdForArchiveDetails(detailsEl);
+  if (!did) return "";
+  if (checked) {
+    autoSwitchPickDeviceIds.add(did);
+  } else if (!aliasGroupHasSelectedExportRows(detailsEl)) {
+    autoSwitchPickDeviceIds.delete(did);
+  }
+  return did;
+}
+
+function isAutoSwitchEnabledForDeviceId(deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did) return false;
+  return !!autoSwitchDevicesById.get(did);
+}
+
+function isAutoSwitchEnabledForArchiveAlias(alias, rowDeviceId = "") {
+  return isAutoSwitchEnabledForDeviceId(resolveDeviceIdForArchiveAlias(alias, rowDeviceId));
+}
+
+function isAutoSwitchGloballyEnabled() {
+  return autoSwitchDevicesById.size > 0 && Array.from(autoSwitchDevicesById.values()).some(Boolean);
+}
+
+function updateAutoSwitchEnabledCountHint() {
+  if (!autoSwitchEnabledCountHint) return;
+  const enabled = Array.from(autoSwitchDevicesById.entries()).filter(([, on]) => on).length;
+  autoSwitchEnabledCountHint.textContent = enabled > 0 ? `自动切号中：${enabled} 台设备` : "自动切号：未开启";
+}
+
+function applyAutoSwitchManualOpsUi() {
+  const hint = AUTO_SWITCH_MANUAL_BLOCK_HINT;
+  [
+    ["startSelectedBtn", "启动选中"],
+    ["startAllBtn", "启动全部"],
+    ["stopSelectedBtn", "停止选中"],
+    ["publishPostStartSelectedBtn", "批量发作品"],
+  ].forEach(([id, label]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.disabled = false;
+    el.title = "";
+  });
+  if (autoSwitchSelectAllEnableBtn) {
+    autoSwitchSelectAllEnableBtn.disabled = autoSwitchSaveInFlight;
+  }
+  if (autoSwitchEnableSelectedBtn) {
+    const pickCount = collectAutoSwitchTargetDeviceIds().length;
+    const rawCount = autoSwitchPickDeviceIds.size
+      + (backupArchiveSelectedRowIndices.size > 0 ? backupArchiveSelectedRowIndices.size : 0);
+    autoSwitchEnableSelectedBtn.disabled = autoSwitchSaveInFlight || pickCount === 0;
+    autoSwitchEnableSelectedBtn.title =
+      pickCount > 0
+        ? `为已选的 ${pickCount} 台设备开启自动切号（本机自治）`
+        : rawCount > 0
+          ? "所选别名尚未绑定有效 device_id，请先在设备总览完成客户端绑定"
+          : "请勾选别名组左侧复选框，或点「全选本页」";
+  }
+  if (autoSwitchDisableSelectedBtn) {
+    const pickCount = collectAutoSwitchTargetDeviceIds().length;
+    autoSwitchDisableSelectedBtn.disabled = autoSwitchSaveInFlight || pickCount === 0;
+  }
+  updateAutoSwitchEnabledCountHint();
+}
+
+const AUTO_SWITCH_MANUAL_BLOCK_HINT = "该设备已开启自动切号，请先关闭后再操作";
+
+function guardAutoSwitchManualOps(actionLabel = "该操作", deviceId = "", alias = "", rowDeviceId = "") {
+  const did = String(deviceId || "").trim() || resolveDeviceIdForArchiveAlias(alias, rowDeviceId);
+  if (!isAutoSwitchEnabledForDeviceId(did)) return true;
+  setStatus(`${actionLabel}不可用：${AUTO_SWITCH_MANUAL_BLOCK_HINT}`, "warning");
+  return false;
+}
+
+async function loadAutoSwitchConfig(options = {}) {
+  const refreshArchive = options.refreshArchive !== false;
   try {
     const data = await request("/api/admin/auto_switch/config");
     const cfg = data.data || {};
-    autoSwitchEnabledGlobal = !!cfg.enabled;
-    if (autoSwitchEnabledToggle) autoSwitchEnabledToggle.checked = autoSwitchEnabledGlobal;
+    autoSwitchDevicesById = new Map();
+    const devices = Array.isArray(cfg.devices) ? cfg.devices : [];
+    devices.forEach((item) => {
+      const did = String(item?.device_id || "").trim();
+      if (did) autoSwitchDevicesById.set(did, !!item?.enabled);
+    });
+    applyAutoSwitchManualOpsUi();
+    populateAutoSwitchSessionSummariesAliasOptions();
+    await loadAutoSwitchSessionSummaries();
+    if (refreshArchive && deviceAliasGroupsEl) {
+      void loadBackupArchiveRecords();
+    }
   } catch (_) {
     /* ignore */
+  }
+}
+
+function renderSmartTemplateDebugBlock(debug) {
+  if (!debug || typeof debug !== "object") return "";
+  const accounts = debug.accounts && typeof debug.accounts === "object" ? debug.accounts : {};
+  const rows = Object.entries(accounts).map(([user, item]) => {
+    const row = item && typeof item === "object" ? item : {};
+    const branch = String(row.branch_label || row.branch || "-");
+    const tpl = String(row.selected_template || row.picked_template || "-");
+    const roll = row.roll;
+    const total = row.total_weight;
+    const rollText =
+      typeof roll === "number" && typeof total === "number" && total > 0
+        ? ` · roll ${roll}/${total}`
+        : "";
+    const src = String(row.resolution_source || "");
+    const srcText = src ? ` · ${src}` : "";
+    return `<li><code>${escapeHtml(user)}</code> → ${escapeHtml(tpl)}（${escapeHtml(branch)}${rollText}${srcText}）</li>`;
+  });
+  if (!rows.length && !debug.session_id) return "";
+  const meta = [
+    debug.enabled ? "智能模板" : "别名绑定",
+    debug.session_id ? `session ${String(debug.session_id)}` : "",
+    debug.enter_reroll ? "enter 重掷" : "",
+  ].filter(Boolean).join(" · ");
+  return `
+    <div class="auto-switch-smart-debug" style="margin:8px 0;">
+      <div class="hint"><strong>模板打包审计</strong>${meta ? ` · ${escapeHtml(meta)}` : ""}</div>
+      ${rows.length ? `<ul class="auto-switch-summary-notes">${rows.join("")}</ul>` : ""}
+    </div>
+  `;
+}
+
+function renderAccountActivityAuditBlock(reconciliation) {
+  const items = Array.isArray(reconciliation?.account_activity) ? reconciliation.account_activity : [];
+  if (!items.length) return "";
+  const actionLabel = {
+    like: "赞",
+    comment: "评",
+    favorite: "藏",
+    share: "转",
+    mutual_traffic_comment: "引流评",
+    mutual_follow: "关注",
+  };
+  const rows = items.map((item) => {
+    const account = String(item?.account || "-");
+    const tpl = String(item?.active_template || "-");
+    const slot = String(item?.slot_key || "-");
+    const start = String(item?.segment_started_at || "-");
+    const end = String(item?.segment_ended_at || "-");
+    const reason = String(item?.segment_reason || "");
+    const cfg = item?.template_config && typeof item.template_config === "object" ? item.template_config : {};
+    const counts = item?.action_counts && typeof item.action_counts === "object" ? item.action_counts : {};
+    const cfgParts = [];
+    if (cfg.mutual_traffic_comment) cfgParts.push("引流评");
+    if (cfg.mutual_traffic_author_follow) cfgParts.push("作者区关注");
+    if (cfg.mutual_traffic_followers_follow) cfgParts.push("Followers关注");
+    if (cfg.mutual_traffic_follow_only) cfgParts.push("仅关注");
+    const probParts = ["like_prob", "comment_prob", "favorite_prob", "share_prob"]
+      .filter((k) => typeof cfg[k] === "number" && cfg[k] > 0)
+      .map((k) => `${actionLabel[k.replace("_prob", "")] || k}${cfg[k]}`);
+    const countParts = Object.entries(counts)
+      .filter(([, v]) => Number(v) > 0)
+      .map(([k, v]) => `${actionLabel[k] || k}×${v}`);
+    const cfgText = [...probParts, ...cfgParts].join(" · ") || "—";
+    const countText = countParts.length ? countParts.join(" · ") : "无计数";
+    return `<li><strong>${escapeHtml(account)}</strong> · ${escapeHtml(tpl)} · ${escapeHtml(start)}~${escapeHtml(end)}` +
+      `${reason ? ` · ${escapeHtml(reason)}` : ""}<br/>` +
+      `<span class="hint">时段 ${escapeHtml(slot)} · 模板配置 ${escapeHtml(cfgText)} · 执行 ${escapeHtml(countText)}</span></li>`;
+  });
+  return `
+    <div class="auto-switch-activity-audit" style="margin:8px 0;">
+      <div class="hint"><strong>账号任务对账</strong> · ${items.length} 段</div>
+      <ul class="auto-switch-summary-notes">${rows.join("")}</ul>
+    </div>
+  `;
+}
+
+function renderAutoSwitchSessionSummaryCard(item) {
+  const alias = String(item?.alias || "-");
+  const deviceId = String(item?.device_id || "");
+  const scheduleDate = String(item?.schedule_date || "");
+  const createdAt = String(item?.created_at || "");
+  const sessionId = String(item?.session_id || "");
+  const stats = item?.stats && typeof item.stats === "object" ? item.stats : {};
+  const statsLine = [
+    `操作 ${Number(stats.total ?? 0)}`,
+    `成功 ${Number(stats.success ?? 0)}`,
+    `失败 ${Number(stats.failed ?? 0)}`,
+    Number(stats.cut_switch_missing_backup ?? 0) > 0
+      ? `备份缺失改登录 ${Number(stats.cut_switch_missing_backup ?? 0)}`
+      : "",
+  ].filter(Boolean).join(" · ");
+  const notes = Array.isArray(item?.reconciliation?.notes) ? item.reconciliation.notes : [];
+  const notesHtml = notes.length
+    ? `<ul class="auto-switch-summary-notes">${notes.map((n) => `<li>${escapeHtml(String(n || ""))}</li>`).join("")}</ul>`
+    : "";
+  const humanLog = String(item?.human_log || "").trim();
+  const smartDebugHtml = renderSmartTemplateDebugBlock(item?.smart_template_debug);
+  const activityHtml = renderAccountActivityAuditBlock(item?.reconciliation);
+  return `
+    <div class="panel-card auto-switch-summary-card">
+      <div class="auto-switch-summary-head">
+        <strong>${escapeHtml(alias)}</strong>
+        <span class="hint">${escapeHtml(deviceId)} · ${escapeHtml(scheduleDate)} · ${escapeHtml(createdAt)}</span>
+      </div>
+      <div class="hint" style="margin:6px 0;">${escapeHtml(sessionId)} · ${escapeHtml(statsLine)}</div>
+      ${activityHtml}
+      ${smartDebugHtml}
+      ${notesHtml}
+      <pre class="auto-switch-human-log">${escapeHtml(humanLog || "（无 human_log）")}</pre>
+    </div>
+  `;
+}
+
+function getAutoSwitchSessionSummariesAliasFilter() {
+  const fromSelect = String(autoSwitchSessionSummariesAliasSelect?.value ?? "").trim();
+  if (fromSelect || !autoSwitchSessionSummariesAliasSelect) return fromSelect;
+  try {
+    return String(localStorage.getItem(AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY) || "").trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+function populateAutoSwitchSessionSummariesAliasOptions() {
+  if (!autoSwitchSessionSummariesAliasSelect) return;
+  const prev = getAutoSwitchSessionSummariesAliasFilter();
+  const seen = new Set();
+  const options = ['<option value="">全部别名</option>'];
+  (boundDeviceAliasPairs || []).forEach(({ device_alias }) => {
+    const alias = normalizeAliasValue(device_alias);
+    if (!alias || seen.has(alias)) return;
+    seen.add(alias);
+    options.push(`<option value="${escapeHtml(alias)}">${escapeHtml(alias)}</option>`);
+  });
+  autoSwitchSessionSummariesAliasSelect.innerHTML = options.join("");
+  const restore = prev && [...autoSwitchSessionSummariesAliasSelect.options].some((opt) => opt.value === prev) ? prev : "";
+  autoSwitchSessionSummariesAliasSelect.value = restore;
+  try {
+    localStorage.setItem(AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY, restore);
+  } catch (_) {}
+}
+
+async function loadAutoSwitchSessionSummaries() {
+  if (!autoSwitchSessionSummariesEl) return;
+  const aliasFilter = getAutoSwitchSessionSummariesAliasFilter();
+  const qs = new URLSearchParams({ limit: "15" });
+  if (aliasFilter) qs.set("alias", aliasFilter);
+  try {
+    const data = await request(`/api/admin/auto_switch/session_summaries?${qs.toString()}`);
+    const items = Array.isArray(data?.data?.items) ? data.data.items : [];
+    if (autoSwitchSessionSummariesHint) {
+      const hintParts = [];
+      if (aliasFilter) hintParts.push(aliasFilter);
+      hintParts.push(items.length ? `最近 ${items.length} 条` : "无记录");
+      autoSwitchSessionSummariesHint.textContent = hintParts.join(" · ");
+    }
+    if (!items.length) {
+      autoSwitchSessionSummariesEl.innerHTML = aliasFilter
+        ? `<div class="hint">别名「${escapeHtml(aliasFilter)}」暂无已关闭的自动切号会话总结</div>`
+        : '<div class="hint">暂无已关闭的自动切号会话总结（关闭设备自动切号后由设备端一次性上报）</div>';
+      return;
+    }
+    autoSwitchSessionSummariesEl.innerHTML = items.map((item) => renderAutoSwitchSessionSummaryCard(item)).join("");
+  } catch (error) {
+    autoSwitchSessionSummariesEl.innerHTML = `<div class="hint">加载会话总结失败：${escapeHtml(error.message || "unknown")}</div>`;
+  }
+}
+
+async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
+  await loadBoundDeviceAliases().catch(() => {});
+  const raw = Array.from(new Set((deviceIds || []).map((d) => String(d || "").trim()).filter(Boolean)));
+  const ids = filterAutoSwitchDeviceIds(raw);
+  if (!ids.length) {
+    setStatus(
+      raw.length
+        ? "所选别名未绑定有效 device_id（档案内 device_id 可能已过期），请先在设备总览确认客户端已绑定"
+        : "请先勾选要操作的设备别名组",
+      "warning",
+    );
+    return;
+  }
+  const data = await request("/api/admin/auto_switch/devices", {
+    method: "POST",
+    body: JSON.stringify({ device_ids: ids, enabled: !!enabled }),
+  });
+  await loadAutoSwitchConfig({ refreshArchive: true });
+  if (options.refreshStatus !== false) {
+    await refreshTaskStatus();
+  }
+  const resp = data?.data || {};
+  setStatus(
+    enabled
+      ? `已为 ${Number(resp.devices_changed || 0)} 台设备开启自动切号（已通知 ${Number(resp.devices_notified || 0)} 台）`
+      : `已为 ${Number(resp.devices_changed || 0)} 台设备关闭自动切号`,
+    "success",
+  );
+}
+
+async function saveAutoSwitchConfig(options = {}) {
+  if (autoSwitchSaveInFlight) {
+    setStatus("自动切号配置保存中，请稍候…", "info");
+    return;
+  }
+  const enabled = !!options.enabled;
+  await loadBoundDeviceAliases().catch(() => {});
+  const deviceIds = filterAutoSwitchDeviceIds(
+    (options.deviceIds && options.deviceIds.length)
+      ? options.deviceIds
+      : collectAutoSwitchTargetDeviceIds(),
+  );
+  if (!deviceIds.length) {
+    setStatus(
+      backupArchiveSelectedRowIndices.size > 0 || autoSwitchPickDeviceIds.size > 0
+        ? "所选别名未绑定有效 device_id，请先在设备总览确认客户端已绑定后再开启自动切号"
+        : "请先选择设备：勾选别名组左侧复选框，或点「全选本页」",
+      "warning",
+    );
+    return;
+  }
+  autoSwitchPickDeviceIds = new Set(deviceIds);
+  autoSwitchSaveInFlight = true;
+  applyAutoSwitchManualOpsUi();
+  try {
+    await saveAutoSwitchForDeviceIds(deviceIds, enabled);
+  } catch (error) {
+    await loadAutoSwitchConfig({ refreshArchive: true });
+    setStatus(error.message || "保存自动切号配置失败", "error");
+  } finally {
+    autoSwitchSaveInFlight = false;
+    applyAutoSwitchManualOpsUi();
+  }
+}
+
+async function collectAllAutoSwitchDeviceIds() {
+  const ids = new Set();
+  try {
+    const cfgResp = await request("/api/admin/auto_switch/config");
+    const devices = Array.isArray(cfgResp?.data?.devices) ? cfgResp.data.devices : [];
+    devices.forEach((item) => {
+      const did = String(item?.device_id || "").trim();
+      if (did) ids.add(did);
+    });
+  } catch (_) {
+    /* 下方仍会用别名绑定表兜底 */
+  }
+  buildAliasDevicePairs().forEach((item) => {
+    const did = String(item?.device_id || "").trim();
+    if (did) ids.add(did);
+  });
+  return Array.from(ids);
+}
+
+async function enableAutoSwitchForAllDevices() {
+  if (autoSwitchSaveInFlight) return;
+  autoSwitchSaveInFlight = true;
+  applyAutoSwitchManualOpsUi();
+  try {
+    await loadBoundDeviceAliases().catch(() => {});
+    const deviceIds = await collectAllAutoSwitchDeviceIds();
+    if (!deviceIds.length) {
+      setStatus("当前账号下没有可开启自动切号的设备（请确认客户端已绑定）", "warning");
+      return;
+    }
+    autoSwitchPickDeviceIds = new Set(deviceIds);
+    await saveAutoSwitchForDeviceIds(deviceIds, true);
+  } catch (error) {
+    await loadAutoSwitchConfig({ refreshArchive: true });
+    setStatus(error.message || "全选并开启失败", "error");
+  } finally {
+    autoSwitchSaveInFlight = false;
+    applyAutoSwitchManualOpsUi();
   }
 }
 
@@ -4401,41 +5027,6 @@ async function saveBackupStatsFullQueryConfig(options = {}) {
     setStatus(error.message || "保存失败", "error");
   } finally {
     backupStatsFullQuerySaveInFlight = false;
-  }
-}
-
-async function saveAutoSwitchConfig(options = {}) {
-  if (autoSwitchSaveInFlight) return;
-  autoSwitchSaveInFlight = true;
-  try {
-    let enabled = !!autoSwitchEnabledToggle?.checked;
-    do {
-      enabled = !!autoSwitchEnabledToggle?.checked;
-      await request("/api/admin/auto_switch/config", {
-        method: "POST",
-        body: JSON.stringify({ enabled }),
-      });
-      autoSwitchEnabledGlobal = enabled;
-    } while (enabled !== !!autoSwitchEnabledToggle?.checked);
-
-    if (options.refreshStatus !== false) {
-      await refreshTaskStatus();
-    }
-    if (deviceAliasGroupsEl) {
-      void loadBackupArchiveRecords();
-    }
-    setStatus(
-      enabled ? "自动切号已开启（将立即对齐当前时段账号；手动切号已禁用）" : "自动切号已关闭（可手动切号）",
-      "success",
-    );
-  } catch (error) {
-    await loadAutoSwitchConfig();
-    setStatus(error.message || "保存自动切号配置失败", "error");
-  } finally {
-    autoSwitchSaveInFlight = false;
-    if (!!autoSwitchEnabledToggle?.checked !== autoSwitchEnabledGlobal) {
-      void saveAutoSwitchConfig(options);
-    }
   }
 }
 
@@ -4634,6 +5225,9 @@ async function apiPublishPostStart(payload) {
 
 async function startPublishPostForSelectedDevices() {
   const selectedIds = selectedDeviceIds();
+  for (const id of selectedIds) {
+    if (!guardAutoSwitchManualOps("发作品", id)) return;
+  }
   if (!selectedIds.length) {
     setStatus("请先勾选设备", "warning");
     return;
@@ -4666,7 +5260,7 @@ async function startPublishPostForSelectedDevices() {
   }
   await loadOverview();
   if (!failedCount) {
-    setStatus(`发作品入口指令已下发（${successCount}/${targets.length}）；云端已关闭对应设备自动开启程序`, "success");
+    setStatus(`发作品入口指令已下发（${successCount}/${targets.length}）；云端已关闭对应设备自动起号策略参与`, "success");
   } else {
     setStatus(`发作品入口部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
   }
@@ -5411,6 +6005,7 @@ async function handleBasicProfileEditFromBackupCard(card) {
 
   const actionAlias = String(card.getAttribute("data-action-alias") || "").trim();
   const deviceId = String(card.getAttribute("data-row-device-id") || "").trim();
+  if (!guardAutoSwitchManualOps("修改账号基本资料", deviceId, actionAlias, deviceId)) return;
   const username = String(card.getAttribute("data-row-username") || "").trim();
   const identity = deviceId
     ? collectDeviceIdentityByDeviceAndAlias(deviceId, actionAlias)
@@ -5420,7 +6015,7 @@ async function handleBasicProfileEditFromBackupCard(card) {
   const detailLines = [
     `设备别名：${actionAlias}`,
     username ? `账号：${username}` : null,
-    "执行期间设备会暂停涨粉并临时关闭「自动开启程序」，避免与修改资料流程争抢 TikTok。",
+    "执行期间设备会暂停涨粉并临时关闭「自动起号策略参与」，避免与修改资料流程争抢 TikTok。",
     "设备端总结果为 success 并回传云端后，系统会自动将该账号「基本资料已修改」标为「是」并关闭 TikTok；随后可回到 AutoTraces 查看。",
   ].filter(Boolean);
   if (!confirmTikTokAction("修改账号基本资料", detailLines.join("\n"))) return;
@@ -5433,6 +6028,7 @@ async function handleBasicProfileEditFromBackupCard(card) {
 }
 
 async function handleRestoreClick(alias, backupName, deviceId = "", execOptions = {}) {
+  if (!guardAutoSwitchManualOps("清理并还原", deviceId, alias, deviceId)) return;
   const {
     skipConfirm = false,
     skipPmClear = false,
@@ -5484,10 +6080,112 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
   return result;
 }
 
-/** 同别名桶内：仅一条记录时视为当前高亮；多条时以 switch_highlight===「是」为高亮 */
-function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row) {
+function getBeijingNowParts() {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type) => parts.find((p) => p.type === type)?.value || "";
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: Number(get("hour") || 0),
+    minute: Number(get("minute") || 0),
+  };
+}
+
+function beijingDateStrNow() {
+  const p = getBeijingNowParts();
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function beijingMinuteOfDayNow() {
+  const p = getBeijingNowParts();
+  return p.hour * 60 + p.minute;
+}
+
+function isAutoSwitchDailyPlanScheduleCurrent() {
+  const planDate = String(autoSwitchDailyPlanDate || "").trim();
+  return Boolean(planDate && planDate === beijingDateStrNow());
+}
+
+function resolveBackupArchiveAliasKey(alias, row = {}) {
+  return normalizeAliasKey(
+    row?.device_bucket_alias
+    || (alias === "__EMPTY_ALIAS__"
+      ? (row?.mobile_alias || row?.device_alias || row?.assigned_alias)
+      : alias)
+  );
+}
+
+/** 按云端 daily_plan + 北京时间解析当前时段应归属的 row（与设备端调度一致） */
+function resolveCurrentSlotEntryForAliasKey(aliasKey) {
+  const key = normalizeAliasKey(aliasKey);
+  if (!key) return null;
+  const bucket = autoSwitchDailyPlansByAlias[key];
+  const slotsMap = bucket?.slots_by_row_index;
+  if (!slotsMap || typeof slotsMap !== "object") return null;
+  const minute = beijingMinuteOfDayNow();
+  let fallback = null;
+  let maxSlotIndex = -1;
+  for (const [ri, slot] of Object.entries(slotsMap)) {
+    const start = Number(slot?.start_min) || 0;
+    const end = Number(slot?.end_min) || 0;
+    const slotIndex = Number(slot?.slot_index) || 0;
+    const entry = { ...slot, rowIndex: Number(ri) };
+    if (start <= minute && minute < end) return entry;
+    if (slotIndex >= maxSlotIndex) {
+      maxSlotIndex = slotIndex;
+      fallback = entry;
+    }
+  }
+  return fallback;
+}
+
+function resolveBackupArchiveRowIndex(row) {
+  const ri = Number(row?.row_index ?? row?.id);
+  return Number.isFinite(ri) && ri >= 0 ? ri : null;
+}
+
+function isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias) {
   const n = Array.isArray(rowsInBucket) ? rowsInBucket.length : 0;
   if (n <= 1) return true;
+  const actionAlias = alias === "__EMPTY_ALIAS__" ? resolveBackupArchiveDisplayAlias(row) : alias;
+  const deviceId = String(row?.device_id || "").trim();
+  if (!isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId)) return false;
+  if (!isAutoSwitchDailyPlanScheduleCurrent()) return false;
+  const current = resolveCurrentSlotEntryForAliasKey(resolveBackupArchiveAliasKey(alias, row));
+  if (!current) return false;
+  const rowRi = resolveBackupArchiveRowIndex(row);
+  if (rowRi != null && Number.isFinite(Number(current.rowIndex))) {
+    return rowRi === Number(current.rowIndex);
+  }
+  const user = String(row?.username || "").trim().toLowerCase();
+  const targetUser = String(current.username || "").trim().toLowerCase();
+  return Boolean(user && targetUser && user === targetUser);
+}
+
+/**
+ * 同别名桶内高亮：
+ * - 自动切号开启时按云端时段计划（北京时间）展示当前归属，不依赖设备回写 switch_highlight；
+ * - 否则仍以 switch_highlight===「是」为准。
+ */
+function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row, alias = "") {
+  const n = Array.isArray(rowsInBucket) ? rowsInBucket.length : 0;
+  if (n <= 1) return true;
+  if (isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias)) return true;
+  const actionAlias = alias === "__EMPTY_ALIAS__" ? resolveBackupArchiveDisplayAlias(row) : alias;
+  const deviceId = String(row?.device_id || "").trim();
+  if (isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId) && isAutoSwitchDailyPlanScheduleCurrent()) {
+    return false;
+  }
   return normalizeSwitchHighlightField(row?.switch_highlight) === "是";
 }
 
@@ -5500,10 +6198,9 @@ function backupArchiveBucketHasHighlightFromCards(cards) {
 
 async function runBackupArchiveAccountCutSwitch(clickedCard) {
   if (!(clickedCard instanceof HTMLElement)) return;
-  if (isAutoSwitchGloballyEnabled()) {
-    setStatus("已开启自动切号（全局），不可手动切号，请等待系统按时段安排", "warning");
-    return;
-  }
+  const actionAlias = String(clickedCard.getAttribute("data-action-alias") || "").trim();
+  const rowDeviceId = String(clickedCard.getAttribute("data-row-device-id") || "").trim();
+  if (!guardAutoSwitchManualOps("手动切号", "", actionAlias, rowDeviceId)) return;
   const details = clickedCard.closest("details");
   const bucketSize = Number(clickedCard.getAttribute("data-bucket-size") || "") || (details ? details.querySelectorAll(".backup-archive-record").length : 0);
   const switchHlDb = normalizeSwitchHighlightField(clickedCard.getAttribute("data-switch-hl"));
@@ -5511,7 +6208,6 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   if (effectiveHighlight) return;
 
   const targetRi = Number(clickedCard.getAttribute("data-backup-row-index"));
-  const actionAlias = String(clickedCard.getAttribute("data-action-alias") || "").trim();
   const targetBackup = String(clickedCard.getAttribute("data-row-backup-name") || "").trim();
   const canRestoreToDevice = Boolean(targetBackup && targetBackup !== "-");
   if (!Number.isFinite(targetRi) || targetRi < 0 || !actionAlias) {
@@ -6427,7 +7123,7 @@ if (applyTemplateSelectedBtn) applyTemplateSelectedBtn.addEventListener("click",
 if (autoStartToggleBtn) {
   autoStartToggleBtn.addEventListener("click", async () => {
     try {
-      setStatus("正在更新自动开启策略...", "info");
+      setStatus("正在更新自动起号策略...", "info");
       const next = !adminAutoStartEnabled;
       const data = await request("/api/admin/auto_start", {
         method: "POST",
@@ -6441,7 +7137,7 @@ if (autoStartToggleBtn) {
       setStatus(
         next
           ? "已开启：已绑定设备在轮询到策略后将自行拉起程序（本机未暂停时）"
-          : `已关闭自动开启（已暂停 ${data.paused_count ?? 0} 台，清空待启动 ${data.cleared_pending_count ?? 0} 台）`,
+          : `已关闭自动起号（已暂停 ${data.paused_count ?? 0} 台，清空待启动 ${data.cleared_pending_count ?? 0} 台）`,
         "success",
       );
     } catch (error) {
@@ -6478,6 +7174,24 @@ if (deviceGroupSelect) {
 }
 if (backupArchiveGroupSelect) {
   backupArchiveGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
+}
+if (autoSwitchSessionSummariesAliasSelect) {
+  const storedAlias = String(localStorage.getItem(AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY) || "").trim();
+  if (storedAlias) autoSwitchSessionSummariesAliasSelect.value = storedAlias;
+  autoSwitchSessionSummariesAliasSelect.addEventListener("change", () => {
+    try {
+      localStorage.setItem(
+        AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY,
+        String(autoSwitchSessionSummariesAliasSelect.value || "").trim(),
+      );
+    } catch (_) {}
+    void loadAutoSwitchSessionSummaries();
+  });
+}
+if (autoSwitchSessionSummariesRefreshBtn) {
+  autoSwitchSessionSummariesRefreshBtn.addEventListener("click", () => {
+    void loadAutoSwitchSessionSummaries();
+  });
 }
 if (exportBackupArchiveXlsxBtn) {
   exportBackupArchiveXlsxBtn.addEventListener("click", () => {
@@ -6776,8 +7490,24 @@ if (backupStatsFullQueryEnabledToggle) {
     saveBackupStatsFullQueryConfig({ refreshStatus: false }),
   );
 }
-if (autoSwitchEnabledToggle) {
-  autoSwitchEnabledToggle.addEventListener("change", () => saveAutoSwitchConfig({ refreshStatus: false }));
+if (autoSwitchSelectAllEnableBtn) {
+  autoSwitchSelectAllEnableBtn.addEventListener("click", () => {
+    enableAutoSwitchForAllDevices().catch((e) => setStatus(e.message || "全选并开启失败", "error"));
+  });
+}
+if (autoSwitchEnableSelectedBtn) {
+  autoSwitchEnableSelectedBtn.addEventListener("click", () => {
+    saveAutoSwitchConfig({ enabled: true }).catch((e) =>
+      setStatus(e.message || "开启失败", "error"),
+    );
+  });
+}
+if (autoSwitchDisableSelectedBtn) {
+  autoSwitchDisableSelectedBtn.addEventListener("click", () => {
+    saveAutoSwitchConfig({ enabled: false }).catch((e) =>
+      setStatus(e.message || "关闭失败", "error"),
+    );
+  });
 }
 if (startSchedulersBtn) {
   startSchedulersBtn.addEventListener("click", startSchedulers);
@@ -6795,6 +7525,7 @@ if (cvModeBtn) {
   cvModeBtn.addEventListener("click", () => switchRunMode("direct"));
 }
 setupMutualTrafficActionMutexListeners();
+setupNoRestToggleListeners();
 if (mutualStartSelectedBtn) {
   mutualStartSelectedBtn.addEventListener("click", () => {
     void startMutualClickForSelectedDevices();
@@ -7084,6 +7815,7 @@ async function loadBoundDeviceAliases() {
   pairs.sort((a, b) => a.device_alias.localeCompare(b.device_alias));
   boundDeviceAliasPairs = pairs;
   boundDeviceAliasesSignature = pairs.map((item) => `${item.device_alias}\0${item.device_id}`).join("\n");
+  populateAutoSwitchSessionSummariesAliasOptions();
   return pairs;
 }
 
@@ -7447,6 +8179,256 @@ function buildAccountImportOverwriteConfirmMessage(overwriteSummaries) {
   return `以下账号将覆盖已有非空字段，确认继续导入？\n\n${lines.join("\n\n")}`;
 }
 
+let accountBatchPreviewItems = [];
+
+function buildAccountBatchPreviewAliasOptionsHtml(currentValue = "") {
+  const current = normalizeAliasValue(currentValue);
+  const aliases = collectAssignableAliases(current);
+  return [
+    '<option value="">无</option>',
+    ...aliases.map((alias) => `<option value="${escapeHtml(alias)}" ${alias === current ? "selected" : ""}>${escapeHtml(alias)}</option>`),
+  ].join("");
+}
+
+function refreshAccountBatchPreviewBulkAliasOptions() {
+  if (!accountBatchPreviewBulkAliasEl) return;
+  const previous = normalizeAliasValue(accountBatchPreviewBulkAliasEl.value);
+  accountBatchPreviewBulkAliasEl.innerHTML = buildAccountBatchPreviewAliasOptionsHtml(previous);
+  if (previous) accountBatchPreviewBulkAliasEl.value = previous;
+}
+
+function updateAccountBatchPreviewSummary() {
+  if (!accountBatchPreviewSummaryEl) return;
+  const total = accountBatchPreviewItems.length;
+  const selected = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate").length;
+  const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
+  const parts = [`共 ${total} 条`, `已选 ${selected} 条`];
+  if (duplicateCount) parts.push(`文件内重复 ${duplicateCount} 条（不可选）`);
+  accountBatchPreviewSummaryEl.textContent = parts.join("，");
+}
+
+function renderAccountBatchPreviewTable() {
+  if (!accountBatchPreviewTableWrapEl) return;
+  if (!accountBatchPreviewItems.length) {
+    accountBatchPreviewTableWrapEl.innerHTML = '<div class="hint" style="padding:16px;">没有可预览的记录</div>';
+    updateAccountBatchPreviewSummary();
+    return;
+  }
+  const rowsHtml = accountBatchPreviewItems.map((item, index) => {
+    const row = item.row || {};
+    const isDuplicate = item.kind === "duplicate";
+    const statusClass = item.kind === "new"
+      ? "import-preview-status--new"
+      : item.kind === "update"
+        ? "import-preview-status--update"
+        : item.kind === "duplicate"
+          ? "import-preview-status--duplicate"
+          : "import-preview-status--skip";
+    const statusText = item.kind === "new"
+      ? "新增"
+      : item.kind === "update"
+        ? "更新已有"
+        : item.kind === "duplicate"
+          ? "文件内重复"
+          : "无需更新";
+    const aliasDisabled = isDuplicate || item.kind === "skip" ? "disabled" : "";
+    const aliasHtml = buildAccountBatchPreviewAliasOptionsHtml(item.assigned_alias || "");
+    return `<tr data-preview-index="${index}">
+      <td><input type="checkbox" class="account-batch-preview-row-check" data-preview-index="${index}" ${item.selected && !isDuplicate ? "checked" : ""} ${isDuplicate ? "disabled" : ""} /></td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.username || "")}">${escapeHtml(row.username || "")}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.password || "")}">${escapeHtml(row.password || "")}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.email || "")}">${escapeHtml(row.email || "")}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.email_password || "")}">${escapeHtml(row.email_password || "")}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.api || "")}">${escapeHtml(row.api || "")}</td>
+      <td>${escapeHtml(row.region || "")}</td>
+      <td><select class="ui-select account-batch-preview-alias-select" data-preview-index="${index}" ${aliasDisabled}>${aliasHtml}</select></td>
+      <td><span class="import-preview-status ${statusClass}">${statusText}</span></td>
+    </tr>`;
+  }).join("");
+  accountBatchPreviewTableWrapEl.innerHTML = `<table class="import-preview-table">
+    <thead>
+      <tr>
+        <th style="width:44px;">选</th>
+        <th>username</th>
+        <th>password</th>
+        <th>email</th>
+        <th>email_pwd</th>
+        <th>api</th>
+        <th>地区</th>
+        <th style="min-width:120px;">别名</th>
+        <th style="width:96px;">状态</th>
+      </tr>
+    </thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>`;
+  syncAccountBatchPreviewSelectAllState();
+  updateAccountBatchPreviewSummary();
+}
+
+function syncAccountBatchPreviewSelectAllState() {
+  if (!accountBatchPreviewSelectAllEl || !accountBatchPreviewTableWrapEl) return;
+  const selectable = accountBatchPreviewItems.filter((item) => item.kind !== "duplicate");
+  const selectedCount = selectable.filter((item) => item.selected).length;
+  accountBatchPreviewSelectAllEl.checked = selectable.length > 0 && selectedCount === selectable.length;
+  accountBatchPreviewSelectAllEl.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
+}
+
+function syncAccountBatchPreviewItemsFromDom() {
+  if (!accountBatchPreviewTableWrapEl) return;
+  accountBatchPreviewTableWrapEl.querySelectorAll(".account-batch-preview-row-check").forEach((el) => {
+    const index = Number(el.dataset.previewIndex);
+    const item = accountBatchPreviewItems[index];
+    if (!item || item.kind === "duplicate") return;
+    item.selected = Boolean(el.checked);
+  });
+  accountBatchPreviewTableWrapEl.querySelectorAll(".account-batch-preview-alias-select").forEach((el) => {
+    const index = Number(el.dataset.previewIndex);
+    const item = accountBatchPreviewItems[index];
+    if (!item || item.kind === "duplicate" || item.kind === "skip") return;
+    item.assigned_alias = normalizeAliasValue(el.value);
+    item.row.assigned_alias = item.assigned_alias;
+  });
+}
+
+function openAccountBatchPreviewModal(items) {
+  if (!accountBatchPreviewModalEl) return;
+  accountBatchPreviewItems = items;
+  refreshAccountBatchPreviewBulkAliasOptions();
+  renderAccountBatchPreviewTable();
+  accountBatchPreviewModalEl.classList.remove("hidden");
+  accountBatchPreviewModalEl.setAttribute("aria-hidden", "false");
+}
+
+function closeAccountBatchPreviewModal() {
+  if (!accountBatchPreviewModalEl) return;
+  accountBatchPreviewModalEl.classList.add("hidden");
+  accountBatchPreviewModalEl.setAttribute("aria-hidden", "true");
+  accountBatchPreviewItems = [];
+}
+
+function buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex) {
+  const seenInBatch = new Set();
+  const items = [];
+  for (const row of parsedRows) {
+    const normalizedUsername = String(row?.username || "").trim().toLowerCase();
+    if (!normalizedUsername) continue;
+    if (seenInBatch.has(normalizedUsername)) {
+      items.push({
+        kind: "duplicate",
+        selected: false,
+        assigned_alias: "",
+        row: { ...row },
+      });
+      continue;
+    }
+    seenInBatch.add(normalizedUsername);
+    const existingIndex = existingUsernameIndex.get(normalizedUsername);
+    if (existingIndex != null) {
+      const existing = accountEditorRows[existingIndex];
+      if (!hasAccountImportRowChanges(existing, row)) {
+        items.push({
+          kind: "skip",
+          selected: false,
+          assigned_alias: normalizeAliasValue(existing?.assigned_alias),
+          row: mergeAccountImportRow(existing, row),
+          existingIndex,
+        });
+        continue;
+      }
+      items.push({
+        kind: "update",
+        selected: true,
+        assigned_alias: normalizeAliasValue(existing?.assigned_alias),
+        row: mergeAccountImportRow(existing, row),
+        existingIndex,
+      });
+      continue;
+    }
+    items.push({
+      kind: "new",
+      selected: true,
+      assigned_alias: "",
+      row: { ...row },
+    });
+  }
+  return items;
+}
+
+async function commitAccountBatchImportFromPreview() {
+  syncAccountBatchPreviewItemsFromDom();
+  const selectedItems = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate" && item.kind !== "skip");
+  if (!selectedItems.length) {
+    throw new Error("请至少勾选一条可导入的记录");
+  }
+  syncAccountAliasFromDeviceRows();
+  const startIndex = accountEditorRows.length;
+  let parsedWithoutApi = 0;
+  const rowsToImport = [];
+  const rowsToUpdate = [];
+  for (const item of selectedItems) {
+    const row = {
+      ...item.row,
+      assigned_alias: normalizeAliasValue(item.assigned_alias || item.row?.assigned_alias),
+    };
+    if (!hasMeaningfulAccountValue(row.api)) parsedWithoutApi += 1;
+    if (item.kind === "update" && item.existingIndex != null) {
+      rowsToUpdate.push({ index: item.existingIndex, row });
+      continue;
+    }
+    rowsToImport.push(row);
+  }
+  const overwriteSummaries = rowsToUpdate
+    .map(({ index, row }) => {
+      const existing = accountEditorRows[index];
+      const incoming = { ...row };
+      const changes = getAccountImportOverwriteChanges(existing, incoming);
+      if (!changes.length) return null;
+      return {
+        username: String(existing?.username || "").trim(),
+        changes,
+      };
+    })
+    .filter(Boolean);
+  if (overwriteSummaries.length) {
+    if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
+      setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
+      return;
+    }
+  }
+  rowsToImport.forEach((row) => accountEditorRows.push(row));
+  rowsToUpdate.forEach(({ index, row }) => {
+    accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
+  });
+  const saveIndexes = [
+    ...rowsToUpdate.map(({ index }) => index),
+    ...rowsToImport.map((_, offset) => startIndex + offset),
+  ];
+  try {
+    for (const index of saveIndexes) {
+      await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
+    }
+  } catch (error) {
+    await loadEditorState();
+    renderAccountEditorRows();
+    renderDeviceEditorRows();
+    throw error;
+  }
+  await loadEditorState();
+  renderAccountEditorRows();
+  renderDeviceEditorRows();
+  if (accountBatchInputEl) accountBatchInputEl.value = "";
+  closeAccountBatchPreviewModal();
+  const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
+  const statusParts = [];
+  if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
+  if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
+  if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
+  if (duplicateCount) statusParts.push(`跳过文件内重复 ${duplicateCount} 条`);
+  const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
+  const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
+  setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
+}
+
 function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const raw = String(line || "").trim();
   if (!raw) return null;
@@ -7506,7 +8488,6 @@ async function importAccountBatchFromText() {
     throw new Error("请先粘贴批量数据（每行一条）");
   }
   syncAccountAliasFromDeviceRows();
-  const startIndex = accountEditorRows.length;
   let parsedWithoutApi = 0;
   const parsedRows = lines.map((line, idx) => {
     try {
@@ -7526,84 +8507,21 @@ async function importAccountBatchFromText() {
       existingUsernameIndex.set(normalized, index);
     }
   });
-  const seenInBatch = new Set();
-  const rowsToImport = [];
-  const rowsToUpdate = [];
-  const skippedDuplicateUsernames = [];
-  for (const row of parsedRows) {
-    const normalizedUsername = normalizeUsername(row?.username);
-    if (!normalizedUsername) continue;
-    if (seenInBatch.has(normalizedUsername)) {
-      skippedDuplicateUsernames.push(String(row?.username || "").trim());
-      continue;
-    }
-    seenInBatch.add(normalizedUsername);
-    const existingIndex = existingUsernameIndex.get(normalizedUsername);
-    if (existingIndex != null) {
-      const existing = accountEditorRows[existingIndex];
-      if (!hasAccountImportRowChanges(existing, row)) continue;
-      rowsToUpdate.push({ index: existingIndex, row });
-      continue;
-    }
-    rowsToImport.push(row);
-  }
-  if (!rowsToImport.length && !rowsToUpdate.length) {
-    if (skippedDuplicateUsernames.length) {
-      const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
-      throw new Error(`没有可导入的账号：检测到文件内重复 username 共 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
+  const previewItems = buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex);
+  const importableCount = previewItems.filter((item) => item.kind === "new" || item.kind === "update").length;
+  const duplicateCount = previewItems.filter((item) => item.kind === "duplicate").length;
+  if (!importableCount) {
+    if (duplicateCount) {
+      throw new Error(`没有可导入的账号：检测到文件内重复 username 共 ${duplicateCount} 条`);
     }
     throw new Error("没有可导入的账号：所有记录已存在且字段无需更新");
   }
-  const overwriteSummaries = rowsToUpdate
-    .map(({ index, row }) => {
-      const existing = accountEditorRows[index];
-      const changes = getAccountImportOverwriteChanges(existing, row);
-      if (!changes.length) return null;
-      return {
-        username: String(existing?.username || "").trim(),
-        changes,
-      };
-    })
-    .filter(Boolean);
-  if (overwriteSummaries.length) {
-    if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
-      setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
-      return;
-    }
+  if (parsedWithoutApi > 0) {
+    setStatus(`已解析 ${previewItems.length} 条，其中 ${parsedWithoutApi} 条未识别到 api，请在预览中确认`, "warning");
+  } else {
+    setStatus(`已解析 ${previewItems.length} 条，请在预览中勾选并确认导入`, "info");
   }
-  rowsToImport.forEach((row) => accountEditorRows.push(row));
-  rowsToUpdate.forEach(({ index, row }) => {
-    accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
-  });
-  const saveIndexes = [
-    ...rowsToUpdate.map(({ index }) => index),
-    ...rowsToImport.map((_, offset) => startIndex + offset),
-  ];
-  try {
-    for (const index of saveIndexes) {
-      await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
-    }
-  } catch (error) {
-    await loadEditorState();
-    renderAccountEditorRows();
-    renderDeviceEditorRows();
-    throw error;
-  }
-  await loadEditorState();
-  renderAccountEditorRows();
-  renderDeviceEditorRows();
-  if (accountBatchInputEl) accountBatchInputEl.value = "";
-  const statusParts = [];
-  if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
-  if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
-  if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
-  if (skippedDuplicateUsernames.length) {
-    const skipPreview = skippedDuplicateUsernames.slice(0, 8).join("、");
-    statusParts.push(`跳过文件内重复 ${skippedDuplicateUsernames.length} 条${skipPreview ? `（如：${skipPreview}）` : ""}`);
-  }
-  const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
-  const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
-  setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
+  openAccountBatchPreviewModal(previewItems);
 }
 
 function isUsernameUsedElsewhere(username, currentIndex) {
@@ -7617,6 +8535,19 @@ function isUsernameUsedElsewhere(username, currentIndex) {
 
 function normalizeAliasValue(value) {
   return String(value || "").trim();
+}
+
+function normalizeAliasKey(value) {
+  return normalizeAliasValue(value).toLowerCase();
+}
+
+function normalizeAutoSwitchPlansByAlias(rawPlans = {}) {
+  const normalized = {};
+  Object.entries(rawPlans || {}).forEach(([alias, bucket]) => {
+    const key = normalizeAliasKey(alias);
+    if (key) normalized[key] = bucket;
+  });
+  return normalized;
 }
 
 function normalizeSwitchHighlightField(value) {
@@ -8144,10 +9075,10 @@ function buildAliasDevicePairs() {
 }
 
 function resolveDeviceIdByAlias(alias) {
-  const normalized = String(alias || "").trim();
-  if (!normalized) return "";
+  const aliasKey = normalizeAliasKey(alias);
+  if (!aliasKey) return "";
   const pairs = buildAliasDevicePairs();
-  const hit = pairs.find((item) => item.device_alias === normalized);
+  const hit = pairs.find((item) => normalizeAliasKey(item.device_alias) === aliasKey);
   return hit?.device_id || "";
 }
 
@@ -8565,7 +9496,7 @@ async function syncEditorField(scope, index, field, value, checked = false) {
 }
 
 async function addBlankEditorRow() {
-  accountEditorRows.push(getAccountRowTemplate());
+  accountEditorRows.push(getAccountRowTemplate({ video_count: "-1" }));
   const index = accountEditorRows.length - 1;
   await saveAccountRow(index);
   renderAccountEditorRows();
@@ -8849,9 +9780,7 @@ function resolveBackupRowDailySlot(alias, row) {
 }
 
 function resolveBackupRowSlotInfo(alias, row) {
-  const aliasKey = alias === "__EMPTY_ALIAS__"
-    ? normalizeAliasValue(row?.mobile_alias || row?.assigned_alias || row?.device_alias)
-    : normalizeAliasValue(alias);
+  const aliasKey = resolveBackupArchiveAliasKey(alias, row);
   if (!aliasKey) return null;
   const bucket = autoSwitchDailyPlansByAlias[aliasKey];
   if (!bucket) return null;
@@ -8887,10 +9816,21 @@ function renderAutoSwitchPublishStatusBadge(slotInfo) {
   return `<span class="${cls}" title="${escapeHtml(title)}">发作品·${escapeHtml(label)}</span>`;
 }
 
-function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}) {
+function renderAutoSwitchDeviceBadge(alias, rowDeviceId = "") {
+  const deviceId = resolveDeviceIdForArchiveAlias(alias, rowDeviceId);
+  if (!deviceId) return "";
+  const on = isAutoSwitchEnabledForDeviceId(deviceId);
+  if (on) {
+    return '<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启自动切号自治，手动切号/清理等操作已锁定">自动切号·开</span>';
+  }
+  return '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该设备未开启自动切号，可手动操作或勾选别名组后批量开启">自动切号·关</span>';
+}
+
+function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}, options = {}) {
   if (!switchActive) {
     return `<span class="backup-archive-env-badge backup-archive-env-badge--idle" title="该账号不是此设备别名的当前环境归属；需先切号后才可操作备份/还原等">非当前环境</span>`;
   }
+  const slotDriven = Boolean(options?.slotDriven);
   const envMeta = resolveBackupArchiveEnvRuntimeMeta(row?.env_status);
   const loginKnown = Boolean(acct);
   const loginOk = loginKnown && Boolean(acct.is_login);
@@ -8901,11 +9841,13 @@ function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}) {
   const runtimeLabel = envMeta?.label || "";
   const runtimeClass = envMeta?.className || "";
   const runtimeTitle = envMeta?.title || "环境就绪状态未知（可能尚未执行切号/还原）";
-  const textParts = ["环境归属"];
+  const textParts = [slotDriven ? "时段归属" : "环境归属"];
   if (runtimeLabel) textParts.push(runtimeLabel);
   textParts.push(loginLabel);
   const titleParts = [
-    "高亮=该设备别名当前环境归属此账号",
+    slotDriven
+      ? "时段归属=按云端今日计划当前时段应在设备内的账号（与 switch_highlight 无关）"
+      : "高亮=该设备别名当前环境归属此账号",
     runtimeLabel ? runtimeTitle : "尚未记录环境就绪状态",
     "登录状态来自账号 is_login（环境内结果，失败不回滚归属）",
   ];
@@ -8913,15 +9855,15 @@ function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}) {
 }
 
 /** 同别名组：默认只展示高亮记录，其余放入折叠区 */
-function partitionBackupArchiveGroupRows(rows = []) {
+function partitionBackupArchiveGroupRows(rows = [], alias = "") {
   if (!Array.isArray(rows) || rows.length <= 1) {
     return { primary: rows || [], secondary: [] };
   }
-  const highlighted = rows.filter((row) => isBackupArchiveRowEffectivelyHighlighted(rows, row));
+  const highlighted = rows.filter((row) => isBackupArchiveRowEffectivelyHighlighted(rows, row, alias));
   if (highlighted.length === 1) {
     return {
       primary: highlighted,
-      secondary: rows.filter((row) => !isBackupArchiveRowEffectivelyHighlighted(rows, row)),
+      secondary: rows.filter((row) => !isBackupArchiveRowEffectivelyHighlighted(rows, row, alias)),
     };
   }
   return { primary: [rows[0]], secondary: rows.slice(1) };
@@ -8946,19 +9888,29 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const linkedAccountInfo = renderLinkedAccountInfo({ username, ...row });
   const stats = resolveBackupRowStats(row);
   const switchHl = normalizeSwitchHighlightField(row?.switch_highlight);
-  const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row);
+  const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row, alias);
+  const slotDrivenHighlight = isBackupArchiveRowCurrentSlotOwner(rows, row, alias);
   const acct = username ? getAccountRecordByUsername(username) : null;
   const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
-  const otherDisabled = switchActive ? "" : " disabled";
-  const autoSwitchBlocksManual = isAutoSwitchGloballyEnabled();
+  const autoSwitchBlocksManual = isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId);
   const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
   const switchTitle = autoSwitchBlocksManual
     ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
     : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
-  const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
+  const manualBlockTitle = autoSwitchBlocksManual ? AUTO_SWITCH_MANUAL_BLOCK_HINT : "";
+  const otherDisabled = autoSwitchBlocksManual || !switchActive ? " disabled" : "";
+  const otherTitle = autoSwitchBlocksManual
+    ? manualBlockTitle
+    : (switchActive ? "" : "需先切号为当前高亮账号后才可操作");
+  const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row, { slotDriven: slotDrivenHighlight });
+  const autoSwitchBadge = renderAutoSwitchDeviceBadge(actionAlias, deviceId);
   const envHintText = switchActive
-    ? "当前高亮：该账号是这条设备环境的归属目标"
-    : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用";
+    ? (slotDrivenHighlight
+      ? "当前时段归属：云端计划内该账号应在设备环境内"
+      : "当前高亮：该账号是这条设备环境的归属目标")
+    : (autoSwitchBlocksManual
+      ? "非当前时段：设备将在对应时段自动切号"
+      : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用");
   const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
   const rowIndexNum = exportRowIndex ?? -1;
   const hasCutSwitchRow = exportRowIndex != null;
@@ -8970,18 +9922,23 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
     : "";
   const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
   const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
+  const showRecordSelect = rows.length > 1;
   const exportSelectTitle = exportRowIndex != null
-    ? "勾选后可点「导出已选 xlsx」"
+    ? "勾选后可导出 / 参与自动切号批量操作"
     : "该记录缺少 row_index，暂无法参与导出";
+  const recordSelectHtml = showRecordSelect
+    ? `<label class="backup-archive-record__select" title="${escapeHtml(exportSelectTitle)}" onclick="event.stopPropagation()">
+                <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
+              </label>`
+    : "";
   return `
         <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
           <div class="backup-archive-record__head">
             <div class="backup-archive-record__title">
-              <label class="backup-archive-record__select" title="${escapeHtml(exportSelectTitle)}" onclick="event.stopPropagation()">
-                <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
-              </label>
+              ${recordSelectHtml}
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
               ${aliasBadge}
+              ${autoSwitchBadge}
               ${envStatusBadge}
               ${dailyPublishBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
@@ -8989,10 +9946,10 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
-              <button type="button" class="ghost"${otherDisabled} title="仅清理设备内 TikTok 数据，不做备份" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
-              <button type="button" class="ghost"${otherDisabled} title="先备份，再清理设备内 TikTok 数据" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
-              <button type="button" class="ghost"${otherDisabled} title="先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
-              ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="高亮条目可点：下发后在设备完成修改链路；成功回传后云端自动将「基本资料已修改」标为「是」并关闭 TikTok" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "仅清理设备内 TikTok 数据，不做备份")}" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先备份，再清理设备内 TikTok 数据")}" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原")}" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
+              ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "高亮条目可点：下发后在设备完成修改链路")}" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
               <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}"${switchDisabled} title="${escapeHtml(switchTitle)}" data-account-switch="1">切号</button>
             </div>
           </div>
@@ -9053,7 +10010,9 @@ function renderBackupGroups(items = []) {
     : "";
   deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
     const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
-    const { primary, secondary } = partitionBackupArchiveGroupRows(rows);
+    const deviceId = resolveDeviceIdForArchiveAlias(alias, rows[0]?.device_id);
+    const autoSwitchOn = isAutoSwitchEnabledForDeviceId(deviceId);
+    const { primary, secondary } = partitionBackupArchiveGroupRows(rows, alias);
     const primaryHtml = primary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, idx, alias)).join("");
     const secondaryHtml = secondary.length
       ? `<details class="backup-archive-group-fold">
@@ -9066,11 +10025,12 @@ function renderBackupGroups(items = []) {
       .map((row) => resolveBackupArchiveExportRowIndex(row))
       .filter((n) => n != null);
     const groupAllSelected = groupRowIndices.length > 0 && groupRowIndices.every((n) => backupArchiveSelectedRowIndices.has(n));
-    return `<details class="panel-card" style="margin-bottom:12px;" open>
+    return `<details class="panel-card" style="margin-bottom:12px;" open data-archive-alias="${escapeHtml(alias === "__EMPTY_ALIAS__" ? "" : alias)}" data-archive-device-id="${escapeHtml(deviceId)}">
       <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;align-items:center;">
         <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          ${groupRowIndices.length ? `<label class="backup-archive-group-select" title="全选/取消本别名组" onclick="event.stopPropagation()"><input type="checkbox" class="backup-archive-group-select-all"${groupAllSelected ? " checked" : ""} data-group-row-indices="${escapeHtml(groupRowIndices.join(","))}" /></label>` : ""}
-          <span>${escapeHtml(label)}${planDateHint}</span>
+          ${groupRowIndices.length ? `<label class="backup-archive-group-select" title="勾选本组：导出 xlsx / 开启或关闭自动切号" onclick="event.stopPropagation()"><input type="checkbox" class="backup-archive-group-select-all"${groupAllSelected ? " checked" : ""} data-group-row-indices="${escapeHtml(groupRowIndices.join(","))}" /></label>` : ""}
+          ${!deviceId ? `<span class="hint" title="未绑定 device_id，无法开启自动切号；请先在设备总览完成客户端绑定">⚠</span>` : ""}
+          <span>${escapeHtml(label)}${planDateHint}${autoSwitchOn ? ' <span class="badge badge--ok">自动切号中</span>' : ""}</span>
         </span>
         <span class="hint">${rows.length} 条</span>
       </summary>
@@ -9101,6 +10061,7 @@ function updateBackupArchiveSelectionUi() {
   if (exportBackupArchiveSelectedXlsxBtn) {
     exportBackupArchiveSelectedXlsxBtn.disabled = backupArchiveXlsxBusy || count <= 0;
   }
+  applyAutoSwitchManualOpsUi();
 }
 
 function setBackupArchiveRowSelected(rowIndex, selected) {
@@ -9122,18 +10083,39 @@ function syncBackupArchiveExportCheckboxes() {
 
 function selectAllBackupArchiveRowsOnPage() {
   if (!deviceAliasGroupsEl) return;
-  deviceAliasGroupsEl.querySelectorAll(".backup-archive-export-select").forEach((el) => {
-    if (!(el instanceof HTMLInputElement)) return;
-    const idx = Number(el.dataset.rowIndex);
-    if (Number.isFinite(idx) && idx >= 0) backupArchiveSelectedRowIndices.add(idx);
-    el.checked = true;
+  deviceAliasGroupsEl.querySelectorAll("details.panel-card[data-archive-alias]").forEach((details) => {
+    if (!(details instanceof HTMLElement)) return;
+    const indices = new Set();
+    const groupCb = details.querySelector(".backup-archive-group-select-all");
+    if (groupCb instanceof HTMLInputElement) {
+      String(groupCb.dataset.groupRowIndices || "")
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isFinite(n) && n >= 0)
+        .forEach((n) => indices.add(n));
+      groupCb.checked = indices.size > 0;
+    }
+    details.querySelectorAll(".backup-archive-export-select").forEach((el) => {
+      if (!(el instanceof HTMLInputElement)) return;
+      const idx = Number(el.dataset.rowIndex);
+      if (Number.isFinite(idx) && idx >= 0) indices.add(idx);
+      el.checked = true;
+    });
+    indices.forEach((idx) => backupArchiveSelectedRowIndices.add(idx));
+    syncAutoSwitchPickForAliasGroup(details, indices.size > 0);
   });
   updateBackupArchiveSelectionUi();
 }
 
 function clearBackupArchiveSelection() {
   backupArchiveSelectedRowIndices.clear();
+  autoSwitchPickDeviceIds.clear();
   syncBackupArchiveExportCheckboxes();
+  if (deviceAliasGroupsEl) {
+    deviceAliasGroupsEl.querySelectorAll(".backup-archive-group-select-all").forEach((el) => {
+      if (el instanceof HTMLInputElement) el.checked = false;
+    });
+  }
   updateBackupArchiveSelectionUi();
 }
 
@@ -9277,9 +10259,31 @@ async function importBackupArchiveXlsxFile(file) {
   }
 }
 
+function scheduleBackupArchiveSlotHighlightRefresh() {
+  if (backupArchiveSlotHighlightTimer) {
+    clearTimeout(backupArchiveSlotHighlightTimer);
+    backupArchiveSlotHighlightTimer = null;
+  }
+  if (!deviceAliasGroupsEl || !Array.isArray(backupArchivePageItems) || !backupArchivePageItems.length) return;
+  const hasAutoSwitch = Array.from(autoSwitchDevicesById.values()).some(Boolean);
+  if (!hasAutoSwitch || !isAutoSwitchDailyPlanScheduleCurrent()) return;
+  const delayMs = Math.max(1000, 60_000 - (Date.now() % 60_000) + 800);
+  backupArchiveSlotHighlightTimer = setTimeout(() => {
+    backupArchiveSlotHighlightTimer = null;
+    if (Array.isArray(backupArchivePageItems) && backupArchivePageItems.length) {
+      renderBackupGroups(backupArchivePageItems);
+      syncBackupArchiveExportCheckboxes();
+      updateBackupArchiveSelectionUi();
+      applyAutoSwitchManualOpsUi();
+    }
+    scheduleBackupArchiveSlotHighlightRefresh();
+  }, delayMs);
+}
+
 async function loadBackupArchiveRecords() {
   if (!deviceAliasGroupsEl) return;
   try {
+    await loadBoundDeviceAliases().catch(() => {});
     const params = new URLSearchParams({
       page: String(currentBackupArchivePage),
       page_size: String(persistBackupArchivePageSize()),
@@ -9288,15 +10292,16 @@ async function loadBackupArchiveRecords() {
     if (group) params.set("device_group", group);
     const searchQ = String(backupArchiveSearchQuery || "").trim();
     if (searchQ) params.set("search", searchQ);
-    const plansPromise = isAutoSwitchGloballyEnabled()
-      ? request("/api/admin/auto_switch/daily_plans").catch(() => ({ data: {} }))
-      : Promise.resolve({ data: {} });
+    // 今日时段是云端预分配信息，与“当前是否已开启自动切号”无关；
+    // 始终拉取，避免设备未开启时只显示 "--" 造成误解。
+    const plansPromise = request("/api/admin/auto_switch/daily_plans")
+      .catch(() => ({ data: {} }));
     const [data, plansResp] = await Promise.all([
       request(`/api/admin/editor/device_rows?${params.toString()}`),
       plansPromise,
     ]);
     const plansPayload = plansResp?.data || {};
-    autoSwitchDailyPlansByAlias = plansPayload.plans_by_alias || {};
+    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
     autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
     backupArchiveAliasTotal = Number(data?.total ?? 0) || 0;
     if (Number.isFinite(Number(data?.page))) currentBackupArchivePage = Number(data.page) || 1;
@@ -9305,6 +10310,7 @@ async function loadBackupArchiveRecords() {
       ...row,
       row_index: resolveBackupArchiveExportRowIndex(row) ?? row?.row_index ?? row?.id,
       account_assigned_alias: row?.account_assigned_alias || "",
+      device_bucket_alias: normalizeAliasValue(row?.assigned_alias || row?.device_alias),
       assigned_alias: row?.assigned_alias || row?.account_assigned_alias || row?.device_alias || "",
       mobile_alias: row?.mobile_alias || row?.device_alias || "",
       created_at: row?.created_at || row?.updated_at || "",
@@ -9318,18 +10324,30 @@ async function loadBackupArchiveRecords() {
       switch_highlight: normalizeSwitchHighlightField(row?.switch_highlight),
       env_status: normalizeEnvStatusField(row?.env_status),
     }));
+    backupArchivePageItems = items;
     updateBackupArchivePagerUi();
     renderBackupGroups(items);
     syncBackupArchiveExportCheckboxes();
     updateBackupArchiveSelectionUi();
+    applyAutoSwitchManualOpsUi();
+    scheduleBackupArchiveSlotHighlightRefresh();
   } catch (error) {
+    if (backupArchiveSlotHighlightTimer) {
+      clearTimeout(backupArchiveSlotHighlightTimer);
+      backupArchiveSlotHighlightTimer = null;
+    }
     deviceAliasGroupsEl.innerHTML = `<div class="hint">加载备份档案失败：${escapeHtml(error.message || "unknown")}</div>`;
   }
 }
 
 if (deviceLogDeviceSelect) {
   deviceLogDeviceSelect.addEventListener("change", () => {
-    void refreshVisibleDeviceLogs();
+    void refreshVisibleDeviceLogs({ requestPull: false });
+  });
+}
+if (deviceLogPullBtn) {
+  deviceLogPullBtn.addEventListener("click", () => {
+    void refreshVisibleDeviceLogs({ requestPull: true });
   });
 }
 if (addBlankRecordBtn) {
@@ -9338,6 +10356,78 @@ if (addBlankRecordBtn) {
 if (importAccountBatchBtn) {
   importAccountBatchBtn.addEventListener("click", () => {
     importAccountBatchFromText().catch((e) => setStatus(e.message || "批量导入失败", "error"));
+  });
+}
+if (closeAccountBatchPreviewBtn) {
+  closeAccountBatchPreviewBtn.addEventListener("click", closeAccountBatchPreviewModal);
+}
+if (cancelAccountBatchPreviewBtn) {
+  cancelAccountBatchPreviewBtn.addEventListener("click", closeAccountBatchPreviewModal);
+}
+if (accountBatchPreviewModalEl) {
+  accountBatchPreviewModalEl.addEventListener("click", (event) => {
+    if (event.target === accountBatchPreviewModalEl) closeAccountBatchPreviewModal();
+  });
+}
+if (accountBatchPreviewSelectAllEl) {
+  accountBatchPreviewSelectAllEl.addEventListener("change", () => {
+    const checked = Boolean(accountBatchPreviewSelectAllEl.checked);
+    accountBatchPreviewItems.forEach((item) => {
+      if (item.kind !== "duplicate" && item.kind !== "skip") item.selected = checked;
+    });
+    renderAccountBatchPreviewTable();
+  });
+}
+if (accountBatchPreviewTableWrapEl) {
+  accountBatchPreviewTableWrapEl.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.classList.contains("account-batch-preview-row-check")) {
+      const index = Number(target.dataset.previewIndex);
+      const item = accountBatchPreviewItems[index];
+      if (item && item.kind !== "duplicate") {
+        item.selected = Boolean(target.checked);
+        syncAccountBatchPreviewSelectAllState();
+        updateAccountBatchPreviewSummary();
+      }
+      return;
+    }
+    if (target.classList.contains("account-batch-preview-alias-select")) {
+      const index = Number(target.dataset.previewIndex);
+      const item = accountBatchPreviewItems[index];
+      if (item) {
+        item.assigned_alias = normalizeAliasValue(target.value);
+        item.row.assigned_alias = item.assigned_alias;
+      }
+    }
+  });
+}
+if (accountBatchPreviewApplyAliasBtn) {
+  accountBatchPreviewApplyAliasBtn.addEventListener("click", () => {
+    syncAccountBatchPreviewItemsFromDom();
+    const alias = normalizeAliasValue(accountBatchPreviewBulkAliasEl?.value);
+    if (!alias) {
+      setStatus("请先选择要批量分配的别名", "warning");
+      return;
+    }
+    let applied = 0;
+    accountBatchPreviewItems.forEach((item) => {
+      if (!item.selected || item.kind === "duplicate" || item.kind === "skip") return;
+      item.assigned_alias = alias;
+      item.row.assigned_alias = alias;
+      applied += 1;
+    });
+    if (!applied) {
+      setStatus("请先勾选需要分配别名的记录", "warning");
+      return;
+    }
+    renderAccountBatchPreviewTable();
+    setStatus(`已为 ${applied} 条选中记录分配别名「${alias}」`, "success");
+  });
+}
+if (confirmAccountBatchPreviewBtn) {
+  confirmAccountBatchPreviewBtn.addEventListener("click", () => {
+    commitAccountBatchImportFromPreview().catch((e) => setStatus(e.message || "批量导入失败", "error"));
   });
 }
 if (batchStreamFileInput) {
@@ -9462,6 +10552,10 @@ if (deviceAliasGroupsEl) {
       event.stopPropagation();
       const idx = Number(target.dataset.rowIndex);
       setBackupArchiveRowSelected(idx, target.checked);
+      const details = target.closest("details.panel-card");
+      if (details instanceof HTMLElement) {
+        syncAutoSwitchPickForAliasGroup(details, aliasGroupHasSelectedExportRows(details));
+      }
       return;
     }
     if (target.classList.contains("backup-archive-group-select-all")) {
@@ -9470,11 +10564,13 @@ if (deviceAliasGroupsEl) {
       const indices = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0);
       indices.forEach((idx) => setBackupArchiveRowSelected(idx, target.checked));
       const details = target.closest("details");
-      if (details) {
+      if (details instanceof HTMLElement) {
         details.querySelectorAll(".backup-archive-export-select").forEach((el) => {
           if (el instanceof HTMLInputElement) el.checked = target.checked;
         });
+        syncAutoSwitchPickForAliasGroup(details, target.checked);
       }
+      return;
     }
   });
   deviceAliasGroupsEl.addEventListener("input", (event) => {
@@ -9532,6 +10628,7 @@ if (deviceAliasGroupsEl) {
       event.preventDefault();
       const alias = String(target.getAttribute("data-device-alias") || "").trim();
       const deviceId = String(target.getAttribute("data-device-id") || "").trim();
+      if (!guardAutoSwitchManualOps("清理 TikTok 数据", deviceId, alias, deviceId)) return;
       const identity = deviceId
         ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
         : collectDeviceIdentityByAlias(alias);
@@ -9551,6 +10648,7 @@ if (deviceAliasGroupsEl) {
       const backupRecordId = Number(target.getAttribute("data-account-id") || 0) || undefined;
       const username = String(target.getAttribute("data-account-username") || "").trim();
       const deviceIdBtn = String(target.getAttribute("data-device-id") || "").trim();
+      if (!guardAutoSwitchManualOps("备份并清理", deviceIdBtn, alias, deviceIdBtn)) return;
       await handleBackupAndClearClick(alias, backupRecordId, username, deviceIdBtn).catch((e) => {
         setStatus(e.message || "备份失败", "error");
       });
@@ -9588,10 +10686,6 @@ if (deviceAliasGroupsEl) {
     }
     if (target.hasAttribute("data-account-switch")) {
       event.preventDefault();
-      if (isAutoSwitchGloballyEnabled()) {
-        setStatus("已开启自动切号（全局），不可手动切号，请等待系统按时段安排", "warning");
-        return;
-      }
       const card = target.closest(".backup-archive-record");
       if (!(card instanceof HTMLElement)) {
         setStatus("未找到账号条目", "warning");
@@ -9614,7 +10708,12 @@ if (deviceAliasGroupsEl) {
       event.preventDefault();
       const alias = String(target.getAttribute("data-account-restore") || "").trim();
       const backupName = String(target.getAttribute("data-account-backup-name") || "").trim();
-      await handleRestoreClick(alias, backupName).catch((e) => {
+      const restoreCard = target.closest(".backup-archive-record");
+      const restoreDeviceId = restoreCard instanceof HTMLElement
+        ? String(restoreCard.getAttribute("data-row-device-id") || "").trim()
+        : "";
+      if (!guardAutoSwitchManualOps("清理并还原", restoreDeviceId, alias, restoreDeviceId)) return;
+      await handleRestoreClick(alias, backupName, restoreDeviceId).catch((e) => {
         setStatus(e.message || "清理并还原失败", "error");
       });
       return;
@@ -9692,7 +10791,7 @@ if (apiBaseInput) {
     loadAccounts();
     void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
     void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
-    void loadAutoSwitchConfig().then(() => loadBackupArchiveRecords());
+    void loadAutoSwitchConfig({ refreshArchive: true });
     loadEditorState().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
@@ -9720,3 +10819,4 @@ document.addEventListener("visibilitychange", () => {
     stopAdminBackgroundPollers();
   }
 });
+}

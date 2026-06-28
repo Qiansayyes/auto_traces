@@ -32,6 +32,8 @@ object PrefsStore {
      * 避免 check_start 仍返回 status=paused 时轮询把本机再次打回暂停。
      */
     private const val KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP = "transient_paused_for_destructive_op"
+    /** 自治切号/发作品等独占 OP 已抢占 TikTok：涨粉应协作退出且不得再拉起 TikTok。 */
+    private const val KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT = "auto_switch_exclusive_preempt"
     private const val KEY_MUTUAL_CLICK_REQUESTED = "mutual_click_requested"
     private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
     /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
@@ -44,7 +46,7 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL = "publish_post_queued_after_mutual"
     /** 下发 publish_post_start 时写入，供 TraceExecutor 内 `__publish_post__` 使用（包名来自 payload） */
     private const val KEY_PUBLISH_POST_PACKAGE = "publish_post_package_name"
-    /** 自动切号发作品：云端按 video_count 下发的本次目标发布条数；0=未指定（沿用运行配置）。 */
+    /** 自动切号发作品：云端按 video_count 下发的本次目标发布条数；null/未指定=沿用运行配置；0=明确跳过发布。 */
     private const val KEY_PUBLISH_POST_TARGET_COUNT = "publish_post_target_count"
     /**
      * 发作品：首条「Post Now / Don't allow / 底部 Cancel」权限类 OCR 按设备别名按自然日只跑一轮。
@@ -66,11 +68,46 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_PUBLISH_ACCOUNT = "auto_switch_publish_account_username"
     /** 发作品来源：auto_switch 等。 */
     private const val KEY_PUBLISH_POST_SOURCE = "publish_post_source"
+    /** 本轮发作品实际成功条数（全部完成后写入，供 ledger 写回 video_count）。 */
+    private const val KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT = "publish_post_last_actual_success_count"
+    /** 自动切号自治模式：off | on | exiting */
+    private const val KEY_AUTO_SWITCH_MODE = "auto_switch_mode"
+    private const val KEY_AUTO_SWITCH_SESSION_ID = "auto_switch_session_id"
+    private const val KEY_AUTO_SWITCH_BUNDLE_REVISION = "auto_switch_bundle_revision"
+    /** 自治期 getConfig 与 bundle_revision 对齐，未变则跳过拉取。 */
+    private const val KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION = "auto_switch_last_config_fetch_revision"
+    /** 最近一次从 bundle 成功应用的 TikTok 账号（fetchConfig 早退校验用）。 */
+    private const val KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME = "auto_switch_last_bundled_username"
+    private const val KEY_AUTO_SWITCH_LAST_SLOT_KEY = "auto_switch_last_slot_key"
+    /** 本机已验证对齐的时段键 `{date}|{slot_index}`（切号链终端成功后写入）。 */
+    private const val KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY = "auto_switch_verified_slot_key"
+    /** 与 [KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY] 配对的 row_index。 */
+    private const val KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX = "auto_switch_verified_row_index"
+    private const val KEY_AUTO_SWITCH_SCHEDULE_DATE = "auto_switch_schedule_date"
+    private const val KEY_AUTO_SWITCH_WEEK_START = "auto_switch_week_start_date"
+    private const val KEY_AUTO_SWITCH_WEEK_END = "auto_switch_week_end_date"
+    private const val KEY_AUTO_SWITCH_SESSION_STARTED_AT = "auto_switch_session_started_at"
+    private const val KEY_AUTO_SWITCH_LEDGER_JSON = "auto_switch_ledger_json"
+    private const val KEY_AUTO_SWITCH_PENDING_SUMMARY = "auto_switch_pending_summary"
+    private const val KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION = "auto_switch_last_scheduler_revision"
+    private const val KEY_AUTO_SWITCH_PUBLISH_DONE_KEY = "auto_switch_publish_done_key"
+    private const val KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY = "auto_switch_publish_aborted_key"
+    private const val KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID = "auto_switch_enter_done_event_id"
+    private const val KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID = "auto_switch_exit_done_event_id"
+    private const val KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE = "auto_switch_daily_reconcile_date"
+    private const val KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_DATE = "auto_switch_daily_reconcile_target_date"
+    private const val KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS = "auto_switch_daily_reconcile_target_ms"
+    private const val KEY_LAST_MODE_EVENT_ID = "last_mode_event_id"
     /**
      * 发作品资料页进图库入口布局：按 [KEY_DEVICE_ID] 持久化（A=右下固定点，B=左侧备用点）。
      * 同设备不同账号发布时优先沿用，减少 A→B 全量试探。
      */
     private const val KEY_PUBLISH_POST_ENTRY_LAYOUT_PREFIX = "publish_post_entry_layout_"
+    /**
+     * 发作品收尾已点 Home、TikTok 仍在 For You 主界面时置 true；
+     * 下次涨粉拉取跳过登录保障/强停重拉，直接点右上角放大镜。
+     */
+    private const val KEY_GROWTH_CONTINUE_FROM_PUBLISH_HOME = "growth_continue_from_publish_home"
     /** 与 check_start.config_push_revision 对齐；管理台「保存并下发」后服务端递增，本机成功拉取配置后写入 */
     private const val KEY_LAST_APPLIED_CONFIG_PUSH_REVISION = "last_applied_config_push_revision"
     /**
@@ -79,7 +116,7 @@ object PrefsStore {
     private const val KEY_LOG_CONTEXT_USERNAME = "log_context_username"
     /** 失败采集：已上传的 business|error_type 去重键集合 */
     private const val KEY_FAILURE_REPORT_UPLOADED = "failure_report_uploaded_keys"
-    /** TikTok 安装后 root 图库权限一键开放：记录已处理的 lastUpdateTime（0=未处理）。 */
+    /** TikTok 安装后 root 图库/相机/麦克风权限一键开放：记录已处理的 lastUpdateTime（0=未处理）。 */
     private const val KEY_TIKTOK_MEDIA_PERMISSION_GRANT_INSTALL_TOKEN = "tiktok_media_permission_grant_install_token"
 
     private lateinit var appContext: Context
@@ -170,6 +207,13 @@ object PrefsStore {
     fun isTransientPausedForDestructiveOp(): Boolean =
         prefs.getBoolean(KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP, false)
 
+    fun setAutoSwitchExclusivePreempt(active: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, active).apply()
+    }
+
+    fun isAutoSwitchExclusivePreempt(): Boolean =
+        prefs.getBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, false)
+
     fun setMutualClickRequested(requested: Boolean) {
         prefs.edit().putBoolean(KEY_MUTUAL_CLICK_REQUESTED, requested).apply()
     }
@@ -193,6 +237,19 @@ object PrefsStore {
     }
 
     fun isMutualFollowOnlySession(): Boolean = prefs.getBoolean(KEY_MUTUAL_FOLLOW_ONLY_SESSION, false)
+
+    fun setGrowthContinueFromPublishHome(value: Boolean) {
+        prefs.edit().putBoolean(KEY_GROWTH_CONTINUE_FROM_PUBLISH_HOME, value).apply()
+    }
+
+    fun peekGrowthContinueFromPublishHome(): Boolean =
+        prefs.getBoolean(KEY_GROWTH_CONTINUE_FROM_PUBLISH_HOME, false)
+
+    fun consumeGrowthContinueFromPublishHome(): Boolean {
+        if (!peekGrowthContinueFromPublishHome()) return false
+        setGrowthContinueFromPublishHome(false)
+        return true
+    }
 
     fun setPublishPostRequested(requested: Boolean) {
         prefs.edit().putBoolean(KEY_PUBLISH_POST_REQUESTED, requested).apply()
@@ -242,7 +299,7 @@ object PrefsStore {
     private fun publishPostPermOcrPrefsKeyForAlias(alias: String): String =
         KEY_PUBLISH_POST_FIRST_DAILY_PERM_OCR_DAY_PREFIX + alias.trim().lowercase(Locale.US)
 
-    /** 今日是否仍需在「该账号当天首条作品」上跑 Post Now / Don't allow / Cancel 三段 OCR。 */
+    /** 今日是否仍需在「该账号当天首条作品发布成功后」跑 Post Now / Only this time / Don't allow / Cancel 可选弹窗 OCR。 */
     fun shouldRunPublishPostFirstDailyPermissionOcr(alias: String): Boolean {
         val a = alias.trim().lowercase(Locale.US)
         if (a.isEmpty()) return true
@@ -251,7 +308,7 @@ object PrefsStore {
         return stored != today
     }
 
-    /** 首条作品当日权限 OCR 已成功跑完时调用（在整条发布成功之后）。 */
+    /** 首条作品当日可选权限弹窗 OCR 已全部跑完时调用；发布成功路径请用 [setPublishPostResumeNextIndex] 的 markFirstDailyPermOcrDone 原子写入。 */
     fun markPublishPostFirstDailyPermissionOcrDone(alias: String) {
         val a = alias.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
@@ -291,14 +348,22 @@ object PrefsStore {
         return prefs.getInt(publishPostResumeNextIndexKey(a), 0).coerceAtLeast(0)
     }
 
-    fun setPublishPostResumeNextIndex(accountKey: String, nextIndex: Int) {
+    fun setPublishPostResumeNextIndex(
+        accountKey: String,
+        nextIndex: Int,
+        markFirstDailyPermOcrDone: Boolean = false,
+    ) {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
         val taskOpId = getPublishPostTaskOpId() ?: return
-        prefs.edit()
+        val editor = prefs.edit()
             .putInt(publishPostResumeNextIndexKey(a), nextIndex.coerceAtLeast(0))
             .putString(publishPostResumeOpIdKey(a), taskOpId)
-            .apply()
+        if (markFirstDailyPermOcrDone) {
+            val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+            editor.putString(publishPostPermOcrPrefsKeyForAlias(a), today)
+        }
+        editor.apply()
     }
 
     fun clearPublishPostResumeProgress(accountKey: String) {
@@ -377,6 +442,20 @@ object PrefsStore {
     fun getPublishPostSource(): String? =
         prefs.getString(KEY_PUBLISH_POST_SOURCE, null)?.trim()?.takeIf { it.isNotEmpty() }
 
+    fun setPublishPostLastActualSuccessCount(count: Int) {
+        prefs.edit()
+            .putInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, count.coerceAtLeast(0))
+            .apply()
+    }
+
+    fun getAndClearPublishPostLastActualSuccessCount(): Int {
+        val v = prefs.getInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, 0).coerceAtLeast(0)
+        if (v > 0) {
+            prefs.edit().remove(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT).apply()
+        }
+        return v
+    }
+
     fun clearAutoSwitchPublishContext() {
         prefs.edit()
             .remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT)
@@ -449,6 +528,25 @@ object PrefsStore {
 
     fun saveLastAppliedConfigPushRevision(revision: Int) {
         prefs.edit().putInt(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION, revision.coerceAtLeast(0)).apply()
+    }
+
+    fun getAutoSwitchLastConfigFetchRevision(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION, -1)
+
+    fun setAutoSwitchLastConfigFetchRevision(revision: Int) {
+        prefs.edit().putInt(KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION, revision).apply()
+    }
+
+    fun getAutoSwitchLastBundledUsername(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchLastBundledUsername(username: String?) {
+        val v = username?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME, v).apply()
+        }
     }
 
     @Synchronized
@@ -567,5 +665,248 @@ object PrefsStore {
 
     fun setTikTokMediaPermissionGrantInstallToken(token: Long) {
         prefs.edit().putLong(KEY_TIKTOK_MEDIA_PERMISSION_GRANT_INSTALL_TOKEN, token.coerceAtLeast(0L)).apply()
+    }
+
+    fun getAutoSwitchMode(): String =
+        prefs.getString(KEY_AUTO_SWITCH_MODE, "off")?.trim()?.lowercase(Locale.US) ?: "off"
+
+    fun isAutoSwitchAutonomousMode(): Boolean {
+        val mode = getAutoSwitchMode()
+        return mode == "on" || mode == "exiting"
+    }
+
+    fun setAutoSwitchMode(mode: String) {
+        prefs.edit().putString(KEY_AUTO_SWITCH_MODE, mode.trim().lowercase(Locale.US)).apply()
+    }
+
+    fun getAutoSwitchSessionId(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_SESSION_ID, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchBundleRevision(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_BUNDLE_REVISION, 0)
+
+    fun getLastModeEventId(): Int =
+        prefs.getInt(KEY_LAST_MODE_EVENT_ID, 0).coerceAtLeast(0)
+
+    fun saveAutoSwitchSessionContext(sessionId: String, bundleRevision: Int) {
+        prefs.edit()
+            .putString(KEY_AUTO_SWITCH_MODE, "on")
+            .putString(KEY_AUTO_SWITCH_SESSION_ID, sessionId)
+            .putInt(KEY_AUTO_SWITCH_BUNDLE_REVISION, bundleRevision.coerceAtLeast(0))
+            .putString(KEY_AUTO_SWITCH_SESSION_STARTED_AT, nowLocalText())
+            .apply()
+    }
+
+    fun getAutoSwitchScheduleDate(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_SCHEDULE_DATE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchScheduleDate(date: String?) {
+        val v = date?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_SCHEDULE_DATE).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_SCHEDULE_DATE, v).apply()
+        }
+    }
+
+    fun setAutoSwitchWeekRange(weekStart: String?, weekEnd: String?) {
+        val start = weekStart?.trim().orEmpty()
+        val end = weekEnd?.trim().orEmpty()
+        val editor = prefs.edit()
+        if (start.isEmpty()) editor.remove(KEY_AUTO_SWITCH_WEEK_START) else editor.putString(KEY_AUTO_SWITCH_WEEK_START, start)
+        if (end.isEmpty()) editor.remove(KEY_AUTO_SWITCH_WEEK_END) else editor.putString(KEY_AUTO_SWITCH_WEEK_END, end)
+        editor.apply()
+    }
+
+    fun getAutoSwitchWeekStart(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_WEEK_START, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchWeekEnd(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_WEEK_END, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchSessionStartedAt(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_SESSION_STARTED_AT, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchLedgerJson(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_LEDGER_JSON, null)?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchLedgerJson(json: String) {
+        prefs.edit().putString(KEY_AUTO_SWITCH_LEDGER_JSON, json).commit()
+    }
+
+    fun clearAutoSwitchLedgerPersisted() {
+        prefs.edit().remove(KEY_AUTO_SWITCH_LEDGER_JSON).apply()
+    }
+
+    fun hasAutoSwitchPendingSummaryUpload(): Boolean =
+        prefs.getBoolean(KEY_AUTO_SWITCH_PENDING_SUMMARY, false)
+
+    fun setAutoSwitchPendingSummaryUpload(pending: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_SWITCH_PENDING_SUMMARY, pending).apply()
+    }
+
+    fun saveLastModeEventId(eventId: Int) {
+        prefs.edit().putInt(KEY_LAST_MODE_EVENT_ID, eventId.coerceAtLeast(0)).apply()
+    }
+
+    fun isModeEventProcessed(eventId: Int): Boolean =
+        eventId > 0 && eventId <= getLastModeEventId()
+
+    fun getAutoSwitchLastSchedulerRevision(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION, 0)
+
+    fun setAutoSwitchLastSchedulerRevision(revision: Int) {
+        prefs.edit().putInt(KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION, revision.coerceAtLeast(0)).apply()
+    }
+
+    fun getAutoSwitchPublishDoneKey(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchPublishDoneKey(key: String?) {
+        val v = key?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY, v).apply()
+        }
+    }
+
+    fun getAutoSwitchPublishAbortedKey(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchPublishAbortedKey(key: String?) {
+        val v = key?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY, v).apply()
+        }
+    }
+
+    fun getAutoSwitchEnterDoneEventId(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID, 0).coerceAtLeast(0)
+
+    fun markAutoSwitchEnterDone(eventId: Int) {
+        prefs.edit().putInt(KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID, eventId.coerceAtLeast(0)).apply()
+    }
+
+    fun isAutoSwitchEnterDone(eventId: Int): Boolean =
+        eventId > 0 && eventId <= getAutoSwitchEnterDoneEventId()
+
+    fun getAutoSwitchExitDoneEventId(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID, 0).coerceAtLeast(0)
+
+    fun markAutoSwitchExitDone(eventId: Int) {
+        prefs.edit().putInt(KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID, eventId.coerceAtLeast(0)).apply()
+    }
+
+    fun isAutoSwitchExitDone(eventId: Int): Boolean =
+        eventId > 0 && eventId <= getAutoSwitchExitDoneEventId()
+
+    fun getAutoSwitchDailyReconcileDate(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchDailyReconcileDate(date: String?) {
+        val v = date?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE, v).apply()
+        }
+    }
+
+    fun getAutoSwitchDailyReconcileTargetDate(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_DATE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchDailyReconcileTargetMs(): Long =
+        prefs.getLong(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS, 0L)
+
+    fun setAutoSwitchDailyReconcileSchedule(targetDate: String, targetMs: Long) {
+        prefs.edit()
+            .putString(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_DATE, targetDate.trim())
+            .putLong(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS, targetMs.coerceAtLeast(0L))
+            .apply()
+    }
+
+    fun clearAutoSwitchDailyReconcileSchedule() {
+        prefs.edit()
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE)
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_DATE)
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS)
+            .apply()
+    }
+
+    private fun nowBeijingText(): String {
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+        fmt.timeZone = java.util.TimeZone.getTimeZone("Asia/Shanghai")
+        return fmt.format(java.util.Date())
+    }
+
+    private fun nowLocalText(): String = nowBeijingText()
+
+    fun clearAutoSwitchSessionContext() {
+        prefs.edit()
+            .putString(KEY_AUTO_SWITCH_MODE, "off")
+            .remove(KEY_AUTO_SWITCH_SESSION_ID)
+            .remove(KEY_AUTO_SWITCH_BUNDLE_REVISION)
+            .remove(KEY_AUTO_SWITCH_LAST_SLOT_KEY)
+            .remove(KEY_AUTO_SWITCH_SCHEDULE_DATE)
+            .remove(KEY_AUTO_SWITCH_WEEK_START)
+            .remove(KEY_AUTO_SWITCH_WEEK_END)
+            .remove(KEY_AUTO_SWITCH_SESSION_STARTED_AT)
+            .remove(KEY_AUTO_SWITCH_PENDING_SUMMARY)
+            .remove(KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION)
+            .remove(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY)
+            .remove(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY)
+            .remove(KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID)
+            .remove(KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID)
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE)
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_DATE)
+            .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS)
+            .remove(KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION)
+            .remove(KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME)
+            .remove(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY)
+            .remove(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX)
+            .apply()
+    }
+
+    fun getAutoSwitchLastSlotKey(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_LAST_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setAutoSwitchLastSlotKey(slotKey: String?) {
+        val v = slotKey?.trim()?.takeIf { it.isNotEmpty() }
+        if (v == null) {
+            prefs.edit().remove(KEY_AUTO_SWITCH_LAST_SLOT_KEY).apply()
+        } else {
+            prefs.edit().putString(KEY_AUTO_SWITCH_LAST_SLOT_KEY, v).apply()
+        }
+    }
+
+    fun setAutoSwitchVerifiedAlignment(slotKey: String, rowIndex: Int) {
+        val sk = slotKey.trim()
+        if (sk.isEmpty() || rowIndex < 0) return
+        prefs.edit()
+            .putString(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY, sk)
+            .putInt(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX, rowIndex)
+            .apply()
+    }
+
+    fun getAutoSwitchVerifiedSlotKey(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getAutoSwitchVerifiedRowIndex(): Int =
+        prefs.getInt(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX, -1)
+
+    fun isAutoSwitchVerifiedAligned(slotKey: String, rowIndex: Int): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty() || rowIndex < 0) return false
+        return getAutoSwitchVerifiedSlotKey() == sk && getAutoSwitchVerifiedRowIndex() == rowIndex
+    }
+
+    fun clearAutoSwitchVerifiedAlignment() {
+        prefs.edit()
+            .remove(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY)
+            .remove(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX)
+            .apply()
     }
 }

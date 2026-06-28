@@ -15,9 +15,6 @@ object LogCenter {
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs = _logs.asStateFlow()
 
-    @Volatile
-    private var syncedCount = 0
-
     private fun withPausedWrapUpTag(content: String): String {
         if (!ExecutionScope.isActive()) return content
         if (PrefsStore.getLocalStatus() != "paused") return content
@@ -33,9 +30,6 @@ object LogCenter {
         LocalDeviceLogWriter.append(alias, body, now.time)
         val merged = (_logs.value + line)
         _logs.value = if (merged.size > MAX_LOCAL_LOGS) merged.takeLast(MAX_LOCAL_LOGS) else merged
-        if (syncedCount > _logs.value.size) {
-            syncedCount = _logs.value.size
-        }
     }
 
     /**
@@ -46,17 +40,7 @@ object LogCenter {
         append(alias, "$action$tail")
     }
 
-    fun consumeUnsynced(maxLines: Int = 80): List<String> {
-        val all = _logs.value
-        if (syncedCount >= all.size) return emptyList()
-        val unsynced = all.subList(syncedCount, all.size)
-        val take = if (unsynced.size > maxLines) unsynced.takeLast(maxLines) else unsynced
-        syncedCount = all.size
-        return take
-    }
-
     fun clear() {
         _logs.value = emptyList()
-        syncedCount = 0
     }
 }

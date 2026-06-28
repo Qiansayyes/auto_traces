@@ -80,6 +80,18 @@ class AppDataBackupManager(private val context: Context) {
                 }
             }
 
+            UnifiedBackupPaths.purgeLegacyUsernameBackups(
+                context,
+                accountName,
+                accountName,
+                "local",
+                outFile.absolutePath,
+                deleteFile = { path ->
+                    val q = DeviceBackupShell.shellQuote(path)
+                    runAsRoot("rm -f $q").exitCode == 0
+                },
+            )
+
             BackupResult(
                 success = true,
                 path = outFile.absolutePath,

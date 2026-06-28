@@ -94,6 +94,8 @@ data class AppConfig(
     val pull_batch_size: Int = 5,
     val break_min: Int = 10,
     val break_max: Int = 20,
+    /** 为 true 时本模板设备永不进入云端批次休息（优先于 break_min/break_max）。 */
+    val no_rest: Boolean = false,
     val visit_delay_min: Double = 0.5,
     val visit_delay_max: Double = 2.0,
     val video_stay_min: Double = 3.0,
@@ -159,6 +161,9 @@ data class CheckStartResponse(
     val auto_start: Boolean? = null,
     /** 与 PrefsStore 中 last_applied_config_push_revision 对齐；管理台保存配置后服务端递增 */
     val config_push_revision: Int? = null,
+    /** 管理台请求拉取本机日志时为 true */
+    val log_pull_requested: Boolean? = null,
+    val log_pull_max_lines: Int? = null,
 )
 
 data class PullUsernameResponse(
@@ -307,6 +312,7 @@ data class DeviceLogsSyncRequest(
     val device_id: String,
     val alias: String,
     val logs: List<String>,
+    val replace: Boolean = false,
 )
 
 data class DeviceAutoStartOptOutRequest(
@@ -453,6 +459,8 @@ data class RuntimeState(
     val effectiveTemplate: String = "",
     val lastMessage: String = "等待初始化",
     val hardStopRequested: Boolean = false,
+    /** 最近一次 check_start 看到的云端“自动起号/自动开启策略”开关；null=尚未拉取到 */
+    val cloudAutoStart: Boolean? = null,
 )
 
 data class ReportMutualCopiedUsernameRequest(
@@ -473,4 +481,192 @@ data class FailureReportUploadResponse(
     val msg: String,
     val report_id: String? = null,
     val dedup_key: String? = null,
+)
+
+data class DeviceModeEvent(
+    val event_id: Int,
+    val type: String,
+    val session_id: String,
+    val bundle_revision: Int? = null,
+    val payload: Map<String, Any>? = null,
+    val issued_at: String? = null,
+)
+
+data class DeviceModeWaitResponse(
+    val code: Int,
+    val msg: String? = null,
+    val event: DeviceModeEvent? = null,
+    val log_pull_requested: Boolean? = null,
+    val log_pull_max_lines: Int? = null,
+)
+
+data class DeviceModeAckRequest(
+    val device_id: String,
+    val alias: String,
+    val event_id: Int,
+    val phase: String,
+    val session_id: String = "",
+)
+
+data class AutoSwitchBundleResponse(
+    val code: Int,
+    val msg: String? = null,
+    val bundle: AutoSwitchBundle? = null,
+)
+
+data class AutoSwitchBundle(
+    val session_id: String? = null,
+    val revision: Int? = null,
+    val schedule_date: String? = null,
+    val week_start_date: String? = null,
+    val week_end_date: String? = null,
+    val timezone: String? = null,
+    val owner_username: String? = null,
+    val device_alias: String? = null,
+    val device_id: String? = null,
+    val run_config: AutoSwitchRunConfig? = null,
+    /** 按 TikTok 用户名（小写）打包的 enter 冻结配置；切号时本地切换，不再拉 getConfig。 */
+    val configs_by_username: Map<String, AutoSwitchBundledAccountConfig>? = null,
+    /** 智能模板解析审计（enter 时 session 重掷 + 每账号分支/权重命中）。 */
+    val smart_template_debug: AutoSwitchSmartTemplateDebug? = null,
+    val accounts: List<AutoSwitchAccount>? = null,
+    val daily_plan: AutoSwitchDailyPlan? = null,
+    val weekly_plan: AutoSwitchWeeklyPlan? = null,
+    val retry_policy: AutoSwitchRetryPolicy? = null,
+)
+
+data class AutoSwitchBundledAccountConfig(
+    val active_template: String? = null,
+    val config: AppConfig? = null,
+)
+
+data class AutoSwitchSmartTemplateDebug(
+    val enabled: Boolean? = null,
+    val session_id: String? = null,
+    val mode: String? = null,
+    val alias: String? = null,
+    val enter_reroll: Boolean? = null,
+    val accounts: Map<String, AutoSwitchSmartTemplateAccountDebug>? = null,
+)
+
+data class AutoSwitchSmartTemplateAccountDebug(
+    val branch: String? = null,
+    val branch_label: String? = null,
+    val follower_count: Int? = null,
+    val video_count: Int? = null,
+    val tiktok_username: String? = null,
+    val threshold_followers: Int? = null,
+    val threshold_video_count: Int? = null,
+    val seed: String? = null,
+    val picked_template: String? = null,
+    val selected_template: String? = null,
+    val roll: Int? = null,
+    val total_weight: Int? = null,
+    val resolution_source: String? = null,
+    val session_id: String? = null,
+)
+
+data class AutoSwitchWeeklyPlan(
+    val week_start_date: String? = null,
+    val week_end_date: String? = null,
+    val account_count: Int? = null,
+    val day_plans: List<AutoSwitchWeeklyDayPlan>? = null,
+)
+
+data class AutoSwitchWeeklyDayPlan(
+    val schedule_date: String? = null,
+    val daily_plan: AutoSwitchDailyPlan? = null,
+)
+
+data class AutoSwitchRunConfig(
+    val run_mode: String? = null,
+    val active_template: String? = null,
+    val publish_post_material_fetch_count: Int? = null,
+    val package_name: String? = null,
+)
+
+data class AutoSwitchAccount(
+    val row_index: Int? = null,
+    val username: String? = null,
+    val backup_path: String? = null,
+    val backup_name: String? = null,
+    val assigned_alias: String? = null,
+    val device_alias: String? = null,
+    val switch_highlight: String? = null,
+    val video_count: String? = null,
+    val follower_count: String? = null,
+    val follower_growth: String? = null,
+    /** account_editor_rows.row_index（自动登录上报用）。 */
+    val account_row_index: Int? = null,
+    val email: String? = null,
+    val password: String? = null,
+    val email_password: String? = null,
+    val api: String? = null,
+    val is_login: Boolean? = null,
+    val login_time: String? = null,
+    val basic_profile_modified: String? = null,
+    val mail_module_code_available: Boolean? = null,
+)
+
+data class AutoSwitchDailyPlan(
+    val slot_minutes: Int? = null,
+    val account_count: Int? = null,
+    val slots: List<AutoSwitchPlanSlot>? = null,
+)
+
+data class AutoSwitchPlanSlot(
+    val slot_index: Int? = null,
+    val start_min: Int? = null,
+    val end_min: Int? = null,
+    val row_index: Int? = null,
+    val username: String? = null,
+    val auto_publish_minute: Int? = null,
+)
+
+data class AutoSwitchRetryPolicy(
+    val cut_switch_max_attempts: Int? = null,
+    val login_max_attempts: Int? = null,
+    val publish_max_attempts: Int? = null,
+    val backoff_base_sec: Int? = null,
+    val backoff_max_sec: Int? = null,
+)
+
+data class AutoSwitchLedgerEntryPayload(
+    val at: String = "",
+    val op_id: String = "",
+    val op_type: String = "",
+    val status: String = "",
+    /** 账本阶段：queued / running / success / failed */
+    val phase: String = "",
+    val message: String = "",
+    val slot_key: String = "",
+    val username: String = "",
+    /** 设备 OP 回传 data 子集，供云端会话结束时写回 device_editor_rows。 */
+    val report_data: Map<String, Any> = emptyMap(),
+)
+
+data class AutoSwitchSessionSummaryRequest(
+    val device_id: String,
+    val alias: String,
+    val session_id: String,
+    val bundle_revision: Int = 0,
+    val schedule_date: String = "",
+    val started_at: String = "",
+    val ended_at: String = "",
+    val ledger: List<AutoSwitchLedgerEntryPayload> = emptyList(),
+    val human_log: String = "",
+    val stats: Map<String, Any> = emptyMap(),
+    /** final=关会话；daily=周期内每日对账 */
+    val summary_kind: String = "final",
+    /** 幂等键：final 用 final；daily 用北京时间日期 */
+    val reconcile_key: String = "",
+    /** enter 时 bundle 内 smart_template_debug，供管理台会话总结审计。 */
+    val smart_template_debug: Map<String, Any> = emptyMap(),
+)
+
+data class AutoSwitchSessionSummaryResponse(
+    val code: Int,
+    val msg: String? = null,
+    val summary_id: Int? = null,
+    val reconciliation: Map<String, Any>? = null,
 )

@@ -354,6 +354,62 @@ nav {
   color: var(--muted);
 }
 
+.auto-switch-summaries-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.auto-switch-summaries-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.auto-switch-summaries-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.auto-switch-summary-card {
+  padding: 12px 14px;
+}
+
+.auto-switch-summary-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+}
+
+.auto-switch-summary-notes {
+  margin: 6px 0 8px 18px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auto-switch-human-log {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f7f8fb;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
+}
+
 .backup-ops-card .field input[type="text"] {
   width: 100%;
   max-width: 360px;
@@ -578,6 +634,99 @@ select.device-group-select.ui-select {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.modal-card--import-preview {
+  width: min(960px, 100%);
+  max-height: min(90vh, 820px);
+  display: flex;
+  flex-direction: column;
+}
+
+.import-preview-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.import-preview-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.import-preview-table-wrap {
+  flex: 1 1 auto;
+  min-height: 180px;
+  max-height: min(52vh, 480px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fafbfd;
+}
+
+.import-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.import-preview-table th,
+.import-preview-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.import-preview-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #f0f3f8;
+  font-weight: 600;
+}
+
+.import-preview-table tr:last-child td {
+  border-bottom: none;
+}
+
+.import-preview-table .preview-cell-truncate {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-preview-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.import-preview-status--new {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+.import-preview-status--update {
+  background: #fff3e0;
+  color: #ef6c00;
+}
+
+.import-preview-status--duplicate {
+  background: #fce4ec;
+  color: #c62828;
+}
+
+.import-preview-status--skip {
+  background: #eceff1;
+  color: #546e7a;
 }
 
 .hint {
@@ -863,6 +1012,12 @@ button:disabled,
 .field textarea:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.backup-archive-auto-switch-badge--off {
+  background: #eef1f6;
+  color: #5c6678;
+  border: 1px solid #d5dbe6;
 }
 
 /* 设备备份档案：单条记录卡片 */

@@ -9,8 +9,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
@@ -39,15 +37,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
 
     // 备份/恢复 UI 已从「操作」页移除
-    private var assignedAccountRows: List<AccountEditorRowRecord> = emptyList()
-    private var assignedUsernameAdapter: ArrayAdapter<String>? = null
-    private var suppressAssignedUsernameSelectCallback: Boolean = false
+    private var assignedAccount: DeviceAssignedAccountResponse? = null
+    /** 硬停后关闭自动滚底，便于用户翻看历史日志；重新启动后台服务后恢复。 */
+    private var logStickToBottom = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        logStickToBottom = !PrefsStore.isHardStopRequested()
 
         requestNotificationPermissionIfNeeded()
         requestReadClipboardPermissionIfNeeded()
@@ -58,6 +57,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.startServiceButton.setOnClickListener {
             lifecycleScope.launch {
+                if (!ensureCloudLoginAndBoundForStart()) return@launch
                 val alias = PrefsStore.getAlias()
                 LogCenter.op(alias, "已请求启动后台服务")
                 runCatching { WorkerService.startResumingAutomation(this@MainActivity) }.onFailure { error ->
@@ -67,6 +67,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 delay(1200)
                 AppCoordinator.refreshRuntimeSnapshot()
+                logStickToBottom = true
                 if (WorkerServiceTracker.isRunning) {
                     AppCoordinator.forceStartRunningNow("设备端点击启动后台服务")
                     LogCenter.op(alias, "后台服务已启动")
@@ -80,6 +81,7 @@ class MainActivity : AppCompatActivity() {
         binding.stopServiceButton.setOnClickListener {
             lifecycleScope.launch {
                 val alias = PrefsStore.getAlias().orEmpty()
+                logStickToBottom = false
                 AppCoordinator.requestUserGracefulHardStop()
                 LogCenter.op(
                     alias,
@@ -147,6 +149,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        updateConfigSummaryLine()
         if (requireCloudLoginIfNeeded()) {
             renderDeviceInfo()
             return
@@ -161,7 +164,6 @@ class MainActivity : AppCompatActivity() {
             ensureBoundIfNeeded()
             renderDeviceInfo()
             clarifyStaleBindErrorIfNeeded()
-            refreshAssignedAccountFields()
         }
     }
 
@@ -177,95 +179,54 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshAssignedAccountFields() {
         val alias = PrefsStore.getAlias().orEmpty().trim()
-        if (alias.isBlank() || PrefsStore.getAuthToken().isNullOrBlank()) {
+        val deviceId = PrefsStore.getDeviceId().orEmpty().trim()
+        if (alias.isBlank() || deviceId.isBlank()) {
             PrefsStore.setLogContextUsername(null)
-            assignedAccountRows = emptyList()
-            assignedUsernameAdapter?.clear()
-            binding.assignedUsernameInput.setText("")
-            binding.assignedPasswordInput.setText("")
-            binding.assignedApiInput.setText("")
-            binding.assignedEmailInput.setText("")
-            binding.assignedEmailPasswordInput.setText("")
-            binding.assignedCopyStatusText.text = "未登录或未绑定，无法拉取分配账号"
+            assignedAccount = null
+            clearAssignedAccountInputs()
+            binding.assignedCopyStatusText.text = "未绑定设备，无法拉取分配账号"
             return
         }
         binding.assignedCopyStatusText.text = "正在拉取账号表单..."
         lifecycleScope.launch {
-            val accountRowsResp = runCatching { ApiService.getAccountEditorRows() }.getOrNull()
-            val editorRowsResp = runCatching { ApiService.getDeviceEditorRows() }.getOrNull()
-
-            val accountRows = accountRowsResp?.items.orEmpty()
-            val editorRows = editorRowsResp?.items.orEmpty()
-
-            assignedAccountRows = accountRows.filter { !it.username.isNullOrBlank() }
-            val aliasNorm = alias.trim()
-            fun effectiveDeviceAlias(r: DeviceEditorRowRecord): String {
-                val aa = r.assigned_alias?.trim().orEmpty()
-                return if (aa.isNotEmpty()) aa else r.device_alias?.trim().orEmpty()
-            }
-            fun isCutSwitchHighlight(r: DeviceEditorRowRecord) =
-                r.switch_highlight?.trim() == "是"
-
-            val matchedRows = editorRows
-                .asSequence()
-                .filter { effectiveDeviceAlias(it) == aliasNorm }
-                .sortedWith(
-                    compareByDescending<DeviceEditorRowRecord> { isCutSwitchHighlight(it) }
-                        .thenBy { it.row_index ?: Int.MAX_VALUE },
-                )
-                .toList()
-
-            val highlightedUsername = matchedRows
-                .firstOrNull { isCutSwitchHighlight(it) }
-                ?.username
-                ?.trim()
-                .orEmpty()
-            val usernames = buildList {
-                if (highlightedUsername.isNotBlank()) add(highlightedUsername)
-                matchedRows
-                    .asSequence()
-                    .mapNotNull { it.username?.trim() }
-                    .filter { it.isNotBlank() }
-                    .filter { it != highlightedUsername }
-                    .forEach { add(it) }
-            }
-
-            suppressAssignedUsernameSelectCallback = true
-            assignedUsernameAdapter?.clear()
-            assignedUsernameAdapter?.addAll(usernames)
-            assignedUsernameAdapter?.notifyDataSetChanged()
-            binding.assignedUsernameSelect.isEnabled = usernames.isNotEmpty()
-
-            if (usernames.isNotEmpty()) {
-                val selectedUsername = usernames.first()
-                binding.assignedUsernameSelect.setSelection(0)
-                applyAssignedAccountByUsername(selectedUsername)
-                val ctxUser = when {
-                    highlightedUsername.isNotBlank() -> highlightedUsername
-                    else -> selectedUsername
+            val resp = runCatching {
+                withContext(Dispatchers.IO) {
+                    ApiService.getDeviceAssignedAccount(deviceId, alias)
                 }
-                PrefsStore.setLogContextUsername(ctxUser.trim().takeIf { it.isNotEmpty() })
-            } else {
+            }.getOrElse { err ->
                 PrefsStore.setLogContextUsername(null)
-                applyAssignedAccountByUsername("")
-                binding.assignedCopyStatusText.text = "该别名暂无分配账号：$alias"
+                assignedAccount = null
+                clearAssignedAccountInputs()
+                binding.assignedCopyStatusText.text = "拉取失败：${err.message ?: "网络错误"}"
+                return@launch
             }
-            suppressAssignedUsernameSelectCallback = false
+            if (resp.code != 0) {
+                PrefsStore.setLogContextUsername(null)
+                assignedAccount = null
+                clearAssignedAccountInputs()
+                binding.assignedCopyStatusText.text = resp.msg?.trim().orEmpty().ifBlank {
+                    "该别名暂无高亮分配账号：$alias"
+                }
+                return@launch
+            }
+
+            assignedAccount = resp
+            applyAssignedAccount(resp)
+            PrefsStore.setLogContextUsername(resp.username?.trim().orEmpty().takeIf { it.isNotEmpty() })
         }
     }
 
-    private fun applyAssignedAccountByUsername(username: String) {
-        val u = username.trim().lowercase()
-        val account = assignedAccountRows.firstOrNull {
-            it.username.orEmpty().trim().lowercase() == u
-        }
-        if (account == null) {
-            binding.assignedUsernameInput.setText("")
-            binding.assignedPasswordInput.setText("")
-            binding.assignedApiInput.setText("")
-            binding.assignedEmailInput.setText("")
-            binding.assignedEmailPasswordInput.setText("")
-            binding.assignedCopyStatusText.text = "未找到该 username 对应的账号表单数据：$username"
+    private fun clearAssignedAccountInputs() {
+        binding.assignedUsernameInput.setText("")
+        binding.assignedPasswordInput.setText("")
+        binding.assignedApiInput.setText("")
+        binding.assignedEmailInput.setText("")
+        binding.assignedEmailPasswordInput.setText("")
+    }
+
+    private fun applyAssignedAccount(account: DeviceAssignedAccountResponse?) {
+        if (account == null || account.username.isNullOrBlank()) {
+            clearAssignedAccountInputs()
             return
         }
         binding.assignedUsernameInput.setText(account.username.orEmpty())
@@ -273,7 +234,16 @@ class MainActivity : AppCompatActivity() {
         binding.assignedApiInput.setText(account.api.orEmpty())
         binding.assignedEmailInput.setText(account.email.orEmpty())
         binding.assignedEmailPasswordInput.setText(account.email_password.orEmpty())
-        binding.assignedCopyStatusText.text = "已加载：${account.username.orEmpty()}"
+        val apiBlank = account.api.isNullOrBlank()
+        val emailPresent = !account.email.isNullOrBlank()
+        val mailModuleOk = account.mail_module_code_available == true
+        binding.assignedCopyStatusText.text = when {
+            apiBlank && emailPresent && !mailModuleOk ->
+                "已加载：${account.username.orEmpty()}（邮箱模块未配置该邮箱 OAuth，请在管理台「邮箱账户管理」导入）"
+            apiBlank && emailPresent && mailModuleOk ->
+                "已加载：${account.username.orEmpty()}（可通过邮箱管理模块获取验证码）"
+            else -> "已加载高亮账号：${account.username.orEmpty()}"
+        }
     }
 
     private fun setupAssignedAccountSection() {
@@ -358,23 +328,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        assignedUsernameAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf())
-        binding.assignedUsernameSelect.adapter = assignedUsernameAdapter
-        binding.assignedUsernameSelect.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                if (suppressAssignedUsernameSelectCallback) return
-                val uname = assignedUsernameAdapter?.getItem(position).orEmpty()
-                PrefsStore.setLogContextUsername(uname.trim().takeIf { it.isNotEmpty() })
-                applyAssignedAccountByUsername(uname)
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) {
-                if (suppressAssignedUsernameSelectCallback) return
-                PrefsStore.setLogContextUsername(null)
-                applyAssignedAccountByUsername("")
-            }
-        }
-        refreshAssignedAccountFields()
+        binding.assignedUsernameSelect.visibility = View.GONE
     }
 
     private fun requireCloudLoginIfNeeded(): Boolean {
@@ -383,6 +337,27 @@ class MainActivity : AppCompatActivity() {
         binding.actionPanel.visibility = View.VISIBLE
         binding.bindStatusText.text = "请先在设置中登录云端账号"
         startActivity(Intent(this, SettingsActivity::class.java))
+        return true
+    }
+
+    /** 启动后台服务前：必须已登录云端且完成设备绑定。 */
+    private fun ensureCloudLoginAndBoundForStart(): Boolean {
+        if (PrefsStore.getAuthToken().isNullOrBlank()) {
+            Toast.makeText(this, "请先在设置中登录云端账号", Toast.LENGTH_SHORT).show()
+            binding.logPanel.visibility = View.GONE
+            binding.actionPanel.visibility = View.VISIBLE
+            binding.bindStatusText.text = "请先在设置中登录云端账号"
+            startActivity(Intent(this, SettingsActivity::class.java))
+            return false
+        }
+        if (!PrefsStore.isBound()) {
+            Toast.makeText(this, "请先填写别名并点击「绑定」完成设备绑定", Toast.LENGTH_SHORT).show()
+            binding.logPanel.visibility = View.GONE
+            binding.actionPanel.visibility = View.VISIBLE
+            binding.bindStatusText.text = "启动前需完成绑定：填写别名后点击绑定"
+            LogCenter.op(PrefsStore.getAlias(), "启动被拒绝：设备未绑定（无 deviceId/alias）")
+            return false
+        }
         return true
     }
 
@@ -396,13 +371,14 @@ class MainActivity : AppCompatActivity() {
     private fun showLogPanel() {
         binding.logPanel.visibility = View.VISIBLE
         binding.actionPanel.visibility = View.GONE
-        scrollLogToLatest()
+        if (logStickToBottom) scrollLogToLatest()
     }
 
     private fun showActionPanel() {
         binding.logPanel.visibility = View.GONE
         binding.actionPanel.visibility = View.VISIBLE
         updateConfigSummaryLine()
+        refreshAssignedAccountFields()
     }
 
     private fun openConfigParamsScreen() {
@@ -412,10 +388,12 @@ class MainActivity : AppCompatActivity() {
     private fun updateConfigSummaryLine() {
         val cfg = AppCoordinator.config.value
         val state = AppCoordinator.runtimeState.value
+        val account = PrefsStore.getLogContextUsername()?.trim().orEmpty().ifBlank { "—" }
         val tpl = state.effectiveTemplate.ifBlank { "—" }
         val loaded = if (state.configLoaded) "已同步" else "未同步"
+        val sourceHint = if (PrefsStore.isAutoSwitchAutonomousMode()) "bundle" else "云端"
         binding.configSummaryText.text =
-            "当前模板：$tpl · ${ConfigDisplay.prettyRunMode(cfg.run_mode)} · $loaded\n" +
+            "当前账号：$account · 模板：$tpl（$sourceHint） · ${ConfigDisplay.prettyRunMode(cfg.run_mode)} · $loaded\n" +
                 "互动：赞${formatProbShort(cfg.like_prob)} 评${formatProbShort(cfg.comment_prob)} " +
                 "藏${formatProbShort(cfg.favorite_prob)} 转${formatProbShort(cfg.share_prob)} · " +
                 "每日上限 ${cfg.like_daily_limit}/${cfg.comment_daily_limit}/${cfg.favorite_daily_limit}/${cfg.share_daily_limit}"
@@ -451,14 +429,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderDeviceInfo() {
-        binding.deviceInfoText.text = buildString {
-            appendLine("版本: ${AppInfo.versionLabel()}")
-            appendLine("Alias: ${PrefsStore.getAlias()}")
-            appendLine("Device ID: ${PrefsStore.getDeviceId()}")
-            appendLine("Local Status: ${PrefsStore.getLocalStatus()}")
-            val au = PrefsStore.getAuthUsername()
-            if (!au.isNullOrBlank()) appendLine("云端账号: $au") else appendLine("云端账号: 未登录（绑定前请在设置中登录）")
-        }
+        val au = PrefsStore.getAuthUsername()
+        val cloudLabel = if (!au.isNullOrBlank()) au else "未登录"
+        binding.deviceInfoText.text =
+            "${PrefsStore.getAlias().orEmpty()} · ${PrefsStore.getLocalStatus()} · 云端: $cloudLabel"
     }
 
     private fun scrollLogToLatest() {
@@ -467,11 +441,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun isLogScrolledToBottom(): Boolean {
+        val scroll = binding.logScroll
+        val child = scroll.getChildAt(0) ?: return true
+        val threshold = (16 * resources.displayMetrics.density).toInt().coerceAtLeast(8)
+        val maxScroll = (child.height - scroll.height + scroll.paddingBottom).coerceAtLeast(0)
+        if (maxScroll == 0) return true
+        return scroll.scrollY >= maxScroll - threshold
+    }
+
     private fun observeLogs() {
         lifecycleScope.launch {
             LogCenter.logs.collect { logs ->
+                val stickToBottom = logStickToBottom && isLogScrolledToBottom()
                 binding.logText.text = logs.takeLast(120).joinToString("\n")
-                scrollLogToLatest()
+                if (stickToBottom) scrollLogToLatest()
             }
         }
 
@@ -483,6 +467,7 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             AppCoordinator.runtimeState.collectLatest { state ->
+                if (state.hardStopRequested) logStickToBottom = false
                 updateConfigSummaryLine()
                 binding.runtimeStateText.text = buildString {
                     appendLine("后台服务: ${if (state.serviceRunning) "运行中" else "未启动"}")
@@ -495,6 +480,16 @@ class MainActivity : AppCompatActivity() {
                         appendLine("当前生效模板: ${state.effectiveTemplate}")
                     }
                     appendLine("服务端: ${state.currentServerUrl}")
+                    val cloudAutoStartLabel = when (state.cloudAutoStart) {
+                        true -> "开启"
+                        false -> "关闭"
+                        null -> "—"
+                    }
+                    appendLine("云端自动起号: $cloudAutoStartLabel")
+                    val autoSwitchMode = PrefsStore.getAutoSwitchMode()
+                    if (autoSwitchMode != "off") {
+                        appendLine("自动切号自治（本机）: $autoSwitchMode")
+                    }
                     appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
                     append("最近状态: ${state.lastMessage}")
                 }

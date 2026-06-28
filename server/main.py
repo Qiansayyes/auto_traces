@@ -10,13 +10,14 @@ import random
 import re
 import sqlite3
 import string
+import signal
 import subprocess
 import sys
 import locale
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from threading import Event, Lock, RLock, Thread
@@ -83,6 +84,8 @@ BASE_DEFAULT_CONFIG = {
     "pull_batch_size": 5,
     # 设备连续完成多少批拉取后，下一次拉取触发休息（与 pull_batch_size 解耦）
     "pull_batches_before_rest": 5,
+    # 为 true 时本模板设备永不进入批次休息（优先于 break_min/break_max）
+    "no_rest": False,
     # 立即处理 follower_queue 的默认批次大小
     "process_queue_batch_size": 100,
     # 评论文本库
@@ -206,6 +209,7 @@ MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD = 5000
 # 应用关闭信号：后台调度线程与 shutdown 钩子共享，避免 uvicorn 长时间卡在 Shutting down。
 _APP_SHUTDOWN_EVENT = Event()
 _app_shutting_down = False
+_EARLY_SHUTDOWN_PREV_HANDLERS: Dict[int, Any] = {}
 MOBILE_PENDING_AUTO_REFILL_DEFAULT_COOLDOWN_SEC = 600
 DEFAULT_PROCESS_QUEUE_BATCH_SIZE = int(BASE_DEFAULT_CONFIG.get("process_queue_batch_size", 100))
 DEVICE_LOG_DEDUP_WINDOW_SEC = 5.0
@@ -731,6 +735,10 @@ def init_auth_db():
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE client_devices ADD COLUMN auto_switch_enabled INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE client_devices ADD COLUMN device_group TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
@@ -826,6 +834,120 @@ def init_autosearch_db():
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (owner_username, schedule_date, alias)
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_switch_weekly_plans (
+                owner_username TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, week_start_date, alias)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_mode_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                owner_username TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                bundle_revision INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                acked_at TEXT,
+                ack_phase TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_device_mode_events_device_pending "
+            "ON device_mode_events(device_id, id) WHERE acked_at IS NULL"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_switch_sessions (
+                session_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                bundle_revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_switch_session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                owner_username TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                bundle_revision INTEGER NOT NULL DEFAULT 0,
+                schedule_date TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL,
+                human_log TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_switch_session_summaries_owner "
+            "ON auto_switch_session_summaries(owner_username, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_switch_session_summaries_device "
+            "ON auto_switch_session_summaries(device_id, id DESC)"
+        )
+        try:
+            conn.execute(
+                "ALTER TABLE auto_switch_session_summaries "
+                "ADD COLUMN summary_kind TEXT NOT NULL DEFAULT 'final'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE auto_switch_session_summaries "
+                "ADD COLUMN reconcile_key TEXT NOT NULL DEFAULT 'final'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # 升级前已入库的总结行 reconcile_key 默认为 final，会挡住新关会话写回；标为 legacy。
+        try:
+            conn.execute(
+                """
+                UPDATE auto_switch_session_summaries
+                SET reconcile_key = 'legacy-' || CAST(id AS TEXT)
+                WHERE reconcile_key = 'final'
+                  AND summary_json NOT LIKE '%"summary_kind"%'
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_switch_publish_video_writeback (
+                owner_username TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                slot_key TEXT NOT NULL DEFAULT '',
+                outcome_op_id TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                delta INTEGER NOT NULL DEFAULT 1,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY (owner_username, session_id, dedupe_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_auto_switch_publish_video_writeback_session
+            ON auto_switch_publish_video_writeback(owner_username, session_id)
             """
         )
         conn.execute(
@@ -1128,6 +1250,7 @@ class DeviceInfo:
     pending_start: bool = False
     paused: bool = False
     auto_start_opt_out: bool = False
+    auto_switch_enabled: bool = False
 
 
 @dataclass
@@ -1153,6 +1276,8 @@ class MemoryStore:
     scheduler_task_interval_sec: Dict[str, int] = field(default_factory=dict)
     scheduler_task_last_run_at: Dict[str, str] = field(default_factory=dict)
     auto_switch_enabled: bool = False
+    # 自治包版本：每次开启自动切号时递增，写入 device_mode_events.bundle_revision。
+    auto_switch_bundle_revision: int = 0
     # 仅用户显式开启自动切号时置 True；重启默认为 False，避免每次启动全量对齐拖垮 SQLite/HTTP。
     auto_switch_align_on_next_tick: bool = False
     auto_switch_last_slot_keys: Dict[str, str] = field(default_factory=dict)
@@ -1172,7 +1297,9 @@ class MemoryStore:
     # 设备端操作任务队列与结果（用于“备份清理/恢复”）
     pending_device_ops: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     device_op_results: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    lock: Lock = field(default_factory=Lock)
+    # device_id -> {"max_lines": int, "requested_at": float}
+    pending_device_log_pulls: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    lock: RLock = field(default_factory=RLock)
 
     def verify_device(self, device_id: str, alias: str) -> DeviceInfo | None:
         device = self.devices.get((device_id or "").strip())
@@ -1184,6 +1311,20 @@ class MemoryStore:
 
 
 store = MemoryStore()
+
+# 设备热路径持锁上限：超时快速失败，避免 check_start / device_ops 拖死全站。
+STORE_LOCK_WAIT_SEC = 2.5
+STORE_LOCK_DEVICE_WAIT_SEC = 1.5
+# 已有设备开启自动切号自治后，云端 minute tick 仅保活探测，大幅降频。
+AUTO_SWITCH_AUTONOMOUS_IDLE_SEC = 300
+
+
+class StoreLockBusy(RuntimeError):
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
+
+
 _overview_fallback_snapshot: Dict[str, Any] = {
     "devices": {},
     "device_logs": {},
@@ -1217,8 +1358,18 @@ def _trim_task_log_keys_unlocked() -> None:
 
 
 @contextlib.contextmanager
-def _tracked_store_lock(label: str, threshold_ms: int = 200):
-    """仅在锁等待过长或持锁过久时打印，避免淹没与「待下发入队」争用相关的信号。"""
+def _tracked_store_lock(
+    label: str,
+    threshold_ms: int = 200,
+    *,
+    blocking: bool = False,
+    wait_sec: float | None = None,
+):
+    """仅在锁等待过长或持锁过久时打印，避免淹没与「待下发入队」争用相关的信号。
+
+    默认带超时（STORE_LOCK_WAIT_SEC），设备热路径抢不到锁时抛 StoreLockBusy 快速失败。
+    启动恢复、shutdown 等路径请传 blocking=True。
+    """
     started_at = time.monotonic()
     caller = "unknown"
     try:
@@ -1227,7 +1378,14 @@ def _tracked_store_lock(label: str, threshold_ms: int = 200):
         caller = f"{Path(frame.filename).name}:{frame.lineno}:{frame.function}"
     except Exception:
         pass
-    store.lock.acquire()
+    timeout = None if blocking else (STORE_LOCK_WAIT_SEC if wait_sec is None else wait_sec)
+    if blocking:
+        acquired = store.lock.acquire()
+    else:
+        acquired = store.lock.acquire(timeout=timeout)
+    if not acquired:
+        print(f"[{now_text()}] 锁超时 | {label} | wait>={timeout}s | caller={caller}")
+        raise StoreLockBusy(label)
     waited_ms = int((time.monotonic() - started_at) * 1000)
     try:
         yield
@@ -1240,6 +1398,22 @@ def _tracked_store_lock(label: str, threshold_ms: int = 200):
         store.lock.release()
 
 
+@contextlib.contextmanager
+def _store_lock(
+    label: str,
+    *,
+    blocking: bool = False,
+    wait_sec: float | None = None,
+):
+    """替换散落的 `with store.lock`，与 _tracked_store_lock 共用超时语义。"""
+    with _tracked_store_lock(label, blocking=blocking, wait_sec=wait_sec):
+        yield
+
+
+def _store_lock_busy_response() -> dict:
+    return {"code": 503, "msg": "服务繁忙，请稍后重试"}
+
+
 
 def _load_client_devices_from_db() -> None:
     """启动时从 SQLite 恢复设备绑定（含归属客户），并重建内存索引。"""
@@ -1247,13 +1421,13 @@ def _load_client_devices_from_db() -> None:
     rows: list[Any] = []
     try:
         rows = conn.execute(
-            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out FROM client_devices"
+            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices"
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
     finally:
         conn.close()
-    with _tracked_store_lock("_load_client_devices_from_db"):
+    with _tracked_store_lock("_load_client_devices_from_db", blocking=True):
         store.devices.clear()
         store.fingerprint_to_device.clear()
         for row in rows:
@@ -1270,6 +1444,7 @@ def _load_client_devices_from_db() -> None:
                 pending_start=bool(int(row["pending_start"] or 0)),
                 paused=bool(int(row["paused"] or 0)),
                 auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in row.keys() else False,
+                auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in row.keys() else False,
             )
             store.fingerprint_to_device[str(row["fingerprint"])] = did
     if rows:
@@ -1293,6 +1468,7 @@ def _persist_client_device_to_db(device_id: str) -> None:
         pending_start = 1 if dev.pending_start else 0
         paused = 1 if dev.paused else 0
         auto_start_opt_out = 1 if dev.auto_start_opt_out else 0
+        auto_switch_enabled = 1 if dev.auto_switch_enabled else 0
     now = now_text()
     conn = _get_db()
     try:
@@ -1302,18 +1478,18 @@ def _persist_client_device_to_db(device_id: str) -> None:
             conn.execute(
                 """
                 UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, fingerprint = ?, status = ?,
-                    pending_start = ?, paused = ?, auto_start_opt_out = ?, updated_at = ?
+                    pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?, updated_at = ?
                 WHERE device_id = ?
                 """,
-                (owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, now, device_id),
+                (owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, now, device_id),
             )
         else:
             conn.execute(
                 """
-                INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (device_id, owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, now, now),
+                (device_id, owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, now, now),
             )
         conn.commit()
         print(f"[{now_text()}] persist_client_device | db_write_done | device_id={device_id} elapsed={(time.perf_counter() - t0) * 1000:.1f}ms")
@@ -1340,59 +1516,66 @@ def _load_persisted_runtime_state():
                 if isinstance(incoming, dict):
                     mode_cfg.update(incoming)
                 merged_cfgs[mode] = mode_cfg
-            with _tracked_store_lock("_load_persisted_runtime_state:configs_by_mode"):
+            with _tracked_store_lock("_load_persisted_runtime_state:configs_by_mode", blocking=True):
                 store.configs_by_mode = merged_cfgs
                 store.config = dict(merged_cfgs.get("growth", MODE_DEFAULT_CONFIGS["growth"]))
         mode = blob.get("run_mode")
         if mode in RUN_MODES:
-            with _tracked_store_lock("_load_persisted_runtime_state:run_mode"):
+            with _tracked_store_lock("_load_persisted_runtime_state:run_mode", blocking=True):
                 store.run_mode = mode  # type: ignore[assignment]
                 store.config = dict(store.configs_by_mode.get(mode, MODE_DEFAULT_CONFIGS[mode]))
         auto_start = blob.get("auto_start_enabled")
         if isinstance(auto_start, bool):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_start"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_start", blocking=True):
                 store.auto_start_enabled = auto_start
         auto_sw = blob.get("auto_switch_enabled")
         if isinstance(auto_sw, bool):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch", blocking=True):
                 store.auto_switch_enabled = auto_sw
+        auto_sw_rev = blob.get("auto_switch_bundle_revision")
+        if auto_sw_rev is not None:
+            try:
+                with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_bundle_revision", blocking=True):
+                    store.auto_switch_bundle_revision = max(0, int(auto_sw_rev))
+            except (TypeError, ValueError):
+                pass
         last_slots = blob.get("auto_switch_last_slot_keys")
         if isinstance(last_slots, dict):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_slots"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_slots", blocking=True):
                 store.auto_switch_last_slot_keys = {
                     str(k): str(v) for k, v in last_slots.items() if str(k).strip() and str(v).strip()
                 }
         publish_done = blob.get("auto_switch_publish_done_keys")
         if isinstance(publish_done, dict):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_done"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_done", blocking=True):
                 store.auto_switch_publish_done_keys = {
                     str(k): str(v) for k, v in publish_done.items() if str(k).strip() and str(v).strip()
                 }
         publish_aborted = blob.get("auto_switch_publish_aborted_keys")
         if isinstance(publish_aborted, dict):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_aborted"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_aborted", blocking=True):
                 store.auto_switch_publish_aborted_keys = {
                     str(k): str(v) for k, v in publish_aborted.items() if str(k).strip() and str(v).strip()
                 }
         publish_inflight = blob.get("auto_switch_publish_inflight_keys")
         if isinstance(publish_inflight, dict):
-            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_inflight"):
+            with _tracked_store_lock("_load_persisted_runtime_state:auto_switch_publish_inflight", blocking=True):
                 store.auto_switch_publish_inflight_keys = {
                     str(k): str(v) for k, v in publish_inflight.items() if str(k).strip() and str(v).strip()
                 }
         bs_enabled = blob.get("backup_stats_full_query_enabled")
         if isinstance(bs_enabled, bool):
-            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_full_query"):
+            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_full_query", blocking=True):
                 store.backup_stats_full_query_enabled = bs_enabled
         bs_last = blob.get("backup_stats_full_query_last_run_date")
         if isinstance(bs_last, str):
-            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_last"):
+            with _tracked_store_lock("_load_persisted_runtime_state:backup_stats_last", blocking=True):
                 store.backup_stats_full_query_last_run_date = bs_last.strip()
         dc = blob.get("default_config")
         if isinstance(dc, dict):
             dm = dict(MODE_DEFAULT_CONFIGS["growth"])
             dm.update(dc)
-            with _tracked_store_lock("_load_persisted_runtime_state:default_config"):
+            with _tracked_store_lock("_load_persisted_runtime_state:default_config", blocking=True):
                 store.default_config = dm
         print(f"[{now_text()}] 系统 | 已从数据库恢复运行配置")
     except sqlite3.OperationalError:
@@ -1432,8 +1615,11 @@ def _save_user_runtime_state(username: str, payload: dict):
         conn.commit()
         u = (username or "").strip()
         if u:
-            with store.lock:
-                store.user_config_push_revision[u] = int(store.user_config_push_revision.get(u, 0)) + 1
+            try:
+                with _store_lock("save_user_runtime_state:push_rev", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+                    store.user_config_push_revision[u] = int(store.user_config_push_revision.get(u, 0)) + 1
+            except StoreLockBusy:
+                print(f"[{now_text()}] save_user_runtime_state | store_lock_busy | user={u}")
     finally:
         conn.close()
 
@@ -1674,6 +1860,46 @@ def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -
     return _normalize_tiktok_username_key(pick.get("username"))
 
 
+NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN = -1
+
+
+def _parse_video_count_raw(value: object) -> int | None:
+    """解析 video_count 原始值（可含负数）；空值返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _default_video_count_for_new_row(conn, owner_username: str, username: str = "") -> str:
+    """新行默认作品数：优先沿用账号表已有值，否则为 -1（新号 24h 内不发作品标记）。"""
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip()
+    if owner and uname:
+        row = conn.execute(
+            """
+            SELECT video_count FROM account_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (owner, uname),
+        ).fetchone()
+        if row:
+            vc = str(row[0] or "").strip()
+            if vc:
+                return vc
+    return str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)
+
+
 def _parse_stat_int(value: object) -> int:
     if value is None:
         return 0
@@ -1842,18 +2068,100 @@ def _stable_weighted_template_pick(seed: str, entries: list[dict[str, object]], 
     return weighted[-1][0]
 
 
+def _get_account_stats_for_smart_template(
+    owner_username: str,
+    alias: str,
+    tiktok_username: str | None = None,
+    account_stats: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """读取指定账号（或高亮账号）的粉丝/作品数，供智能模板分支判定。"""
+    if isinstance(account_stats, dict) and account_stats:
+        return {
+            "tiktok_username": _normalize_tiktok_username_key(account_stats.get("tiktok_username")),
+            "follower_count": _parse_stat_int(account_stats.get("follower_count")),
+            "video_count": _parse_stat_int(account_stats.get("video_count")),
+        }
+    owner = str(owner_username or "").strip()
+    alias_clean = _normalize_alias_key(alias)
+    account = _normalize_tiktok_username_key(tiktok_username or "")
+    if owner and alias_clean and account:
+        conn = _get_db()
+        try:
+            rows = conn.execute(
+                """
+                SELECT username, video_count, follower_count, device_alias, assigned_alias
+                FROM device_editor_rows
+                WHERE owner_username = ?
+                """,
+                (owner,),
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows or []:
+            item = {
+                "username": str(row[0] or "").strip(),
+                "video_count": row[1] if len(row) > 1 else "",
+                "follower_count": row[2] if len(row) > 2 else "",
+                "device_alias": str(row[3] or "").strip() if len(row) > 3 else "",
+                "assigned_alias": str(row[4] or "").strip() if len(row) > 4 else "",
+            }
+            if _device_editor_effective_alias(item) != alias_clean:
+                continue
+            if not _normalize_tiktok_username_key(item.get("username")) == account:
+                continue
+            return {
+                "tiktok_username": account,
+                "follower_count": _parse_stat_int(item.get("follower_count")),
+                "video_count": _parse_stat_int(item.get("video_count")),
+            }
+    return _get_highlight_account_stats(owner_username, alias_clean)
+
+
+def _smart_template_weighted_roll(seed: str, entries: list[dict[str, object]], valid_names: set[str]) -> tuple[int, int]:
+    weighted: list[tuple[str, int]] = []
+    for item in entries:
+        name = str(item.get("template_name") or "").strip()
+        if not name or name not in valid_names:
+            continue
+        try:
+            weight = int(item.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0
+        if weight > 0:
+            weighted.append((name, weight))
+    total = sum(w for _, w in weighted)
+    if total <= 0:
+        return 0, 0
+    digest = hashlib.sha256(str(seed or "").encode("utf-8")).hexdigest()
+    roll = int(digest[:8], 16) % total
+    return roll, total
+
+
 def _resolve_smart_template_for_alias(
     owner_username: str,
     data: dict,
     mode: str,
     alias: str,
     templates: Dict[str, Dict[str, object]],
+    *,
+    tiktok_username: str | None = None,
+    account_stats: dict[str, object] | None = None,
+    session_id: str = "",
 ) -> tuple[str, dict[str, object]]:
-    """智能模板：按高亮账号粉丝/作品数选分支，再按权重稳定命中具体模板。"""
+    """智能模板：按账号粉丝/作品数选分支，再按权重命中具体模板。
+
+    session_id 非空时写入 seed，使同一 session 每次 enter 重新掷概率；
+    管理台预览/普通 getConfig 不传 session_id，保持按账号稳定命中。
+    """
     mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
     alias_clean = _normalize_alias_key(alias)
     cfg = _normalize_smart_template_config(data.get("smart_template_config"))
-    stats = _get_highlight_account_stats(owner_username, alias_clean)
+    stats = _get_account_stats_for_smart_template(
+        owner_username,
+        alias_clean,
+        tiktok_username=tiktok_username,
+        account_stats=account_stats,
+    )
     followers = int(stats.get("follower_count") or 0)
     videos = int(stats.get("video_count") or 0)
     min_followers = int(cfg.get("old_branch_min_followers") or 0)
@@ -1868,8 +2176,11 @@ def _resolve_smart_template_for_alias(
     if not isinstance(branch_entries, list):
         branch_entries = []
     account = str(stats.get("tiktok_username") or "").strip()
-    seed = f"{owner_username}|{mode_key}|{alias_clean}|{account}|{branch}"
+    session_part = str(session_id or "").strip()
+    seed_base = f"{owner_username}|{mode_key}|{alias_clean}|{account}|{branch}"
+    seed = f"{session_part}|{seed_base}" if session_part else seed_base
     valid_names = set(templates.keys())
+    roll, total_weight = _smart_template_weighted_roll(seed, branch_entries, valid_names)
     picked = _stable_weighted_template_pick(seed, branch_entries, valid_names)
     stored_active = str(data.get("active_template") or "").strip()
     fallback = stored_active if stored_active in valid_names else (sorted(valid_names)[0] if valid_names else "default")
@@ -1884,6 +2195,10 @@ def _resolve_smart_template_for_alias(
         "threshold_video_count": min_videos,
         "seed": seed,
         "picked_template": picked,
+        "selected_template": selected,
+        "roll": roll,
+        "total_weight": total_weight,
+        "session_id": session_part,
     }
     return selected, debug
 
@@ -2124,6 +2439,7 @@ def _resolve_template_for_mode_alias(
             mode_key,
             alias_clean,
             templates,
+            tiktok_username=account_clean or None,
         )
         config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
         print(
@@ -2213,6 +2529,7 @@ def persist_runtime_state():
             "default_config": dict(store.default_config),
             "auto_start_enabled": store.auto_start_enabled,
             "auto_switch_enabled": bool(store.auto_switch_enabled),
+            "auto_switch_bundle_revision": int(store.auto_switch_bundle_revision or 0),
             "auto_switch_last_slot_keys": dict(store.auto_switch_last_slot_keys),
             "auto_switch_publish_done_keys": dict(store.auto_switch_publish_done_keys),
             "auto_switch_publish_aborted_keys": dict(store.auto_switch_publish_aborted_keys),
@@ -2434,20 +2751,47 @@ def _interruptible_worker_sleep(seconds: float) -> bool:
     return _APP_SHUTDOWN_EVENT.wait(max(0.05, float(seconds)))
 
 
-@app.on_event("shutdown")
-async def _on_app_shutdown() -> None:
+def _begin_app_shutdown_early(*, log: bool = True) -> None:
+    """收到关闭信号时立即执行，不必等 uvicorn 排空所有 HTTP 连接。"""
     global _app_shutting_down
+    if _app_shutting_down:
+        return
     _app_shutting_down = True
     _APP_SHUTDOWN_EVENT.set()
     with contextlib.suppress(Exception):
         store.scheduler_stop_event.set()
     with contextlib.suppress(Exception):
         _stop_all_task_processes()
+    if log:
+        print(f"[{now_text()}] app shutdown | background workers signaled (early)")
+
+
+def _install_early_shutdown_signal_handlers() -> None:
+    """在 uvicorn 优雅关闭等待连接期间，先停后台线程并拒绝新请求。"""
+
+    def _wrap(signum, frame):
+        _begin_app_shutdown_early()
+        prev = _EARLY_SHUTDOWN_PREV_HANDLERS.get(signum)
+        if prev is not None and callable(prev) and prev is not _wrap:
+            prev(signum, frame)
+            return
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(Exception):
+            _EARLY_SHUTDOWN_PREV_HANDLERS[sig] = signal.getsignal(sig)
+            signal.signal(sig, _wrap)
+
+
+@app.on_event("shutdown")
+async def _on_app_shutdown() -> None:
+    _begin_app_shutdown_early(log=False)
     with contextlib.suppress(Exception):
         from mail_integration import stop_mail_module_process
 
         await asyncio.to_thread(stop_mail_module_process)
-    print(f"[{now_text()}] app shutdown | background workers signaled")
+    print(f"[{now_text()}] app shutdown | complete")
 
 
 @app.on_event("startup")
@@ -2466,6 +2810,8 @@ async def install_asyncio_exception_filter() -> None:
         current_loop.default_exception_handler(context)
 
     loop.set_exception_handler(_handler)
+    _install_early_shutdown_signal_handlers()
+    _reconcile_auto_switch_mode_event_mailbox()
 
 
 if __name__ == "__main__":
@@ -2491,7 +2837,9 @@ async def log_request_timing(request: Request, call_next):
         return JSONResponse(status_code=503, content={"code": 1, "msg": "服务正在关闭"})
     started = time.perf_counter()
     path = request.url.path
-    print(f"[{now_text()}] HTTP {request.method} {path} | enter")
+    quiet_poll = path in ("/api/device/mode_wait", "/api/check_start", "/api/device_ops/poll")
+    if not quiet_poll:
+        print(f"[{now_text()}] HTTP {request.method} {path} | enter")
     try:
         # 管理台核心接口：避免因数据库锁/偶发阻塞导致前端长期 pending。
         if path in ("/api/admin/overview", "/api/auth/me", "/api/health"):
@@ -2499,9 +2847,11 @@ async def log_request_timing(request: Request, call_next):
             response = await asyncio.wait_for(call_next(request), timeout=20.0)
             print(f"[{now_text()}] HTTP {request.method} {path} | call_next_done")
         else:
-            print(f"[{now_text()}] HTTP {request.method} {path} | call_next_start")
+            if not quiet_poll:
+                print(f"[{now_text()}] HTTP {request.method} {path} | call_next_start")
             response = await call_next(request)
-            print(f"[{now_text()}] HTTP {request.method} {path} | call_next_done")
+            if not quiet_poll:
+                print(f"[{now_text()}] HTTP {request.method} {path} | call_next_done")
     except asyncio.TimeoutError:
         elapsed_ms = (time.perf_counter() - started) * 1000
         print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 504 | {elapsed_ms:.1f}ms | TIMEOUT")
@@ -2668,6 +3018,11 @@ class AutoStartRequest(BaseModel):
 
 class AutoSwitchConfigRequest(BaseModel):
     enabled: bool | None = None
+
+
+class AutoSwitchDevicesRequest(BaseModel):
+    device_ids: List[str] = Field(default_factory=list)
+    enabled: bool
 
 
 class BackupStatsFullQueryConfigRequest(BaseModel):
@@ -2936,6 +3291,44 @@ class DeviceOpPollRequest(BaseModel):
     alias: str = Field(..., min_length=1, max_length=64)
 
 
+class DeviceModeAckRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    event_id: int = Field(..., ge=1)
+    phase: str = Field(..., min_length=1, max_length=64)
+    session_id: str = Field(default="", max_length=128)
+
+
+class AutoSwitchLedgerEntryPayload(BaseModel):
+    at: str = Field(default="", max_length=64)
+    op_id: str = Field(default="", max_length=128)
+    op_type: str = Field(default="", max_length=64)
+    status: str = Field(default="", max_length=32)
+    phase: str = Field(default="", max_length=32)
+    message: str = Field(default="", max_length=2000)
+    slot_key: str = Field(default="", max_length=64)
+    username: str = Field(default="", max_length=128)
+    report_data: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutoSwitchSessionSummaryRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    bundle_revision: int = Field(default=0, ge=0)
+    schedule_date: str = Field(default="", max_length=32)
+    started_at: str = Field(default="", max_length=64)
+    ended_at: str = Field(default="", max_length=64)
+    ledger: List[AutoSwitchLedgerEntryPayload] = Field(default_factory=list)
+    human_log: str = Field(default="", max_length=50000)
+    stats: dict[str, Any] = Field(default_factory=dict)
+    """final=关会话总结；daily=自治周期内每日对账（同一 session 可多次）。"""
+    summary_kind: str = Field(default="final", max_length=16)
+    """幂等键：final 用 final；daily 用北京时间日期 YYYY-MM-DD。"""
+    reconcile_key: str = Field(default="", max_length=64)
+    smart_template_debug: dict[str, Any] = Field(default_factory=dict)
+
+
 class MutualClickRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
@@ -2981,6 +3374,12 @@ class DeviceLogSyncRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
     logs: List[str] = Field(default_factory=list)
+    replace: bool = False
+
+
+class DeviceLogPullRequest(BaseModel):
+    device_ids: List[str] = Field(default_factory=list)
+    max_lines: int = 400
 
 
 class UpdateConfigRequest(BaseModel):
@@ -3019,6 +3418,7 @@ class UpdateConfigRequest(BaseModel):
     following_filter_max_following_count: int | None = None
     pull_batch_size: int | None = None
     pull_batches_before_rest: int | None = None
+    no_rest: bool | None = None
     process_queue_batch_size: int | None = None
     comment_texts: List[str] | None = None
     mutual_comment_texts: List[str] | None = None
@@ -4082,6 +4482,43 @@ def _beijing_minute_of_day(dt: datetime | None = None) -> int:
     return cur.hour * 60 + cur.minute
 
 
+def _parse_beijing_date(date_str: str) -> datetime:
+    text = str(date_str or "").strip()
+    return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=BEIJING_TZ)
+
+
+def _beijing_week_bounds(date_str: str | None = None) -> tuple[str, str]:
+    """北京时间自然周：周一 00:00 至周日 24:00（含首尾日期）。"""
+    date_key = str(date_str or "").strip() or _beijing_date_str()
+    dt = _parse_beijing_date(date_key)
+    monday = dt - timedelta(days=dt.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+
+
+def _iter_dates_inclusive(start_date: str, end_date: str) -> List[str]:
+    start = _parse_beijing_date(start_date)
+    end = _parse_beijing_date(end_date)
+    if end < start:
+        return []
+    out: List[str] = []
+    cur = start
+    while cur <= end:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def _date_in_week_range(date_str: str, week_start: str, week_end: str) -> bool:
+    try:
+        d = _parse_beijing_date(date_str)
+        s = _parse_beijing_date(week_start)
+        e = _parse_beijing_date(week_end)
+    except ValueError:
+        return False
+    return s <= d <= e
+
+
 def _auto_switch_bucket_key(owner_username: str, alias: str) -> str:
     return f"{str(owner_username or '').strip()}::{_normalize_alias_key(alias)}"
 
@@ -4145,13 +4582,82 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
 
 
 def _auto_publish_count_for_video_count(video_count: int) -> int:
-    """自动切号发作品：按账号 video_count 决定本次下发条数。"""
+    """自动切号发作品：按账号 video_count 决定本次下发条数（不含 -1 新号冷却标记）。"""
     vc = max(0, int(video_count))
     if vc < 3:
         return 1
     if vc <= 9:
         return 2
     return 3
+
+
+def _auto_switch_graduate_new_account_video_count(
+    owner_username: str,
+    target_row: dict[str, Any],
+) -> bool:
+    """自动切号发作品：新号 video_count=-1 首次触发时改为 0，表示已过 24h 冷却。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return False
+    try:
+        raw_ri = target_row.get("row_index")
+        row_index = int(raw_ri) if raw_ri is not None else -1
+    except (TypeError, ValueError):
+        row_index = -1
+    username = str(target_row.get("username") or "").strip()
+    now = now_text()
+    changed = 0
+    conn = _get_db()
+    try:
+        if row_index >= 0:
+            cur = conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET video_count = '0', updated_at = ?
+                WHERE owner_username = ? AND row_index = ? AND TRIM(video_count) = ?
+                """,
+                (now, owner, row_index, str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)),
+            )
+            changed += int(cur.rowcount or 0)
+        if username:
+            cur = conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET video_count = '0', updated_at = ?
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+                  AND TRIM(video_count) = ?
+                """,
+                (now, owner, username, str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)),
+            )
+            changed += int(cur.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    if changed > 0:
+        target_row["video_count"] = "0"
+    return changed > 0
+
+
+def _auto_switch_skip_publish_new_account_cooldown(
+    owner_username: str,
+    alias: str,
+    target_row: dict[str, Any],
+    slot_key: str,
+    bucket_key: str,
+    publish_minute: int,
+) -> None:
+    """新号首次自动发作品窗口：-1→0，本时段不发作品并标记完成。"""
+    account = str(target_row.get("username") or "").strip()
+    _auto_switch_graduate_new_account_video_count(owner_username, target_row)
+    done_key = _auto_switch_publish_done_key(slot_key)
+    with store.lock:
+        store.auto_switch_publish_inflight_keys.pop(bucket_key, None)
+        store.auto_switch_publish_done_keys[bucket_key] = done_key
+    persist_runtime_state()
+    _auto_switch_log(
+        f"新号 24h 冷却：本时段跳过自动发作品（video_count -1→0）| owner={owner_username} alias={alias} "
+        f"slot={slot_key} time={_format_beijing_minute(publish_minute)} account={account or '-'}"
+    )
 
 
 def _random_auto_publish_minute(start_min: int, end_min: int) -> int | None:
@@ -4214,6 +4720,193 @@ def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, An
     return {"slot_minutes": base, "account_count": n, "slots": slots}
 
 
+def _slot_username_order(plan: dict[str, Any]) -> tuple[str, ...]:
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    return tuple(str(s.get("username") or "").strip() for s in slots)
+
+
+def _weekly_plan_rows_fingerprint(rows: List[dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for row in sorted(rows, key=lambda r: int(r.get("row_index") or 0)):
+        ri = int(row.get("row_index") or -1)
+        user = str(row.get("username") or "").strip().lower()
+        parts.append(f"{ri}:{user}")
+    return "|".join(parts)
+
+
+def _generate_auto_switch_weekly_plan(
+    rows: List[dict[str, Any]],
+    week_start_date: str,
+    week_end_date: str,
+) -> dict[str, Any]:
+    """为自然周内每一天独立洗牌生成时段（每天账号顺序不同）。"""
+    days: Dict[str, Any] = {}
+    for date_key in _iter_dates_inclusive(week_start_date, week_end_date):
+        days[date_key] = _generate_auto_switch_daily_plan(rows)
+    # return 必须在 for 循环外（与 for 同级缩进），否则会只生成 1 天
+    return {
+        "week_start_date": week_start_date,
+        "week_end_date": week_end_date,
+        "account_count": len(rows),
+        "rows_fingerprint": _weekly_plan_rows_fingerprint(rows),
+        "days": days,
+    }
+
+
+def _load_auto_switch_weekly_plan(
+    owner_username: str,
+    alias: str,
+    week_start_date: str,
+) -> dict[str, Any] | None:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    week_key = str(week_start_date or "").strip()
+    if not owner or not alias_key or not week_key:
+        return None
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT plan_json FROM auto_switch_weekly_plans
+            WHERE owner_username = ? AND week_start_date = ? AND alias = ?
+            """,
+            (owner, week_key, alias_key),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        plan = json.loads(row[0])
+        return plan if isinstance(plan, dict) else None
+    except Exception:
+        return None
+
+
+def _save_auto_switch_weekly_plan(
+    owner_username: str,
+    alias: str,
+    week_start_date: str,
+    plan: dict[str, Any],
+) -> None:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    week_key = str(week_start_date or "").strip()
+    if not owner or not alias_key or not week_key:
+        return
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO auto_switch_weekly_plans
+            (owner_username, week_start_date, alias, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (owner, week_key, alias_key, json.dumps(plan, ensure_ascii=False), now_text()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _weekly_plan_is_complete(
+    plan: dict[str, Any] | None,
+    week_start_date: str,
+    week_end_date: str,
+    rows: List[dict[str, Any]],
+) -> bool:
+    account_count = len(rows)
+    if not plan or not isinstance(plan.get("days"), dict):
+        return False
+    if int(plan.get("account_count") or 0) != int(account_count):
+        return False
+    expected_fp = _weekly_plan_rows_fingerprint(rows)
+    stored_fp = str(plan.get("rows_fingerprint") or "").strip()
+    if stored_fp and stored_fp != expected_fp:
+        return False
+    if not stored_fp and account_count > 0:
+        return False
+    days = plan.get("days") or {}
+    expected = _iter_dates_inclusive(week_start_date, week_end_date)
+    if len(expected) != 7:
+        return False
+    for date_key in expected:
+        day_plan = days.get(date_key)
+        if not isinstance(day_plan, dict):
+            return False
+        slots = day_plan.get("slots")
+        if not isinstance(slots, list) or len(slots) != account_count:
+            return False
+    return True
+
+
+def _ensure_auto_publish_minutes_in_weekly_plan(plan: dict[str, Any]) -> bool:
+    modified = False
+    days = plan.get("days")
+    if not isinstance(days, dict):
+        return False
+    for day_plan in days.values():
+        if isinstance(day_plan, dict) and _ensure_auto_publish_minutes_in_plan(day_plan):
+            modified = True
+    return modified
+
+
+def _ensure_auto_switch_weekly_plan(
+    owner_username: str,
+    alias: str,
+    rows: List[dict[str, Any]],
+    schedule_date: str | None = None,
+) -> dict[str, Any]:
+    """确保当前自然周（周一至周日）的 7 天排班已生成；每天独立洗牌。"""
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    week_start, week_end = _beijing_week_bounds(date_key)
+    existing = _load_auto_switch_weekly_plan(owner_username, alias, week_start)
+    if _weekly_plan_is_complete(existing, week_start, week_end, rows):
+        if _ensure_auto_publish_minutes_in_weekly_plan(existing):
+            _save_auto_switch_weekly_plan(owner_username, alias, week_start, existing)
+            _auto_switch_log(
+                f"已补齐本周发作品随机时间点 | owner={owner_username} alias={alias} week={week_start}~{week_end}"
+            )
+        return existing
+    plan = _generate_auto_switch_weekly_plan(rows, week_start, week_end)
+    _save_auto_switch_weekly_plan(owner_username, alias, week_start, plan)
+    for day_key, day_plan in (plan.get("days") or {}).items():
+        if isinstance(day_plan, dict):
+            _save_auto_switch_daily_plan(owner_username, alias, str(day_key), day_plan)
+    orders = [
+        _slot_username_order(day_plan)
+        for day_plan in (plan.get("days") or {}).values()
+        if isinstance(day_plan, dict)
+    ]
+    distinct_days = len(set(orders))
+    _auto_switch_log(
+        f"已生成本周随机时段（7天，{distinct_days}种排班） | owner={owner_username} alias={alias} "
+        f"week={week_start}~{week_end}"
+    )
+    return plan
+
+
+def _daily_plan_for_schedule_date(
+    weekly_plan: dict[str, Any],
+    schedule_date: str,
+) -> dict[str, Any] | None:
+    days = weekly_plan.get("days") if isinstance(weekly_plan.get("days"), dict) else {}
+    day_plan = days.get(str(schedule_date or "").strip())
+    return day_plan if isinstance(day_plan, dict) else None
+
+
+def _weekly_plan_for_bundle(weekly_plan: dict[str, Any]) -> dict[str, Any]:
+    """设备端 Gson 友好：附带 day_plans 列表（含 7 天每日计划）。"""
+    out = dict(weekly_plan)
+    days = out.get("days") if isinstance(out.get("days"), dict) else {}
+    out["day_plans"] = [
+        {"schedule_date": date_key, "daily_plan": day_plan}
+        for date_key, day_plan in sorted(days.items())
+        if isinstance(day_plan, dict)
+    ]
+    return out
+
+
 def _load_auto_switch_daily_plan(owner_username: str, alias: str, schedule_date: str) -> dict[str, Any] | None:
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
@@ -4262,21 +4955,27 @@ def _save_auto_switch_daily_plan(owner_username: str, alias: str, schedule_date:
 
 
 def _ensure_auto_switch_daily_plan(owner_username: str, alias: str, rows: List[dict[str, Any]], schedule_date: str) -> dict[str, Any]:
-    existing = _load_auto_switch_daily_plan(owner_username, alias, schedule_date)
+    """单日计划：优先从本周周计划取当天，否则按日生成（兼容旧逻辑）。"""
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    weekly = _ensure_auto_switch_weekly_plan(owner_username, alias, rows, date_key)
+    day_plan = _daily_plan_for_schedule_date(weekly, date_key)
+    if day_plan:
+        return day_plan
+    existing = _load_auto_switch_daily_plan(owner_username, alias, date_key)
     if existing and isinstance(existing.get("slots"), list) and len(existing["slots"]) == len(rows):
         if _ensure_auto_publish_minutes_in_plan(existing):
-            _save_auto_switch_daily_plan(owner_username, alias, schedule_date, existing)
+            _save_auto_switch_daily_plan(owner_username, alias, date_key, existing)
             _auto_switch_log(
-                f"已补齐今日发作品随机时间点 | owner={owner_username} alias={alias} date={schedule_date}"
+                f"已补齐今日发作品随机时间点 | owner={owner_username} alias={alias} date={date_key}"
             )
         return existing
     plan = _generate_auto_switch_daily_plan(rows)
-    _save_auto_switch_daily_plan(owner_username, alias, schedule_date, plan)
+    _save_auto_switch_daily_plan(owner_username, alias, date_key, plan)
     slot_desc = ", ".join(
         _auto_switch_slot_plan_log_line(s) for s in plan.get("slots") or []
     )
     _auto_switch_log(
-        f"已生成今日随机时段 | owner={owner_username} alias={alias} date={schedule_date} | {slot_desc}"
+        f"已生成今日随机时段 | owner={owner_username} alias={alias} date={date_key} | {slot_desc}"
     )
     return plan
 
@@ -4318,17 +5017,29 @@ def _auto_switch_plans_view_for_owner(
 ) -> dict[str, Any]:
     owner = str(owner_username or "").strip()
     date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    week_start, week_end = _beijing_week_bounds(date_key)
     if not owner:
-        return {"schedule_date": date_key, "plans_by_alias": {}}
+        return {
+            "schedule_date": date_key,
+            "week_start_date": week_start,
+            "week_end_date": week_end,
+            "plans_by_alias": {},
+        }
     buckets = _list_device_editor_buckets(owner)
     plans_by_alias: Dict[str, Any] = {}
     for alias_key, rows in buckets.items():
         if len(rows) < 2:
             continue
         if ensure:
-            plan = _ensure_auto_switch_daily_plan(owner, alias_key, rows, date_key)
+            weekly = _ensure_auto_switch_weekly_plan(owner, alias_key, rows, date_key)
+            plan = _daily_plan_for_schedule_date(weekly, date_key) or _ensure_auto_switch_daily_plan(
+                owner, alias_key, rows, date_key
+            )
         else:
-            plan = _load_auto_switch_daily_plan(owner, alias_key, date_key)
+            weekly = _load_auto_switch_weekly_plan(owner, alias_key, week_start)
+            plan = _daily_plan_for_schedule_date(weekly or {}, date_key) if weekly else None
+            if not plan:
+                plan = _load_auto_switch_daily_plan(owner, alias_key, date_key)
             if not plan or not isinstance(plan.get("slots"), list):
                 continue
         slots_by_row_index: Dict[str, dict[str, Any]] = {}
@@ -4382,7 +5093,12 @@ def _auto_switch_plans_view_for_owner(
             "slots_by_row_index": slots_by_row_index,
             "slots_by_username": slots_by_username,
         }
-    return {"schedule_date": date_key, "plans_by_alias": plans_by_alias}
+    return {
+        "schedule_date": date_key,
+        "week_start_date": week_start,
+        "week_end_date": week_end,
+        "plans_by_alias": plans_by_alias,
+    }
 
 
 def _auto_switch_slot_index_at_minute(plan: dict[str, Any], minute_of_day: int) -> int:
@@ -4679,20 +5395,10 @@ def _auto_switch_enqueue_publish(
         return None
     count = max(1, min(int(publish_count), 5))
 
-    auto_start_disabled = False
-    with store.lock:
-        dev = store.devices.get(did)
-        if dev and not dev.auto_start_opt_out:
-            dev.auto_start_opt_out = True
-            auto_start_disabled = True
-    if auto_start_disabled:
-        _persist_client_device_to_db(did)
-        _append_device_log(did, "自动切号发作品：云端已自动关闭该设备的自动开启程序")
-
     _resume_device_for_cloud_op(
         did,
         f"[{now_text()}] 自动切号发作品 | 已下发（alias={alias_clean} publish_count={count} "
-        f"北京时间 {_format_beijing_minute(publish_minute)}）",
+        f"北京时间 {_format_beijing_minute(publish_minute)}；素材就绪后设备端再暂停涨粉）",
     )
     op_id = _enqueue_tiktok_device_op(
         did,
@@ -4781,7 +5487,19 @@ def _auto_switch_maybe_enqueue_publish(
         )
         return
 
-    video_count = _parse_stat_int(target_row.get("video_count"))
+    raw_video_count = _parse_video_count_raw(target_row.get("video_count"))
+    if raw_video_count == NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN:
+        _auto_switch_skip_publish_new_account_cooldown(
+            owner_username,
+            alias,
+            target_row,
+            slot_key,
+            bucket_key,
+            pub_minute,
+        )
+        return
+
+    video_count = max(0, int(raw_video_count or 0))
     publish_count = _auto_publish_count_for_video_count(video_count)
     op_id = _auto_switch_enqueue_publish(
         owner_username,
@@ -4804,11 +5522,6 @@ def _auto_switch_maybe_enqueue_publish(
             f"time={_format_beijing_minute(pub_minute)} video_count={video_count} "
             f"publish_count={publish_count} account={str(target_row.get('username') or '')} op_id={op_id}"
         )
-
-
-def _auto_switch_enabled_now() -> bool:
-    with store.lock:
-        return bool(store.auto_switch_enabled)
 
 
 def _device_op_payload(op: dict[str, Any]) -> dict[str, Any]:
@@ -4883,7 +5596,7 @@ def _auto_switch_enqueue_cut_switch(
     source_row: dict[str, Any],
     target_row: dict[str, Any],
 ) -> bool:
-    if not _auto_switch_enabled_now():
+    if not _device_auto_switch_enabled(device_id):
         return False
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
@@ -4996,7 +5709,7 @@ def _auto_switch_enqueue_bootstrap_cut_switch(
     target_row: dict[str, Any],
 ) -> bool:
     """无切号高亮的多账号桶：仅清理 TikTok 后还原目标（不备份源），对齐到当前时段账号。"""
-    if not _auto_switch_enabled_now():
+    if not _device_auto_switch_enabled(device_id):
         return False
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
@@ -5101,10 +5814,11 @@ def _auto_switch_list_owners_with_buckets() -> List[str]:
 
 
 def _auto_switch_tick() -> None:
+    # 已开启自动切号的设备由本机 bundle + 本地 scheduler 自治；云端 minute tick 不再入队。
+    if _any_device_auto_switch_enabled():
+        return
     tick_started = time.perf_counter()
     with store.lock:
-        if not store.auto_switch_enabled:
-            return
         align_now = bool(store.auto_switch_align_on_next_tick)
         if align_now:
             store.auto_switch_align_on_next_tick = False
@@ -5255,6 +5969,11 @@ def _auto_switch_worker_loop() -> None:
         return
     while not _APP_SHUTDOWN_EVENT.is_set():
         try:
+            if _any_device_auto_switch_enabled():
+                # 设备自治：bundle 已下发，由本机 scheduler 执行；云端 tick 仅低频保活。
+                if _interruptible_worker_sleep(AUTO_SWITCH_AUTONOMOUS_IDLE_SEC):
+                    break
+                continue
             _auto_switch_tick()
         except Exception as exc:
             _auto_switch_log(f"调度异常: {exc}")
@@ -5691,27 +6410,37 @@ def _patch_backup_record_device_result(
             """,
             (username, mobile_alias),
         ).fetchone()
+        set_parts = [
+            "backup_path = ?",
+            "backup_name = ?",
+            "backup_time = ?",
+            "backup_status = ?",
+            "updated_at = ?",
+        ]
+        params: list[object] = [
+            backup_path,
+            backup_name or "",
+            now,
+            "已备份",
+            now,
+        ]
+        if vc_text is not None:
+            set_parts.append("video_count = ?")
+            params.append(vc_text)
+        if fc_text is not None:
+            set_parts.append("follower_count = ?")
+            params.append(fc_text)
+        if follower_growth or fc_text is not None:
+            set_parts.append("follower_growth = ?")
+            params.append(follower_growth)
+        params.extend([username, mobile_alias])
         cur = conn.execute(
             f"""
             UPDATE device_editor_rows
-            SET video_count = COALESCE(?, ''),
-                follower_count = COALESCE(?, ''),
-                follower_growth = COALESCE(?, ''),
-                backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
+            SET {', '.join(set_parts)}
             WHERE username = ? AND {_backup_record_alias_expr()} = ?
             """,
-            (
-                vc_text,
-                fc_text,
-                follower_growth,
-                backup_path,
-                backup_name or "",
-                now,
-                "已备份",
-                now,
-                username,
-                mobile_alias,
-            ),
+            tuple(params),
         )
         owner = str(owner_row["owner_username"] or "").strip() if owner_row else ""
         fg_sync = follower_growth if follower_growth else None
@@ -5910,13 +6639,14 @@ def _upsert_backup_record_for_account(
             (owner,),
         ).fetchone()[0]
         row_index = int(max_row) + 1
+        default_vc = _default_video_count_for_new_row(db, owner, uname)
         db.execute(
             """
             INSERT INTO device_editor_rows
-                (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at)
-            VALUES (?, ?, ?, '', '', ?, ?, ?, '', '', '', '', '', '否', ?)
+                (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, video_count, updated_at)
+            VALUES (?, ?, ?, '', '', ?, ?, ?, '', '', '', '', '', '否', ?, ?)
             """,
-            (owner, row_index, alias, region_text, uname, alias, now),
+            (owner, row_index, alias, region_text, uname, alias, default_vc, now),
         )
         if commit and own_conn:
             db.commit()
@@ -6032,14 +6762,18 @@ def _enqueue_device_op(device_id: str, op: Dict[str, Any]) -> None:
 
 def _next_device_op(device_id: str) -> Dict[str, Any] | None:
     print(f"[{now_text()}] device_ops.poll | next_op_check_start | device_id={device_id}")
-    with _tracked_store_lock("_next_device_op"):
-        q = store.pending_device_ops.get(device_id) or []
-        if not q:
-            print(f"[{now_text()}] device_ops.poll | next_op_empty | device_id={device_id}")
-            return None
-        op = q.pop(0)
-        print(f"[{now_text()}] device_ops.poll | next_op_pop | device_id={device_id} op_type={op.get('type')}")
-        return op
+    try:
+        with _tracked_store_lock("_next_device_op", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+            q = store.pending_device_ops.get(device_id) or []
+            if not q:
+                print(f"[{now_text()}] device_ops.poll | next_op_empty | device_id={device_id}")
+                return None
+            op = q.pop(0)
+            print(f"[{now_text()}] device_ops.poll | next_op_pop | device_id={device_id} op_type={op.get('type')}")
+            return op
+    except StoreLockBusy:
+        print(f"[{now_text()}] device_ops.poll | store_lock_busy | device_id={device_id}")
+        return None
 
 
 def _save_device_op_result(op_id: str, result: Dict[str, Any]) -> None:
@@ -6053,6 +6787,19 @@ def _save_device_op_result(op_id: str, result: Dict[str, Any]) -> None:
             if not oldest_key:
                 break
             store.device_op_results.pop(oldest_key, None)
+
+
+def _device_op_report_is_duplicate(op_id: str, status: str) -> bool:
+    """非自治模式下 op_id 幂等：已成功/失败回报不再触发写库副作用。"""
+    oid = str(op_id or "").strip()
+    if not oid:
+        return False
+    existing = _get_device_op_result(oid)
+    if not existing:
+        return False
+    prev = str(existing.get("status") or "").strip().lower()
+    new = str(status or "").strip().lower()
+    return prev in ("success", "failed") and new in ("success", "failed")
 
 
 def _get_device_op_result(op_id: str) -> Dict[str, Any] | None:
@@ -6197,6 +6944,67 @@ def _device_logs_dict_for_ids(device_ids: Iterable[str], max_lines: int = 120) -
         if lines:
             out[did] = lines
     return out
+
+
+DEVICE_LOG_PULL_TTL_SEC = 300
+
+
+def _replace_device_log(device_id: str, lines: List[str]) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    cleaned = [str(x).rstrip("\r\n") for x in (lines or []) if str(x).strip()]
+    path = _device_log_file_path(did)
+    try:
+        if cleaned:
+            path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+        elif path.is_file():
+            path.write_text("", encoding="utf-8")
+        with _device_log_dedup_cache_lock:
+            _device_log_dedup_cache.pop(did, None)
+    except Exception as exc:
+        print(f"[{now_text()}] device_log_file_replace_failed | device={did} err={exc}")
+
+
+def _peek_device_log_pull_request(device_id: str) -> Dict[str, Any] | None:
+    did = str(device_id or "").strip()
+    if not did:
+        return None
+    with store.lock:
+        req = store.pending_device_log_pulls.get(did)
+        if not req:
+            return None
+        requested_at = float(req.get("requested_at") or 0.0)
+        if requested_at and (time.time() - requested_at) > DEVICE_LOG_PULL_TTL_SEC:
+            store.pending_device_log_pulls.pop(did, None)
+            return None
+        max_lines = max(1, min(int(req.get("max_lines") or 400), 500))
+        return {"max_lines": max_lines, "requested_at": requested_at}
+
+
+def _complete_device_log_pull(device_id: str) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    with store.lock:
+        store.pending_device_log_pulls.pop(did, None)
+
+
+def _request_device_log_pulls(device_ids: Iterable[str], max_lines: int = 400) -> List[str]:
+    safe_lines = max(1, min(int(max_lines or 400), 500))
+    now = time.time()
+    queued: List[str] = []
+    with store.lock:
+        for raw in device_ids:
+            did = str(raw or "").strip()
+            if not did:
+                continue
+            store.pending_device_log_pulls[did] = {
+                "max_lines": safe_lines,
+                "requested_at": now,
+            }
+            queued.append(did)
+    return queued
 
 
 def _append_device_log(device_id: str, line: str) -> None:
@@ -7105,7 +7913,7 @@ def _hydrate_device_from_db(device_id: str) -> None:
     conn = _get_db()
     try:
         row = conn.execute(
-            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out FROM client_devices WHERE device_id = ?",
+            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices WHERE device_id = ?",
             (device_id,),
         ).fetchone()
     finally:
@@ -7125,6 +7933,7 @@ def _hydrate_device_from_db(device_id: str) -> None:
             pending_start=bool(int(row["pending_start"] or 0)),
             paused=bool(int(row["paused"] or 0)),
             auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in row.keys() else False,
+            auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in row.keys() else False,
         )
         store.fingerprint_to_device[str(row["fingerprint"])] = device_id
 
@@ -7262,8 +8071,12 @@ def sync_status(payload: SyncStatusRequest):
     if error:
         return error
 
-    with store.lock:
-        device.status = payload.status
+    try:
+        with _store_lock("sync_status", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+            device.status = payload.status
+    except StoreLockBusy:
+        print(f"[{now_text()}] sync_status | store_lock_busy | device_id={payload.device_id} alias={payload.alias}")
+        return _store_lock_busy_response()
 
     _persist_client_device_to_db(payload.device_id)
     print(f"[{now_text()}] 设备别名：{payload.alias} | 状态更新：{payload.status}")
@@ -7364,11 +8177,8 @@ def get_runtime_config(response: Response, authorization: str | None = Header(de
     templates, template_meta = _build_effective_template_bundle(session["username"], data)
     active_template = str(data.get("active_template") or "default")
     if active_template not in templates:
+        # GET 只修正响应中的模板名，不写库、不 bump config_push_revision，避免登录/刷新误触发设备同步。
         active_template = "default" if "default" in templates else sorted(templates.keys())[0]
-        owner, name, is_shared = _parse_template_ref(active_template)
-        if not is_shared or owner == session["username"]:
-            data["active_template"] = name if is_shared else active_template
-            _save_user_runtime_state(session["username"], data)
     resp = dict(data)
     resp["active_template"] = active_template
     resp["configs_by_template"] = templates
@@ -7852,6 +8662,9 @@ def start_task(payload: StartTaskRequest, authorization: str | None = Header(def
     for device_id in payload.device_ids:
         if device_id not in allowed:
             return {"code": 403, "msg": "包含无权操作的设备"}
+        blocked = _reject_if_auto_switch_manual_ops(device_id=device_id)
+        if blocked:
+            return blocked
     started_count = 0
     touched: list[str] = []
     with store.lock:
@@ -7892,6 +8705,9 @@ def stop_task(payload: StartTaskRequest, authorization: str | None = Header(defa
     for device_id in payload.device_ids:
         if device_id not in allowed:
             return {"code": 403, "msg": "包含无权操作的设备"}
+        blocked_one = _reject_if_auto_switch_manual_ops(device_id=device_id)
+        if blocked_one:
+            return blocked_one
 
     stopped_count = 0
     touched: list[str] = []
@@ -7929,20 +8745,27 @@ def check_start(device_id: str, alias: str):
 
     mutated = False
     auto = _user_auto_start_enabled(device.owner_username) and (not device.auto_start_opt_out)
-    with _tracked_store_lock("check_start"):
-        if device.pending_start:
-            device.pending_start = False
-            device.status = "running"
-            device.paused = False
-            mutated = True
-            result: dict = {"code": 0, "msg": "启动", "status": "running", "auto_start": auto}
-        elif device.status == "paused":
-            result = {"code": 0, "msg": "暂停", "status": "paused", "auto_start": auto}
-        else:
-            result = {"code": 1, "msg": "暂无指令", "auto_start": auto}
-    with store.lock:
-        push_rev = int(store.user_config_push_revision.get(device.owner_username, 0))
-    result["config_push_revision"] = push_rev
+    try:
+        with _tracked_store_lock("check_start", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+            if device.pending_start:
+                device.pending_start = False
+                device.status = "running"
+                device.paused = False
+                mutated = True
+                result: dict = {"code": 0, "msg": "启动", "status": "running", "auto_start": auto}
+            elif device.status == "paused":
+                result = {"code": 0, "msg": "暂停", "status": "paused", "auto_start": auto}
+            else:
+                result = {"code": 1, "msg": "暂无指令", "auto_start": auto}
+            push_rev = int(store.user_config_push_revision.get(device.owner_username, 0))
+            result["config_push_revision"] = push_rev
+    except StoreLockBusy:
+        print(f"[{now_text()}] check_start | store_lock_busy | device_id={device_id} alias={alias}")
+        return _store_lock_busy_response()
+    pull_req = _peek_device_log_pull_request(device_id)
+    if pull_req:
+        result["log_pull_requested"] = True
+        result["log_pull_max_lines"] = int(pull_req.get("max_lines") or 400)
     if mutated:
         _persist_client_device_to_db(device_id)
     print(f"[{now_text()}] check_start | done | device_id={device_id} result={result.get('msg')}")
@@ -7963,20 +8786,27 @@ def pull_username(
         return error
 
     promoted = False
-    with _tracked_store_lock("pull_username"):
-        if device.status != "running":
-            if device.pending_start:
-                device.pending_start = False
-                device.status = "running"
-                promoted = True
-            else:
-                print(f"[{now_text()}] pull_username | not_running | device_id={device_id}")
-                return {"code": 3, "msg": "设备未启动，请先从云端一键启动"}
+    try:
+        with _tracked_store_lock("pull_username", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+            if device.status != "running":
+                if device.pending_start:
+                    device.pending_start = False
+                    device.status = "running"
+                    promoted = True
+                else:
+                    print(f"[{now_text()}] pull_username | not_running | device_id={device_id}")
+                    return {"code": 3, "msg": "设备未启动，请先从云端一键启动"}
+    except StoreLockBusy:
+        print(f"[{now_text()}] pull_username | store_lock_busy | device_id={device_id} alias={alias}")
+        return _store_lock_busy_response()
 
     if promoted:
         _persist_client_device_to_db(device_id)
-        with store.lock:
-            store.device_pull_rounds[device_id] = 0
+        try:
+            with _store_lock("pull_username:promoted_rounds", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+                store.device_pull_rounds[device_id] = 0
+        except StoreLockBusy:
+            print(f"[{now_text()}] pull_username | store_lock_busy_rounds_reset | device_id={device_id}")
 
     # 设备 owner 的运行配置（含模板合并/共享模板）应与 get_config 一致；
     # pull_username 用它来决定 pull_batch_size、休息前批次数与休息策略。
@@ -8021,8 +8851,9 @@ def pull_username(
         break_max_cfg = _cfg_int("break_max", 20)
     except Exception:
         break_max_cfg = 20
-    # 最短、最长均为 0：关闭休息（仍按批次数清零轮次，但不返回 code=2）
-    rest_enabled = not (break_min_cfg == 0 and break_max_cfg == 0)
+    no_rest_cfg = bool(eff_config.get("no_rest"))
+    # 模板「不休息」或最短/最长均为 0：关闭休息（仍按批次数清零轮次，但不返回 code=2）
+    rest_enabled = not no_rest_cfg and not (break_min_cfg == 0 and break_max_cfg == 0)
 
     account_logged_in = False
     conn_login = _get_db()
@@ -8037,11 +8868,15 @@ def pull_username(
         return {"code": 1, "msg": "账号未登录，请先完成自动登录"}
 
     # ——按“拉取批次”触发休息：已完成 N 次有效拉取后，下一次拉取直接返回休息（不查库）——
-    with store.lock:
-        rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
-        batch_threshold_met = rounds >= batches_before_rest
-        if batch_threshold_met:
-            store.device_pull_rounds[device_id] = 0
+    try:
+        with _store_lock("pull_username:rest_rounds", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+            rounds = int(store.device_pull_rounds.get(device_id, 0) or 0)
+            batch_threshold_met = rounds >= batches_before_rest
+            if batch_threshold_met:
+                store.device_pull_rounds[device_id] = 0
+    except StoreLockBusy:
+        print(f"[{now_text()}] pull_username | store_lock_busy_rest | device_id={device_id}")
+        return _store_lock_busy_response()
 
     if batch_threshold_met and rest_enabled:
         bmin = max(0, min(break_min_cfg, 24 * 60))
@@ -8061,18 +8896,17 @@ def pull_username(
     def _finish_pull_username_response(payload: dict, *, count_round: bool = False) -> dict:
         """仅在本次拉取返回有效用户名后累计休息批次数。"""
         if count_round:
-            with store.lock:
-                store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
+            try:
+                with _store_lock("pull_username:count_round", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
+                    store.device_pull_rounds[device_id] = int(store.device_pull_rounds.get(device_id, 0) or 0) + 1
+            except StoreLockBusy:
+                print(f"[{now_text()}] pull_username | store_lock_busy_count_round | device_id={device_id}")
         return payload
 
     consumed_mobile_pending = False
     selected: List[str] = []
     conn = _get_db()
     try:
-        with store.lock:
-            # 兼容旧逻辑：mode 已在上方由用户配置/请求参数决定，这里仅防并发读写。
-            mode = mode if mode in RUN_MODES else store.run_mode
-
         if mode == "live":
             rows = conn.execute(
                 "SELECT username FROM live_customer ORDER BY usage_count ASC, created_at ASC LIMIT ?",
@@ -8191,6 +9025,62 @@ def report_result(payload: ReportResultRequest):
     return {"code": 0, "msg": "结果接收成功"}
 
 
+@app.get("/api/device/mode_wait")
+async def device_mode_wait(
+    device_id: str,
+    alias: str,
+    since_event_id: int = 0,
+    timeout_sec: int = 120,
+):
+    """长轮询：等待自动切号 ENTER/EXIT 等模式事件（自治 P0 控制面）。"""
+    error, _device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    safe_timeout = max(5, min(int(timeout_sec or 120), 180))
+    deadline = time.monotonic() + float(safe_timeout)
+    while time.monotonic() < deadline:
+        pull_req = _peek_device_log_pull_request(device_id)
+        if pull_req:
+            return {
+                "code": 0,
+                "event": None,
+                "msg": "log_pull",
+                "log_pull_requested": True,
+                "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
+            }
+        event = _fetch_pending_device_mode_event(device_id, since_event_id)
+        if event:
+            print(
+                f"[{now_text()}] device_mode.wait | hit | device_id={device_id} "
+                f"event_id={event.get('event_id')} type={event.get('type')}"
+            )
+            return {"code": 0, "event": event}
+        if _APP_SHUTDOWN_EVENT.is_set():
+            break
+        await asyncio.sleep(1.0)
+    return {"code": 0, "event": None, "msg": "none"}
+
+
+@app.post("/api/device/mode_ack")
+def device_mode_ack(payload: DeviceModeAckRequest):
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    ok = _ack_device_mode_event(
+        payload.device_id,
+        payload.event_id,
+        payload.phase,
+        session_id=payload.session_id,
+    )
+    if not ok:
+        return {"code": 1, "msg": "事件不存在或已确认"}
+    print(
+        f"[{now_text()}] device_mode.ack | device_id={payload.device_id} "
+        f"event_id={payload.event_id} phase={payload.phase}"
+    )
+    return {"code": 0, "msg": "已确认", "event_id": payload.event_id, "phase": payload.phase}
+
+
 @app.post("/api/device_ops/poll")
 def device_ops_poll(payload: DeviceOpPollRequest):
     if not _device_ops_poll_try_acquire(payload.device_id):
@@ -8260,11 +9150,9 @@ def _fetch_tiktok_email_code_from_api(api_url: str) -> tuple[int, str, str | Non
 
 def _try_fetch_tiktok_email_code_via_mail_module(owner_username: str, email: str) -> tuple[int, str, str | None]:
     try:
-        from mail_integration import fetch_tiktok_email_code_via_mail_module, mail_module_can_fetch_code
+        from mail_integration import fetch_tiktok_email_code_via_mail_module
     except ImportError:
         return 1, "邮箱管理模块未集成", None
-    if not mail_module_can_fetch_code(owner_username, email):
-        return 1, "邮箱管理模块未配置该邮箱或令牌无效", None
     return fetch_tiktok_email_code_via_mail_module(
         owner_username,
         email,
@@ -8282,6 +9170,7 @@ def _tiktok_email_code_response(
 ) -> dict:
     owner = str(owner_username or "").strip()
     email = str(account_email or "").strip()
+    mail_msg = ""
 
     if owner and email:
         mail_code, mail_msg, mail_email_code = _try_fetch_tiktok_email_code_via_mail_module(owner, email)
@@ -8298,9 +9187,17 @@ def _tiktok_email_code_response(
 
     legacy_url = (api_url or "").strip()
     if not legacy_url:
+        if not owner:
+            fail_msg = "设备未关联管理账号，无法通过邮箱管理模块获取验证码"
+        elif not email:
+            fail_msg = "邮箱为空且 API 为空，无法获取验证码"
+        elif mail_msg:
+            fail_msg = f"邮箱管理模块：{mail_msg}（且 API 为空）"
+        else:
+            fail_msg = "邮箱管理模块不可用且 API 为空，无法获取验证码"
         return {
             "code": 1,
-            "msg": "邮箱管理模块不可用且 API 为空，无法获取验证码",
+            "msg": fail_msg,
             "email_code": None,
         }
 
@@ -8364,6 +9261,109 @@ def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username:
         (owner, username),
     ).fetchone()
     return dict(acct) if acct else None
+
+
+def _account_bundle_fields_for_username(
+    conn: sqlite3.Connection, owner_username: str, username: str
+) -> dict[str, Any]:
+    """自动切号 bundle 内账号：合并 account_editor_rows 凭据与登录态。"""
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip()
+    empty: dict[str, Any] = {
+        "account_row_index": 0,
+        "email": "",
+        "password": "",
+        "email_password": "",
+        "api": "",
+        "is_login": False,
+        "login_time": "",
+        "basic_profile_modified": "否",
+        "mail_module_code_available": False,
+    }
+    if not owner or not uname:
+        return empty
+    acct = conn.execute(
+        """
+        SELECT row_index, username, password, email, email_password, api, is_login, login_time,
+               basic_profile_modified
+        FROM account_editor_rows
+        WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+        LIMIT 1
+        """,
+        (owner, uname),
+    ).fetchone()
+    if not acct:
+        return empty
+    row = dict(acct)
+    account_email = str(row.get("email") or "").strip()
+    mail_module_code_available = False
+    try:
+        from mail_integration import mail_module_can_fetch_code
+
+        mail_module_code_available = mail_module_can_fetch_code(owner, account_email)
+    except ImportError:
+        mail_module_code_available = False
+    return {
+        "account_row_index": int(row.get("row_index") or 0),
+        "email": account_email,
+        "password": str(row.get("password") or "").strip(),
+        "email_password": str(row.get("email_password") or "").strip(),
+        "api": str(row.get("api") or "").strip(),
+        "is_login": bool(int(row.get("is_login") or 0)),
+        "login_time": str(row.get("login_time") or "").strip(),
+        "basic_profile_modified": _normalize_switch_highlight(row.get("basic_profile_modified")),
+        "mail_module_code_available": mail_module_code_available,
+    }
+
+
+def _fetch_device_alias_account_form_items(
+    conn: sqlite3.Connection, owner_username: str, alias: str
+) -> list[dict[str, Any]]:
+    """设备端账号表单：仅返回当前别名桶内切号高亮（或单条桶回退）的账号凭据。"""
+    row = _fetch_device_assigned_account_row(conn, owner_username, alias)
+    if not row:
+        return []
+    username = str(row.get("username") or "").strip()
+    if not username:
+        return []
+    return [
+        {
+            "device_row_index": None,
+            "account_row_index": int(row.get("row_index") or 0),
+            "username": username,
+            "password": str(row.get("password") or "").strip(),
+            "email": str(row.get("email") or "").strip(),
+            "email_password": str(row.get("email_password") or "").strip(),
+            "api": str(row.get("api") or "").strip(),
+            "is_login": bool(int(row.get("is_login") or 0)),
+            "login_time": str(row.get("login_time") or "").strip(),
+            "region": "",
+            "switch_highlight": "是",
+            "basic_profile_modified": _normalize_switch_highlight(row.get("basic_profile_modified")),
+        }
+    ]
+
+
+@app.get("/api/device/alias_account_form")
+def device_alias_account_form(device_id: str, alias: str):
+    """设备端：按当前绑定别名拉取切号高亮账号表单（供主界面复制凭据）。"""
+    error, device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    conn = _get_db()
+    try:
+        items = _fetch_device_alias_account_form_items(conn, owner, alias)
+        if not items:
+            return {
+                "code": 1,
+                "msg": "未找到该别名下已高亮的分配账号（同桶多条时需有且仅有一条切号高亮，且账号分配别名须一致）",
+            }
+        return {"code": 0, "msg": "ok", "items": items}
+    finally:
+        conn.close()
 
 
 @app.get("/api/gallery_library/random")
@@ -8553,6 +9553,28 @@ def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdate
         conn.close()
 
 
+def _resolve_device_tiktok_account_email(
+    owner_username: str,
+    alias: str,
+    payload_email: str,
+) -> str:
+    email = str(payload_email or "").strip()
+    if email:
+        return email
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return ""
+    conn = _get_db()
+    try:
+        row = _fetch_device_assigned_account_row(conn, owner, alias)
+    finally:
+        conn.close()
+    if not row:
+        return ""
+    return str(row.get("email") or "").strip()
+
+
 @app.post("/api/device/tiktok/email_code")
 def device_tiktok_email_code(payload: DeviceTikTokEmailCodeRequest):
     """设备端拉取 TikTok 邮箱验证码：优先邮箱管理模块，失败则回退旧 API 链接。"""
@@ -8560,12 +9582,13 @@ def device_tiktok_email_code(payload: DeviceTikTokEmailCodeRequest):
     if error:
         return error
     owner = str(getattr(device, "owner_username", "") or "").strip()
+    account_email = _resolve_device_tiktok_account_email(owner, payload.alias, payload.email)
     return _tiktok_email_code_response(
         payload.device_id,
         payload.alias,
         payload.api_url,
         owner_username=owner,
-        account_email=payload.email,
+        account_email=account_email,
     )
 
 
@@ -8737,21 +9760,15 @@ def admin_device_tiktok_mutual_click_follow_only_start(
 
 @app.post("/api/admin/device_tiktok/publish_post_start")
 def admin_device_tiktok_publish_post_start(payload: MutualClickRequest, authorization: str | None = Header(default=None)):
+    blocked = _reject_if_auto_switch_manual_ops(device_id=payload.device_id, alias=payload.alias)
+    if blocked:
+        return blocked
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
-    auto_start_disabled = False
-    with store.lock:
-        dev = store.devices.get(payload.device_id)
-        if dev and not dev.auto_start_opt_out:
-            dev.auto_start_opt_out = True
-            auto_start_disabled = True
-    if auto_start_disabled:
-        _persist_client_device_to_db(payload.device_id)
-        _append_device_log(payload.device_id, "发作品指令：云端已自动关闭该设备的自动开启程序")
     _resume_device_for_cloud_op(
         payload.device_id,
-        f"[{now_text()}] 云端后台 | 已下发发作品指令，设备由暂停切换为 running（alias={payload.alias}）",
+        f"[{now_text()}] 云端后台 | 已下发发作品指令，设备由暂停切换为 running（alias={payload.alias}；素材就绪后再暂停涨粉）",
     )
     op_id = _enqueue_tiktok_device_op(
         payload.device_id,
@@ -8764,9 +9781,9 @@ def admin_device_tiktok_publish_post_start(payload: MutualClickRequest, authoriz
     )
     return {
         "code": 0,
-        "msg": "已下发设备端任务：发作品入口（已自动关闭该设备自动开启程序）" if auto_start_disabled else "已下发设备端任务：发作品入口",
+        "msg": "已下发设备端任务：发作品入口（素材就绪后设备端再暂停涨粉）",
         "op_id": op_id,
-        "auto_start_opt_out": True if auto_start_disabled else bool(getattr(_device, "auto_start_opt_out", False)),
+        "auto_start_opt_out": bool(getattr(_device, "auto_start_opt_out", False)),
     }
 
 
@@ -8775,6 +9792,13 @@ def device_ops_report(payload: DeviceOpReportRequest):
     error, device = auth_or_error(payload.device_id, payload.alias)
     if error:
         return error
+
+    if _device_op_report_is_duplicate(payload.op_id, payload.status):
+        print(
+            f"[{now_text()}] device_ops.report | duplicate_ignored | op_id={payload.op_id} "
+            f"status={payload.status}"
+        )
+        return {"code": 0, "msg": "重复回报已忽略", "duplicate": True}
 
     data = payload.data or {}
     result = {
@@ -8839,36 +9863,18 @@ def device_ops_report(payload: DeviceOpReportRequest):
                 _append_device_log(payload.device_id, item)
 
     if payload.status == "success" and isinstance(data, dict):
-        _pe_op = str(data.get("op_type") or "").strip() == "tiktok_edit_basic_profile"
-        _pe_ok = bool(data.get("profile_edit_success"))
-        _pe_p1 = data.get("profile_edit_bio_after_part1_ok")
-        _pe_p2 = data.get("profile_edit_bio_after_part2_ok")
-        if _pe_p1 is not None and _pe_p2 is not None:
-            _pe_parts_ok = bool(_pe_p1) and bool(_pe_p2)
-        else:
-            _pe_parts_ok = _pe_ok
-        if _pe_op and _pe_ok and _pe_parts_ok and not bool(data.get("skip_account_db_update")):
-            owner_u = str(device.owner_username or "").strip()
+        pe_writeback = _apply_profile_edit_device_op_report(
+            str(device.owner_username or "").strip(),
+            payload.alias,
+            data,
+        )
+        if pe_writeback.get("updated"):
             alias_key = _normalize_alias_key(payload.alias)
-            if owner_u and alias_key:
-                conn = _get_db()
-                try:
-                    cur = conn.execute(
-                        """
-                        UPDATE account_editor_rows
-                        SET basic_profile_modified = '是', updated_at = ?
-                        WHERE owner_username = ?
-                          AND LOWER(TRIM(COALESCE(assigned_alias, ''))) = ?
-                        """,
-                        (now_text(), owner_u, alias_key),
-                    )
-                    conn.commit()
-                    print(
-                        f"[{now_text()}] account_editor_rows | basic_profile_modified=是 "
-                        f"| owner={owner_u} alias={alias_key} rowcount={cur.rowcount}"
-                    )
-                finally:
-                    conn.close()
+            print(
+                f"[{now_text()}] account_editor_rows | basic_profile_modified=是 "
+                f"| owner={device.owner_username} alias={alias_key} "
+                f"username={pe_writeback.get('username')} rowcount={pe_writeback.get('updated')}"
+            )
 
     if (
         payload.status == "success"
@@ -8996,6 +10002,11 @@ def device_logs_sync(payload: DeviceLogSyncRequest):
         return error
 
     cleaned = [str(x).strip() for x in (payload.logs or []) if str(x).strip()]
+    if payload.replace:
+        _replace_device_log(payload.device_id, cleaned)
+        _complete_device_log_pull(payload.device_id)
+        return {"code": 0, "msg": "日志已覆盖同步", "count": len(cleaned), "replace": True}
+
     if not cleaned:
         return {"code": 0, "msg": "无新增日志"}
 
@@ -9036,11 +10047,12 @@ def submit_tiktok_backup(payload: TikTokBackupSubmitRequest, authorization: str 
                 (owner,),
             ).fetchone()[0]
             row_index = int(max_row) + 1
+        default_vc = _default_video_count_for_new_row(conn, owner, username)
         conn.execute(
             """
             INSERT INTO device_editor_rows
-                (owner_username, row_index, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, switch_highlight, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '否', ?)
+                (owner_username, row_index, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, switch_highlight, video_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '否', ?, ?)
             ON CONFLICT(owner_username, row_index) DO UPDATE SET
                 username = excluded.username,
                 assigned_alias = excluded.assigned_alias,
@@ -9059,6 +10071,7 @@ def submit_tiktok_backup(payload: TikTokBackupSubmitRequest, authorization: str 
                 (payload.backup_name or "").strip(),
                 (payload.backup_time or now).strip(),
                 (payload.backup_status or "").strip(),
+                default_vc,
                 now,
             ),
         )
@@ -9168,6 +10181,9 @@ def admin_device_tiktok_clear(payload: DeviceTikTokBackupClearRequest, authoriza
 
 @app.post("/api/admin/device_tiktok/backup_and_clear")
 def admin_device_tiktok_backup_and_clear(payload: DeviceTikTokBackupClearRequest, authorization: str | None = Header(default=None)):
+    blocked = _reject_if_auto_switch_manual_ops(device_id=payload.device_id, alias=payload.alias)
+    if blocked:
+        return blocked
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
@@ -9381,6 +10397,9 @@ def admin_device_tiktok_launch_3(payload: DeviceTikTokBackupClearRequest, author
 
 @app.post("/api/admin/device_tiktok/edit_basic_profile")
 def admin_device_tiktok_edit_basic_profile(payload: DeviceTikTokBackupClearRequest, authorization: str | None = Header(default=None)):
+    blocked = _reject_if_auto_switch_manual_ops(device_id=payload.device_id, alias=payload.alias)
+    if blocked:
+        return blocked
     err, device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
@@ -9801,6 +10820,9 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 persisted_alias = _recover_assigned_alias_for_account_username(
                     conn, owner, recover_username
                 )
+        vc_input = _blank_if_none(payload.video_count)
+        if not vc_input and not existing:
+            vc_input = str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)
         conn.execute(
             """
             INSERT INTO account_editor_rows
@@ -9841,7 +10863,7 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 payload.login_time.strip(),
                 payload.region.strip(),
                 persisted_alias,
-                _blank_if_none(payload.video_count),
+                vc_input,
                 _blank_if_none(payload.follower_count),
                 _blank_if_none(payload.follower_growth),
                 _normalize_switch_highlight(payload.basic_profile_modified),
@@ -10088,6 +11110,22 @@ def list_device_editor_rows(
             if ukey and ukey in account_alias_by_user:
                 item["account_assigned_alias"] = account_alias_by_user[ukey]
             items.append(item)
+        alias_to_device: dict[str, str] = {}
+        for br in conn.execute(
+            """
+            SELECT device_id, alias FROM client_devices
+            WHERE owner_username = ? AND TRIM(COALESCE(alias, '')) <> ''
+            """,
+            (owner,),
+        ).fetchall():
+            key = str(br["alias"] or "").strip().lower()
+            if key and key not in alias_to_device:
+                alias_to_device[key] = str(br["device_id"])
+        for item in items:
+            eff = str(item.get("assigned_alias") or item.get("device_alias") or "").strip().lower()
+            bound = alias_to_device.get(eff, "")
+            if bound:
+                item["device_id"] = bound
         return {
             "code": 0,
             "items": items,
@@ -10451,6 +11489,8 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
             acct_login_time = _blank_if_none(row.get("account_login_time"))
             acct_is_login = 1 if _parse_editor_login_flag(row.get("account_is_login")) else 0
             acct_video = _blank_if_none(row.get("account_video_count")) or _blank_if_none(row.get("video_count"))
+            if not acct_video:
+                acct_video = str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)
             acct_follower = _blank_if_none(row.get("account_follower_count")) or _blank_if_none(
                 row.get("follower_count")
             )
@@ -10579,6 +11619,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                     updated_at = excluded.updated_at
                 """
             )
+            device_video = _blank_if_none(row.get("video_count")) or acct_video
             conn.execute(
                 f"""
                 INSERT INTO device_editor_rows
@@ -10603,7 +11644,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                     _blank_if_none(row.get("backup_status")),
                     _blank_if_none(row.get("remark")),
                     sh,
-                    _blank_if_none(row.get("video_count")),
+                    device_video,
                     _blank_if_none(row.get("follower_count")),
                     _blank_if_none(row.get("follower_growth")),
                     now,
@@ -10742,11 +11783,12 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 return {"code": 1, "msg": f"别名「{effective_alias}」尚未在账号表单中分配，不能写入设备档案"}
 
         sh = _normalize_switch_highlight(payload.switch_highlight)
+        default_vc = _default_video_count_for_new_row(conn, owner, username)
         conn.execute(
             """
             INSERT INTO device_editor_rows
-                (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (owner_username, row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, video_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_username, row_index) DO UPDATE SET
                 device_alias = excluded.device_alias,
                 device_id = excluded.device_id,
@@ -10782,6 +11824,7 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
                 payload.backup_status.strip(),
                 payload.remark.strip(),
                 sh,
+                default_vc,
                 now,
             ),
         )
@@ -10819,7 +11862,7 @@ def set_device_editor_switch_highlight(payload: DeviceEditorSwitchHighlightReque
     try:
         row = conn.execute(
             """
-            SELECT row_index, assigned_alias, device_alias
+            SELECT row_index, assigned_alias, device_alias, device_id
             FROM device_editor_rows
             WHERE owner_username = ? AND row_index = ?
             LIMIT 1
@@ -10831,6 +11874,13 @@ def set_device_editor_switch_highlight(payload: DeviceEditorSwitchHighlightReque
         eff_assigned = str(row["assigned_alias"] or "").strip()
         eff_device = str(row["device_alias"] or "").strip()
         bucket = eff_assigned if eff_assigned else eff_device
+        blocked = _reject_if_auto_switch_manual_ops(
+            device_id=str(row["device_id"] or "").strip(),
+            owner_username=owner,
+            alias=bucket,
+        )
+        if blocked:
+            return blocked
         now = now_text()
         conn.execute(
             f"""
@@ -10934,6 +11984,9 @@ def admin_device_delete(payload: DeviceIdAliasRequest, authorization: str | None
 
 @app.post("/api/admin/device_tiktok/restore")
 def admin_device_tiktok_restore(payload: DeviceTikTokRestoreRequest, authorization: str | None = Header(default=None)):
+    blocked = _reject_if_auto_switch_manual_ops(device_id=payload.device_id, alias=payload.alias)
+    if blocked:
+        return blocked
     err, _device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
     if err:
         return err
@@ -13040,22 +14093,2420 @@ def trigger_backup_stats_full_query_once(authorization: str | None = Header(defa
     return {"code": 0, "msg": "已提交后台全量查询任务，请在任务日志中查看进度"}
 
 
+AUTO_SWITCH_MANUAL_BLOCK_MSG = "该设备已开启自动切号，请先关闭后再执行手动操作"
+
+
+def _device_auto_switch_enabled(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    with store.lock:
+        dev = store.devices.get(did)
+        return bool(dev and dev.auto_switch_enabled)
+
+
+def _any_device_auto_switch_enabled() -> bool:
+    with store.lock:
+        return any(bool(d.auto_switch_enabled) for d in store.devices.values())
+
+
+def _resolve_device_id_for_owner_alias(owner_username: str, alias: str, fallback_device_id: str = "") -> str:
+    alias_key = _normalize_alias_key(alias)
+    owner = str(owner_username or "").strip()
+    fallback = str(fallback_device_id or "").strip()
+    if fallback:
+        with store.lock:
+            dev = store.devices.get(fallback)
+            if dev and str(dev.owner_username or "").strip() == owner:
+                if not alias_key or _normalize_alias_key(dev.alias) == alias_key:
+                    return fallback
+    if not owner or not alias_key:
+        return fallback
+    with store.lock:
+        for did, dev in store.devices.items():
+            if str(dev.owner_username or "").strip() != owner:
+                continue
+            if _normalize_alias_key(dev.alias) == alias_key:
+                return str(did)
+    return fallback
+
+
+def _reject_if_auto_switch_manual_ops(
+    device_id: str = "",
+    owner_username: str = "",
+    alias: str = "",
+) -> dict | None:
+    did = str(device_id or "").strip()
+    if not did:
+        did = _resolve_device_id_for_owner_alias(owner_username, alias)
+    if did and _device_auto_switch_enabled(did):
+        return {"code": 1, "msg": AUTO_SWITCH_MANUAL_BLOCK_MSG}
+    return None
+
+
+def _auto_switch_enabled_now() -> bool:
+    """兼容旧调用：任一设备开启自动切号即视为功能活跃。"""
+    return _any_device_auto_switch_enabled()
+
+
+def _new_auto_switch_session_id(*, entering: bool) -> str:
+    prefix = "as_on" if entering else "as_off"
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def _persist_auto_switch_session_row(session_id: str, *, enabled: bool, bundle_revision: int) -> None:
+    conn = _get_db()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO auto_switch_sessions
+            (session_id, enabled, bundle_revision, created_at, closed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                1 if enabled else 0,
+                int(bundle_revision or 0),
+                now_text(),
+                None if enabled else now_text(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _supersede_pending_device_mode_events(
+    device_id: str,
+    event_types: tuple[str, ...] | list[str],
+) -> int:
+    """作废设备信箱中尚未 ACK 的指定类型模式事件，避免过期 enter/exit 覆盖管理台最新意图。"""
+    did = str(device_id or "").strip()
+    types = [str(t or "").strip() for t in (event_types or []) if str(t or "").strip()]
+    if not did or not types:
+        return 0
+    placeholders = ",".join("?" for _ in types)
+    conn = _get_db()
+    try:
+        cur = conn.execute(
+            f"""
+            UPDATE device_mode_events
+            SET acked_at = ?, ack_phase = 'superseded'
+            WHERE device_id = ? AND acked_at IS NULL AND event_type IN ({placeholders})
+            """,
+            (now_text(), did, *types),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def _reconcile_auto_switch_mode_event_mailbox() -> None:
+    """启动后与 client_devices 开关对齐：作废与当前状态矛盾的待投递模式事件。"""
+    with store.lock:
+        devices = list(store.devices.items())
+    exit_superseded = 0
+    enter_superseded = 0
+    for did, dev in devices:
+        if bool(dev.auto_switch_enabled):
+            exit_superseded += _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+        else:
+            enter_superseded += _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+    total = exit_superseded + enter_superseded
+    if total > 0:
+        _auto_switch_log(
+            f"启动对齐模式信箱：作废 exit={exit_superseded} enter={enter_superseded}"
+        )
+
+
+def _enqueue_device_mode_event(
+    device_id: str,
+    owner_username: str,
+    event_type: str,
+    session_id: str,
+    bundle_revision: int = 0,
+    payload: dict | None = None,
+) -> int:
+    """写入设备模式事件信箱，返回 event_id。"""
+    did = str(device_id or "").strip()
+    owner = str(owner_username or "").strip()
+    et = str(event_type or "").strip()
+    sid = str(session_id or "").strip()
+    if not did or not owner or not et or not sid:
+        return 0
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    conn = _get_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO device_mode_events
+            (device_id, owner_username, event_type, session_id, bundle_revision, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (did, owner, et, sid, int(bundle_revision or 0), payload_json, now_text()),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def _enqueue_auto_switch_mode_events_for_all_devices(
+    event_type: str,
+    session_id: str,
+    bundle_revision: int = 0,
+) -> int:
+    """为全部绑定设备写入 ENTER/EXIT 事件，返回写入条数。"""
+    et = str(event_type or "").strip()
+    sid = str(session_id or "").strip()
+    if not et or not sid:
+        return 0
+    with store.lock:
+        devices = list(store.devices.items())
+    count = 0
+    for did, dev in devices:
+        eid = _enqueue_device_mode_event(
+            did,
+            dev.owner_username,
+            et,
+            sid,
+            bundle_revision=bundle_revision,
+        )
+        if eid > 0:
+            count += 1
+            _append_device_log(
+                did,
+                f"[{now_text()}] 自动切号 | 已投递模式事件 {et} session={sid} event_id={eid}",
+            )
+    return count
+
+
+def _enqueue_auto_switch_mode_events_for_device_ids(
+    device_ids: list[str],
+    event_type: str,
+    session_id: str,
+    bundle_revision: int = 0,
+) -> int:
+    et = str(event_type or "").strip()
+    sid = str(session_id or "").strip()
+    if not et or not sid:
+        return 0
+    count = 0
+    for did in device_ids:
+        did_clean = str(did or "").strip()
+        if not did_clean:
+            continue
+        with store.lock:
+            dev = store.devices.get(did_clean)
+            if not dev:
+                continue
+            owner = dev.owner_username
+        eid = _enqueue_device_mode_event(
+            did_clean,
+            owner,
+            et,
+            sid,
+            bundle_revision=bundle_revision,
+        )
+        if eid > 0:
+            count += 1
+            _append_device_log(
+                did_clean,
+                f"[{now_text()}] 自动切号 | 已投递模式事件 {et} session={sid} event_id={eid}",
+            )
+    return count
+
+
+def _cancel_pending_auto_switch_device_ops_for_device(device_id: str) -> int:
+    did = str(device_id or "").strip()
+    if not did:
+        return 0
+    rollback_items: list[tuple[str, dict[str, Any]]] = []
+    removed_op_ids: set[str] = set()
+    removed = 0
+    with store.lock:
+        queue = list(store.pending_device_ops.get(did) or [])
+        if not queue:
+            return 0
+        owner = ""
+        dev = store.devices.get(did)
+        if dev:
+            owner = str(dev.owner_username or "").strip()
+        kept: list[dict[str, Any]] = []
+        for op in queue:
+            if not _is_pending_auto_switch_device_op(op):
+                kept.append(op)
+                continue
+            removed += 1
+            op_id = str(op.get("op_id") or "").strip()
+            if op_id:
+                removed_op_ids.add(op_id)
+            payload = _device_op_payload(op)
+            op_type = str(op.get("op_type") or "")
+            if owner and op_type in ("tiktok_backup_and_clear", "tiktok_restore", "tiktok_clear"):
+                if _resolve_cut_switch_source_row_index(payload) >= 0:
+                    rollback_items.append((owner, dict(payload)))
+        if kept:
+            store.pending_device_ops[did] = kept
+        else:
+            store.pending_device_ops.pop(did, None)
+        if removed_op_ids:
+            for bucket_key, inflight in list(store.auto_switch_publish_inflight_keys.items()):
+                if not bucket_key.endswith(f"|{_normalize_alias_key(dev.alias if dev else '')}"):
+                    continue
+                _slot, op_id = _parse_auto_switch_publish_inflight(str(inflight))
+                if op_id in removed_op_ids:
+                    store.auto_switch_publish_inflight_keys.pop(bucket_key, None)
+    seen_rollback: set[tuple[str, int]] = set()
+    for owner, data in rollback_items:
+        src = _resolve_cut_switch_source_row_index(data)
+        key = (owner, src)
+        if src < 0 or key in seen_rollback:
+            continue
+        seen_rollback.add(key)
+        _device_ops_rollback_cut_switch_highlight(owner, data)
+    return removed
+
+
+def _build_auto_switch_account_configs(
+    owner: str,
+    data: dict,
+    mode: str,
+    alias_key: str,
+    account_rows: list[dict[str, Any]],
+    session_id: str = "",
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], str, dict[str, Any]]:
+    """为桶内每个账号解析模板并打包完整 trace 配置（含智能模板 per-account + session 重掷）。"""
+    templates, _template_meta = _build_effective_template_bundle(owner, data)
+    mode_key = mode if mode in RUN_MODES else str(data.get("run_mode") or "growth")
+    smart_enabled = _alias_smart_template_enabled(data, mode_key, alias_key)
+    configs_by_username: dict[str, dict[str, Any]] = {}
+    accounts_debug: dict[str, dict[str, Any]] = {}
+
+    for row in account_rows:
+        username = str(row.get("username") or "").strip()
+        if not username:
+            continue
+        account_key = _normalize_tiktok_username_key(username)
+        if not account_key:
+            continue
+        if smart_enabled and mode_key in SMART_TEMPLATE_RUN_MODES and templates:
+            row_stats = {
+                "tiktok_username": account_key,
+                "follower_count": _parse_stat_int(row.get("follower_count")),
+                "video_count": _parse_stat_int(row.get("video_count")),
+            }
+            selected_name, smart_debug = _resolve_smart_template_for_alias(
+                owner,
+                data,
+                mode_key,
+                alias_key,
+                templates,
+                account_stats=row_stats,
+                session_id=session_id,
+            )
+            config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
+            accounts_debug[account_key] = {
+                **smart_debug,
+                "resolution_source": "smart_template",
+            }
+        else:
+            selected_name, config, _, _ = _resolve_template_for_mode_alias(
+                owner,
+                data,
+                mode_key,
+                alias_key,
+                username,
+            )
+            accounts_debug[account_key] = {
+                "tiktok_username": account_key,
+                "selected_template": selected_name,
+                "follower_count": _parse_stat_int(row.get("follower_count")),
+                "video_count": _parse_stat_int(row.get("video_count")),
+                "resolution_source": "alias_binding",
+            }
+        configs_by_username[account_key] = {
+            "active_template": selected_name,
+            "config": config,
+        }
+
+    highlight_user = _resolve_switch_highlight_tiktok_username(owner, alias_key)
+    highlight_key = _normalize_tiktok_username_key(highlight_user)
+    highlight_entry = configs_by_username.get(highlight_key)
+    if not highlight_entry and configs_by_username:
+        highlight_entry = next(iter(configs_by_username.values()))
+    active_template = str((highlight_entry or {}).get("active_template") or "")
+    eff_config = dict((highlight_entry or {}).get("config") or MODE_DEFAULT_CONFIGS["growth"])
+
+    smart_template_debug: dict[str, Any] = {
+        "enabled": smart_enabled,
+        "session_id": str(session_id or "").strip(),
+        "mode": mode_key,
+        "alias": alias_key,
+        "enter_reroll": bool(str(session_id or "").strip()),
+        "accounts": accounts_debug,
+    }
+    return configs_by_username, smart_template_debug, active_template, eff_config
+
+
+def _build_auto_switch_bundle_for_device(
+    device_id: str,
+    alias: str,
+    session_id: str = "",
+    revision: int = 0,
+) -> dict[str, Any]:
+    error, device = auth_or_error(device_id, alias)
+    if error:
+        raise ValueError(str(error.get("msg") or "设备鉴权失败"))
+    owner = str(device.owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    schedule_date = _beijing_date_str()
+    buckets = _list_device_editor_buckets(owner)
+    rows = buckets.get(alias_key, [])
+    if not rows:
+        raise ValueError(f"别名 {alias_key} 无备份档案")
+    weekly_plan = _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
+    week_start = str(weekly_plan.get("week_start_date") or "").strip()
+    week_end = str(weekly_plan.get("week_end_date") or "").strip()
+    plan = _daily_plan_for_schedule_date(weekly_plan, schedule_date)
+    if not plan:
+        raise ValueError(f"本周排班缺少今日计划 date={schedule_date}")
+    runtime = _normalize_user_runtime_state(_load_user_runtime_state(owner))
+    mode = str(runtime.get("run_mode") or "growth")
+    if mode not in RUN_MODES:
+        mode = "growth"
+    accounts: list[dict[str, Any]] = []
+    conn = _get_db()
+    try:
+        for row in rows:
+            username = str(row.get("username") or "").strip()
+            acct_fields = _account_bundle_fields_for_username(conn, owner, username)
+            accounts.append(
+                {
+                    "row_index": int(row.get("row_index") or 0),
+                    "username": username,
+                    "backup_path": str(row.get("backup_path") or "").strip(),
+                    "backup_name": str(row.get("backup_name") or "").strip(),
+                    "assigned_alias": str(row.get("assigned_alias") or "").strip(),
+                    "device_alias": str(row.get("device_alias") or "").strip(),
+                    "switch_highlight": str(row.get("switch_highlight") or "").strip(),
+                    "video_count": row.get("video_count"),
+                    "follower_count": row.get("follower_count"),
+                    "follower_growth": row.get("follower_growth"),
+                    **acct_fields,
+                }
+            )
+    finally:
+        conn.close()
+    configs_by_username, smart_template_debug, active_template, eff_config = _build_auto_switch_account_configs(
+        owner,
+        runtime,
+        mode,
+        alias_key,
+        accounts,
+        session_id=str(session_id or "").strip(),
+    )
+    mat_fetch = eff_config.get("publish_post_material_fetch_count", 3)
+    try:
+        mat_fetch_n = int(mat_fetch)
+    except (TypeError, ValueError):
+        mat_fetch_n = 3
+    return {
+        "session_id": str(session_id or "").strip(),
+        "revision": int(revision or 0),
+        "schedule_date": schedule_date,
+        "week_start_date": week_start,
+        "week_end_date": week_end,
+        "weekly_plan": _weekly_plan_for_bundle(weekly_plan),
+        "timezone": "Asia/Shanghai",
+        "owner_username": owner,
+        "device_alias": alias_key,
+        "device_id": str(device_id or "").strip(),
+        "run_config": {
+            "run_mode": mode,
+            "active_template": str(active_template or ""),
+            "publish_post_material_fetch_count": mat_fetch_n,
+            "package_name": TIKTOK_PACKAGE_NAME,
+        },
+        "configs_by_username": configs_by_username,
+        "smart_template_debug": smart_template_debug,
+        "accounts": accounts,
+        "daily_plan": plan,
+        "retry_policy": {
+            "cut_switch_max_attempts": 3,
+            "login_max_attempts": 5,
+            "publish_max_attempts": 3,
+            "backoff_base_sec": 30,
+            "backoff_max_sec": 600,
+        },
+    }
+
+
+def _fetch_pending_device_mode_event(device_id: str, since_event_id: int = 0) -> dict[str, Any] | None:
+    did = str(device_id or "").strip()
+    if not did:
+        return None
+    since = max(0, int(since_event_id or 0))
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, event_type, session_id, bundle_revision, payload_json, created_at
+            FROM device_mode_events
+            WHERE device_id = ? AND acked_at IS NULL AND id > ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (did, since),
+        ).fetchone()
+        # 兼容设备端 since_event_id 过大（如服务端重启/迁移后 id 重置），导致永远收不到未 ACK 事件。
+        # 若存在未 ACK 事件，则回退为从最早未 ACK 事件开始投递，避免设备端卡在“仅监听模式事件”。
+        if not row and since > 0:
+            row = conn.execute(
+                """
+                SELECT id, event_type, session_id, bundle_revision, payload_json, created_at
+                FROM device_mode_events
+                WHERE device_id = ? AND acked_at IS NULL
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (did,),
+            ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    payload: dict[str, Any] = {}
+    try:
+        raw = json.loads(row[4] or "{}")
+        if isinstance(raw, dict):
+            payload = raw
+    except Exception:
+        payload = {}
+    return {
+        "event_id": int(row[0]),
+        "type": str(row[1] or ""),
+        "session_id": str(row[2] or ""),
+        "bundle_revision": int(row[3] or 0),
+        "payload": payload,
+        "issued_at": str(row[5] or ""),
+    }
+
+
+_AUTO_SWITCH_MODE_ACK_TERMINAL_PHASES = frozenset({"bundle_loaded", "summary_uploaded"})
+
+
+def _ack_device_mode_event(
+    device_id: str,
+    event_id: int,
+    phase: str,
+    session_id: str = "",
+) -> bool:
+    did = str(device_id or "").strip()
+    eid = int(event_id or 0)
+    ph = str(phase or "").strip()
+    if not did or eid <= 0 or not ph:
+        return False
+    conn = _get_db()
+    try:
+        sid = str(session_id or "").strip()
+        event_row = conn.execute(
+            "SELECT event_type FROM device_mode_events WHERE device_id = ? AND id = ?",
+            (did, eid),
+        ).fetchone()
+        event_type = str(event_row[0] or "").strip() if event_row else ""
+        is_terminal = ph in _AUTO_SWITCH_MODE_ACK_TERMINAL_PHASES
+        if is_terminal:
+            params: list[Any] = [now_text(), ph, did, eid]
+            sql = """
+                UPDATE device_mode_events
+                SET acked_at = ?, ack_phase = ?
+                WHERE device_id = ? AND id = ? AND acked_at IS NULL
+            """
+        else:
+            params = [ph, did, eid]
+            sql = """
+                UPDATE device_mode_events
+                SET ack_phase = ?
+                WHERE device_id = ? AND id = ? AND acked_at IS NULL
+            """
+        if sid:
+            sql += " AND session_id = ?"
+            params.append(sid)
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        ok = int(cur.rowcount or 0) > 0
+    finally:
+        conn.close()
+    if ok and is_terminal:
+        # 管理台 set_auto_switch_devices 已是开关真源；终端 ACK 仅确认，不得用过期事件反向覆盖。
+        if event_type == "auto_switch_enter" and ph == "bundle_loaded":
+            with store.lock:
+                dev = store.devices.get(did)
+                if dev and not dev.auto_switch_enabled:
+                    _auto_switch_log(
+                        f"忽略过期 enter ACK event_id={eid} device={did}（管理台当前为关）"
+                    )
+                elif dev:
+                    _persist_client_device_to_db(did)
+        elif event_type == "auto_switch_exit" and ph == "summary_uploaded":
+            with store.lock:
+                dev = store.devices.get(did)
+                if dev and dev.auto_switch_enabled:
+                    _auto_switch_log(
+                        f"忽略过期 exit ACK event_id={eid} device={did}（管理台已重新开启）"
+                    )
+                elif dev:
+                    _persist_client_device_to_db(did)
+    return ok
+
+
 @app.get("/api/admin/auto_switch/config")
 def get_auto_switch_config(authorization: str | None = Header(default=None)):
-    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    err, session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
-    with store.lock:
-        enabled = bool(store.auto_switch_enabled)
+    allowed = _session_device_ids(session)
+    devices_out: list[dict[str, Any]] = []
+    try:
+        with _store_lock("auto_switch_config", wait_sec=STORE_LOCK_WAIT_SEC):
+            for did in sorted(allowed):
+                dev = store.devices.get(did)
+                if not dev:
+                    continue
+                devices_out.append(
+                    {
+                        "device_id": did,
+                        "alias": str(dev.alias or ""),
+                        "enabled": bool(dev.auto_switch_enabled),
+                    }
+                )
+    except StoreLockBusy:
+        return {"code": 503, "msg": "服务繁忙，请稍后重试"}
+    enabled_count = sum(1 for d in devices_out if d.get("enabled"))
+    autonomous_mode = enabled_count > 0
     return {
         "code": 0,
         "data": {
-            "enabled": enabled,
+            "devices": devices_out,
+            "enabled_count": enabled_count,
+            "any_enabled": enabled_count > 0,
+            "autonomous_mode": autonomous_mode,
+            "cloud_tick_active": not autonomous_mode,
+            "autonomous_idle_sec": AUTO_SWITCH_AUTONOMOUS_IDLE_SEC,
             "beijing_date": _beijing_date_str(),
             "beijing_time": _beijing_now().strftime("%H:%M:%S"),
             "tick_interval_sec": AUTO_SWITCH_TICK_INTERVAL_SEC,
         },
     }
+
+
+@app.post("/api/admin/auto_switch/devices")
+def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    allowed = _session_device_ids(session)
+    device_ids = [str(d or "").strip() for d in (payload.device_ids or []) if str(d or "").strip()]
+    device_ids = [d for d in device_ids if d in allowed]
+    if not device_ids:
+        return {"code": 1, "msg": "未选择有效设备"}
+    target_enabled = bool(payload.enabled)
+    session_id = _new_auto_switch_session_id(entering=target_enabled)
+    bundle_revision = 0
+    if target_enabled:
+        with store.lock:
+            store.auto_switch_bundle_revision = int(store.auto_switch_bundle_revision or 0) + 1
+            bundle_revision = int(store.auto_switch_bundle_revision)
+        persist_runtime_state()
+        _persist_auto_switch_session_row(session_id, enabled=True, bundle_revision=bundle_revision)
+    else:
+        _persist_auto_switch_session_row(session_id, enabled=False, bundle_revision=0)
+
+    changed = 0
+    notified = 0
+    cancelled_ops = 0
+    for did in device_ids:
+        turning_on = False
+        turning_off = False
+        owner = ""
+        with store.lock:
+            dev = store.devices.get(did)
+            if not dev:
+                continue
+            owner = str(dev.owner_username or "").strip()
+            was_enabled = bool(dev.auto_switch_enabled)
+            dev.auto_switch_enabled = bool(target_enabled)
+            if target_enabled and not was_enabled:
+                turning_on = True
+            elif (not target_enabled) and was_enabled:
+                turning_off = True
+        _persist_client_device_to_db(did)
+        if turning_on or turning_off:
+            changed += 1
+        if turning_on:
+            superseded = _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+            if superseded > 0:
+                _auto_switch_log(
+                    f"开启前作废 {superseded} 条待投递 exit 事件 device={did} session={session_id}"
+                )
+            if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
+                notified += 1
+                _append_device_log(did, f"[{now_text()}] 自动切号 | 已开启自治 session={session_id}")
+                with store.lock:
+                    store.auto_switch_align_on_next_tick = True
+        elif turning_off:
+            superseded = _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+            if superseded > 0:
+                _auto_switch_log(
+                    f"关闭前作废 {superseded} 条待投递 enter 事件 device={did} session={session_id}"
+                )
+            cancelled_ops += _cancel_pending_auto_switch_device_ops_for_device(did)
+            if _enqueue_device_mode_event(did, owner, "auto_switch_exit", session_id, bundle_revision=0):
+                notified += 1
+                _append_device_log(did, f"[{now_text()}] 自动切号 | 已关闭自治 session={session_id}")
+
+    if target_enabled:
+        _auto_switch_log(
+            f"已为 {changed} 台设备开启自动切号 session={session_id} revision={bundle_revision} notified={notified}"
+        )
+    else:
+        _auto_switch_log(
+            f"已为 {changed} 台设备关闭自动切号 session={session_id} cancelled_ops={cancelled_ops} notified={notified}"
+        )
+    return {
+        "code": 0,
+        "msg": "自动切号设备配置已更新",
+        "data": {
+            "enabled": target_enabled,
+            "session_id": session_id,
+            "bundle_revision": bundle_revision if target_enabled else 0,
+            "devices_changed": changed,
+            "devices_notified": notified,
+            "cancelled_ops": cancelled_ops,
+        },
+    }
+
+
+@app.post("/api/admin/auto_switch/config")
+def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | None = Header(default=None)):
+    """兼容旧全局开关：转为对当前用户全部设备批量开/关。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    if payload.enabled is None:
+        return get_auto_switch_config(authorization=authorization)
+    allowed = sorted(_session_device_ids(session))
+    req = AutoSwitchDevicesRequest(device_ids=allowed, enabled=bool(payload.enabled))
+    return set_auto_switch_devices(req, authorization=authorization)
+
+
+@app.get("/api/auto_switch/bundle")
+def get_auto_switch_bundle(
+    device_id: str,
+    alias: str,
+    session_id: str = "",
+    revision: int = 0,
+):
+    error, _device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    if not _device_auto_switch_enabled(device_id):
+        return {"code": 1, "msg": "该设备未开启自动切号"}
+    try:
+        bundle = _build_auto_switch_bundle_for_device(device_id, alias, session_id, revision)
+    except ValueError as exc:
+        return {"code": 1, "msg": str(exc)}
+    except Exception as exc:
+        return {"code": 1, "msg": f"构建自治包失败：{exc}"}
+    return {"code": 0, "bundle": bundle}
+
+
+@app.get("/api/admin/auto_switch/bundle_preview")
+def admin_auto_switch_bundle_preview(
+    device_id: str,
+    alias: str,
+    session_id: str = "",
+    authorization: str | None = Header(default=None),
+):
+    """管理台预览自治 bundle（含 configs_by_username 与 smart_template_debug）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    allowed = set(_session_device_ids(session))
+    did = str(device_id or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not did or not alias_key:
+        return {"code": 1, "msg": "device_id 与 alias 不能为空"}
+    if did not in allowed:
+        return {"code": 1, "msg": "无权预览该设备"}
+    preview_session = str(session_id or "").strip() or f"preview-{uuid.uuid4().hex[:12]}"
+    try:
+        bundle = _build_auto_switch_bundle_for_device(did, alias_key, preview_session, revision=0)
+    except ValueError as exc:
+        return {"code": 1, "msg": str(exc)}
+    except Exception as exc:
+        return {"code": 1, "msg": f"构建预览 bundle 失败：{exc}"}
+    return {"code": 0, "bundle": bundle, "preview_session_id": preview_session}
+
+
+_AUTO_SWITCH_LEDGER_WRITEBACK_OP_TYPES = frozenset(
+    {"tiktok_backup_and_clear", "tiktok_clear", "tiktok_restore"}
+)
+
+
+def _auto_switch_ledger_entry_writeback_eligible(entry: dict[str, Any]) -> tuple[bool, str]:
+    """仅备份成功、还原成功、切号高亮相关条目可写回 device_editor_rows。"""
+    op_type = str(entry.get("op_type") or "").strip()
+    phase = str(entry.get("phase") or entry.get("status") or "").strip().lower()
+    status = str(entry.get("status") or "").strip().lower()
+    terminal = phase in ("success", "failed") or status in ("success", "failed")
+    if op_type not in _AUTO_SWITCH_LEDGER_WRITEBACK_OP_TYPES:
+        return False, f"{op_type or '未知类型'} 不参与档案写回，仅记入对账"
+    if not terminal:
+        return False, f"{op_type} 未达终态（phase={phase or status or '-'}），跳过写回"
+    data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+    if not data:
+        return False, f"{op_type} 缺少 report_data，无法写回"
+    if op_type == "tiktok_backup_and_clear":
+        if status != "success" and phase != "success":
+            return True, ""  # 失败走 rollback
+        if bool(data.get("backup_skipped")):
+            return False, "备份已跳过（backup_skipped），不写回备份字段"
+    return True, ""
+
+
+def _normalize_auto_switch_summary_kind(kind: object) -> str:
+    k = str(kind or "").strip().lower()
+    return k if k in ("final", "daily") else "final"
+
+
+def _resolve_auto_switch_reconcile_meta(payload: AutoSwitchSessionSummaryRequest) -> tuple[str, str]:
+    kind = _normalize_auto_switch_summary_kind(payload.summary_kind)
+    key = str(payload.reconcile_key or "").strip()
+    if not key:
+        key = "final" if kind == "final" else _beijing_date_str()
+    return kind, key
+
+
+def _find_auto_switch_session_summary_id(
+    owner_username: str,
+    device_id: str,
+    alias: str,
+    session_id: str,
+    reconcile_key: str = "final",
+) -> int:
+    owner = str(owner_username or "").strip()
+    did = str(device_id or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    sid = str(session_id or "").strip()
+    rkey = str(reconcile_key or "final").strip() or "final"
+    if not owner or not did or not alias_key or not sid:
+        return 0
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM auto_switch_session_summaries
+            WHERE owner_username = ? AND device_id = ? AND alias = ? AND session_id = ?
+              AND reconcile_key = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (owner, did, alias_key, sid, rkey),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _save_auto_switch_session_summary(
+    owner_username: str,
+    device_id: str,
+    alias: str,
+    payload: AutoSwitchSessionSummaryRequest,
+    reconciliation: dict[str, Any],
+) -> int:
+    owner = str(owner_username or "").strip()
+    did = str(device_id or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    sid = str(payload.session_id or "").strip()
+    if not owner or not did or not alias_key or not sid:
+        return 0
+    summary_kind, reconcile_key = _resolve_auto_switch_reconcile_meta(payload)
+    summary_doc = {
+        "session_id": sid,
+        "device_id": did,
+        "alias": alias_key,
+        "summary_kind": summary_kind,
+        "reconcile_key": reconcile_key,
+        "bundle_revision": int(payload.bundle_revision or 0),
+        "schedule_date": str(payload.schedule_date or "").strip(),
+        "started_at": str(payload.started_at or "").strip(),
+        "ended_at": str(payload.ended_at or "").strip(),
+        "ledger": [e.model_dump() for e in payload.ledger],
+        "human_log": str(payload.human_log or "").strip(),
+        "stats": payload.stats if isinstance(payload.stats, dict) else {},
+        "reconciliation": reconciliation,
+    }
+    smart_dbg = payload.smart_template_debug if isinstance(payload.smart_template_debug, dict) else {}
+    if smart_dbg:
+        summary_doc["smart_template_debug"] = smart_dbg
+    existing_id = _find_auto_switch_session_summary_id(owner, did, alias_key, sid, reconcile_key)
+    conn = _get_db()
+    try:
+        if existing_id > 0:
+            conn.execute(
+                """
+                UPDATE auto_switch_session_summaries
+                SET bundle_revision = ?, schedule_date = ?, summary_json = ?, human_log = ?,
+                    summary_kind = ?, reconcile_key = ?
+                WHERE id = ?
+                """,
+                (
+                    int(payload.bundle_revision or 0),
+                    str(payload.schedule_date or "").strip(),
+                    json.dumps(summary_doc, ensure_ascii=False),
+                    str(payload.human_log or "").strip(),
+                    summary_kind,
+                    reconcile_key,
+                    existing_id,
+                ),
+            )
+            conn.commit()
+            return existing_id
+        cur = conn.execute(
+            """
+            INSERT INTO auto_switch_session_summaries
+            (session_id, device_id, owner_username, alias, bundle_revision, schedule_date,
+             summary_json, human_log, summary_kind, reconcile_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sid,
+                did,
+                owner,
+                alias_key,
+                int(payload.bundle_revision or 0),
+                str(payload.schedule_date or "").strip(),
+                json.dumps(summary_doc, ensure_ascii=False),
+                str(payload.human_log or "").strip(),
+                summary_kind,
+                reconcile_key,
+                now_text(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def _list_auto_switch_session_summaries_for_owner(
+    owner_username: str,
+    *,
+    device_id: str = "",
+    alias: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return []
+    did = str(device_id or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    lim = max(1, min(int(limit or 20), 100))
+    where = ["owner_username = ?"]
+    params: list[Any] = [owner]
+    if did:
+        where.append("device_id = ?")
+        params.append(did)
+    if alias_key:
+        where.append("alias = ?")
+        params.append(alias_key)
+    params.append(lim)
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, session_id, device_id, alias, bundle_revision, schedule_date,
+                   summary_json, human_log, created_at
+            FROM auto_switch_session_summaries
+            WHERE {' AND '.join(where)}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        summary: dict[str, Any] = {}
+        try:
+            parsed = json.loads(row[6] or "{}")
+            if isinstance(parsed, dict):
+                summary = parsed
+        except Exception:
+            summary = {}
+        out.append(
+            {
+                "id": int(row[0]),
+                "session_id": str(row[1] or ""),
+                "device_id": str(row[2] or ""),
+                "alias": str(row[3] or ""),
+                "bundle_revision": int(row[4] or 0),
+                "schedule_date": str(row[5] or ""),
+                "human_log": str(row[7] or ""),
+                "created_at": str(row[8] or ""),
+                "stats": summary.get("stats") if isinstance(summary.get("stats"), dict) else {},
+                "reconciliation": summary.get("reconciliation")
+                if isinstance(summary.get("reconciliation"), dict)
+                else {},
+                "smart_template_debug": summary.get("smart_template_debug")
+                if isinstance(summary.get("smart_template_debug"), dict)
+                else {},
+            }
+        )
+    return out
+
+
+def _pending_profile_edit_usernames_from_ledger(entries: list[dict[str, Any]]) -> set[str]:
+    pending: set[str] = set()
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            continue
+        op_type = str(raw.get("op_type") or "")
+        if op_type == "auto_switch_profile_baseline":
+            data = raw.get("report_data") if isinstance(raw.get("report_data"), dict) else {}
+            raw_list = str(data.get("pending_profile_edit_usernames") or "").strip()
+            if not raw_list:
+                continue
+            for part in raw_list.split(","):
+                u = part.strip().lower()
+                if u:
+                    pending.add(u)
+            continue
+        if op_type == "profile_edit_required":
+            data = raw.get("report_data") if isinstance(raw.get("report_data"), dict) else {}
+            u = str(
+                raw.get("username")
+                or data.get("username")
+                or data.get("account_username")
+                or ""
+            ).strip().lower()
+            if u:
+                pending.add(u)
+    return pending
+
+
+def _profile_edit_report_username(
+    data: dict[str, Any],
+    owner_username: str = "",
+    alias: str = "",
+) -> str:
+    """从改资料设备回传 data 解析目标 TikTok 用户名；缺省时回退切号高亮账号。"""
+    u = str(
+        data.get("username")
+        or data.get("account_username")
+        or data.get("new_username")
+        or ""
+    ).strip().lstrip("@")
+    if u:
+        return u
+    assigned = str(data.get("profile_edit_assigned_username") or data.get("old_username") or "").strip().lstrip("@")
+    if assigned:
+        return assigned
+    owner = str(owner_username or "").strip()
+    alias_key = str(alias or "").strip()
+    if owner and alias_key:
+        return _resolve_switch_highlight_tiktok_username(owner, alias_key)
+    return ""
+
+
+def _profile_edit_writeback_username_candidates(data: dict[str, Any]) -> list[str]:
+    """改资料写回：按优先级尝试多个用户名（Bio 步骤可能已将账号 old→new）。"""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: object) -> None:
+        text = str(raw or "").strip().lstrip("@")
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            candidates.append(text)
+
+    for key in (
+        "username",
+        "account_username",
+        "new_username",
+        "profile_edit_assigned_username",
+        "old_username",
+    ):
+        _add(data.get(key))
+    return candidates
+
+
+def _profile_edit_identity_keys(data: dict[str, Any]) -> set[str]:
+    """改资料对账：同一账号 old/new 用户名均视为同一身份键。"""
+    keys: set[str] = set()
+    for raw in _profile_edit_writeback_username_candidates(data):
+        keys.add(raw.lower())
+    return keys
+
+
+def _mark_account_basic_profile_modified_by_row_index(
+    owner_username: str,
+    row_index: int,
+    *,
+    only_if_pending: bool = False,
+) -> int:
+    owner = str(owner_username or "").strip()
+    ri = int(row_index)
+    if not owner or ri < 0:
+        return 0
+    conn = _get_db()
+    try:
+        sql = """
+            UPDATE account_editor_rows
+            SET basic_profile_modified = '是', updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+        """
+        if only_if_pending:
+            sql += " AND TRIM(COALESCE(basic_profile_modified, '否')) <> '是'"
+        cur = conn.execute(sql, (now_text(), owner, ri))
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def _mark_account_basic_profile_modified_for_username(
+    owner_username: str,
+    username: str,
+    *,
+    only_if_pending: bool = False,
+) -> int:
+    """将指定账号 account_editor_rows.basic_profile_modified 标为「是」。"""
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip().lstrip("@")
+    if not owner or not uname:
+        return 0
+    conn = _get_db()
+    try:
+        sql = """
+            UPDATE account_editor_rows
+            SET basic_profile_modified = '是', updated_at = ?
+            WHERE owner_username = ?
+              AND LOWER(TRIM(COALESCE(username, ''))) = LOWER(?)
+        """
+        if only_if_pending:
+            sql += " AND TRIM(COALESCE(basic_profile_modified, '否')) <> '是'"
+        cur = conn.execute(sql, (now_text(), owner, uname))
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def _mark_account_basic_profile_modified_for_profile_edit(
+    owner_username: str,
+    alias: str,
+    data: dict[str, Any],
+    *,
+    only_if_pending: bool = False,
+) -> dict[str, Any]:
+    """
+    改资料成功写回：优先 account_row_index（Bio 改名后仍稳定），再按 old/new 用户名候选匹配。
+    """
+    owner = str(owner_username or "").strip()
+    if not owner or not isinstance(data, dict):
+        return {"updated": 0, "username": ""}
+    row_index_raw = data.get("account_row_index")
+    if row_index_raw is not None:
+        try:
+            ri = int(row_index_raw)
+            if ri >= 0:
+                rowcount = _mark_account_basic_profile_modified_by_row_index(
+                    owner, ri, only_if_pending=only_if_pending
+                )
+                if rowcount:
+                    resolved = _profile_edit_report_username(data, owner, alias)
+                    return {"updated": rowcount, "username": resolved or f"row_index:{ri}"}
+        except (TypeError, ValueError):
+            pass
+    for uname in _profile_edit_writeback_username_candidates(data):
+        rowcount = _mark_account_basic_profile_modified_for_username(
+            owner, uname, only_if_pending=only_if_pending
+        )
+        if rowcount:
+            return {"updated": rowcount, "username": uname}
+    fb = _profile_edit_report_username({}, owner, alias)
+    if fb:
+        rowcount = _mark_account_basic_profile_modified_for_username(owner, fb, only_if_pending=only_if_pending)
+        if rowcount:
+            return {"updated": rowcount, "username": fb}
+    return {"updated": 0, "username": ""}
+
+
+def _apply_profile_edit_device_op_report(
+    owner_username: str,
+    alias: str,
+    data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """设备 tiktok_edit_basic_profile 成功回传：按 username 写 basic_profile_modified（非 assigned_alias）。"""
+    if not isinstance(data, dict):
+        return {"updated": 0, "username": ""}
+    if str(data.get("op_type") or "").strip() != "tiktok_edit_basic_profile":
+        return {"updated": 0, "username": ""}
+    if not bool(data.get("profile_edit_success")):
+        return {"updated": 0, "username": ""}
+    p1 = data.get("profile_edit_bio_after_part1_ok")
+    p2 = data.get("profile_edit_bio_after_part2_ok")
+    if p1 is not None and p2 is not None and not (bool(p1) and bool(p2)):
+        return {"updated": 0, "username": ""}
+    if bool(data.get("skip_account_db_update")):
+        return {"updated": 0, "username": ""}
+    owner_u = str(owner_username or "").strip()
+    if not owner_u:
+        return {"updated": 0, "username": ""}
+    return _mark_account_basic_profile_modified_for_profile_edit(
+        owner_u,
+        alias,
+        data,
+        only_if_pending=False,
+    )
+
+
+def _profile_edit_success_entries_from_ledger(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("op_type") or "") != "tiktok_edit_basic_profile":
+            continue
+        phase = str(raw.get("phase") or raw.get("status") or "").strip().lower()
+        if phase != "success":
+            continue
+        data = raw.get("report_data") if isinstance(raw.get("report_data"), dict) else {}
+        if bool(data.get("skip_account_db_update")):
+            continue
+        if data.get("profile_edit_success") is False:
+            continue
+        p1 = data.get("profile_edit_bio_after_part1_ok")
+        p2 = data.get("profile_edit_bio_after_part2_ok")
+        if p1 is not None and p2 is not None and not (bool(p1) and bool(p2)):
+            continue
+        merged: dict[str, Any] = dict(data)
+        for key in ("username", "account_username", "profile_edit_assigned_username", "old_username", "new_username", "account_row_index", "row_index"):
+            if key not in merged or not str(merged.get(key) or "").strip():
+                val = raw.get(key)
+                if val is not None and str(val).strip():
+                    merged[key] = val
+        out.append(merged)
+    return out
+
+
+def _profile_edit_success_usernames_from_ledger(entries: list[dict[str, Any]]) -> set[str]:
+    done: set[str] = set()
+    for data in _profile_edit_success_entries_from_ledger(entries):
+        done.update(_profile_edit_identity_keys(data))
+    return done
+
+
+def _profile_edit_failed_usernames_from_ledger(entries: list[dict[str, Any]]) -> list[str]:
+    failed: list[str] = []
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("op_type") or "") != "tiktok_edit_basic_profile":
+            continue
+        phase = str(raw.get("phase") or raw.get("status") or "").strip().lower()
+        if phase != "failed":
+            continue
+        data = raw.get("report_data") if isinstance(raw.get("report_data"), dict) else {}
+        u = str(raw.get("username") or data.get("username") or data.get("account_username") or "").strip()
+        if u:
+            failed.append(u)
+    return failed
+
+
+def _apply_auto_switch_ledger_profile_edit_success_to_account_rows(
+    owner_username: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """ledger 显示改资料成功但 account_editor_rows 仍为否时补写 basic_profile_modified。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {"fixed": 0, "notes": []}
+    success_entries = _profile_edit_success_entries_from_ledger(ledger)
+    if not success_entries:
+        return {"fixed": 0, "notes": []}
+    fixed = 0
+    notes: list[str] = []
+    for data in success_entries:
+        result = _mark_account_basic_profile_modified_for_profile_edit(
+            owner,
+            "",
+            data,
+            only_if_pending=True,
+        )
+        if result.get("updated"):
+            fixed += int(result["updated"])
+            notes.append(f"补写 basic_profile_modified=是：{result.get('username') or 'unknown'}")
+    return {"fixed": fixed, "notes": notes}
+
+
+def _apply_auto_switch_ledger_account_login_writeback(
+    owner_username: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """ledger 记录 account_mark_login 成功时写回 account_editor_rows.is_login。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {"applied": 0, "notes": []}
+    applied = 0
+    notes: list[str] = []
+    seen_users: set[str] = set()
+    for entry in ledger or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("op_type") or "").strip() != "account_mark_login":
+            continue
+        phase = str(entry.get("phase") or entry.get("status") or "").strip().lower()
+        if phase != "success":
+            continue
+        data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+        username = str(
+            data.get("username") or data.get("account_username") or entry.get("username") or ""
+        ).strip().lstrip("@")
+        if not username:
+            continue
+        user_key = username.lower()
+        if user_key in seen_users:
+            continue
+        seen_users.add(user_key)
+        login_time = str(data.get("login_time") or entry.get("at") or "").strip() or now_text()
+        conn = _get_db()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET is_login = 1, login_time = ?, updated_at = ?
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                """,
+                (login_time, now_text(), owner, username),
+            )
+            conn.commit()
+            if int(cur.rowcount or 0) > 0:
+                applied += 1
+                notes.append(f"对账写 is_login=是：{username}")
+        finally:
+            conn.close()
+    if applied:
+        notes.insert(0, f"登录状态写回 {applied} 条")
+    return {"applied": applied, "notes": notes}
+
+
+def _apply_auto_switch_ledger_username_update_writeback(
+    owner_username: str,
+    alias: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """ledger 记录 account_username_update 时同步账号表与设备表 username。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner:
+        return {"applied": 0, "notes": []}
+    applied = 0
+    notes: list[str] = []
+    for entry in ledger or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("op_type") or "").strip() != "account_username_update":
+            continue
+        phase = str(entry.get("phase") or entry.get("status") or "").strip().lower()
+        if phase != "success":
+            continue
+        data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+        old_username = str(data.get("old_username") or "").strip().lstrip("@")
+        new_username = _normalize_mutual_clip_username(str(data.get("new_username") or "").strip())
+        if not old_username or not new_username:
+            continue
+        if old_username.lower() == new_username.lower():
+            continue
+        conn = _get_db()
+        try:
+            row = conn.execute(
+                """
+                SELECT row_index, username FROM account_editor_rows
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                ORDER BY updated_at DESC, row_index DESC
+                LIMIT 1
+                """,
+                (owner, old_username),
+            ).fetchone()
+            if not row:
+                notes.append(f"用户名变更跳过（未找到旧账号）：{old_username} → {new_username}")
+                continue
+            row_index = int(row["row_index"] or 0)
+            conflict = conn.execute(
+                """
+                SELECT 1 FROM account_editor_rows
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                  AND row_index <> ?
+                LIMIT 1
+                """,
+                (owner, new_username, row_index),
+            ).fetchone()
+            if conflict:
+                notes.append(f"用户名变更冲突（新名已占用）：{old_username} → {new_username}")
+                continue
+            device_alias = alias_key or _normalized_alias(alias)
+            ts = now_text()
+            conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET username = ?,
+                    assigned_alias = CASE
+                        WHEN TRIM(COALESCE(assigned_alias, '')) <> '' THEN assigned_alias
+                        ELSE ?
+                    END,
+                    updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (new_username, device_alias, ts, owner, row_index),
+            )
+            dev_updated = _sync_device_editor_username_for_account(
+                conn,
+                owner,
+                old_username,
+                new_username,
+                assigned_alias=device_alias,
+            )
+            conn.commit()
+            applied += 1
+            notes.append(
+                f"用户名写回：{old_username} → {new_username}（设备表 {dev_updated} 行）"
+            )
+        finally:
+            conn.close()
+    if applied:
+        notes.insert(0, f"用户名变更写回 {applied} 条")
+    return {"applied": applied, "notes": notes}
+
+
+def _collect_usernames_from_auto_switch_ledger(ledger: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for entry in ledger or []:
+        if not isinstance(entry, dict):
+            continue
+        candidates: list[str] = []
+        entry_user = str(entry.get("username") or "").strip().lstrip("@")
+        if entry_user:
+            candidates.append(entry_user)
+        data = entry.get("report_data")
+        if isinstance(data, dict):
+            for key in ("username", "account_username"):
+                u = str(data.get(key) or "").strip().lstrip("@")
+                if u:
+                    candidates.append(u)
+        for user in candidates:
+            key = user.lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(user)
+    return ordered
+
+
+def _needs_profile_stats_video_count_fill(owner_username: str, username: str) -> bool:
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip().lstrip("@")
+    if not owner or not uname:
+        return False
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT video_count FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+            ORDER BY updated_at DESC, row_index DESC
+            LIMIT 1
+            """,
+            (owner, uname),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return False
+    raw_vc = _parse_video_count_raw(row["video_count"])
+    return raw_vc is None or raw_vc == NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN
+
+
+def _write_owner_device_profile_stats(
+    owner_username: str,
+    username: str,
+    video_count: int | None,
+    follower_count: int | None,
+) -> bool:
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip().lstrip("@")
+    if not owner or not uname:
+        return False
+    if video_count is None and follower_count is None:
+        return False
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT row_index, follower_count FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+            ORDER BY updated_at DESC, row_index DESC
+            LIMIT 1
+            """,
+            (owner, uname),
+        ).fetchone()
+        if not row:
+            return False
+        prev_fc = _parse_count_text_to_int(row["follower_count"])
+        new_fc = follower_count if isinstance(follower_count, int) else None
+        follower_growth = ""
+        if isinstance(new_fc, int) and isinstance(prev_fc, int):
+            follower_growth = str(max(new_fc - prev_fc, 0))
+        elif isinstance(new_fc, int):
+            follower_growth = "0"
+        now = now_text()
+        vc_text = None if video_count is None else str(video_count)
+        fc_text = None if follower_count is None else str(follower_count)
+        set_parts: list[str] = []
+        params: list[object] = []
+        if vc_text is not None:
+            set_parts.append("video_count = ?")
+            params.append(vc_text)
+        if fc_text is not None:
+            set_parts.append("follower_count = ?")
+            params.append(fc_text)
+            set_parts.append("follower_growth = ?")
+            params.append(follower_growth)
+        set_parts.append("updated_at = ?")
+        params.append(now)
+        params.extend([owner, int(row["row_index"])])
+        conn.execute(
+            f"""
+            UPDATE device_editor_rows
+            SET {', '.join(set_parts)}
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            tuple(params),
+        )
+        _sync_account_editor_stats(
+            conn,
+            uname,
+            owner_username=owner,
+            video_count=vc_text,
+            follower_count=fc_text,
+            follower_growth=follower_growth if fc_text is not None else None,
+            now=now,
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _apply_auto_switch_session_profile_stats_writeback(
+    owner_username: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """关会话：ledger 涉及账号若 video_count 仍为 -1/空，抓取 TikTok 主页补写统计。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {"applied": 0, "notes": ["缺少 owner，跳过画像 video_count 补写"]}
+    users = _collect_usernames_from_auto_switch_ledger(ledger)
+    if not users:
+        return {"applied": 0, "notes": ["ledger 无 username，跳过画像 video_count 补写"]}
+    pending = [u for u in users if _needs_profile_stats_video_count_fill(owner, u)]
+    if not pending:
+        return {"applied": 0, "notes": ["ledger 账号 video_count 均已填，跳过画像补写"]}
+    applied = 0
+    notes: list[str] = []
+    for username in pending:
+        result = fetch_tiktok_profile_stats(username, write_back=False)
+        if int(result.get("code", 1)) != 0:
+            notes.append(f"画像补写失败 @{username}：{result.get('msg', 'unknown')}")
+            continue
+        extract = result.get("universal_extract") or {}
+        vc = extract.get("video_count")
+        fc = extract.get("follower_count")
+        vc_int = int(vc) if isinstance(vc, int) else None
+        fc_int = int(fc) if isinstance(fc, int) else None
+        if vc_int is None and fc_int is None:
+            notes.append(f"画像补写 @{username}：关键字段为空")
+            continue
+        if _write_owner_device_profile_stats(owner, username, vc_int, fc_int):
+            applied += 1
+            detail = f"video_count={vc_int}" if vc_int is not None else ""
+            if fc_int is not None:
+                detail = (detail + f" follower_count={fc_int}").strip()
+            notes.append(f"画像补写 @{username} {detail}".strip())
+        else:
+            notes.append(f"画像补写 @{username}：DB 行未更新")
+    if applied:
+        notes.insert(0, f"画像 video_count 补写 {applied} 个账号")
+    return {"applied": applied, "notes": notes}
+
+
+def _increment_auto_switch_account_video_count(
+    owner_username: str,
+    username: str,
+    *,
+    delta: int = 1,
+    row_index: int = -1,
+) -> bool:
+    """自治 ledger 回放：发作品成功后累加 video_count（-1 视为 0 后再加）。"""
+    owner = str(owner_username or "").strip()
+    uname = str(username or "").strip().lstrip("@")
+    inc = max(1, int(delta or 1))
+    if not owner or not uname:
+        return False
+    conn = _get_db()
+    try:
+        row = None
+        if int(row_index) >= 0:
+            row = conn.execute(
+                """
+                SELECT row_index, video_count FROM device_editor_rows
+                WHERE owner_username = ? AND row_index = ?
+                LIMIT 1
+                """,
+                (owner, int(row_index)),
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                """
+                SELECT row_index, video_count FROM device_editor_rows
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+                ORDER BY updated_at DESC, row_index DESC
+                LIMIT 1
+                """,
+                (owner, uname),
+            ).fetchone()
+        if not row:
+            return False
+        raw_vc = _parse_video_count_raw(row["video_count"])
+        base = 0 if raw_vc == NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN else max(0, int(raw_vc or 0))
+        new_vc = str(base + inc)
+        ri = int(row["row_index"])
+        now = now_text()
+        conn.execute(
+            """
+            UPDATE device_editor_rows
+            SET video_count = ?, updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (new_vc, now, owner, ri),
+        )
+        _sync_account_editor_stats(
+            conn,
+            uname,
+            owner_username=owner,
+            video_count=new_vc,
+            now=now,
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _ensure_auto_switch_publish_video_writeback_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auto_switch_publish_video_writeback (
+            owner_username TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL,
+            slot_key TEXT NOT NULL DEFAULT '',
+            outcome_op_id TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT '',
+            delta INTEGER NOT NULL DEFAULT 1,
+            applied_at TEXT NOT NULL,
+            PRIMARY KEY (owner_username, session_id, dedupe_key)
+        )
+        """
+    )
+
+
+def _publish_video_writeback_dedupe_key(slot_key: str, outcome_op_id: str) -> str:
+    sk = str(slot_key or "").strip()
+    if sk:
+        return f"slot:{sk}"
+    oid = str(outcome_op_id or "").strip()
+    if oid:
+        return f"op:{oid}"
+    return ""
+
+
+def _is_publish_video_writeback_applied(
+    conn,
+    owner_username: str,
+    session_id: str,
+    dedupe_key: str,
+) -> bool:
+    owner = str(owner_username or "").strip()
+    sid = str(session_id or "").strip()
+    key = str(dedupe_key or "").strip()
+    if not owner or not sid or not key:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1 FROM auto_switch_publish_video_writeback
+        WHERE owner_username = ? AND session_id = ? AND dedupe_key = ?
+        LIMIT 1
+        """,
+        (owner, sid, key),
+    ).fetchone()
+    return row is not None
+
+
+def _mark_publish_video_writeback_applied(
+    conn,
+    owner_username: str,
+    session_id: str,
+    dedupe_key: str,
+    *,
+    slot_key: str = "",
+    outcome_op_id: str = "",
+    username: str = "",
+    delta: int = 1,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO auto_switch_publish_video_writeback
+        (owner_username, session_id, dedupe_key, slot_key, outcome_op_id, username, delta, applied_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(owner_username or "").strip(),
+            str(session_id or "").strip(),
+            str(dedupe_key or "").strip(),
+            str(slot_key or "").strip(),
+            str(outcome_op_id or "").strip(),
+            str(username or "").strip().lstrip("@"),
+            max(1, int(delta or 1)),
+            now_text(),
+        ),
+    )
+
+
+def _apply_auto_switch_ledger_stats_writeback(
+    owner_username: str,
+    ledger: list[dict[str, Any]],
+    *,
+    session_id: str = "",
+) -> dict[str, Any]:
+    """自治 ledger 回放：新号 -1→0 毕业；发作品成功按 session+slot/op 幂等累加 video_count。"""
+    owner = str(owner_username or "").strip()
+    sid = str(session_id or "").strip()
+    if not owner:
+        return {"applied": 0, "notes": ["缺少 owner，跳过 video_count 写回"]}
+
+    publish_count_by_slot: dict[str, int] = {}
+    for entry in ledger or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("op_type") or "") != "publish_post_start":
+            continue
+        data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+        slot_key = str(entry.get("slot_key") or data.get("auto_switch_slot_key") or "").strip()
+        pc_raw = data.get("publish_count")
+        try:
+            pc = int(pc_raw) if pc_raw is not None else 0
+        except (TypeError, ValueError):
+            pc = 0
+        if slot_key and pc > 0:
+            publish_count_by_slot[slot_key] = pc
+
+    applied = 0
+    notes: list[str] = []
+    skipped_publish = 0
+    conn = _get_db()
+    try:
+        if sid:
+            _ensure_auto_switch_publish_video_writeback_table(conn)
+        for entry in ledger or []:
+            if not isinstance(entry, dict):
+                continue
+            op_type = str(entry.get("op_type") or "").strip()
+            phase = str(entry.get("phase") or entry.get("status") or "").strip().lower()
+            if op_type == "auto_switch_video_count_graduate" and phase == "success":
+                data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+                username = str(data.get("username") or entry.get("username") or "").strip().lstrip("@")
+                try:
+                    ri = int(data.get("row_index") if data.get("row_index") is not None else -1)
+                except (TypeError, ValueError):
+                    ri = -1
+                if username or ri >= 0:
+                    if _auto_switch_graduate_new_account_video_count(
+                        owner,
+                        {"username": username, "row_index": ri},
+                    ):
+                        applied += 1
+                        notes.append(f"video_count -1→0：{username or f'row#{ri}'}")
+                continue
+            if op_type != "publish_post_outcome" or phase != "success":
+                continue
+            data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+            if data.get("publish_post_completed") is False:
+                continue
+            slot_key = str(entry.get("slot_key") or data.get("auto_switch_slot_key") or "").strip()
+            outcome_op_id = str(entry.get("op_id") or "").strip()
+            username = str(
+                data.get("account_username")
+                or data.get("username")
+                or entry.get("username")
+                or ""
+            ).strip().lstrip("@")
+            if not username:
+                continue
+            dedupe_key = _publish_video_writeback_dedupe_key(slot_key, outcome_op_id)
+            if sid and dedupe_key and _is_publish_video_writeback_applied(conn, owner, sid, dedupe_key):
+                skipped_publish += 1
+                continue
+            if sid and not dedupe_key:
+                notes.append(f"发作品 outcome 缺少 slot/op_id，跳过 video_count 累加：{username}")
+                continue
+            try:
+                actual_raw = data.get("publish_post_success_count")
+                actual = int(actual_raw) if actual_raw is not None else 0
+            except (TypeError, ValueError):
+                actual = 0
+            planned = publish_count_by_slot.get(slot_key, 0)
+            delta = actual if actual > 0 else (planned if planned > 0 else 1)
+            if planned > 0 and actual > planned:
+                delta = planned
+            if _increment_auto_switch_account_video_count(owner, username, delta=delta):
+                if sid and dedupe_key:
+                    _mark_publish_video_writeback_applied(
+                        conn,
+                        owner,
+                        sid,
+                        dedupe_key,
+                        slot_key=slot_key,
+                        outcome_op_id=outcome_op_id,
+                        username=username,
+                        delta=delta,
+                    )
+                    conn.commit()
+                applied += 1
+                notes.append(f"发作品成功 video_count +{delta}：{username}（{dedupe_key or '无幂等键'}）")
+        if sid and skipped_publish:
+            notes.append(f"发作品 video_count 已写回过 {skipped_publish} 条，跳过重复累加")
+    finally:
+        conn.close()
+
+    if applied:
+        notes.insert(0, f"video_count 写回 {applied} 条")
+    return {"applied": applied, "notes": notes}
+
+
+def _reconcile_auto_switch_session_summary(
+    owner_username: str,
+    alias: str,
+    schedule_date: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """根据 ledger 与当日计划生成简要对账说明。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    plan = _load_auto_switch_daily_plan(owner, alias_key, date_key) or {}
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+
+    def _ledger_items() -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for raw in ledger or []:
+            if isinstance(raw, dict):
+                items.append(raw)
+            elif hasattr(raw, "model_dump"):
+                items.append(raw.model_dump())
+        return items
+
+    entries = _ledger_items()
+    success = sum(1 for e in entries if str(e.get("status") or "").strip().lower() == "success")
+    failed = sum(1 for e in entries if str(e.get("status") or "").strip().lower() == "failed")
+    cut_ops = [
+        e
+        for e in entries
+        if str(e.get("op_type") or "") in {"tiktok_backup_and_clear", "tiktok_clear", "tiktok_restore"}
+    ]
+    publish_ops = [e for e in entries if str(e.get("op_type") or "") == "publish_post_start"]
+    publish_outcomes = [e for e in entries if str(e.get("op_type") or "") == "publish_post_outcome"]
+    profile_edit_ops = [e for e in entries if str(e.get("op_type") or "") == "tiktok_edit_basic_profile"]
+    profile_baseline_ops = [e for e in entries if str(e.get("op_type") or "") == "auto_switch_profile_baseline"]
+    profile_required_ops = [e for e in entries if str(e.get("op_type") or "") == "profile_edit_required"]
+    login_ops = [e for e in entries if str(e.get("op_type") or "") == "account_mark_login"]
+    username_ops = [e for e in entries if str(e.get("op_type") or "") == "account_username_update"]
+    failure_deferred_ops = [e for e in entries if str(e.get("op_type") or "") == "failure_report_deferred"]
+    account_activity_ops = [
+        e for e in entries if str(e.get("op_type") or "") == "auto_switch_account_activity"
+    ]
+    missing_backup_ops = [
+        e for e in entries if str(e.get("op_type") or "") == "cut_switch_missing_backup"
+    ]
+
+    pending_profile_edits = _pending_profile_edit_usernames_from_ledger(entries)
+    profile_edit_success_users = _profile_edit_success_usernames_from_ledger(entries)
+    profile_edit_failed_users = _profile_edit_failed_usernames_from_ledger(entries)
+    missing_profile_edit_usernames = sorted(pending_profile_edits - profile_edit_success_users)
+
+    publish_done_slots: set[str] = set()
+    for e in publish_outcomes:
+        if str(e.get("status") or "").strip().lower() == "success":
+            sk = str(e.get("slot_key") or "").strip()
+            if sk:
+                publish_done_slots.add(sk)
+
+    missing_publish_slots: list[str] = []
+    minute_now = _beijing_minute_of_day()
+    for slot in slots:
+        try:
+            idx = int(slot.get("slot_index") or -1)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0:
+            continue
+        slot_key = f"{date_key}|{idx}"
+        if slot_key in publish_done_slots:
+            continue
+        pub_min = slot.get("auto_publish_minute")
+        if pub_min is None:
+            continue
+        try:
+            pub_minute = int(pub_min)
+        except (TypeError, ValueError):
+            continue
+        if minute_now < pub_minute:
+            continue
+        user = str(slot.get("username") or "").strip()
+        missing_publish_slots.append(f"{slot_key} ({user or '-'})")
+
+    notes: list[str] = []
+    notes.append(f"ledger 共 {len(entries)} 条：成功 {success}，失败 {failed}")
+    notes.append(f"切号相关 {len(cut_ops)} 条，发作品下发 {len(publish_ops)} 条，发作品结果 {len(publish_outcomes)} 条")
+    notes.append(
+        f"改资料待办 {len(profile_required_ops)} 条（汇总基线 {len(profile_baseline_ops)} 条），"
+        f"改资料 OP {len(profile_edit_ops)} 条"
+        f"（成功 {len(profile_edit_success_users)}，失败 {len(profile_edit_failed_users)}）"
+    )
+    notes.append(
+        f"登录写回 ledger {len(login_ops)} 条，用户名变更 ledger {len(username_ops)} 条，"
+        f"失败采集待传 {len(failure_deferred_ops)} 条"
+    )
+    if missing_backup_ops:
+        notes.append(
+            f"切号备份包本机缺失改自动登录 {len(missing_backup_ops)} 次"
+        )
+    if pending_profile_edits:
+        notes.append(
+            f"会话内轮到且待改资料 {len(pending_profile_edits)} 个："
+            f"{', '.join(sorted(pending_profile_edits)[:8])}"
+            + (f"…等 {len(pending_profile_edits)} 个" if len(pending_profile_edits) > 8 else "")
+        )
+    if missing_profile_edit_usernames:
+        notes.append(
+            f"待改资料但 ledger 未见成功记录：{', '.join(missing_profile_edit_usernames[:8])}"
+            + (f"…另有 {len(missing_profile_edit_usernames) - 8} 个" if len(missing_profile_edit_usernames) > 8 else "")
+        )
+    elif pending_profile_edits:
+        notes.append("改资料对账：bundle 待改账号均已有成功 ledger 记录")
+    if account_activity_ops:
+        notes.append(f"账号任务段审计 {len(account_activity_ops)} 条（模板与行为计数见 account_activity）")
+    if profile_edit_failed_users:
+        notes.append(f"改资料失败账号：{', '.join(profile_edit_failed_users[:8])}")
+    if missing_publish_slots:
+        notes.append(f"计划内未见成功发作品记录的时段：{', '.join(missing_publish_slots[:8])}")
+        if len(missing_publish_slots) > 8:
+            notes.append(f"…另有 {len(missing_publish_slots) - 8} 个时段")
+    else:
+        notes.append("计划时段发作品记录与 ledger 对账：未发现明显缺口（或当日无发作品计划）")
+
+    return {
+        "schedule_date": date_key,
+        "plan_slot_count": len(slots),
+        "ledger_total": len(entries),
+        "ledger_success": success,
+        "ledger_failed": failed,
+        "cut_op_count": len(cut_ops),
+        "publish_dispatch_count": len(publish_ops),
+        "publish_outcome_count": len(publish_outcomes),
+        "profile_baseline_count": len(profile_baseline_ops),
+        "profile_required_count": len(profile_required_ops),
+        "profile_edit_dispatch_count": len(profile_edit_ops),
+        "profile_edit_success_count": len(profile_edit_success_users),
+        "profile_edit_failed_count": len(profile_edit_failed_users),
+        "pending_profile_edit_usernames": sorted(pending_profile_edits),
+        "missing_profile_edit_usernames": missing_profile_edit_usernames,
+        "missing_publish_slots": missing_publish_slots,
+        "cut_switch_missing_backup_count": len(missing_backup_ops),
+        "account_activity": _account_activity_audit_from_ledger(account_activity_ops),
+        "notes": notes,
+    }
+
+
+def _account_activity_audit_from_ledger(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从 ledger 提取账号×时段×模板×行为计数，供管理台对账展示。"""
+    out: list[dict[str, Any]] = []
+    for raw in entries or []:
+        if not isinstance(raw, dict):
+            continue
+        data = _sanitize_auto_switch_ledger_report_data(raw.get("report_data"))
+        if not data:
+            data = _sanitize_auto_switch_ledger_report_data(raw)
+        account = str(data.get("account_username") or raw.get("username") or "").strip()
+        if not account:
+            continue
+        tpl = str(data.get("active_template") or "").strip()
+        slot_key = str(data.get("auto_switch_slot_key") or raw.get("slot_key") or "").strip()
+        started = str(data.get("segment_started_at") or "").strip()
+        ended = str(data.get("segment_ended_at") or raw.get("at") or "").strip()
+        reason = str(data.get("segment_reason") or "").strip()
+        run_mode = str(data.get("run_mode") or "").strip()
+        config_json = str(data.get("template_config_json") or "").strip()
+        counts_json = str(data.get("action_counts_json") or "").strip()
+        template_config: dict[str, Any] = {}
+        action_counts: dict[str, Any] = {}
+        if config_json:
+            try:
+                parsed_cfg = json.loads(config_json)
+                if isinstance(parsed_cfg, dict):
+                    template_config = parsed_cfg
+            except Exception:
+                template_config = {}
+        if counts_json:
+            try:
+                parsed_cnt = json.loads(counts_json)
+                if isinstance(parsed_cnt, dict):
+                    action_counts = parsed_cnt
+            except Exception:
+                action_counts = {}
+        out.append(
+            {
+                "account": account,
+                "slot_key": slot_key,
+                "active_template": tpl,
+                "run_mode": run_mode,
+                "segment_started_at": started,
+                "segment_ended_at": ended,
+                "segment_reason": reason,
+                "template_config": template_config,
+                "action_counts": action_counts,
+            }
+        )
+    out.sort(key=lambda x: (str(x.get("segment_started_at") or ""), str(x.get("account") or "")))
+    return out
+
+
+_AUTO_SWITCH_LEDGER_REPORT_KEYS = frozenset(
+    {
+        "op_type",
+        "backup_skipped",
+        "backup_record_id",
+        "username",
+        "mobile_alias",
+        "assigned_alias",
+        "backup_path",
+        "backup_name",
+        "previous_backup_path",
+        "old_backup_path",
+        "video_count",
+        "follower_count",
+        "new_follower_count",
+        "cut_switch_after_backup",
+        "cut_switch_target_row_index",
+        "restore_highlight_row_index",
+        "skip_pm_clear",
+        "source",
+        "auto_switch_slot_key",
+        "account_username",
+        "profile_edit_assigned_username",
+        "account_row_index",
+        "profile_edit_trigger",
+        "profile_edit_success",
+        "basic_profile_modified_before",
+        "pending_profile_edit_usernames",
+        "profile_edit_bio_after_part1_ok",
+        "profile_edit_bio_after_part2_ok",
+        "skip_account_db_update",
+        "publish_count",
+        "row_index",
+        "publish_post_completed",
+        "publish_post_success_count",
+        "publish_post_resumable",
+        "publish_post_resume_next_index",
+        "login_time",
+        "old_username",
+        "new_username",
+        "failure_business",
+        "failure_error_type",
+        "failure_summary",
+        "failure_ocr_related",
+        "active_template",
+        "segment_started_at",
+        "segment_ended_at",
+        "segment_reason",
+        "run_mode",
+        "template_config_json",
+        "action_counts_json",
+    }
+)
+
+
+def _sanitize_auto_switch_ledger_report_data(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _AUTO_SWITCH_LEDGER_REPORT_KEYS:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        out[key] = val
+    return out
+
+
+def _apply_auto_switch_ledger_backup_success_to_editor_rows(
+    owner_username: str,
+    fallback_alias: str,
+    data: dict[str, Any],
+) -> None:
+    """自治 ledger 回放：备份成功时写回 device_editor_rows（不复删设备端已处理的旧备份文件）。"""
+    backup_record_id = data.get("backup_record_id")
+    username = str(data.get("username") or "").strip().lstrip("@")
+    mobile_alias = str(data.get("mobile_alias") or fallback_alias or "").strip()
+    backup_path = str(data.get("backup_path") or "").strip()
+    backup_name = str(data.get("backup_name") or "").strip() or None
+    if username and backup_name and not _backup_name_contains_username(backup_name, username):
+        print(
+            f"[{now_text()}] auto_switch.ledger_writeback | backup_name 未包含 username "
+            f"| user={username} name={backup_name}"
+        )
+    if backup_record_id:
+        try:
+            rid = int(backup_record_id)
+        except (TypeError, ValueError):
+            rid = 0
+        if rid > 0:
+            conn = _get_db()
+            try:
+                ts = now_text()
+                conn.execute(
+                    """
+                    UPDATE device_editor_rows
+                    SET backup_path = ?, backup_name = ?, backup_time = ?, backup_status = ?, updated_at = ?
+                    WHERE owner_username = ? AND row_index = ?
+                    """,
+                    (backup_path, backup_name or "", ts, "已备份", ts, owner_username, rid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    elif username and mobile_alias and backup_path:
+        _patch_backup_record_device_result(
+            username,
+            mobile_alias,
+            backup_path=backup_path,
+            backup_name=backup_name,
+            video_count=None,
+            follower_count=None,
+            new_follower_count=None,
+        )
+
+    video_count = data.get("video_count")
+    follower_count = data.get("follower_count")
+    new_follower_count = data.get("new_follower_count")
+    vc = int(video_count) if isinstance(video_count, int) else None
+    fc = int(follower_count) if isinstance(follower_count, int) else None
+    nfc = int(new_follower_count) if isinstance(new_follower_count, int) else None
+    if not backup_path or not mobile_alias:
+        return
+    if not username:
+        latest = _get_latest_backup_record_for_alias(mobile_alias)
+        if latest:
+            username = str(latest.get("username") or "").strip().lstrip("@")
+    rec = None
+    if username and mobile_alias:
+        rec = _get_backup_record_by_key(username, mobile_alias)
+    if not rec and mobile_alias:
+        rec = _get_latest_backup_record_for_alias(mobile_alias)
+        if rec:
+            username = str(rec.get("username") or "").strip().lstrip("@")
+    if not username or not rec:
+        return
+    db_alias = str(rec.get("assigned_alias") or rec.get("device_alias") or "").strip()
+    key_alias = db_alias if db_alias else mobile_alias
+    patched = _patch_backup_record_device_result(
+        username,
+        key_alias,
+        backup_path=backup_path,
+        backup_name=backup_name,
+        video_count=vc,
+        follower_count=fc,
+        new_follower_count=nfc,
+    )
+    if patched == 0 and mobile_alias:
+        _patch_latest_backup_row_by_alias(
+            mobile_alias,
+            backup_path=backup_path,
+            backup_name=backup_name,
+            video_count=vc,
+            follower_count=fc,
+            new_follower_count=nfc,
+        )
+
+
+def _replay_auto_switch_ledger_to_device_editor_rows(
+    owner_username: str,
+    alias: str,
+    ledger: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    按 ledger 时间顺序回放自治期间 OP 结果，写回 device_editor_rows。
+    逻辑与 device_ops/report 中档案更新保持一致（备份字段、切号高亮、环境状态）。
+    """
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return {
+            "applied_effects": 0,
+            "skipped_without_data": 0,
+            "writeback_notes": ["缺少 owner 或 alias，已跳过档案写回"],
+        }
+
+    applied = 0
+    skipped = 0
+    notes: list[str] = []
+
+    for entry in ledger or []:
+        if not isinstance(entry, dict):
+            continue
+        eligible, skip_note = _auto_switch_ledger_entry_writeback_eligible(entry)
+        if not eligible:
+            if skip_note:
+                notes.append(skip_note)
+            continue
+        status = str(entry.get("status") or "").strip().lower()
+        phase = str(entry.get("phase") or "").strip().lower()
+        if phase in ("success", "failed"):
+            status = phase
+        data = _sanitize_auto_switch_ledger_report_data(entry.get("report_data"))
+        op_type = str(data.get("op_type") or entry.get("op_type") or "").strip()
+        if not data:
+            if op_type in _AUTO_SWITCH_LEDGER_WRITEBACK_OP_TYPES:
+                skipped += 1
+                op_id = str(entry.get("op_id") or "").strip()
+                notes.append(
+                    f"跳过无 report_data 的 {op_type} 条目"
+                    + (f"（op_id={op_id}）" if op_id else "")
+                )
+            continue
+
+        backup_skipped = bool(data.get("backup_skipped"))
+        if status == "success":
+            if op_type == "tiktok_backup_and_clear" and not backup_skipped:
+                _apply_auto_switch_ledger_backup_success_to_editor_rows(owner, alias_key, data)
+                applied += 1
+            if op_type in ("tiktok_backup_and_clear", "tiktok_clear"):
+                _device_ops_apply_cut_switch_after_backup(owner, data)
+                applied += 1
+            elif op_type == "tiktok_restore":
+                _device_ops_apply_cut_switch_after_restore(owner, data)
+                applied += 1
+        else:
+            if op_type == "tiktok_restore":
+                _device_ops_apply_restore_failure(owner, data)
+                applied += 1
+            if op_type in ("tiktok_backup_and_clear", "tiktok_restore", "tiktok_clear"):
+                _device_ops_rollback_cut_switch_highlight(owner, data)
+                applied += 1
+
+    conn = _get_db()
+    try:
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+    finally:
+        conn.close()
+
+    if applied:
+        notes.append(f"已根据 ledger 回放写回 device_editor_rows（生效 {applied} 次）")
+    elif not skipped:
+        notes.append("ledger 中无可写回的切号/备份档案条目")
+    if skipped:
+        notes.append(f"有 {skipped} 条切号相关 ledger 缺少 report_data，未写回（需新版设备端）")
+
+    return {
+        "applied_effects": applied,
+        "skipped_without_data": skipped,
+        "writeback_notes": notes,
+    }
+
+
+def _apply_auto_switch_ledger_writeback_bundle(
+    owner_username: str,
+    alias: str,
+    ledger: list[dict[str, Any]],
+    summary_kind: str,
+    session_id: str = "",
+) -> dict[str, Any]:
+    """会话/每日对账：回放 ledger 写回 device_editor_rows 与统计字段。"""
+    writeback = _replay_auto_switch_ledger_to_device_editor_rows(owner_username, alias, ledger)
+    writeback["duplicate"] = False
+    login_writeback = _apply_auto_switch_ledger_account_login_writeback(owner_username, ledger)
+    writeback["login_account_writeback"] = login_writeback
+    username_writeback = _apply_auto_switch_ledger_username_update_writeback(owner_username, alias, ledger)
+    writeback["username_account_writeback"] = username_writeback
+    stats_writeback = _apply_auto_switch_ledger_stats_writeback(
+        owner_username,
+        ledger,
+        session_id=session_id,
+    )
+    writeback["stats_writeback"] = stats_writeback
+    profile_writeback = _apply_auto_switch_ledger_profile_edit_success_to_account_rows(owner_username, ledger)
+    writeback["profile_account_writeback"] = profile_writeback
+    profile_stats_writeback = _apply_auto_switch_session_profile_stats_writeback(owner_username, ledger)
+    writeback["profile_stats_writeback"] = profile_stats_writeback
+    for wb in (login_writeback, username_writeback, stats_writeback, profile_writeback, profile_stats_writeback):
+        for note in wb.get("notes") or []:
+            if isinstance(note, str) and note.strip():
+                writeback.setdefault("writeback_notes", []).append(note.strip())
+    return writeback
+
+
+@app.post("/api/auto_switch/session_summary")
+def post_auto_switch_session_summary(payload: AutoSwitchSessionSummaryRequest):
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(device.owner_username or "").strip()
+    alias_key = _normalize_alias_key(payload.alias or device.alias)
+    ledger_dicts = [e.model_dump() for e in payload.ledger]
+    summary_kind, reconcile_key = _resolve_auto_switch_reconcile_meta(payload)
+    reconciliation = _reconcile_auto_switch_session_summary(
+        owner,
+        alias_key,
+        str(payload.schedule_date or "").strip(),
+        ledger_dicts,
+    )
+    existing_summary_id = _find_auto_switch_session_summary_id(
+        owner,
+        payload.device_id,
+        alias_key,
+        str(payload.session_id or "").strip(),
+        reconcile_key,
+    )
+    is_duplicate = existing_summary_id > 0
+    if is_duplicate:
+        dup_note = (
+            f"同 session 每日对账已处理（{reconcile_key}），跳过写回（幂等）"
+            if summary_kind == "daily"
+            else "同 session 总结重传，跳过 device_editor_rows 写回（幂等）"
+        )
+        writeback = {
+            "applied_effects": 0,
+            "skipped_without_data": 0,
+            "writeback_notes": [dup_note],
+            "duplicate": True,
+            "summary_kind": summary_kind,
+            "reconcile_key": reconcile_key,
+        }
+    else:
+        writeback = _apply_auto_switch_ledger_writeback_bundle(
+            owner,
+            alias_key,
+            ledger_dicts,
+            summary_kind,
+            str(payload.session_id or "").strip(),
+        )
+        for note in writeback.get("writeback_notes") or []:
+            if isinstance(note, str) and note.strip():
+                reconciliation.setdefault("notes", []).append(note.strip())
+    reconciliation["editor_writeback"] = writeback
+    reconciliation["duplicate_summary"] = is_duplicate
+    reconciliation["summary_kind"] = summary_kind
+    reconciliation["reconcile_key"] = reconcile_key
+    for note in writeback.get("writeback_notes") or []:
+        if isinstance(note, str) and note.strip():
+            reconciliation.setdefault("notes", []).append(note.strip())
+    row_id = _save_auto_switch_session_summary(
+        owner,
+        payload.device_id,
+        alias_key,
+        payload,
+        reconciliation,
+    )
+    if not row_id:
+        return {"code": 1, "msg": "保存会话总结失败"}
+    enter_sid = str(payload.session_id or "").strip()
+    if enter_sid and not is_duplicate and summary_kind == "final":
+        conn = _get_db()
+        try:
+            conn.execute(
+                """
+                UPDATE auto_switch_sessions SET closed_at = ?
+                WHERE session_id = ? AND closed_at IS NULL
+                """,
+                (now_text(), enter_sid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    _append_device_log(
+        payload.device_id,
+        f"[{now_text()}] 自动切号 | {'每日对账' if summary_kind == 'daily' else '会话总结'}已上报 "
+        f"session={payload.session_id} reconcile={reconcile_key} ledger={len(payload.ledger)}"
+        + ("（重传更新）" if is_duplicate else ""),
+    )
+    _auto_switch_log(
+        f"{'每日对账' if summary_kind == 'daily' else '会话总结'}已入库 | owner={owner} "
+        f"device={payload.device_id} alias={alias_key} session={payload.session_id} "
+        f"reconcile={reconcile_key} ledger={len(payload.ledger)} "
+        f"writeback={writeback.get('applied_effects', 0)} duplicate={is_duplicate}"
+    )
+    return {
+        "code": 0,
+        "msg": "会话总结已保存" if not is_duplicate else "会话总结已更新（重传）",
+        "summary_id": row_id,
+        "duplicate": is_duplicate,
+        "reconciliation": reconciliation,
+    }
+
+
+@app.get("/api/admin/auto_switch/session_summaries")
+def get_auto_switch_session_summaries(
+    device_id: str = "",
+    alias: str = "",
+    limit: int = 20,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session.get("username") or "").strip()
+    allowed = set(_session_device_ids(session))
+    did = str(device_id or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if did and did not in allowed:
+        return {"code": 1, "msg": "无权查看该设备"}
+    items = _list_auto_switch_session_summaries_for_owner(
+        owner,
+        device_id=did,
+        alias=alias_key,
+        limit=limit,
+    )
+    return {"code": 0, "data": {"items": items, "total": len(items), "alias": alias_key}}
 
 
 @app.get("/api/admin/auto_switch/daily_plans")
@@ -13068,49 +16519,9 @@ def get_auto_switch_daily_plans(
         return err
     owner = str(session.get("username") or "").strip()
     date_key = str(schedule_date or "").strip() or _beijing_date_str()
-    with store.lock:
-        auto_switch_on = bool(store.auto_switch_enabled)
-    if not auto_switch_on:
-        return {
-            "code": 0,
-            "data": {"schedule_date": date_key, "plans_by_alias": {}},
-        }
-    view = _auto_switch_plans_view_for_owner(owner, date_key, ensure=False)
+    # 今日时段为预分配计划；管理台展示与设备是否当前开启自动切号无关。
+    view = _auto_switch_plans_view_for_owner(owner, date_key, ensure=True)
     return {"code": 0, "data": view}
-
-
-@app.post("/api/admin/auto_switch/config")
-def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | None = Header(default=None)):
-    err, _session = _require_login({"authorization": authorization} if authorization else {})
-    if err:
-        return err
-    turning_on = False
-    turning_off = False
-    with store.lock:
-        if payload.enabled is not None:
-            next_enabled = bool(payload.enabled)
-            turning_on = next_enabled and not store.auto_switch_enabled
-            turning_off = (not next_enabled) and bool(store.auto_switch_enabled)
-            store.auto_switch_enabled = next_enabled
-            if turning_on:
-                store.auto_switch_align_on_next_tick = True
-            elif not next_enabled:
-                store.auto_switch_align_on_next_tick = False
-    persist_runtime_state()
-    cancelled_ops = 0
-    if turning_off:
-        cancelled_ops = _cancel_pending_auto_switch_device_ops()
-    if turning_on:
-        _auto_switch_log("自动切号总开关已开启，将在下一轮调度立即对齐当前时段账号")
-    elif turning_off:
-        _auto_switch_log(
-            f"自动切号总开关已关闭（已撤销队列中 {cancelled_ops} 个待执行任务）"
-        )
-    return {
-        "code": 0,
-        "msg": "自动切号配置已更新",
-        "data": {"enabled": bool(store.auto_switch_enabled)},
-    }
 
 
 @app.get("/api/admin/tasks/scheduler/config")
@@ -13182,7 +16593,8 @@ def task_status():
         _trim_task_log_keys_unlocked()
         task_logs = {k: v[-120:] for k, v in store.task_logs.items()}
     with store.lock:
-        auto_switch_enabled = bool(store.auto_switch_enabled)
+        auto_switch_enabled = _any_device_auto_switch_enabled()
+        auto_switch_device_count = sum(1 for d in store.devices.values() if d.auto_switch_enabled)
         backup_stats_full_query_enabled = bool(store.backup_stats_full_query_enabled)
         backup_stats_full_query_last_run_date = str(store.backup_stats_full_query_last_run_date or "")
         backup_stats_full_query_in_flight = bool(store.backup_stats_full_query_in_flight)
@@ -13456,6 +16868,77 @@ def admin_logs_snapshot(
     }
 
 
+@app.post("/api/admin/device_logs/request_pull")
+def admin_device_logs_request_pull(
+    payload: DeviceLogPullRequest,
+    authorization: str | None = Header(default=None),
+):
+    """管理台请求设备上传今日本地日志文件（设备在下次 check_start 时响应）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+
+    raw_ids = [str(x or "").strip() for x in (payload.device_ids or []) if str(x or "").strip()]
+    unique_ids = list(dict.fromkeys(raw_ids))
+    if not unique_ids:
+        return {"code": 1, "msg": "请指定 device_ids"}
+
+    allowed = _session_device_ids(session, lock_wait_sec=4.0)
+    safe_ids = [did for did in unique_ids if did in allowed]
+    if not safe_ids:
+        return {"code": 403, "msg": "无权拉取这些设备日志"}
+
+    queued = _request_device_log_pulls(safe_ids, payload.max_lines)
+    return {
+        "code": 0,
+        "msg": "已请求设备上传今日日志",
+        "requested": queued,
+        "max_lines": max(1, min(int(payload.max_lines or 400), 500)),
+    }
+
+
+@app.get("/api/admin/device_logs/download")
+def admin_device_logs_download(
+    device_id: str = "",
+    authorization: str | None = Header(default=None),
+):
+    """下载已同步到云端的设备日志文件（需先请求设备上传今日本地日志）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return JSONResponse(err, status_code=int(err.get("code") or 401))
+
+    did = str(device_id or "").strip()
+    if not did:
+        return JSONResponse({"code": 1, "msg": "请指定 device_id"}, status_code=400)
+
+    allowed = _session_device_ids(session, lock_wait_sec=4.0)
+    if did not in allowed:
+        return JSONResponse({"code": 403, "msg": "无权下载该设备日志"}, status_code=403)
+
+    path = _device_log_file_path(did)
+    if not path.is_file() or path.stat().st_size <= 0:
+        return JSONResponse(
+            {"code": 1, "msg": "暂无该设备日志，请先点击「下载今日日志」等待设备回传"},
+            status_code=404,
+        )
+
+    alias = did
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT alias FROM client_devices WHERE device_id = ? LIMIT 1",
+            (did,),
+        ).fetchone()
+        if row and str(row["alias"] or "").strip():
+            alias = str(row["alias"]).strip()
+    except Exception:
+        pass
+
+    safe_alias = re.sub(r"[^A-Za-z0-9_.-]+", "_", alias) or "device"
+    filename = f"{safe_alias}_{time.strftime('%Y-%m-%d')}.txt"
+    return FileResponse(path=str(path), media_type="text/plain; charset=utf-8", filename=filename)
+
+
 @app.get("/api/admin/device_logs")
 def admin_device_logs(
     device_id: str = "",
@@ -13486,9 +16969,22 @@ def admin_device_logs(
         return {"code": 403, "msg": "无权查看这些设备日志"}
 
     safe_lines = max(1, min(int(max_lines or 120), 500))
+    pull_pending: list[str] = []
+    now = time.time()
+    with store.lock:
+        for did in safe_ids:
+            req = store.pending_device_log_pulls.get(did)
+            if not req:
+                continue
+            requested_at = float(req.get("requested_at") or 0.0)
+            if requested_at and (now - requested_at) > DEVICE_LOG_PULL_TTL_SEC:
+                store.pending_device_log_pulls.pop(did, None)
+                continue
+            pull_pending.append(did)
     return {
         "code": 0,
         "device_logs": _device_logs_dict_for_ids(safe_ids, safe_lines),
+        "pull_pending": pull_pending,
     }
 
 
