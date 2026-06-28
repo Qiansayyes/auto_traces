@@ -920,22 +920,19 @@ object AppCoordinator {
     }
 
     private enum class CloudStatusSyncKind {
-        /** 自治期跳过：独占 OP 暂停/恢复等 */
+        /** 常规轮询/独占 OP 暂停恢复等（自治期全部本地处理） */
         ROUTINE,
-        /** 始终同步：enter/exit/硬停/手动暂停 */
+        /** 生命周期事件（自治期全部本地处理，退出后 flush） */
         LIFECYCLE,
-        /** 始终同步：空档涨粉 pull_username 门禁 */
+        /** 空档涨粉恢复（自治期全部本地处理） */
         GROWTH,
     }
 
     private suspend fun syncCloudStatus(
         status: String,
-        kind: CloudStatusSyncKind = CloudStatusSyncKind.ROUTINE,
+        @Suppress("UNUSED_PARAMETER") kind: CloudStatusSyncKind = CloudStatusSyncKind.ROUTINE,
         retries: Int = 1,
     ) {
-        if (PrefsStore.isAutoSwitchAutonomousMode() && kind == CloudStatusSyncKind.ROUTINE) {
-            return
-        }
         syncStatusToCloud(status, retries)
     }
 
@@ -946,9 +943,23 @@ object AppCoordinator {
         }
     }
 
-    private suspend fun syncStatusToCloud(status: String, retries: Int = 1) {
+    /** 自治期结束后，将本地状态一次性同步到云端。 */
+    private suspend fun flushCloudStatusAfterAutonomousExit() {
+        syncStatusToCloud(PrefsStore.getLocalStatus(), retries = 2, forceCloudSync = true)
+    }
+
+    private suspend fun syncStatusToCloud(
+        status: String,
+        retries: Int = 1,
+        forceCloudSync: Boolean = false,
+    ) {
         val deviceId = PrefsStore.getDeviceId() ?: return
         val alias = PrefsStore.getAlias() ?: return
+        if (PrefsStore.isAutoSwitchAutonomousMode() && !forceCloudSync) {
+            PrefsStore.saveLocalStatus(status)
+            updateRuntime(localStatus = status)
+            return
+        }
         if (status == PrefsStore.getLastSyncedCloudStatus()) {
             return
         }
@@ -1838,9 +1849,11 @@ object AppCoordinator {
                     PrefsStore.clearAutoSwitchSessionContext()
                     PrefsStore.markAutoSwitchExitDone(eventId)
                     PrefsStore.saveLastModeEventId(eventId)
+                    flushCloudStatusAfterAutonomousExit()
                 } else {
                     PrefsStore.setAutoSwitchMode("off")
                     PrefsStore.setAutoSwitchPendingSummaryUpload(true)
+                    flushCloudStatusAfterAutonomousExit()
                     runCatching {
                         ApiService.modeAck(deviceId, alias, eventId, "exiting_started", sessionId)
                     }.onFailure { err ->
@@ -3989,6 +4002,7 @@ object AppCoordinator {
             AutoSwitchLedger.clear()
             AutoSwitchAccountActivityTracker.reset()
             PrefsStore.clearAutoSwitchSessionContext()
+            flushCloudStatusAfterAutonomousExit()
             LogCenter.op(alias, "【自动切号】待上报会话总结已成功补传")
         }
     }

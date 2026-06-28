@@ -1351,6 +1351,7 @@ STORE_LOCK_WAIT_SEC = 2.5
 STORE_LOCK_DEVICE_WAIT_SEC = 1.5
 # client_devices 异步落库：状态未变且距上次写入不足该间隔则跳过；否则合并批量 commit。
 _DEVICE_PERSIST_MIN_INTERVAL_SEC = 30.0
+_AUTO_SWITCH_DEVICE_PERSIST_MIN_INTERVAL_SEC = 300.0
 _DEVICE_PERSIST_BATCH_INTERVAL_SEC = 0.3
 _device_persist_lock = Lock()
 _device_persist_pending: set[str] = set()
@@ -1601,6 +1602,12 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
     return written
 
 
+def _device_persist_min_interval_sec(device_id: str) -> float:
+    if _device_auto_switch_enabled(device_id):
+        return _AUTO_SWITCH_DEVICE_PERSIST_MIN_INTERVAL_SEC
+    return _DEVICE_PERSIST_MIN_INTERVAL_SEC
+
+
 def _persist_client_device_to_db(device_id: str, *, force: bool = False) -> None:
     """将单台设备的当前内存状态写入 client_devices（默认异步合并；force 时立即落库）。"""
     did = str(device_id or "").strip()
@@ -1612,14 +1619,15 @@ def _persist_client_device_to_db(device_id: str, *, force: bool = False) -> None
             return
         snapshot = _device_persist_row_snapshot(dev)
     now_mono = time.monotonic()
+    min_interval = _device_persist_min_interval_sec(did)
     if not force:
         last_at = _device_persist_last_at.get(did, 0.0)
         last_snap = _device_persist_last_written.get(did)
         # 快照未变：完全跳过（内存与 DB 已一致）
-        if last_snap == snapshot and (now_mono - last_at) < _DEVICE_PERSIST_MIN_INTERVAL_SEC:
+        if last_snap == snapshot and (now_mono - last_at) < min_interval:
             return
         # 快照已变但距上次落库不足间隔：仅标记 dirty，由 worker 在间隔到期后合并写入
-        if (now_mono - last_at) < _DEVICE_PERSIST_MIN_INTERVAL_SEC:
+        if (now_mono - last_at) < min_interval:
             with _device_persist_lock:
                 _device_persist_pending.add(did)
             return
@@ -1657,7 +1665,7 @@ def _device_persist_worker_loop() -> None:
         eligible = [
             did
             for did in pending
-            if (now_mono - _device_persist_last_at.get(did, 0.0)) >= _DEVICE_PERSIST_MIN_INTERVAL_SEC
+            if (now_mono - _device_persist_last_at.get(did, 0.0)) >= _device_persist_min_interval_sec(did)
         ]
         if not eligible:
             continue
@@ -8424,6 +8432,7 @@ def sync_status(payload: SyncStatusRequest):
     if str(device.status or "") == new_status:
         return {"code": 0, "msg": "状态未变化"}
 
+    autonomous = _device_auto_switch_enabled(payload.device_id)
     try:
         with _store_lock("sync_status", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
             if str(device.status or "") == new_status:
@@ -8432,6 +8441,9 @@ def sync_status(payload: SyncStatusRequest):
     except StoreLockBusy:
         print(f"[{now_text()}] sync_status | store_lock_busy | device_id={payload.device_id} alias={payload.alias}")
         return _store_lock_busy_response()
+
+    if autonomous:
+        return {"code": 0, "msg": "自治期已更新内存"}
 
     _persist_client_device_to_db(payload.device_id)
     print(f"[{now_text()}] 设备别名：{payload.alias} | 状态更新：{new_status}")
@@ -9121,7 +9133,7 @@ def check_start(device_id: str, alias: str):
     if pull_req:
         result["log_pull_requested"] = True
         result["log_pull_max_lines"] = int(pull_req.get("max_lines") or 400)
-    if mutated:
+    if mutated and not _device_auto_switch_enabled(device_id):
         _persist_client_device_to_db(device_id)
     print(f"[{now_text()}] check_start | done | device_id={device_id} result={result.get('msg')}")
     return result
@@ -9155,7 +9167,7 @@ def pull_username(
         print(f"[{now_text()}] pull_username | store_lock_busy | device_id={device_id} alias={alias}")
         return _store_lock_busy_response()
 
-    if promoted:
+    if promoted and not _device_auto_switch_enabled(device_id):
         _persist_client_device_to_db(device_id)
         try:
             with _store_lock("pull_username:promoted_rounds", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
