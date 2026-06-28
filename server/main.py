@@ -1315,6 +1315,18 @@ store = MemoryStore()
 # 设备热路径持锁上限：超时快速失败，避免 check_start / device_ops 拖死全站。
 STORE_LOCK_WAIT_SEC = 2.5
 STORE_LOCK_DEVICE_WAIT_SEC = 1.5
+# client_devices 异步落库：状态未变且距上次写入不足该间隔则跳过；否则合并批量 commit。
+_DEVICE_PERSIST_MIN_INTERVAL_SEC = 30.0
+_DEVICE_PERSIST_BATCH_INTERVAL_SEC = 0.3
+_device_persist_lock = Lock()
+_device_persist_pending: set[str] = set()
+_device_persist_last_written: Dict[str, tuple] = {}
+_device_persist_last_at: Dict[str, float] = {}
+_device_persist_wake = Event()
+# 管理台 overview 队列 COUNT 缓存，降低与设备写库叠加的读锁竞争。
+_OVERVIEW_QUEUE_STATS_CACHE_TTL_SEC = 45.0
+_overview_queue_stats_cache_lock = Lock()
+_overview_queue_stats_cache: Dict[str, Any] = {"expires_at": 0.0}
 # 已有设备开启自动切号自治后，云端 minute tick 仅保活探测，大幅降频。
 AUTO_SWITCH_AUTONOMOUS_IDLE_SEC = 300
 
@@ -1451,50 +1463,172 @@ def _load_client_devices_from_db() -> None:
         print(f"[{now_text()}] 系统 | 已从数据库恢复 {len(rows)} 台绑定设备")
 
 
-def _persist_client_device_to_db(device_id: str) -> None:
-    """将单台设备的当前内存状态写入 client_devices。"""
+def _device_persist_row_snapshot(dev: DeviceInfo) -> tuple:
+    return (
+        str(dev.owner_username or ""),
+        str(dev.alias or ""),
+        str(dev.device_group or ""),
+        str(dev.fingerprint or ""),
+        str(dev.status or "offline"),
+        bool(dev.pending_start),
+        bool(dev.paused),
+        bool(dev.auto_start_opt_out),
+        bool(dev.auto_switch_enabled),
+    )
+
+
+def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
+    """批量 upsert client_devices（单次 commit），仅由落库 worker / shutdown flush 调用。"""
+    unique_ids = list(dict.fromkeys(str(d or "").strip() for d in device_ids if str(d or "").strip()))
+    if not unique_ids:
+        return 0
+    rows: List[tuple[str, tuple]] = []
+    with store.lock:
+        for did in unique_ids:
+            dev = store.devices.get(did)
+            if dev:
+                rows.append((did, _device_persist_row_snapshot(dev)))
+    if not rows:
+        return 0
+
     t0 = time.perf_counter()
-    print(f"[{now_text()}] persist_client_device | start | device_id={device_id}")
-    with _tracked_store_lock("_persist_client_device_to_db"):
-        dev = store.devices.get(device_id)
-        if not dev:
-            print(f"[{now_text()}] persist_client_device | missing_device | device_id={device_id}")
-            return
-        owner = dev.owner_username
-        alias = dev.alias
-        device_group = dev.device_group
-        fingerprint = dev.fingerprint
-        status = dev.status
-        pending_start = 1 if dev.pending_start else 0
-        paused = 1 if dev.paused else 0
-        auto_start_opt_out = 1 if dev.auto_start_opt_out else 0
-        auto_switch_enabled = 1 if dev.auto_switch_enabled else 0
     now = now_text()
     conn = _get_db()
+    written = 0
     try:
-        print(f"[{now_text()}] persist_client_device | db_write_start | device_id={device_id} status={status}")
-        exists = conn.execute("SELECT created_at FROM client_devices WHERE device_id = ?", (device_id,)).fetchone()
-        if exists:
-            conn.execute(
-                """
-                UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, fingerprint = ?, status = ?,
-                    pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?, updated_at = ?
-                WHERE device_id = ?
-                """,
-                (owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, now, device_id),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (device_id, owner, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, now, now),
-            )
+        for did, snap in rows:
+            (
+                owner,
+                alias,
+                device_group,
+                fingerprint,
+                status,
+                pending_start,
+                paused,
+                auto_start_opt_out,
+                auto_switch_enabled,
+            ) = snap
+            pending_i = 1 if pending_start else 0
+            paused_i = 1 if paused else 0
+            auto_start_i = 1 if auto_start_opt_out else 0
+            auto_switch_i = 1 if auto_switch_enabled else 0
+            exists = conn.execute("SELECT created_at FROM client_devices WHERE device_id = ?", (did,)).fetchone()
+            if exists:
+                conn.execute(
+                    """
+                    UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, fingerprint = ?, status = ?,
+                        pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?, updated_at = ?
+                    WHERE device_id = ?
+                    """,
+                    (
+                        owner,
+                        alias,
+                        device_group,
+                        fingerprint,
+                        status,
+                        pending_i,
+                        paused_i,
+                        auto_start_i,
+                        auto_switch_i,
+                        now,
+                        did,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        did,
+                        owner,
+                        alias,
+                        device_group,
+                        fingerprint,
+                        status,
+                        pending_i,
+                        paused_i,
+                        auto_start_i,
+                        auto_switch_i,
+                        now,
+                        now,
+                    ),
+                )
+            _device_persist_last_written[did] = snap
+            _device_persist_last_at[did] = time.monotonic()
+            written += 1
         conn.commit()
-        print(f"[{now_text()}] persist_client_device | db_write_done | device_id={device_id} elapsed={(time.perf_counter() - t0) * 1000:.1f}ms")
     finally:
         conn.close()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    if elapsed_ms >= 200 or written >= 8:
+        print(f"[{now_text()}] persist_client_device | batch | n={written} elapsed={elapsed_ms:.1f}ms")
+    return written
+
+
+def _persist_client_device_to_db(device_id: str, *, force: bool = False) -> None:
+    """将单台设备的当前内存状态写入 client_devices（默认异步合并；force 时立即落库）。"""
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return
+        snapshot = _device_persist_row_snapshot(dev)
+    now_mono = time.monotonic()
+    if not force:
+        last_snap = _device_persist_last_written.get(did)
+        last_at = _device_persist_last_at.get(did, 0.0)
+        if last_snap == snapshot and (now_mono - last_at) < _DEVICE_PERSIST_MIN_INTERVAL_SEC:
+            return
+    if force:
+        _write_client_devices_batch([did])
+        return
+    with _device_persist_lock:
+        _device_persist_pending.add(did)
+    _device_persist_wake.set()
+
+
+def _flush_device_persist_queue_blocking() -> None:
+    """shutdown 时排空待落库队列。"""
+    for _ in range(4):
+        with _device_persist_lock:
+            batch = list(_device_persist_pending)
+            _device_persist_pending.clear()
+        if batch:
+            _write_client_devices_batch(batch)
+        else:
+            break
+
+
+def _device_persist_worker_loop() -> None:
+    while not _APP_SHUTDOWN_EVENT.is_set():
+        _device_persist_wake.wait(timeout=_DEVICE_PERSIST_BATCH_INTERVAL_SEC)
+        _device_persist_wake.clear()
+        if _APP_SHUTDOWN_EVENT.is_set():
+            break
+        with _device_persist_lock:
+            if not _device_persist_pending:
+                continue
+            batch = list(_device_persist_pending)
+            _device_persist_pending.clear()
+        _write_client_devices_batch(batch)
+
+
+def _start_device_persist_worker() -> None:
+    Thread(target=_device_persist_worker_loop, name="client_device_persist", daemon=True).start()
+
+
+def _seed_device_persist_throttle_from_memory() -> None:
+    """重启后从内存设备态初始化节流快照，避免每台设备首轮 sync 都写库。"""
+    now_mono = time.monotonic()
+    with store.lock:
+        items = [(did, _device_persist_row_snapshot(dev)) for did, dev in store.devices.items()]
+    for did, snap in items:
+        _device_persist_last_written[did] = snap
+        _device_persist_last_at[did] = now_mono
 
 
 def _load_persisted_runtime_state():
@@ -2644,6 +2778,7 @@ def persist_runtime_state():
 
 
 _load_client_devices_from_db()
+_seed_device_persist_throttle_from_memory()
 _load_persisted_runtime_state()
 
 
@@ -2855,6 +2990,8 @@ def _begin_app_shutdown_early(*, log: bool = True) -> None:
         store.scheduler_stop_event.set()
     with contextlib.suppress(Exception):
         _stop_all_task_processes()
+    with contextlib.suppress(Exception):
+        _flush_device_persist_queue_blocking()
     if log:
         print(f"[{now_text()}] app shutdown | background workers signaled (early)")
 
@@ -3023,7 +3160,7 @@ def report_device_auto_start_opt_out(payload: ReportDeviceAutoStartOptOutRequest
         if not dev:
             return {"code": 1, "msg": "设备不存在"}
         dev.auto_start_opt_out = bool(payload.opt_out)
-    _persist_client_device_to_db(did)
+    _persist_client_device_to_db(did, force=True)
     return {"code": 0, "msg": "已更新", "device_id": did, "auto_start_opt_out": bool(payload.opt_out)}
 
 
@@ -3149,7 +3286,7 @@ def set_device_auto_start_opt_out(payload: DeviceAutoStartOptOutRequest, authori
             return {"code": 1, "msg": "设备不存在"}
         dev.auto_start_opt_out = bool(payload.opt_out)
         alias = dev.alias
-    _persist_client_device_to_db(did)
+    _persist_client_device_to_db(did, force=True)
     return {"code": 0, "msg": "已更新", "device_id": did, "alias": alias, "auto_start_opt_out": bool(payload.opt_out)}
 
 
@@ -9177,7 +9314,7 @@ def report_result(payload: ReportResultRequest):
             device.status = "error"
         status_err = True
     if status_err:
-        _persist_client_device_to_db(payload.device_id)
+        _persist_client_device_to_db(payload.device_id, force=True)
 
     return {"code": 0, "msg": "结果接收成功"}
 
@@ -13272,6 +13409,7 @@ def _insert_mobile_pending_usernames(usernames: List[str], skip_privacy_filter: 
         msg = f"用户名部分导入成功（成功 {inserted}，失败 {failed}）"
         if first_error:
             msg = f"{msg}，首个错误：{first_error}"
+    _invalidate_overview_queue_stats_cache()
     return {
         "code": 0,
         "msg": msg,
@@ -16857,10 +16995,11 @@ def admin_table_page(table: str, page: int = 1, page_size: int = 100, search_fie
         conn.close()
 
 
-def _overview_queue_payload_from_db(*, preview_limit: int = 200) -> dict[str, Any]:
-    """不持有 store.lock：概览降级时仍返回真实队列计数与待下发预览（避免误显示为 0）。"""
+def _load_overview_queue_stats_from_db(*, preview_limit: int = 200) -> dict[str, Any]:
+    """读取 overview 队列 COUNT 与待下发预览（不持有 store.lock）。"""
     conn = _get_db()
     try:
+        follow_total = conn.execute("SELECT COUNT(1) FROM follower_queue").fetchone()[0]
         follow_unprocessed = conn.execute(
             "SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 0"
         ).fetchone()[0]
@@ -16879,21 +17018,56 @@ def _overview_queue_payload_from_db(*, preview_limit: int = 200) -> dict[str, An
         ]
         live_count = conn.execute("SELECT COUNT(1) FROM live_customer").fetchone()[0]
         return {
-            "mobile_pending_total": pending_count,
+            "follow_total": int(follow_total or 0),
+            "follow_unprocessed": int(follow_unprocessed or 0),
+            "follow_done": int(follow_done or 0),
+            "pending_count": int(pending_count or 0),
+            "pending_preview": pending_preview,
+            "live_count": int(live_count or 0),
+            "mobile_pending_total": int(pending_count or 0),
             "queue_stats": {
                 "follower": {
-                    "pending": follow_unprocessed,
+                    "pending": int(follow_unprocessed or 0),
                     "processing": 0,
-                    "done": follow_done,
+                    "done": int(follow_done or 0),
                     "failed": 0,
                 },
-                "mobile_pending": pending_count,
-                "live_customer": live_count,
+                "mobile_pending": int(pending_count or 0),
+                "live_customer": int(live_count or 0),
             },
             "mobile_pending_preview": pending_preview,
         }
     finally:
         conn.close()
+
+
+def _invalidate_overview_queue_stats_cache() -> None:
+    with _overview_queue_stats_cache_lock:
+        _overview_queue_stats_cache["expires_at"] = 0.0
+
+
+def _overview_queue_stats_cached(*, preview_limit: int = 200) -> dict[str, Any]:
+    now = time.monotonic()
+    with _overview_queue_stats_cache_lock:
+        expires = float(_overview_queue_stats_cache.get("expires_at") or 0)
+        payload = _overview_queue_stats_cache.get("payload")
+        if isinstance(payload, dict) and now < expires:
+            return dict(payload)
+    fresh = _load_overview_queue_stats_from_db(preview_limit=preview_limit)
+    with _overview_queue_stats_cache_lock:
+        _overview_queue_stats_cache["payload"] = fresh
+        _overview_queue_stats_cache["expires_at"] = now + _OVERVIEW_QUEUE_STATS_CACHE_TTL_SEC
+    return dict(fresh)
+
+
+def _overview_queue_payload_from_db(*, preview_limit: int = 200) -> dict[str, Any]:
+    """不持有 store.lock：概览降级时仍返回真实队列计数与待下发预览（避免误显示为 0）。"""
+    cached = _overview_queue_stats_cached(preview_limit=preview_limit)
+    return {
+        "mobile_pending_total": cached["mobile_pending_total"],
+        "queue_stats": dict(cached["queue_stats"]),
+        "mobile_pending_preview": list(cached["mobile_pending_preview"]),
+    }
 
 
 @app.get("/api/admin/overview")
@@ -16938,22 +17112,13 @@ def admin_overview(
     device_stats = _device_stats_from_db(session, device_group=group_filter)
     config_snapshot = dict(store.config)
     run_mode_snapshot = _user_run_mode(session["username"])
-    conn = _get_db()
-    try:
-        follow_total = conn.execute("SELECT COUNT(1) FROM follower_queue").fetchone()[0]
-        follow_unprocessed = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 0").fetchone()[0]
-        follow_done = conn.execute("SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 1").fetchone()[0]
-        pending_count = conn.execute("SELECT COUNT(1) FROM mobile_pending_usernames WHERE consume_status = 'pending'").fetchone()[0]
-        pending_preview = [
-            str(r[0])
-            for r in conn.execute(
-                "SELECT username FROM mobile_pending_usernames WHERE consume_status = 'pending' ORDER BY created_at, id LIMIT ?",
-                (preview_limit,),
-            ).fetchall()
-        ]
-        live_count = conn.execute("SELECT COUNT(1) FROM live_customer").fetchone()[0]
-    finally:
-        conn.close()
+    queue_snapshot = _overview_queue_stats_cached(preview_limit=preview_limit)
+    follow_total = queue_snapshot["follow_total"]
+    follow_unprocessed = queue_snapshot["follow_unprocessed"]
+    follow_done = queue_snapshot["follow_done"]
+    pending_count = queue_snapshot["pending_count"]
+    pending_preview = queue_snapshot["pending_preview"]
+    live_count = queue_snapshot["live_count"]
     t_db = time.perf_counter()
     print(
         f"[{now_text()}] overview.step | db_snapshot | {(t_db - snapshot_started) * 1000:.1f}ms "
@@ -17159,6 +17324,7 @@ def admin_device_logs(
 
 
 _start_auto_switch_worker()
+_start_device_persist_worker()
 _ensure_backup_stats_full_query_schedule_off()
 if _backup_stats_full_query_schedule_available():
     _start_backup_stats_full_query_worker()

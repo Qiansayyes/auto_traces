@@ -1853,6 +1853,84 @@ class RealTraceExecutor(
         return ProfileEditMenuTriple(cp, nm, bio)
     }
 
+    /*
+     * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
+     * 换头像后重新 OCR Name/Bio 菜单坐标；Bio 点击后校验是否误入 Name 编辑页。
+     *
+     * private data class ProfileEditNameBioMenuCoords(
+     *     val name: Pair<Int, Int>,
+     *     val bio: Pair<Int, Int>,
+     * )
+     *
+     * private suspend fun profileEditOcrRefreshNameBioMenuCoords(
+     *     ctx: Context,
+     *     logAlias: String,
+     *     w: Int,
+     *     h: Int,
+     *     phase: String,
+     * ): ProfileEditNameBioMenuCoords? {
+     *     repeat(3) { attemptIndex ->
+     *         val attempt = attemptIndex + 1
+     *         if (hardStopOrNull(logAlias, "修改基本资料-刷新NameBio坐标-$phase")) return null
+     *         if (attempt > 1 && !profileEditDelay(logAlias, 650, "刷新NameBio坐标-$phase")) return null
+     *         val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_menu_refresh_${phase}_$attempt")
+     *         if (vision == null) {
+     *             devOp(logAlias, "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次 OCR 失败：$errTag")
+     *             if (errTag == "hard_stop") return null
+     *             continue
+     *         }
+     *         val triple = findProfileEditChangePhotoNameBioTriple(vision) ?: continue
+     *         val namePx = coerceTapToScreen(triple.name.point, w, h).let { it.x to it.y }
+     *         val bioPx = coerceTapToScreen(triple.bio.point, w, h).let { it.x to it.y }
+     *         devOp(
+     *             logAlias,
+     *             "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次：Name=(${namePx.first},${namePx.second}) Bio=(${bioPx.first},${bioPx.second})",
+     *         )
+     *         return ProfileEditNameBioMenuCoords(namePx, bioPx)
+     *     }
+     *     return null
+     * }
+     *
+     * private suspend fun profileEditScreenShowsNameEditorPlaceholder(ctx: Context, logAlias: String): Boolean {
+     *     if (hardStopOrNull(logAlias, "修改基本资料-Name页探测")) return false
+     *     val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_name_editor_probe")
+     *         ?: return false
+     *     if (errTag == "hard_stop") return false
+     *     return ocrHasConsecutiveWordsFromPhrase(vision, PROFILE_EDIT_PREFERRED_NAME_PHRASE)
+     * }
+     *
+     * private suspend fun profileEditTapBioMenuOpenEditor(
+     *     ctx: Context,
+     *     logAlias: String,
+     *     w: Int,
+     *     h: Int,
+     *     bioTapPx: Pair<Int, Int>,
+     * ): Pair<Pair<Int, Int>?, String?> {
+     *     var tap = bioTapPx
+     *     repeat(2) { tryIndex ->
+     *         devOp(logAlias, "「修改基本资料」Bio：点击 Bio 菜单 (${tap.first},${tap.second}) 聚焦 Bio 输入框")
+     *         if (!runSuCommand("input tap ${tap.first} ${tap.second}")) return null to "bio_tap_failed"
+     *         delay(450)
+     *         if (!profileEditScreenShowsNameEditorPlaceholder(ctx, logAlias)) return tap to null
+     *         devOp(
+     *             logAlias,
+     *             "「修改基本资料」Bio：点击后误入 Name 编辑页（菜单坐标可能过期），返回并重刷坐标",
+     *         )
+     *         navBack(logAlias, "Bio误开Name返回")
+     *         if (!profileEditDelay(logAlias, 520L, "Bio误开Name返回后")) return null to "hard_stop"
+     *         if (tryIndex == 0) {
+     *             val fresh = profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "bio_reopen")
+     *                 ?: return null to "bio_opened_name_editor"
+     *             tap = fresh.bio
+     *         } else {
+     *             return null to "bio_opened_name_editor"
+     *         }
+     *     }
+     *     return null to "bio_opened_name_editor"
+     * }
+     * ===== 修改资料优化备用代码（后续按需打开）END =====
+     */
+
     private fun flattenOcrLinesWithBoxes(result: Text): List<Pair<Text.Line, Rect>> {
         val out = ArrayList<Pair<Text.Line, Rect>>()
         for (block in result.textBlocks) {
@@ -4835,6 +4913,22 @@ class RealTraceExecutor(
             )
         }
 
+        /*
+         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
+         * profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "pre_name")?.let { fresh ->
+         *     menuNamePxOut = fresh.name
+         *     menuBioPxOut = fresh.bio
+         *     devOp(
+         *         logAlias,
+         *         "「修改基本资料」换头像后已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) Bio=(${fresh.bio.first},${fresh.bio.second})",
+         *     )
+         * } ?: devOp(
+         *     logAlias,
+         *     "「修改基本资料」换头像后未能 OCR 刷新 Name/Bio 坐标，仍使用换头像前记录值（存在误点风险）",
+         * )
+         * ===== 修改资料优化备用代码（后续按需打开）END =====
+         */
+
         val postConfirmAttempts: Int
         if (PROFILE_EDIT_SKIP_NAME_STEP) {
             devOp(logAlias, "「修改基本资料」显示名(Name)：已临时跳过（PROFILE_EDIT_SKIP_NAME_STEP=true），继续 TikTok 文案/Bio")
@@ -4931,6 +5025,22 @@ class RealTraceExecutor(
             }
         }
 
+        /*
+         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
+         * profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "pre_bio")?.let { fresh ->
+         *     menuNamePxOut = fresh.name
+         *     menuBioPxOut = fresh.bio
+         *     devOp(
+         *         logAlias,
+         *         "「修改基本资料」Bio 前已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) Bio=(${fresh.bio.first},${fresh.bio.second})",
+         *     )
+         * } ?: devOp(
+         *     logAlias,
+         *     "「修改基本资料」Bio 前未能 OCR 刷新 Name/Bio 坐标，仍使用此前记录值",
+         * )
+         * ===== 修改资料优化备用代码（后续按需打开）END =====
+         */
+
         val bioRecall = menuBioPxOut
         if (bioRecall == null) {
             return chainBase(
@@ -4975,6 +5085,21 @@ class RealTraceExecutor(
             )
         }
         delay(450)
+        /*
+         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
+         * val (bioTapResolved, bioOpenFail) = profileEditTapBioMenuOpenEditor(ctx, logAlias, w, h, bioRecall)
+         * if (bioOpenFail != null) {
+         *     return chainBase(
+         *         success = false,
+         *         failureStep = bioOpenFail,
+         *         avatarTryCount = avatarPostVerifyCount,
+         *         postConfirmChangePhotoTries = postConfirmAttempts,
+         *     )
+         * }
+         * val bioRecallActive = bioTapResolved ?: bioRecall
+         * menuBioPxOut = bioRecallActive
+         * ===== 修改资料优化备用代码（后续按需打开）END =====
+         */
         if (usernameCopiedToClipboard && assignedUsername != null) {
             profileEditSyncUsernameFromBioClipboardIfNeeded(logAlias, assignedUsername)
                 ?.let { profileEditUsernameSyncedTo = it }
