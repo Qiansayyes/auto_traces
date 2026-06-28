@@ -3319,6 +3319,7 @@ object AppCoordinator {
             )
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
+            executor.setAccountStatusReloginInProgress(true)
             ensureAccountLoggedIn(
                 alias = alias,
                 deviceId = deviceId,
@@ -3396,6 +3397,7 @@ object AppCoordinator {
 
     private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
         LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录（来源=$source）")
+        executor.setAccountStatusReloginInProgress(true)
         val opId = "acct_status_${System.currentTimeMillis()}"
         return ensureAccountLoggedIn(
             alias = alias,
@@ -3526,6 +3528,7 @@ object AppCoordinator {
             false
         }
         autoLoginActive = false
+        executor.clearAccountStatusReloginState()
         if (loginOk) {
             lastEnsureLoginPerformedFreshAutoLogin = true
             AutoSwitchBundleHolder.notifyAccountLoggedIn(username)
@@ -6716,6 +6719,7 @@ object AppCoordinator {
             if (errThrowable is AccountStatusLoggedOutException) {
                 LogCenter.op(alias, "涨粉：掉登录，终止 $username：${errThrowable.message}")
                 pendingUsernames.add(0, username)
+                executor.setAccountStatusReloginInProgress(true)
                 ensureGrowthAccountLoggedInWithRetry(
                     alias = alias,
                     deviceId = deviceId,

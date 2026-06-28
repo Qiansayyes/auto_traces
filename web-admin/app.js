@@ -712,11 +712,14 @@ const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
+let autoSwitchDailyPlansLoaded = false;
+let autoSwitchDailyPlansLoadPromise = null;
 let backupArchiveSlotHighlightTimer = null;
 let autoSwitchDevicesById = new Map();
 let autoSwitchPickDeviceIds = new Set();
 let autoSwitchSaveInFlight = false;
 let backupStatsFullQueryScheduleAvailable = false;
+let backupStatsFullQueryManualAvailable = false;
 let backupStatsFullQuerySaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
 const DB_SEARCH_FIELD_KEY = "auto_traces_db_search_field_v1";
@@ -1696,7 +1699,6 @@ async function switchSection(id, options = {}) {
   if (nextSectionId === "backup-section") {
     try {
       await loadBoundDeviceAliases();
-      await loadEditorState();
       renderDeviceRegionPresetOptions();
       renderDeviceAliasPresetOptions();
       await loadAutoSwitchConfig({ refreshArchive: false });
@@ -4995,6 +4997,19 @@ function applyBackupStatsFullQueryScheduleUi(cfg = {}) {
       ? "每天北京时间 0:00 自动对全部 owner 的备份档案执行全量查询并落库（不限分组）"
       : (String(cfg.disabled_reason || "").trim() || "每日定时全量查询暂时不可用");
   }
+  applyBackupStatsFullQueryManualUi(cfg);
+}
+
+function applyBackupStatsFullQueryManualUi(cfg = {}) {
+  backupStatsFullQueryManualAvailable = cfg.manual_available !== false;
+  const available = backupStatsFullQueryManualAvailable;
+  if (fetchTiktokStatsFullBtn) {
+    fetchTiktokStatsFullBtn.disabled = !available || backupStatsFullQueryInFlight;
+    fetchTiktokStatsFullBtn.style.opacity = available ? "" : "0.55";
+    fetchTiktokStatsFullBtn.title = available
+      ? "按当前分组筛选，批量查询该分组下全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）"
+      : (String(cfg.manual_disabled_reason || "").trim() || "暂时不可用：全量查询并落库功能已关闭");
+  }
 }
 
 async function loadBackupStatsFullQueryConfig() {
@@ -5003,7 +5018,7 @@ async function loadBackupStatsFullQueryConfig() {
     const cfg = data.data || {};
     applyBackupStatsFullQueryScheduleUi(cfg);
   } catch (_) {
-    applyBackupStatsFullQueryScheduleUi({ available: false, enabled: false });
+    applyBackupStatsFullQueryScheduleUi({ available: false, enabled: false, manual_available: false });
   }
 }
 
@@ -5627,6 +5642,10 @@ async function fetchTiktokStats() {
 }
 
 async function fetchTiktokStatsFullForBackupArchive() {
+  if (!backupStatsFullQueryManualAvailable) {
+    setStatus("全量查询并落库暂时不可用", "warning");
+    return;
+  }
   if (backupStatsFullQueryInFlight) {
     setStatus("全量查询正在进行中，请稍候", "warning");
     return;
@@ -5702,7 +5721,7 @@ async function fetchTiktokStatsFullForBackupArchive() {
     setStatus(error.message || "全量查询失败", "error");
   } finally {
     backupStatsFullQueryInFlight = false;
-    if (fetchTiktokStatsFullBtn) fetchTiktokStatsFullBtn.disabled = false;
+    applyBackupStatsFullQueryManualUi({ manual_available: backupStatsFullQueryManualAvailable });
     updateBackupArchivePagerUi();
   }
 }
@@ -7639,10 +7658,15 @@ if (fetchTiktokStatsBtn) {
 }
 if (fetchTiktokStatsFullBtn) {
   fetchTiktokStatsFullBtn.addEventListener("click", () => {
+    if (!backupStatsFullQueryManualAvailable) {
+      setStatus("全量查询并落库暂时不可用", "warning");
+      return;
+    }
     fetchTiktokStatsFullForBackupArchive().catch((error) => {
       setStatus(error.message || "全量查询失败", "error");
     });
   });
+  applyBackupStatsFullQueryManualUi({ manual_available: false });
 }
 async function handleDbTableSwitch(nextTable = "") {
   currentDbPage = 1;
@@ -7970,10 +7994,9 @@ async function syncAssignableAliasOptionsIfNeeded() {
 }
 
 async function loadEditorState() {
-  const [accountsResp, devicesResp, backupResp] = await Promise.all([
+  const [accountsResp, devicesResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
     request("/api/admin/device_editor_rows/export_backup"),
-    request("/api/admin/tiktok_backup/search?limit=100"),
     loadBoundDeviceAliases().catch(() => []),
   ]);
   accountEditorRows = Array.isArray(accountsResp.items)
@@ -7982,10 +8005,30 @@ async function loadEditorState() {
   deviceEditorRows = Array.isArray(devicesResp.items)
     ? devicesResp.items.map((item) => getDeviceRowTemplate(item))
     : [];
-  backupArchiveRows = Array.isArray(backupResp.items) ? backupResp.items : [];
   rebuildBackupAliasByUsername();
   syncAccountAliasFromDeviceRows();
   enrichAccountStatsFromDeviceRows();
+}
+
+async function loadDailyPlansIfNeeded({ force = false } = {}) {
+  if (autoSwitchDailyPlansLoaded && !force) return { plans_by_alias: autoSwitchDailyPlansByAlias, schedule_date: autoSwitchDailyPlanDate };
+  if (autoSwitchDailyPlansLoadPromise) {
+    if (!force) return autoSwitchDailyPlansLoadPromise;
+    await autoSwitchDailyPlansLoadPromise.catch(() => {});
+  }
+  autoSwitchDailyPlansLoadPromise = (async () => {
+    const plansResp = await request("/api/admin/auto_switch/daily_plans");
+    const plansPayload = plansResp?.data || {};
+    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
+    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
+    autoSwitchDailyPlansLoaded = true;
+    return plansPayload;
+  })();
+  try {
+    return await autoSwitchDailyPlansLoadPromise;
+  } finally {
+    autoSwitchDailyPlansLoadPromise = null;
+  }
 }
 
 function rebuildBackupAliasByUsername() {
@@ -7998,6 +8041,21 @@ function rebuildBackupAliasByUsername() {
   };
   (backupArchiveRows || []).forEach(ingest);
   (deviceEditorRows || []).forEach(ingest);
+}
+
+function mergeBackupArchiveRowsCache(existingRows = [], newRows = []) {
+  const merged = new Map();
+  const ingest = (row) => {
+    const rowIndex = resolveBackupArchiveExportRowIndex(row);
+    const username = String(row?.username || "").trim().toLowerCase();
+    const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
+    const key = rowIndex != null ? `idx:${rowIndex}` : `ua:${username}|${alias}`;
+    if (!key || key === "ua:|") return;
+    merged.set(key, row);
+  };
+  (Array.isArray(existingRows) ? existingRows : []).forEach(ingest);
+  (Array.isArray(newRows) ? newRows : []).forEach(ingest);
+  return Array.from(merged.values());
 }
 
 /** 账号表 assigned_alias 为空时，从设备档案反查别名用于展示与保存 */
@@ -10338,17 +10396,13 @@ async function loadBackupArchiveRecords() {
     if (searchQ) params.set("search", searchQ);
     const searchField = String(backupArchiveSearchField || "").trim();
     if (searchField) params.set("search_field", searchField);
-    // 今日时段是云端预分配信息，与“当前是否已开启自动切号”无关；
-    // 始终拉取，避免设备未开启时只显示 "--" 造成误解。
-    const plansPromise = request("/api/admin/auto_switch/daily_plans")
-      .catch(() => ({ data: {} }));
-    const [data, plansResp] = await Promise.all([
-      request(`/api/admin/editor/device_rows?${params.toString()}`),
-      plansPromise,
-    ]);
-    const plansPayload = plansResp?.data || {};
-    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
-    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
+    void loadDailyPlansIfNeeded().then(() => {
+      if (deviceAliasGroupsEl && Array.isArray(backupArchivePageItems) && backupArchivePageItems.length) {
+        renderBackupGroups(backupArchivePageItems);
+        scheduleBackupArchiveSlotHighlightRefresh();
+      }
+    }).catch(() => {});
+    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
     backupArchiveAliasTotal = Number(data?.total ?? 0) || 0;
     if (Number.isFinite(Number(data?.page))) currentBackupArchivePage = Number(data.page) || 1;
     const rows = Array.isArray(data.items) ? data.items : [];
@@ -10370,6 +10424,9 @@ async function loadBackupArchiveRecords() {
       switch_highlight: normalizeSwitchHighlightField(row?.switch_highlight),
       env_status: normalizeEnvStatusField(row?.env_status),
     }));
+    backupArchiveRows = mergeBackupArchiveRowsCache(backupArchiveRows, items);
+    rebuildBackupAliasByUsername();
+    syncAccountAliasFromDeviceRows();
     backupArchivePageItems = items;
     updateBackupArchivePagerUi();
     renderBackupGroups(items);
@@ -10847,7 +10904,7 @@ if (apiBaseInput) {
     loadAccounts();
     void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
     void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
-    void loadAutoSwitchConfig({ refreshArchive: true });
+    void loadAutoSwitchConfig({ refreshArchive: false });
     loadEditorState().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();

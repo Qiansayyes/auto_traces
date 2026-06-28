@@ -741,13 +741,8 @@
           <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
               <h3 style="margin:0;">设备备份档案</h3>
-              <span class="hint" title="切号确认后立即切换高亮；高亮=环境归属；还原成功=环境活跃">高亮=环境归属 · 还原成功=环境活跃 · 标签含登录状态</span>
-              <select id="backupArchiveGroupSelect" class="ui-select ui-select--toolbar" style="min-width:180px;">
-                <option value="">全部分组</option>
-                <option value="__ungrouped__">未分组</option>
-              </select>
-              <button id="fetchTiktokStatsFull" class="ghost" type="button" title="按上方分组筛选，批量查询该分组下全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）">全量查询并落库</button>
-              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;opacity:.55;" title="暂时不可用：每日 0 点自动全量查询已关闭，请使用上方「全量查询并落库」按分组手动执行">
+              <button id="fetchTiktokStatsFull" class="ghost" type="button" disabled style="opacity:.55;" title="暂时不可用：全量查询并落库功能已关闭">全量查询并落库</button>
+              <label style="display:flex;align-items:center;gap:8px;margin-left:4px;opacity:.55;" title="暂时不可用：每日 0 点自动全量查询已关闭">
                 <input id="backupStatsFullQueryEnabledToggle" type="checkbox" disabled />
                 每日0点自动全量查询（暂不可用）
               </label>

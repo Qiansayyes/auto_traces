@@ -201,6 +201,8 @@ _AUTO_SWITCH_MAX_SWITCH_OPS_PER_TICK = 8
 BACKUP_STATS_FULL_QUERY_LOG_KEY = "backup_stats_full_query"
 # 暂时关闭「每日 0 点自动全量查询」；恢复时改 True 并重启服务。
 BACKUP_STATS_FULL_QUERY_SCHEDULE_AVAILABLE = False
+# 暂时关闭「全量查询并落库」手动按钮；恢复时改 True。
+BACKUP_STATS_FULL_QUERY_MANUAL_AVAILABLE = False
 BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
 MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
@@ -2842,6 +2844,10 @@ _load_persisted_runtime_state()
 
 def _backup_stats_full_query_schedule_available() -> bool:
     return bool(BACKUP_STATS_FULL_QUERY_SCHEDULE_AVAILABLE)
+
+
+def _backup_stats_full_query_manual_available() -> bool:
+    return bool(BACKUP_STATS_FULL_QUERY_MANUAL_AVAILABLE)
 
 
 def _ensure_backup_stats_full_query_schedule_off() -> None:
@@ -14411,9 +14417,15 @@ def get_backup_stats_full_query_config(authorization: str | None = Header(defaul
             "scope": "全部 owner 下所有备份档案 username（不限分组）",
             "beijing_date": _beijing_date_str(),
             "beijing_time": _beijing_now().strftime("%H:%M:%S"),
+            "manual_available": _backup_stats_full_query_manual_available(),
             "disabled_reason": (
-                "" if _backup_stats_full_query_schedule_available()
-                else "每日定时全量查询暂时不可用，请使用分组「全量查询并落库」手动执行"
+                ""
+                if _backup_stats_full_query_schedule_available()
+                else "每日定时全量查询暂时不可用"
+            ),
+            "manual_disabled_reason": (
+                "" if _backup_stats_full_query_manual_available()
+                else "全量查询并落库暂时不可用"
             ),
         },
     }
@@ -14454,6 +14466,8 @@ def trigger_backup_stats_full_query_once(authorization: str | None = Header(defa
     err, _session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
+    if not _backup_stats_full_query_manual_available():
+        return {"code": 1, "msg": "全量查询并落库暂时不可用"}
     with store.lock:
         if store.backup_stats_full_query_in_flight:
             return {"code": 1, "msg": "全量查询任务正在执行中，请稍后再试"}

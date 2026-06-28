@@ -191,6 +191,12 @@ interface TraceExecutor {
      * 不含：每用户名任务开始、修改基本资料外轮、云端设备指令前、每轮涨粉拉取前。
      */
     suspend fun runLoginSafeguardMeasure(ctx: Context, sourceTag: String): LoginSafeguardOutcome
+
+    /** Account status 首遇恢复后进入重登期：自动登录 OCR 须顺手关弹窗。 */
+    fun setAccountStatusReloginInProgress(active: Boolean) {}
+
+    /** 自动登录结束（成功或失败）：退出重登期并清零 OK 点击计数。 */
+    fun clearAccountStatusReloginState() {}
 }
 
 class RealTraceExecutor(
@@ -344,6 +350,17 @@ class RealTraceExecutor(
     @Volatile
     private var accountStatusRecoveryInProgress: Boolean = false
 
+    /**
+     * Account status 首遇（强停冷启）后的重登期：自动登录链内任意 OCR 见弹窗则顺手点 OK，不中断登录。
+     * 由 [performAccountStatusLogoutRecovery] / 协调器 [setAccountStatusReloginInProgress] 开启，
+     * 登录成功或失败后 [clearAccountStatusReloginState] 关闭。
+     */
+    @Volatile
+    private var accountStatusReloginInProgress: Boolean = false
+
+    /** 重登期内顺手点 Account status OK 的次数（登录结束后清零）。 */
+    private var accountStatusInlineOkTapCount: Int = 0
+
     /** 涨粉 / 互点 / 发作品：该深度 >0 时所有 OCR 须观察掉登录信号；自动登录与改资料除外。 */
     @Volatile
     private var accountStatusOcrWatchDepth: Int = 0
@@ -376,7 +393,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 自动登录链与修改基本资料 OCR 不观察 Account status（[loginSafeguardLogoutProbeActive] 时除外 auto_login）。
+     * 自动登录链与修改基本资料 OCR 默认不观察 Account status；
+     * [accountStatusReloginInProgress] 时 auto_login_* 须观察并顺手关弹窗。
      * 互点/发作品冷启里的 [runLoginSafeguardMeasure] 使用 `login_safeguard_*`。
      */
     private fun isAccountStatusOcrExcludedTag(fileTag: String): Boolean {
@@ -396,6 +414,11 @@ class RealTraceExecutor(
     }
 
     private fun shouldObserveAccountStatusOnOcr(fileTag: String?): Boolean {
+        val tag = fileTag?.trim().orEmpty()
+        if (accountStatusReloginInProgress) {
+            if (tag.startsWith("profile_edit")) return false
+            if (tag.startsWith("auto_login") || tag.startsWith("login_safeguard")) return true
+        }
         if (!isLogoutProbeContextActive()) return false
         if (loginSafeguardLogoutProbeActive) {
             return fileTag == null || !fileTag.trim().startsWith("profile_edit")
@@ -417,10 +440,10 @@ class RealTraceExecutor(
         ctx: Context,
         vision: Text,
         fileTag: String?,
-    ) {
-        if (!isLogoutProbeContextActive()) return
+    ): Boolean {
+        if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return false
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
-        probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
+        return probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
     }
 
     /** 裁切 OCR 前对整屏截图顺手处理弹窗/验证，并在涨粉等场景下观察掉登录信号。 */
@@ -448,7 +471,7 @@ class RealTraceExecutor(
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
-            if (!isLogoutProbeContextActive()) return
+            if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return
             probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
@@ -690,9 +713,6 @@ class RealTraceExecutor(
         private const val INLINE_IDENTITY_VERIFY_RESEND_TAP_COOLDOWN_MS = 1200L
         /** 登录入口 / Resend code 未命中：关开 TikTok 整链重来上限。 */
         private const val AUTO_LOGIN_MAX_CHAIN_RESTARTS = 3
-        /** Account status 掉登录弹窗：点 OK 后最长等待（毫秒），期间 OCR 复核是否已关闭。 */
-        private const val ACCOUNT_STATUS_LOGOUT_OK_WAIT_MS = 3000L
-        private const val ACCOUNT_STATUS_LOGOUT_OK_POLL_INTERVAL_MS = 600L
         /** 密码页 Continue/Next 后 OCR 轮询最长时长（毫秒），判定直达首页或兴趣页。 */
         private const val AUTO_LOGIN_POST_PASSWORD_ROUTE_MAX_DURATION_MS = 180_000L
         private const val AUTO_LOGIN_RESEND_WAIT_MS = 5000L
@@ -1997,58 +2017,9 @@ class RealTraceExecutor(
         return runSuCommand("input tap $fx $fy")
     }
 
-    /** 掉登录恢复期间专用 OCR（不触发弹窗检测与其它顺手点击）。 */
-    private suspend fun accountStatusRecoveryOcrOnce(ctx: Context, tag: String): Text? {
-        val (vision, err) = mlKitRecognizeFullScreenCore(ctx, tag)
-        if (vision == null && err != "hard_stop") {
-            devOp(
-                PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown",
-                "掉登录复核 OCR 失败：$err [$tag]",
-            )
-        }
-        return vision
-    }
-
     /**
-     * 点 OK 后最长 [ACCOUNT_STATUS_LOGOUT_OK_WAIT_MS]：周期性 OCR，若仍见 Account status 则再点 OK。
-     */
-    private suspend fun waitAndDismissAccountStatusDialog(
-        ctx: Context,
-        alias: String,
-        w: Int,
-        h: Int,
-    ) {
-        val deadline = SystemClock.elapsedRealtime() + ACCOUNT_STATUS_LOGOUT_OK_WAIT_MS
-        var pass = 0
-        while (SystemClock.elapsedRealtime() < deadline) {
-            if (hardStopOrNull(alias, "掉登录等待OK")) {
-                throw AccountStatusLoggedOutException("硬停")
-            }
-            coroutineContext.ensureActive()
-            val remaining = deadline - SystemClock.elapsedRealtime()
-            if (remaining <= 0) break
-            delay(minOf(ACCOUNT_STATUS_LOGOUT_OK_POLL_INTERVAL_MS, remaining))
-            pass++
-            val probe = accountStatusRecoveryOcrOnce(ctx, "account_status_ok_verify_$pass") ?: continue
-            if (!visionShowsAccountStatusLogoutDialog(probe)) {
-                if (visionShowsWelcomeBackLogoutScreen(probe)) {
-                    devOp(
-                        alias,
-                        "掉登录：OK 后见 Add another account / Welcome back（第 $pass 次复核 OCR），从登录入口续接自动登录",
-                    )
-                    throw LoginSafeguardRequiresAutoLoginException()
-                }
-                devOp(alias, "掉登录：OK 已生效，Account status 弹窗已消失（第 $pass 次复核 OCR）")
-                return
-            }
-            devOp(alias, "掉登录：Account status 仍在，再次点 OK（第 $pass 次复核 OCR）")
-            tapAccountStatusOk(alias, probe, w, h)
-        }
-        devOp(alias, "掉登录：${ACCOUNT_STATUS_LOGOUT_OK_WAIT_MS}ms 复核结束（弹窗可能仍在）")
-    }
-
-    /**
-     * 掉登录弹窗：点 OK → 3s 内 OCR 复核并补点 → 强停 TikTok → 冷启；随后抛出 [AccountStatusLoggedOutException]。
+     * 掉登录弹窗（首遇）：点 OK → 强停 TikTok → 冷启；进入重登期后抛出 [AccountStatusLoggedOutException]。
+     * 重登期内见弹窗走 [dismissAccountStatusInline]，不在此强停冷启。
      */
     private suspend fun performAccountStatusLogoutRecovery(
         ctx: Context,
@@ -2068,7 +2039,6 @@ class RealTraceExecutor(
             val w = dm.widthPixels.coerceAtLeast(1)
             val h = dm.heightPixels.coerceAtLeast(1)
             tapAccountStatusOk(alias, vision, w, h)
-            waitAndDismissAccountStatusDialog(ctx, alias, w, h)
             val pkg = Config.TIKTOK_PACKAGE_NAME
             devOp(alias, "掉登录：强停 TikTok 后台")
             runSuCommand("am force-stop $pkg")
@@ -2086,7 +2056,27 @@ class RealTraceExecutor(
         } finally {
             accountStatusRecoveryInProgress = false
         }
+        accountStatusReloginInProgress = true
         throw AccountStatusLoggedOutException("Account status 掉登录已处理，需重新自动登录")
+    }
+
+    /** 重登期内：仅点 OK 关 Account status 弹窗，继续自动登录。 @return 是否已点击 OK */
+    private suspend fun dismissAccountStatusInline(
+        ctx: Context,
+        alias: String,
+        vision: Text,
+    ): Boolean {
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        if (!tapAccountStatusOk(alias, vision, w, h)) return false
+        accountStatusInlineOkTapCount++
+        devOp(
+            alias,
+            "掉登录重登期：顺手点 Account status OK（累计 $accountStatusInlineOkTapCount 次）",
+        )
+        autoLoginDelay(alias, 400L, "Account status OK 后")
+        return true
     }
 
     /** 点 OK 后的 Welcome back 等：同屏见 Add another account / another account（Account status 弹窗已消失）。 */
@@ -2102,18 +2092,22 @@ class RealTraceExecutor(
         alias: String,
         vision: Text,
         fileTag: String?,
-    ) {
-        if (accountStatusRecoveryInProgress) return
+    ): Boolean {
+        if (accountStatusRecoveryInProgress) return false
         val observeAccountStatus = shouldObserveAccountStatusOnOcr(fileTag)
         val observeAddAnother = shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)
-        if (!observeAccountStatus && !observeAddAnother) return
+        if (!observeAccountStatus && !observeAddAnother) return false
 
         if (observeAccountStatus && visionShowsAccountStatusLogoutDialog(vision)) {
+            if (accountStatusReloginInProgress) {
+                return dismissAccountStatusInline(ctx, alias, vision)
+            }
             performAccountStatusLogoutRecovery(ctx, alias, vision)
         }
         if ((observeAccountStatus || observeAddAnother) && visionShowsWelcomeBackLogoutScreen(vision)) {
             maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
         }
+        return false
     }
 
     /**
@@ -2184,7 +2178,14 @@ class RealTraceExecutor(
                 result
             }
             if (vision == null) return null to "hard_stop"
-            observeAccountStatusOnOcrText(ctx, vision, fileTag)
+            val accountStatusDismissedInline = observeAccountStatusOnOcrText(ctx, vision, fileTag)
+            if (
+                accountStatusDismissedInline &&
+                fileTag.startsWith("auto_login") &&
+                !fileTag.endsWith("_acct_status_redo")
+            ) {
+                return mlKitRecognizeFullScreen(ctx, "${fileTag}_acct_status_redo")
+            }
             // 通用兜底：任意 OCR 后若同屏出现 Don't allow，顺手点击并继续原流程。
             // 发作品（publish_post_*）、修改基本资料（profile_edit_*）不在此顺手点。
             if (!fileTag.contains("dont_allow", ignoreCase = true) &&
@@ -13930,7 +13931,9 @@ class RealTraceExecutor(
             }
 
             loginEntryMissStreak++
-            if (loginEntryMissStreak > AUTO_LOGIN_ENTRY_MISS_BEFORE_EDIT_PROBE && ocrVisionHasStrictEdit(vision)) {
+            if (loginEntryMissStreak > AUTO_LOGIN_ENTRY_MISS_BEFORE_EDIT_PROBE &&
+                autoLoginEntryEditIndicatesLoggedIn(vision)
+            ) {
                 val preview = buildProfileEditOcrPreview(vision).take(400)
                 devOp(
                     alias,
@@ -14352,6 +14355,37 @@ class RealTraceExecutor(
     private fun ocrVisionHasStrictEdit(result: Text): Boolean =
         findStrictEditTapPoint(result) != null || findStrictExactLabelHit(result, "Edit") != null
 
+    /** 重登期入口：禁止仅凭 Edit 判定已登录。 */
+    private fun autoLoginEntryEditIndicatesLoggedIn(vision: Text): Boolean {
+        if (accountStatusReloginInProgress) return false
+        return ocrVisionHasStrictEdit(vision)
+    }
+
+    /** 成功终检：须见 Edit 且同屏无 Account status 弹窗。 */
+    private fun autoLoginSuccessEditVisible(vision: Text): Boolean {
+        if (visionShowsAccountStatusLogoutDialog(vision)) return false
+        return ocrVisionHasStrictEdit(vision)
+    }
+
+    override fun setAccountStatusReloginInProgress(active: Boolean) {
+        accountStatusReloginInProgress = active
+        if (active) {
+            devOp(
+                PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown",
+                "掉登录：进入 Account status 重登期（自动登录 OCR 将顺手关弹窗）",
+            )
+        }
+    }
+
+    override fun clearAccountStatusReloginState() {
+        if (!accountStatusReloginInProgress && accountStatusInlineOkTapCount == 0) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val taps = accountStatusInlineOkTapCount
+        accountStatusReloginInProgress = false
+        accountStatusInlineOkTapCount = 0
+        devOp(alias, "掉登录：Account status 重登期结束（重登期顺手点 OK 共 $taps 次，计数已清零）")
+    }
+
     /** 终检点 Profile：底栏 profile 文案。 */
     private fun findAutoLoginProfileTabHit(result: Text, screenH: Int): StrictLabelHit? =
         findBottomBandLabelContaining(result, screenH, "profile", bottomFractionStart = 0.72f)
@@ -14395,7 +14429,7 @@ class RealTraceExecutor(
                     return false
                 }
                 val editVision = autoLoginOcrOnce(ctx, alias, "auto_login_success_edit_${pass}_$editPass") ?: continue
-                if (ocrVisionHasStrictEdit(editVision)) {
+                if (autoLoginSuccessEditVisible(editVision)) {
                     val preview = buildProfileEditOcrPreview(editVision).take(400)
                     devOp(alias, "自动登录成功校验：已识别 Edit，判定登录成功；OCR=$preview")
                     return true
@@ -16001,6 +16035,9 @@ class RealTraceExecutor(
                 )
             ) {
                 AutoLoginCutSwitchStepOutcome.Ok -> {
+                    if (accountStatusReloginInProgress) {
+                        clearAccountStatusReloginState()
+                    }
                     devOp(alias, "自动登录(Email后分流)：全流程完成（Profile→Edit 终检通过）")
                     return true
                 }
