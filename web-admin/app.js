@@ -7994,9 +7994,10 @@ async function syncAssignableAliasOptionsIfNeeded() {
 }
 
 async function loadEditorState() {
-  const [accountsResp, devicesResp] = await Promise.all([
+  const [accountsResp, devicesResp, backupResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
     request("/api/admin/device_editor_rows/export_backup"),
+    request("/api/admin/tiktok_backup/search?limit=100"),
     loadBoundDeviceAliases().catch(() => []),
   ]);
   accountEditorRows = Array.isArray(accountsResp.items)
@@ -8005,6 +8006,7 @@ async function loadEditorState() {
   deviceEditorRows = Array.isArray(devicesResp.items)
     ? devicesResp.items.map((item) => getDeviceRowTemplate(item))
     : [];
+  backupArchiveRows = Array.isArray(backupResp.items) ? backupResp.items : [];
   rebuildBackupAliasByUsername();
   syncAccountAliasFromDeviceRows();
   enrichAccountStatsFromDeviceRows();
