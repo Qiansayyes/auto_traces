@@ -1698,7 +1698,7 @@ async function switchSection(id, options = {}) {
   }
   if (nextSectionId === "backup-section") {
     try {
-      await loadBoundDeviceAliases();
+      await loadBoundDeviceAliases().catch(() => {});
       renderDeviceRegionPresetOptions();
       renderDeviceAliasPresetOptions();
       await loadAutoSwitchConfig({ refreshArchive: false });
@@ -10089,13 +10089,6 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
 function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
-    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
-    return;
-  }
-  const filteredItems = backupArchiveSearchQuery
-    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
-    : items;
-  if (!filteredItems.length) {
     const searchFieldLabel = ACCOUNT_RECORDS_SEARCH_FIELD_LABELS[backupArchiveSearchField] || "全部字段";
     const emptyHint = backupArchiveSearchQuery
       ? `未找到在「${searchFieldLabel}」中匹配「${backupArchiveSearchQuery}」的备份档案`
@@ -10104,7 +10097,7 @@ function renderBackupGroups(items = []) {
     return;
   }
   const groups = new Map();
-  filteredItems.forEach((item) => {
+  items.forEach((item) => {
     const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
     if (!groups.has(alias)) groups.set(alias, []);
     groups.get(alias).push(item);
