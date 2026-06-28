@@ -949,11 +949,15 @@ object AppCoordinator {
     private suspend fun syncStatusToCloud(status: String, retries: Int = 1) {
         val deviceId = PrefsStore.getDeviceId() ?: return
         val alias = PrefsStore.getAlias() ?: return
+        if (status == PrefsStore.getLastSyncedCloudStatus()) {
+            return
+        }
         val attempts = retries.coerceAtLeast(1)
         repeat(attempts) { attempt ->
             runCatching {
                 val response = ApiService.syncStatus(deviceId, alias, status)
                 PrefsStore.saveLocalStatus(status)
+                PrefsStore.saveLastSyncedCloudStatus(status)
                 LogCenter.op(
                     alias,
                     if (status == "running") "已与云端同步：任务运行中" else "已与云端同步：设备在线",
@@ -1240,7 +1244,7 @@ object AppCoordinator {
                                 PrefsStore.setTransientPausedForDestructiveOp(false)
                                 val alreadyPaused = PrefsStore.getLocalStatus() == "paused"
                                 PrefsStore.saveLocalStatus("paused")
-                                ApiService.syncStatus(deviceId, alias, "paused")
+                                syncCloudStatus("paused", CloudStatusSyncKind.LIFECYCLE)
                                 if (!alreadyPaused) {
                                     LogCenter.op(alias, "收到暂停指令")
                                     updateRuntime(localStatus = "paused", lastMessage = "已暂停，等待继续")
@@ -1262,7 +1266,7 @@ object AppCoordinator {
                                     started.set(true)
                                 }
                                 PrefsStore.saveLocalStatus("running")
-                                ApiService.syncStatus(deviceId, alias, "running")
+                                syncStatusToCloud("running")
                                 LogCenter.op(alias, "管理台已下发「开始运行」，涨粉/任务即将启动")
                                 updateRuntime(localStatus = "running", lastMessage = "收到启动/继续指令")
                                 if (!WorkerServiceTracker.isRunning) {

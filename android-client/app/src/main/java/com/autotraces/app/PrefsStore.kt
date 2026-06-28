@@ -11,6 +11,8 @@ object PrefsStore {
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_DEVICE_ALIAS = "device_alias"
     private const val KEY_LOCAL_STATUS = "local_status"
+    /** 最近一次成功同步到云端的 status；与 [KEY_LOCAL_STATUS] 区分，避免重复 POST /api/sync_status。 */
+    private const val KEY_LAST_SYNCED_CLOUD_STATUS = "last_synced_cloud_status"
     private const val KEY_SERVER_BASE_URL = "server_base_url"
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
@@ -154,6 +156,7 @@ object PrefsStore {
             .remove(KEY_DEVICE_ID)
             .remove(KEY_DEVICE_ALIAS)
             .putString(KEY_LOCAL_STATUS, "online")
+            .remove(KEY_LAST_SYNCED_CLOUD_STATUS)
             .putLong(KEY_LAST_BIND_REFRESH_MS, 0L)
             .remove(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION)
             .remove(KEY_LOG_CONTEXT_USERNAME)
@@ -505,6 +508,17 @@ object PrefsStore {
     }
 
     fun getLocalStatus(): String = prefs.getString(KEY_LOCAL_STATUS, "online") ?: "online"
+
+    fun getLastSyncedCloudStatus(): String? =
+        prefs.getString(KEY_LAST_SYNCED_CLOUD_STATUS, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun saveLastSyncedCloudStatus(status: String) {
+        prefs.edit().putString(KEY_LAST_SYNCED_CLOUD_STATUS, status).apply()
+    }
+
+    fun clearLastSyncedCloudStatus() {
+        prefs.edit().remove(KEY_LAST_SYNCED_CLOUD_STATUS).apply()
+    }
 
     fun saveServerBaseUrl(baseUrl: String) {
         prefs.edit().putString(KEY_SERVER_BASE_URL, baseUrl).apply()

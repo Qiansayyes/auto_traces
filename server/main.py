@@ -8189,8 +8189,8 @@ def auth_login_legacy_get():
 
 
 @app.get("/api/health")
-def api_health():
-    """轻量探活：不访问 SQLite，供管理台/Nginx 检测后端是否仍可响应。"""
+async def api_health():
+    """轻量探活：不访问 SQLite；async 避免 sync 路由占满线程池时 health 也排队超时。"""
     return {"code": 0, "msg": "ok", "ts": now_text()}
 
 
@@ -8365,15 +8365,21 @@ def sync_status(payload: SyncStatusRequest):
     if error:
         return error
 
+    new_status = str(payload.status or "").strip()
+    if str(device.status or "") == new_status:
+        return {"code": 0, "msg": "状态未变化"}
+
     try:
         with _store_lock("sync_status", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
-            device.status = payload.status
+            if str(device.status or "") == new_status:
+                return {"code": 0, "msg": "状态未变化"}
+            device.status = new_status  # type: ignore[assignment]
     except StoreLockBusy:
         print(f"[{now_text()}] sync_status | store_lock_busy | device_id={payload.device_id} alias={payload.alias}")
         return _store_lock_busy_response()
 
     _persist_client_device_to_db(payload.device_id)
-    print(f"[{now_text()}] 设备别名：{payload.alias} | 状态更新：{payload.status}")
+    print(f"[{now_text()}] 设备别名：{payload.alias} | 状态更新：{new_status}")
     return {"code": 0, "msg": "状态同步成功"}
 
 
