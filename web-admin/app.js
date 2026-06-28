@@ -33,7 +33,6 @@ const mutualFollowOnlySelectedBtn = document.getElementById("mutualFollowOnlySel
 const publishPostStartSelectedBtn = document.getElementById("publishPostStartSelectedBtn");
 const aliasFilterInput = document.getElementById("aliasFilter");
 const deviceGroupSelect = document.getElementById("deviceGroupSelect");
-const backupArchiveGroupSelect = document.getElementById("backupArchiveGroupSelect");
 const exportBackupArchiveXlsxBtn = document.getElementById("exportBackupArchiveXlsxBtn");
 const exportBackupArchiveSelectedXlsxBtn = document.getElementById("exportBackupArchiveSelectedXlsxBtn");
 const backupArchiveSelectAllPageBtn = document.getElementById("backupArchiveSelectAllPageBtn");
@@ -261,7 +260,6 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
-const backupArchiveSearchFieldSelect = document.getElementById("backupArchiveSearchFieldSelect");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
 const DEVICE_EDITOR_STORAGE_KEY = "auto_traces_device_editor_rows_v1";
@@ -283,7 +281,6 @@ let accountRecordsSearchField = "";
 let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
 let backupArchiveSearchQuery = "";
-let backupArchiveSearchField = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
 let currentDeviceGroupFilter = "";
@@ -712,8 +709,6 @@ const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1";
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
-let autoSwitchDailyPlansLoaded = false;
-let autoSwitchDailyPlansLoadPromise = null;
 let backupArchiveSlotHighlightTimer = null;
 let autoSwitchDevicesById = new Map();
 let autoSwitchPickDeviceIds = new Set();
@@ -1698,7 +1693,8 @@ async function switchSection(id, options = {}) {
   }
   if (nextSectionId === "backup-section") {
     try {
-      await loadBoundDeviceAliases().catch(() => {});
+      await loadBoundDeviceAliases();
+      await loadEditorState();
       renderDeviceRegionPresetOptions();
       renderDeviceAliasPresetOptions();
       await loadAutoSwitchConfig({ refreshArchive: false });
@@ -2502,20 +2498,9 @@ function selectedDeviceIdsByStatus(statuses = []) {
 }
 
 function getActiveDeviceGroupFilter() {
-  const activePanel = document.querySelector(".panel.active")?.id;
   const fromOverview = String(deviceGroupSelect?.value ?? "").trim();
-  const fromBackup = String(backupArchiveGroupSelect?.value ?? "").trim();
   const stored = String(localStorage.getItem(DEVICE_GROUP_FILTER_KEY) || "").trim();
-  let raw;
-  if (activePanel === "backup-section" && backupArchiveGroupSelect) {
-    raw = fromBackup;
-  } else if (deviceGroupSelect) {
-    raw = fromOverview;
-  } else if (backupArchiveGroupSelect) {
-    raw = fromBackup;
-  } else {
-    raw = stored;
-  }
+  const raw = deviceGroupSelect ? fromOverview : stored;
   return raw === "none" ? "" : raw;
 }
 
@@ -2523,9 +2508,6 @@ function syncDeviceGroupFilterSelects(value = getActiveDeviceGroupFilter()) {
   currentDeviceGroupFilter = String(value || "").trim();
   if (deviceGroupSelect && deviceGroupSelect.value !== currentDeviceGroupFilter) {
     deviceGroupSelect.value = currentDeviceGroupFilter;
-  }
-  if (backupArchiveGroupSelect && backupArchiveGroupSelect.value !== currentDeviceGroupFilter) {
-    backupArchiveGroupSelect.value = currentDeviceGroupFilter;
   }
   try {
     localStorage.setItem(DEVICE_GROUP_FILTER_KEY, currentDeviceGroupFilter);
@@ -2547,7 +2529,6 @@ function populateDeviceGroupFilterOptions(groupNames = []) {
   const html = buildOptions();
   const prev = currentDeviceGroupFilter;
   if (deviceGroupSelect) deviceGroupSelect.innerHTML = html;
-  if (backupArchiveGroupSelect) backupArchiveGroupSelect.innerHTML = html;
   syncDeviceGroupFilterSelects(prev);
 }
 
@@ -5007,7 +4988,7 @@ function applyBackupStatsFullQueryManualUi(cfg = {}) {
     fetchTiktokStatsFullBtn.disabled = !available || backupStatsFullQueryInFlight;
     fetchTiktokStatsFullBtn.style.opacity = available ? "" : "0.55";
     fetchTiktokStatsFullBtn.title = available
-      ? "按当前分组筛选，批量查询该分组下全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）"
+      ? "批量查询全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）"
       : (String(cfg.manual_disabled_reason || "").trim() || "暂时不可用：全量查询并落库功能已关闭");
   }
 }
@@ -5539,16 +5520,8 @@ async function importLiveCustomers() {
   }
 }
 
-function formatDeviceGroupFilterLabel(groupFilter = "") {
-  const group = String(groupFilter || "").trim();
-  if (!group) return "全部分组";
-  if (group === "__ungrouped__") return "未分组";
-  return group;
-}
-
 async function collectBackupArchiveUsernamesForQuery(options = {}) {
   const scope = options.scope === "page" ? "page" : "group";
-  const group = getActiveDeviceGroupFilter();
   const pageSize = scope === "page" ? persistBackupArchivePageSize() : MAX_BACKUP_ARCHIVE_PAGE_SIZE;
   const usernames = [];
   const seen = new Set();
@@ -5560,7 +5533,6 @@ async function collectBackupArchiveUsernamesForQuery(options = {}) {
       page: String(page),
       page_size: String(pageSize),
     });
-    if (group) params.set("device_group", group);
     const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
     const rows = Array.isArray(data.items) ? data.items : [];
     rows.forEach((row) => {
@@ -5578,7 +5550,7 @@ async function collectBackupArchiveUsernamesForQuery(options = {}) {
     page += 1;
   } while (page <= totalPages);
 
-  return { usernames, group };
+  return { usernames };
 }
 
 async function fetchTiktokStats() {
@@ -5655,13 +5627,11 @@ async function fetchTiktokStatsFullForBackupArchive() {
   if (fetchTiktokStatsFullBtn) fetchTiktokStatsFullBtn.disabled = true;
 
   try {
-    const groupFilter = getActiveDeviceGroupFilter();
-    const groupLabel = formatDeviceGroupFilterLabel(groupFilter);
-    setStatus(`正在收集「${groupLabel}」下的备份账号...`, "info");
+    setStatus("正在收集备份账号...", "info");
 
     const { usernames } = await collectBackupArchiveUsernamesForQuery({ scope: "group" });
     if (!usernames.length) {
-      setStatus(`「${groupLabel}」下没有可查询的用户名`, "warning");
+      setStatus("没有可查询的用户名", "warning");
       return;
     }
 
@@ -7175,28 +7145,19 @@ aliasFilterInput.addEventListener("input", () => {
 function onDeviceGroupFilterChanged(event) {
   const target = event?.target;
   let value;
-  if (target === backupArchiveGroupSelect) {
-    value = String(backupArchiveGroupSelect.value ?? "").trim();
-  } else if (target === deviceGroupSelect) {
+  if (target === deviceGroupSelect) {
     value = String(deviceGroupSelect.value ?? "").trim();
   } else {
     value = getActiveDeviceGroupFilter();
   }
   syncDeviceGroupFilterSelects(value);
   currentOverviewPage = 1;
-  currentBackupArchivePage = 1;
   void loadOverview().catch(() => {});
-  if (document.querySelector(".panel.active")?.id === "backup-section") {
-    void loadBackupArchiveRecords().catch(() => {});
-  }
 }
 if (deviceGroupSelect) {
   const storedFilter = String(localStorage.getItem(DEVICE_GROUP_FILTER_KEY) || "").trim();
   if (storedFilter) syncDeviceGroupFilterSelects(storedFilter);
   deviceGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
-}
-if (backupArchiveGroupSelect) {
-  backupArchiveGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
 }
 if (autoSwitchSessionSummariesAliasSelect) {
   const storedAlias = String(localStorage.getItem(AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY) || "").trim();
@@ -7904,22 +7865,6 @@ function backupArchiveRecordMatchesSearch(row = {}) {
   if (!backupArchiveSearchQuery) return true;
   const username = String(row?.username || "").trim();
   const acct = username ? getAccountRecordByUsername(username) : null;
-  const field = String(backupArchiveSearchField || "").trim();
-  if (field === "alias") {
-    return matchesSearchInFields(backupArchiveSearchQuery, [
-      row.device_alias,
-      row.assigned_alias,
-      row.mobile_alias,
-      row.account_assigned_alias,
-      acct?.assigned_alias,
-    ]);
-  }
-  if (field === "username") {
-    return matchesSearchInFields(backupArchiveSearchQuery, [username]);
-  }
-  if (field === "region") {
-    return matchesSearchInFields(backupArchiveSearchQuery, [row.region, acct?.region]);
-  }
   return matchesSearchInFields(backupArchiveSearchQuery, [
     username,
     row.device_alias,
@@ -8012,27 +7957,6 @@ async function loadEditorState() {
   enrichAccountStatsFromDeviceRows();
 }
 
-async function loadDailyPlansIfNeeded({ force = false } = {}) {
-  if (autoSwitchDailyPlansLoaded && !force) return { plans_by_alias: autoSwitchDailyPlansByAlias, schedule_date: autoSwitchDailyPlanDate };
-  if (autoSwitchDailyPlansLoadPromise) {
-    if (!force) return autoSwitchDailyPlansLoadPromise;
-    await autoSwitchDailyPlansLoadPromise.catch(() => {});
-  }
-  autoSwitchDailyPlansLoadPromise = (async () => {
-    const plansResp = await request("/api/admin/auto_switch/daily_plans");
-    const plansPayload = plansResp?.data || {};
-    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
-    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
-    autoSwitchDailyPlansLoaded = true;
-    return plansPayload;
-  })();
-  try {
-    return await autoSwitchDailyPlansLoadPromise;
-  } finally {
-    autoSwitchDailyPlansLoadPromise = null;
-  }
-}
-
 function rebuildBackupAliasByUsername() {
   backupAliasByUsername = new Map();
   const ingest = (row) => {
@@ -8043,21 +7967,6 @@ function rebuildBackupAliasByUsername() {
   };
   (backupArchiveRows || []).forEach(ingest);
   (deviceEditorRows || []).forEach(ingest);
-}
-
-function mergeBackupArchiveRowsCache(existingRows = [], newRows = []) {
-  const merged = new Map();
-  const ingest = (row) => {
-    const rowIndex = resolveBackupArchiveExportRowIndex(row);
-    const username = String(row?.username || "").trim().toLowerCase();
-    const alias = normalizeAliasValue(row?.assigned_alias || row?.mobile_alias || row?.device_alias);
-    const key = rowIndex != null ? `idx:${rowIndex}` : `ua:${username}|${alias}`;
-    if (!key || key === "ua:|") return;
-    merged.set(key, row);
-  };
-  (Array.isArray(existingRows) ? existingRows : []).forEach(ingest);
-  (Array.isArray(newRows) ? newRows : []).forEach(ingest);
-  return Array.from(merged.values());
 }
 
 /** 账号表 assigned_alias 为空时，从设备档案反查别名用于展示与保存 */
@@ -9478,7 +9387,7 @@ function renderLinkedAccountInfo(row = {}) {
 function renderDeviceEditorRows() {
   if (!deviceAliasGroupsEl) return;
   renderDeviceAliasPresetOptions();
-  // 备份档案页用分页+分组接口渲染；勿用本地全量 deviceEditorRows 覆盖，否则会冲掉分组筛选。
+  // 备份档案页用分页接口渲染；勿用本地全量 deviceEditorRows 覆盖。
   if (document.getElementById("backup-section")?.classList.contains("active")) {
     void loadBackupArchiveRecords();
     return;
@@ -10089,15 +9998,21 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
 function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
-    const searchFieldLabel = ACCOUNT_RECORDS_SEARCH_FIELD_LABELS[backupArchiveSearchField] || "全部字段";
+    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
+    return;
+  }
+  const filteredItems = backupArchiveSearchQuery
+    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
+    : items;
+  if (!filteredItems.length) {
     const emptyHint = backupArchiveSearchQuery
-      ? `未找到在「${searchFieldLabel}」中匹配「${backupArchiveSearchQuery}」的备份档案`
+      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
       : "暂无备份档案";
     deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
     return;
   }
   const groups = new Map();
-  items.forEach((item) => {
+  filteredItems.forEach((item) => {
     const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
     if (!groups.has(alias)) groups.set(alias, []);
     groups.get(alias).push(item);
@@ -10220,7 +10135,7 @@ function setBackupArchiveXlsxButtonsBusy(busy) {
   backupArchiveXlsxBusy = Boolean(busy);
   if (exportBackupArchiveXlsxBtn) {
     exportBackupArchiveXlsxBtn.disabled = busy;
-    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出分组全部 xlsx";
+    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出全部 xlsx";
   }
   if (exportBackupArchiveSelectedXlsxBtn) {
     exportBackupArchiveSelectedXlsxBtn.disabled = busy || backupArchiveSelectedRowIndices.size <= 0;
@@ -10277,16 +10192,14 @@ async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
   }
   setBackupArchiveXlsxButtonsBusy(true);
   try {
-    const group = getActiveDeviceGroupFilter();
     const params = new URLSearchParams();
-    if (group) params.set("device_group", group);
     if (selectedOnly && selected.length) params.set("row_indices", selected.join(","));
     const token = authToken();
     const qs = params.toString();
     const url = await buildApiUrl(
       `/api/admin/editor/backup_archive/export_xlsx${qs ? `?${qs}` : ""}`,
     );
-    setStatus(selectedOnly ? "正在导出已选备份为 xlsx..." : "正在导出当前分组全部备份为 xlsx...", "info");
+    setStatus(selectedOnly ? "正在导出已选备份为 xlsx..." : "正在导出全部备份为 xlsx...", "info");
     const response = await fetch(url, {
       method: "GET",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -10385,19 +10298,19 @@ async function loadBackupArchiveRecords() {
       page: String(currentBackupArchivePage),
       page_size: String(persistBackupArchivePageSize()),
     });
-    const group = getActiveDeviceGroupFilter();
-    if (group) params.set("device_group", group);
     const searchQ = String(backupArchiveSearchQuery || "").trim();
     if (searchQ) params.set("search", searchQ);
-    const searchField = String(backupArchiveSearchField || "").trim();
-    if (searchField) params.set("search_field", searchField);
-    void loadDailyPlansIfNeeded().then(() => {
-      if (deviceAliasGroupsEl && Array.isArray(backupArchivePageItems) && backupArchivePageItems.length) {
-        renderBackupGroups(backupArchivePageItems);
-        scheduleBackupArchiveSlotHighlightRefresh();
-      }
-    }).catch(() => {});
-    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
+    // 今日时段是云端预分配信息，与“当前是否已开启自动切号”无关；
+    // 始终拉取，避免设备未开启时只显示 "--" 造成误解。
+    const plansPromise = request("/api/admin/auto_switch/daily_plans")
+      .catch(() => ({ data: {} }));
+    const [data, plansResp] = await Promise.all([
+      request(`/api/admin/editor/device_rows?${params.toString()}`),
+      plansPromise,
+    ]);
+    const plansPayload = plansResp?.data || {};
+    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
+    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
     backupArchiveAliasTotal = Number(data?.total ?? 0) || 0;
     if (Number.isFinite(Number(data?.page))) currentBackupArchivePage = Number(data.page) || 1;
     const rows = Array.isArray(data.items) ? data.items : [];
@@ -10419,9 +10332,6 @@ async function loadBackupArchiveRecords() {
       switch_highlight: normalizeSwitchHighlightField(row?.switch_highlight),
       env_status: normalizeEnvStatusField(row?.env_status),
     }));
-    backupArchiveRows = mergeBackupArchiveRowsCache(backupArchiveRows, items);
-    rebuildBackupAliasByUsername();
-    syncAccountAliasFromDeviceRows();
     backupArchivePageItems = items;
     updateBackupArchivePagerUi();
     renderBackupGroups(items);
@@ -10610,7 +10520,6 @@ if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
   const onBackupArchiveSearchChanged = () => {
     backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
-    backupArchiveSearchField = String(backupArchiveSearchFieldSelect?.value || "").trim();
     clearTimeout(backupSearchTimer);
     backupSearchTimer = setTimeout(() => {
       currentBackupArchivePage = 1;
@@ -10618,9 +10527,6 @@ if (backupArchiveSearchInput) {
     }, 300);
   };
   backupArchiveSearchInput.addEventListener("input", onBackupArchiveSearchChanged);
-  if (backupArchiveSearchFieldSelect) {
-    backupArchiveSearchFieldSelect.addEventListener("change", onBackupArchiveSearchChanged);
-  }
 }
 if (accountEditorListEl) {
   accountEditorListEl.addEventListener("input", (event) => {
@@ -10899,7 +10805,7 @@ if (apiBaseInput) {
     loadAccounts();
     void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
     void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
-    void loadAutoSwitchConfig({ refreshArchive: false });
+    void loadAutoSwitchConfig({ refreshArchive: true });
     loadEditorState().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
