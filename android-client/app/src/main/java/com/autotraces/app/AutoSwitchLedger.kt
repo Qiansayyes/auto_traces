@@ -219,6 +219,7 @@ object AutoSwitchLedger {
         }
     }
 
+    /** 审计用：解析 ledger 中本 slot 切号是否曾成功（不参与切号闸门，闸门仅认 [PrefsStore] verified）。 */
     fun isCutSwitchSlotVerified(slotKey: String, targetRowIndex: Int): Boolean {
         val sk = slotKey.trim()
         if (sk.isBlank() || targetRowIndex < 0) return false
@@ -854,6 +855,31 @@ object AutoSwitchLedger {
         for (i in entries.indices) {
             val e = entries[i]
             if (e.slot_key != sk) continue
+            if (e.op_type !in cutSwitchOpTypes) continue
+            if (e.phase != "queued") continue
+            entries[i] = e.copy(
+                at = nowBeijingText(),
+                status = "cancelled",
+                phase = "cancelled",
+                message = detail,
+            )
+            changed = true
+        }
+        if (changed) persist()
+    }
+
+    /** 跨自然日：取消指定日期下所有仍为 queued 的切号 OP。 */
+    fun cancelQueuedCutSwitchOpsForScheduleDate(scheduleDate: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val date = scheduleDate.trim()
+        if (date.isEmpty()) return
+        val prefix = "$date|"
+        val detail = "日期切换，取消昨日待执行切号 OP"
+        var changed = false
+        for (i in entries.indices) {
+            val e = entries[i]
+            val sk = e.slot_key?.trim().orEmpty()
+            if (!sk.startsWith(prefix)) continue
             if (e.op_type !in cutSwitchOpTypes) continue
             if (e.phase != "queued") continue
             entries[i] = e.copy(

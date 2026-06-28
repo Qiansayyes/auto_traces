@@ -31,6 +31,8 @@ import kotlinx.coroutines.withContext
 import com.autotraces.app.backup.BackupDirectoryReconciler
 import com.autotraces.app.backup.DeviceBackupShell
 import com.autotraces.app.backup.UnifiedBackupPaths
+import com.autotraces.app.backup.model.BackupRecord
+import com.autotraces.app.backup.network.BackupReporter
 
 object AppCoordinator {
     private fun prettyTemplateName(raw: String?): String {
@@ -106,6 +108,9 @@ object AppCoordinator {
         onRefreshWeeklyBundle = { refreshAutoSwitchWeeklyBundleFromCloud() },
         isPublishExecutionActive = { isPublishPostSwitchActive() },
         onStalePublishInflight = { slotKey -> abortStaleAutoSwitchPublishInflight(slotKey) },
+        onSlotTransition = { prevSlotKey, newSlotKey ->
+            handleAutoSwitchSlotTransition(prevSlotKey, newSlotKey)
+        },
         onVerifyPublishInsertionLogin = { alias, deviceId, targetUsername, slotKey ->
             verifyPublishInsertionLoginBeforeEnqueue(alias, deviceId, targetUsername, slotKey)
         },
@@ -2284,6 +2289,85 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * 切号备份 tar 完成后立即把备份地址上报云端（不等到 pm clear 与整段 OP 结束）。
+     */
+    private suspend fun reportAutoSwitchCutSwitchBackupImmediately(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        username: String,
+        packageName: String,
+        backupName: String,
+        backupPath: String,
+        payload: DeviceOpPayload?,
+    ) {
+        val user = username.trim()
+        if (user.isBlank() || backupPath.isBlank()) return
+        val record = BackupRecord(
+            accountName = user,
+            packageName = packageName,
+            deviceAlias = alias,
+            deviceId = deviceId,
+            appAccount = PrefsStore.getAuthUsername().orEmpty(),
+            backupType = "backup",
+            backupScope = "cloud",
+            success = true,
+            path = backupPath,
+            filename = backupName,
+            message = "auto_switch cut_switch backup",
+            uploadStatus = "pending",
+        )
+        val uploadOk = runCatching {
+            BackupReporter().uploadBackupAndCreateTask(deviceId, alias, record).success
+        }.getOrElse { err ->
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】切号备份云端上报异常：${err.message}")
+            }
+            false
+        }
+        val reportData = mutableMapOf<String, Any>(
+            "op_type" to "tiktok_backup_and_clear",
+            "device_id" to deviceId,
+            "backup_name" to backupName,
+            "backup_path" to backupPath,
+            "package_name" to packageName,
+            "mobile_alias" to alias,
+            "username" to user,
+            "backup_report_phase" to "immediate_after_tar",
+        )
+        payload?.backup_record_id?.let { reportData["backup_record_id"] = it }
+        payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            reportData["auto_switch_slot_key"] = it
+        }
+        reportData.withDeviceOpReportFlags()
+        reportDeviceOpToCloud(
+            deviceId = deviceId,
+            alias = alias,
+            opId = "${opId}_backup_immediate",
+            status = "success",
+            message = "切号备份完成，地址已即时上报",
+            data = reportData,
+        )
+        val bundle = AutoSwitchBundleHolder.getBundle()
+        if (bundle != null) {
+            val accounts = bundle.accounts.orEmpty().map { acc ->
+                if (acc.username?.trim().equals(user, ignoreCase = true)) {
+                    acc.copy(backup_name = backupName, backup_path = backupPath)
+                } else {
+                    acc
+                }
+            }
+            AutoSwitchBundleHolder.setBundle(bundle.copy(accounts = accounts))
+        }
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】切号备份 @$user 地址已即时上报云端：$backupName（api=${if (uploadOk) "ok" else "fail"}）",
+            )
+        }
+    }
+
     /** 切号还原阶段备份包缺失：记入 ledger 并改走 exclusive 自动登录。 */
     private suspend fun handleCutSwitchMissingBackupFallback(
         alias: String,
@@ -2950,7 +3034,7 @@ object AppCoordinator {
     }
 
     /**
-     * 高亮已与时段一致但未 verified：登录 + OCR 保障后写对齐证明（不做 clear/restore）。
+     * 时段目标未 verified：登录 + OCR 保障后写对齐证明（不做 clear/restore）。
      */
     private suspend fun verifySlotAlignmentLightweightLogin(
         alias: String,
@@ -3565,9 +3649,22 @@ object AppCoordinator {
         return runCatching {
             val resp = ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
             if (resp.code == 0 && resp.bundle != null) {
-                applyAutoSwitchBundle(alias, deviceId, resp.bundle, revision, startSchedulerIfStopped = false)
-                autoSwitchLocalScheduler.requestImmediateTick()
-                maybeStartGrowthInAutoSwitchIdle("周计划刷新")
+                val equivalent = applyAutoSwitchBundle(
+                    alias,
+                    deviceId,
+                    resp.bundle,
+                    revision,
+                    startSchedulerIfStopped = false,
+                )
+                if (!equivalent || !autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()) {
+                    autoSwitchLocalScheduler.requestImmediateTick()
+                    maybeStartGrowthInAutoSwitchIdle("周计划刷新")
+                } else {
+                    LogCenter.op(
+                        alias,
+                        "【自动切号】周计划幂等刷新（时段+账号未变且本时段已对齐），不打断自治涨粉",
+                    )
+                }
                 true
             } else {
                 LogCenter.op(alias, "【自动切号】周计划 bundle 拉取失败：${resp.msg}")
@@ -3579,13 +3676,26 @@ object AppCoordinator {
         }
     }
 
+    /** 时段边界：收尾上一时段活动统计（切号链随后执行备份/还原/登录）。 */
+    private fun handleAutoSwitchSlotTransition(prevSlotKey: String, newSlotKey: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        AutoSwitchAccountActivityTracker.finalizeSegment("slot_transition")
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】时段切换 $prevSlotKey → $newSlotKey，已收尾上一时段活动统计",
+            )
+        }
+    }
+
     private fun applyAutoSwitchBundle(
         alias: String,
         deviceId: String,
         bundle: AutoSwitchBundle,
         revision: Int,
         startSchedulerIfStopped: Boolean = true,
-    ) {
+    ): Boolean {
         val scheduleDate = bundle.schedule_date?.trim().orEmpty()
         if (scheduleDate.isNotBlank()) {
             PrefsStore.setAutoSwitchScheduleDate(scheduleDate)
@@ -3599,25 +3709,37 @@ object AppCoordinator {
             PrefsStore.setAutoSwitchWeekRange(weekStart, weekEnd)
         }
         val wasSchedulerRunning = autoSwitchLocalScheduler.isRunning()
-        if (wasSchedulerRunning) {
+        val scheduleEquivalent = if (wasSchedulerRunning) {
             autoSwitchLocalScheduler.refreshWeeklyBundle(bundle)
-        } else if (startSchedulerIfStopped) {
+        } else {
+            false
+        }
+        if (!wasSchedulerRunning && startSchedulerIfStopped) {
             autoSwitchLocalScheduler.start(alias, deviceId, bundle, revision = revision)
         }
         if (revision != PrefsStore.getAutoSwitchLastConfigFetchRevision()) {
             PrefsStore.setAutoSwitchLastConfigFetchRevision(-1)
         }
-        val logUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
-        val slotTargetUser = bundle.resolveCurrentSlotTargetAccount(
-            scheduleDate.ifBlank { PrefsStore.getAutoSwitchScheduleDate().orEmpty() },
-            beijingMinuteOfDayForBundle(),
-        )?.username?.trim().orEmpty().ifBlank {
-            bundle.resolveHighlightedAccount(logUser)?.username?.trim().orEmpty()
+        val skipDisruptiveConfigApply =
+            scheduleEquivalent && autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()
+        if (!skipDisruptiveConfigApply) {
+            val logUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
+            val slotTargetUser = bundle.resolveCurrentSlotTargetAccount(
+                scheduleDate.ifBlank { PrefsStore.getAutoSwitchScheduleDate().orEmpty() },
+                beijingMinuteOfDayForBundle(),
+            )?.username?.trim().orEmpty().ifBlank {
+                bundle.resolveHighlightedAccount(logUser)?.username?.trim().orEmpty()
+            }
+            applyBundledConfigFromAutoSwitch(
+                logUser.ifBlank { slotTargetUser }.ifBlank { null },
+                logToUser = true,
+            )
+        } else if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】bundle 幂等刷新：本时段已对齐，跳过配置重载以免打断涨粉",
+            )
         }
-        applyBundledConfigFromAutoSwitch(
-            logUser.ifBlank { slotTargetUser }.ifBlank { null },
-            logToUser = true,
-        )
         scheduleBackupDirectoryReconcile(
             alias = alias,
             deviceId = deviceId,
@@ -3628,6 +3750,7 @@ object AppCoordinator {
             val label = if (!wasSchedulerRunning && startSchedulerIfStopped) "enter 打包" else "bundle 更新"
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
         }
+        return scheduleEquivalent
     }
 
     private fun beijingMinuteOfDayForBundle(): Int {
@@ -4885,6 +5008,7 @@ object AppCoordinator {
                 }
                 var ok = false
                 var backupSkipped = false
+                var backupPathReportedImmediately = false
                 var dataDirKb: Long? = null
                 var attempt = 0
                 while (true) {
@@ -4972,6 +5096,20 @@ object AppCoordinator {
                             }
                             tarOk
                         }
+                    }
+
+                    if (backupOk && !backupSkipped && !backupPathReportedImmediately) {
+                        reportAutoSwitchCutSwitchBackupImmediately(
+                            alias = alias,
+                            deviceId = deviceId,
+                            opId = opId,
+                            username = reportUsername,
+                            packageName = packageName,
+                            backupName = backupName,
+                            backupPath = backupPath,
+                            payload = payload,
+                        )
+                        backupPathReportedImmediately = true
                     }
 
                     val clearOk = if (backupOk) {

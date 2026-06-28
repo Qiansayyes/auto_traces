@@ -62,7 +62,7 @@ enum class LoginSafeguardOutcome {
     Failed,
 }
 
-/** 自动登录流程变体：`Default` 强制重登等；`CutSwitchAfterRestore` 云端 is_login=否 / 批量带流（Email 后可能性1/2 分流）。 */
+/** 自动登录流程变体：`Default` 强制重登等；`CutSwitchAfterRestore` 云端 is_login=否（入口标记；Email 后 Inbox 等分流对所有流程统一生效）。 */
 enum class AutoLoginFlow {
     Default,
     CutSwitchAfterRestore,
@@ -439,11 +439,17 @@ class RealTraceExecutor(
                     .addOnSuccessListener { cont.resume(it) }
                     .addOnFailureListener { cont.resumeWithException(it) }
             }
+            var vision = if (!inlineIdentityVerificationInProgress) {
+                dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "截图OCR顺手")
+            } else {
+                result
+            }
+            if (vision == null) return
             if (!inlineIdentityVerificationInProgress) {
-                handleOcrVisionInlineInterruptions(ctx, result, fileTag, "截图OCR顺手")
+                handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
             if (!isLogoutProbeContextActive()) return
-            probeAndHandleLogoutSignalsFromVision(ctx, alias, result, fileTag)
+            probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -670,6 +676,8 @@ class RealTraceExecutor(
         private const val INLINE_VIEWER_HISTORY_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 登录后「Save login for next time?」弹窗：点 Save login 的冷却。 */
         private const val INLINE_SAVE_LOGIN_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 通用 OCR 顺手消 Swipe up 提示：单次最多上滑次数。 */
+        private const val INLINE_SWIPE_UP_DISMISS_MAX_PASSES = 8
         /** 身份验证（Before you continue）：OCR 轮询间隔。 */
         private const val INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS = 1500L
         /** 身份验证：点 Outlook+Next 后等待 Before you continue 消失的最大 OCR 次数。 */
@@ -1027,6 +1035,7 @@ class RealTraceExecutor(
 
     /**
      * 优先 [navBack] 回首页（底栏 Home+Profile 同见视为已回首页，不强关）；
+     * 导航返回过程中 OCR 已见底栏 Home+Profile 时，再执行最后一次返回（搜索/内页也可能误命中底栏）；
      * 首次 OCR 已见底栏 Home+Profile 则判定可能仍在搜索/内页，未按返回键，改为强关重启；
      * 超过 [RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS] 次仍未回首页则 fallback 强关重启。
      *
@@ -1151,8 +1160,39 @@ class RealTraceExecutor(
             if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) return false
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
-                    devOp(alias, "$reason：第 $pass 次导航返回后已回首页（未强关 TikTok）")
-                    return true
+                    devOp(
+                        alias,
+                        "$reason：第 $pass 次导航返回后 OCR 已见回首页信息，再执行最后一次返回",
+                    )
+                    if (hardStopOrNull(alias, reason)) return false
+                    invalidateForegroundProbeCache()
+                    if (!isPackageVisible(pkg)) {
+                        if (!ensureTikTokForegroundStableBeforeRecoverOcr("回首页后补返前")) {
+                            devOp(alias, "$reason：回首页后最后一次返回前 TikTok 非前台且无法拉回")
+                            return false
+                        }
+                    }
+                    navBack(alias, "$reason 回首页·最后一次返回（第 $pass 次已命中）")
+                    if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·最后一次返回后")) {
+                        return false
+                    }
+                    when (evaluateRecoverHomeOcr("final_back_$pass", "最后一次返回")) {
+                        RecoverHomeOcrOutcome.HardStop -> return false
+                        RecoverHomeOcrOutcome.ForegroundUnavailable -> {
+                            if (ensureTikTokForegroundStableBeforeRecoverOcr("最后一次返回后")) {
+                                devOp(alias, "$reason：最后一次返回后已拉回 TikTok 前台，视为恢复完成")
+                                return true
+                            }
+                            devOp(alias, "$reason：最后一次返回后无法保持 TikTok 前台")
+                            return false
+                        }
+                        RecoverHomeOcrOutcome.OnMainFeed,
+                        RecoverHomeOcrOutcome.NotOnMainFeed,
+                        -> {
+                            devOp(alias, "$reason：最后一次返回完成，导航返回回首页恢复成功（未强关 TikTok）")
+                            return true
+                        }
+                    }
                 }
                 RecoverHomeOcrOutcome.HardStop -> return false
                 RecoverHomeOcrOutcome.ForegroundUnavailable -> {
@@ -1640,6 +1680,56 @@ class RealTraceExecutor(
         return null
     }
 
+    /** 子串匹配：单 element/line → 同行 element 拼接 → 相邻 2～4 行拼接（OCR 折行兜底）。 */
+    private fun findLabelHitContainingIgnoreCaseRelaxed(result: Text, substring: String): StrictLabelHit? {
+        findLabelHitContainingIgnoreCase(result, substring)?.let { return it }
+        val needle = substring.lowercase(Locale.US)
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
+                val boxes = line.elements.mapNotNull { it.boundingBox }
+                if (boxes.size >= 2) {
+                    val joined = line.elements.joinToString(" ") { it.text.trim() }.lowercase(Locale.US)
+                    if (joined.contains(needle)) {
+                        val u = boxes.fold(boxes[0]) { acc, r ->
+                            Rect(
+                                minOf(acc.left, r.left),
+                                minOf(acc.top, r.top),
+                                maxOf(acc.right, r.right),
+                                maxOf(acc.bottom, r.bottom),
+                            )
+                        }
+                        return StrictLabelHit(Point(u.centerX(), u.centerY()), u)
+                    }
+                }
+            }
+        }
+        val pairs = flattenOcrLinesWithBoxes(result)
+        val n = pairs.size
+        for (len in 2..4) {
+            for (i in 0..n - len) {
+                val slice = pairs.subList(i, i + len)
+                val joined = slice.joinToString(" ") { it.first.text.trim() }.lowercase(Locale.US)
+                if (!joined.contains(needle)) continue
+                val u = slice.fold(slice[0].second) { acc, pair ->
+                    val r = pair.second
+                    Rect(
+                        minOf(acc.left, r.left),
+                        minOf(acc.top, r.top),
+                        maxOf(acc.right, r.right),
+                        maxOf(acc.bottom, r.bottom),
+                    )
+                }
+                return StrictLabelHit(Point(u.centerX(), u.centerY()), u)
+            }
+        }
+        return null
+    }
+
+    private fun findAutoLoginNeedHelpLoggingHit(result: Text): StrictLabelHit? =
+        findLabelHitContainingIgnoreCaseRelaxed(result, "need help logging in")
+            ?: findLabelHitContainingIgnoreCaseRelaxed(result, "need help logging")
+            ?: findLabelHitContainingIgnoreCaseRelaxed(result, "help logging in")
+
     /** 严格 trim 等于 [exact] 的 element 或 line，返回点击中心与 bbox。 */
     private fun findStrictExactLabelHit(result: Text, exact: String): StrictLabelHit? {
         for (block in result.textBlocks) {
@@ -2010,7 +2100,13 @@ class RealTraceExecutor(
         return try {
             val (result, err) = mlKitRecognizeFullScreenCore(ctx, fileTag)
             if (result == null) return null to err
-            observeAccountStatusOnOcrText(ctx, result, fileTag)
+            var vision = if (!inlineIdentityVerificationInProgress) {
+                dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "OCR顺手处理")
+            } else {
+                result
+            }
+            if (vision == null) return null to "hard_stop"
+            observeAccountStatusOnOcrText(ctx, vision, fileTag)
             // 通用兜底：任意 OCR 后若同屏出现 Don't allow，顺手点击并继续原流程。
             // 发作品（publish_post_*）、修改基本资料（profile_edit_*）不在此顺手点。
             if (!fileTag.contains("dont_allow", ignoreCase = true) &&
@@ -2021,7 +2117,7 @@ class RealTraceExecutor(
                     tapDontAllowFromVisionIfPresent(
                         ctx = ctx,
                         alias = null,
-                        vision = result,
+                        vision = vision,
                         phaseLog = "OCR顺手处理",
                         useAutoLoginJitter = false,
                         markAutoLoginHandled = false,
@@ -2031,11 +2127,11 @@ class RealTraceExecutor(
             // 任意整屏 OCR：顺手关 Viewer history / Save login for next time 弹窗，并令调用方重试 OCR。
             // auto_login_* / login_safeguard_* 由 [autoLoginTryDismissInlineOverlaysFromVision] 处理。
             if (!inlineIdentityVerificationInProgress) {
-                handleOcrVisionInlineInterruptions(ctx, result, fileTag)?.let { interruptTag ->
+                handleOcrVisionInlineInterruptions(ctx, vision, fileTag)?.let { interruptTag ->
                     return null to interruptTag
                 }
             }
-            result to "ok"
+            vision to "ok"
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -2998,6 +3094,55 @@ class RealTraceExecutor(
             if (!profileEditDelay(logAlias, settleMs, "For You下滑${pass + 1}后")) return false
         }
         return true
+    }
+
+    private fun ocrVisionHasSwipeUpPrompt(result: Text): Boolean =
+        findLabelHitContainingIgnoreCase(result, "swipe up") != null
+
+    /**
+     * 识别到 Swipe up 时按 For You 预划同向上滑，直至文案消失或达上限。
+     * @return 最终 vision；处理中硬停或 OCR 失败返回 null；未识别到 Swipe up 时原样返回 [initialVision]。
+     */
+    private suspend fun dismissSwipeUpPromptUntilGone(
+        ctx: Context,
+        initialVision: Text,
+        fileTag: String,
+        phaseLog: String,
+    ): Text? {
+        if (!ocrVisionHasSwipeUpPrompt(initialVision)) return initialVision
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        val logAlias = alias ?: "unknown"
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val safeTag = fileTag.replace(Regex("[^a-zA-Z0-9_]+"), "_").take(48)
+
+        for (pass in 1..INLINE_SWIPE_UP_DISMISS_MAX_PASSES) {
+            if (isHardStopActive()) return null
+            val vision = if (pass == 1) {
+                initialVision
+            } else {
+                val (v, err) = mlKitRecognizeFullScreenCore(ctx, "${safeTag}_swipe_up_$pass")
+                if (v == null) {
+                    if (err == "hard_stop") return null
+                    continue
+                }
+                v
+            }
+            if (!ocrVisionHasSwipeUpPrompt(vision)) {
+                if (pass > 1) {
+                    alias?.let { devOp(it, "$phaseLog：Swipe up 已消失（上滑 ${pass - 1} 次后）") }
+                }
+                return vision
+            }
+            alias?.let {
+                devOp(it, "$phaseLog：识别到 Swipe up，上滑 ${pass}/$INLINE_SWIPE_UP_DISMISS_MAX_PASSES")
+            }
+            forYouFeedSwipeNextHumanized(logAlias, w, h, "$phaseLog Swipe up")
+            delay(450L)
+        }
+        val (finalVision, _) = mlKitRecognizeFullScreenCore(ctx, "${safeTag}_swipe_up_final")
+        return finalVision
     }
 
     /**
@@ -13414,6 +13559,25 @@ class RealTraceExecutor(
         )
     }
 
+    private fun autoLoginLogNeedHelpLoggingProbe(
+        alias: String,
+        pass: Int,
+        maxPasses: Int,
+        vision: Text,
+        hit: StrictLabelHit?,
+    ) {
+        val preview = buildProfileEditOcrPreview(vision, maxLines = 60)
+        val hitLabel = if (hit != null) {
+            "命中 tap=(${hit.point.x},${hit.point.y})"
+        } else {
+            "未命中"
+        }
+        devOp(
+            alias,
+            "自动登录 Need help logging in(切号) 第 $pass/$maxPasses 次 $hitLabel：读取到文案 ${preview.take(800)}",
+        )
+    }
+
     private fun autoLoginLogPasswordLayoutProbe(
         alias: String,
         pass: Int,
@@ -13674,6 +13838,7 @@ class RealTraceExecutor(
         maxPasses: Int = AUTO_LOGIN_OCR_MAX_PASSES,
         retryDelayMs: Long = AUTO_LOGIN_OCR_RETRY_DELAY_MS,
         findHit: (Text) -> StrictLabelHit?,
+        onVisionProbe: ((pass: Int, passes: Int, vision: Text, hit: StrictLabelHit?) -> Unit)? = null,
     ): AutoLoginStepOutcome {
         val passes = maxPasses.coerceIn(1, 20)
         for (pass in 1..passes) {
@@ -13685,6 +13850,7 @@ class RealTraceExecutor(
             }
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass") ?: continue
             val hit = findHit(vision)
+            onVisionProbe?.invoke(pass, passes, vision, hit)
             if (hit == null) {
                 devOp(alias, "自动登录 $phaseLog 第 $pass/$passes 次：未命中")
                 continue
@@ -13945,9 +14111,9 @@ class RealTraceExecutor(
     }
 
     private fun ocrVisionHasSwipePrompt(result: Text): Boolean =
-        findStrictExactLabelHit(result, "swipe") != null ||
+        ocrVisionHasSwipeUpPrompt(result) ||
+            findStrictExactLabelHit(result, "swipe") != null ||
             findStrictExactLabelHit(result, "Swipe") != null ||
-            findLabelHitContainingIgnoreCase(result, "swipe up") != null ||
             findLabelHitContainingIgnoreCase(result, "swipe") != null
 
     private suspend fun autoLoginPerformSwipeUpTwice(
@@ -14340,24 +14506,28 @@ class RealTraceExecutor(
         h: Int,
         tagPrefix: String,
         timeoutMs: Long = 180_000L,
-    ): Boolean {
+    ): AutoLoginEmailAfterContinueOutcome {
         val startedAt = System.currentTimeMillis()
         var pass = 0
         var lastSawFacebook = false
         var lastContinueTapAt = 0L
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
-            if (hardStopOrNull(alias, "自动登录-Email后等待跳转")) return false
+            if (hardStopOrNull(alias, "自动登录-Email后等待跳转")) return AutoLoginEmailAfterContinueOutcome.Failed
             pass++
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass")
             if (vision == null) {
-                if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return false
+                if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return AutoLoginEmailAfterContinueOutcome.Failed
                 continue
             }
 
             val sawVerifyEmail = ocrVisionHasVerifyEmailMarker(vision)
             if (sawVerifyEmail) {
                 devOp(alias, "自动登录：已识别 Verify 文案，认为 Email→Continue 跳转成功（第 $pass 次 OCR）")
-                return true
+                return AutoLoginEmailAfterContinueOutcome.VerifyReady
+            }
+            if (autoLoginVisionShowsCheckYourInbox(vision)) {
+                devOp(alias, "自动登录：Email后 OCR 命中 Check your inbox，转入 Inbox 密码路径（第 $pass 次）")
+                return AutoLoginEmailAfterContinueOutcome.CheckYourInbox
             }
 
             val sawFacebook = findLabelHitContainingIgnoreCase(vision, "facebook") != null
@@ -14392,16 +14562,16 @@ class RealTraceExecutor(
                     alias,
                     "自动登录：Email后第 $pass 次仍见 Facebook（Username 页，暂不点 Continue），继续 OCR（已耗时 ${elapsedSec}s）",
                 )
-                if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return false
+                if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return AutoLoginEmailAfterContinueOutcome.Failed
                 continue
             }
 
-            if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return false
+            if (!autoLoginDelay(alias, 1000L, "Email后等待跳转")) return AutoLoginEmailAfterContinueOutcome.Failed
         }
 
         val elapsed = (System.currentTimeMillis() - startedAt) / 1000
         devOp(alias, "自动登录：Email→Continue 等待跳转超时（${elapsed}s），lastSawFacebook=$lastSawFacebook")
-        return false
+        return AutoLoginEmailAfterContinueOutcome.Failed
     }
 
     private fun autoLoginSeesInterestPicker(result: Text): Boolean {
@@ -14682,6 +14852,13 @@ class RealTraceExecutor(
         Unknown,
     }
 
+    /** 旧流 Email→Continue 等待：见到 Verify / Check your inbox / 超时失败。 */
+    private enum class AutoLoginEmailAfterContinueOutcome {
+        VerifyReady,
+        CheckYourInbox,
+        Failed,
+    }
+
     private sealed class AutoLoginCutSwitchStepOutcome {
         data object Ok : AutoLoginCutSwitchStepOutcome()
         data object ChainRestart : AutoLoginCutSwitchStepOutcome()
@@ -14697,8 +14874,12 @@ class RealTraceExecutor(
         autoLoginDetectVerificationPageMarker(vision) != null ||
             findLabelHitContainingIgnoreCase(vision, "resend code") != null
 
+    private fun autoLoginVisionShowsCheckYourInbox(vision: Text): Boolean =
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "check your inbox") != null ||
+            findAutoLoginNeedHelpLoggingHit(vision) != null
+
     private fun autoLoginCutSwitchClassifyPostEmailBranch(vision: Text, screenH: Int): AutoLoginCutSwitchPostEmailBranch {
-        if (findLabelHitContainingIgnoreCase(vision, "check your inbox") != null) {
+        if (autoLoginVisionShowsCheckYourInbox(vision)) {
             return AutoLoginCutSwitchPostEmailBranch.CheckYourInbox
         }
         when (autoLoginClassifyRouteScreen(vision, screenH)) {
@@ -14913,11 +15094,14 @@ class RealTraceExecutor(
         password: String,
     ): Boolean {
         val needHelp = autoLoginOcrTapByFinder(
-            ctx, alias, w, h, "cut_switch_need_help", "Need help logging(切号)",
-            findHit = { v -> findLabelHitContainingIgnoreCase(v, "need help logging") },
+            ctx, alias, w, h, "cut_switch_need_help", "Need help logging in(切号)",
+            findHit = { v -> findAutoLoginNeedHelpLoggingHit(v) },
+            onVisionProbe = { pass, passes, vision, hit ->
+                autoLoginLogNeedHelpLoggingProbe(alias, pass, passes, vision, hit)
+            },
         )
         if (needHelp != AutoLoginStepOutcome.Ok) {
-            devOp(alias, "自动登录(切号)：未点到 Need help logging")
+            devOp(alias, "自动登录(切号)：未点到 Need help logging in")
             return false
         }
         if (!autoLoginDelay(alias, 800L, "Need help 后")) return false
@@ -15172,16 +15356,32 @@ class RealTraceExecutor(
         dontAllowHandledEarly: Boolean,
     ): AutoLoginCutSwitchStepOutcome {
         if (!autoLoginDelay(alias, 800L, "验证码分支探测")) return AutoLoginCutSwitchStepOutcome.Failed
-        val continueEmail = autoLoginTapContinueAndWaitForVerifyEmail(
-            ctx,
-            alias,
-            w,
-            h,
-            "auto_login_continue_email",
-        )
-        if (!continueEmail) {
-            devOp(alias, "自动登录：Email→Continue 跳转失败（3 分钟内仍未识别 Verify 文案，或仍可见 Facebook）")
-            return AutoLoginCutSwitchStepOutcome.Failed
+        when (
+            autoLoginTapContinueAndWaitForVerifyEmail(
+                ctx,
+                alias,
+                w,
+                h,
+                "auto_login_continue_email",
+            )
+        ) {
+            AutoLoginEmailAfterContinueOutcome.VerifyReady -> Unit
+            AutoLoginEmailAfterContinueOutcome.CheckYourInbox ->
+                return autoLoginRunCheckYourInboxPostEmailTail(
+                    ctx = ctx,
+                    alias = alias,
+                    deviceId = deviceId,
+                    w = w,
+                    h = h,
+                    password = password,
+                    apiUrl = apiUrl,
+                    email = email,
+                    dontAllowHandledEarly = dontAllowHandledEarly,
+                )
+            AutoLoginEmailAfterContinueOutcome.Failed -> {
+                devOp(alias, "自动登录：Email→Continue 跳转失败（3 分钟内仍未识别 Verify 文案，或仍可见 Facebook）")
+                return AutoLoginCutSwitchStepOutcome.Failed
+            }
         }
 
         if (!autoLoginDelay(alias, 800L, "验证码分支探测")) return AutoLoginCutSwitchStepOutcome.Failed
@@ -15353,6 +15553,77 @@ class RealTraceExecutor(
         }
     }
 
+    private suspend fun autoLoginRunCheckYourInboxPostEmailTail(
+        ctx: Context,
+        alias: String,
+        deviceId: String,
+        w: Int,
+        h: Int,
+        password: String,
+        apiUrl: String,
+        email: String,
+        dontAllowHandledEarly: Boolean,
+    ): AutoLoginCutSwitchStepOutcome {
+        val reachedInterest = booleanArrayOf(false)
+        val reachedHome = booleanArrayOf(false)
+        val needVerify = booleanArrayOf(false)
+
+        if (!autoLoginCutSwitchInboxPasswordPath(ctx, alias, w, h, password)) {
+            return AutoLoginCutSwitchStepOutcome.Failed
+        }
+        val transition = autoLoginWaitPageTransitionCutSwitch(
+            ctx = ctx,
+            alias = alias,
+            h = h,
+            phaseLog = "Inbox密码后",
+            tagPrefix = "cut_switch_inbox_pwd_transition",
+            markerGone = { v -> !autoLoginVisionHasContinueMarker(v) },
+            allowVerifySuccess = true,
+        )
+        when (
+            autoLoginCutSwitchApplyTransitionOutcome(
+                alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify,
+            )
+        ) {
+            AutoLoginCutSwitchStepOutcome.Ok -> Unit
+            else -> return AutoLoginCutSwitchStepOutcome.Failed
+        }
+
+        if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
+            if (!autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)) {
+                return AutoLoginCutSwitchStepOutcome.ChainRestart
+            }
+            if (apiUrl.isBlank() && email.isBlank()) {
+                devOp(alias, "自动登录(Email后 Inbox)：需要验证码但 API 与邮箱均为空")
+                return AutoLoginCutSwitchStepOutcome.Failed
+            }
+            val verifyResult = autoLoginEnterVerificationCodeCutSwitch(ctx, alias, w, h, deviceId, apiUrl, email)
+            when (verifyResult.step) {
+                AutoLoginCutSwitchStepOutcome.Ok -> {
+                    reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
+                    reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
+                }
+                AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+            }
+        }
+
+        if (!reachedInterest[0] && !reachedHome[0]) {
+            devOp(alias, "自动登录(Email后 Inbox)：未完成登录短路径（兴趣页/Home）")
+            return AutoLoginCutSwitchStepOutcome.Failed
+        }
+
+        return if (
+            autoLoginCutSwitchFinishLoginTail(
+                ctx, alias, w, h, reachedInterest[0], reachedHome[0], dontAllowHandledEarly,
+            )
+        ) {
+            AutoLoginCutSwitchStepOutcome.Ok
+        } else {
+            AutoLoginCutSwitchStepOutcome.Failed
+        }
+    }
+
     private suspend fun runAutoLoginCutSwitchPostEmail(
         ctx: Context,
         alias: String,
@@ -15377,26 +15648,17 @@ class RealTraceExecutor(
             AutoLoginCutSwitchPostEmailBranch.ShortPathInterest -> reachedInterest[0] = true
             AutoLoginCutSwitchPostEmailBranch.ShortPathHome -> reachedHome[0] = true
             AutoLoginCutSwitchPostEmailBranch.CheckYourInbox -> {
-                if (!autoLoginCutSwitchInboxPasswordPath(ctx, alias, w, h, password)) {
-                    return AutoLoginCutSwitchStepOutcome.Failed
-                }
-                val transition = autoLoginWaitPageTransitionCutSwitch(
+                return autoLoginRunCheckYourInboxPostEmailTail(
                     ctx = ctx,
                     alias = alias,
+                    deviceId = deviceId,
+                    w = w,
                     h = h,
-                    phaseLog = "Inbox密码后",
-                    tagPrefix = "cut_switch_inbox_pwd_transition",
-                    markerGone = { v -> !autoLoginVisionHasContinueMarker(v) },
-                    allowVerifySuccess = true,
+                    password = password,
+                    apiUrl = apiUrl,
+                    email = email,
+                    dontAllowHandledEarly = dontAllowHandledEarly,
                 )
-                when (
-                    autoLoginCutSwitchApplyTransitionOutcome(
-                        alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify,
-                    )
-                ) {
-                    AutoLoginCutSwitchStepOutcome.Ok -> Unit
-                    else -> return AutoLoginCutSwitchStepOutcome.Failed
-                }
             }
             /*
              * 可能性 1（新）：Email 后直接布局 A/B 密码页 — 暂注释，后续启用。
@@ -15600,34 +15862,8 @@ class RealTraceExecutor(
             if (!autoLoginInputText(alias, email)) return false
             if (!autoLoginDelay(alias, 400L, "Email 输入后")) return false
 
-            if (flowKind == AutoLoginFlow.CutSwitchAfterRestore) {
-                when (
-                    runAutoLoginCutSwitchPostEmail(
-                        ctx = ctx,
-                        alias = alias,
-                        deviceId = deviceId,
-                        w = w,
-                        h = h,
-                        email = email,
-                        password = password,
-                        apiUrl = apiUrl,
-                        dontAllowHandledEarly = dontAllowHandledEarly,
-                    )
-                ) {
-                    AutoLoginCutSwitchStepOutcome.Ok -> {
-                        devOp(alias, "自动登录(分流)：全流程完成（Profile→Edit 终检通过）")
-                        return true
-                    }
-                    AutoLoginCutSwitchStepOutcome.ChainRestart -> {
-                        devOp(alias, "自动登录(分流)：阶段失败，整链重来")
-                        continue
-                    }
-                    AutoLoginCutSwitchStepOutcome.Failed -> return false
-                }
-            }
-
             when (
-                autoLoginRunLegacyPostEmailChain(
+                runAutoLoginCutSwitchPostEmail(
                     ctx = ctx,
                     alias = alias,
                     deviceId = deviceId,
@@ -15639,8 +15875,14 @@ class RealTraceExecutor(
                     dontAllowHandledEarly = dontAllowHandledEarly,
                 )
             ) {
-                AutoLoginCutSwitchStepOutcome.Ok -> return true
-                AutoLoginCutSwitchStepOutcome.ChainRestart -> continue
+                AutoLoginCutSwitchStepOutcome.Ok -> {
+                    devOp(alias, "自动登录(Email后分流)：全流程完成（Profile→Edit 终检通过）")
+                    return true
+                }
+                AutoLoginCutSwitchStepOutcome.ChainRestart -> {
+                    devOp(alias, "自动登录(Email后分流)：阶段失败，整链重来")
+                    continue
+                }
                 AutoLoginCutSwitchStepOutcome.Failed -> return false
             }
             } catch (logout: AccountStatusLoggedOutException) {

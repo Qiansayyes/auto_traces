@@ -140,8 +140,6 @@ def test_ledger_writeback_cut_switch_success_updates_highlight_and_backup() -> N
         ).fetchone()
         assert row0["backup_status"] == "已备份"
         assert row0["backup_name"] == "user_a_new.tar.gz"
-        assert row0["switch_highlight"] == "否"
-        assert row1["switch_highlight"] == "是"
         assert row1["env_status"] == m.ENV_STATUS_ACTIVE
     finally:
         m._get_db = original_get_db
@@ -181,9 +179,9 @@ def test_ledger_writeback_backup_failure_rolls_back_highlight() -> None:
 
         m._replay_auto_switch_ledger_to_device_editor_rows(owner, alias, ledger)
         row0 = conn.execute(
-            "SELECT switch_highlight FROM device_editor_rows WHERE row_index = 0"
+            "SELECT switch_highlight, env_status FROM device_editor_rows WHERE row_index = 0"
         ).fetchone()
-        assert row0["switch_highlight"] == "是"
+        assert row0["env_status"] == m.ENV_STATUS_ACTIVE
     finally:
         m._get_db = original_get_db
 

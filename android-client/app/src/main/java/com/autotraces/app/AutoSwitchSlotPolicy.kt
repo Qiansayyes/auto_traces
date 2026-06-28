@@ -11,6 +11,34 @@ import kotlin.random.Random
  * 扩展新插入：实现 [AutoSwitchSlotInsertion]，注册到 [AutoSwitchLocalScheduler] 的 insertions 列表。
  */
 object AutoSwitchSlotWindow {
+    /** 时段右边界（左闭右开）；缺省 1440。 */
+    fun slotEndMin(slot: AutoSwitchPlanSlot): Int {
+        val end = slot.end_min
+        return if (end != null && end > 0) end else 1440
+    }
+
+    /** 当前分钟所在 slot_index；与 [AutoSwitchSlotResolution.resolveTargetSlot] 配套。 */
+    fun resolveSlotIndex(plan: AutoSwitchDailyPlan, minuteOfDay: Int): Int {
+        val slots = plan.slots.orEmpty()
+        if (slots.isEmpty()) return 0
+        val minute = minuteOfDay.coerceIn(0, 1439)
+        for (slot in slots) {
+            val start = slot.start_min ?: 0
+            val end = slotEndMin(slot)
+            if (start <= minute && minute < end) {
+                return slot.slot_index ?: 0
+            }
+        }
+        return slots.last().slot_index ?: slots.size - 1
+    }
+
+    fun resolveTargetSlot(plan: AutoSwitchDailyPlan, minuteOfDay: Int): AutoSwitchPlanSlot? {
+        val idx = resolveSlotIndex(plan, minuteOfDay)
+        val slots = plan.slots.orEmpty()
+        return slots.firstOrNull { (it.slot_index ?: -1) == idx }
+            ?: slots.getOrNull(idx.coerceAtMost(slots.size - 1))
+    }
+
     /** 当前分钟是否落在账号分配时段内（左闭右开）。 */
     fun isWithinSlot(minuteOfDay: Int, slot: AutoSwitchPlanSlot): Boolean {
         val start = slot.start_min ?: 0
@@ -135,10 +163,7 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
         if (AutoSwitchLedger.isPublishSlotInflight(slotKey)) return false
 
         val targetRi = ctx.account.row_index ?: -1
-        if (
-            !PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi) ||
-            !AutoSwitchLedger.isCutSwitchSlotVerified(slotKey, targetRi)
-        ) {
+        if (!PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)) {
             logOnce(ctx.alias, slotKey, "not_verified") {
                 LogCenter.op(
                     ctx.alias,

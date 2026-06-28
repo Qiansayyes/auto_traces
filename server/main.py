@@ -1752,15 +1752,108 @@ def _device_editor_effective_alias(row: dict) -> str:
     return _normalize_alias_key(row.get("device_alias"))
 
 
-def _pick_device_editor_bucket_row(matched: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """同别名桶内解析当前账号行：仅接受唯一切号高亮；单条桶可回退该行；多条且无明确高亮返回 None。"""
+def _auto_switch_slot_end_min(slot: dict[str, Any], slots: list[dict[str, Any]]) -> int:
+    """时段右边界（左闭右开）；缺省为当日结束 1440。"""
+    try:
+        end = int(slot.get("end_min")) if slot.get("end_min") is not None else 0
+    except (TypeError, ValueError):
+        end = 0
+    return end if end > 0 else 1440
+
+
+def _resolve_slot_highlight_row_index(
+    owner_username: str,
+    alias: str,
+    schedule_date: str | None = None,
+    minute_of_day: int | None = None,
+    rows: list[dict[str, Any]] | None = None,
+) -> int:
+    """自动切号桶：按当前北京时段计划解析应高亮的 row_index。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return -1
+    bucket_rows = rows
+    if bucket_rows is None:
+        buckets = _list_device_editor_buckets(owner)
+        bucket_rows = buckets.get(alias_key, [])
+    if not bucket_rows:
+        return -1
+    if len(bucket_rows) == 1:
+        return int(bucket_rows[0].get("row_index") or 0)
+    date_key = str(schedule_date or "").strip() or _beijing_date_str()
+    minute = max(0, min(int(minute_of_day if minute_of_day is not None else _beijing_minute_of_day()), 1439))
+    try:
+        weekly_plan = _ensure_auto_switch_weekly_plan(owner, alias_key, bucket_rows, date_key)
+        plan = _daily_plan_for_schedule_date(weekly_plan, date_key)
+        if not plan:
+            return -1
+        target_slot = _auto_switch_target_row(plan, minute)
+        if not target_slot:
+            return -1
+        try:
+            ri = int(target_slot.get("row_index"))
+        except (TypeError, ValueError):
+            return -1
+        return ri if ri >= 0 else -1
+    except Exception:
+        return -1
+
+
+def _sync_switch_highlight_from_slot(
+    conn: sqlite3.Connection,
+    owner_username: str,
+    alias: str,
+    schedule_date: str | None = None,
+    minute_of_day: int | None = None,
+) -> int:
+    """将别名桶内 switch_highlight 与当前时段计划对齐（多账号桶）；单账号桶恒为是。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return -1
+    buckets = _list_device_editor_buckets(owner)
+    rows = buckets.get(alias_key, [])
+    if not rows:
+        return -1
+    if len(rows) == 1:
+        rid = int(rows[0].get("row_index") or 0)
+        if rid >= 0:
+            _db_apply_switch_highlight_exclusive(conn, owner, rid)
+        return rid
+    ri = _resolve_slot_highlight_row_index(
+        owner, alias_key, schedule_date, minute_of_day, rows,
+    )
+    if ri >= 0:
+        _db_apply_switch_highlight_exclusive(conn, owner, ri)
+    return ri
+
+
+def _pick_device_editor_bucket_row(
+    matched: list[dict[str, Any]],
+    owner_username: str = "",
+    alias: str = "",
+    schedule_date: str | None = None,
+    minute_of_day: int | None = None,
+) -> dict[str, Any] | None:
+    """同别名桶内解析当前账号行：多账号按时段计划，单条桶回退该行。"""
     if not matched:
         return None
+    if len(matched) == 1:
+        return matched[0]
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if owner and alias_key:
+        ri = _resolve_slot_highlight_row_index(
+            owner, alias_key, schedule_date, minute_of_day, matched,
+        )
+        if ri >= 0:
+            for row in matched:
+                if int(row.get("row_index") or -1) == ri:
+                    return row
     yes_rows = [r for r in matched if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
     if len(yes_rows) == 1:
         return yes_rows[0]
-    if len(matched) == 1:
-        return matched[0]
     if len(yes_rows) > 1:
         return min(yes_rows, key=lambda r: int(r.get("row_index") or 0))
     return None
@@ -1854,7 +1947,7 @@ def _resolve_switch_highlight_tiktok_username(owner_username: str, alias: str) -
         if _device_editor_effective_alias(item) != alias_clean:
             continue
         matched.append(item)
-    pick = _pick_device_editor_bucket_row(matched)
+    pick = _pick_device_editor_bucket_row(matched, owner, alias_clean)
     if not pick:
         return ""
     return _normalize_tiktok_username_key(pick.get("username"))
@@ -1957,7 +2050,7 @@ def _get_highlight_account_stats(owner_username: str, alias: str) -> dict[str, o
         matched.append(item)
     if not matched:
         return empty
-    pick = _pick_device_editor_bucket_row(matched)
+    pick = _pick_device_editor_bucket_row(matched, owner, alias_clean)
     if not pick:
         return empty
     return {
@@ -4109,10 +4202,9 @@ def _db_set_env_status(
 
 def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, owner_username: str) -> None:
     """
-    切号高亮不变量（与前端约定一致）：
-    - 同一 owner 下，按「COALESCE(TRIM(assigned_alias), TRIM(device_alias))」分桶（与档案别名口径一致）；
-    - 每桶仅 1 条：强制 switch_highlight = 是；
-    - 每桶 ≥2 条：有且仅有一条为「是」；若 0 条为是则取最小 row_index 为是，若多条为是则保留其中最小 row_index 为是。
+    切号高亮不变量：
+    - 单账号桶：强制 switch_highlight = 是；
+    - 多账号自动切号桶：按当前北京时段计划派生高亮（不认切号 OP 写入）。
     """
     owner_username = str(owner_username or "").strip()
     if not owner_username:
@@ -4137,7 +4229,7 @@ def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, 
         buckets.setdefault(key, []).append(r)
 
     now = now_text()
-    for _key, grp in buckets.items():
+    for bucket_key, grp in buckets.items():
         if len(grp) == 1:
             rid = int(grp[0]["row_index"])
             if _normalize_switch_highlight(grp[0].get("switch_highlight")) != "是":
@@ -4150,27 +4242,8 @@ def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, 
                     (now, owner_username, rid),
                 )
             continue
-        indices = [int(r["row_index"]) for r in grp]
-        yes_rows = [r for r in grp if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
-        if len(yes_rows) == 1:
-            winner = int(yes_rows[0]["row_index"])
-        elif len(yes_rows) == 0:
-            # 多条且均为「否」：允许（切号流程中「备份并清理」已清掉高亮、还原尚未回传前不应自动点亮任一条）
-            continue
-        else:
-            winner = min(int(r["row_index"]) for r in yes_rows)
-        for r in grp:
-            rid = int(r["row_index"])
-            val = "是" if rid == winner else "否"
-            if _normalize_switch_highlight(r.get("switch_highlight")) != val:
-                conn.execute(
-                    """
-                    UPDATE device_editor_rows
-                    SET switch_highlight = ?, updated_at = ?
-                    WHERE owner_username = ? AND row_index = ?
-                    """,
-                    (val, now, owner_username, rid),
-                )
+        if bucket_key:
+            _sync_switch_highlight_from_slot(conn, owner_username, bucket_key)
 
 
 def _db_apply_switch_highlight_exclusive(conn: sqlite3.Connection, owner_username: str, row_index: int, now: str | None = None) -> None:
@@ -4212,7 +4285,7 @@ def _db_apply_switch_highlight_exclusive(conn: sqlite3.Connection, owner_usernam
 
 
 def _apply_cut_switch_highlight_intent(owner_username: str, target_row_index: int) -> bool:
-    """切号任务入队时立即切换环境归属高亮；设备还原/登录成败不回滚。"""
+    """切号任务入队：仅更新 env_status；高亮由时段计划派生，不在此写入。"""
     owner = str(owner_username or "").strip()
     try:
         tid = int(target_row_index)
@@ -4223,7 +4296,6 @@ def _apply_cut_switch_highlight_intent(owner_username: str, target_row_index: in
     conn = _get_db()
     try:
         now = now_text()
-        _db_apply_switch_highlight_exclusive(conn, owner, tid, now)
         row = conn.execute(
             """
             SELECT assigned_alias, device_alias
@@ -4244,7 +4316,9 @@ def _apply_cut_switch_highlight_intent(owner_username: str, target_row_index: in
                 """,
                 (now, owner, bucket, tid),
             )
-        _db_set_env_status(conn, owner, tid, ENV_STATUS_PENDING, now)
+            _db_set_env_status(conn, owner, tid, ENV_STATUS_PENDING, now)
+            if bucket:
+                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         return True
@@ -4272,35 +4346,33 @@ def _maybe_apply_cut_switch_highlight_on_enqueue(
 
 
 def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -> None:
-    """设备回传「备份并清理/清理」成功时幂等确认切号高亮（入队时已切换归属，此处不回滚）。"""
+    """设备回传「备份并清理/清理」成功：仅确认 env_status（高亮由时段计划派生）。"""
     mode = str(data.get("cut_switch_after_backup") or "").strip().lower()
     if mode not in ("clear_source_for_restore", "exclusive_activate_target"):
         return
     conn = _get_db()
     try:
         now = now_text()
+        bucket = ""
         if mode == "clear_source_for_restore":
-            br = data.get("backup_record_id")
-            try:
-                rid = int(br) if br is not None else 0
-            except (TypeError, ValueError):
-                rid = 0
-            if rid > 0:
-                conn.execute(
-                    """
-                    UPDATE device_editor_rows
-                    SET switch_highlight = '否', updated_at = ?
-                    WHERE owner_username = ? AND row_index = ?
-                    """,
-                    (now, owner_username, rid),
-                )
             tr = data.get("cut_switch_target_row_index")
             try:
                 tid = int(tr) if tr is not None else -1
             except (TypeError, ValueError):
                 tid = -1
             if tid >= 0:
-                _db_apply_switch_highlight_exclusive(conn, owner_username, tid, now)
+                _db_set_env_status(conn, owner_username, tid, ENV_STATUS_PENDING, now)
+                row = conn.execute(
+                    """
+                    SELECT assigned_alias, device_alias
+                    FROM device_editor_rows
+                    WHERE owner_username = ? AND row_index = ?
+                    LIMIT 1
+                    """,
+                    (owner_username, tid),
+                ).fetchone()
+                if row:
+                    bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
         elif mode == "exclusive_activate_target":
             tr = data.get("cut_switch_target_row_index")
             try:
@@ -4308,8 +4380,20 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
             except (TypeError, ValueError):
                 tid = -1
             if tid >= 0:
-                _db_apply_switch_highlight_exclusive(conn, owner_username, tid, now)
                 _db_set_env_status(conn, owner_username, tid, ENV_STATUS_ACTIVE, now)
+                row = conn.execute(
+                    """
+                    SELECT assigned_alias, device_alias
+                    FROM device_editor_rows
+                    WHERE owner_username = ? AND row_index = ?
+                    LIMIT 1
+                    """,
+                    (owner_username, tid),
+                ).fetchone()
+                if row:
+                    bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
+        if bucket:
+            _sync_switch_highlight_from_slot(conn, owner_username, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner_username)
         conn.commit()
     finally:
@@ -4317,7 +4401,7 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
 
 
 def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) -> None:
-    """设备回传「还原」成功时，幂等确认高亮并将环境标为活跃。"""
+    """设备回传「还原」成功：标 env 活跃；高亮由时段计划派生。"""
     owner = str(owner_username or "").strip()
     if not owner:
         return
@@ -4327,8 +4411,20 @@ def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) 
     conn = _get_db()
     try:
         now = now_text()
-        _db_apply_switch_highlight_exclusive(conn, owner, tid, now)
         _db_set_env_status(conn, owner, tid, ENV_STATUS_ACTIVE, now)
+        row = conn.execute(
+            """
+            SELECT assigned_alias, device_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            LIMIT 1
+            """,
+            (owner, tid),
+        ).fetchone()
+        if row:
+            bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
+            if bucket:
+                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
     finally:
@@ -4363,7 +4459,7 @@ def _resolve_cut_switch_source_row_index(data: dict) -> int:
 
 
 def _device_ops_rollback_cut_switch_highlight(owner_username: str, data: dict) -> None:
-    """切号失败时回溯高亮到源账号（backup_record_id）。"""
+    """切号失败：高亮仍按时段计划；源账号 env 标活跃。"""
     owner = str(owner_username or "").strip()
     if not owner:
         return
@@ -4373,8 +4469,20 @@ def _device_ops_rollback_cut_switch_highlight(owner_username: str, data: dict) -
     conn = _get_db()
     try:
         now = now_text()
-        _db_apply_switch_highlight_exclusive(conn, owner, source_row, now)
         _db_set_env_status(conn, owner, source_row, ENV_STATUS_ACTIVE, now)
+        row = conn.execute(
+            """
+            SELECT assigned_alias, device_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            LIMIT 1
+            """,
+            (owner, source_row),
+        ).fetchone()
+        if row:
+            bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
+            if bucket:
+                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
     finally:
@@ -5109,9 +5217,9 @@ def _auto_switch_slot_index_at_minute(plan: dict[str, Any], minute_of_day: int) 
     for slot in slots:
         try:
             start = int(slot.get("start_min") or 0)
-            end = int(slot.get("end_min") or 0)
         except (TypeError, ValueError):
-            continue
+            start = 0
+        end = _auto_switch_slot_end_min(slot, slots)
         if start <= minute < end:
             return int(slot.get("slot_index") or 0)
     return int(slots[-1].get("slot_index") or len(slots) - 1)
@@ -5128,13 +5236,16 @@ def _auto_switch_target_row(plan: dict[str, Any], minute_of_day: int) -> dict[st
     return slots[min(idx, len(slots) - 1)]
 
 
-def _auto_switch_highlighted_row(rows: List[dict[str, Any]]) -> dict[str, Any] | None:
-    highlighted = [r for r in rows if _normalize_switch_highlight(r.get("switch_highlight")) == "是"]
-    if len(highlighted) == 1:
-        return highlighted[0]
-    if len(rows) == 1:
-        return rows[0]
-    return None
+def _auto_switch_highlighted_row(
+    rows: List[dict[str, Any]],
+    owner_username: str = "",
+    alias: str = "",
+    schedule_date: str | None = None,
+    minute_of_day: int | None = None,
+) -> dict[str, Any] | None:
+    return _pick_device_editor_bucket_row(
+        rows, owner_username, alias, schedule_date, minute_of_day,
+    )
 
 
 def _resolve_device_id_for_owner_alias(owner_username: str, alias: str, hint_device_id: str = "") -> str | None:
@@ -5856,9 +5967,20 @@ def _auto_switch_tick() -> None:
             slot_key = f"{schedule_date}|{slot_index}"
             bucket_key = _auto_switch_bucket_key(owner, alias_key)
 
-            highlighted = _auto_switch_highlighted_row(rows)
+            highlighted = _auto_switch_highlighted_row(
+                rows, owner, alias_key, schedule_date, minute_of_day,
+            )
+            device_active = next(
+                (
+                    r for r in rows
+                    if str(r.get("env_status") or "").strip() == ENV_STATUS_ACTIVE
+                ),
+                None,
+            )
+            if device_active is None and len(rows) == 1:
+                device_active = rows[0]
             try:
-                current_ri = int(highlighted.get("row_index") or -1) if highlighted else -1
+                current_ri = int(device_active.get("row_index") or -1) if device_active else -1
             except (TypeError, ValueError):
                 current_ri = -1
 
@@ -5901,9 +6023,9 @@ def _auto_switch_tick() -> None:
                 _auto_switch_log(f"跳过：设备任务队列未空闲 device={device_id} alias={alias_key}")
                 continue
 
-            if not highlighted:
+            if not device_active:
                 if len(rows) <= 1:
-                    _auto_switch_log(f"跳过：别名桶内无切号高亮 owner={owner} alias={alias_key}")
+                    _auto_switch_log(f"跳过：别名桶内无法解析设备当前账号 owner={owner} alias={alias_key}")
                     continue
                 if not align_now:
                     continue
@@ -5934,7 +6056,7 @@ def _auto_switch_tick() -> None:
             if not _auto_switch_enabled_now():
                 return
 
-            ok = _auto_switch_enqueue_cut_switch(owner, alias_key, device_id, highlighted, target_row)
+            ok = _auto_switch_enqueue_cut_switch(owner, alias_key, device_id, device_active, target_row)
             if ok:
                 switch_ops_this_tick += 1
                 with store.lock:
@@ -5942,7 +6064,7 @@ def _auto_switch_tick() -> None:
                 state_dirty = True
                 _auto_switch_log(
                     f"已下发切号 | owner={owner} alias={alias_key} slot={slot_key} "
-                    f"{str(highlighted.get('username') or '')} → {str(target_row.get('username') or '')}"
+                    f"{str(device_active.get('username') or '')} → {str(target_row.get('username') or '')}"
                 )
 
     if align_deferred:
@@ -9241,7 +9363,7 @@ def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username:
         for r in dev_rows
         if _normalize_alias_key(_effective_device_editor_alias(dict(r))) == alias_key
     ]
-    pick = _pick_device_editor_bucket_row(matched)
+    pick = _pick_device_editor_bucket_row(matched, owner, alias_key)
     if not pick:
         return None
     username = str(pick.get("username") or "").strip()
@@ -11584,10 +11706,10 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                         WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
                         ELSE device_editor_rows.assigned_alias
                     END,
-                    backup_path = CASE WHEN TRIM(excluded.backup_path) <> '' AND TRIM(COALESCE(device_editor_rows.backup_path, '')) = '' THEN excluded.backup_path ELSE device_editor_rows.backup_path END,
-                    backup_name = CASE WHEN TRIM(excluded.backup_name) <> '' AND TRIM(COALESCE(device_editor_rows.backup_name, '')) = '' THEN excluded.backup_name ELSE device_editor_rows.backup_name END,
-                    backup_time = CASE WHEN TRIM(excluded.backup_time) <> '' AND TRIM(COALESCE(device_editor_rows.backup_time, '')) = '' THEN excluded.backup_time ELSE device_editor_rows.backup_time END,
-                    backup_status = CASE WHEN TRIM(excluded.backup_status) <> '' AND TRIM(COALESCE(device_editor_rows.backup_status, '')) = '' THEN excluded.backup_status ELSE device_editor_rows.backup_status END,
+                    backup_path = CASE WHEN TRIM(excluded.backup_path) <> '' THEN excluded.backup_path ELSE device_editor_rows.backup_path END,
+                    backup_name = CASE WHEN TRIM(excluded.backup_name) <> '' THEN excluded.backup_name ELSE device_editor_rows.backup_name END,
+                    backup_time = CASE WHEN TRIM(excluded.backup_time) <> '' THEN excluded.backup_time ELSE device_editor_rows.backup_time END,
+                    backup_status = CASE WHEN TRIM(excluded.backup_status) <> '' THEN excluded.backup_status ELSE device_editor_rows.backup_status END,
                     remark = CASE WHEN TRIM(excluded.remark) <> '' AND TRIM(COALESCE(device_editor_rows.remark, '')) = '' THEN excluded.remark ELSE device_editor_rows.remark END,
                     switch_highlight = CASE
                         WHEN TRIM(excluded.switch_highlight) = '是' THEN '是'
@@ -14472,6 +14594,10 @@ def _build_auto_switch_bundle_for_device(
     plan = _daily_plan_for_schedule_date(weekly_plan, schedule_date)
     if not plan:
         raise ValueError(f"本周排班缺少今日计划 date={schedule_date}")
+    minute_of_day = _beijing_minute_of_day()
+    slot_highlight_ri = _resolve_slot_highlight_row_index(
+        owner, alias_key, schedule_date, minute_of_day, rows,
+    )
     runtime = _normalize_user_runtime_state(_load_user_runtime_state(owner))
     mode = str(runtime.get("run_mode") or "growth")
     if mode not in RUN_MODES:
@@ -14479,18 +14605,21 @@ def _build_auto_switch_bundle_for_device(
     accounts: list[dict[str, Any]] = []
     conn = _get_db()
     try:
+        _sync_switch_highlight_from_slot(conn, owner, alias_key, schedule_date, minute_of_day)
+        conn.commit()
         for row in rows:
             username = str(row.get("username") or "").strip()
+            ri = int(row.get("row_index") or 0)
             acct_fields = _account_bundle_fields_for_username(conn, owner, username)
             accounts.append(
                 {
-                    "row_index": int(row.get("row_index") or 0),
+                    "row_index": ri,
                     "username": username,
                     "backup_path": str(row.get("backup_path") or "").strip(),
                     "backup_name": str(row.get("backup_name") or "").strip(),
                     "assigned_alias": str(row.get("assigned_alias") or "").strip(),
                     "device_alias": str(row.get("device_alias") or "").strip(),
-                    "switch_highlight": str(row.get("switch_highlight") or "").strip(),
+                    "switch_highlight": "是" if ri == slot_highlight_ri else "否",
                     "video_count": row.get("video_count"),
                     "follower_count": row.get("follower_count"),
                     "follower_growth": row.get("follower_growth"),

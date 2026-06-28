@@ -19,9 +19,10 @@ import kotlinx.coroutines.sync.withLock
  * 自动切号自治调度器。
  *
  * 时段模型：
- * 1. **对齐阶段**：账号 row 与时段目标不一致 → 入队切号（涨粉暂停）；
- * 2. **基线阶段**：对齐且登录 OK → 涨粉占满时段空档；
+ * 1. **切号阶段**（本时段未 verified）：上一时段收尾 → 备份并即时上报 → 有备份还原 / 无备份自动登录 → 写 verified；
+ * 2. **基线阶段**：本时段已 verified → 涨粉占满空档，不再做对齐校验打断；
  * 3. **插入阶段**：在 [start_min, end_min) 内到点的发作品/互点等 → 暂停涨粉 → 独占 TikTok → 结束后恢复涨粉。
+ * 云端重复下发且时段+账号指纹不变时幂等刷新，已对齐时段不打断自治。
  */
 class AutoSwitchLocalScheduler(
     private val scope: CoroutineScope,
@@ -34,6 +35,8 @@ class AutoSwitchLocalScheduler(
     private val onRefreshWeeklyBundle: suspend () -> Boolean = { false },
     private val isPublishExecutionActive: () -> Boolean = { false },
     private val onStalePublishInflight: (slotKey: String) -> Unit = {},
+    /** 时段切换：收尾上一时段活动统计等（由 [AppCoordinator] 注入）。 */
+    private val onSlotTransition: (prevSlotKey: String, newSlotKey: String) -> Unit = { _, _ -> },
     private val onVerifyPublishInsertionLogin: suspend (
         alias: String,
         deviceId: String,
@@ -46,7 +49,7 @@ class AutoSwitchLocalScheduler(
         deviceId: String,
         targetUsername: String,
     ) -> Boolean = { _, _, _ -> true },
-    /** 高亮已与时段一致但未 verified：登录校验对齐（跳过 clear/restore）。 */
+    /** 时段目标未 verified：登录校验对齐（跳过 clear/restore）。 */
     private val onVerifySlotAlignmentLogin: suspend (
         alias: String,
         deviceId: String,
@@ -94,14 +97,13 @@ class AutoSwitchLocalScheduler(
     private var lastProcessedScheduleDate: String? = null
     private var lastWeeklyRefreshAttemptMs: Long = 0L
 
-    /** 本分钟 tick 判定：高亮账号是否与当前时段目标一致 */
+    /** 本分钟 tick 判定：本时段是否已 verified（切号链已完成）。 */
     @Volatile
     private var accountAlignedWithSlot: Boolean = false
 
     private data class SlotAlignment(
         val needsCutSwitch: Boolean,
         val verifiedAligned: Boolean,
-        val metadataAligned: Boolean,
     )
 
     fun notifyPublishOutcome(
@@ -152,7 +154,7 @@ class AutoSwitchLocalScheduler(
         cutSwitchInflightSlotKey = null
     }
 
-    /** 切号失败或前序步骤失败：清除本机已验证对齐证明。 */
+    /** 切号证明失效：清本地 persisted verified，下分钟 tick 将重试切号链（ledger 仅作审计，不参与闸门）。 */
     fun invalidateSlotAlignment(slotKey: String, reason: String) {
         val sk = slotKey.trim()
         PrefsStore.clearAutoSwitchVerifiedAlignment()
@@ -160,20 +162,10 @@ class AutoSwitchLocalScheduler(
             publishLoginVerifiedSlotKey = null
         }
         accountAlignedWithSlot = false
-        clearHighlightInBundle()
         if (alias.isNotBlank()) {
             val slotLabel = sk.ifBlank { "-" }
             LogCenter.op(alias, "【自动切号】对齐证明失效 slot=$slotLabel：$reason")
         }
-    }
-
-    private fun clearHighlightInBundle() {
-        val current = bundle ?: return
-        val accounts = current.accounts.orEmpty().map { acc ->
-            acc.copy(switch_highlight = "否")
-        }
-        bundle = current.copy(accounts = accounts)
-        syncBundleHolder()
     }
 
     /** 切号链前序步骤失败（如硬停）时，丢弃同 slot 尚未执行的还原 OP，避免在错误状态下还原。 */
@@ -295,14 +287,12 @@ class AutoSwitchLocalScheduler(
         syncBundleHolder()
     }
 
-    /** 跨天仍在本周内：仅刷新内存 bundle；跨周由 [onRefreshWeeklyBundle] 拉新包。 */
-    fun refreshWeeklyBundle(bundle: AutoSwitchBundle) {
-        val verifiedRi = PrefsStore.getAutoSwitchVerifiedRowIndex()
-        val merged = if (verifiedRi >= 0) {
-            mergeVerifiedHighlight(bundle, verifiedRi)
-        } else {
-            bundle
-        }
+    /** 跨天仍在本周内：仅刷新内存 bundle；跨周由 [onRefreshWeeklyBundle] 拉新包。返回是否时段+账号指纹未变。 */
+    fun refreshWeeklyBundle(bundle: AutoSwitchBundle): Boolean {
+        val local = this.bundle
+        val equivalent = local != null && local.isScheduleAndAccountsEquivalentTo(bundle)
+        val mergedIncoming = bundle.mergePreservingLocalRuntimeState(local)
+        val merged = mergedIncoming
         this.bundle = merged
         syncBundleHolder()
         lastWeeklyRefreshAttemptMs = 0L
@@ -311,18 +301,28 @@ class AutoSwitchLocalScheduler(
         if (weekStart.isNotBlank() && weekEnd.isNotBlank()) {
             PrefsStore.setAutoSwitchWeekRange(weekStart, weekEnd)
         }
+        if (equivalent) {
+            accountAlignedWithSlot = isCurrentSlotEnvironmentCommitted()
+        }
+        val fpNote = if (equivalent) "（时段+账号未变，幂等刷新）" else ""
         LogCenter.op(
             alias,
-            "【自动切号】已刷新周计划 bundle week=$weekStart~$weekEnd days=${merged.weekly_plan?.day_plans?.size ?: 0}",
+            "【自动切号】已刷新周计划 bundle week=$weekStart~$weekEnd days=${merged.weekly_plan?.day_plans?.size ?: 0}$fpNote",
         )
+        return equivalent
     }
 
-    private fun mergeVerifiedHighlight(bundle: AutoSwitchBundle, verifiedRi: Int): AutoSwitchBundle {
-        val accounts = bundle.accounts.orEmpty().map { acc ->
-            val rowRi = acc.row_index ?: -1
-            acc.copy(switch_highlight = if (rowRi == verifiedRi) "是" else "否")
-        }
-        return bundle.copy(accounts = accounts)
+    /** 本时段环境已让位给目标账号（还原/自动登录成功并 verified）。 */
+    fun isCurrentSlotEnvironmentCommitted(): Boolean {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
+        val b = bundle ?: return false
+        val scheduleDate = beijingDateStr()
+        val minuteOfDay = beijingMinuteOfDay()
+        val plan = b.dailyPlanForDate(scheduleDate) ?: return false
+        val slotIndex = AutoSwitchSlotWindow.resolveSlotIndex(plan, minuteOfDay)
+        val slotKey = "$scheduleDate|$slotIndex"
+        val targetRi = b.resolveCurrentSlotTargetAccount(scheduleDate, minuteOfDay)?.row_index ?: return false
+        return PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
     }
 
     fun notifyCutSwitchAligned(targetRowIndex: Int, slotKey: String) {
@@ -333,16 +333,9 @@ class AutoSwitchLocalScheduler(
             return
         }
         cancelDuplicatePendingCutSwitchOps(sk)
-        val current = bundle ?: return
-        val accounts = current.accounts.orEmpty().map { acc ->
-            val rowRi = acc.row_index ?: -1
-            acc.copy(switch_highlight = if (rowRi == ri) "是" else "否")
-        }
-        bundle = current.copy(accounts = accounts)
         cutSwitchInflightSlotKey = null
         PrefsStore.setAutoSwitchVerifiedAlignment(sk, ri)
         accountAlignedWithSlot = true
-        syncBundleHolder()
     }
 
     private fun syncBundleHolder() {
@@ -372,7 +365,7 @@ class AutoSwitchLocalScheduler(
         stop(clearState = false)
         this.alias = alias.trim()
         this.deviceId = deviceId.trim()
-        this.bundle = bundle
+        this.bundle = bundle.withCurrentTimeSlotHighlight()
         syncBundleHolder()
         this.alignOnNextTick = true
         lastSlotKey = PrefsStore.getAutoSwitchLastSlotKey()
@@ -380,7 +373,7 @@ class AutoSwitchLocalScheduler(
         publishAbortedKey = PrefsStore.getAutoSwitchPublishAbortedKey()
         insertionInflight = null
         recoverStalePublishInflightOnStart()
-        accountAlignedWithSlot = false
+        accountAlignedWithSlot = isCurrentSlotEnvironmentCommitted()
         lastProcessedScheduleDate = null
         PrefsStore.setAutoSwitchLastSchedulerRevision(rev)
         drainJob = scope.launch { drainQueueLoop() }
@@ -542,6 +535,9 @@ class AutoSwitchLocalScheduler(
             publishAbortedKey = null
             insertionInflight = null
             publishLoginVerifiedSlotKey = null
+            opQueue.clear()
+            busy.set(false)
+            AutoSwitchLedger.cancelQueuedCutSwitchOpsForScheduleDate(lastProcessedScheduleDate!!)
             PrefsStore.clearAutoSwitchVerifiedAlignment()
             PrefsStore.setAutoSwitchPublishDoneKey(null)
             PrefsStore.setAutoSwitchPublishAbortedKey(null)
@@ -578,7 +574,7 @@ class AutoSwitchLocalScheduler(
         }
 
         val minuteOfDay = beijingMinuteOfDay()
-        val targetSlot = resolveTargetSlot(plan, minuteOfDay) ?: run {
+        val targetSlot = AutoSwitchSlotWindow.resolveTargetSlot(plan, minuteOfDay) ?: run {
             accountAlignedWithSlot = false
             LogCenter.op(alias, "【自动切号】调度跳过：当前分钟 $minuteOfDay 无匹配时段")
             return
@@ -589,7 +585,7 @@ class AutoSwitchLocalScheduler(
             return
         }
 
-        val slotIndex = resolveSlotIndex(plan, minuteOfDay)
+        val slotIndex = AutoSwitchSlotWindow.resolveSlotIndex(plan, minuteOfDay)
         val slotKey = "$scheduleDate|$slotIndex"
 
         refreshInsertionSlotState(slotKey, minuteOfDay, targetSlot)
@@ -602,15 +598,17 @@ class AutoSwitchLocalScheduler(
             LogCenter.op(alias, "【自动切号】调度跳过：时段目标 row_index=$targetRi 不在 bundle.accounts")
             return
         }
-        val alignment = evaluateSlotAlignment(slotKey, targetRi, accounts)
+        bundle = currentBundle.withTimeSlotHighlight(scheduleDate, minuteOfDay)
+        syncBundleHolder()
+
+        val alignment = evaluateSlotAlignment(slotKey, targetRi)
         val needsCutSwitch = alignment.needsCutSwitch
         accountAlignedWithSlot = alignment.verifiedAligned
 
-        if (needsCutSwitch && alignment.metadataAligned && !alignment.verifiedAligned) {
-            LogCenter.op(
-                alias,
-                "【自动切号】高亮与时段一致但未验证对齐，仍入队切号 slot=$slotKey targetRi=$targetRi",
-            )
+        if (lastSlotKey != null && lastSlotKey != slotKey) {
+            onSlotTransition(lastSlotKey!!, slotKey)
+            lastSlotKey = slotKey
+            PrefsStore.setAutoSwitchLastSlotKey(slotKey)
         }
 
         val busyReason = if (needsCutSwitch) {
@@ -634,7 +632,7 @@ class AutoSwitchLocalScheduler(
             lastSlotKey = slotKey
             PrefsStore.setAutoSwitchLastSlotKey(slotKey)
             val enqueuedInsertion = scheduleSlotInsertions(
-                currentBundle, targetSlot, targetRow, scheduleDate, slotKey, minuteOfDay,
+                bundle ?: currentBundle, targetSlot, targetRow, scheduleDate, slotKey, minuteOfDay,
             )
             tryResumeGrowthBaseline(enqueuedInsertion = enqueuedInsertion)
             return
@@ -646,38 +644,50 @@ class AutoSwitchLocalScheduler(
             return
         }
 
-        val highlightedForSource = resolveHighlightedRowStrict(accounts) ?: resolveHighlightedRow(accounts)
+        val deviceCommittedRow = resolveDeviceCommittedAccount(accounts, targetRow, slotKey)
         val cutEnqueued = when {
-            highlightedForSource == null -> {
+            deviceCommittedRow == null -> {
+                val logUser = PrefsStore.getLogContextUsername()?.trim()?.lowercase().orEmpty()
+                val targetUserKey = targetRow.username?.trim()?.lowercase().orEmpty()
+                if (logUser.isNotBlank() && logUser == targetUserKey &&
+                    tryLightweightSlotAlignmentVerify(targetRow, slotKey)
+                ) {
+                    tryResumeGrowthBaseline(enqueuedInsertion = false)
+                    return
+                }
                 if (accounts.size <= 1) {
                     val soleRi = accounts.firstOrNull()?.row_index ?: -1
                     if (soleRi != targetRi) {
-                        LogCenter.op(alias, "【自动切号】调度跳过：无高亮且仅 1 个账号，无法切号")
+                        LogCenter.op(alias, "【自动切号】调度跳过：无法推断设备当前账号且仅 1 个 bundle 账号，无法切号")
                         return
                     }
                     if (tryLightweightSlotAlignmentVerify(targetRow, slotKey)) {
                         tryResumeGrowthBaseline(enqueuedInsertion = false)
                         return
                     }
-                    enqueueBootstrapCutSwitch(currentBundle, targetRow, slotKey)
+                    enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)
                 } else {
-                    enqueueBootstrapCutSwitch(currentBundle, targetRow, slotKey)
+                    enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)
                 }
             }
-            (highlightedForSource.row_index ?: -1) == targetRi -> {
+            (deviceCommittedRow.row_index ?: -1) == targetRi -> {
                 if (tryLightweightSlotAlignmentVerify(targetRow, slotKey)) {
                     tryResumeGrowthBaseline(enqueuedInsertion = false)
                     return
                 }
+                LogCenter.op(
+                    alias,
+                    "【自动切号】时段 $slotKey 设备已是 ${targetRow.username} 但未 verified，登录校验对齐中",
+                )
                 false
             }
             else -> {
-                val sourceUser = highlightedForSource.username?.trim().orEmpty()
+                val sourceUser = deviceCommittedRow.username?.trim().orEmpty()
                 LogCenter.op(
                     alias,
-                    "【自动切号】时段 $slotKey 应对齐 $targetUser（当前 $sourceUser），入队切号",
+                    "【自动切号】时段 $slotKey 应对齐 $targetUser（设备当前 $sourceUser），入队切号",
                 )
-                enqueueCutSwitch(currentBundle, highlightedForSource, targetRow, slotKey)
+                enqueueCutSwitch(bundle ?: currentBundle, deviceCommittedRow, targetRow, slotKey)
             }
         }
         if (cutEnqueued) {
@@ -752,6 +762,10 @@ class AutoSwitchLocalScheduler(
         if (targetUser.isBlank()) return false
         val sk = slotKey.trim()
         if (sk.isEmpty()) return false
+        if (PrefsStore.isAutoSwitchVerifiedAligned(sk, targetRi)) {
+            notifyCutSwitchAligned(targetRi, sk)
+            return true
+        }
         if (hasCutSwitchWorkInProgress(sk, targetRi)) return false
 
         lightweightVerifyInflightSlotKey = sk
@@ -760,7 +774,7 @@ class AutoSwitchLocalScheduler(
             onPauseGrowth()
             LogCenter.op(
                 alias,
-                "【自动切号】时段 $sk 高亮已是 $targetUser 但未 verified，执行登录校验对齐（跳过 clear/restore）",
+                "【自动切号】时段 $sk 设备已是 $targetUser 但未 verified，执行登录校验对齐（跳过 clear/restore）",
             )
             val loginOk = onVerifySlotAlignmentLogin(alias, deviceId, targetUser, sk, targetRi)
             if (!loginOk) {
@@ -875,52 +889,40 @@ class AutoSwitchLocalScheduler(
     private fun evaluateSlotAlignment(
         slotKey: String,
         targetRi: Int,
-        accounts: List<AutoSwitchAccount>,
     ): SlotAlignment {
-        val highlightedStrict = resolveHighlightedRowStrict(accounts)
-        val metadataAligned = (highlightedStrict?.row_index ?: -1) == targetRi
-
-        // 先只按高亮是否对齐判断；下面这些 verified / ledger 条件暂时注释掉，后续再恢复。
-        // val verifiedAligned =
-        //     PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi) &&
-        //         AutoSwitchLedger.isCutSwitchSlotVerified(slotKey, targetRi) &&
-        //         !AutoSwitchLedger.isCutSwitchSlotInflight(slotKey)
-        // if (verifiedAligned) {
-        //     return SlotAlignment(
-        //         needsCutSwitch = false,
-        //         verifiedAligned = true,
-        //         metadataAligned = true,
-        //     )
-        // }
+        val verified = PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
         return SlotAlignment(
-            needsCutSwitch = !metadataAligned,
-            verifiedAligned = metadataAligned,
-            metadataAligned = metadataAligned,
+            needsCutSwitch = !verified,
+            verifiedAligned = verified,
         )
     }
 
-    /** 对齐判定专用：只信 switch_highlight，不用 logContext 兜底。 */
-    private fun resolveHighlightedRowStrict(accounts: List<AutoSwitchAccount>): AutoSwitchAccount? {
-        val highlighted = accounts.filter { normalizeSwitchHighlight(it.switch_highlight) }
-        if (highlighted.size == 1) return highlighted[0]
-        if (accounts.size == 1) return accounts[0]
-        return null
-    }
-
-    private fun resolveHighlightedRow(accounts: List<AutoSwitchAccount>): AutoSwitchAccount? {
-        val highlighted = accounts.filter { normalizeSwitchHighlight(it.switch_highlight) }
-        if (highlighted.size == 1) return highlighted[0]
-        if (highlighted.size > 1 && alias.isNotBlank()) {
-            LogCenter.op(alias, "【自动切号】bundle 内多个 switch_highlight=是（${highlighted.size}），改用当前登录账号推断")
+    /** 设备环境当前归属账号（用于切号源推断；高亮只认时段，不在此使用）。 */
+    private fun resolveDeviceCommittedAccount(
+        accounts: List<AutoSwitchAccount>,
+        targetRow: AutoSwitchAccount,
+        slotKey: String,
+    ): AutoSwitchAccount? {
+        val targetRi = targetRow.row_index ?: -1
+        val targetUser = targetRow.username?.trim()?.lowercase().orEmpty()
+        if (PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)) {
+            return accounts.firstOrNull { (it.row_index ?: -1) == targetRi }
         }
-        if (accounts.size == 1) return accounts[0]
-        val logUser = PrefsStore.getLogContextUsername()?.trim()?.lowercase()
-        if (!logUser.isNullOrBlank()) {
+        val logUser = PrefsStore.getLogContextUsername()?.trim()?.lowercase().orEmpty()
+        if (logUser.isNotBlank() && targetUser.isNotBlank() && logUser == targetUser) {
+            return targetRow
+        }
+        val verifiedSk = PrefsStore.getAutoSwitchVerifiedSlotKey().orEmpty()
+        val verifiedRi = PrefsStore.getAutoSwitchVerifiedRowIndex()
+        if (verifiedRi >= 0 && verifiedSk.isNotBlank() &&
+            !PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
+        ) {
+            accounts.firstOrNull { (it.row_index ?: -1) == verifiedRi }?.let { return it }
+        }
+        if (logUser.isNotBlank()) {
             accounts.firstOrNull { it.username?.trim()?.lowercase() == logUser }?.let { return it }
         }
-        if (highlighted.isNotEmpty()) {
-            return highlighted.first()
-        }
+        if (accounts.size == 1) return accounts[0]
         return null
     }
 
@@ -1144,9 +1146,6 @@ class AutoSwitchLocalScheduler(
         return true
     }
 
-    private fun normalizeSwitchHighlight(raw: String?): Boolean =
-        raw?.trim() == "是"
-
     private fun resolveTargetRestoreBackup(
         targetRow: AutoSwitchAccount,
         targetUser: String,
@@ -1174,26 +1173,6 @@ class AutoSwitchLocalScheduler(
             alias,
             "【自动切号】目标 @$targetUser 备份包本机不可用，跳过还原，备份清理后自动登录",
         )
-    }
-
-    private fun resolveSlotIndex(plan: AutoSwitchDailyPlan, minuteOfDay: Int): Int {
-        val slots = plan.slots.orEmpty()
-        if (slots.isEmpty()) return 0
-        val minute = minuteOfDay.coerceIn(0, 1439)
-        for (slot in slots) {
-            val start = slot.start_min ?: 0
-            val end = slot.end_min ?: 0
-            if (start <= minute && minute < end) {
-                return slot.slot_index ?: 0
-            }
-        }
-        return slots.last().slot_index ?: slots.size - 1
-    }
-
-    private fun resolveTargetSlot(plan: AutoSwitchDailyPlan, minuteOfDay: Int): AutoSwitchPlanSlot? {
-        val idx = resolveSlotIndex(plan, minuteOfDay)
-        return plan.slots.orEmpty().firstOrNull { (it.slot_index ?: -1) == idx }
-            ?: plan.slots.orEmpty().getOrNull(idx.coerceAtMost(plan.slots.orEmpty().size - 1))
     }
 
     private fun beijingMinuteOfDay(): Int {

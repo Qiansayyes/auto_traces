@@ -1,5 +1,6 @@
 package com.autotraces.app
 
+import java.io.File
 import java.util.Calendar
 import java.util.TimeZone
 
@@ -60,19 +61,23 @@ object AutoSwitchBundleHolder {
         bundle = current.copy(accounts = accounts)
     }
 
-    private fun beijingMinuteOfDay(): Int {
-        val cal = Calendar.getInstance(beijingTz)
-        return cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
-    }
+    private fun beijingMinuteOfDay(): Int =
+        beijingMinuteOfDay(Calendar.getInstance(beijingTz))
 
-    private fun beijingDateStr(): String {
-        val cal = Calendar.getInstance(beijingTz)
-        val y = cal.get(Calendar.YEAR)
-        val m = cal.get(Calendar.MONTH) + 1
-        val d = cal.get(Calendar.DAY_OF_MONTH)
-        return String.format("%04d-%02d-%02d", y, m, d)
-    }
+    private fun beijingDateStr(): String = beijingDateStr(Calendar.getInstance(beijingTz))
 }
+
+private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
+
+private fun beijingDateStr(cal: Calendar): String {
+    val y = cal.get(Calendar.YEAR)
+    val m = cal.get(Calendar.MONTH) + 1
+    val d = cal.get(Calendar.DAY_OF_MONTH)
+    return String.format("%04d-%02d-%02d", y, m, d)
+}
+
+private fun beijingMinuteOfDay(cal: Calendar): Int =
+    cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
 
 /** 从周计划 bundle 解析指定日期的 daily_plan（跨天自治用）。 */
 fun AutoSwitchBundle.dailyPlanForDate(date: String): AutoSwitchDailyPlan? {
@@ -120,24 +125,44 @@ fun AutoSwitchBundle.resolveCurrentSlotTargetAccount(
     if (date.isEmpty() || !isDateInWeekRange(date)) return null
     val plan = dailyPlanForDate(date) ?: return null
     val minute = minuteOfDay.coerceIn(0, 1439)
-    val targetSlot = plan.resolveTargetSlot(minute) ?: return null
+    val targetSlot = AutoSwitchSlotWindow.resolveTargetSlot(plan, minute) ?: return null
     if (!AutoSwitchSlotWindow.isWithinSlot(minute, targetSlot)) return null
     val targetRi = targetSlot.row_index ?: -1
     return accounts.orEmpty().firstOrNull { (it.row_index ?: -1) == targetRi }
 }
 
-fun AutoSwitchBundle.resolveHighlightedAccount(logContextUsername: String?): AutoSwitchAccount? {
+/** 高亮仅由当前时段计划决定；时段外或计划缺失时再回退 logContext / 单账号。 */
+fun AutoSwitchBundle.resolveHighlightedAccount(logContextUsername: String? = null): AutoSwitchAccount? {
     val accounts = accounts.orEmpty()
     if (accounts.isEmpty()) return null
-    val highlighted = accounts.filter { it.switch_highlight?.trim() == "是" }
-    if (highlighted.size == 1) return highlighted[0]
+    val cal = Calendar.getInstance(beijingTz)
+    val scheduleDate = beijingDateStr(cal)
+    val minuteOfDay = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+    resolveCurrentSlotTargetAccount(scheduleDate, minuteOfDay)?.let { return it }
     val logUser = logContextUsername?.trim()?.lowercase()
     if (!logUser.isNullOrBlank()) {
         accounts.firstOrNull { it.username?.trim()?.lowercase() == logUser }?.let { return it }
     }
-    if (highlighted.isNotEmpty()) return highlighted.first()
     if (accounts.size == 1) return accounts[0]
     return null
+}
+
+/** 按时段 row_index 刷新 bundle 内 switch_highlight（云端/本机展示均只认时间）。 */
+fun AutoSwitchBundle.withTimeSlotHighlight(scheduleDate: String, minuteOfDay: Int): AutoSwitchBundle {
+    val targetRi = resolveCurrentSlotTargetAccount(scheduleDate, minuteOfDay)?.row_index ?: return this
+    val accounts = accounts.orEmpty().map { acc ->
+        val rowRi = acc.row_index ?: -1
+        acc.copy(switch_highlight = if (rowRi == targetRi) "是" else "否")
+    }
+    return copy(accounts = accounts)
+}
+
+fun AutoSwitchBundle.withCurrentTimeSlotHighlight(): AutoSwitchBundle {
+    val cal = Calendar.getInstance(beijingTz)
+    return withTimeSlotHighlight(
+        beijingDateStr(cal),
+        cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE),
+    )
 }
 
 /** 从 bundle 内 configs_by_username 解析指定账号的 enter 冻结配置。 */
@@ -195,19 +220,80 @@ fun AutoSwitchAccount.toAssignedAccountResponse(): DeviceAssignedAccountResponse
     )
 }
 
-private fun AutoSwitchDailyPlan.resolveTargetSlot(minuteOfDay: Int): AutoSwitchPlanSlot? {
-    val slots = slots.orEmpty()
-    if (slots.isEmpty()) return null
-    val minute = minuteOfDay.coerceIn(0, 1439)
-    var idx = slots.last().slot_index ?: slots.size - 1
-    for (slot in slots) {
-        val start = slot.start_min ?: 0
-        val end = slot.end_min ?: 0
-        if (start <= minute && minute < end) {
-            idx = slot.slot_index ?: idx
-            break
+/**
+ * 自治幂等键：账号 row + username 与周计划各日时段（slot_index / row / 时间窗）。
+ * 账号数不变且重复下发时，指纹一致则不应触发重新对齐。
+ */
+fun AutoSwitchBundle.scheduleAndAccountsFingerprint(): String {
+    val accountPart = accounts.orEmpty()
+        .mapNotNull { acc ->
+            val ri = acc.row_index ?: return@mapNotNull null
+            val user = acc.username?.trim().orEmpty().lowercase()
+            "$ri:$user"
+        }
+        .sorted()
+        .joinToString("|")
+    val planPart = weekly_plan?.day_plans.orEmpty()
+        .mapNotNull { dp ->
+            val date = dp.schedule_date?.trim().orEmpty()
+            if (date.isEmpty()) return@mapNotNull null
+            val slots = dp.daily_plan?.slots.orEmpty()
+                .mapNotNull { slot ->
+                    val idx = slot.slot_index ?: return@mapNotNull null
+                    val ri = slot.row_index ?: -1
+                    val start = slot.start_min ?: 0
+                    val end = slot.end_min ?: 1440
+                    val pub = slot.auto_publish_minute
+                    "$idx:$ri:$start-$end:p$pub"
+                }
+                .sorted()
+                .joinToString(",")
+            "$date=[$slots]"
+        }
+        .sorted()
+        .joinToString(";")
+    val legacy = if (planPart.isEmpty() && !daily_plan?.slots.isNullOrEmpty()) {
+        val date = schedule_date?.trim().orEmpty()
+        val slots = daily_plan?.slots.orEmpty()
+            .mapNotNull { slot ->
+                val idx = slot.slot_index ?: return@mapNotNull null
+                val ri = slot.row_index ?: -1
+                val start = slot.start_min ?: 0
+                val end = slot.end_min ?: 1440
+                "$idx:$ri:$start-$end"
+            }
+            .sorted()
+            .joinToString(",")
+        if (date.isNotEmpty()) "$date=[$slots]" else ""
+    } else {
+        ""
+    }
+    return "acc[$accountPart]|plan[${planPart.ifBlank { legacy }}]"
+}
+
+fun AutoSwitchBundle.isScheduleAndAccountsEquivalentTo(other: AutoSwitchBundle?): Boolean {
+    if (other == null) return false
+    return scheduleAndAccountsFingerprint() == other.scheduleAndAccountsFingerprint()
+}
+
+/** 云端重下发时保留本机时段高亮与本机存在的备份路径，避免打断自治。 */
+fun AutoSwitchBundle.mergePreservingLocalRuntimeState(local: AutoSwitchBundle?): AutoSwitchBundle {
+    val prev = local ?: return this.withCurrentTimeSlotHighlight()
+    var mergedAccounts = withCurrentTimeSlotHighlight().accounts.orEmpty()
+    val localByRow = prev.accounts.orEmpty().associateBy { it.row_index ?: -1 }
+    mergedAccounts = mergedAccounts.map { acc ->
+        val ri = acc.row_index ?: return@map acc
+        val localAcc = localByRow[ri] ?: return@map acc
+        val localPath = localAcc.backup_path?.trim().orEmpty()
+        val localName = localAcc.backup_name?.trim().orEmpty()
+        if (localPath.isNotEmpty() && File(localPath).exists()) {
+            acc.copy(
+                backup_path = localPath,
+                backup_name = localName.ifBlank { acc.backup_name },
+            )
+        } else {
+            acc
         }
     }
-    return slots.firstOrNull { (it.slot_index ?: -1) == idx }
-        ?: slots.getOrNull(idx.coerceAtMost(slots.size - 1))
+    return copy(accounts = mergedAccounts)
 }
