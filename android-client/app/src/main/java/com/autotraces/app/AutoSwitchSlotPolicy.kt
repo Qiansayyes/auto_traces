@@ -86,6 +86,28 @@ interface AutoSwitchSlotInsertionHost {
     suspend fun verifyInsertionAccountLoggedIn(ctx: AutoSwitchSlotTickContext, kind: String): Boolean
 }
 
+/** 自动切号发作品：video_count 解析与条数策略（客户端与 [PublishPostSlotInsertion] 共用）。 */
+internal object AutoSwitchPublishVideoCount {
+    const val NEW_ACCOUNT_COOLDOWN = -1
+
+    fun parseRaw(raw: String?): Int {
+        val text = raw?.trim().orEmpty()
+        if (text.isEmpty()) return 0
+        return text.toIntOrNull() ?: 0
+    }
+
+    fun isNewAccountCooldown(raw: String?): Boolean = parseRaw(raw) == NEW_ACCOUNT_COOLDOWN
+
+    fun autoPublishCountFor(videoCount: Int): Int {
+        val vc = videoCount.coerceAtLeast(0)
+        return when {
+            vc < 3 -> 1
+            vc <= 9 -> 2
+            else -> 3
+        }
+    }
+}
+
 /** 时段内可插入的独占操作（发作品、互点等）。 */
 interface AutoSwitchSlotInsertion {
     val kind: String
@@ -125,10 +147,15 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
 
         val doneKey = "$slotKey|publish"
         val abortKey = "$slotKey|publish_aborted"
-        if (PrefsStore.getAutoSwitchPublishDoneKey() == doneKey ||
-            PrefsStore.getAutoSwitchPublishAbortedKey() == abortKey
-        ) {
+        if (PrefsStore.getAutoSwitchPublishDoneKey() == doneKey) {
             return false
+        }
+        if (PrefsStore.getAutoSwitchPublishAbortedKey() == abortKey) {
+            if (PrefsStore.hasRecoverableAutoSwitchPublish(slotKey)) {
+                PrefsStore.setAutoSwitchPublishAbortedKey(null)
+            } else {
+                return false
+            }
         }
         if (host.isInsertionInflight(kind, slotKey)) return false
         val resumeAccount = ctx.account.username?.trim().orEmpty()
@@ -136,7 +163,10 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
         if (
             PrefsStore.isPublishPostPending() &&
             PrefsStore.getAutoSwitchPublishSlotKey()?.trim() == slotKey &&
-            PrefsStore.getPublishPostResumeNextIndex(resumeAccount.ifBlank { ctx.alias }) > 0
+            (
+                PrefsStore.getPublishPostResumeNextIndex(resumeAccount.ifBlank { ctx.alias }) > 0 ||
+                    PrefsStore.isPublishPostMaterialReady()
+                )
         ) {
             logOnce(ctx.alias, slotKey, "resume_pending") {
                 LogCenter.op(
@@ -181,8 +211,10 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             return false
         }
 
-        val rawVc = parseVideoCountRaw(ctx.account.video_count)
-        if (rawVc == NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN) {
+        val rawVc = AutoSwitchPublishVideoCount.parseRaw(ctx.account.video_count)
+        if (rawVc == AutoSwitchPublishVideoCount.NEW_ACCOUNT_COOLDOWN) {
+            // 基线阶段 [AutoSwitchLocalScheduler.tryGraduateNewAccountCooldownAtPublishMinute] 应已处理；
+            // 此处仅作兜底，且绝不走独占入队/登录校验。
             host.graduateNewAccountVideoCount(ctx.account)
             AutoSwitchLedger.recordVideoCountGraduate(
                 username = ctx.account.username?.trim().orEmpty(),
@@ -192,7 +224,7 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             PrefsStore.setAutoSwitchPublishDoneKey(doneKey)
             LogCenter.op(
                 ctx.alias,
-                "【自动切号】跳过发作品：新号冷却 video_count=-1→0 account=${ctx.account.username}（本时段不发，下一时段起正常发）",
+                "【自动切号】跳过发作品：新号冷却 video_count=-1→0 account=${ctx.account.username}（本时段不发作品，继续涨粉基线）",
             )
             return false
         }
@@ -207,7 +239,7 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             return false
         }
 
-        val publishCount = autoPublishCountForVideoCount(rawVc)
+        val publishCount = AutoSwitchPublishVideoCount.autoPublishCountFor(rawVc)
         val pkg = ctx.bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
         val aliasClean = ctx.bundle.device_alias?.trim().orEmpty().ifBlank { ctx.alias }
         val opId = newLocalOpId("publish")
@@ -249,7 +281,6 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
     }
 
     companion object {
-        private const val NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN = -1
         private val onceLogKeys = mutableSetOf<String>()
 
         private fun logOnce(alias: String, slotKey: String, tag: String, block: () -> Unit) {
@@ -259,20 +290,5 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
 
         private fun newLocalOpId(prefix: String): String =
             "local-as-$prefix-${System.currentTimeMillis()}-${Random.nextInt(1000)}"
-
-        private fun parseVideoCountRaw(raw: String?): Int {
-            val text = raw?.trim().orEmpty()
-            if (text.isEmpty()) return 0
-            return text.toIntOrNull() ?: 0
-        }
-
-        private fun autoPublishCountForVideoCount(videoCount: Int): Int {
-            val vc = videoCount.coerceAtLeast(0)
-            return when {
-                vc < 3 -> 1
-                vc <= 9 -> 2
-                else -> 3
-            }
-        }
     }
 }

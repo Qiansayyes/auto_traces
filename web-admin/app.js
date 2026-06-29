@@ -9995,10 +9995,18 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
       `;
 }
 
+function syncBackupArchiveSearchFromInput() {
+  if (!backupArchiveSearchInput) return;
+  backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
+}
+
 function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
-    deviceAliasGroupsEl.innerHTML = '<div class="hint">暂无备份档案</div>';
+    const emptyHint = backupArchiveSearchQuery
+      ? `未找到匹配「${escapeHtml(backupArchiveSearchQuery)}」的备份档案`
+      : "暂无备份档案";
+    deviceAliasGroupsEl.innerHTML = `<div class="hint">${emptyHint}</div>`;
     return;
   }
   const filteredItems = backupArchiveSearchQuery
@@ -10293,6 +10301,7 @@ function scheduleBackupArchiveSlotHighlightRefresh() {
 async function loadBackupArchiveRecords() {
   if (!deviceAliasGroupsEl) return;
   try {
+    syncBackupArchiveSearchFromInput();
     await loadBoundDeviceAliases().catch(() => {});
     const params = new URLSearchParams({
       page: String(currentBackupArchivePage),
@@ -10519,7 +10528,7 @@ if (accountRecordsPageSizeInput) {
 if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
   const onBackupArchiveSearchChanged = () => {
-    backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
+    syncBackupArchiveSearchFromInput();
     clearTimeout(backupSearchTimer);
     backupSearchTimer = setTimeout(() => {
       currentBackupArchivePage = 1;
@@ -10527,6 +10536,7 @@ if (backupArchiveSearchInput) {
     }, 300);
   };
   backupArchiveSearchInput.addEventListener("input", onBackupArchiveSearchChanged);
+  backupArchiveSearchInput.addEventListener("search", onBackupArchiveSearchChanged);
 }
 if (accountEditorListEl) {
   accountEditorListEl.addEventListener("input", (event) => {

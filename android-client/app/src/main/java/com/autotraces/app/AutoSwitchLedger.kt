@@ -321,6 +321,47 @@ object AutoSwitchLedger {
         )
     }
 
+    /** 进程恢复续发：撤销 stale 失败 outcome，将 publish_post_start 重置为 running。 */
+    fun reopenPublishSlotForResume(slotKey: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        var changed = false
+        val removeIdx = entries.indices.reversed().filter { i ->
+            val e = entries[i]
+            e.slot_key == sk &&
+                e.op_type == "publish_post_outcome" &&
+                e.phase == "failed" &&
+                (e.message.contains("清理残留") ||
+                    e.message.contains("本机已结束") ||
+                    isPublishOutcomeResumable(e))
+        }
+        for (i in removeIdx) {
+            val opId = entries[i].op_id
+            entries.removeAt(i)
+            entryIndexByOpId.remove(opId)
+            changed = true
+        }
+        if (removeIdx.isNotEmpty()) {
+            entryIndexByOpId.clear()
+            entries.forEachIndexed { index, entry -> entryIndexByOpId[entry.op_id] = index }
+        }
+        for (i in entries.indices.reversed()) {
+            val e = entries[i]
+            if (e.slot_key != sk || e.op_type != "publish_post_start") continue
+            if (e.phase == "running") break
+            entries[i] = e.copy(
+                at = nowBeijingText(),
+                status = "running",
+                phase = "running",
+                message = "进程恢复续发",
+            )
+            changed = true
+            break
+        }
+        if (changed) persist()
+    }
+
     fun recordOpFailure(op: DeviceOp, message: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         val payload = op.payload

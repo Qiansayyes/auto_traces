@@ -246,6 +246,7 @@ _DEVICE_EDITOR_PRUNE_INTERVAL_SEC = 120.0
 _device_editor_prune_last_at: dict[str, float] = {}
 _DEVICE_EDITOR_RECONCILE_INTERVAL_SEC = 300.0
 _device_editor_reconcile_last_at: dict[str, float] = {}
+DEVICE_EDITOR_UNASSIGNED_ALIAS_BUCKET = "__UNASSIGNED__"
 _DEVICE_OPS_POLL_MIN_INTERVAL_SEC = 10.0
 _device_ops_poll_last_at: dict[str, float] = {}
 
@@ -4159,8 +4160,53 @@ def _normalized_alias(value: object | None) -> str:
     return str(value or "").strip()
 
 
-def _backup_record_alias_expr() -> str:
-    return "COALESCE(NULLIF(TRIM(assigned_alias), ''), device_alias)"
+def _backup_record_alias_expr(table_alias: str = "") -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    return f"COALESCE(NULLIF(TRIM({prefix}assigned_alias), ''), {prefix}device_alias)"
+
+
+def _editor_username_key_sql(column: str) -> str:
+    """账号 username 比对键：忽略大小写与 leading @。"""
+    return f"LOWER(LTRIM(TRIM({column}), '@'))"
+
+
+def _device_editor_paged_alias_expr(alias_expr: str | None = None) -> str:
+    """分页按别名分组；空别名归入固定桶，避免列表误显示为 0 组。"""
+    expr = alias_expr or _backup_record_alias_expr()
+    return (
+        f"CASE WHEN TRIM({expr}) = '' THEN '{DEVICE_EDITOR_UNASSIGNED_ALIAS_BUCKET}' "
+        f"ELSE {expr} END"
+    )
+
+
+def _ensure_device_editor_rows_materialized(conn: sqlite3.Connection, owner: str) -> tuple[int, int]:
+    """存在设备档案但有效别名为空时，强制对齐一次（不受 reconcile 限频）。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return 0, 0
+    alias_expr = _backup_record_alias_expr()
+    raw = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM device_editor_rows WHERE owner_username = ?",
+            (owner_key,),
+        ).fetchone()[0]
+        or 0
+    )
+    if raw <= 0:
+        return 0, 0
+    with_alias = int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*) FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''
+            """,
+            (owner_key,),
+        ).fetchone()[0]
+        or 0
+    )
+    if with_alias > 0:
+        return 0, 0
+    return _reconcile_editor_alias_bindings(conn, owner_key)
 
 
 def _device_editor_search_sql(
@@ -4205,6 +4251,7 @@ def _device_editor_search_sql(
         )
         """
         return sql, [pattern, pattern, pattern]
+    alias_match = _backup_record_alias_expr(ta)
     sql = f"""
         AND (
             LOWER(TRIM({ta}.username)) LIKE ?
@@ -4215,7 +4262,7 @@ def _device_editor_search_sql(
             OR EXISTS (
                 SELECT 1 FROM account_editor_rows a
                 WHERE a.owner_username = {ta}.owner_username
-                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND {_editor_username_key_sql('a.username')} = {_editor_username_key_sql(f'{ta}.username')}
                   AND (
                     LOWER(TRIM(a.username)) LIKE ?
                     OR LOWER(TRIM(a.assigned_alias)) LIKE ?
@@ -4223,9 +4270,15 @@ def _device_editor_search_sql(
                     OR LOWER(TRIM(a.region)) LIKE ?
                   )
             )
+            OR EXISTS (
+                SELECT 1 FROM client_devices cd
+                WHERE cd.owner_username = {ta}.owner_username
+                  AND TRIM(cd.alias) = TRIM({alias_match})
+                  AND LOWER(TRIM(COALESCE(cd.device_group, ''))) LIKE ?
+            )
         )
     """
-    return sql, [pattern] * 9
+    return sql, [pattern] * 10
 
 
 def _sync_account_assigned_alias_for_username(
@@ -4323,13 +4376,14 @@ def _prune_orphan_device_editor_rows(conn: sqlite3.Connection, owner_username: s
     owner = str(owner_username or "").strip()
     if not owner:
         return 0
+    user_key = _editor_username_key_sql("username")
     cur = conn.execute(
-        """
+        f"""
         DELETE FROM device_editor_rows
         WHERE owner_username = ?
           AND TRIM(username) <> ''
-          AND LOWER(TRIM(username)) NOT IN (
-            SELECT LOWER(TRIM(username))
+          AND {user_key} NOT IN (
+            SELECT {_editor_username_key_sql('username')}
             FROM account_editor_rows
             WHERE owner_username = ? AND TRIM(username) <> ''
           )
@@ -11424,23 +11478,27 @@ def list_device_editor_rows(
         owner = str(session["username"] or "").strip()
         pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
         to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
+        forced_accounts, forced_devices = _ensure_device_editor_rows_materialized(conn, owner)
+        to_accounts += forced_accounts
+        to_devices += forced_devices
         if pruned or to_accounts or to_devices:
             _ensure_device_editor_switch_highlight_invariants(conn, owner)
             conn.commit()
+        paged_alias_expr = _device_editor_paged_alias_expr(alias_expr)
         count_row = conn.execute(
             f"""
-            SELECT COUNT(DISTINCT {alias_expr})
+            SELECT COUNT(DISTINCT {paged_alias_expr})
             FROM device_editor_rows
-            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}{search_sql}
+            WHERE owner_username = ?{group_sql}{search_sql}
             """,
             (owner, *group_params, *search_params),
         ).fetchone()
         total_aliases = int(count_row[0] if count_row else 0)
         alias_rows = conn.execute(
             f"""
-            SELECT DISTINCT {alias_expr} AS eff_alias
+            SELECT DISTINCT {paged_alias_expr} AS eff_alias
             FROM device_editor_rows
-            WHERE owner_username = ? AND TRIM({alias_expr}) <> ''{group_sql}{search_sql}
+            WHERE owner_username = ?{group_sql}{search_sql}
             ORDER BY eff_alias ASC
             LIMIT ? OFFSET ?
             """,
@@ -11463,8 +11521,8 @@ def list_device_editor_rows(
             f"""
             SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
-            WHERE owner_username = ? AND {alias_expr} IN ({placeholders}){search_sql}
-            ORDER BY {alias_expr} ASC, row_index ASC
+            WHERE owner_username = ? AND {paged_alias_expr} IN ({placeholders}){search_sql}
+            ORDER BY {paged_alias_expr} ASC, row_index ASC
             """,
             (owner, *page_aliases, *search_params),
         ).fetchall()

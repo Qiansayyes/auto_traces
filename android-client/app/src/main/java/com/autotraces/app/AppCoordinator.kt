@@ -27,6 +27,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import com.autotraces.app.backup.BackupDirectoryReconciler
 import com.autotraces.app.backup.DeviceBackupShell
@@ -98,6 +100,7 @@ object AppCoordinator {
 
     private var startPollJob: Job? = null
     private var modeWaitJob: Job? = null
+    private val modeEventMutex = Mutex()
     private val autoSwitchLocalScheduler = AutoSwitchLocalScheduler(
         scope,
         executeOp = { alias, deviceId, op -> handleDeviceOp(alias, deviceId, op) },
@@ -107,7 +110,11 @@ object AppCoordinator {
         onTryResumeGrowth = { maybeStartGrowthInAutoSwitchIdle() },
         onRefreshWeeklyBundle = { refreshAutoSwitchWeeklyBundleFromCloud() },
         isPublishExecutionActive = { isPublishPostSwitchActive() },
-        onStalePublishInflight = { slotKey -> abortStaleAutoSwitchPublishInflight(slotKey) },
+        onStalePublishInflight = { slotKey ->
+            if (!tryResumeStaleAutoSwitchPublish(slotKey)) {
+                abortStaleAutoSwitchPublishInflight(slotKey)
+            }
+        },
         onSlotTransition = { prevSlotKey, newSlotKey ->
             handleAutoSwitchSlotTransition(prevSlotKey, newSlotKey)
         },
@@ -179,6 +186,12 @@ object AppCoordinator {
 
     /** exit 关闭自治：涨粉已抢占后最多再等当前步骤收尾（秒级协作退出，不必等整轮 OCR 链）。 */
     private const val AUTO_SWITCH_EXIT_DRAIN_MS = 60_000L
+
+    /**
+     * mode_wait 长轮询秒数。须低于常见 nginx proxy_read_timeout（默认 60s），
+     * 否则网关会先返回 HTML 504，设备端收不到 JSON 空轮询结果。
+     */
+    private const val MODE_WAIT_TIMEOUT_SEC = 50
 
     private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
 
@@ -270,6 +283,14 @@ object AppCoordinator {
         if (PublishPostGrowthGate.isBlockingGrowth()) return
         releaseAutoSwitchExclusivePreemptIfIdle(reason)
         if (manuallyPaused || shouldHonorUserHardStop()) return
+        // 轻量对齐/冷却跳过等路径可能留下 localStatus=paused 且无独占 OP，此处自愈恢复 running。
+        if (PrefsStore.getLocalStatus() != "running" &&
+            !PrefsStore.isAutoSwitchExclusivePreempt() &&
+            autoSwitchLocalScheduler.shouldAllowGrowthBaseline()
+        ) {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
+        }
         if (PrefsStore.getLocalStatus() != "running") return
         if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) return
         if (pullLoopJob?.isActive == true) return
@@ -475,10 +496,15 @@ object AppCoordinator {
             )
         }
         result.missingCloud.forEach { miss ->
+            val fallback = miss.keptLocalFallbackName.trim()
+            val detail = if (fallback.isNotEmpty()) {
+                "（云端包不在本机，已保留较新本地包：$fallback；建议切号还原或重新备份以同步云端元数据）"
+            } else {
+                "（本机无此文件，需重新登录该账号后自动备份）"
+            }
             LogCenter.op(
                 alias,
-                "$logPrefix 云端备份缺失 @${miss.username}：${miss.cloudBackupName} " +
-                    "（本机无此文件，需重新登录该账号后自动备份）",
+                "$logPrefix 云端备份缺失 @${miss.username}：${miss.cloudBackupName} $detail",
             )
         }
     }
@@ -675,6 +701,12 @@ object AppCoordinator {
             } else {
                 startPullLoop()
             }
+        } else if (
+            PrefsStore.isAutoSwitchAutonomousMode() &&
+            PrefsStore.getLocalStatus() != "running" &&
+            pullLoopJob?.isActive != true
+        ) {
+            maybeStartGrowthInAutoSwitchIdle("循环保活")
         }
     }
 
@@ -1662,7 +1694,7 @@ object AppCoordinator {
                 val roundStarted = SystemClock.elapsedRealtime()
                 try {
                     val sinceId = PrefsStore.getLastModeEventId()
-                    val resp = ApiService.modeWait(deviceId, alias, sinceId, timeoutSec = 120)
+                    val resp = ApiService.modeWait(deviceId, alias, sinceId, timeoutSec = MODE_WAIT_TIMEOUT_SEC)
                     uploadDeviceLogsIfPullRequested(
                         alias,
                         deviceId,
@@ -1685,7 +1717,15 @@ object AppCoordinator {
                     authErrorRounds = 0
                     val event = resp.event
                     if (event != null && event.event_id > 0) {
-                        handleDeviceModeEvent(alias, deviceId, event)
+                        val ev = event
+                        val dId = deviceId
+                        val al = alias
+                        // 模式事件处理（拉 bundle / drain 等）与长轮询解耦，避免阻塞 mode_wait 与自治调度。
+                        scope.launch {
+                            modeEventMutex.withLock {
+                                handleDeviceModeEvent(al, dId, ev)
+                            }
+                        }
                         continue
                     }
                     // 长轮询空结果：正常应接近 timeoutSec；若过快返回则退避，避免打爆服务端。
@@ -3082,25 +3122,21 @@ object AppCoordinator {
         PrefsStore.setLogContextUsername(user)
         applyBundledConfigFromAutoSwitch(user, logToUser = false)
 
+        // 每分钟 tick 内只做一轮尝试；失败由调度器下分钟重试，避免 ensureAccountLoggedInWithRetry
+        // 在 tickMutex 内无限重试导致本地调度器整体卡死。
         if (!isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = user)) {
-            when (
-                ensureAccountLoggedInWithRetry(
-                    alias = alias,
-                    deviceId = deviceId,
-                    reason = "时段对齐校验",
-                    expectedUsername = user,
-                )
-            ) {
-                AccountLoginRetryOutcome.LoggedIn -> Unit
-                AccountLoginRetryOutcome.AccountChanged -> {
-                    LogCenter.op(alias, "【自动切号】时段对齐校验账号不符 slot=$sk")
-                    autoSwitchLocalScheduler.invalidateSlotAlignment(sk, "时段对齐校验账号切换")
-                    return false
-                }
-                AccountLoginRetryOutcome.Aborted -> {
-                    LogCenter.op(alias, "【自动切号】时段对齐校验自动登录中止 slot=$sk")
-                    return false
-                }
+            val loginOk = ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = "slot_align_${System.currentTimeMillis()}",
+                reason = "时段对齐校验",
+                strict = true,
+                forceRelogin = false,
+                preferredUsername = user,
+            )
+            if (!loginOk) {
+                LogCenter.op(alias, "【自动切号】时段对齐校验自动登录未通过 slot=$sk，下分钟重试")
+                return false
             }
         }
 
@@ -3809,6 +3845,8 @@ object AppCoordinator {
                 applyAutoSwitchBundle(alias, deviceId, resp.bundle, revision)
                 scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
                 LogCenter.op(alias, "【自动切号】已恢复本地调度（重启后重拉 bundle）")
+                autoSwitchLocalScheduler.requestImmediateTick()
+                maybeStartGrowthInAutoSwitchIdle("重启恢复")
             } else {
                 LogCenter.op(alias, "【自动切号】恢复本地调度失败：${resp.msg}")
             }
@@ -4716,6 +4754,7 @@ object AppCoordinator {
                 var lastStopOk = false
                 var lastLaunchOk = false
                 var lastChain: ProfileEditChainResult? = null
+                var avatarSucceededEver = false
                 var successOverall = false
                 var stopAfterProfileEditOk = false
 
@@ -4784,6 +4823,9 @@ object AppCoordinator {
                         continue
                     }
 
+                    if (profileUsernameAtStart.isNotBlank()) {
+                        ProfileEditStepStateStore.resetAbandonedForOuterRetry(profileUsernameAtStart)
+                    }
                     val chain = try {
                         executor.profileEditRunOcrChain(appContext, _config.value)
                     } catch (e: AccountStatusLoggedOutException) {
@@ -4803,15 +4845,16 @@ object AppCoordinator {
                         )
                     }
                     lastChain = chain
+                    if (chain.avatarStepOk) {
+                        avatarSucceededEver = true
+                    }
                     if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
                         opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
                         runSu("am force-stop $packageName")
                         break
                     }
-                    val bioPartsOk = chain.bioAfterPart1Ok && chain.bioAfterPart2Ok
-                    if (chain.success && bioPartsOk) {
-                        successOverall = true
-                        opLog("修改基本资料完成（外轮 $outer/$maxOuter）")
+                    if (profileEditOuterChainFullyComplete(chain)) {
+                        opLog("修改基本资料：Bio 后①② 均完成（外轮 $outer/$maxOuter），结束外轮")
                         stopAfterProfileEditOk = runSu("am force-stop $packageName")
                         delay(1200)
                         break
@@ -4823,6 +4866,7 @@ object AppCoordinator {
                     }
                 }
 
+                successOverall = profileEditOverallSuccessFromOuterRounds(avatarSucceededEver)
                 val chain = lastChain
                 val previewsJoin = { xs: List<String> ->
                     xs.joinToString("\n---\n").take(6000)
@@ -4836,13 +4880,13 @@ object AppCoordinator {
                     opId = opId,
                     status = if (successOverall) "success" else "failed",
                     message = if (successOverall) {
-                        "已完成：Bio 后①② 均成功，已关闭 TikTok 后台；云端将「基本资料已修改」标为「是」"
+                        "已完成：换头像成功，云端将「基本资料已修改」标为「是」"
                     } else if (chain?.failureStep == "hard_stop") {
                         "已硬停：修改基本资料流程被用户中止，未标「基本资料已修改」"
                     } else if (chain?.bioAfterPart1Ok == true && chain.bioAfterPart2Ok != true) {
-                        "未完成：Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
+                        "未完成：换头像未成功；Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
                     } else {
-                        "未完成：${chain?.failureStep ?: "outer_or_unknown"}（已最多外轮 $maxOuter 次）"
+                        "未完成：换头像未成功；${chain?.failureStep ?: "outer_or_unknown"}（已最多外轮 $maxOuter 次）"
                     },
                     data = mutableMapOf<String, Any>(
                         "op_type" to "tiktok_edit_basic_profile",
@@ -4857,6 +4901,7 @@ object AppCoordinator {
                         "ratio_tap_ok" to lastRatioTapOk,
                         "profile_edit_outer_max" to maxOuter,
                         "profile_edit_success" to successOverall,
+                        "profile_edit_avatar_step_ok" to avatarSucceededEver,
                         "profile_edit_bio_after_part1_ok" to (chain?.bioAfterPart1Ok ?: false),
                         "profile_edit_bio_after_part2_ok" to (chain?.bioAfterPart2Ok ?: false),
                         "profile_edit_failure_step" to (chain?.failureStep ?: ""),
@@ -4891,6 +4936,7 @@ object AppCoordinator {
                 )
                 if (successOverall && profileUsernameAtStart.isNotBlank()) {
                     AutoSwitchBundleHolder.notifyBasicProfileModified(profileUsernameAtStart)
+                    ProfileEditStepStateStore.clear(profileUsernameAtStart)
                 }
                 if (!successOverall && chain?.failureStep != "hard_stop") {
                     scheduleFailureReport(
@@ -6051,6 +6097,7 @@ object AppCoordinator {
             ?: PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
             ?: alias
         if (PrefsStore.getPublishPostResumeNextIndex(accountKey) > 0) return
+        if (PrefsStore.isPublishPostMaterialReady() && tryResumeStaleAutoSwitchPublish(sk)) return
         if (ledgerInflight && sk.isNotBlank()) {
             abortStaleAutoSwitchPublishInflight(sk)
         }
@@ -6083,6 +6130,40 @@ object AppCoordinator {
             accountChanged = false,
         )
     }
+
+    /**
+     * 进程被杀/服务重启后：若素材已就绪或 pending 未清，自动续发而非放弃本时段发作品。
+     */
+    private fun tryResumeStaleAutoSwitchPublish(slotKey: String): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return false
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
+        if (isPublishPostSwitchActive()) return false
+        if (!PrefsStore.hasRecoverableAutoSwitchPublish(sk)) return false
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isBlank()) return false
+
+        autoSwitchLocalScheduler.clearSlotPublishAborted(sk)
+        AutoSwitchLedger.reopenPublishSlotForResume(sk)
+        PrefsStore.setPublishPostPending(true)
+        PrefsStore.setPublishPostRequested(true)
+
+        LogCenter.op(
+            alias,
+            "【自动切号】残留发作品可恢复，触发续发：slot=$sk op=${PrefsStore.getPublishPostTaskOpId()} " +
+                "materialReady=${PrefsStore.isPublishPostMaterialReady()}",
+        )
+        triggerPublishPostNow(alias)
+        return true
+    }
+
+    /** 修改基本资料外轮：Bio 后①② 均完成时可结束外轮（整体成功仍仅看 avatarStepOk）。 */
+    private fun profileEditOuterChainFullyComplete(chain: ProfileEditChainResult): Boolean =
+        chain.bioAfterPart1Ok && chain.bioAfterPart2Ok
+
+    /** 外轮全部结束后汇总：仅头像步骤成功即认定改资料成功。 */
+    private fun profileEditOverallSuccessFromOuterRounds(avatarSucceededEver: Boolean): Boolean =
+        avatarSucceededEver
 
     /**
      * 改资料设备回传：携带开始时用户名、row_index，以及 Bio 步骤可能同步后的新用户名，避免写回错位。
@@ -6276,6 +6357,7 @@ object AppCoordinator {
             var lastW = dm.widthPixels
             var lastH = dm.heightPixels
             var lastChain: ProfileEditChainResult? = null
+            var avatarSucceededEver = false
             var successOverall = false
             var stopAfterProfileEditOk = false
             val ratioTapX = 0.97f
@@ -6376,17 +6458,21 @@ object AppCoordinator {
                     }
                 }
 
+                if (profileUsernameAtStart.isNotBlank()) {
+                    ProfileEditStepStateStore.resetAbandonedForOuterRetry(profileUsernameAtStart)
+                }
                 val chain = runProfileEditChainOnce()
                 lastChain = chain
+                if (chain.avatarStepOk) {
+                    avatarSucceededEver = true
+                }
                 if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
                     opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
                     runSu("am force-stop $packageName")
                     break
                 }
-                val bioPartsOk = chain.bioAfterPart1Ok && chain.bioAfterPart2Ok
-                if (chain.success && bioPartsOk) {
-                    successOverall = true
-                    opLog("修改基本资料完成（外轮 $outer/$maxOuter）")
+                if (profileEditOuterChainFullyComplete(chain)) {
+                    opLog("修改基本资料：Bio 后①② 均完成（外轮 $outer/$maxOuter），结束外轮")
                     stopAfterProfileEditOk = runSu("am force-stop $packageName").also { delay(1200) }
                     break
                 }
@@ -6397,6 +6483,7 @@ object AppCoordinator {
                 }
             }
 
+            successOverall = profileEditOverallSuccessFromOuterRounds(avatarSucceededEver)
             val chain = lastChain ?: ProfileEditChainResult(success = false, failureStep = "no_chain")
             val previewsJoin = { xs: List<String> -> xs.joinToString("\n---\n").take(6000) }
             val currentAssignedUsername = resolveAssignedAccount(alias, deviceId)?.username?.trim().orEmpty()
@@ -6407,13 +6494,13 @@ object AppCoordinator {
                 status = if (successOverall) "success" else "failed",
                 message = when {
                     successOverall ->
-                        "切号后衔接改资料成功，云端将「基本资料已修改」标为「是」"
+                        "切号后衔接改资料成功（换头像成功），云端将「基本资料已修改」标为「是」"
                     chain.failureStep == "hard_stop" ->
                         "切号后改资料已硬停"
                     chain.bioAfterPart1Ok && !chain.bioAfterPart2Ok ->
-                        "切号后改资料未完成：Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
+                        "切号后改资料未完成：换头像未成功；Bio 后① 已完成但② 未成功（${chain.failureStep}），未标「基本资料已修改」"
                     else ->
-                        "切号后改资料未完成：${chain.failureStep}（已最多外轮 $maxOuter 次）"
+                        "切号后改资料未完成：换头像未成功；${chain.failureStep}（已最多外轮 $maxOuter 次）"
                 },
                 data = mutableMapOf<String, Any>(
                     "op_type" to "tiktok_edit_basic_profile",
@@ -6430,6 +6517,7 @@ object AppCoordinator {
                     "launch_ok" to lastLaunchOk,
                     "ratio_tap_ok" to lastRatioTapOk,
                     "profile_edit_success" to successOverall,
+                    "profile_edit_avatar_step_ok" to avatarSucceededEver,
                     "profile_edit_bio_after_part1_ok" to chain.bioAfterPart1Ok,
                     "profile_edit_bio_after_part2_ok" to chain.bioAfterPart2Ok,
                     "profile_edit_failure_step" to chain.failureStep,
@@ -6457,6 +6545,7 @@ object AppCoordinator {
             )
             if (successOverall && profileUsernameAtStart.isNotBlank()) {
                 AutoSwitchBundleHolder.notifyBasicProfileModified(profileUsernameAtStart)
+                ProfileEditStepStateStore.clear(profileUsernameAtStart)
             }
             if (!successOverall && chain.failureStep != "hard_stop") {
                 scheduleFailureReport(

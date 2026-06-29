@@ -72,6 +72,8 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_SOURCE = "publish_post_source"
     /** 本轮发作品实际成功条数（全部完成后写入，供 ledger 写回 video_count）。 */
     private const val KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT = "publish_post_last_actual_success_count"
+    /** 发作品素材已拉取并就绪；进程被杀后可凭此跳过清库/重拉并续发。 */
+    private const val KEY_PUBLISH_POST_MATERIAL_READY = "publish_post_material_ready"
     /** 自动切号自治模式：off | on | exiting */
     private const val KEY_AUTO_SWITCH_MODE = "auto_switch_mode"
     private const val KEY_AUTO_SWITCH_SESSION_ID = "auto_switch_session_id"
@@ -85,6 +87,8 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY = "auto_switch_verified_slot_key"
     /** 与 [KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY] 配对的 row_index。 */
     private const val KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX = "auto_switch_verified_row_index"
+    /** 改资料三步断点续接：按账号键存 JSON（[ProfileEditStepState]）。 */
+    private const val KEY_PROFILE_EDIT_STEP_STATE_PREFIX = "profile_edit_step_state_"
     private const val KEY_AUTO_SWITCH_SCHEDULE_DATE = "auto_switch_schedule_date"
     private const val KEY_AUTO_SWITCH_WEEK_START = "auto_switch_week_start_date"
     private const val KEY_AUTO_SWITCH_WEEK_END = "auto_switch_week_end_date"
@@ -470,11 +474,36 @@ object PrefsStore {
     fun isAutoSwitchPublishTask(): Boolean =
         getPublishPostSource() == "auto_switch" && getAutoSwitchPublishSlotKey() != null
 
+    fun setPublishPostMaterialReady(ready: Boolean) {
+        prefs.edit().putBoolean(KEY_PUBLISH_POST_MATERIAL_READY, ready).apply()
+    }
+
+    fun isPublishPostMaterialReady(): Boolean =
+        prefs.getBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
+
+    /**
+     * 进程被杀/服务重启后，本时段发作品是否仍可恢复（有 op、slot 且素材已就绪或 pending 未清）。
+     */
+    fun hasRecoverableAutoSwitchPublish(slotKey: String): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return false
+        if (getPublishPostSource() != "auto_switch") return false
+        if (getAutoSwitchPublishSlotKey()?.trim() != sk) return false
+        if (getPublishPostTaskOpId().isNullOrBlank()) return false
+        if (isPublishPostMaterialReady()) return true
+        if (isPublishPostPending() || isPublishPostRequested()) return true
+        val accountKey = getAutoSwitchPublishAccountUsername()?.trim().orEmpty()
+            .ifBlank { getLogContextUsername()?.trim().orEmpty() }
+            .ifBlank { getAlias().orEmpty() }
+        return getPublishPostResumeNextIndex(accountKey) > 0
+    }
+
     fun clearPublishPostState() {
         prefs.edit()
             .putBoolean(KEY_PUBLISH_POST_REQUESTED, false)
             .putBoolean(KEY_PUBLISH_POST_PENDING, false)
             .putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
+            .putBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
             .remove(KEY_PUBLISH_POST_PACKAGE)
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)
@@ -922,5 +951,22 @@ object PrefsStore {
             .remove(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY)
             .remove(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX)
             .apply()
+    }
+
+    fun getProfileEditStepStateJson(accountKey: String): String? =
+        prefs.getString(KEY_PROFILE_EDIT_STEP_STATE_PREFIX + accountKey.trim().lowercase(Locale.US), null)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+
+    fun setProfileEditStepStateJson(accountKey: String, json: String) {
+        val key = accountKey.trim().lowercase(Locale.US)
+        if (key.isEmpty()) return
+        prefs.edit().putString(KEY_PROFILE_EDIT_STEP_STATE_PREFIX + key, json).apply()
+    }
+
+    fun clearProfileEditStepStateJson(accountKey: String) {
+        val key = accountKey.trim().lowercase(Locale.US)
+        if (key.isEmpty()) return
+        prefs.edit().remove(KEY_PROFILE_EDIT_STEP_STATE_PREFIX + key).apply()
     }
 }

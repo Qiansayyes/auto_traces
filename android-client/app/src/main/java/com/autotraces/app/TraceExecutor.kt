@@ -119,6 +119,17 @@ data class ProfileEditChainResult(
     val profileEditAssignedUsername: String = "",
     /** Bio 步骤检测到 TikTok 用户名变更并已同步（ledger/API）后的新用户名；未变更则为空 */
     val profileEditUsernameSyncedTo: String = "",
+    /** 步骤1换头像已成功（发帖后见 Change photo） */
+    val avatarStepOk: Boolean = false,
+    /** 步骤2改显示名已成功（Confirm 后见 Change photo） */
+    val nameStepOk: Boolean = false,
+    /** 步骤3改 Bio+①② 已成功 */
+    val bioStepOk: Boolean = false,
+    val avatarStepAbandoned: Boolean = false,
+    val nameStepAbandoned: Boolean = false,
+    val bioStepAbandoned: Boolean = false,
+    /** 本次链入口续接点：avatar|name|bio|bio_part2_only|done */
+    val profileEditResumeFrom: String = "",
 )
 
 interface TraceExecutor {
@@ -346,6 +357,8 @@ class RealTraceExecutor(
     private var lastSaveLoginForNextTimePopupDismissAtMs: Long = 0L
     @Volatile
     private var inlineIdentityVerificationInProgress: Boolean = false
+    /** Check your inbox 分支：验证码页默认已聚焦，无需再点输入区。 */
+    private var autoLoginCheckYourInboxPathActive: Boolean = false
     private var lastInlineIdentityResendTapAtMs: Long = 0L
     @Volatile
     private var accountStatusRecoveryInProgress: Boolean = false
@@ -361,7 +374,7 @@ class RealTraceExecutor(
     /** 重登期内顺手点 Account status OK 的次数（登录结束后清零）。 */
     private var accountStatusInlineOkTapCount: Int = 0
 
-    /** 涨粉 / 互点 / 发作品：该深度 >0 时所有 OCR 须观察掉登录信号；自动登录与改资料除外。 */
+    /** 涨粉 / 互点 / 发作品：该深度 >0 时 OCR 须观察 Account status 弹窗；Add another account 在所有 OCR 步骤检测（auto_login 除外）。 */
     @Volatile
     private var accountStatusOcrWatchDepth: Int = 0
 
@@ -402,16 +415,9 @@ class RealTraceExecutor(
         return t.startsWith("profile_edit") || t.startsWith("auto_login")
     }
 
-    /**
-     * 登录状态保障会主动 OCR「Add another account」做判定；任务执行中见该文案则须中止并自动登录。
-     * 登录保障期间由 [loginSafeguardLogoutProbeActive] 统一走掉登录探测，不再单独排除 tag。
-     */
-    private fun isAddAnotherAccountLogoutOcrExcludedTag(fileTag: String): Boolean {
-        val t = fileTag.trim()
-        return t.startsWith("profile_edit") ||
-            t.startsWith("auto_login") ||
-            t.startsWith("login_safeguard")
-    }
+    /** auto_login 链会主动点击 Add another account，不能误判为掉登录。 */
+    private fun isAddAnotherAccountLogoutOcrExcludedTag(fileTag: String): Boolean =
+        fileTag.trim().startsWith("auto_login")
 
     private fun shouldObserveAccountStatusOnOcr(fileTag: String?): Boolean {
         val tag = fileTag?.trim().orEmpty()
@@ -428,12 +434,19 @@ class RealTraceExecutor(
     }
 
     private fun shouldObserveAddAnotherAccountLogoutOnOcr(fileTag: String?): Boolean {
-        if (!isLogoutProbeContextActive()) return false
-        if (loginSafeguardLogoutProbeActive) {
-            return fileTag == null || !fileTag.trim().startsWith("profile_edit")
-        }
         if (fileTag != null && isAddAnotherAccountLogoutOcrExcludedTag(fileTag)) return false
         return true
+    }
+
+    /** 任意 OCR 结果：见 Add another account / another account 则中止并触发自动登录。 */
+    private suspend fun probeAddAnotherAccountLogoutFromOcrVision(
+        ctx: Context,
+        vision: Text,
+        fileTag: String?,
+    ) {
+        if (!shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
     }
 
     private suspend fun observeAccountStatusOnOcrText(
@@ -441,6 +454,8 @@ class RealTraceExecutor(
         vision: Text,
         fileTag: String?,
     ): Boolean {
+        probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
+        if (accountStatusRecoveryInProgress) return false
         if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return false
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
         return probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
@@ -471,6 +486,7 @@ class RealTraceExecutor(
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
+            probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
             if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return
             probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
         } catch (ex: AccountStatusLoggedOutException) {
@@ -660,11 +676,6 @@ class RealTraceExecutor(
 
         /** 临时跳过显示名(Name) 整段（点 Name→输入→Save→Confirm→终验）；测完其他功能后改回 false。 */
         private const val PROFILE_EDIT_SKIP_NAME_STEP = false
-
-        /** Name 编辑页可修改态占位文案（不可改时通常不出现）。 */
-        private const val PROFILE_EDIT_PREFERRED_NAME_PHRASE = "add your preferred name"
-        private const val PROFILE_EDIT_NAME_EDITABLE_OCR_MAX_TRIES = 3
-        private const val PROFILE_EDIT_NAME_EDITABLE_OCR_RETRY_MS = 2000L
 
         /** Bio 后②：设置齿轮比例点（相对屏宽/高）。 */
         private const val PROFILE_EDIT_SETTINGS_GEAR_RATIO_X = 0.96f
@@ -1873,83 +1884,38 @@ class RealTraceExecutor(
         return ProfileEditMenuTriple(cp, nm, bio)
     }
 
-    /*
-     * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
-     * 换头像后重新 OCR Name/Bio 菜单坐标；Bio 点击后校验是否误入 Name 编辑页。
-     *
-     * private data class ProfileEditNameBioMenuCoords(
-     *     val name: Pair<Int, Int>,
-     *     val bio: Pair<Int, Int>,
-     * )
-     *
-     * private suspend fun profileEditOcrRefreshNameBioMenuCoords(
-     *     ctx: Context,
-     *     logAlias: String,
-     *     w: Int,
-     *     h: Int,
-     *     phase: String,
-     * ): ProfileEditNameBioMenuCoords? {
-     *     repeat(3) { attemptIndex ->
-     *         val attempt = attemptIndex + 1
-     *         if (hardStopOrNull(logAlias, "修改基本资料-刷新NameBio坐标-$phase")) return null
-     *         if (attempt > 1 && !profileEditDelay(logAlias, 650, "刷新NameBio坐标-$phase")) return null
-     *         val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_menu_refresh_${phase}_$attempt")
-     *         if (vision == null) {
-     *             devOp(logAlias, "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次 OCR 失败：$errTag")
-     *             if (errTag == "hard_stop") return null
-     *             continue
-     *         }
-     *         val triple = findProfileEditChangePhotoNameBioTriple(vision) ?: continue
-     *         val namePx = coerceTapToScreen(triple.name.point, w, h).let { it.x to it.y }
-     *         val bioPx = coerceTapToScreen(triple.bio.point, w, h).let { it.x to it.y }
-     *         devOp(
-     *             logAlias,
-     *             "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次：Name=(${namePx.first},${namePx.second}) Bio=(${bioPx.first},${bioPx.second})",
-     *         )
-     *         return ProfileEditNameBioMenuCoords(namePx, bioPx)
-     *     }
-     *     return null
-     * }
-     *
-     * private suspend fun profileEditScreenShowsNameEditorPlaceholder(ctx: Context, logAlias: String): Boolean {
-     *     if (hardStopOrNull(logAlias, "修改基本资料-Name页探测")) return false
-     *     val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_name_editor_probe")
-     *         ?: return false
-     *     if (errTag == "hard_stop") return false
-     *     return ocrHasConsecutiveWordsFromPhrase(vision, PROFILE_EDIT_PREFERRED_NAME_PHRASE)
-     * }
-     *
-     * private suspend fun profileEditTapBioMenuOpenEditor(
-     *     ctx: Context,
-     *     logAlias: String,
-     *     w: Int,
-     *     h: Int,
-     *     bioTapPx: Pair<Int, Int>,
-     * ): Pair<Pair<Int, Int>?, String?> {
-     *     var tap = bioTapPx
-     *     repeat(2) { tryIndex ->
-     *         devOp(logAlias, "「修改基本资料」Bio：点击 Bio 菜单 (${tap.first},${tap.second}) 聚焦 Bio 输入框")
-     *         if (!runSuCommand("input tap ${tap.first} ${tap.second}")) return null to "bio_tap_failed"
-     *         delay(450)
-     *         if (!profileEditScreenShowsNameEditorPlaceholder(ctx, logAlias)) return tap to null
-     *         devOp(
-     *             logAlias,
-     *             "「修改基本资料」Bio：点击后误入 Name 编辑页（菜单坐标可能过期），返回并重刷坐标",
-     *         )
-     *         navBack(logAlias, "Bio误开Name返回")
-     *         if (!profileEditDelay(logAlias, 520L, "Bio误开Name返回后")) return null to "hard_stop"
-     *         if (tryIndex == 0) {
-     *             val fresh = profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "bio_reopen")
-     *                 ?: return null to "bio_opened_name_editor"
-     *             tap = fresh.bio
-     *         } else {
-     *             return null to "bio_opened_name_editor"
-     *         }
-     *     }
-     *     return null to "bio_opened_name_editor"
-     * }
-     * ===== 修改资料优化备用代码（后续按需打开）END =====
-     */
+    private data class ProfileEditNameBioMenuCoords(
+        val name: Pair<Int, Int>,
+        val bio: Pair<Int, Int>,
+    )
+
+    private suspend fun profileEditOcrRefreshNameBioMenuCoords(
+        ctx: Context,
+        logAlias: String,
+        w: Int,
+        h: Int,
+        phase: String,
+    ): ProfileEditNameBioMenuCoords? {
+        for (attempt in 1..3) {
+            if (hardStopOrNull(logAlias, "修改基本资料-刷新NameBio坐标-$phase")) return null
+            if (attempt > 1 && !profileEditDelay(logAlias, 650, "刷新NameBio坐标-$phase")) return null
+            val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_menu_refresh_${phase}_$attempt")
+            if (vision == null) {
+                devOp(logAlias, "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次 OCR 失败：$errTag")
+                if (errTag == "hard_stop") return null
+                continue
+            }
+            val triple = findProfileEditChangePhotoNameBioTriple(vision) ?: continue
+            val namePx = coerceTapToScreen(triple.name.point, w, h).let { it.x to it.y }
+            val bioPx = coerceTapToScreen(triple.bio.point, w, h).let { it.x to it.y }
+            devOp(
+                logAlias,
+                "「修改基本资料」刷新 Name/Bio 坐标($phase) 第 $attempt/3 次：Name=(${namePx.first},${namePx.second}) Bio=(${bioPx.first},${bioPx.second})",
+            )
+            return ProfileEditNameBioMenuCoords(namePx, bioPx)
+        }
+        return null
+    }
 
     private fun flattenOcrLinesWithBoxes(result: Text): List<Pair<Text.Line, Rect>> {
         val out = ArrayList<Pair<Text.Line, Rect>>()
@@ -2079,14 +2045,7 @@ class RealTraceExecutor(
         return true
     }
 
-    /** 点 OK 后的 Welcome back 等：同屏见 Add another account / another account（Account status 弹窗已消失）。 */
-    private fun visionShowsWelcomeBackLogoutScreen(vision: Text): Boolean =
-        findAddAnotherAccountTapHit(vision) != null
-
-    /**
-     * 统一掉登录探测：Account status 弹窗 + Welcome back（Add another account / another account）。
-     * 凡开启 Account status 观测的节点，同帧也检测 Add another account；后者走 [LoginSafeguardRequiresAutoLoginException]。
-     */
+    /** Account status 弹窗掉登录探测（Add another account 由 [probeAddAnotherAccountLogoutFromOcrVision] 统一处理）。 */
     private suspend fun probeAndHandleLogoutSignalsFromVision(
         ctx: Context,
         alias: String,
@@ -2094,18 +2053,13 @@ class RealTraceExecutor(
         fileTag: String?,
     ): Boolean {
         if (accountStatusRecoveryInProgress) return false
-        val observeAccountStatus = shouldObserveAccountStatusOnOcr(fileTag)
-        val observeAddAnother = shouldObserveAddAnotherAccountLogoutOnOcr(fileTag)
-        if (!observeAccountStatus && !observeAddAnother) return false
+        if (!shouldObserveAccountStatusOnOcr(fileTag)) return false
 
-        if (observeAccountStatus && visionShowsAccountStatusLogoutDialog(vision)) {
+        if (visionShowsAccountStatusLogoutDialog(vision)) {
             if (accountStatusReloginInProgress) {
                 return dismissAccountStatusInline(ctx, alias, vision)
             }
             performAccountStatusLogoutRecovery(ctx, alias, vision)
-        }
-        if ((observeAccountStatus || observeAddAnother) && visionShowsWelcomeBackLogoutScreen(vision)) {
-            maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
         }
         return false
     }
@@ -2553,7 +2507,7 @@ class RealTraceExecutor(
             devOp(alias, "身份验证 OCR 失败：$err [$tag]")
             return null
         }
-        runCatching { observeAccountStatusOnOcrText(ctx, vision, tag) }
+        observeAccountStatusOnOcrText(ctx, vision, tag)
         return vision
     }
 
@@ -2888,52 +2842,6 @@ class RealTraceExecutor(
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) return true
             devOp(logAlias, "「修改基本资料」$phaseLog：tap 失败（su），将重试 OCR")
         }
-        return false
-    }
-
-    /**
-     * 进入 Name 编辑页后：OCR 探测「add your preferred name」占位文案（含其中连续词组即通过）。
-     * 至多 [PROFILE_EDIT_NAME_EDITABLE_OCR_MAX_TRIES] 次，重试间隔 [PROFILE_EDIT_NAME_EDITABLE_OCR_RETRY_MS]。
-     */
-    private suspend fun profileEditOcrPreferredNameEditable(
-        ctx: Context,
-        logAlias: String,
-    ): Boolean {
-        val phrase = PROFILE_EDIT_PREFERRED_NAME_PHRASE
-        val maxTries = PROFILE_EDIT_NAME_EDITABLE_OCR_MAX_TRIES
-        for (attempt in 1..maxTries) {
-            if (hardStopOrNull(logAlias, "修改基本资料-Name可编辑探测")) return false
-            if (attempt > 1) {
-                if (!profileEditDelay(logAlias, PROFILE_EDIT_NAME_EDITABLE_OCR_RETRY_MS, "Name可编辑探测重试")) {
-                    return false
-                }
-            }
-            val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_name_editable_$attempt")
-            if (vision == null) {
-                devOp(logAlias, "「修改基本资料」Name可编辑探测 第 $attempt/$maxTries 次 OCR 失败：$errTag")
-                if (errTag == "hard_stop") return false
-                continue
-            }
-            if (ocrHasConsecutiveWordsFromPhrase(vision, phrase)) {
-                devOp(
-                    logAlias,
-                    "「修改基本资料」Name可编辑：第 $attempt/$maxTries 次 OCR 已见「$phrase」连续词片段，继续修改显示名",
-                )
-                return true
-            }
-            logOcrReadTextOnMiss(
-                logAlias,
-                "「修改基本资料」Name可编辑探测",
-                attempt,
-                maxTries,
-                vision,
-                420,
-            )
-        }
-        devOp(
-            logAlias,
-            "「修改基本资料」Name不可编辑：$maxTries 次均未见「$phrase」相关文案，跳过修改显示名",
-        )
         return false
     }
 
@@ -4164,6 +4072,9 @@ class RealTraceExecutor(
                 }
                 continue
             }
+            if (useSideEffectFreeOcr) {
+                probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, cacheTag)
+            }
             val hit = findDismissHit(vision)
             if (hit == null) {
                 missCount++
@@ -4226,6 +4137,69 @@ class RealTraceExecutor(
         val h = dm.heightPixels
         if (PROFILE_EDIT_TEST_PART2_ONLY) {
             return profileEditRunBioAfterPart2Only(ctx, logAlias, w, h)
+        }
+
+        val profileUsernameKey = fetchAssignedUsernameForProfileEdit(logAlias).orEmpty()
+        var stepPersist = ProfileEditStepStateStore.load(profileUsernameKey).let { loaded ->
+            if (profileUsernameKey.isNotEmpty()) loaded.copy(username = profileUsernameKey) else loaded
+        }
+        val resumeFrom = stepPersist.resolveResumeStep()
+        devOp(
+            logAlias,
+            "「修改基本资料」断点续接：resume=$resumeFrom avatarOk=${stepPersist.avatarOk} nameOk=${stepPersist.nameOk} " +
+                "bioOk=${stepPersist.bioOk} bioPart1Ok=${stepPersist.bioPart1Ok} " +
+                "abandoned=avatar:${stepPersist.avatarAbandoned} name:${stepPersist.nameAbandoned} bio:${stepPersist.bioAbandoned}",
+        )
+
+        fun withStepFields(base: ProfileEditChainResult): ProfileEditChainResult = base.copy(
+            avatarStepOk = stepPersist.avatarOk,
+            nameStepOk = stepPersist.nameOk,
+            bioStepOk = stepPersist.bioOk,
+            avatarStepAbandoned = stepPersist.avatarAbandoned,
+            nameStepAbandoned = stepPersist.nameAbandoned,
+            bioStepAbandoned = stepPersist.bioAbandoned,
+            profileEditResumeFrom = resumeFrom.name.lowercase(Locale.US),
+        )
+
+        fun persistStepState(update: ProfileEditStepState.() -> ProfileEditStepState) {
+            stepPersist = stepPersist.update().let { next ->
+                if (profileUsernameKey.isNotEmpty()) next.copy(username = profileUsernameKey) else next
+            }
+            ProfileEditStepStateStore.save(stepPersist)
+        }
+
+        if (resumeFrom == ProfileEditResumeStep.DONE) {
+            if (stepPersist.bioAbandoned) {
+                devOp(logAlias, "「修改基本资料」三步均已放弃，跳过 OCR 链")
+                return withStepFields(
+                    ProfileEditChainResult(
+                        success = false,
+                        failureStep = "profile_edit_all_steps_abandoned",
+                    ),
+                )
+            }
+            if (stepPersist.bioOk) {
+                devOp(logAlias, "「修改基本资料」三步均已完成，跳过 OCR 链")
+                return withStepFields(
+                    ProfileEditChainResult(
+                        success = true,
+                        failureStep = "",
+                        bioAfterPart1Ok = true,
+                        bioAfterPart2Ok = true,
+                    ),
+                )
+            }
+        }
+
+        if (resumeFrom == ProfileEditResumeStep.BIO_PART2_ONLY) {
+            val part2 = profileEditRunBioAfterPart2Only(ctx, logAlias, w, h)
+            if (part2.success && part2.bioAfterPart1Ok && part2.bioAfterPart2Ok) {
+                persistStepState { copy(bioOk = true, bioPart1Ok = true) }
+                ProfileEditStepStateStore.clear(profileUsernameKey)
+            } else if (part2.bioAfterPart1Ok && !part2.bioAfterPart2Ok) {
+                persistStepState { copy(bioPart1Ok = true) }
+            }
+            return withStepFields(part2)
         }
 
         devOp(
@@ -4424,9 +4398,123 @@ class RealTraceExecutor(
             )
         }
 
+        val skipAvatarStep = stepPersist.avatarOk || stepPersist.avatarAbandoned ||
+            resumeFrom == ProfileEditResumeStep.NAME || resumeFrom == ProfileEditResumeStep.BIO
+        var avatarPostVerifyCount = 0
+        var avatarPostSeen = false
         var changePhotoTapPx: Pair<Int, Int>? = null
         var changePhotoTapOk = false
         var changePhotoStrictAttempts = 0
+        val uploadPreviews = mutableListOf<String>()
+        var uploadTapPx: Pair<Int, Int>? = null
+        var uploadTapOk = false
+        var uploadAttempts = 0
+        val allowPreviews = mutableListOf<String>()
+        var allowTapPx: Pair<Int, Int>? = null
+        var allowTapOk = false
+        var allowAttempts = 0
+        var allowSkippedBecauseRecentsVisible = false
+        var profileEditAssignedUsername = ""
+        var profileEditUsernameSyncedTo = ""
+
+        fun chainBase(
+            success: Boolean,
+            failureStep: String,
+            avatarTryCount: Int = 0,
+            bioVerifyTryCount: Int = 0,
+            appliedName: String = "",
+            postConfirmChangePhotoTries: Int = 0,
+            profileEditBioApplied: String = "",
+            bioAfterPart1Ok: Boolean = false,
+            bioAfterPart2Ok: Boolean = false,
+        ) = withStepFields(
+            ProfileEditChainResult(
+                success = success,
+                failureStep = failureStep,
+                editOcrAttempts = editAttempts,
+                changeOcrAttempts = changeAttempts,
+                editOcrPreviews = editPreviews.toList(),
+                changeOcrPreviews = changePreviews.toList(),
+                editTapPx = editTap.x to editTap.y,
+                changeMenuLinePx = menuLineRecorded,
+                changeMenuChangePhotoPx = menuChangePhotoPxOut,
+                changeMenuNamePx = menuNamePxOut,
+                changeMenuBioPx = menuBioPxOut,
+                changeTapPx = changePhotoTapPx,
+                editTapOk = true,
+                changeTapOk = changePhotoTapOk,
+                changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
+                changePhotoStrictTapPx = changePhotoTapPx,
+                changePhotoStrictTapOk = changePhotoTapOk,
+                uploadPhotoOcrAttempts = uploadAttempts,
+                uploadPhotoOcrPreviews = uploadPreviews.toList(),
+                uploadPhotoTapPx = uploadTapPx,
+                uploadPhotoTapOk = uploadTapOk,
+                allowAllOcrAttempts = allowAttempts,
+                allowAllOcrPreviews = allowPreviews.toList(),
+                allowAllTapPx = allowTapPx,
+                allowAllTapOk = allowTapOk,
+                avatarVerifyOcrAttempts = avatarTryCount,
+                postConfirmChangePhotoOcrAttempts = postConfirmChangePhotoTries,
+                bioVerifyOcrAttempts = bioVerifyTryCount,
+                displayNameRandomApplied = appliedName,
+                profileEditBioApplied = profileEditBioApplied,
+                bioAfterPart1Ok = bioAfterPart1Ok,
+                bioAfterPart2Ok = bioAfterPart2Ok,
+                profileEditAssignedUsername = profileEditAssignedUsername,
+                profileEditUsernameSyncedTo = profileEditUsernameSyncedTo,
+            ),
+        )
+
+        if (skipAvatarStep) {
+            devOp(
+                logAlias,
+                "「修改基本资料」步骤1换头像：跳过（avatarOk=${stepPersist.avatarOk} " +
+                    "avatarAbandoned=${stepPersist.avatarAbandoned} resume=$resumeFrom）",
+            )
+            avatarPostSeen = true
+            profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "resume_skip_avatar")?.let { fresh ->
+                menuNamePxOut = fresh.name
+                menuBioPxOut = fresh.bio
+                devOp(
+                    logAlias,
+                    "「修改基本资料」续接前已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) " +
+                        "Bio=(${fresh.bio.first},${fresh.bio.second})",
+                )
+            } ?: devOp(logAlias, "「修改基本资料」续接跳过换头像后未能 OCR 刷新 Name/Bio 坐标，仍使用 Edit 菜单阶段记录值")
+        } else {
+        var avatarStepDone = false
+        var avatarLastFail = ""
+        class AvatarAttemptFail(step: String) : RuntimeException() {
+            init {
+                avatarLastFail = step
+            }
+        }
+        for (avatarTry in 0 until 2) {
+            try {
+            if (avatarTry > 0) {
+                devOp(
+                    logAlias,
+                    "「修改基本资料」步骤1换头像：第 1 次失败（$avatarLastFail），重试 1 次",
+                )
+                navBack(logAlias, "换头像重试：返回资料菜单")
+                if (!profileEditDelay(logAlias, 650L, "换头像重试返回后")) {
+                    return withStepFields(chainBase(success = false, failureStep = "hard_stop"))
+                }
+                profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "avatar_retry")?.let { fresh ->
+                    menuNamePxOut = fresh.name
+                    menuBioPxOut = fresh.bio
+                }
+                changePhotoTapPx = null
+                changePhotoTapOk = false
+                changePhotoStrictAttempts = 0
+                avatarPostSeen = false
+                avatarPostVerifyCount = 0
+            }
+
+        changePhotoTapPx = null
+        changePhotoTapOk = false
+        changePhotoStrictAttempts = 0
         val menuVision = visionWhenMenuLineHit
         if (menuVision != null) {
             delay(400)
@@ -4502,25 +4590,7 @@ class RealTraceExecutor(
             changePhotoTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!changePhotoTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Change photo(专段整屏) 的 input tap 未成功（su）")
-                return ProfileEditChainResult(
-                    success = false,
-                    failureStep = "change_photo_tap_su_failed",
-                    editOcrAttempts = editAttempts,
-                    changeOcrAttempts = changeAttempts,
-                    editOcrPreviews = editPreviews.toList(),
-                    changeOcrPreviews = changePreviews.toList(),
-                    editTapPx = editTap.x to editTap.y,
-                    changeMenuLinePx = menuLineRecorded,
-                    changeMenuChangePhotoPx = menuChangePhotoPxOut,
-                    changeMenuNamePx = menuNamePxOut,
-                    changeMenuBioPx = menuBioPxOut,
-                    editTapOk = true,
-                    changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-                    changePhotoStrictTapPx = changePhotoTapPx,
-                    changePhotoStrictTapOk = false,
-                    changeTapPx = changePhotoTapPx,
-                    changeTapOk = false,
-                )
+                throw AvatarAttemptFail("change_photo_tap_su_failed")
             }
         }
         if (!changePhotoTapOk) {
@@ -4528,23 +4598,7 @@ class RealTraceExecutor(
                 logAlias,
                 "「修改基本资料」失败：「Change photo」未完成有效点击（已含菜单同屏首击若适用 + 专段整屏 OCR 至多 3 次）",
             )
-            return ProfileEditChainResult(
-                success = false,
-                failureStep = "change_photo_strict_ocr_3x_miss",
-                editOcrAttempts = editAttempts,
-                changeOcrAttempts = changeAttempts,
-                editOcrPreviews = editPreviews.toList(),
-                changeOcrPreviews = changePreviews.toList(),
-                editTapPx = editTap.x to editTap.y,
-                changeMenuLinePx = menuLineRecorded,
-                changeMenuChangePhotoPx = menuChangePhotoPxOut,
-                changeMenuNamePx = menuNamePxOut,
-                changeMenuBioPx = menuBioPxOut,
-                editTapOk = true,
-                changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-                changePhotoStrictTapPx = changePhotoTapPx,
-                changePhotoStrictTapOk = false,
-            )
+            throw AvatarAttemptFail("change_photo_strict_ocr_3x_miss")
         }
         delay(600)
         devOp(
@@ -4552,10 +4606,10 @@ class RealTraceExecutor(
             "「修改基本资料」「Change photo」tap 已完成；短延迟后重新整屏 OCR，严格匹配「Upload photo」/「Select from Gallery」（命中坐标将写入日志）",
         )
 
-        val uploadPreviews = mutableListOf<String>()
-        var uploadTapPx: Pair<Int, Int>? = null
-        var uploadTapOk = false
-        var uploadAttempts = 0
+        uploadPreviews.clear()
+        uploadTapPx = null
+        uploadTapOk = false
+        uploadAttempts = 0
         while (uploadAttempts < 3 && !uploadTapOk) {
             uploadAttempts++
             delay(600)
@@ -4588,56 +4642,12 @@ class RealTraceExecutor(
             uploadTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!uploadTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Upload photo/Select from Gallery 的 input tap 未成功（su）")
-                return ProfileEditChainResult(
-                    success = false,
-                    failureStep = "upload_photo_tap_su_failed",
-                    editOcrAttempts = editAttempts,
-                    changeOcrAttempts = changeAttempts,
-                    editOcrPreviews = editPreviews.toList(),
-                    changeOcrPreviews = changePreviews.toList(),
-                    editTapPx = editTap.x to editTap.y,
-                    changeMenuLinePx = menuLineRecorded,
-                    changeMenuChangePhotoPx = menuChangePhotoPxOut,
-                    changeMenuNamePx = menuNamePxOut,
-                    changeMenuBioPx = menuBioPxOut,
-                    editTapOk = true,
-                    changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-                    changePhotoStrictTapPx = changePhotoTapPx,
-                    changePhotoStrictTapOk = true,
-                    changeTapPx = changePhotoTapPx,
-                    changeTapOk = true,
-                    uploadPhotoOcrAttempts = uploadAttempts,
-                    uploadPhotoOcrPreviews = uploadPreviews.toList(),
-                    uploadPhotoTapPx = uploadTapPx,
-                    uploadPhotoTapOk = false,
-                )
+                throw AvatarAttemptFail("upload_photo_tap_su_failed")
             }
         }
         if (!uploadTapOk) {
             devOp(logAlias, "「修改基本资料」失败：严格「Upload photo」/「Select from Gallery」经 3 次 OCR 仍未完成有效点击")
-            return ProfileEditChainResult(
-                success = false,
-                failureStep = "upload_photo_ocr_3x_miss",
-                editOcrAttempts = editAttempts,
-                changeOcrAttempts = changeAttempts,
-                editOcrPreviews = editPreviews.toList(),
-                changeOcrPreviews = changePreviews.toList(),
-                editTapPx = editTap.x to editTap.y,
-                changeMenuLinePx = menuLineRecorded,
-                changeMenuChangePhotoPx = menuChangePhotoPxOut,
-                changeMenuNamePx = menuNamePxOut,
-                changeMenuBioPx = menuBioPxOut,
-                editTapOk = true,
-                changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-                changePhotoStrictTapPx = changePhotoTapPx,
-                changePhotoStrictTapOk = true,
-                changeTapPx = changePhotoTapPx,
-                changeTapOk = true,
-                uploadPhotoOcrAttempts = uploadAttempts,
-                uploadPhotoOcrPreviews = uploadPreviews.toList(),
-                uploadPhotoTapPx = uploadTapPx,
-                uploadPhotoTapOk = false,
-            )
+            throw AvatarAttemptFail("upload_photo_ocr_3x_miss")
         }
         delay(600)
         devOp(
@@ -4646,11 +4656,11 @@ class RealTraceExecutor(
                 "未见 Allow all 但已见 Recents 则跳过 Allow；之后 OCR「Recents」确认界面稳定）",
         )
 
-        val allowPreviews = mutableListOf<String>()
-        var allowTapPx: Pair<Int, Int>? = null
-        var allowTapOk = false
-        var allowSkippedBecauseRecentsVisible = false
-        var allowAttempts = 0
+        allowPreviews.clear()
+        allowTapPx = null
+        allowTapOk = false
+        allowSkippedBecauseRecentsVisible = false
+        allowAttempts = 0
         while (
             allowAttempts < PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES &&
             !allowTapOk &&
@@ -4703,33 +4713,7 @@ class RealTraceExecutor(
             allowTapOk = runSuCommand("input tap ${tap.x} ${tap.y}")
             if (!allowTapOk) {
                 devOp(logAlias, "「修改基本资料」失败：Allow all 的 input tap 未成功（su）")
-                return ProfileEditChainResult(
-                    success = false,
-                    failureStep = "allow_all_tap_su_failed",
-                    editOcrAttempts = editAttempts,
-                    changeOcrAttempts = changeAttempts,
-                    editOcrPreviews = editPreviews.toList(),
-                    changeOcrPreviews = changePreviews.toList(),
-                    editTapPx = editTap.x to editTap.y,
-                    changeMenuLinePx = menuLineRecorded,
-                    changeMenuChangePhotoPx = menuChangePhotoPxOut,
-                    changeMenuNamePx = menuNamePxOut,
-                    changeMenuBioPx = menuBioPxOut,
-                    editTapOk = true,
-                    changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-                    changePhotoStrictTapPx = changePhotoTapPx,
-                    changePhotoStrictTapOk = true,
-                    changeTapPx = changePhotoTapPx,
-                    changeTapOk = true,
-                    uploadPhotoOcrAttempts = uploadAttempts,
-                    uploadPhotoOcrPreviews = uploadPreviews.toList(),
-                    uploadPhotoTapPx = uploadTapPx,
-                    uploadPhotoTapOk = true,
-                    allowAllOcrAttempts = allowAttempts,
-                    allowAllOcrPreviews = allowPreviews.toList(),
-                    allowAllTapPx = allowTapPx,
-                    allowAllTapOk = false,
-                )
+                throw AvatarAttemptFail("allow_all_tap_su_failed")
             }
         }
         if (!allowTapOk && !allowSkippedBecauseRecentsVisible) {
@@ -4739,56 +4723,6 @@ class RealTraceExecutor(
                     "跳过 Allow all 点击，继续等待 Recents 稳定",
             )
         }
-
-        var profileEditAssignedUsername = ""
-        var profileEditUsernameSyncedTo = ""
-
-        fun chainBase(
-            success: Boolean,
-            failureStep: String,
-            avatarTryCount: Int = 0,
-            bioVerifyTryCount: Int = 0,
-            appliedName: String = "",
-            postConfirmChangePhotoTries: Int = 0,
-            profileEditBioApplied: String = "",
-            bioAfterPart1Ok: Boolean = false,
-            bioAfterPart2Ok: Boolean = false,
-        ) = ProfileEditChainResult(
-            success = success && bioAfterPart1Ok && bioAfterPart2Ok,
-            failureStep = failureStep,
-            editOcrAttempts = editAttempts,
-            changeOcrAttempts = changeAttempts,
-            editOcrPreviews = editPreviews.toList(),
-            changeOcrPreviews = changePreviews.toList(),
-            editTapPx = editTap.x to editTap.y,
-            changeMenuLinePx = menuLineRecorded,
-            changeMenuChangePhotoPx = menuChangePhotoPxOut,
-            changeMenuNamePx = menuNamePxOut,
-            changeMenuBioPx = menuBioPxOut,
-            changeTapPx = changePhotoTapPx,
-            editTapOk = true,
-            changeTapOk = true,
-            changePhotoStrictOcrAttempts = changePhotoStrictAttempts,
-            changePhotoStrictTapPx = changePhotoTapPx,
-            changePhotoStrictTapOk = changePhotoTapOk,
-            uploadPhotoOcrAttempts = uploadAttempts,
-            uploadPhotoOcrPreviews = uploadPreviews.toList(),
-            uploadPhotoTapPx = uploadTapPx,
-            uploadPhotoTapOk = uploadTapOk,
-            allowAllOcrAttempts = allowAttempts,
-            allowAllOcrPreviews = allowPreviews.toList(),
-            allowAllTapPx = allowTapPx,
-            allowAllTapOk = allowTapOk,
-            avatarVerifyOcrAttempts = avatarTryCount,
-            postConfirmChangePhotoOcrAttempts = postConfirmChangePhotoTries,
-            bioVerifyOcrAttempts = bioVerifyTryCount,
-            displayNameRandomApplied = appliedName,
-            profileEditBioApplied = profileEditBioApplied,
-            bioAfterPart1Ok = bioAfterPart1Ok,
-            bioAfterPart2Ok = bioAfterPart2Ok,
-            profileEditAssignedUsername = profileEditAssignedUsername,
-            profileEditUsernameSyncedTo = profileEditUsernameSyncedTo,
-        )
 
         delay(550)
         when {
@@ -4800,7 +4734,7 @@ class RealTraceExecutor(
                 devOp(logAlias, "「修改基本资料」Allow all 未点击，等待 Recents 稳定后进入选图发帖")
         }
         if (!profileEditWaitRecentsStable(ctx, logAlias, w, h)) {
-            return chainBase(success = false, failureStep = "recents_stable_miss")
+            throw AvatarAttemptFail("recents_stable_miss")
         }
 
         delay(400)
@@ -4811,7 +4745,7 @@ class RealTraceExecutor(
             "「修改基本资料」左上区域固定点（约 0.125×宽, 0.20×高）→ (${cropX},${cropY})，屏 ${w}x${h}",
         )
         if (!runSuCommand("input tap $cropX $cropY")) {
-            return chainBase(success = false, failureStep = "post_crop_corner_tap_failed")
+            throw AvatarAttemptFail("post_crop_corner_tap_failed")
         }
 
         // 发布作品功能：第一次点 Next 后，等待 1500ms ~ 2000ms，再点第二次 Next。
@@ -4821,7 +4755,7 @@ class RealTraceExecutor(
                 ctx, logAlias, w, h, "profile_edit_post_next_a", "Next(第1次)", "Next", 6,
             ) { findStrictExactLabelHit(it, "Next") }
         ) {
-            return chainBase(success = false, failureStep = "post_next_first_miss")
+            throw AvatarAttemptFail("post_next_first_miss")
         }
         delay(Random.nextLong(1500L, 2001L))
         if (
@@ -4829,7 +4763,7 @@ class RealTraceExecutor(
                 ctx, logAlias, w, h, "profile_edit_post_next_b", "Next(第2次)", "Next", 6,
             ) { findStrictExactLabelHit(it, "Next") }
         ) {
-            return chainBase(success = false, failureStep = "post_next_second_miss")
+            throw AvatarAttemptFail("post_next_second_miss")
         }
 
         // 这里不是发布作品链，而是“修改账户基本信息”流程中的确认/返回步骤。
@@ -4854,25 +4788,19 @@ class RealTraceExecutor(
                 ctx, logAlias, w, h, "profile_edit_post_save", "Save(发帖)", "Save", 6,
             ) { findStrictExactLabelHit(it, "Save") }
         ) {
-            return chainBase(success = false, failureStep = "post_save_ocr_miss")
+            throw AvatarAttemptFail("post_save_ocr_miss")
         }
 
         if (!profileEditDelay(logAlias, 400L, "Save(发帖)后")) {
             return chainBase(success = false, failureStep = "hard_stop")
         }
         val uploadWaitOutcome = profileEditWaitAvatarUploadSettledOrChangePhoto(ctx, logAlias, runtimeConfig)
-        var avatarPostVerifyCount = 0
-        var avatarPostSeen = false
         when (uploadWaitOutcome) {
             ProfileEditAvatarUploadWaitOutcome.HardStop ->
                 return chainBase(success = false, failureStep = "hard_stop")
             is ProfileEditAvatarUploadWaitOutcome.TimedOut -> {
                 avatarPostVerifyCount = uploadWaitOutcome.pollAttempts
-                return chainBase(
-                    success = false,
-                    failureStep = "avatar_uploading_wait_timeout",
-                    avatarTryCount = avatarPostVerifyCount,
-                )
+                throw AvatarAttemptFail("avatar_uploading_wait_timeout")
             }
             is ProfileEditAvatarUploadWaitOutcome.ChangePhotoReady -> {
                 avatarPostSeen = true
@@ -4905,103 +4833,112 @@ class RealTraceExecutor(
             }
             devOp(
                 logAlias,
-                "「修改基本资料」发帖后：7 次均未出现「Change photo」，判定异常，本链失败（外轮将强停重来）",
+                "「修改基本资料」发帖后：7 次均未出现「Change photo」，判定换头像失败",
             )
-            return chainBase(
-                success = false,
-                failureStep = "avatar_verify_change_photo_timeout",
-                avatarTryCount = avatarPostVerifyCount,
-            )
+            throw AvatarAttemptFail("avatar_verify_change_photo_timeout")
         }
-
-        /*
-         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
-         * profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "pre_name")?.let { fresh ->
-         *     menuNamePxOut = fresh.name
-         *     menuBioPxOut = fresh.bio
-         *     devOp(
-         *         logAlias,
-         *         "「修改基本资料」换头像后已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) Bio=(${fresh.bio.first},${fresh.bio.second})",
-         *     )
-         * } ?: devOp(
-         *     logAlias,
-         *     "「修改基本资料」换头像后未能 OCR 刷新 Name/Bio 坐标，仍使用换头像前记录值（存在误点风险）",
-         * )
-         * ===== 修改资料优化备用代码（后续按需打开）END =====
-         */
+        avatarStepDone = true
+        persistStepState { copy(avatarOk = true) }
+        profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "post_avatar")?.let { fresh ->
+            menuNamePxOut = fresh.name
+            menuBioPxOut = fresh.bio
+            devOp(
+                logAlias,
+                "「修改基本资料」换头像后已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) " +
+                    "Bio=(${fresh.bio.first},${fresh.bio.second})",
+            )
+        } ?: devOp(
+            logAlias,
+            "「修改基本资料」换头像后未能 OCR 刷新 Name/Bio 坐标，仍使用换头像前记录值",
+        )
+        break
+            } catch (_: AvatarAttemptFail) {
+            }
+        }
+        if (!avatarStepDone) {
+            if (PrefsStore.isHardStopRequested()) {
+                return withStepFields(
+                    chainBase(success = false, failureStep = "hard_stop", avatarTryCount = avatarPostVerifyCount),
+                )
+            }
+            persistStepState { copy(avatarAbandoned = true) }
+            devOp(
+                logAlias,
+                "「修改基本资料」步骤1换头像：2 次均未成功（$avatarLastFail），永久跳过 Avatar",
+            )
+            navBack(logAlias, "Avatar放弃：尝试返回资料菜单")
+            profileEditDelay(logAlias, 650L, "Avatar放弃返回后")
+            profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "post_avatar_abandon")?.let { fresh ->
+                menuNamePxOut = fresh.name
+                menuBioPxOut = fresh.bio
+            }
+        }
+        } // end !skipAvatarStep
 
         val postConfirmAttempts: Int
-        if (PROFILE_EDIT_SKIP_NAME_STEP) {
-            devOp(logAlias, "「修改基本资料」显示名(Name)：已临时跳过（PROFILE_EDIT_SKIP_NAME_STEP=true），继续 TikTok 文案/Bio")
+        var appliedDisplayName = ""
+        val skipNameStep = PROFILE_EDIT_SKIP_NAME_STEP || stepPersist.nameOk || stepPersist.nameAbandoned ||
+            resumeFrom == ProfileEditResumeStep.BIO
+        if (skipNameStep) {
+            if (stepPersist.nameAbandoned) {
+                devOp(logAlias, "「修改基本资料」步骤2改显示名：永久跳过（name_abandoned=true）")
+            } else if (stepPersist.nameOk) {
+                devOp(logAlias, "「修改基本资料」步骤2改显示名：跳过（name_ok=true）")
+            } else if (PROFILE_EDIT_SKIP_NAME_STEP) {
+                devOp(logAlias, "「修改基本资料」显示名(Name)：已临时跳过（PROFILE_EDIT_SKIP_NAME_STEP=true）")
+            } else {
+                devOp(logAlias, "「修改基本资料」步骤2改显示名：跳过（从 bio 续接）")
+            }
             postConfirmAttempts = 0
         } else {
-            val nameRecall = menuNamePxOut
-            if (nameRecall == null) {
-                return chainBase(
-                    success = false,
-                    failureStep = "display_name_menu_coords_missing",
-                    avatarTryCount = avatarPostVerifyCount,
-                )
-            }
-            devOp(logAlias, "「修改基本资料」显示名：点击菜单阶段记录的 Name (${nameRecall.first},${nameRecall.second}) 聚焦输入框")
-            if (!runSuCommand("input tap ${nameRecall.first} ${nameRecall.second}")) {
-                return chainBase(
-                    success = false,
-                    failureStep = "display_name_tap_failed",
-                    avatarTryCount = avatarPostVerifyCount,
-                )
-            }
-            delay(450)
-            if (!profileEditOcrPreferredNameEditable(ctx, logAlias)) {
-                if (PrefsStore.isHardStopRequested()) {
-                    return chainBase(
-                        success = false,
-                        failureStep = "hard_stop",
-                        avatarTryCount = avatarPostVerifyCount,
-                    )
+            var nameStepDone = false
+            var nameFailStep = ""
+            var nameRetryPostConfirm = 0
+            for (nameTry in 0 until 2) {
+                if (nameTry > 0) {
+                    devOp(logAlias, "「修改基本资料」步骤2改显示名：第 1 次失败（$nameFailStep），重试 1 次")
+                    navBack(logAlias, "Name 步骤重试：返回资料菜单")
+                    if (!profileEditDelay(logAlias, 650L, "Name重试返回后")) {
+                        return withStepFields(chainBase(success = false, failureStep = "hard_stop", avatarTryCount = avatarPostVerifyCount))
+                    }
+                    profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "name_retry")?.let { fresh ->
+                        menuNamePxOut = fresh.name
+                        menuBioPxOut = fresh.bio
+                    }
                 }
-                navBack(logAlias, "Name 不可编辑：跳过修改显示名并返回资料菜单")
-                if (!profileEditDelay(logAlias, 520L, "Name跳过返回后")) {
-                    return chainBase(
-                        success = false,
-                        failureStep = "hard_stop",
-                        avatarTryCount = avatarPostVerifyCount,
-                    )
+                val nameRecallTry = menuNamePxOut
+                if (nameRecallTry == null) {
+                    nameFailStep = "display_name_menu_coords_missing"
+                    continue
                 }
-                postConfirmAttempts = 0
-            } else {
+                devOp(
+                    logAlias,
+                    "「修改基本资料」显示名：点击菜单 Name (${nameRecallTry.first},${nameRecallTry.second}) 聚焦输入框" +
+                        if (nameTry > 0) "（重试）" else "",
+                )
+                if (!runSuCommand("input tap ${nameRecallTry.first} ${nameRecallTry.second}")) {
+                    nameFailStep = "display_name_tap_failed"
+                    continue
+                }
+                delay(450)
                 profileEditClearFocusedNameField(logAlias)
                 delay(350)
                 val picked = ProfileEditFemaleDisplayNames.NAMES[Random.nextInt(ProfileEditFemaleDisplayNames.NAMES.size)]
                 devOp(logAlias, "「修改基本资料」显示名：随机抽取「$picked」，输入到已清空后的框内")
                 if (!tryInputCommentText(logAlias, picked)) {
-                    return chainBase(
-                        success = false,
-                        failureStep = "display_name_input_failed",
-                        avatarTryCount = avatarPostVerifyCount,
-                        appliedName = picked,
-                    )
+                    nameFailStep = "display_name_input_failed"
+                    appliedDisplayName = picked
+                    continue
                 }
-
-                val nameSaveTap = profileEditOcrTapSaveTopmost(ctx, logAlias, w, h)
-                if (nameSaveTap == null) {
-                    return chainBase(
-                        success = false,
-                        failureStep = "name_flow_save_ocr_miss",
-                        avatarTryCount = avatarPostVerifyCount,
-                        appliedName = picked,
-                    )
+                appliedDisplayName = picked
+                if (profileEditOcrTapSaveTopmost(ctx, logAlias, w, h) == null) {
+                    nameFailStep = "name_flow_save_ocr_miss"
+                    continue
                 }
-
                 if (!profileEditOcrTapConfirmPasses(ctx, logAlias, w, h)) {
-                    return chainBase(
-                        success = false,
-                        failureStep = "name_flow_confirm_miss",
-                        avatarTryCount = avatarPostVerifyCount,
-                        appliedName = picked,
-                    )
+                    nameFailStep = "name_flow_confirm_miss"
+                    continue
                 }
-
                 delay(1000L)
                 val (postConfirmCpOk, postConfirmCpAttempts) = profileEditOcrUntilChangePhotoSeen(
                     ctx,
@@ -5010,37 +4947,43 @@ class RealTraceExecutor(
                     "Confirm 后资料页（需见 Change photo）",
                 )
                 if (!postConfirmCpOk) {
-                    devOp(
-                        logAlias,
-                        "「修改基本资料」Confirm 后：7 次均未出现「Change photo」，判定页面异常，本链失败（外轮将强停重来）",
-                    )
-                    return chainBase(
-                        success = false,
-                        failureStep = "post_confirm_change_photo_timeout",
-                        avatarTryCount = avatarPostVerifyCount,
-                        postConfirmChangePhotoTries = postConfirmCpAttempts,
-                        appliedName = picked,
+                    nameFailStep = "post_confirm_change_photo_timeout"
+                    nameRetryPostConfirm = postConfirmCpAttempts
+                    devOp(logAlias, "「修改基本资料」Confirm 后：7 次均未出现「Change photo」")
+                    continue
+                }
+                nameRetryPostConfirm = postConfirmCpAttempts
+                nameStepDone = true
+                persistStepState { copy(nameOk = true) }
+                break
+            }
+            if (!nameStepDone) {
+                if (PrefsStore.isHardStopRequested()) {
+                    return withStepFields(
+                        chainBase(success = false, failureStep = "hard_stop", avatarTryCount = avatarPostVerifyCount),
                     )
                 }
-                postConfirmAttempts = postConfirmCpAttempts
+                persistStepState { copy(nameAbandoned = true) }
+                devOp(logAlias, "「修改基本资料」步骤2改显示名：2 次均未成功（$nameFailStep），永久跳过 Name")
+                profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "post_name_abandon")?.let { fresh ->
+                    menuNamePxOut = fresh.name
+                    menuBioPxOut = fresh.bio
+                }
+                postConfirmAttempts = nameRetryPostConfirm
+            } else {
+                postConfirmAttempts = nameRetryPostConfirm
             }
         }
 
-        /*
-         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
-         * profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "pre_bio")?.let { fresh ->
-         *     menuNamePxOut = fresh.name
-         *     menuBioPxOut = fresh.bio
-         *     devOp(
-         *         logAlias,
-         *         "「修改基本资料」Bio 前已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) Bio=(${fresh.bio.first},${fresh.bio.second})",
-         *     )
-         * } ?: devOp(
-         *     logAlias,
-         *     "「修改基本资料」Bio 前未能 OCR 刷新 Name/Bio 坐标，仍使用此前记录值",
-         * )
-         * ===== 修改资料优化备用代码（后续按需打开）END =====
-         */
+        profileEditOcrRefreshNameBioMenuCoords(ctx, logAlias, w, h, "pre_bio")?.let { fresh ->
+            menuNamePxOut = fresh.name
+            menuBioPxOut = fresh.bio
+            devOp(
+                logAlias,
+                "「修改基本资料」Bio 前已刷新 Name/Bio 菜单坐标：Name=(${fresh.name.first},${fresh.name.second}) " +
+                    "Bio=(${fresh.bio.first},${fresh.bio.second})",
+            )
+        } ?: devOp(logAlias, "「修改基本资料」Bio 前未能 OCR 刷新 Name/Bio 坐标，仍使用此前记录值")
 
         val bioRecall = menuBioPxOut
         if (bioRecall == null) {
@@ -5086,21 +5029,6 @@ class RealTraceExecutor(
             )
         }
         delay(450)
-        /*
-         * ===== 修改资料优化备用代码（后续按需打开）BEGIN =====
-         * val (bioTapResolved, bioOpenFail) = profileEditTapBioMenuOpenEditor(ctx, logAlias, w, h, bioRecall)
-         * if (bioOpenFail != null) {
-         *     return chainBase(
-         *         success = false,
-         *         failureStep = bioOpenFail,
-         *         avatarTryCount = avatarPostVerifyCount,
-         *         postConfirmChangePhotoTries = postConfirmAttempts,
-         *     )
-         * }
-         * val bioRecallActive = bioTapResolved ?: bioRecall
-         * menuBioPxOut = bioRecallActive
-         * ===== 修改资料优化备用代码（后续按需打开）END =====
-         */
         if (usernameCopiedToClipboard && assignedUsername != null) {
             profileEditSyncUsernameFromBioClipboardIfNeeded(logAlias, assignedUsername)
                 ?.let { profileEditUsernameSyncedTo = it }
@@ -5233,6 +5161,7 @@ class RealTraceExecutor(
                 )
             }
             part1Ok = true
+            persistStepState { copy(bioPart1Ok = true) }
             devOp(logAlias, "「修改基本资料」Bio 后① 第 $part1Round 轮成功，进入②（Privacy/Viewers 链）")
         }
         if (!part1Ok) {
@@ -5326,7 +5255,7 @@ class RealTraceExecutor(
             )
             devOp(
                 logAlias,
-                "「修改基本资料」Bio 后① 已完成但② 失败，不上报云端「基本资料已修改」（step=$lastPart2Fail）",
+                "「修改基本资料」Bio 后① 已完成但② 失败（step=$lastPart2Fail）；整体成功仍仅看头像是否已成功",
             )
             return chainBase(
                 success = false,
@@ -5343,12 +5272,14 @@ class RealTraceExecutor(
         val bioShort = if (bioPicked.length <= 40) bioPicked else bioPicked.take(40) + "…"
         devOp(
             logAlias,
-            "「修改基本资料」OCR 链成功（①② 均完成，可上报云端标「基本资料已修改」为是）：Edit→…→Bio「$bioShort」→" +
+            "「修改基本资料」OCR 链完成（①② 均完成；整体成功仍仅看头像 avatarOk）：Edit→…→Bio「$bioShort」→" +
                 "①Save→终验→返回→②比例点→【插入】Permissions/Save login info/返回→【旧】Permissions校验→Privacy→Comments→Viewers→等 3s(仅 Off 路径)",
         )
         devOp(logAlias, "「修改基本资料」①② 完成，关闭 TikTok 后台：am force-stop ${Config.TIKTOK_PACKAGE_NAME}")
         runSuCommand("am force-stop ${Config.TIKTOK_PACKAGE_NAME}")
         delay(800)
+        persistStepState { copy(bioOk = true, bioPart1Ok = true) }
+        ProfileEditStepStateStore.clear(profileUsernameKey)
         return chainBase(
             success = true,
             failureStep = "",
@@ -9011,17 +8942,21 @@ class RealTraceExecutor(
         val resumeStartIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
         val targetPublishCount = PrefsStore.getPublishPostTargetCount()
         if (resumeStartIdx <= 0) {
-            devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
-            deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
-            val fetchCount = (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
-            if (fetchCount > 0) {
-                if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
-                    lastPublishPostEntryFailureReason =
-                        lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
-                    return false
-                }
+            if (PrefsStore.isPublishPostMaterialReady()) {
+                devOp(alias, "发作品：检测到素材已就绪（进程恢复），跳过图库清理与素材拉取")
             } else {
-                devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
+                devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
+                deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
+                val fetchCount = (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
+                if (fetchCount > 0) {
+                    if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
+                        lastPublishPostEntryFailureReason =
+                            lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
+                        return false
+                    }
+                } else {
+                    devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
+                }
             }
         } else {
             devOp(
@@ -9087,6 +9022,9 @@ class RealTraceExecutor(
         }
         if (!PublishPostGrowthGate.enterExclusivePublishPhase(alias)) {
             return false
+        }
+        if (galleryMaterialCount > 0) {
+            PrefsStore.setPublishPostMaterialReady(true)
         }
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
         publishPostEntryLayout = publishPostLoadDeviceEntryLayout(alias)
@@ -9201,6 +9139,7 @@ class RealTraceExecutor(
         }
         runCatching { publishPostTapBottomHomeAfterCompletion(service, alias) }
         PrefsStore.clearPublishPostResumeProgress(accountKey)
+        PrefsStore.setPublishPostMaterialReady(false)
         PrefsStore.setPublishPostLastActualSuccessCount(publishRounds)
         devOp(alias, "发作品：本轮全部发布成功（不删除图库，下次新任务开始前再清）")
         return true
@@ -10284,6 +10223,9 @@ class RealTraceExecutor(
                 "发作品：素材拉取完成 taskId=${task.taskId} files=${task.files.size}；" +
                     "图库统计 图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} 合计=${stats.resolvedCount}",
             )
+            if (stats.resolvedCount > 0) {
+                PrefsStore.setPublishPostMaterialReady(true)
+            }
             stats.resolvedCount > 0
         } catch (t: Throwable) {
             val companionId = CompanionApi.deviceId(app)
@@ -13535,6 +13477,10 @@ class RealTraceExecutor(
         h: Int,
         vision: Text?,
     ) {
+        if (autoLoginCheckYourInboxPathActive) {
+            devOp(alias, "自动登录(Check your inbox)：跳过点验证码输入区（默认已可输入）")
+            return
+        }
         val hit = vision?.let { v ->
             findLabelHitContainingIgnoreCase(v, "enter code")
                 ?: findLabelHitContainingIgnoreCase(v, "verification code")
@@ -13965,10 +13911,25 @@ class RealTraceExecutor(
         phaseLog: String,
         maxPasses: Int = AUTO_LOGIN_OCR_MAX_PASSES,
         retryDelayMs: Long = AUTO_LOGIN_OCR_RETRY_DELAY_MS,
+        initialVision: Text? = null,
         findHit: (Text) -> StrictLabelHit?,
         onVisionProbe: ((pass: Int, passes: Int, vision: Text, hit: StrictLabelHit?) -> Unit)? = null,
     ): AutoLoginStepOutcome {
         val passes = maxPasses.coerceIn(1, 20)
+        if (initialVision != null) {
+            val hit = findHit(initialVision)
+            onVisionProbe?.invoke(1, passes, initialVision, hit)
+            if (hit != null) {
+                val tap = autoLoginTapWithJitter(hit.point, w, h)
+                devOp(alias, "自动登录 $phaseLog：复用上帧 OCR 命中，tap (${tap.x},${tap.y})")
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    if (!autoLoginDelay(alias, 550L, "$phaseLog 点击后")) return AutoLoginStepOutcome.Failed
+                    return AutoLoginStepOutcome.Ok
+                }
+            } else {
+                devOp(alias, "自动登录 $phaseLog：复用上帧 OCR 未命中，进入 OCR 重试")
+            }
+        }
         for (pass in 1..passes) {
             if (hardStopOrNull(alias, "自动登录-$phaseLog")) return AutoLoginStepOutcome.Failed
             if (pass > 1) {
@@ -14464,7 +14425,7 @@ class RealTraceExecutor(
         return SafeguardProfileScreenKind.Unknown
     }
 
-    /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Account status / Welcome back 由 [probeAndHandleLogoutSignalsFromVision] 处理。 */
+    /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Add another account 由 [probeAddAnotherAccountLogoutFromOcrVision] 统一处理。 */
     private fun safeguardVisionNeedsAutoLogin(vision: Text, screenH: Int): Boolean {
         if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
         if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
@@ -14686,7 +14647,7 @@ class RealTraceExecutor(
             }
             if (autoLoginVisionShowsCheckYourInbox(vision)) {
                 devOp(alias, "自动登录：Email后 OCR 命中 Check your inbox，转入 Inbox 密码路径（第 $pass 次）")
-                return AutoLoginEmailAfterContinueOutcome.CheckYourInbox
+                return AutoLoginEmailAfterContinueOutcome.CheckYourInbox(vision)
             }
 
             val sawFacebook = findLabelHitContainingIgnoreCase(vision, "facebook") != null
@@ -15012,11 +14973,16 @@ class RealTraceExecutor(
     }
 
     /** 旧流 Email→Continue 等待：见到 Verify / Check your inbox / 超时失败。 */
-    private enum class AutoLoginEmailAfterContinueOutcome {
-        VerifyReady,
-        CheckYourInbox,
-        Failed,
+    private sealed class AutoLoginEmailAfterContinueOutcome {
+        data object VerifyReady : AutoLoginEmailAfterContinueOutcome()
+        data class CheckYourInbox(val vision: Text) : AutoLoginEmailAfterContinueOutcome()
+        data object Failed : AutoLoginEmailAfterContinueOutcome()
     }
+
+    private data class AutoLoginCutSwitchPostEmailDetectResult(
+        val branch: AutoLoginCutSwitchPostEmailBranch,
+        val vision: Text,
+    )
 
     private sealed class AutoLoginCutSwitchStepOutcome {
         data object Ok : AutoLoginCutSwitchStepOutcome()
@@ -15033,20 +14999,23 @@ class RealTraceExecutor(
         autoLoginDetectVerificationPageMarker(vision) != null ||
             findLabelHitContainingIgnoreCase(vision, "resend code") != null
 
+    /** 仅「Check your inbox」文案触发 Inbox 密码路径；「Need help logging in」验证码页也有，不能作分流依据。 */
     private fun autoLoginVisionShowsCheckYourInbox(vision: Text): Boolean =
-        findLabelHitContainingIgnoreCaseRelaxed(vision, "check your inbox") != null ||
-            findAutoLoginNeedHelpLoggingHit(vision) != null
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "check your inbox") != null
 
     private fun autoLoginCutSwitchClassifyPostEmailBranch(vision: Text, screenH: Int): AutoLoginCutSwitchPostEmailBranch {
-        if (autoLoginVisionShowsCheckYourInbox(vision)) {
-            return AutoLoginCutSwitchPostEmailBranch.CheckYourInbox
-        }
         when (autoLoginClassifyRouteScreen(vision, screenH)) {
             AutoLoginRouteScreenKind.Interest -> return AutoLoginCutSwitchPostEmailBranch.ShortPathInterest
             AutoLoginRouteScreenKind.MainFeed -> return AutoLoginCutSwitchPostEmailBranch.ShortPathHome
             AutoLoginRouteScreenKind.Unknown -> Unit
         }
-        if (ocrVisionHasVerifyEmailMarker(vision)) return AutoLoginCutSwitchPostEmailBranch.VerifyPage
+        // Verify 页与 Check your inbox 页都可能含 verify 子串；先排除验证码页再判 Inbox。
+        if (autoLoginVisionOnVerificationPage(vision)) {
+            return AutoLoginCutSwitchPostEmailBranch.VerifyPage
+        }
+        if (autoLoginVisionShowsCheckYourInbox(vision)) {
+            return AutoLoginCutSwitchPostEmailBranch.CheckYourInbox
+        }
         if (findSinglePasswordAndNextHits(vision) != null ||
             findAllPasswordLabelHits(vision).isNotEmpty()
         ) {
@@ -15120,7 +15089,7 @@ class RealTraceExecutor(
         w: Int,
         h: Int,
         tagPrefix: String,
-    ): AutoLoginCutSwitchPostEmailBranch? {
+    ): AutoLoginCutSwitchPostEmailDetectResult? {
         val startedAt = System.currentTimeMillis()
         var pass = 0
         var lastContinueTapAt = 0L
@@ -15137,7 +15106,7 @@ class RealTraceExecutor(
                 branch != AutoLoginCutSwitchPostEmailBranch.Unknown
             ) {
                 devOp(alias, "自动登录(切号)：Email 后分流=$branch（第 $pass 次 OCR）")
-                return branch
+                return AutoLoginCutSwitchPostEmailDetectResult(branch, vision)
             }
             val sawFacebook = findLabelHitContainingIgnoreCase(vision, "facebook") != null
             val continueStrict = findStrictExactLabelHit(vision, "Continue")
@@ -15251,9 +15220,11 @@ class RealTraceExecutor(
         w: Int,
         h: Int,
         password: String,
+        inboxPageVision: Text? = null,
     ): Boolean {
         val needHelp = autoLoginOcrTapByFinder(
             ctx, alias, w, h, "cut_switch_need_help", "Need help logging in(切号)",
+            initialVision = inboxPageVision,
             findHit = { v -> findAutoLoginNeedHelpLoggingHit(v) },
             onVisionProbe = { pass, passes, vision, hit ->
                 autoLoginLogNeedHelpLoggingProbe(alias, pass, passes, vision, hit)
@@ -15516,7 +15487,7 @@ class RealTraceExecutor(
     ): AutoLoginCutSwitchStepOutcome {
         if (!autoLoginDelay(alias, 800L, "验证码分支探测")) return AutoLoginCutSwitchStepOutcome.Failed
         when (
-            autoLoginTapContinueAndWaitForVerifyEmail(
+            val emailAfterContinue = autoLoginTapContinueAndWaitForVerifyEmail(
                 ctx,
                 alias,
                 w,
@@ -15525,7 +15496,7 @@ class RealTraceExecutor(
             )
         ) {
             AutoLoginEmailAfterContinueOutcome.VerifyReady -> Unit
-            AutoLoginEmailAfterContinueOutcome.CheckYourInbox ->
+            is AutoLoginEmailAfterContinueOutcome.CheckYourInbox ->
                 return autoLoginRunCheckYourInboxPostEmailTail(
                     ctx = ctx,
                     alias = alias,
@@ -15536,6 +15507,7 @@ class RealTraceExecutor(
                     apiUrl = apiUrl,
                     email = email,
                     dontAllowHandledEarly = dontAllowHandledEarly,
+                    inboxPageVision = emailAfterContinue.vision,
                 )
             AutoLoginEmailAfterContinueOutcome.Failed -> {
                 devOp(alias, "自动登录：Email→Continue 跳转失败（3 分钟内仍未识别 Verify 文案，或仍可见 Facebook）")
@@ -15722,64 +15694,70 @@ class RealTraceExecutor(
         apiUrl: String,
         email: String,
         dontAllowHandledEarly: Boolean,
+        inboxPageVision: Text? = null,
     ): AutoLoginCutSwitchStepOutcome {
-        val reachedInterest = booleanArrayOf(false)
-        val reachedHome = booleanArrayOf(false)
-        val needVerify = booleanArrayOf(false)
+        autoLoginCheckYourInboxPathActive = true
+        try {
+            val reachedInterest = booleanArrayOf(false)
+            val reachedHome = booleanArrayOf(false)
+            val needVerify = booleanArrayOf(false)
 
-        if (!autoLoginCutSwitchInboxPasswordPath(ctx, alias, w, h, password)) {
-            return AutoLoginCutSwitchStepOutcome.Failed
-        }
-        val transition = autoLoginWaitPageTransitionCutSwitch(
-            ctx = ctx,
-            alias = alias,
-            h = h,
-            phaseLog = "Inbox密码后",
-            tagPrefix = "cut_switch_inbox_pwd_transition",
-            markerGone = { v -> !autoLoginVisionHasContinueMarker(v) },
-            allowVerifySuccess = true,
-        )
-        when (
-            autoLoginCutSwitchApplyTransitionOutcome(
-                alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify,
-            )
-        ) {
-            AutoLoginCutSwitchStepOutcome.Ok -> Unit
-            else -> return AutoLoginCutSwitchStepOutcome.Failed
-        }
-
-        if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
-            if (!autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)) {
-                return AutoLoginCutSwitchStepOutcome.ChainRestart
-            }
-            if (apiUrl.isBlank() && email.isBlank()) {
-                devOp(alias, "自动登录(Email后 Inbox)：需要验证码但 API 与邮箱均为空")
+            if (!autoLoginCutSwitchInboxPasswordPath(ctx, alias, w, h, password, inboxPageVision)) {
                 return AutoLoginCutSwitchStepOutcome.Failed
             }
-            val verifyResult = autoLoginEnterVerificationCodeCutSwitch(ctx, alias, w, h, deviceId, apiUrl, email)
-            when (verifyResult.step) {
-                AutoLoginCutSwitchStepOutcome.Ok -> {
-                    reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
-                    reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
-                }
-                AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
-                AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
-            }
-        }
-
-        if (!reachedInterest[0] && !reachedHome[0]) {
-            devOp(alias, "自动登录(Email后 Inbox)：未完成登录短路径（兴趣页/Home）")
-            return AutoLoginCutSwitchStepOutcome.Failed
-        }
-
-        return if (
-            autoLoginCutSwitchFinishLoginTail(
-                ctx, alias, w, h, reachedInterest[0], reachedHome[0], dontAllowHandledEarly,
+            val transition = autoLoginWaitPageTransitionCutSwitch(
+                ctx = ctx,
+                alias = alias,
+                h = h,
+                phaseLog = "Inbox密码后",
+                tagPrefix = "cut_switch_inbox_pwd_transition",
+                markerGone = { v -> !autoLoginVisionHasContinueMarker(v) },
+                allowVerifySuccess = true,
             )
-        ) {
-            AutoLoginCutSwitchStepOutcome.Ok
-        } else {
-            AutoLoginCutSwitchStepOutcome.Failed
+            when (
+                autoLoginCutSwitchApplyTransitionOutcome(
+                    alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify,
+                )
+            ) {
+                AutoLoginCutSwitchStepOutcome.Ok -> Unit
+                else -> return AutoLoginCutSwitchStepOutcome.Failed
+            }
+
+            if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
+                if (!autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)) {
+                    return AutoLoginCutSwitchStepOutcome.ChainRestart
+                }
+                if (apiUrl.isBlank() && email.isBlank()) {
+                    devOp(alias, "自动登录(Email后 Inbox)：需要验证码但 API 与邮箱均为空")
+                    return AutoLoginCutSwitchStepOutcome.Failed
+                }
+                val verifyResult = autoLoginEnterVerificationCodeCutSwitch(ctx, alias, w, h, deviceId, apiUrl, email)
+                when (verifyResult.step) {
+                    AutoLoginCutSwitchStepOutcome.Ok -> {
+                        reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
+                        reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
+                    }
+                    AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                    AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+                }
+            }
+
+            if (!reachedInterest[0] && !reachedHome[0]) {
+                devOp(alias, "自动登录(Email后 Inbox)：未完成登录短路径（兴趣页/Home）")
+                return AutoLoginCutSwitchStepOutcome.Failed
+            }
+
+            return if (
+                autoLoginCutSwitchFinishLoginTail(
+                    ctx, alias, w, h, reachedInterest[0], reachedHome[0], dontAllowHandledEarly,
+                )
+            ) {
+                AutoLoginCutSwitchStepOutcome.Ok
+            } else {
+                AutoLoginCutSwitchStepOutcome.Failed
+            }
+        } finally {
+            autoLoginCheckYourInboxPathActive = false
         }
     }
 
@@ -15795,9 +15773,10 @@ class RealTraceExecutor(
         dontAllowHandledEarly: Boolean,
     ): AutoLoginCutSwitchStepOutcome {
         if (!autoLoginDelay(alias, 800L, "分流-Email分流前")) return AutoLoginCutSwitchStepOutcome.Failed
-        val branch = autoLoginSubmitEmailAndDetectBranchCutSwitch(
+        val detectResult = autoLoginSubmitEmailAndDetectBranchCutSwitch(
             ctx, alias, w, h, "cut_switch_email_branch",
         ) ?: return AutoLoginCutSwitchStepOutcome.Failed
+        val branch = detectResult.branch
 
         val reachedInterest = booleanArrayOf(false)
         val reachedHome = booleanArrayOf(false)
@@ -15817,6 +15796,7 @@ class RealTraceExecutor(
                     apiUrl = apiUrl,
                     email = email,
                     dontAllowHandledEarly = dontAllowHandledEarly,
+                    inboxPageVision = detectResult.vision,
                 )
             }
             /*

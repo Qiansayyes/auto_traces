@@ -24,6 +24,8 @@ object BackupDirectoryReconciler {
     data class MissingCloudBackup(
         val username: String,
         val cloudBackupName: String,
+        /** 云端指定包不在本机时，若保留了较新的本地包则为其文件名 */
+        val keptLocalFallbackName: String = "",
     )
 
     data class ReconcileResult(
@@ -78,7 +80,8 @@ object BackupDirectoryReconciler {
         val toDelete = mutableSetOf<String>()
         val missingCloud = mutableListOf<MissingCloudBackup>()
 
-        // 1) 已分配账号：决定每个 username 保留哪一个
+        // 1) 已分配账号：每个 username 只保留“最新可用”的 1 个包。
+        //    云端 backup_name 仅作提示/对账，不再作为删包的唯一依据，避免云端名与设备实际文件名不一致时误删。
         for ((userKey, policy) in policyByUser) {
             val userToken = UnifiedBackupPaths.sanitizeUsernameForBackupFilename(userKey)
             if (userToken.isEmpty()) continue
@@ -98,24 +101,22 @@ object BackupDirectoryReconciler {
             val invalidFiles = userFiles.filter { file -> file !in validFiles.toSet() }
             invalidFiles.forEach { toDelete.add(it.canonicalOrAbsolute()) }
 
+            val keepFile = validFiles.maxByOrNull { it.lastModified() }
             val cloudName = policy.cloudBackupName.trim().let { if (it == "-") "" else it }
-            val cloudFile = if (cloudName.isNotEmpty()) {
-                validFiles.firstOrNull { it.name.equals(cloudName, ignoreCase = true) }
-                    ?: validFiles.firstOrNull {
-                        it.name.equals(File(cloudName).name, ignoreCase = true)
-                    }
-            } else {
-                null
-            }
-
-            val keepFile = when {
-                cloudName.isNotEmpty() && cloudFile != null -> cloudFile
-                cloudName.isNotEmpty() && cloudFile == null -> {
-                    missingCloud.add(MissingCloudBackup(userKey, cloudName))
-                    // 云端指定包不在本机：本地旧包均视为过期重复，不保留
-                    null
+            if (cloudName.isNotEmpty()) {
+                val cloudMatchesLocal = validFiles.any { file ->
+                    file.name.equals(cloudName, ignoreCase = true) ||
+                        file.name.equals(File(cloudName).name, ignoreCase = true)
                 }
-                else -> validFiles.maxByOrNull { it.lastModified() }
+                if (!cloudMatchesLocal) {
+                    missingCloud.add(
+                        MissingCloudBackup(
+                            userKey,
+                            cloudName,
+                            keptLocalFallbackName = keepFile?.name.orEmpty(),
+                        ),
+                    )
+                }
             }
 
             val keepPath = keepFile?.canonicalOrAbsolute()

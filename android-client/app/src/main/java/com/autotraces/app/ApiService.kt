@@ -407,20 +407,22 @@ object ApiService {
         clazz: Class<T>,
         includeAuth: Boolean = false,
     ): T = withContext(Dispatchers.IO) {
-        val builder = Request.Builder().url(getBaseUrl() + path).get()
-        if (includeAuth) {
-            val t = PrefsStore.getAuthToken()
-            if (!t.isNullOrBlank()) {
-                builder.addHeader("Authorization", "Bearer $t")
+        executeWithTransientRetry {
+            val builder = Request.Builder().url(getBaseUrl() + path).get()
+            if (includeAuth) {
+                val t = PrefsStore.getAuthToken()
+                if (!t.isNullOrBlank()) {
+                    builder.addHeader("Authorization", "Bearer $t")
+                }
             }
-        }
-        val request = builder.build()
-        httpClient.newCall(request).execute().use { response ->
-            val bodyText = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code}: $bodyText")
+            val request = builder.build()
+            httpClient.newCall(request).execute().use { response ->
+                val bodyText = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: $bodyText")
+                }
+                gson.fromJson(bodyText, clazz)
             }
-            gson.fromJson(bodyText, clazz)
         }
     }
 
@@ -438,25 +440,51 @@ object ApiService {
         clazz: Class<T>,
         includeAuth: Boolean = false,
     ): T = withContext(Dispatchers.IO) {
-        val requestBody = gson.toJson(body)
-            .toRequestBody("application/json; charset=utf-8".toMediaType())
-        val builder = Request.Builder()
-            .url(getBaseUrl() + path)
-            .post(requestBody)
-        if (includeAuth) {
-            val t = PrefsStore.getAuthToken()
-            if (!t.isNullOrBlank()) {
-                builder.addHeader("Authorization", "Bearer $t")
+        executeWithTransientRetry {
+            val requestBody = gson.toJson(body)
+                .toRequestBody("application/json; charset=utf-8".toMediaType())
+            val builder = Request.Builder()
+                .url(getBaseUrl() + path)
+                .post(requestBody)
+            if (includeAuth) {
+                val t = PrefsStore.getAuthToken()
+                if (!t.isNullOrBlank()) {
+                    builder.addHeader("Authorization", "Bearer $t")
+                }
+            }
+            val request = builder.build()
+            httpClient.newCall(request).execute().use { response ->
+                val bodyText = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: $bodyText")
+                }
+                gson.fromJson(bodyText, clazz)
             }
         }
-        val request = builder.build()
-        httpClient.newCall(request).execute().use { response ->
-            val bodyText = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code}: $bodyText")
+    }
+
+    private fun isTransientNetworkError(err: Throwable): Boolean {
+        val msg = err.message.orEmpty().lowercase()
+        return err is java.io.EOFException ||
+            msg.contains("unexpected end of stream") ||
+            msg.contains("connection reset") ||
+            msg.contains("connection abort") ||
+            (msg.contains("connection") && msg.contains("closed")) ||
+            msg.contains("broken pipe")
+    }
+
+    private inline fun <T> executeWithTransientRetry(block: () -> T): T {
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            try {
+                return block()
+            } catch (err: Throwable) {
+                lastError = err
+                if (!isTransientNetworkError(err) || attempt >= 2) throw err
+                Thread.sleep(1_000L * (attempt + 1))
             }
-            gson.fromJson(bodyText, clazz)
         }
+        throw lastError ?: IOException("transient network retry exhausted")
     }
 
     private fun encode(value: String): String {

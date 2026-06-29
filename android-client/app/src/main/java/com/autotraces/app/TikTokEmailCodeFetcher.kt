@@ -98,6 +98,8 @@ object TikTokEmailCodeFetcher {
             lastError = result.exceptionOrNull() as? Exception
             val retriable = lastError?.message?.let { msg ->
                 msg.contains("timeout", ignoreCase = true) ||
+                    msg.contains("unexpected end of stream", ignoreCase = true) ||
+                    msg.contains("connection reset", ignoreCase = true) ||
                     msg.contains("超时") ||
                     msg.contains("未拉取到邮件") ||
                     msg.contains("未识别到 6 位验证码") ||
