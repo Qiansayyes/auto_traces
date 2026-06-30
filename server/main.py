@@ -13200,6 +13200,23 @@ def _failure_reports_find_duplicate(
     return None
 
 
+def _failure_reports_delete_zip(report_id: str) -> None:
+    zip_path = _failure_reports_zip_path(str(report_id or "").strip())
+    if zip_path and zip_path.is_file():
+        zip_path.unlink(missing_ok=True)
+
+
+def _failure_reports_evict_oldest(items: list[dict[str, Any]], slots: int = 1) -> list[dict[str, Any]]:
+    """队列满时丢弃最旧记录，为新上传腾出空间（管理台仍可见最新 FAILURE_REPORTS_MAX_ITEMS 条）。"""
+    need = max(1, int(slots or 1))
+    out = list(items)
+    while len(out) + need > FAILURE_REPORTS_MAX_ITEMS and out:
+        out.sort(key=lambda x: str(x.get("created_at") or ""))
+        evicted = out.pop(0)
+        _failure_reports_delete_zip(str(evicted.get("id") or ""))
+    return out
+
+
 def _failure_reports_visible_items(_session: dict) -> list[dict[str, Any]]:
     return _failure_reports_read_index()
 
@@ -13246,12 +13263,7 @@ async def device_failure_reports_upload(
         if _failure_reports_find_duplicate(items, dedup_key):
             return {"code": 2, "msg": "相同业务相同失败类型已上报，跳过", "dedup_key": dedup_key}
         if len(items) >= FAILURE_REPORTS_MAX_ITEMS:
-            return {
-                "code": 3,
-                "msg": f"云端失败采集已满（最多 {FAILURE_REPORTS_MAX_ITEMS} 条），请处理后再上传",
-                "count": len(items),
-                "max_items": FAILURE_REPORTS_MAX_ITEMS,
-            }
+            items = _failure_reports_evict_oldest(items, slots=1)
         zip_path.write_bytes(raw)
         entry = {
             "id": report_id,
@@ -15065,31 +15077,42 @@ def _ack_device_mode_event(
     try:
         sid = str(session_id or "").strip()
         event_row = conn.execute(
-            "SELECT event_type FROM device_mode_events WHERE device_id = ? AND id = ?",
+            "SELECT event_type, acked_at FROM device_mode_events WHERE device_id = ? AND id = ?",
             (did, eid),
         ).fetchone()
-        event_type = str(event_row[0] or "").strip() if event_row else ""
+        if not event_row:
+            return False
+        event_type = str(event_row[0] or "").strip()
+        if event_row[1]:
+            # 幂等：终端已 ACK 过则直接成功，避免 mode_wait 反复投递同一事件。
+            return True
         is_terminal = ph in _AUTO_SWITCH_MODE_ACK_TERMINAL_PHASES
-        if is_terminal:
-            params: list[Any] = [now_text(), ph, did, eid]
-            sql = """
-                UPDATE device_mode_events
-                SET acked_at = ?, ack_phase = ?
-                WHERE device_id = ? AND id = ? AND acked_at IS NULL
-            """
-        else:
-            params = [ph, did, eid]
-            sql = """
-                UPDATE device_mode_events
-                SET ack_phase = ?
-                WHERE device_id = ? AND id = ? AND acked_at IS NULL
-            """
-        if sid:
-            sql += " AND session_id = ?"
-            params.append(sid)
-        cur = conn.execute(sql, tuple(params))
+
+        def _run_ack(require_session: bool) -> int:
+            if is_terminal:
+                params: list[Any] = [now_text(), ph, did, eid]
+                sql = """
+                    UPDATE device_mode_events
+                    SET acked_at = ?, ack_phase = ?
+                    WHERE device_id = ? AND id = ? AND acked_at IS NULL
+                """
+            else:
+                params = [ph, did, eid]
+                sql = """
+                    UPDATE device_mode_events
+                    SET ack_phase = ?
+                    WHERE device_id = ? AND id = ? AND acked_at IS NULL
+                """
+            if require_session and sid:
+                sql += " AND session_id = ?"
+                params.append(sid)
+            cur = conn.execute(sql, tuple(params))
+            return int(cur.rowcount or 0)
+
+        ok = _run_ack(require_session=bool(sid)) > 0
+        if not ok and sid and is_terminal:
+            ok = _run_ack(require_session=False) > 0
         conn.commit()
-        ok = int(cur.rowcount or 0) > 0
     finally:
         conn.close()
     if ok and is_terminal:

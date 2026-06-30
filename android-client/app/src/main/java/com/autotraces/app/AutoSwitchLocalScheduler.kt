@@ -430,6 +430,7 @@ class AutoSwitchLocalScheduler(
         publishAbortedKey = PrefsStore.getAutoSwitchPublishAbortedKey()
         insertionInflight = null
         recoverStalePublishInflightOnStart()
+        recoverStaleCutSwitchInflightOnStart()
         accountAlignedWithSlot = isCurrentSlotEnvironmentCommitted()
         lastProcessedScheduleDate = null
         PrefsStore.setAutoSwitchLastSchedulerRevision(rev)
@@ -655,6 +656,7 @@ class AutoSwitchLocalScheduler(
 
         refreshInsertionSlotState(slotKey, minuteOfDay, targetSlot)
         maybeSweepOrphanedPublishState(slotKey)
+        maybeSweepOrphanedCutSwitchState(slotKey)
 
         val accounts = currentBundle.accounts.orEmpty()
         val targetRi = targetSlot.row_index ?: -1
@@ -985,6 +987,54 @@ class AutoSwitchLocalScheduler(
         if (sk.isBlank()) return
         onStalePublishInflight(sk)
         LogCenter.op(alias, "【自动切号】发作品协程已结束，清理残留 prefs/ledger：slot=$sk")
+    }
+
+    private fun recoverStaleCutSwitchInflightOnStart() {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (busy.get() || opQueue.isNotEmpty()) return
+        val sk = cutSwitchInflightSlotKey?.trim().orEmpty()
+            .ifBlank { lightweightVerifyInflightSlotKey?.trim().orEmpty() }
+            .ifBlank { PrefsStore.getAutoSwitchLastSlotKey()?.trim().orEmpty() }
+        if (sk.isBlank()) return
+        if (!hasOrphanedCutSwitchInflight(sk)) return
+        sweepOrphanedCutSwitchInflight(sk, "调度器启动时发现残留切号 in-flight")
+    }
+
+    private fun maybeSweepOrphanedCutSwitchState(slotKey: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        if (!hasOrphanedCutSwitchInflight(sk)) return
+        sweepOrphanedCutSwitchInflight(sk, "本机无切号执行上下文，清理残留 in-flight")
+    }
+
+    private fun hasOrphanedCutSwitchInflight(slotKey: String): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return false
+        if (busy.get()) return false
+        if (opQueue.any { isCutSwitchOpForSlot(it, sk) }) return false
+        if (lightweightVerifyJob?.isActive == true && lightweightVerifyInflightSlotKey == sk) {
+            return false
+        }
+        if (AutoSwitchLedger.isCutSwitchSlotInflight(sk)) return true
+        if (lightweightVerifyInflightSlotKey == sk) return true
+        return cutSwitchInflightSlotKey == sk
+    }
+
+    private fun sweepOrphanedCutSwitchInflight(slotKey: String, reason: String) {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return
+        AutoSwitchLedger.abortStaleCutSwitchSlot(sk, reason)
+        if (lightweightVerifyInflightSlotKey == sk && lightweightVerifyJob?.isActive != true) {
+            lightweightVerifyInflightSlotKey = null
+            lightweightVerifyJob = null
+        }
+        if (cutSwitchInflightSlotKey == sk) {
+            cutSwitchInflightSlotKey = null
+        }
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】清理残留切号 in-flight：slot=$sk")
+        }
     }
 
     private fun clearInsertionInflightIfKind(kind: String, slotKey: String) {

@@ -21,10 +21,11 @@ object ApiService {
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    /** check_start / device_ops/poll：服务端繁忙时常 >15s，过短会误报 timeout。 */
     private val pollClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(45, TimeUnit.SECONDS)
         .build()
 
     private val longTimeoutClient = OkHttpClient.Builder()
@@ -52,11 +53,31 @@ object ApiService {
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * pull_username 与 get_config 一样要做模板解析 + 多段 store_lock + DB 查询；
+     * 服务端繁忙时响应常 >15s，15s readTimeout 会把正常慢响应误判成 timeout。
+     */
+    private val pullUsernameClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
     /** 设备日志同步可能携带数百行 JSON，写超时需长于默认 15s。 */
     private val deviceLogSyncClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * TikTok 邮箱验证码代取：应快速返回或明确失败，勿复用 mode_wait 的 180s 长轮询 client，
+     * 否则自动登录拉码阶段会长时间无日志且切号 OP 一直占 busy。
+     */
+    private val emailCodeClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private lateinit var defaultBaseUrl: String
@@ -156,7 +177,7 @@ object ApiService {
             ?.let { "&tiktok_username=${encode(it)}" }
             .orEmpty()
         return getWithClient(
-            pollClient,
+            pullUsernameClient,
             path = "/api/pull_username?device_id=${encode(deviceId)}&alias=${encode(alias)}&count=${count}$modeQ$accountQ",
             clazz = PullUsernameResponse::class.java,
         )
@@ -233,7 +254,7 @@ object ApiService {
         for (path in paths) {
             try {
                 return postWithClient(
-                    longTimeoutClient,
+                    emailCodeClient,
                     path = path,
                     body = body,
                     clazz = TikTokEmailCodeResponse::class.java,

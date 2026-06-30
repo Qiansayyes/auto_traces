@@ -886,6 +886,30 @@ object AutoSwitchLedger {
         )
     }
 
+    /** 本机已无切号执行上下文时，将 ledger 中 queued/running 切号 OP 标为 failed，避免挡住重新入队。 */
+    fun abortStaleCutSwitchSlot(slotKey: String, message: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        if (!isCutSwitchSlotInflight(sk)) return
+        val detail = message.trim().ifBlank { "残留切号 in-flight 已清理" }
+        var changed = false
+        for (i in entries.indices) {
+            val e = entries[i]
+            if (e.slot_key != sk) continue
+            if (e.op_type !in cutSwitchOpTypes) continue
+            if (e.phase != "queued" && e.phase != "running") continue
+            entries[i] = e.copy(
+                at = nowBeijingText(),
+                status = "failed",
+                phase = "failed",
+                message = detail,
+            )
+            changed = true
+        }
+        if (changed) persist()
+    }
+
     /** 对齐已完成时取消 ledger 中同 slot 仍为 queued 的切号 OP，避免 inflight 挡住 verified。 */
     fun cancelQueuedCutSwitchOpsForSlot(slotKey: String, reason: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return

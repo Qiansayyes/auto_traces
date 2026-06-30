@@ -1,5 +1,6 @@
 package com.autotraces.app
 
+import com.google.gson.Gson
 import java.io.File
 import java.util.Calendar
 import java.util.TimeZone
@@ -9,6 +10,7 @@ object AutoSwitchBundleHolder {
     @Volatile
     private var bundle: AutoSwitchBundle? = null
 
+    private val bundleGson = Gson()
     private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
 
     fun setBundle(value: AutoSwitchBundle?) {
@@ -16,6 +18,35 @@ object AutoSwitchBundleHolder {
     }
 
     fun getBundle(): AutoSwitchBundle? = bundle
+
+    fun persistToPrefs(value: AutoSwitchBundle) {
+        runCatching {
+            PrefsStore.saveAutoSwitchBundleJson(bundleGson.toJson(value))
+        }
+    }
+
+    fun restoreFromPrefs(): AutoSwitchBundle? {
+        val json = PrefsStore.getAutoSwitchBundleJson() ?: return null
+        return runCatching {
+            bundleGson.fromJson(json, AutoSwitchBundle::class.java)
+        }.getOrNull()
+    }
+
+    /** 进程重启后判断本地缓存 bundle 是否仍可驱动自治调度。 */
+    fun isUsableForAutonomousResume(
+        value: AutoSwitchBundle,
+        expectedSessionId: String = PrefsStore.getAutoSwitchSessionId().orEmpty(),
+    ): Boolean {
+        if (value.accounts.isNullOrEmpty()) return false
+        val hasPlan = !value.weekly_plan?.day_plans.isNullOrEmpty() || value.daily_plan != null
+        if (!hasPlan) return false
+        val expectedSid = expectedSessionId.trim()
+        val bundleSid = value.session_id?.trim().orEmpty()
+        if (expectedSid.isNotEmpty() && bundleSid.isNotEmpty() && !bundleSid.equals(expectedSid, ignoreCase = true)) {
+            return false
+        }
+        return true
+    }
 
     fun resolveAssignedAccount(
         preferredUsername: String? = null,

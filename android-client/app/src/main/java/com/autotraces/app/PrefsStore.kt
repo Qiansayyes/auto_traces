@@ -78,6 +78,8 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_MODE = "auto_switch_mode"
     private const val KEY_AUTO_SWITCH_SESSION_ID = "auto_switch_session_id"
     private const val KEY_AUTO_SWITCH_BUNDLE_REVISION = "auto_switch_bundle_revision"
+    /** enter 后冻结的周计划 bundle JSON，进程重启后本地自治可立即恢复，不必等云端拉取。 */
+    private const val KEY_AUTO_SWITCH_BUNDLE_JSON = "auto_switch_bundle_json"
     /** 自治期 getConfig 与 bundle_revision 对齐，未变则跳过拉取。 */
     private const val KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION = "auto_switch_last_config_fetch_revision"
     /** 最近一次从 bundle 成功应用的 TikTok 账号（fetchConfig 早退校验用）。 */
@@ -728,6 +730,17 @@ object PrefsStore {
     fun getAutoSwitchBundleRevision(): Int =
         prefs.getInt(KEY_AUTO_SWITCH_BUNDLE_REVISION, 0)
 
+    fun getAutoSwitchBundleJson(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_BUNDLE_JSON, null)?.takeIf { it.isNotEmpty() }
+
+    fun saveAutoSwitchBundleJson(json: String) {
+        prefs.edit().putString(KEY_AUTO_SWITCH_BUNDLE_JSON, json).commit()
+    }
+
+    fun clearAutoSwitchBundleJson() {
+        prefs.edit().remove(KEY_AUTO_SWITCH_BUNDLE_JSON).apply()
+    }
+
     fun getLastModeEventId(): Int =
         prefs.getInt(KEY_LAST_MODE_EVENT_ID, 0).coerceAtLeast(0)
 
@@ -892,6 +905,7 @@ object PrefsStore {
             .putString(KEY_AUTO_SWITCH_MODE, "off")
             .remove(KEY_AUTO_SWITCH_SESSION_ID)
             .remove(KEY_AUTO_SWITCH_BUNDLE_REVISION)
+            .remove(KEY_AUTO_SWITCH_BUNDLE_JSON)
             .remove(KEY_AUTO_SWITCH_LAST_SLOT_KEY)
             .remove(KEY_AUTO_SWITCH_SCHEDULE_DATE)
             .remove(KEY_AUTO_SWITCH_WEEK_START)

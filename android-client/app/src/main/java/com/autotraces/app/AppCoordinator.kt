@@ -100,6 +100,9 @@ object AppCoordinator {
 
     private var startPollJob: Job? = null
     private var modeWaitJob: Job? = null
+    private var autoSwitchResumeJob: Job? = null
+    @Volatile
+    private var lastAutoSwitchCloudResumeFailMs: Long = 0L
     private val modeEventMutex = Mutex()
     private val autoSwitchLocalScheduler = AutoSwitchLocalScheduler(
         scope,
@@ -693,7 +696,7 @@ object AppCoordinator {
             startDeviceOpsLoop()
         }
         if (PrefsStore.getAutoSwitchMode() == "on" && !autoSwitchLocalScheduler.isRunning()) {
-            scope.launch { resumeAutoSwitchSchedulerIfNeeded() }
+            requestAutoSwitchSchedulerResume()
         }
         if (PrefsStore.getLocalStatus() == "running" && pullLoopJob?.isActive != true) {
             if (PrefsStore.isAutoSwitchAutonomousMode()) {
@@ -1213,8 +1216,19 @@ object AppCoordinator {
                 }
 
                 if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                    val growthHint =
-                        if (pullLoopJob?.isActive == true) "空档涨粉中" else "调度中"
+                    if (!autoSwitchLocalScheduler.isRunning()) {
+                        requestAutoSwitchSchedulerResume()
+                    }
+                    val growthHint = when {
+                        !autoSwitchLocalScheduler.isRunning() ->
+                            if (PrefsStore.getAutoSwitchBundleJson() != null) {
+                                "恢复调度中"
+                            } else {
+                                "等待 bundle（需云端或首次 enter）"
+                            }
+                        pullLoopJob?.isActive == true -> "空档涨粉中"
+                        else -> "调度中"
+                    }
                     updateRuntime(lastMessage = "自动切号自治：$growthHint")
                     maybeRunDailyAutoSwitchReconcile(alias, deviceId)
                     delay(60_000)
@@ -1825,6 +1839,17 @@ object AppCoordinator {
                     }
                 }.onFailure { err ->
                     LogCenter.op(alias, "【自动切号】bundle 拉取异常：${err.message}")
+                }
+                if (!bundleLoaded) {
+                    val cached = AutoSwitchBundleHolder.restoreFromPrefs()
+                    if (
+                        cached != null &&
+                        AutoSwitchBundleHolder.isUsableForAutonomousResume(cached, sessionId)
+                    ) {
+                        applyAutoSwitchBundle(alias, deviceId, cached, bundleRevision)
+                        bundleLoaded = true
+                        LogCenter.op(alias, "【自动切号】云端 bundle 暂不可用，已用本地缓存启动自治")
+                    }
                 }
                 updateRuntime(lastMessage = if (bundleLoaded) "自动切号自治：本地调度中" else "自动切号自治：等待 bundle")
                 if (bundleLoaded) {
@@ -3781,6 +3806,7 @@ object AppCoordinator {
             PrefsStore.setAutoSwitchWeekRange(weekStart, weekEnd)
         }
         val wasSchedulerRunning = autoSwitchLocalScheduler.isRunning()
+        AutoSwitchBundleHolder.persistToPrefs(bundle)
         val scheduleEquivalent = if (wasSchedulerRunning) {
             autoSwitchLocalScheduler.refreshWeeklyBundle(bundle)
         } else {
@@ -3830,6 +3856,23 @@ object AppCoordinator {
         return cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
     }
 
+    private fun requestAutoSwitchSchedulerResume() {
+        if (PrefsStore.getAutoSwitchMode() != "on") return
+        if (autoSwitchLocalScheduler.isRunning()) return
+        if (autoSwitchResumeJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (
+            AutoSwitchBundleHolder.getBundle() == null &&
+            AutoSwitchBundleHolder.restoreFromPrefs() == null &&
+            now - lastAutoSwitchCloudResumeFailMs < 30_000L
+        ) {
+            return
+        }
+        autoSwitchResumeJob = scope.launch {
+            resumeAutoSwitchSchedulerIfNeeded()
+        }
+    }
+
     private suspend fun resumeAutoSwitchSchedulerIfNeeded() {
         if (PrefsStore.getAutoSwitchMode() != "on") return
         if (autoSwitchLocalScheduler.isRunning()) return
@@ -3839,20 +3882,54 @@ object AppCoordinator {
         if (deviceId.isBlank() || alias.isBlank()) return
         val sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
         val revision = PrefsStore.getAutoSwitchBundleRevision()
-        runCatching {
-            val resp = ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
-            if (resp.code == 0 && resp.bundle != null) {
-                applyAutoSwitchBundle(alias, deviceId, resp.bundle, revision)
-                scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
-                LogCenter.op(alias, "【自动切号】已恢复本地调度（重启后重拉 bundle）")
-                autoSwitchLocalScheduler.requestImmediateTick()
-                maybeStartGrowthInAutoSwitchIdle("重启恢复")
-            } else {
-                LogCenter.op(alias, "【自动切号】恢复本地调度失败：${resp.msg}")
-            }
-        }.onFailure { err ->
-            LogCenter.op(alias, "【自动切号】恢复本地调度异常：${err.message}")
+
+        var startedFromCache = false
+        val cachedBundle = AutoSwitchBundleHolder.getBundle()
+            ?: AutoSwitchBundleHolder.restoreFromPrefs()?.also { AutoSwitchBundleHolder.setBundle(it) }
+        if (
+            cachedBundle != null &&
+            AutoSwitchBundleHolder.isUsableForAutonomousResume(cachedBundle, sessionId)
+        ) {
+            applyAutoSwitchBundle(alias, deviceId, cachedBundle, revision)
+            scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
+            LogCenter.op(alias, "【自动切号】已用本地缓存立即恢复调度（后台同步云端 bundle）")
+            updateRuntime(lastMessage = "自动切号自治：本地调度中")
+            autoSwitchLocalScheduler.requestImmediateTick()
+            maybeStartGrowthInAutoSwitchIdle("本地 bundle 恢复")
+            startedFromCache = true
         }
+
+        val cloudResult = runCatching {
+            ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
+        }
+        cloudResult.fold(
+            onSuccess = { resp ->
+                if (resp.code == 0 && resp.bundle != null) {
+                    applyAutoSwitchBundle(alias, deviceId, resp.bundle, revision)
+                    scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
+                    if (startedFromCache) {
+                        LogCenter.op(alias, "【自动切号】云端 bundle 已后台同步")
+                    } else {
+                        LogCenter.op(alias, "【自动切号】已恢复本地调度（重启后重拉 bundle）")
+                        updateRuntime(lastMessage = "自动切号自治：本地调度中")
+                    }
+                    autoSwitchLocalScheduler.requestImmediateTick()
+                    maybeStartGrowthInAutoSwitchIdle(if (startedFromCache) "云端 bundle 同步" else "重启恢复")
+                    lastAutoSwitchCloudResumeFailMs = 0L
+                } else if (!startedFromCache) {
+                    lastAutoSwitchCloudResumeFailMs = System.currentTimeMillis()
+                    LogCenter.op(alias, "【自动切号】恢复本地调度失败：${resp.msg}")
+                    updateRuntime(lastMessage = "自动切号自治：等待 bundle")
+                }
+            },
+            onFailure = { err ->
+                if (!startedFromCache) {
+                    lastAutoSwitchCloudResumeFailMs = System.currentTimeMillis()
+                    LogCenter.op(alias, "【自动切号】恢复本地调度异常：${err.message}")
+                    updateRuntime(lastMessage = "自动切号自治：等待 bundle")
+                }
+            },
+        )
     }
 
     private fun beijingDateString(): String {

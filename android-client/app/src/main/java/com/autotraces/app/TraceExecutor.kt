@@ -484,6 +484,16 @@ class RealTraceExecutor(
             }
             if (vision == null) return
             if (!inlineIdentityVerificationInProgress) {
+                runCatching {
+                    tapDontAllowFromVisionIfPresent(
+                        ctx = ctx,
+                        alias = null,
+                        vision = vision,
+                        phaseLog = "截图OCR顺手",
+                        useAutoLoginJitter = false,
+                        markAutoLoginHandled = false,
+                    )
+                }
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
@@ -2140,12 +2150,8 @@ class RealTraceExecutor(
             ) {
                 return mlKitRecognizeFullScreen(ctx, "${fileTag}_acct_status_redo")
             }
-            // 通用兜底：任意 OCR 后若同屏出现 Don't allow，顺手点击并继续原流程。
-            // 发作品（publish_post_*）、修改基本资料（profile_edit_*）不在此顺手点。
-            if (!fileTag.contains("dont_allow", ignoreCase = true) &&
-                !fileTag.startsWith("publish_post_") &&
-                !fileTag.startsWith("profile_edit_")
-            ) {
+            // 通用兜底：任意 OCR 后若同屏出现 Don't allow（含通讯录同步弹窗），顺手点击并继续原流程。
+            if (!fileTag.contains("dont_allow", ignoreCase = true)) {
                 runCatching {
                     tapDontAllowFromVisionIfPresent(
                         ctx = ctx,
@@ -3075,8 +3081,11 @@ class RealTraceExecutor(
     override suspend fun profileEditForYouTwoSwipesAfterLaunch(logAlias: String, w: Int, h: Int): Boolean {
         if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
         devOp(logAlias, "「修改基本资料」For You：假定已在推荐页，刷两下视频（无点赞）")
+        val ctx = appContextProvider()
+        runForYouWarmupPreSwipeInlineOcr(ctx, logAlias, 0)
         repeat(2) { pass ->
             if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
+            runForYouWarmupPreSwipeInlineOcr(ctx, logAlias, pass + 1)
             val settleMs = profileEditForYouFeedSwipeOnce(logAlias, w, h)
             if (!profileEditDelay(logAlias, settleMs, "For You下滑${pass + 1}后")) return false
         }
@@ -4017,7 +4026,7 @@ class RealTraceExecutor(
 
     /**
      * 整屏 OCR 查找权限拒绝按钮并点击；未命中不点击、不判失败。
-     * [useSideEffectFreeOcr] 为 true 时走 [mlKitRecognizeFullScreenCore]，不与通用 OCR 顺手点 Don't allow 混用。
+     * [useSideEffectFreeOcr] 为 true 时走 [mlKitRecognizeFullScreenCore]，但仍会顺手探测 Add another account / 弹窗。
      */
     private suspend fun tryDismissDontAllowOcr(
         ctx: Context,
@@ -4073,6 +4082,21 @@ class RealTraceExecutor(
                 continue
             }
             if (useSideEffectFreeOcr) {
+                runCatching {
+                    tapDontAllowFromVisionIfPresent(
+                        ctx = ctx,
+                        alias = logAlias,
+                        vision = vision,
+                        phaseLog = phaseLog,
+                        useAutoLoginJitter = false,
+                        markAutoLoginHandled = false,
+                    )
+                }
+                if (
+                    handleOcrVisionInlineInterruptions(ctx, vision, cacheTag, phaseLog) != null
+                ) {
+                    continue
+                }
                 probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, cacheTag)
             }
             val hit = findDismissHit(vision)
@@ -5607,6 +5631,7 @@ class RealTraceExecutor(
         }
         var logoutProbesDone = 0
         var swipeCount = 0
+        runForYouWarmupPreSwipeInlineOcr(service, alias, 0)
         while (System.currentTimeMillis() - startedAt < totalMs) {
             if (growthYieldOrNull(alias, "For You 预滑")) {
                 forceStopTikTokIfExclusivePreempt(alias, "For You 预滑")
@@ -5668,6 +5693,7 @@ class RealTraceExecutor(
             if (Random.nextDouble() < 0.12) {
                 if (!growthDelay(alias, Random.nextLong(120, 401), "For You 预滑-翻页前犹豫")) return
             }
+            runForYouWarmupPreSwipeInlineOcr(service, alias, swipeCount + 1)
             val settleMs = forYouFeedSwipeNextHumanized(alias, width, height, "For You 预滑翻页")
             if (!growthDelay(alias, settleMs, "For You 预滑-翻页")) return
             swipeCount++
@@ -7395,6 +7421,33 @@ class RealTraceExecutor(
         findStrictExactLabelHit(result, "Don't allow")?.let { return it }
         findStrictExactLabelHit(result, "Don’t allow")?.let { return it }
         findStrictExactLabelHit(result, "Dont allow")?.let { return it }
+        findStrictExactAcrossAdjacentLines(result, "Don't allow")?.let { return it }
+        findStrictExactAcrossAdjacentLines(result, "Don’t allow")?.let { return it }
+        findStrictExactAcrossAdjacentLines(result, "Dont allow")?.let { return it }
+        findLabelHitContainingIgnoreCase(result, "don't allow")?.let { return it }
+        findLabelHitContainingIgnoreCase(result, "dont allow")?.let { return it }
+        findLabelHitContainingIgnoreCase(result, "don t allow")?.let { return it }
+        return findContactsSyncFriendsPopupDontAllowFallback(result)
+    }
+
+    /** TikTok「同步通讯录 / more fun with friends」弹窗：优先 OCR Don't allow，否则相对 OK 按钮左侧兜底。 */
+    private fun visionHasContactsSyncFriendsPopup(vision: Text): Boolean {
+        val blob = vision.text.lowercase(Locale.US)
+        return blob.contains("syncing your phone contacts") ||
+            blob.contains("more fun with friends") ||
+            (blob.contains("phone contacts") && blob.contains("discovered by people"))
+    }
+
+    private fun findContactsSyncFriendsPopupDontAllowFallback(vision: Text): StrictLabelHit? {
+        if (!visionHasContactsSyncFriendsPopup(vision)) return null
+        val okHit = findBottommostStrictExactLabelHit(vision, "OK")
+            ?: findStrictExactLabelHit(vision, "OK")
+        if (okHit != null) {
+            val w = okHit.rect.width().coerceAtLeast(80)
+            val px = (okHit.rect.left - w * 0.95f).toInt()
+            val py = okHit.rect.centerY()
+            return StrictLabelHit(Point(px, py), okHit.rect)
+        }
         return null
     }
 
@@ -7765,6 +7818,33 @@ class RealTraceExecutor(
      * For You 预滑：每段开始前整屏 OCR，探测 Account status / Add another account 并走既有掉登录分支。
      * 仅当 [FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS] ≤ 配置总时长时由 [runForYouWarmupIfNeeded] 调用。
      */
+    private suspend fun runForYouWarmupPreSwipeInlineOcr(
+        ctx: Context,
+        alias: String,
+        swipeIndex: Int,
+    ) {
+        if (swipeIndex == 0) {
+            devOp(
+                alias,
+                "For You 预滑：进入推荐流后顺手 OCR（Don't allow / 通讯录弹窗 / Add another account / 其它弹窗）",
+            )
+        } else {
+            devOp(
+                alias,
+                "For You 预滑：第 $swipeIndex 次翻页前顺手 OCR（Don't allow / Add another account / 弹窗）",
+            )
+        }
+        val tag = if (swipeIndex == 0) {
+            "for_you_warmup_pre_swipe_start"
+        } else {
+            "for_you_warmup_pre_swipe_$swipeIndex"
+        }
+        val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)
+        if (vision == null) {
+            devOp(alias, "For You 预滑：顺手 OCR 未得 vision：$err")
+        }
+    }
+
     private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
         ctx: Context,
         alias: String,
