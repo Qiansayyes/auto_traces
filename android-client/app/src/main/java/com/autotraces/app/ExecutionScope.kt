@@ -18,4 +18,6 @@ object ExecutionScope {
     }
 
     fun isActive(): Boolean = depth.get() > 0
+
+    fun depth(): Int = depth.get()
 }

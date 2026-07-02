@@ -23,22 +23,17 @@ import com.autotraces.app.videoded.TaskSnapshot
 import com.autotraces.app.videoded.TaskStore
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
-import kotlin.coroutines.resume
 import kotlin.concurrent.thread
-import kotlin.coroutines.resumeWithException
 import kotlin.jvm.Volatile
 import kotlin.random.Random
 
@@ -355,6 +350,8 @@ class RealTraceExecutor(
     private var lastInlineDontAllowTapAtMs: Long = 0L
     private var lastViewerHistoryPopupDismissAtMs: Long = 0L
     private var lastSaveLoginForNextTimePopupDismissAtMs: Long = 0L
+    private var lastContinueEditingPostPopupDismissAtMs: Long = 0L
+    private var lastSecurityCheckupPopupDismissAtMs: Long = 0L
     @Volatile
     private var inlineIdentityVerificationInProgress: Boolean = false
     /** Check your inbox 分支：验证码页默认已聚焦，无需再点输入区。 */
@@ -470,13 +467,8 @@ class RealTraceExecutor(
         if (accountStatusRecoveryInProgress) return
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         try {
-            val result = suspendCancellableCoroutine<Text> { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "截图OCR顺手")
             } else {
@@ -484,16 +476,6 @@ class RealTraceExecutor(
             }
             if (vision == null) return
             if (!inlineIdentityVerificationInProgress) {
-                runCatching {
-                    tapDontAllowFromVisionIfPresent(
-                        ctx = ctx,
-                        alias = null,
-                        vision = vision,
-                        phaseLog = "截图OCR顺手",
-                        useAutoLoginJitter = false,
-                        markAutoLoginHandled = false,
-                    )
-                }
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
@@ -505,8 +487,6 @@ class RealTraceExecutor(
             throw ex
         } catch (_: Exception) {
             // OCR 失败时不因掉登录探测阻断主流程
-        } finally {
-            recognizer.close()
         }
     }
 
@@ -720,6 +700,12 @@ class RealTraceExecutor(
         private const val INLINE_VIEWER_HISTORY_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 登录后「Save login for next time?」弹窗：点 Save login 的冷却。 */
         private const val INLINE_SAVE_LOGIN_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 「Continue editing this post?」草稿弹窗：点 Save draft 的冷却。 */
+        private const val INLINE_CONTINUE_EDITING_POST_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** Security checkup 弹窗：OCR 命中后点屏顶 20% 关闭的冷却。 */
+        private const val INLINE_SECURITY_CHECKUP_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** Security checkup 弹窗：点击 Y = 屏高 × 本比例（屏顶 20% 处，点遮罩关闭）。 */
+        private const val SECURITY_CHECKUP_POPUP_DISMISS_TOP_Y_FRACTION = 0.20f
         /** 通用 OCR 顺手消 Swipe up 提示：单次最多上滑次数。 */
         private const val INLINE_SWIPE_UP_DISMISS_MAX_PASSES = 8
         /** 身份验证（Before you continue）：OCR 轮询间隔。 */
@@ -860,6 +846,7 @@ class RealTraceExecutor(
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (!forceStopBeforeLaunch && isTikTokForeground()) {
             devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
             if (!skipDontAllowOcr) {
                 dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
             }
@@ -889,6 +876,7 @@ class RealTraceExecutor(
         var didLaunchCommand = false
         if (tiktokAlreadyForeground) {
             devOp(alias, "$tag：TikTok 已在前台（严格 dumpsys），跳过重复拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已前台跳过启动命令")
             didLaunchCommand = true
         } else {
             // 本应用/悬浮层在前台时 startActivity 常无法切到 TikTok，优先 root 拉起
@@ -909,6 +897,7 @@ class RealTraceExecutor(
             }
         }
         if (!didLaunchCommand) {
+            logTikTokForegroundCheck(alias, tag, passed = false, detail = "启动命令均未成功")
             devOp(alias, "$tag：拉起 TikTok 失败（启动命令均未成功）")
             return false
         }
@@ -947,6 +936,7 @@ class RealTraceExecutor(
 
         val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
         devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}）")
+        logTikTokForegroundCheck(alias, tag, passed = true)
 
         val dismissedDontAllow =
             if (!skipDontAllowOcr) {
@@ -989,18 +979,24 @@ class RealTraceExecutor(
         ctx: Context,
         alias: String,
         tag: String,
-    ): Boolean = tryDismissDontAllowOcr(
-        ctx = ctx,
-        alias = alias,
-        phaseLog = "拉起后 Don't allow OCR 取消",
-        logSuffix = tag.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "launch" },
-        maxPasses = TIKTOK_LAUNCH_DONT_ALLOW_OCR_MAX_PASSES,
-        retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
-        logPrefix = "",
-        compactLog = true,
-        useSideEffectFreeOcr = true,
-        findDismissHit = { findLaunchPermissionDismissHit(it) },
-    )
+    ): Boolean {
+        // 暂时禁用：root 拉起 TikTok 后的权限弹窗 OCR 取消
+        return false
+        /*
+        return tryDismissDontAllowOcr(
+            ctx = ctx,
+            alias = alias,
+            phaseLog = "拉起后 Don't allow OCR 取消",
+            logSuffix = tag.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "launch" },
+            maxPasses = TIKTOK_LAUNCH_DONT_ALLOW_OCR_MAX_PASSES,
+            retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
+            logPrefix = "",
+            compactLog = true,
+            useSideEffectFreeOcr = true,
+            findDismissHit = { findLaunchPermissionDismissHit(it) },
+        )
+        */
+    }
 
     override suspend fun launchTikTokWithForegroundVerification(
         ctx: Context,
@@ -1083,6 +1079,11 @@ class RealTraceExecutor(
      * [PrefsStore.peekGrowthContinueFromPublishHome] 为 true 时（发作品全部完成且已点 Home 后），
      * 短期内尽量避免强停重启，仅尝试 navBack 回首页；发作品进行中不受此限制。
      */
+    private fun markSkipForYouWarmupAfterRecoverHome(alias: String) {
+        skipForYouWarmupOnNextUsername = true
+        devOp(alias, "回首页恢复成功，下一名涨粉将跳过 For You 预滑")
+    }
+
     private suspend fun recoverToHomeViaBackOrRestart(
         service: Context,
         reason: String,
@@ -1099,7 +1100,9 @@ class RealTraceExecutor(
                 devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
                 return false
             }
-            return restartTikTokForRecovery(skipDontAllowOcr)
+            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+            }
         }
 
         val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
@@ -1175,13 +1178,17 @@ class RealTraceExecutor(
                         if (blockForceRestart) "发作品刚完成后跳过硬关重启" else "改为强关重启",
                 )
                 if (blockForceRestart) return false
-                return restartTikTokForRecovery(skipDontAllowOcr)
+                return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+                    if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+                }
             }
             RecoverHomeOcrOutcome.HardStop -> return false
             RecoverHomeOcrOutcome.ForegroundUnavailable -> {
                 devOp(alias, "$reason：首次 OCR 前 TikTok 前台不可用，未按返回键，改为强关重启")
                 if (blockForceRestart) return false
-                return restartTikTokForRecovery(skipDontAllowOcr)
+                return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+                    if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+                }
             }
             RecoverHomeOcrOutcome.NotOnMainFeed -> {
                 devOp(alias, "$reason：OCR 未见主 Feed 底栏，开始导航返回回首页")
@@ -1222,6 +1229,7 @@ class RealTraceExecutor(
                         RecoverHomeOcrOutcome.ForegroundUnavailable -> {
                             if (ensureTikTokForegroundStableBeforeRecoverOcr("最后一次返回后")) {
                                 devOp(alias, "$reason：最后一次返回后已拉回 TikTok 前台，视为恢复完成")
+                                markSkipForYouWarmupAfterRecoverHome(alias)
                                 return true
                             }
                             devOp(alias, "$reason：最后一次返回后无法保持 TikTok 前台")
@@ -1231,6 +1239,7 @@ class RealTraceExecutor(
                         RecoverHomeOcrOutcome.NotOnMainFeed,
                         -> {
                             devOp(alias, "$reason：最后一次返回完成，导航返回回首页恢复成功（未强关 TikTok）")
+                            markSkipForYouWarmupAfterRecoverHome(alias)
                             return true
                         }
                     }
@@ -1250,7 +1259,9 @@ class RealTraceExecutor(
                 if (blockForceRestart) "发作品刚完成后跳过硬关重启" else "改为强关重启",
         )
         if (blockForceRestart) return false
-        return restartTikTokForRecovery(skipDontAllowOcr)
+        return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+            if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+        }
     }
 
     private data class StrictLabelHit(val point: Point, val rect: Rect)
@@ -2107,20 +2118,14 @@ class RealTraceExecutor(
             return null to "bitmap_decode_failed"
         }
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         var saveOcrDebug = false
         return try {
-            val result = suspendCancellableCoroutine<Text> { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             result to "ok"
         } catch (ex: Exception) {
             saveOcrDebug = true
             null to "mlkit:${ex.javaClass.simpleName}:${ex.message?.take(120)}"
         } finally {
-            recognizer.close()
             bitmap.recycle()
             if (saveOcrDebug) {
                 OcrDebugKeeper.saveOnFailure(screenshotFile, fileTag)
@@ -2150,8 +2155,12 @@ class RealTraceExecutor(
             ) {
                 return mlKitRecognizeFullScreen(ctx, "${fileTag}_acct_status_redo")
             }
-            // 通用兜底：任意 OCR 后若同屏出现 Don't allow（含通讯录同步弹窗），顺手点击并继续原流程。
-            if (!fileTag.contains("dont_allow", ignoreCase = true)) {
+            // 通用兜底：任意 OCR 后若同屏出现 Don't allow，顺手点击并继续原流程。
+            // 发作品（publish_post_*）、修改基本资料（profile_edit_*）不在此顺手点。
+            if (!fileTag.contains("dont_allow", ignoreCase = true) &&
+                !fileTag.startsWith("publish_post_") &&
+                !fileTag.startsWith("profile_edit_")
+            ) {
                 runCatching {
                     tapDontAllowFromVisionIfPresent(
                         ctx = ctx,
@@ -2163,7 +2172,7 @@ class RealTraceExecutor(
                     )
                 }
             }
-            // 任意整屏 OCR：顺手关 Viewer history / Save login for next time 弹窗，并令调用方重试 OCR。
+            // 任意整屏 OCR：顺手关 Viewer history / Save login / Continue editing this post / Security checkup 弹窗，并令调用方重试 OCR。
             // auto_login_* / login_safeguard_* 由 [autoLoginTryDismissInlineOverlaysFromVision] 处理。
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag)?.let { interruptTag ->
@@ -2328,7 +2337,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 任意 OCR vision 上顺手处理弹窗/验证（Save login、Viewer history、Before you continue 身份验证等）。
+     * 任意 OCR vision 上顺手处理弹窗/验证（Save login、Viewer history、Continue editing this post、Security checkup、Before you continue 身份验证等）。
      * @return 非 null 表示已处理中断，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun handleOcrVisionInlineInterruptions(
@@ -2356,7 +2365,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 后顺手关弹窗（Viewer history / Save login for next time 等）。
+     * 整屏 OCR 后顺手关弹窗（Viewer history / Save login for next time / Continue editing this post / Security checkup 等）。
      * @return 非 null 表示已点击关弹窗，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun dismissFullScreenInlinePopupsIfPresent(
@@ -2393,7 +2402,151 @@ class RealTraceExecutor(
             )
         }.getOrDefault(false)
         if (saveLoginDismissed) return "save_login_popup_dismissed"
+        val continueEditingDismissed = runCatching {
+            tryDismissContinueEditingPostPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (continueEditingDismissed) return "continue_editing_post_popup_dismissed"
+        val securityCheckupDismissed = runCatching {
+            tryDismissSecurityCheckupPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (securityCheckupDismissed) return "security_checkup_popup_dismissed"
         return null
+    }
+
+    private fun visionHasSecurityCheckupPopup(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "do a quick security") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "quick security checkup") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "quickly security check up") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "quickly security") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "complete a few personalised") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "complete a few personalized") != null) return true
+        return false
+    }
+
+    /** Security checkup 弹窗：OCR 命中后点屏顶 20% 遮罩区域关闭（勿点 Continue 进入流程）。 */
+    private suspend fun tryDismissSecurityCheckupPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasSecurityCheckupPopup(vision)) return false
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSecurityCheckupPopupDismissAtMs < INLINE_SECURITY_CHECKUP_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val px = (w * 0.5f).toInt().coerceIn(1, w - 1)
+        val py = (h * SECURITY_CHECKUP_POPUP_DISMISS_TOP_Y_FRACTION).toInt().coerceIn(1, h - 1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(Point(px, py), w, h)
+        } else {
+            coerceTapToScreen(Point(px, py), w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Security checkup 弹窗，点屏顶20% (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastSecurityCheckupPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(350L)
+        return true
+    }
+
+    private fun visionHasContinueEditingPostPopup(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "continue editing this post") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "continu editing this post") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "contiue editing") != null) return true
+        return false
+    }
+
+    /** 「Continue editing this post?」弹窗左侧 Save draft；OCR 折行或未拆分时取最靠左命中。 */
+    private fun findContinueEditingPostSaveDraftButtonHit(vision: Text): StrictLabelHit? {
+        findStrictExactLabelHit(vision, "Save draft")?.let { return it }
+        findStrictExactAcrossAdjacentLines(vision, "Save draft")?.let { return it }
+        findLabelHitContainingIgnoreCase(vision, "save draft")?.let { return it }
+        val editHit = findStrictExactLabelHit(vision, "Edit") ?: return null
+        val anchorY = editHit.rect.centerY()
+        val ySlack = (editHit.rect.height() * 0.85f).toInt().coerceAtLeast(14)
+        var best: StrictLabelHit? = null
+        var bestRight = Int.MIN_VALUE
+        fun consider(text: String, box: Rect) {
+            val t = text.trim().lowercase(Locale.US)
+            if (t == "edit") return
+            val isSaveDraft = t == "save draft" ||
+                t == "draft" ||
+                (t.startsWith("save") && t.contains("draft"))
+            if (!isSaveDraft) return
+            if (kotlin.math.abs(box.centerY() - anchorY) > ySlack) return
+            if (box.right >= editHit.rect.left - 6) return
+            if (box.right > bestRight) {
+                bestRight = box.right
+                best = StrictLabelHit(Point(box.centerX(), box.centerY()), box)
+            }
+        }
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                line.boundingBox?.let { consider(line.text, it) }
+                for (el in line.elements) {
+                    el.boundingBox?.let { consider(el.text, it) }
+                }
+            }
+        }
+        if (best != null) return best
+        val gap = (editHit.rect.width() * 1.15f).toInt().coerceAtLeast(48)
+        val px = (editHit.rect.left - gap).coerceAtLeast(1)
+        val py = anchorY
+        return StrictLabelHit(Point(px, py), Rect(px - 1, py - 1, px + 1, py + 1))
+    }
+
+    /** 同屏见「Continue editing this post?」弹窗时，点 Save draft 关闭。 */
+    private suspend fun tryDismissContinueEditingPostPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasContinueEditingPostPopup(vision)) return false
+        val saveDraftHit = findContinueEditingPostSaveDraftButtonHit(vision) ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见 Continue editing this post 但未同屏命中 Save draft，跳过弹窗处理")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastContinueEditingPostPopupDismissAtMs < INLINE_CONTINUE_EDITING_POST_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(saveDraftHit.point, w, h)
+        } else {
+            coerceTapToScreen(saveDraftHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Continue editing this post 弹窗，点 Save draft (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastContinueEditingPostPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(450L)
+        return true
     }
 
     /** 同屏见「Save login for next time?」弹窗时，点偏下方 Save login 关闭。 */
@@ -3081,11 +3234,8 @@ class RealTraceExecutor(
     override suspend fun profileEditForYouTwoSwipesAfterLaunch(logAlias: String, w: Int, h: Int): Boolean {
         if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
         devOp(logAlias, "「修改基本资料」For You：假定已在推荐页，刷两下视频（无点赞）")
-        val ctx = appContextProvider()
-        runForYouWarmupPreSwipeInlineOcr(ctx, logAlias, 0)
         repeat(2) { pass ->
             if (hardStopOrNull(logAlias, "修改基本资料-For You预刷")) return false
-            runForYouWarmupPreSwipeInlineOcr(ctx, logAlias, pass + 1)
             val settleMs = profileEditForYouFeedSwipeOnce(logAlias, w, h)
             if (!profileEditDelay(logAlias, settleMs, "For You下滑${pass + 1}后")) return false
         }
@@ -4026,7 +4176,7 @@ class RealTraceExecutor(
 
     /**
      * 整屏 OCR 查找权限拒绝按钮并点击；未命中不点击、不判失败。
-     * [useSideEffectFreeOcr] 为 true 时走 [mlKitRecognizeFullScreenCore]，但仍会顺手探测 Add another account / 弹窗。
+     * [useSideEffectFreeOcr] 为 true 时走 [mlKitRecognizeFullScreenCore]，不与通用 OCR 顺手点 Don't allow 混用。
      */
     private suspend fun tryDismissDontAllowOcr(
         ctx: Context,
@@ -4082,21 +4232,6 @@ class RealTraceExecutor(
                 continue
             }
             if (useSideEffectFreeOcr) {
-                runCatching {
-                    tapDontAllowFromVisionIfPresent(
-                        ctx = ctx,
-                        alias = logAlias,
-                        vision = vision,
-                        phaseLog = phaseLog,
-                        useAutoLoginJitter = false,
-                        markAutoLoginHandled = false,
-                    )
-                }
-                if (
-                    handleOcrVisionInlineInterruptions(ctx, vision, cacheTag, phaseLog) != null
-                ) {
-                    continue
-                }
                 probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, cacheTag)
             }
             val hit = findDismissHit(vision)
@@ -5321,6 +5456,8 @@ class RealTraceExecutor(
      * 下一轮可以跳过再次点放大镜与重新启动 app，仅需清空搜索框并输入下一个主用户名。
      */
     private var lastEndedAtUsersSelection: Boolean = false
+    /** 上一名 [recoverToHomeViaBackOrRestart] 已成功回到主 Feed，下一名涨粉跳过 For You 预滑。 */
+    private var skipForYouWarmupOnNextUsername: Boolean = false
     private var livePostClickAtMs: Long = 0L
     /** 最近一次点击的作品位：growth 为 left/middle/right；live/direct 为 left_first */
     private var lastClickedPostSlot: String = ""
@@ -5412,7 +5549,9 @@ class RealTraceExecutor(
         if (shouldSkipDeviceLog(action)) return
         val root = currentRootUsernameForLogs.trim()
         val prefix = if (root.isNotEmpty()) "[$root] " else ""
-        LogCenter.op(alias, "$prefix$action", elapsedMs)
+        val line = "$prefix$action"
+        ProcessDiagnostics.setPhase(line)
+        LogCenter.op(alias, line, elapsedMs)
     }
 
     private fun devOp(alias: String, action: String, elapsedMs: Long? = null) {
@@ -5501,6 +5640,9 @@ class RealTraceExecutor(
         alias: String,
         tag: String,
     ): Boolean {
+        // 暂时禁用：系统权限授权页在前台时 OCR 点 Don't allow 并恢复 TikTok
+        return false
+        /*
         if (!isSystemPermissionGrantDialogForeground()) return false
         devOp(alias, "$tag：检测到系统权限授权页在前台（TikTok 可能在后台），整屏 OCR 点 Don't allow")
         val logSuffix = tag.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "perm" }
@@ -5532,6 +5674,7 @@ class RealTraceExecutor(
         dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
         invalidateForegroundProbeCache()
         return isTikTokForeground()
+        */
     }
 
     private suspend fun ensureTikTokInForeground(
@@ -5543,6 +5686,7 @@ class RealTraceExecutor(
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {
             devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已可见跳过拉起")
             return true
         }
 
@@ -5631,7 +5775,6 @@ class RealTraceExecutor(
         }
         var logoutProbesDone = 0
         var swipeCount = 0
-        runForYouWarmupPreSwipeInlineOcr(service, alias, 0)
         while (System.currentTimeMillis() - startedAt < totalMs) {
             if (growthYieldOrNull(alias, "For You 预滑")) {
                 forceStopTikTokIfExclusivePreempt(alias, "For You 预滑")
@@ -5693,7 +5836,6 @@ class RealTraceExecutor(
             if (Random.nextDouble() < 0.12) {
                 if (!growthDelay(alias, Random.nextLong(120, 401), "For You 预滑-翻页前犹豫")) return
             }
-            runForYouWarmupPreSwipeInlineOcr(service, alias, swipeCount + 1)
             val settleMs = forYouFeedSwipeNextHumanized(alias, width, height, "For You 预滑翻页")
             if (!growthDelay(alias, settleMs, "For You 预滑-翻页")) return
             swipeCount++
@@ -5838,7 +5980,12 @@ class RealTraceExecutor(
                 return "TikTok 恢复拉起失败，无法执行 $username"
             }
             delay(500)
-            runForYouWarmupIfNeeded(service, alias, config)
+            if (skipForYouWarmupOnNextUsername) {
+                skipForYouWarmupOnNextUsername = false
+                devOp(alias, "涨粉：上一名已回主 Feed，跳过 For You 预滑")
+            } else {
+                runForYouWarmupIfNeeded(service, alias, config)
+            }
             if (!clickMagnifier(service)) {
                 return "TikTok 恢复拉起失败，无法点击放大镜，无法执行 $username"
             }
@@ -6004,13 +6151,8 @@ class RealTraceExecutor(
         val cropHeight = (bitmap.height * 0.32f).toInt().coerceAtLeast(1)
         val cropped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, cropHeight)
         val image = InputImage.fromBitmap(cropped, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             fun isVideosWord(t: String): Boolean {
                 val w = t.trim()
                 return w.equals("Videos", ignoreCase = true) ||
@@ -6037,7 +6179,6 @@ class RealTraceExecutor(
             rethrowTaskLogoutIfNeeded(ex)
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             cropped.recycle()
             screenshotFile.delete()
@@ -6387,13 +6528,8 @@ class RealTraceExecutor(
         val halfH = (fullH * 0.5f).toInt().coerceAtLeast(1)
         val topHalf = Bitmap.createBitmap(bitmapFull, 0, 0, bitmapFull.width, halfH)
         val image = InputImage.fromBitmap(topHalf, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             observeAccountStatusOnOcrText(service, result, "mutual_author_message_half")
             result.textBlocks.asSequence()
                 .flatMap { it.lines.asSequence() }
@@ -6409,7 +6545,6 @@ class RealTraceExecutor(
             devOp(alias, "互点：Message OCR 异常 ${ex.message}")
             false
         } finally {
-            recognizer.close()
             bitmapFull.recycle()
             topHalf.recycle()
             screenshotFile.delete()
@@ -6611,13 +6746,8 @@ class RealTraceExecutor(
         val cropTop = (followersRef.y + fullH * 0.05f).toInt().coerceIn(0, fullH - 1)
         val cropBottom = (fullH * 0.5f).toInt().coerceIn(cropTop + 1, fullH)
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val elements = mutualFollowOnlyOcrElementsFromResult(result)
             val replying = mutualFollowOnlyScreenShowsReplyingFromElements(elements) ||
                 result.textBlocks.asSequence()
@@ -6642,7 +6772,6 @@ class RealTraceExecutor(
             devOp(alias, "互点仅关注：点击后 OCR 分类异常 ${ex.message}")
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
         }
@@ -6819,13 +6948,8 @@ class RealTraceExecutor(
         val cropHeight = (cropBottom - cropTop).coerceAtLeast(1)
         val region = Bitmap.createBitmap(bitmap, 0, cropTop, fullW, cropHeight)
         val image = InputImage.fromBitmap(region, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
 
             val allElements = result.textBlocks.asSequence()
                 .flatMap { it.lines.asSequence() }
@@ -6881,7 +7005,6 @@ class RealTraceExecutor(
             devOp(alias, "互点：作者区 Follow OCR 异常 ${ex.message}")
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             region.recycle()
             screenshotFile.delete()
@@ -6999,6 +7122,7 @@ class RealTraceExecutor(
         val limit = config.mutual_follow_tap_session_limit.coerceAtLeast(1)
         var reachedEnd = false
         var rounds = 0
+        var singleDigitTotal: Int? = null
         while (!reachedEnd && rounds < 7) {
             if (mutualClickOrNull(alias, "互点粉丝列表 Follow+下滑")) return
             if (mutualFollowLimitReached) return
@@ -7009,12 +7133,15 @@ class RealTraceExecutor(
                     tapKind = FollowersListOcrTapKind.FOLLOW_BUTTON_CENTER,
                 )
             } catch (_: GrowthFlowRestartRequired) {
-                devOp(alias, "互点：粉丝列表 OCR 触发恢复重启逻辑，结束本段 Followers 列表处理")
+                devOp(alias, "互点：粉丝列表 OCR 触发恢复重启逻辑，结束本轮 Followers 列表处理")
                 return
             }
             if (followers.isEmpty()) {
                 devOp(alias, "互点：粉丝列表（涨粉同款 OCR）无可用 Follow 行，结束列表滑动")
                 return
+            }
+            if (singleDigitTotal == null) {
+                singleDigitTotal = inferSingleDigitFollowersTotal(service, followers.size)
             }
             devOp(alias, "互点：粉丝列表 OCR 命中 ${followers.size} 条 Follow（中心点击）")
             for (entry in followers) {
@@ -7026,6 +7153,11 @@ class RealTraceExecutor(
                     return
                 }
                 delay(Random.nextLong(1000, 1501))
+            }
+            if (singleDigitTotal != null) {
+                devOp(alias, "互点：粉丝列表个位数($singleDigitTotal)，首轮处理完毕，跳过下滑")
+                reachedEnd = true
+                break
             }
             val avgRow = followers.map { it.rowHeight }.average().toFloat().coerceAtLeast(1f)
             val scrollDistance = (avgRow * 7f).coerceAtLeast(240f)
@@ -7421,33 +7553,6 @@ class RealTraceExecutor(
         findStrictExactLabelHit(result, "Don't allow")?.let { return it }
         findStrictExactLabelHit(result, "Don’t allow")?.let { return it }
         findStrictExactLabelHit(result, "Dont allow")?.let { return it }
-        findStrictExactAcrossAdjacentLines(result, "Don't allow")?.let { return it }
-        findStrictExactAcrossAdjacentLines(result, "Don’t allow")?.let { return it }
-        findStrictExactAcrossAdjacentLines(result, "Dont allow")?.let { return it }
-        findLabelHitContainingIgnoreCase(result, "don't allow")?.let { return it }
-        findLabelHitContainingIgnoreCase(result, "dont allow")?.let { return it }
-        findLabelHitContainingIgnoreCase(result, "don t allow")?.let { return it }
-        return findContactsSyncFriendsPopupDontAllowFallback(result)
-    }
-
-    /** TikTok「同步通讯录 / more fun with friends」弹窗：优先 OCR Don't allow，否则相对 OK 按钮左侧兜底。 */
-    private fun visionHasContactsSyncFriendsPopup(vision: Text): Boolean {
-        val blob = vision.text.lowercase(Locale.US)
-        return blob.contains("syncing your phone contacts") ||
-            blob.contains("more fun with friends") ||
-            (blob.contains("phone contacts") && blob.contains("discovered by people"))
-    }
-
-    private fun findContactsSyncFriendsPopupDontAllowFallback(vision: Text): StrictLabelHit? {
-        if (!visionHasContactsSyncFriendsPopup(vision)) return null
-        val okHit = findBottommostStrictExactLabelHit(vision, "OK")
-            ?: findStrictExactLabelHit(vision, "OK")
-        if (okHit != null) {
-            val w = okHit.rect.width().coerceAtLeast(80)
-            val px = (okHit.rect.left - w * 0.95f).toInt()
-            val py = okHit.rect.centerY()
-            return StrictLabelHit(Point(px, py), okHit.rect)
-        }
         return null
     }
 
@@ -7818,33 +7923,6 @@ class RealTraceExecutor(
      * For You 预滑：每段开始前整屏 OCR，探测 Account status / Add another account 并走既有掉登录分支。
      * 仅当 [FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS] ≤ 配置总时长时由 [runForYouWarmupIfNeeded] 调用。
      */
-    private suspend fun runForYouWarmupPreSwipeInlineOcr(
-        ctx: Context,
-        alias: String,
-        swipeIndex: Int,
-    ) {
-        if (swipeIndex == 0) {
-            devOp(
-                alias,
-                "For You 预滑：进入推荐流后顺手 OCR（Don't allow / 通讯录弹窗 / Add another account / 其它弹窗）",
-            )
-        } else {
-            devOp(
-                alias,
-                "For You 预滑：第 $swipeIndex 次翻页前顺手 OCR（Don't allow / Add another account / 弹窗）",
-            )
-        }
-        val tag = if (swipeIndex == 0) {
-            "for_you_warmup_pre_swipe_start"
-        } else {
-            "for_you_warmup_pre_swipe_$swipeIndex"
-        }
-        val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)
-        if (vision == null) {
-            devOp(alias, "For You 预滑：顺手 OCR 未得 vision：$err")
-        }
-    }
-
     private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
         ctx: Context,
         alias: String,
@@ -9432,7 +9510,6 @@ class RealTraceExecutor(
         val topCrop = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, topHeight)
         val fullImage = InputImage.fromBitmap(bitmap, 0)
         val topImage = InputImage.fromBitmap(topCrop, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
             fun isUsersTabWord(t: String): Boolean {
                 val w = t.trim()
@@ -9440,11 +9517,7 @@ class RealTraceExecutor(
                     w.equals("User", ignoreCase = true) ||
                     w.equals("用户", ignoreCase = true)
             }
-            val topResult = suspendCancellableCoroutine { cont ->
-                recognizer.process(topImage)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val topResult = MlKitOcrGate.recognize(topImage)
             val topTexts = topResult.textBlocks.flatMap { it.lines }
                 .flatMap { line -> line.elements.map { it.text.trim() } + listOf(line.text.trim()) }
                 .filter { it.isNotEmpty() }
@@ -9453,11 +9526,7 @@ class RealTraceExecutor(
             ) {
                 return false
             }
-            val fullResult = suspendCancellableCoroutine { cont ->
-                recognizer.process(fullImage)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val fullResult = MlKitOcrGate.recognize(fullImage)
             val allTexts = fullResult.textBlocks.flatMap { it.lines }
                 .map { it.text.trim() }
                 .filter { it.isNotEmpty() }
@@ -9484,7 +9553,6 @@ class RealTraceExecutor(
         } catch (_: Exception) {
             false
         } finally {
-            recognizer.close()
             bitmap.recycle()
             topCrop.recycle()
             screenshotFile.delete()
@@ -9600,13 +9668,8 @@ class RealTraceExecutor(
         val safeHeight = cropHeight.coerceAtMost(bitmap.height - cropTop)
         val cropped = Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, safeHeight)
         val image = InputImage.fromBitmap(cropped, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val texts = result.textBlocks.flatMap { it.lines }.map { it.text.trim() }.filter { it.isNotEmpty() }
             val tabWords = listOf("Top", "Users", "Videos", "Photos", "Shop")
             val tabHitCount = tabWords.count { tab -> texts.any { it.contains(tab, ignoreCase = true) } }
@@ -9624,7 +9687,6 @@ class RealTraceExecutor(
             
             0
         } finally {
-            recognizer.close()
             bitmap.recycle()
             cropped.recycle()
             screenshotFile.delete()
@@ -9648,13 +9710,8 @@ class RealTraceExecutor(
         val cropHeight = (bitmap.height * 0.32f).toInt().coerceAtLeast(1)
         val cropped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, cropHeight)
         val image = InputImage.fromBitmap(cropped, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             fun isUsersWord(t: String): Boolean {
                 val w = t.trim()
                 return w.equals("Users", ignoreCase = true) ||
@@ -9680,7 +9737,6 @@ class RealTraceExecutor(
             
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             cropped.recycle()
             screenshotFile.delete()
@@ -9740,23 +9796,37 @@ class RealTraceExecutor(
         val minFollowRows = 5
 
         suspend fun followersListVerifiedByOcr(): Boolean {
+            val snapshot = captureFollowersListOcrSnapshot(
+                service,
+                "followers_verify_check.png",
+                "growth_followers_verify",
+            )
+            val singleDigit = snapshot?.let { resolveSingleDigitFollowersTotal(it) }
+            if (singleDigit != null) {
+                devOp(
+                    alias,
+                    "Followers 校验：个位数粉丝列表 tab=${snapshot.tabFollowersCount} " +
+                        "follow=${snapshot.followButtonCount} total=$singleDigit",
+                )
+                return true
+            }
             val rows = findFollowersEntriesByOcr(service, verificationOnly = true)
             return rows.size >= minFollowRows
         }
 
         /**
          * 每次 [clickFollowersRoot] 调用之后固定 2 轮 OCR（无论 su 是否成功）：
-         * 每轮 OCR 前均 delay(2500) 等待列表渲染；命中 ≥ [minFollowRows] 条严格 "Follow" 即认为已在粉丝列表。
+         * 每轮 OCR 前均 delay(2500) 等待列表渲染；个位数列表或命中 ≥ [minFollowRows] 条严格 "Follow" 即认为已在粉丝列表。
          */
         suspend fun twoRoundOcrAfterTapAttempt(): Boolean {
             delay(2500)
             if (followersListVerifiedByOcr()) {
-                devOp(alias, "Followers 校验：第 1 轮 OCR 命中 ≥$minFollowRows 条 Follow，已进入粉丝列表")
+                devOp(alias, "Followers 校验：第 1 轮 OCR 通过，已进入粉丝列表")
                 return true
             }
             delay(2500)
             if (followersListVerifiedByOcr()) {
-                devOp(alias, "Followers 校验：第 2 轮 OCR 命中 ≥$minFollowRows 条 Follow，已进入粉丝列表")
+                devOp(alias, "Followers 校验：第 2 轮 OCR 通过，已进入粉丝列表")
                 return true
             }
             return false
@@ -9853,6 +9923,12 @@ class RealTraceExecutor(
         } finally {
             screenshotFile.delete()
         }
+    }
+
+    /** 帧差/纯检测 OCR：RGB_565 解码，约为 ARGB_8888 一半内存（不参与坐标点击）。 */
+    private fun decodeScreenshotRgb565(path: String): Bitmap? {
+        val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
+        return BitmapFactory.decodeFile(path, opts)
     }
 
 
@@ -10468,21 +10544,61 @@ class RealTraceExecutor(
         foregroundProbeCache = null
     }
 
+    /** 桌面/Quickstep 包名（WM 焦点误报为 launcher 但用户实际在看 TikTok 等应用时常见）。 */
+    private fun isLauncherLikePackage(packageName: String): Boolean {
+        val lower = packageName.lowercase(Locale.US)
+        if (lower.contains("launcher")) return true
+        return lower == "com.miui.home" ||
+            lower == "com.bbk.launcher2" ||
+            lower == "com.huawei.android.launcher" ||
+            lower == "com.oppo.launcher" ||
+            lower == "com.sec.android.app.launcher" ||
+            lower == "com.google.android.apps.nexuslauncher"
+    }
+
     /**
-     * 从 dumpsys 解析**当前焦点/顶层**包名（仅 mCurrentFocus / mFocusedApp / topResumed / activity top）。
+     * 从 dumpsys 解析**当前焦点/顶层**包名（topResumed / mCurrentFocus / activity top）。
      * 不用 activity 栈里残留包名，避免 force-stop 后仍误判 TikTok 在前台。
+     * 部分 ROM（Transsion Quickstep 等）TikTok 已可见但 mCurrentFocus 仍为桌面，此时以 activity top 为准。
      */
     private fun resolveStrictForegroundPackage(raw: String): String? {
-        for (line in filterDumpsysFocusLines(raw)) {
-            val lower = line.lowercase(Locale.US)
-            val highTrust = lower.contains("mcurrentfocus") ||
-                lower.contains("mfocusedapp") ||
-                lower.contains("mfocusedwindow") ||
-                lower.contains("topresumedactivity")
-            if (!highTrust) continue
+        val focusLines = filterDumpsysFocusLines(raw)
+        for (line in focusLines) {
+            if (!line.lowercase(Locale.US).contains("topresumedactivity")) continue
             extractPackageFromDumpsysComponentLine(line)?.let { return it }
         }
-        return extractTopActivityPackage(raw)
+
+        var windowFocus: String? = null
+        for (line in focusLines) {
+            val lower = line.lowercase(Locale.US)
+            if (!lower.contains("mcurrentfocus") &&
+                !lower.contains("mfocusedapp") &&
+                !lower.contains("mfocusedwindow")
+            ) {
+                continue
+            }
+            val pkg = extractPackageFromDumpsysComponentLine(line) ?: continue
+            windowFocus = pkg
+            break
+        }
+
+        val topActivity = extractTopActivityPackage(raw)
+        if (windowFocus != null && topActivity != null &&
+            isLauncherLikePackage(windowFocus) &&
+            !isLauncherLikePackage(topActivity)
+        ) {
+            return topActivity
+        }
+        if (windowFocus != null) return windowFocus
+
+        for (line in focusLines) {
+            val lower = line.lowercase(Locale.US)
+            if (lower.contains("topresumedactivity")) continue
+            if (lower.contains("mresumedactivity") || lower.contains("resumedactivity")) {
+                extractPackageFromDumpsysComponentLine(line)?.let { return it }
+            }
+        }
+        return topActivity
     }
 
     private fun extractPackageFromDumpsysComponentLine(line: String): String? {
@@ -10560,18 +10676,54 @@ class RealTraceExecutor(
     }
 
     private fun isTikTokForeground(): Boolean {
-        val fg = resolveStrictForegroundPackage(collectForegroundProbeTexts()) ?: return false
-        return Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(fg, ignoreCase = true) }
+        val probe = collectForegroundProbeTexts()
+        resolveStrictForegroundPackage(probe)?.let { fg ->
+            if (Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(fg, ignoreCase = true) }) return true
+        }
+        // WM 焦点仍在桌面但 dumpsys activity top 已是 TikTok（用户可见、脚本误报 launcher 焦点）
+        extractTopActivityPackage(probe)?.let { top ->
+            if (Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(top, ignoreCase = true) }) return true
+        }
+        return false
+    }
+
+    private data class ForegroundProbeSnapshot(
+        val focusPkg: String?,
+        val activityTop: String?,
+    )
+
+    private fun captureForegroundProbeSnapshot(): ForegroundProbeSnapshot {
+        val probe = collectForegroundProbeTexts()
+        return ForegroundProbeSnapshot(
+            focusPkg = resolveStrictForegroundPackage(probe),
+            activityTop = extractTopActivityPackage(probe),
+        )
+    }
+
+    /** 专用可见日志：绕过 [shouldSkipDeviceLog]；文案禁止含 dumpsys。 */
+    private fun logTikTokForegroundCheck(
+        alias: String,
+        source: String,
+        passed: Boolean,
+        detail: String = "",
+    ) {
+        val snap = captureForegroundProbeSnapshot()
+        val focus = snap.focusPkg ?: "无"
+        val top = snap.activityTop ?: "无"
+        val verdict = if (passed) "通过" else "失败"
+        val suffix = detail.trim().takeIf { it.isNotEmpty() }?.let { " $it" } ?: ""
+        devOpEmit(
+            alias,
+            "TikTok 前台校验：$verdict 焦点包=$focus activityTop=$top 来源=$source$suffix",
+        )
     }
 
     private fun logForegroundProbeFailure(alias: String, tag: String, expectedPkg: String) {
-        val probe = collectForegroundProbeTexts()
-        val strictFg = resolveStrictForegroundPackage(probe)
-        val parsed = extractPackagesFromDumpsys(probe)
-        val focusSnippet = filterDumpsysFocusLines(probe).take(4).joinToString(" | ")
-        devOp(
-            alias,
-            "$tag：严格前台校验失败（期望=$expectedPkg 焦点包=${strictFg ?: "无"} 栈解析=${parsed.joinToString()} 焦点行=${focusSnippet.ifBlank { "无" }}）",
+        logTikTokForegroundCheck(
+            alias = alias,
+            source = tag,
+            passed = false,
+            detail = "期望=$expectedPkg",
         )
     }
 
@@ -10701,13 +10853,8 @@ class RealTraceExecutor(
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, cropHeight)
 
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             // 优先按「单词」匹配：OCR 常把整行识别为 "Ask Top Users Videos Shop Sounds"，
             // 需在 line.elements 里找到 "Users" 并用其 boundingBox 精确点击
             fun isUsersWord(t: String): Boolean {
@@ -10743,7 +10890,6 @@ class RealTraceExecutor(
             
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
         }
@@ -10759,13 +10905,8 @@ class RealTraceExecutor(
         }
         observeAccountStatusOnScreenshot(service, bitmap, "search_loading")
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val texts = result.textBlocks.flatMap { it.lines }.map { it.text.trim() }.filter { it.isNotEmpty() }
             val tabs = listOf("Ask", "Top", "Shop", "Videos", "Users", "Sounds")
             val tabHit = texts.count { t -> tabs.any { t.equals(it, ignoreCase = true) } }
@@ -10779,7 +10920,6 @@ class RealTraceExecutor(
             
             false
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
         }
@@ -10795,13 +10935,8 @@ class RealTraceExecutor(
         }
         observeAccountStatusOnScreenshot(service, bitmap, "profile_ocr")
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val texts = result.textBlocks.flatMap { it.lines }.map { it.text.trim() }.filter { it.isNotEmpty() }
             val keywords = listOf("Following", "Likes", "Follow", "Message")
             val hitKeywords = keywords.filter { key ->
@@ -10819,7 +10954,6 @@ class RealTraceExecutor(
             
             false
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
         }
@@ -10830,7 +10964,7 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "检查无作品或私密账号")) return false
         val screenshotFile = File(service.cacheDir, "profile_novideos.png")
         if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return false
-        val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
+        val bitmap = decodeScreenshotRgb565(screenshotFile.absolutePath) ?: run {
             screenshotFile.delete()
             return false
         }
@@ -10841,13 +10975,8 @@ class RealTraceExecutor(
             .coerceAtMost(bitmap.height - cropTop)
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, cropHeight)
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val texts = result.textBlocks
                 .flatMap { it.lines }
                 .map { it.text.trim() }
@@ -10887,7 +11016,6 @@ class RealTraceExecutor(
             
             false
         } finally {
-            recognizer.close()
             bitmap.recycle()
             croppedBitmap.recycle()
             screenshotFile.delete()
@@ -11345,12 +11473,22 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "恢复 Followers 列表")) return false
         if (hardStopOrNull(alias, "恢复 Followers 列表")) return false
         // 这里的 OCR 只负责“数 Follow”，不参与滚动。
-        // 规则：返回后 Follow 数量 < 4 => 页面错乱；>= 4 => 认为回到了正常 Followers 列表。
+        // 规则：个位数粉丝列表或 Follow>=4 => 正常；否则视为页面错乱。
         navBack(alias, "二次判定失败后回到 Followers 列表进行 OCR 复核")
         delay(900)
-        val count = countFollowersFollowButtonsByOcrNormalized(service)
-        val ok = count >= 4
-        devOp(alias, "Followers 列表 OCR 复核：Follow=${count}，阈值>=4，结果=${if (ok) "通过" else "失败"}")
+        val snapshot = captureFollowersListOcrSnapshot(
+            service,
+            "followers_recovery_check.png",
+            "growth_followers_recovery_check",
+        )
+        val count = snapshot?.followButtonCount ?: 0
+        val singleDigit = snapshot?.let { resolveSingleDigitFollowersTotal(it) }
+        val ok = singleDigit != null || count >= 4
+        devOp(
+            alias,
+            "Followers 列表 OCR 复核：Follow=$count tab=${snapshot?.tabFollowersCount} " +
+                "singleDigit=$singleDigit，结果=${if (ok) "通过" else "失败"}",
+        )
         if (!ok) {
             // 页面错乱：优先导航返回回首页，等待恢复后让上层跳过当前条目，进入下一轮。
             val restarted = recoverToHomeViaBackOrRestart(service, "Followers 列表 OCR 复核")
@@ -11363,36 +11501,159 @@ class RealTraceExecutor(
         return true
     }
 
-    private suspend fun countFollowersFollowButtonsByOcrNormalized(service: Context): Int {
-        val screenshotFile = File(service.cacheDir, "followers_recovery_check.png")
-        if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return 0
+    private data class FollowersListOcrSnapshot(
+        val tabFollowersCount: Int?,
+        val followButtonCount: Int,
+    )
+
+    private fun isFollowersTabOcrLabel(raw: String): Boolean {
+        val n = normalizeFollowersOcrText(raw)
+        return n == "followers" || n == "follower"
+    }
+
+    private fun parseSingleDigitFromOcrDigits(raw: String): Int? {
+        val digits = raw.filter { it.isDigit() }
+        return when {
+            digits.length == 1 -> digits.toIntOrNull()?.takeIf { it in 1..9 }
+            else -> null
+        }
+    }
+
+    /** 从 Tab 文案解析 Followers 后的个位数（1..9），如 "Followers 5" / "Followers5"。 */
+    private fun parseFollowersTabSingleDigitCountFromOcr(result: Text): Int? {
+        val tabDigitRegex = Regex("""(?<![a-z])followers\s*([1-9])(?!\d)""", RegexOption.IGNORE_CASE)
+        for (line in result.textBlocks.flatMap { it.lines }) {
+            val lineText = line.text.trim()
+            tabDigitRegex.find(lineText)?.let { match ->
+                match.groupValues[1].toIntOrNull()?.takeIf { it in 1..9 }?.let { return it }
+            }
+            val elements = line.elements.map { it.text.trim() }
+            val followersIdx = elements.indexOfFirst { el -> isFollowersTabOcrLabel(el) }
+            if (followersIdx >= 0) {
+                parseSingleDigitFromOcrDigits(elements[followersIdx])?.let { return it }
+                for (i in followersIdx + 1 until elements.size) {
+                    parseSingleDigitFromOcrDigits(elements[i])?.let { return it }
+                    if (elements[i].any { it.isDigit() }) break
+                }
+            }
+        }
+        val blob = result.textBlocks.flatMap { it.lines }.joinToString(" ") { it.text.trim() }
+        tabDigitRegex.find(blob)?.let { match ->
+            match.groupValues[1].toIntOrNull()?.takeIf { it in 1..9 }?.let { return it }
+        }
+        // Followers 与数字被 OCR 拆到相邻 element 时，按 Tab 行纵向对齐取右侧个位数。
+        data class TabDigitCandidate(val digit: Int, val centerX: Int, val centerY: Int)
+        val followersAnchors = mutableListOf<Pair<Int, Int>>()
+        val digitCandidates = mutableListOf<TabDigitCandidate>()
+        for (line in result.textBlocks.flatMap { it.lines }) {
+            for (element in line.elements) {
+                val text = element.text.trim()
+                val box = element.boundingBox ?: continue
+                if (isFollowersTabOcrLabel(text)) {
+                    followersAnchors += box.centerX() to box.centerY()
+                }
+                parseSingleDigitFromOcrDigits(text)?.let { digit ->
+                    digitCandidates += TabDigitCandidate(digit, box.centerX(), box.centerY())
+                }
+            }
+        }
+        val rowTolerancePx = 42
+        for ((anchorX, anchorY) in followersAnchors) {
+            digitCandidates
+                .filter { it.centerX > anchorX && kotlin.math.abs(it.centerY - anchorY) <= rowTolerancePx }
+                .minByOrNull { it.centerX - anchorX }
+                ?.digit
+                ?.let { return it }
+        }
+        return null
+    }
+
+    /** 整屏严格等于 "Follow" 的按钮数（排除 Following / Followers Tab 文案与顶部 Tab 行）。 */
+    private fun countStrictFollowButtonsFromOcrResult(result: Text, imageHeight: Int = 0): Int {
+        val minCenterY = if (imageHeight > 0) (imageHeight * 0.18f).toInt() else 0
+        return result.textBlocks
+            .flatMap { it.lines }
+            .flatMap { it.elements }
+            .count { element ->
+                if (!isFollowersListFollowOcrLabel(element.text)) return@count false
+                val centerY = element.boundingBox?.centerY() ?: 0
+                centerY >= minCenterY
+            }
+    }
+
+    /**
+     * 判定粉丝列表是否为个位数且一屏可展示完毕：
+     * 1) Followers Tab 后数字为 1..9；或
+     * 2) 整屏 Follow 按钮数为 1..9（排除 Following / Followers Tab 文案）。
+     * 任一信号命中即采用（优先 Tab 数字）。
+     */
+    private fun resolveSingleDigitFollowersTotal(snapshot: FollowersListOcrSnapshot): Int? {
+        val tab = snapshot.tabFollowersCount?.takeIf { it in 1..9 }
+        val follow = snapshot.followButtonCount.takeIf { it in 1..9 }
+        return tab ?: follow
+    }
+
+    private suspend fun captureFollowersListOcrSnapshot(
+        service: Context,
+        screenshotName: String,
+        observeTag: String,
+    ): FollowersListOcrSnapshot? {
+        val screenshotFile = File(service.cacheDir, screenshotName)
+        if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return null
         val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
             screenshotFile.delete()
-            return 0
+            return null
         }
-        observeAccountStatusOnScreenshot(service, bitmap, "growth_followers_recovery_check")
+        observeAccountStatusOnScreenshot(service, bitmap, observeTag)
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
-            // 只统计“Follow”按钮，严格等于 Follow；不把 Following、Followed 之类算进去。
-            result.textBlocks
-                .flatMap { it.lines }
-                .flatMap { it.elements }
-                .count { element ->
-                    element.text.trim().equals("Follow", ignoreCase = true)
-                }
+            val result = MlKitOcrGate.recognize(image)
+            FollowersListOcrSnapshot(
+                tabFollowersCount = parseFollowersTabSingleDigitCountFromOcr(result),
+                followButtonCount = countStrictFollowButtonsFromOcrResult(result, bitmap.height),
+            )
         } catch (ex: Exception) {
             rethrowTaskLogoutIfNeeded(ex)
-            0
+            null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
+        }
+    }
+
+    private suspend fun detectSingleDigitFollowersTotal(service: Context): Int? {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val snapshot = captureFollowersListOcrSnapshot(
+            service,
+            "followers_single_digit_check.png",
+            "growth_followers_single_digit_check",
+        ) ?: return null
+        val total = resolveSingleDigitFollowersTotal(snapshot)
+        if (total != null) {
+            LogCenter.append(
+                alias,
+                "粉丝列表个位数判定：总数=$total tab=${snapshot.tabFollowersCount} follow=${snapshot.followButtonCount}",
+            )
+        }
+        return total
+    }
+
+    /** 结合 Tab 数字、整屏 Follow 计数与当前可见行数，推断个位数粉丝总量。 */
+    private suspend fun inferSingleDigitFollowersTotal(
+        service: Context,
+        visibleFollowRows: Int,
+    ): Int? {
+        if (visibleFollowRows !in 1..9) return null
+        val snapshot = captureFollowersListOcrSnapshot(
+            service,
+            "followers_single_digit_infer.png",
+            "growth_followers_single_digit_infer",
+        ) ?: return null
+        resolveSingleDigitFollowersTotal(snapshot)?.let { return it }
+        return when {
+            snapshot.tabFollowersCount == visibleFollowRows -> visibleFollowRows
+            snapshot.followButtonCount == visibleFollowRows -> visibleFollowRows
+            else -> null
         }
     }
 
@@ -11417,8 +11678,8 @@ class RealTraceExecutor(
             if (waitMs > 0L) delay(waitMs)
             if (!runSuCommand("screencap -p ${afterTap.absolutePath}")) return false
 
-            val bmp1Full = BitmapFactory.decodeFile(beforeTapReference.absolutePath) ?: return false
-            val bmp2Full = BitmapFactory.decodeFile(afterTap.absolutePath) ?: run {
+            val bmp1Full = decodeScreenshotRgb565(beforeTapReference.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(afterTap.absolutePath) ?: run {
                 bmp1Full.recycle()
                 return false
             }
@@ -11484,8 +11745,8 @@ class RealTraceExecutor(
             delay(500)
             if (!runSuCommand("screencap -p ${screenshot2.absolutePath}")) return false
 
-            val bmp1Full = BitmapFactory.decodeFile(screenshot1.absolutePath) ?: return false
-            val bmp2Full = BitmapFactory.decodeFile(screenshot2.absolutePath) ?: run {
+            val bmp1Full = decodeScreenshotRgb565(screenshot1.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(screenshot2.absolutePath) ?: run {
                 bmp1Full.recycle()
                 return false
             }
@@ -11563,8 +11824,8 @@ class RealTraceExecutor(
             if (waitMs > 0L) delay(waitMs)
             if (!runSuCommand("screencap -p ${afterTap.absolutePath}")) return false
 
-            val bmp1Full = BitmapFactory.decodeFile(beforeTapReference.absolutePath) ?: return false
-            val bmp2Full = BitmapFactory.decodeFile(afterTap.absolutePath) ?: run {
+            val bmp1Full = decodeScreenshotRgb565(beforeTapReference.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(afterTap.absolutePath) ?: run {
                 bmp1Full.recycle()
                 return false
             }
@@ -11623,8 +11884,8 @@ class RealTraceExecutor(
             delay(500)
             if (!runSuCommand("screencap -p ${screenshot2.absolutePath}")) return false
 
-            val bmp1Full = BitmapFactory.decodeFile(screenshot1.absolutePath) ?: return false
-            val bmp2Full = BitmapFactory.decodeFile(screenshot2.absolutePath) ?: run {
+            val bmp1Full = decodeScreenshotRgb565(screenshot1.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(screenshot2.absolutePath) ?: run {
                 bmp1Full.recycle()
                 return false
             }
@@ -11711,14 +11972,9 @@ class RealTraceExecutor(
         val cropHeight = (bitmap.height * 0.5f).toInt().coerceAtLeast(1)
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, cropHeight)
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             fun norm(s: String): String = s.lowercase()
                 .replace('0', 'o')
                 .replace('5', 's')
@@ -11764,7 +12020,6 @@ class RealTraceExecutor(
             rethrowTaskLogoutIfNeeded(ex)
             false
         } finally {
-            recognizer.close()
             bitmap.recycle()
             croppedBitmap.recycle()
             screenshotFile.delete()
@@ -11825,14 +12080,9 @@ class RealTraceExecutor(
         val safeHeight = cropHeight.coerceAtMost(height - cropTop)
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, cropTop, width, safeHeight)
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val normalizedTargets = targets.map(textNormalizer)
             val allLines = result.textBlocks.flatMap { it.lines }
             val allElements = allLines.flatMap { it.elements }
@@ -11939,7 +12189,6 @@ class RealTraceExecutor(
             rethrowTaskLogoutIfNeeded(ex)
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             croppedBitmap.recycle()
             screenshotFile.delete()
@@ -11986,6 +12235,7 @@ class RealTraceExecutor(
         }
         var reachedEnd = false
         var rounds = 0
+        var singleDigitTotal: Int? = null
         // 主循环：固定最多 7 轮；若中途判定到底则提前结束
         while (!reachedEnd && rounds < 7) {
             if (growthYieldOrNull(alias, "处理粉丝列表循环")) {
@@ -12006,12 +12256,16 @@ class RealTraceExecutor(
                 }
                 throw GrowthFlowRestartRequired("粉丝列表 OCR 未命中条目，页面异常，已执行重启 TikTok")
             }
+            if (singleDigitTotal == null) {
+                singleDigitTotal = inferSingleDigitFollowersTotal(service, followers.size)
+            }
             for (entry in followers) {
                 if (growthYieldOrNull(alias, "处理粉丝列表单条")) {
                     forceStopTikTokIfExclusivePreempt(alias, "处理粉丝列表单条")
                     return
                 }
                 runSuCommand("input tap ${entry.clickPoint.x} ${entry.clickPoint.y}")
+                devOp(alias, "粉丝列表：点头像 (${entry.clickPoint.x},${entry.clickPoint.y})")
                 if (!growthDelay(alias, Random.nextLong(1200, 1600), "粉丝列表-点头像")) return
                 // 新增：按配置概率直接跳过点击作品，和无作品/私密保持同样处理
                 if (config.skip_post_click_prob > 0.0 && Random.nextDouble() < config.skip_post_click_prob) {
@@ -12038,6 +12292,11 @@ class RealTraceExecutor(
                 val postFlowDone = enterPostAndRunInteractionsWithSecondCheck(service, config)
                 // 若作品内动作被取消，依旧给一点缓冲，避免紧接着操作下一条导致 UI 抢占
                 delay(Random.nextLong(450, 750))
+            }
+            if (singleDigitTotal != null) {
+                LogCenter.append(alias, "粉丝列表个位数($singleDigitTotal)，首轮处理完毕，跳过下滑")
+                reachedEnd = true
+                break
             }
             // 测试用：只滑动 1 轮，便于观察每轮边界与回调链路
             val avgRow = followers.map { it.rowHeight }.average().toFloat().coerceAtLeast(1f)
@@ -12076,13 +12335,8 @@ class RealTraceExecutor(
                 return false
             }
             val image = InputImage.fromBitmap(bitmap, 0)
-            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             try {
-                val result = suspendCancellableCoroutine { cont ->
-                    recognizer.process(image)
-                        .addOnSuccessListener { cont.resume(it) }
-                        .addOnFailureListener { cont.resumeWithException(it) }
-                }
+                val result = MlKitOcrGate.recognize(image)
                 observeAccountStatusOnOcrText(service, result, "growth_followers_end_check")
                 if (
                     popupRetry == 0 &&
@@ -12098,12 +12352,12 @@ class RealTraceExecutor(
                 }
                 val rawTexts = result.textBlocks.flatMap { it.lines }.map { it.text.trim() }.filter { it.isNotEmpty() }
                 val normalized = rawTexts.map { it.lowercase() }
-                val followCount = result.textBlocks
-                    .flatMap { it.lines }
-                    .flatMap { it.elements }
-                    .count { element ->
-                        element.text.trim().equals("Follow", ignoreCase = true)
-                    }
+                val snapshot = FollowersListOcrSnapshot(
+                    tabFollowersCount = parseFollowersTabSingleDigitCountFromOcr(result),
+                    followButtonCount = countStrictFollowButtonsFromOcrResult(result, bitmap.height),
+                )
+                val followCount = snapshot.followButtonCount
+                val singleDigitTotal = resolveSingleDigitFollowersTotal(snapshot)
                 val endMarkers = listOf(
                     "no more results",
                     "you've reached the end",
@@ -12111,10 +12365,13 @@ class RealTraceExecutor(
                     "end of list",
                 )
                 val hitEndMarker = normalized.any { line -> endMarkers.any { marker -> line.contains(marker) } }
-                val reachedEnd = hitEndMarker || followCount == 0
+                val singleDigitComplete = singleDigitTotal != null &&
+                    (followCount > 0 || snapshot.tabFollowersCount != null)
+                val reachedEnd = hitEndMarker || followCount == 0 || singleDigitComplete
                 LogCenter.append(
                     alias,
-                    "粉丝列表到底判定: followCount=$followCount marker=$hitEndMarker result=$reachedEnd",
+                    "粉丝列表到底判定: followCount=$followCount tab=${snapshot.tabFollowersCount} " +
+                        "singleDigit=$singleDigitTotal marker=$hitEndMarker result=$reachedEnd",
                 )
                 return reachedEnd
             } catch (ex: Exception) {
@@ -12122,7 +12379,6 @@ class RealTraceExecutor(
                 LogCenter.append(alias, "粉丝列表到底 OCR 判定失败：${ex.message}")
                 return false
             } finally {
-                recognizer.close()
                 bitmap.recycle()
                 screenshotFile.delete()
             }
@@ -12158,13 +12414,8 @@ class RealTraceExecutor(
                 return emptyList()
             }
             val image = InputImage.fromBitmap(bitmap, 0)
-            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             try {
-                val result = suspendCancellableCoroutine { cont ->
-                    recognizer.process(image)
-                        .addOnSuccessListener { cont.resume(it) }
-                        .addOnFailureListener { cont.resumeWithException(it) }
-                }
+                val result = MlKitOcrGate.recognize(image, "粉丝列表")
                 observeAccountStatusOnOcrText(service, result, "growth_followers_ocr")
                 if (
                     popupRetry == 0 &&
@@ -12248,7 +12499,6 @@ class RealTraceExecutor(
                 LogCenter.append(alias, "粉丝列表 OCR 识别失败：${ex.message}")
                 return emptyList()
             } finally {
-                recognizer.close()
                 bitmap.recycle()
                 screenshotFile.delete()
             }
@@ -12443,14 +12693,9 @@ class RealTraceExecutor(
         val cropHeight = (bitmap.height - cropTop).coerceAtLeast(1)
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, cropHeight)
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             fun norm(s: String): String = s.lowercase()
                 .replace('0', 'o')
                 .replace('5', 's')
@@ -12489,7 +12734,6 @@ class RealTraceExecutor(
             rethrowTaskLogoutIfNeeded(ex)
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             croppedBitmap.recycle()
             screenshotFile.delete()
@@ -12582,13 +12826,8 @@ class RealTraceExecutor(
             return null
         }
         val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val target = "repost"
             val matches = result.textBlocks
                 .flatMap { it.lines }
@@ -12605,7 +12844,6 @@ class RealTraceExecutor(
             
             null
         } finally {
-            recognizer.close()
             bitmap.recycle()
             screenshotFile.delete()
         }
@@ -12757,13 +12995,8 @@ class RealTraceExecutor(
             }
             val fullH = bitmap.height.coerceAtLeast(1)
             val image = InputImage.fromBitmap(bitmap, 0)
-            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             try {
-                val result = suspendCancellableCoroutine { cont ->
-                    recognizer.process(image)
-                        .addOnSuccessListener { cont.resume(it) }
-                        .addOnFailureListener { cont.resumeWithException(it) }
-                }
+                val result = MlKitOcrGate.recognize(image)
                 observeAccountStatusOnOcrText(service, result, "mutual_follow_only_reply_ocr")
                 if (
                     popupRetry == 0 &&
@@ -12810,7 +13043,6 @@ class RealTraceExecutor(
                 devOp(alias, "互点仅关注：Reply OCR 异常 ${ex.message}")
                 return emptyList()
             } finally {
-                recognizer.close()
                 bitmap.recycle()
                 screenshotFile.delete()
             }
@@ -13324,13 +13556,8 @@ class RealTraceExecutor(
         val cropHeight = (height * 0.68f).toInt().coerceAtLeast(1)
         val croppedBitmap = Bitmap.createBitmap(bitmap, 0, cropTop, width, cropHeight)
         val image = InputImage.fromBitmap(croppedBitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         return try {
-            val result = suspendCancellableCoroutine { cont ->
-                recognizer.process(image)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+            val result = MlKitOcrGate.recognize(image)
             val allText = result.textBlocks.flatMap { it.lines }.map { it.text.trim() }.filter { it.isNotEmpty() }
             val preview = allText.take(30).joinToString(" | ")
             val hadText = allText.isNotEmpty()
@@ -13374,7 +13601,6 @@ class RealTraceExecutor(
             rethrowTaskLogoutIfNeeded(ex)
             UserListOcrAttemptResult(null, false, "")
         } finally {
-            recognizer.close()
             bitmap.recycle()
             croppedBitmap.recycle()
             screenshotFile.delete()
@@ -13899,6 +14125,34 @@ class RealTraceExecutor(
             )
         ) {
             autoLoginDelay(alias, 450L, "Save login 弹窗后")
+            return true
+        }
+
+        // 5) 「Continue editing this post?」草稿弹窗：点 Save draft
+        if (
+            tryDismissContinueEditingPostPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Continue editing 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Continue editing Save draft 后")
+            return true
+        }
+
+        // 6) Security checkup 弹窗：点屏顶 20% 遮罩关闭
+        if (
+            tryDismissSecurityCheckupPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Security checkup 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Security checkup 弹窗后")
             return true
         }
         return false
@@ -14473,6 +14727,11 @@ class RealTraceExecutor(
                 if (autoLoginSuccessEditVisible(editVision)) {
                     val preview = buildProfileEditOcrPreview(editVision).take(400)
                     devOp(alias, "自动登录成功校验：已识别 Edit，判定登录成功；OCR=$preview")
+                    if (!safeguardTapBottomHome(ctx, alias, w, h)) {
+                        devOp(alias, "自动登录成功校验：Profile→Edit 已通过但点 Home 失败")
+                        return false
+                    }
+                    devOp(alias, "自动登录成功校验：Profile→Edit 通过后已点 Home（与登录状态保障一致）")
                     return true
                 }
                 val preview = buildProfileEditOcrPreview(editVision).take(300)

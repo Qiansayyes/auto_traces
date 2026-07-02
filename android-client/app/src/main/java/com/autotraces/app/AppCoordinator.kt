@@ -24,6 +24,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -100,10 +101,10 @@ object AppCoordinator {
 
     private var startPollJob: Job? = null
     private var modeWaitJob: Job? = null
-    private var autoSwitchResumeJob: Job? = null
-    @Volatile
-    private var lastAutoSwitchCloudResumeFailMs: Long = 0L
+    private var autoSwitchBundleRetryJob: Job? = null
     private val modeEventMutex = Mutex()
+    @Volatile
+    private var lastCloudAutoSwitchEnabled: Boolean? = null
     private val autoSwitchLocalScheduler = AutoSwitchLocalScheduler(
         scope,
         executeOp = { alias, deviceId, op -> handleDeviceOp(alias, deviceId, op) },
@@ -113,22 +114,17 @@ object AppCoordinator {
         onTryResumeGrowth = { maybeStartGrowthInAutoSwitchIdle() },
         onRefreshWeeklyBundle = { refreshAutoSwitchWeeklyBundleFromCloud() },
         isPublishExecutionActive = { isPublishPostSwitchActive() },
+        isMutualExecutionActive = { isMutualSwitchActive() },
         onStalePublishInflight = { slotKey ->
             if (!tryResumeStaleAutoSwitchPublish(slotKey)) {
-                abortStaleAutoSwitchPublishInflight(slotKey)
+                val alias = PrefsStore.getAlias()?.trim().orEmpty()
+                if (alias.isNotBlank()) {
+                    resetStalePublishInflightForRetry(slotKey, alias)
+                }
             }
         },
         onSlotTransition = { prevSlotKey, newSlotKey ->
             handleAutoSwitchSlotTransition(prevSlotKey, newSlotKey)
-        },
-        onVerifyPublishInsertionLogin = { alias, deviceId, targetUsername, slotKey ->
-            verifyPublishInsertionLoginBeforeEnqueue(alias, deviceId, targetUsername, slotKey)
-        },
-        onPublishLoginCacheStillValid = { alias, deviceId, targetUsername ->
-            isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = targetUsername)
-        },
-        onVerifySlotAlignmentLogin = { alias, deviceId, targetUsername, slotKey, targetRi ->
-            verifySlotAlignmentLightweightLogin(alias, deviceId, targetUsername, slotKey, targetRi)
         },
         resolveRestoreBackupArchive = { backupName, backupPathHint, username, aliasClean, devId ->
             UnifiedBackupPaths.resolveRestoreBackupArchive(
@@ -140,8 +136,30 @@ object AppCoordinator {
                 devId,
             )?.let { it.fileName to it.absolutePath }
         },
+        verifyInsertionLogin = { ctx, kind ->
+            if (kind == "publish") {
+                verifyPublishInsertionLoginBeforeEnqueue(
+                    alias = ctx.alias,
+                    deviceId = ctx.deviceId,
+                    targetUsername = ctx.account.username.orEmpty(),
+                    slotKey = ctx.slotKey,
+                )
+            } else {
+                true
+            }
+        },
     )
     private var pullLoopJob: Job? = null
+    private val autoSwitchRecoverMutex = Mutex()
+    private val autoSwitchBundleFetchMutex = Mutex()
+    @Volatile
+    private var lastAutoSwitchRecoverAtMs: Long = 0L
+    @Volatile
+    private var lastBundleNetworkFetchAtMs: Long = 0L
+    @Volatile
+    private var lastBundleNetworkFetchRevision: Int = -1
+    @Volatile
+    private var lastBundleNetworkFetchSessionId: String = ""
     private var deviceOpsJob: Job? = null
     private var mutualSwitchJob: Job? = null
     private var publishPostSwitchJob: Job? = null
@@ -190,11 +208,18 @@ object AppCoordinator {
     /** exit 关闭自治：涨粉已抢占后最多再等当前步骤收尾（秒级协作退出，不必等整轮 OCR 链）。 */
     private const val AUTO_SWITCH_EXIT_DRAIN_MS = 60_000L
 
+    /** 同一次服务恢复内 recoverAutoSwitchAutonomousWork 最短间隔，避免 bundle 重载风暴。 */
+    private const val AUTO_SWITCH_RECOVER_DEBOUNCE_MS = 8_000L
+
     /**
      * mode_wait 长轮询秒数。须低于常见 nginx proxy_read_timeout（默认 60s），
      * 否则网关会先返回 HTML 504，设备端收不到 JSON 空轮询结果。
      */
     private const val MODE_WAIT_TIMEOUT_SEC = 50
+
+    /** enter 后 bundle 拉取失败：首次 30s 退避重试，倍增至最多 5min（仅可恢复错误）。 */
+    private const val AUTO_SWITCH_BUNDLE_RETRY_INITIAL_MS = 30_000L
+    private const val AUTO_SWITCH_BUNDLE_RETRY_MAX_MS = 300_000L
 
     private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
 
@@ -219,7 +244,9 @@ object AppCoordinator {
             !PublishPostGrowthGate.isBlockingGrowth() &&
             !isMutualSwitchActive() &&
             !isBatchStreamActive() &&
-            !(PrefsStore.isAutoSwitchAutonomousMode() && isAutoSwitchPublishLocallyActive())
+            !(PrefsStore.isAutoSwitchAutonomousMode() &&
+                (isAutoSwitchPublishLocallyActive() ||
+                    AutoSwitchLocalPlanStore.isPublishContextOccupying()))
     }
 
     /** 自治切号/发作品入队前：抢占 TikTok 通道，暂停涨粉拉取并协作中止在跑任务。 */
@@ -252,6 +279,7 @@ object AppCoordinator {
      * 不 cancel pullLoopJob（避免打断改资料 finally 误恢复涨粉；当前步骤靠 exiting/独占标志协作退出）。
      */
     private fun beginAutoSwitchExitShutdown(alias: String) {
+        cancelAutoSwitchBundleRetry()
         PrefsStore.setAutoSwitchMode("exiting")
         autoSwitchLocalScheduler.stop()
         pendingUsernames.clear()
@@ -263,6 +291,111 @@ object AppCoordinator {
             forceStopTikTokForExclusiveEnqueue("自动切号关闭")
         }
         LogCenter.op(alias, "【自动切号】关闭中：已暂停涨粉、清空队列并抢占 TikTok，等待当前步骤收尾")
+    }
+
+    private fun noteCloudAutoSwitchEnabled(cloudEnabled: Boolean?) {
+        if (cloudEnabled != null) {
+            lastCloudAutoSwitchEnabled = cloudEnabled
+        }
+    }
+
+    private fun isCloudAutoSwitchDisabled(): Boolean = lastCloudAutoSwitchEnabled == false
+
+    /** mode_wait 携带的云端开关对账：本地仍在自治但云端已关时，不等 exit 事件丢失也能退出。 */
+    private suspend fun reconcileCloudAutoSwitchState(
+        alias: String,
+        deviceId: String,
+        cloudEnabled: Boolean?,
+    ) {
+        noteCloudAutoSwitchEnabled(cloudEnabled)
+        if (cloudEnabled != false) return
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (PrefsStore.getAutoSwitchMode() == "exiting") return
+        LogCenter.op(alias, "【自动切号】云端开关已关，本机同步退出（对账）")
+        performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+    }
+
+    /**
+     * 执行 auto_switch_exit 收尾（有 eventId 时上报 ACK；对账路径 eventId=0 仅本地退出）。
+     */
+    private suspend fun performAutoSwitchExitShutdown(
+        alias: String,
+        deviceId: String,
+        eventId: Int,
+        exitSessionId: String,
+    ) {
+        if (
+            PrefsStore.getAutoSwitchMode() == "off" &&
+            !AutoSwitchLedger.hasPendingUpload() &&
+            !PrefsStore.hasAutoSwitchPendingSummaryUpload()
+        ) {
+            if (eventId > 0) {
+                PrefsStore.markAutoSwitchExitDone(eventId)
+                runCatching {
+                    ApiService.modeAck(deviceId, alias, eventId, "summary_uploaded", exitSessionId)
+                }
+                PrefsStore.saveLastModeEventId(eventId)
+            }
+            return
+        }
+        val enterSessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
+        beginAutoSwitchExitShutdown(alias)
+        if (eventId > 0) {
+            LogCenter.op(
+                alias,
+                "【自动切号】收到关闭指令，等待涨粉/独占收尾 enter_session=$enterSessionId exit_event=$exitSessionId",
+            )
+        } else {
+            LogCenter.op(
+                alias,
+                "【自动切号】对账退出，等待涨粉/独占收尾 enter_session=$enterSessionId",
+            )
+        }
+        awaitAutoSwitchExclusiveDrain(alias, maxMs = AUTO_SWITCH_EXIT_DRAIN_MS)
+        val summaryUploaded = uploadAutoSwitchSessionSummary(alias, deviceId)
+        if (summaryUploaded) {
+            if (eventId > 0) {
+                runCatching {
+                    ApiService.modeAck(deviceId, alias, eventId, "exiting_started", exitSessionId)
+                }.onFailure { err ->
+                    LogCenter.op(alias, "自治模式 ACK(exiting_started) 失败：${err.message}")
+                }
+                runCatching {
+                    ApiService.modeAck(deviceId, alias, eventId, "summary_uploaded", exitSessionId)
+                }.onSuccess {
+                    LogCenter.op(alias, "【自动切号】收尾已上报云端")
+                }.onFailure { err ->
+                    LogCenter.op(alias, "自治模式 ACK(summary_uploaded) 失败：${err.message}")
+                }
+            }
+            AutoSwitchLedger.clear()
+            AutoSwitchAccountActivityTracker.reset()
+            PrefsStore.clearAutoSwitchSessionContext()
+            if (eventId > 0) {
+                PrefsStore.markAutoSwitchExitDone(eventId)
+                PrefsStore.saveLastModeEventId(eventId)
+            }
+            flushCloudStatusAfterAutonomousExit()
+        } else {
+            PrefsStore.setAutoSwitchMode("off")
+            PrefsStore.setAutoSwitchPendingSummaryUpload(true)
+            flushCloudStatusAfterAutonomousExit()
+            if (eventId > 0) {
+                runCatching {
+                    ApiService.modeAck(deviceId, alias, eventId, "exiting_started", exitSessionId)
+                }.onFailure { err ->
+                    LogCenter.op(alias, "自治模式 ACK(exiting_started) 失败：${err.message}")
+                }
+            }
+            LogCenter.op(alias, "【自动切号】会话总结上报未成功，已保留本地 ledger 待重试")
+        }
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        updateRuntime(lastMessage = "自动切号已关闭，已恢复常规轮询")
+        if (deviceOpsJob?.isActive != true) {
+            startDeviceOpsLoop()
+        }
     }
 
     /** 独占 OP 队列已空且账号已对齐时，解除抢占并恢复涨粉。 */
@@ -279,11 +412,12 @@ object AppCoordinator {
         }
     }
 
-    /** 账号已对齐且本地 OP 队列空闲时，恢复自治模式下的涨粉拉取。 */
+    /** 账号已对齐且本地 OP 队列空闲时，恢复自治模式下的涨粉拉取（由切号完成/调度空档/显式恢复触发，非 ensureLoopsRunning 看门狗）。 */
     private fun maybeStartGrowthInAutoSwitchIdle(reason: String = "自治空档") {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (PrefsStore.getAutoSwitchMode() == "exiting") return
         if (PublishPostGrowthGate.isBlockingGrowth()) return
+        val wasRunning = PrefsStore.getLocalStatus() == "running"
         releaseAutoSwitchExclusivePreemptIfIdle(reason)
         if (manuallyPaused || shouldHonorUserHardStop()) return
         // 轻量对齐/冷却跳过等路径可能留下 localStatus=paused 且无独占 OP，此处自愈恢复 running。
@@ -295,17 +429,275 @@ object AppCoordinator {
             updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
         }
         if (PrefsStore.getLocalStatus() != "running") return
-        if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) return
+        if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (alias.isNotBlank()) {
+                autoSwitchLocalScheduler.growthBaselineBlockReason()?.let { reason ->
+                    LogCenter.op(alias, "【自动切号】$reason，暂不恢复涨粉拉取")
+                }
+            }
+            return
+        }
         if (pullLoopJob?.isActive == true) return
+        if (ExecutionScope.isActive()) return
         if (!canStartPullLoopNow()) return
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (alias.isNotBlank()) {
             LogCenter.op(alias, "【自动切号】$reason，恢复涨粉拉取")
         }
-        if (queueRunMode() == ServerRunMode.GROWTH) {
+        if (queueRunMode() == ServerRunMode.GROWTH && !wasRunning) {
             growthModeLoginSafeguardPending = !PrefsStore.peekGrowthContinueFromPublishHome()
         }
         startPullLoop()
+    }
+
+    /** 内存中是否真有独占 OP 在跑（与 prefs 里 crash 遗留的 preempt 标记区分）。 */
+    private fun isAutoSwitchExclusiveWorkActuallyActive(): Boolean =
+        basicProfileEditRunning ||
+            autoLoginActive ||
+            ExecutionScope.isActive() ||
+            autoSwitchLocalScheduler.isExclusiveWorkActive() ||
+            isPublishPostSwitchActive() ||
+            isMutualSwitchActive() ||
+            isBatchStreamActive() ||
+            PublishPostGrowthGate.isBlockingGrowth()
+
+    /** crash / 强杀后 prefs 可能仍留 preempt=是，但进程内已无 OP：清掉并按 plan 续跑。 */
+    private suspend fun recoverStaleAutoSwitchExclusiveState(reason: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        autoSwitchLocalScheduler.recoverAllStaleInflightOnStart()
+        if (isAutoSwitchExclusiveWorkActuallyActive()) return
+        var cleared = false
+        if (PrefsStore.isAutoSwitchExclusivePreempt()) {
+            PrefsStore.setAutoSwitchExclusivePreempt(false)
+            cleared = true
+        }
+        if (PrefsStore.isTransientPausedForDestructiveOp()) {
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            cleared = true
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (cleared && alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】$reason：已清除 crash 遗留独占/暂停标记，将按本地计划文件续跑")
+        }
+    }
+
+    /** 云端 bundle 拉取失败时，用磁盘 plan + bundle 缓存恢复调度器。 */
+    private suspend fun resumeAutoSwitchFromLocalPlan(reason: String): Boolean {
+        if (PrefsStore.getAutoSwitchMode() != "on") return false
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) return false
+        val plan = AutoSwitchLocalPlanStore.get() ?: return false
+        val cachedBundle = AutoSwitchBundleHolder.getBundle() ?: AutoSwitchBundleHolder.loadCachedBundle()
+            ?: return false
+        val revision = PrefsStore.getAutoSwitchBundleRevision().coerceAtLeast(plan.revision)
+        applyAutoSwitchBundle(alias, deviceId, cachedBundle, revision)
+        LogCenter.op(
+            alias,
+            "【自动切号】$reason：已按本地计划恢复调度 planRev=${plan.revision} slots=${plan.slots.size}",
+        )
+        autoSwitchLocalScheduler.requestImmediateTick()
+        maybeStartGrowthInAutoSwitchIdle(reason)
+        return true
+    }
+    private data class AutoSwitchBundleNetworkResult(
+        val loaded: Boolean,
+        val bundle: AutoSwitchBundle? = null,
+        val msg: String = "",
+        val cloudDisabled: Boolean = false,
+        val skippedNetwork: Boolean = false,
+    )
+
+    /**
+     * 串行化 bundle 网络拉取；同 session+revision 在 debounce 窗口内不重复打服务端。
+     */
+    private suspend fun fetchAutoSwitchBundleFromCloud(
+        alias: String,
+        deviceId: String,
+        reason: String,
+        forceNetwork: Boolean = false,
+    ): AutoSwitchBundleNetworkResult {
+        return autoSwitchBundleFetchMutex.withLock {
+            val sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
+            val revision = PrefsStore.getAutoSwitchBundleRevision()
+            val now = SystemClock.elapsedRealtime()
+            if (
+                !forceNetwork &&
+                revision == lastBundleNetworkFetchRevision &&
+                sessionId == lastBundleNetworkFetchSessionId &&
+                now - lastBundleNetworkFetchAtMs < AUTO_SWITCH_RECOVER_DEBOUNCE_MS
+            ) {
+                val cached = AutoSwitchBundleHolder.getBundle()
+                if (cached != null) {
+                    if (alias.isNotBlank()) {
+                        LogCenter.op(
+                            alias,
+                            "【自动切号】$reason：跳过重复 bundle 网络请求（revision=$revision，" +
+                                "${now - lastBundleNetworkFetchAtMs}ms 内已拉取）",
+                        )
+                    }
+                    return@withLock AutoSwitchBundleNetworkResult(
+                        loaded = true,
+                        bundle = cached,
+                        skippedNetwork = true,
+                    )
+                }
+            }
+            runCatching {
+                val resp = ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
+                val msg = resp.msg.orEmpty()
+                when {
+                    resp.code == 0 && resp.bundle != null -> {
+                        lastBundleNetworkFetchAtMs = SystemClock.elapsedRealtime()
+                        lastBundleNetworkFetchRevision = revision
+                        lastBundleNetworkFetchSessionId = sessionId
+                        AutoSwitchBundleNetworkResult(loaded = true, bundle = resp.bundle)
+                    }
+                    msg.contains("未开启自动切号") ->
+                        AutoSwitchBundleNetworkResult(loaded = false, msg = msg, cloudDisabled = true)
+                    else ->
+                        AutoSwitchBundleNetworkResult(loaded = false, msg = msg.ifBlank { "bundle 为空" })
+                }
+            }.getOrElse { err ->
+                AutoSwitchBundleNetworkResult(loaded = false, msg = err.message.orEmpty())
+            }
+        }
+    }
+
+    private suspend fun recoverAutoSwitchAutonomousWork(reason: String) {
+        if (PrefsStore.getAutoSwitchMode() != "on") return
+        autoSwitchRecoverMutex.withLock {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastAutoSwitchRecoverAtMs < AUTO_SWITCH_RECOVER_DEBOUNCE_MS) {
+                val skipAlias = PrefsStore.getAlias()?.trim().orEmpty()
+                if (skipAlias.isNotBlank()) {
+                    LogCenter.op(
+                        skipAlias,
+                        "【自动切号】$reason：恢复去重跳过完整 bundle 重载（${now - lastAutoSwitchRecoverAtMs}ms 内已恢复），轻量续跑",
+                    )
+                }
+                resumeAutoSwitchGrowthLightweight(reason)
+                return@withLock
+            }
+            lastAutoSwitchRecoverAtMs = now
+            recoverAutoSwitchAutonomousWorkInner(reason)
+        }
+    }
+
+    /** 服务重建/恢复去重时：不重拉 bundle，仅按本地 plan 续跑调度与涨粉。 */
+    private suspend fun resumeAutoSwitchGrowthLightweight(reason: String) {
+        if (PrefsStore.getAutoSwitchMode() != "on") return
+        if (PrefsStore.isHardStopRequested()) return
+        manuallyPaused = false
+        if (
+            PrefsStore.getLocalStatus() != "running" &&
+            !PrefsStore.isAutoSwitchExclusivePreempt() &&
+            autoSwitchLocalScheduler.shouldAllowGrowthBaseline()
+        ) {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
+        }
+        if (!autoSwitchLocalScheduler.isRunning()) {
+            resumeAutoSwitchFromLocalPlan("$reason-轻量本地")
+        } else {
+            autoSwitchLocalScheduler.recoverAllStaleInflightOnStart()
+            autoSwitchLocalScheduler.requestImmediateTick()
+        }
+        maybeStartGrowthInAutoSwitchIdle("$reason-轻量续跑")
+    }
+
+    private suspend fun recoverAutoSwitchAutonomousWorkInner(reason: String) {
+        manuallyPaused = false
+        recoverStaleAutoSwitchExclusiveState(reason)
+        if (!PrefsStore.isHardStopRequested()) {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
+        }
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) return
+
+        // 服务 onDestroy 可能留下 tickJob 空转；恢复时强制重载 bundle 并重启调度器。
+        if (autoSwitchLocalScheduler.isRunning()) {
+            autoSwitchLocalScheduler.stop(clearState = false)
+        }
+
+        var resumed = false
+        val fetchOutcome = fetchAutoSwitchBundleFromCloud(alias, deviceId, reason)
+        when {
+            fetchOutcome.cloudDisabled -> {
+                noteCloudAutoSwitchEnabled(false)
+                LogCenter.op(alias, "【自动切号】云端已关闭自治，停止本地调度")
+                performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                return
+            }
+            fetchOutcome.loaded && fetchOutcome.bundle != null -> {
+                val revision = PrefsStore.getAutoSwitchBundleRevision()
+                noteCloudAutoSwitchEnabled(true)
+                AutoSwitchLedger.restoreFromPrefs()
+                applyAutoSwitchBundle(alias, deviceId, fetchOutcome.bundle, revision)
+                scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
+                if (!fetchOutcome.skippedNetwork) {
+                    LogCenter.op(alias, "【自动切号】已恢复本地调度（$reason）")
+                }
+                resumed = true
+            }
+            alias.isNotBlank() ->
+                LogCenter.op(
+                    alias,
+                    "【自动切号】$reason：bundle 拉取失败 ${fetchOutcome.msg}，尝试本地缓存",
+                )
+        }
+        if (!resumed) {
+            if (isCloudAutoSwitchDisabled()) {
+                performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                return
+            }
+            resumed = resumeAutoSwitchFromLocalPlan(reason)
+        }
+        if (!resumed && alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】$reason：恢复失败（无 bundle / 无本地 plan）")
+            return
+        }
+
+        logAutoSwitchRecoverySnapshot(alias, reason)
+        ProcessDiagnostics.emitHeartbeat("恢复:$reason")
+        autoSwitchLocalScheduler.requestImmediateTick(forceLog = true)
+        maybeStartGrowthInAutoSwitchIdle(reason)
+    }
+
+    private fun logAutoSwitchRecoverySnapshot(alias: String, reason: String) {
+        val plan = AutoSwitchLocalPlanStore.get() ?: run {
+            LogCenter.op(alias, "【自动切号】$reason：plan 文件为空")
+            return
+        }
+        val scheduleDate = beijingDateString()
+        val minute = beijingMinuteOfDayForBundle()
+        val slot = AutoSwitchLocalPlanStore.resolveSlotForMinute(plan, scheduleDate, minute)
+        val slotKey = slot?.slot_key ?: "-"
+        val pendingSlot = PrefsStore.getAutoSwitchLastSlotKey()?.trim().orEmpty().ifBlank { "-" }
+        val pendingPlanSlot = pendingSlot.takeIf { it != "-" }?.let { AutoSwitchLocalPlanStore.slot(it) }
+        val pendingCutDone = pendingPlanSlot?.let { AutoSwitchLocalPlanStore.isCutSwitchDone(it.slot_key) }
+            ?: slot?.let { AutoSwitchLocalPlanStore.isCutSwitchDone(it.slot_key) }
+            ?: false
+        val pendingStep = pendingPlanSlot?.cut_switch?.nextPendingStep()?.let { step ->
+            when (step) {
+                CutSwitchStepKind.BACKUP -> "备份"
+                CutSwitchStepKind.CLEAR -> "清理"
+                CutSwitchStepKind.RESTORE_OR_LOGIN -> "还原/登录"
+            }
+        } ?: "-"
+        val progressSlotKey = pendingPlanSlot?.slot_key ?: slotKey
+        val progressLine = AutoSwitchLocalPlanStore.formatCutSwitchProgressLine(progressSlotKey)
+        LogCenter.op(
+            alias,
+            "【自动切号】$reason：续跑诊断 北京=$scheduleDate ${minute / 60}:${"%02d".format(minute % 60)} " +
+                "当前槽=$slotKey 切号完成=$pendingCutDone 待执行=$pendingStep 上次槽=$pendingSlot " +
+                "调度器=${if (autoSwitchLocalScheduler.isRunning()) "运行" else "停"} " +
+                "bundle=${if (autoSwitchLocalScheduler.hasBundleLoaded()) "有" else "无"}" +
+                (progressLine?.let { " | $it" } ?: ""),
+        )
     }
 
     /** 本机自动切号自治入队的 OP（id 形如 local-as-backup-…），步骤细节只写 operation_logs，不打实时日志。 */
@@ -552,6 +944,16 @@ object AppCoordinator {
     fun init(application: android.content.Context) {
         appContext = application.applicationContext
         PublishPostGrowthGate.installEnterHandler { alias -> enterPublishPostExclusivePhase(alias) }
+        ProcessDiagnostics.registerSnapshotProvider {
+            buildString {
+                append("worker=${WorkerServiceTracker.isRunning}")
+                append(" pull=${pullLoopJob?.isActive == true}")
+                append(" queue=${pendingUsernames.size}")
+                append(" preempt=${PrefsStore.isAutoSwitchExclusivePreempt()}")
+                append(" status=${PrefsStore.getLocalStatus()}")
+                append(" hardStop=${PrefsStore.isHardStopRequested()}")
+            }
+        }
         updateRuntime(
             serviceRunning = WorkerServiceTracker.isRunning,
             localStatus = PrefsStore.getLocalStatus(),
@@ -583,12 +985,25 @@ object AppCoordinator {
             LogCenter.op(alias, "上线同步失败：${error.message}")
         }
         fetchConfig(logToUser = true)
-        LogCenter.op(alias, "设备已就绪，请在管理台点击「启动设备」开始涨粉/任务")
-        updateRuntime(
-            localStatus = PrefsStore.getLocalStatus(),
-            currentServerUrl = ApiService.getBaseUrl(),
-            lastMessage = "已就绪，等待管理台启动",
-        )
+        if (PrefsStore.isAutoSwitchAutonomousMode() && PrefsStore.getAutoSwitchMode() == "on") {
+            if (!PrefsStore.isHardStopRequested() && !manuallyPaused) {
+                recoverAutoSwitchAutonomousWork("进程绑定就绪")
+            } else {
+                LogCenter.op(alias, "自动切号自治：硬停/手动暂停中，未自动恢复任务")
+                updateRuntime(
+                    localStatus = PrefsStore.getLocalStatus(),
+                    currentServerUrl = ApiService.getBaseUrl(),
+                    lastMessage = "自动切号自治：硬停/暂停中",
+                )
+            }
+        } else {
+            LogCenter.op(alias, "设备已就绪，请在管理台点击「启动设备」开始涨粉/任务")
+            updateRuntime(
+                localStatus = PrefsStore.getLocalStatus(),
+                currentServerUrl = ApiService.getBaseUrl(),
+                lastMessage = "已就绪，等待管理台启动",
+            )
+        }
         enqueuePendingReports()
     }
 
@@ -610,8 +1025,10 @@ object AppCoordinator {
         if (started.compareAndSet(false, true)) {
             scope.launch {
                 bootstrapAfterBinding()
-                PrefsStore.saveLocalStatus("online")
-                updateRuntime(localStatus = "online", lastMessage = "在线，等待管理台启动")
+                if (!PrefsStore.isAutoSwitchAutonomousMode()) {
+                    PrefsStore.saveLocalStatus("online")
+                    updateRuntime(localStatus = "online", lastMessage = "在线，等待管理台启动")
+                }
                 startCheckLoop()
             }
             return
@@ -642,11 +1059,17 @@ object AppCoordinator {
                 }
                 return@launch
             }
-            if (PrefsStore.isAutoSwitchExclusivePreempt()) {
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                recoverStaleAutoSwitchExclusiveState("显式启动前")
+            }
+            if (PrefsStore.isAutoSwitchExclusivePreempt() && isAutoSwitchExclusiveWorkActuallyActive()) {
                 if (!alias.isNullOrBlank()) {
                     LogCenter.op(alias, "切号/独占操作进行中，忽略显式启动（$reason）")
                 }
                 return@launch
+            }
+            if (PrefsStore.isAutoSwitchExclusivePreempt()) {
+                PrefsStore.setAutoSwitchExclusivePreempt(false)
             }
             val wasRunning = PrefsStore.getLocalStatus() == "running"
             // 显式启动（本机按钮/云端自动拉起）时，解除本地硬停与手动暂停闸门。
@@ -681,7 +1104,7 @@ object AppCoordinator {
             ensureLoopsRunning()
             runCatching { syncRunningToCloud() }
             if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                maybeStartGrowthInAutoSwitchIdle("显式启动")
+                recoverAutoSwitchAutonomousWork("显式启动")
             } else {
                 startPullLoop()
             }
@@ -695,21 +1118,14 @@ object AppCoordinator {
         if (!PrefsStore.isAutoSwitchAutonomousMode() && deviceOpsJob?.isActive != true) {
             startDeviceOpsLoop()
         }
-        if (PrefsStore.getAutoSwitchMode() == "on" && !autoSwitchLocalScheduler.isRunning()) {
-            requestAutoSwitchSchedulerResume()
-        }
-        if (PrefsStore.getLocalStatus() == "running" && pullLoopJob?.isActive != true) {
-            if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                maybeStartGrowthInAutoSwitchIdle("循环保活")
-            } else {
-                startPullLoop()
-            }
-        } else if (
-            PrefsStore.isAutoSwitchAutonomousMode() &&
-            PrefsStore.getLocalStatus() != "running" &&
+        // 自治模式 bundle/调度恢复由 recoverAutoSwitchAutonomousWork 统一处理，避免与 onWorkerServiceChanged 重复拉取。
+        // 自治模式涨粉由切号完成/调度空档/recoverAutoSwitchAutonomousWork 显式恢复，不在此做 pull loop 看门狗。
+        if (
+            !PrefsStore.isAutoSwitchAutonomousMode() &&
+            PrefsStore.getLocalStatus() == "running" &&
             pullLoopJob?.isActive != true
         ) {
-            maybeStartGrowthInAutoSwitchIdle("循环保活")
+            startPullLoop()
         }
     }
 
@@ -880,6 +1296,7 @@ object AppCoordinator {
      */
     private suspend fun ensureTikTokGalleryPermissionGrantedIfNeeded() {
         if (PrefsStore.getAuthToken().isNullOrBlank()) return
+        ProcessDiagnostics.setPhase("TikTok权限检测/授予")
         val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
         val alias = PrefsStore.getAlias()?.takeIf { it.isNotBlank() } ?: "SYSTEM"
         val packageInstalled = runCatching {
@@ -1216,20 +1633,14 @@ object AppCoordinator {
                 }
 
                 if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                    if (!autoSwitchLocalScheduler.isRunning()) {
-                        requestAutoSwitchSchedulerResume()
-                    }
-                    val growthHint = when {
-                        !autoSwitchLocalScheduler.isRunning() ->
-                            if (PrefsStore.getAutoSwitchBundleJson() != null) {
-                                "恢复调度中"
-                            } else {
-                                "等待 bundle（需云端或首次 enter）"
-                            }
-                        pullLoopJob?.isActive == true -> "空档涨粉中"
-                        else -> "调度中"
-                    }
+                    val growthHint =
+                        if (pullLoopJob?.isActive == true) "空档涨粉中" else "调度中"
                     updateRuntime(lastMessage = "自动切号自治：$growthHint")
+                    if (isCloudAutoSwitchDisabled()) {
+                        modeEventMutex.withLock {
+                            reconcileCloudAutoSwitchState(alias, deviceId, false)
+                        }
+                    }
                     maybeRunDailyAutoSwitchReconcile(alias, deviceId)
                     delay(60_000)
                     continue
@@ -1663,6 +2074,7 @@ object AppCoordinator {
         summary: String,
         ocrRelated: Boolean? = null,
     ) {
+        if (!FailureReportUploader.UPLOAD_ENABLED) return
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (deviceId.isEmpty() || alias.isEmpty()) return
@@ -1729,11 +2141,16 @@ object AppCoordinator {
                         continue
                     }
                     authErrorRounds = 0
+                    noteCloudAutoSwitchEnabled(resp.auto_switch_enabled)
                     val event = resp.event
                     if (event != null && event.event_id > 0) {
                         val ev = event
                         val dId = deviceId
                         val al = alias
+                        // 乐观推进 since_event_id，避免 handler 长跑期间重复投递同一事件。
+                        if (ev.event_id > PrefsStore.getLastModeEventId()) {
+                            PrefsStore.saveLastModeEventId(ev.event_id)
+                        }
                         // 模式事件处理（拉 bundle / drain 等）与长轮询解耦，避免阻塞 mode_wait 与自治调度。
                         scope.launch {
                             modeEventMutex.withLock {
@@ -1741,6 +2158,11 @@ object AppCoordinator {
                             }
                         }
                         continue
+                    }
+                    scope.launch {
+                        modeEventMutex.withLock {
+                            reconcileCloudAutoSwitchState(alias, deviceId, resp.auto_switch_enabled)
+                        }
                     }
                     // 长轮询空结果：正常应接近 timeoutSec；若过快返回则退避，避免打爆服务端。
                     val elapsed = SystemClock.elapsedRealtime() - roundStarted
@@ -1760,6 +2182,128 @@ object AppCoordinator {
         }
     }
 
+    private data class AutoSwitchBundleFetchOutcome(
+        val loaded: Boolean,
+        val msg: String = "",
+        val cloudDisabled: Boolean = false,
+    )
+
+    private fun cancelAutoSwitchBundleRetry() {
+        autoSwitchBundleRetryJob?.cancel()
+        autoSwitchBundleRetryJob = null
+    }
+
+    /** 配置/鉴权类错误重试无意义，避免打爆 VPS。 */
+    private fun isAutoSwitchBundlePermanentFailure(msg: String): Boolean {
+        val m = msg.trim()
+        if (m.isEmpty()) return false
+        return m.contains("无备份档案") ||
+            m.contains("缺少今日计划") ||
+            m.contains("鉴权") ||
+            m.contains("未开启自动切号") ||
+            m.contains("无权") ||
+            m.contains("不存在")
+    }
+
+    private suspend fun tryLoadAutoSwitchBundleForEnter(
+        alias: String,
+        deviceId: String,
+        sessionId: String,
+        bundleRevision: Int,
+    ): AutoSwitchBundleFetchOutcome {
+        val outcome = fetchAutoSwitchBundleFromCloud(alias, deviceId, "enter 加载 bundle", forceNetwork = true)
+        return when {
+            outcome.loaded && outcome.bundle != null -> {
+                applyAutoSwitchBundle(alias, deviceId, outcome.bundle, bundleRevision)
+                val weekStart = outcome.bundle.week_start_date?.trim().orEmpty()
+                val weekEnd = outcome.bundle.week_end_date?.trim().orEmpty()
+                val dayCount = outcome.bundle.weekly_plan?.day_plans?.size ?: 0
+                LogCenter.op(
+                    alias,
+                    "【自动切号】bundle 已加载 session=$sessionId revision=$bundleRevision " +
+                        "week=$weekStart~$weekEnd days=$dayCount",
+                )
+                AutoSwitchBundleFetchOutcome(loaded = true)
+            }
+            outcome.cloudDisabled ->
+                AutoSwitchBundleFetchOutcome(loaded = false, msg = outcome.msg, cloudDisabled = true)
+            else ->
+                AutoSwitchBundleFetchOutcome(loaded = false, msg = outcome.msg.ifBlank { "bundle 为空" })
+        }
+    }
+
+    private suspend fun finalizeAutoSwitchEnterAfterBundleLoaded(
+        alias: String,
+        deviceId: String,
+        eventId: Int,
+        sessionId: String,
+    ) {
+        cancelAutoSwitchBundleRetry()
+        PrefsStore.markAutoSwitchEnterDone(eventId)
+        PrefsStore.saveLastModeEventId(eventId)
+        updateRuntime(lastMessage = "自动切号自治：本地调度中")
+        runCatching {
+            ApiService.modeAck(deviceId, alias, eventId, "bundle_loaded", sessionId)
+        }.onFailure { err ->
+            LogCenter.op(alias, "自治模式 ACK(bundle_loaded) 失败：${err.message}")
+        }
+        delay(1_500)
+        autoSwitchLocalScheduler.requestImmediateTick()
+        maybeStartGrowthInAutoSwitchIdle("自治启动")
+    }
+
+    private fun scheduleAutoSwitchBundleEnterRetry(
+        alias: String,
+        deviceId: String,
+        eventId: Int,
+        sessionId: String,
+        bundleRevision: Int,
+        firstFailureMsg: String,
+    ) {
+        if (isAutoSwitchBundlePermanentFailure(firstFailureMsg)) {
+            LogCenter.op(alias, "【自动切号】bundle 失败不可自动重试：$firstFailureMsg")
+            return
+        }
+        cancelAutoSwitchBundleRetry()
+        autoSwitchBundleRetryJob = scope.launch {
+            var delayMs = AUTO_SWITCH_BUNDLE_RETRY_INITIAL_MS
+            var attempt = 0
+            while (isActive) {
+                delay(delayMs)
+                if (PrefsStore.getAutoSwitchMode() != "on") return@launch
+                if (PrefsStore.isAutoSwitchEnterDone(eventId)) return@launch
+                if (PrefsStore.getAutoSwitchSessionId().orEmpty() != sessionId) return@launch
+                if (autoSwitchLocalScheduler.isRunning() && autoSwitchLocalScheduler.hasBundleLoaded()) {
+                    return@launch
+                }
+                if (isCloudAutoSwitchDisabled()) {
+                    performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                    return@launch
+                }
+                attempt++
+                val outcome = tryLoadAutoSwitchBundleForEnter(alias, deviceId, sessionId, bundleRevision)
+                if (outcome.loaded) {
+                    finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
+                    return@launch
+                }
+                if (outcome.cloudDisabled) {
+                    noteCloudAutoSwitchEnabled(false)
+                    performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                    return@launch
+                }
+                if (isAutoSwitchBundlePermanentFailure(outcome.msg)) {
+                    LogCenter.op(alias, "【自动切号】bundle 重试停止（不可恢复）：${outcome.msg}")
+                    return@launch
+                }
+                LogCenter.op(
+                    alias,
+                    "【自动切号】bundle 重试第 ${attempt} 次失败：${outcome.msg}，${delayMs / 1000}s 后再试",
+                )
+                delayMs = (delayMs * 2).coerceAtMost(AUTO_SWITCH_BUNDLE_RETRY_MAX_MS)
+            }
+        }
+    }
+
     private suspend fun handleDeviceModeEvent(alias: String, deviceId: String, event: DeviceModeEvent) {
         val type = event.type.trim()
         val sessionId = event.session_id.trim()
@@ -1775,11 +2319,9 @@ object AppCoordinator {
         when (type) {
             "auto_switch_enter" -> {
                 if (PrefsStore.isAutoSwitchEnterDone(eventId)) {
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "bundle_loaded", sessionId)
+                    if (isCloudAutoSwitchDisabled()) {
+                        performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
                     }
-                    PrefsStore.saveLastModeEventId(eventId)
-                    LogCenter.op(alias, "【自动切号】enter 事件已处理过(event_id=$eventId)，已重发 bundle_loaded ACK")
                     return
                 }
                 // 自治模式：切号/发作品与涨粉互斥；空档时段账号对齐后恢复涨粉。
@@ -1815,65 +2357,43 @@ object AppCoordinator {
                 AutoSwitchLedger.startSession(sessionId, bundleRevision = bundleRevision)
                 PrefsStore.setAutoSwitchPendingSummaryUpload(false)
                 scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
-                var bundleLoaded = false
-                runCatching {
-                    val resp = ApiService.fetchAutoSwitchBundle(
-                        deviceId,
+                cancelAutoSwitchBundleRetry()
+                val bundleOutcome = tryLoadAutoSwitchBundleForEnter(
+                    alias,
+                    deviceId,
+                    sessionId,
+                    bundleRevision,
+                )
+                if (!bundleOutcome.loaded) {
+                    val failMsg = bundleOutcome.msg.ifBlank { "未知错误" }
+                    LogCenter.op(alias, "【自动切号】bundle 拉取失败：$failMsg")
+                }
+                updateRuntime(
+                    lastMessage = if (bundleOutcome.loaded) {
+                        "自动切号自治：本地调度中"
+                    } else {
+                        "自动切号自治：等待 bundle"
+                    },
+                )
+                when {
+                    bundleOutcome.loaded ->
+                        finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
+                    bundleOutcome.cloudDisabled -> {
+                        noteCloudAutoSwitchEnabled(false)
+                        performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                    }
+                    else -> scheduleAutoSwitchBundleEnterRetry(
                         alias,
+                        deviceId,
+                        eventId,
                         sessionId,
                         bundleRevision,
+                        bundleOutcome.msg,
                     )
-                    if (resp.code == 0 && resp.bundle != null) {
-                        applyAutoSwitchBundle(alias, deviceId, resp.bundle, bundleRevision)
-                        bundleLoaded = true
-                        val weekStart = resp.bundle.week_start_date?.trim().orEmpty()
-                        val weekEnd = resp.bundle.week_end_date?.trim().orEmpty()
-                        val dayCount = resp.bundle.weekly_plan?.day_plans?.size ?: 0
-                        LogCenter.op(
-                            alias,
-                            "【自动切号】已进入自治 session=$sessionId revision=$bundleRevision " +
-                                "week=$weekStart~$weekEnd days=$dayCount",
-                        )
-                    } else {
-                        LogCenter.op(alias, "【自动切号】bundle 拉取失败：${resp.msg}")
-                    }
-                }.onFailure { err ->
-                    LogCenter.op(alias, "【自动切号】bundle 拉取异常：${err.message}")
-                }
-                if (!bundleLoaded) {
-                    val cached = AutoSwitchBundleHolder.restoreFromPrefs()
-                    if (
-                        cached != null &&
-                        AutoSwitchBundleHolder.isUsableForAutonomousResume(cached, sessionId)
-                    ) {
-                        applyAutoSwitchBundle(alias, deviceId, cached, bundleRevision)
-                        bundleLoaded = true
-                        LogCenter.op(alias, "【自动切号】云端 bundle 暂不可用，已用本地缓存启动自治")
-                    }
-                }
-                updateRuntime(lastMessage = if (bundleLoaded) "自动切号自治：本地调度中" else "自动切号自治：等待 bundle")
-                if (bundleLoaded) {
-                    PrefsStore.markAutoSwitchEnterDone(eventId)
-                    PrefsStore.saveLastModeEventId(eventId)
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "bundle_loaded", sessionId)
-                    }.onFailure { err ->
-                        LogCenter.op(alias, "自治模式 ACK(bundle_loaded) 失败：${err.message}")
-                    }
-                    scope.launch {
-                        delay(1_500)
-                        autoSwitchLocalScheduler.requestImmediateTick()
-                        maybeStartGrowthInAutoSwitchIdle("自治启动")
-                    }
                 }
             }
             "auto_switch_exit" -> {
                 if (PrefsStore.isAutoSwitchExitDone(eventId)) {
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "summary_uploaded", sessionId)
-                    }
-                    PrefsStore.saveLastModeEventId(eventId)
-                    LogCenter.op(alias, "【自动切号】exit 事件已处理过(event_id=$eventId)，已重发 summary_uploaded ACK")
                     return
                 }
                 if (
@@ -1882,57 +2402,10 @@ object AppCoordinator {
                     !PrefsStore.hasAutoSwitchPendingSummaryUpload()
                 ) {
                     PrefsStore.markAutoSwitchExitDone(eventId)
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "summary_uploaded", sessionId)
-                    }
                     PrefsStore.saveLastModeEventId(eventId)
                     return
                 }
-                val enterSessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
-                beginAutoSwitchExitShutdown(alias)
-                LogCenter.op(
-                    alias,
-                    "【自动切号】收到关闭指令，等待涨粉/独占收尾 enter_session=$enterSessionId exit_event=$sessionId",
-                )
-                awaitAutoSwitchExclusiveDrain(alias, maxMs = AUTO_SWITCH_EXIT_DRAIN_MS)
-                val summaryUploaded = uploadAutoSwitchSessionSummary(alias, deviceId)
-                if (summaryUploaded) {
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "exiting_started", sessionId)
-                    }.onFailure { err ->
-                        LogCenter.op(alias, "自治模式 ACK(exiting_started) 失败：${err.message}")
-                    }
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "summary_uploaded", sessionId)
-                    }.onSuccess {
-                        LogCenter.op(alias, "【自动切号】收尾已上报云端")
-                    }.onFailure { err ->
-                        LogCenter.op(alias, "自治模式 ACK(summary_uploaded) 失败：${err.message}")
-                    }
-                    AutoSwitchLedger.clear()
-                    AutoSwitchAccountActivityTracker.reset()
-                    PrefsStore.clearAutoSwitchSessionContext()
-                    PrefsStore.markAutoSwitchExitDone(eventId)
-                    PrefsStore.saveLastModeEventId(eventId)
-                    flushCloudStatusAfterAutonomousExit()
-                } else {
-                    PrefsStore.setAutoSwitchMode("off")
-                    PrefsStore.setAutoSwitchPendingSummaryUpload(true)
-                    flushCloudStatusAfterAutonomousExit()
-                    runCatching {
-                        ApiService.modeAck(deviceId, alias, eventId, "exiting_started", sessionId)
-                    }.onFailure { err ->
-                        LogCenter.op(alias, "自治模式 ACK(exiting_started) 失败：${err.message}")
-                    }
-                    LogCenter.op(alias, "【自动切号】会话总结上报未成功，已保留本地 ledger 待重试")
-                }
-                PrefsStore.setAutoSwitchExclusivePreempt(false)
-                pullLoopJob?.cancel()
-                pullLoopJob = null
-                updateRuntime(lastMessage = "自动切号已关闭，已恢复常规轮询")
-                if (deviceOpsJob?.isActive != true) {
-                    startDeviceOpsLoop()
-                }
+                performAutoSwitchExitShutdown(alias, deviceId, eventId, sessionId)
             }
             else -> LogCenter.op(alias, "收到未知模式事件：$type")
         }
@@ -2368,7 +2841,7 @@ object AppCoordinator {
             )
             LogCenter.op(
                 alias,
-                "【自动切号】切号 OP 成功但未写 verified（row=$targetRowIndex slot=${sk.ifBlank { "-" }}）",
+                "【自动切号】切号 OP 成功但未写 plan 切号完成（row=$targetRowIndex slot=${sk.ifBlank { "-" }}）",
             )
         }
         PrefsStore.setTransientPausedForDestructiveOp(false)
@@ -2388,9 +2861,60 @@ object AppCoordinator {
     }
 
     /**
-     * 切号备份 tar 完成后立即把备份地址上报云端（不等到 pm clear 与整段 OP 结束）。
+     * 切号备份 tar 完成后：自治期记入 ledger 待上传；非自治仍即时上传。
      */
     private suspend fun reportAutoSwitchCutSwitchBackupImmediately(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        username: String,
+        packageName: String,
+        backupName: String,
+        backupPath: String,
+        payload: DeviceOpPayload?,
+    ) {
+        val user = username.trim()
+        if (user.isBlank() || backupPath.isBlank()) return
+        updateLocalBundleBackupPath(user, backupName, backupPath)
+        if (PrefsStore.isAutoSwitchAutonomousMode()) {
+            val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
+            AutoSwitchLedger.recordCutSwitchBackupDeferred(
+                sourceOpId = opId,
+                username = user,
+                packageName = packageName,
+                backupName = backupName,
+                backupPath = backupPath,
+                slotKey = slotKey,
+                backupRecordId = payload?.backup_record_id,
+            )
+            if (alias.isNotBlank()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】切号备份 @$user 已本地打包：$backupName（文件待 exit/每日对账时上传云端）",
+                )
+            }
+            return
+        }
+        uploadCutSwitchBackupToCloudNow(
+            alias = alias,
+            deviceId = deviceId,
+            opId = opId,
+            username = user,
+            packageName = packageName,
+            backupName = backupName,
+            backupPath = backupPath,
+            payload = payload,
+        )
+    }
+
+    private fun updateLocalBundleBackupPath(username: String, backupName: String, backupPath: String) {
+        AutoSwitchLocalPlanStore.updateBackupPath(username, backupName, backupPath)
+        AutoSwitchBundleHolder.getBundle()?.let { bundle ->
+            AutoSwitchBundleHolder.setBundle(AutoSwitchLocalPlanStore.applyRuntimeToBundle(bundle))
+        }
+    }
+
+    private suspend fun uploadCutSwitchBackupToCloudNow(
         alias: String,
         deviceId: String,
         opId: String,
@@ -2416,9 +2940,9 @@ object AppCoordinator {
             message = "auto_switch cut_switch backup",
             uploadStatus = "pending",
         )
-        val uploadOk = runCatching {
+        val uploadOk = try {
             BackupReporter().uploadBackupAndCreateTask(deviceId, alias, record).success
-        }.getOrElse { err ->
+        } catch (err: Exception) {
             if (alias.isNotBlank()) {
                 LogCenter.op(alias, "【自动切号】切号备份云端上报异常：${err.message}")
             }
@@ -2447,21 +2971,72 @@ object AppCoordinator {
             message = "切号备份完成，地址已即时上报",
             data = reportData,
         )
-        val bundle = AutoSwitchBundleHolder.getBundle()
-        if (bundle != null) {
-            val accounts = bundle.accounts.orEmpty().map { acc ->
-                if (acc.username?.trim().equals(user, ignoreCase = true)) {
-                    acc.copy(backup_name = backupName, backup_path = backupPath)
-                } else {
-                    acc
-                }
-            }
-            AutoSwitchBundleHolder.setBundle(bundle.copy(accounts = accounts))
-        }
         if (alias.isNotBlank()) {
             LogCenter.op(
                 alias,
                 "【自动切号】切号备份 @$user 地址已即时上报云端：$backupName（api=${if (uploadOk) "ok" else "fail"}）",
+            )
+        }
+    }
+
+    /** 自治 exit / 每日对账前：上传 ledger 中待传的切号备份 tar。 */
+    private suspend fun flushDeferredCutSwitchBackupUploads(alias: String, deviceId: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (AutoSwitchLedger.getEntryCount() == 0) {
+            AutoSwitchLedger.restoreFromPrefs()
+        }
+        if (!AutoSwitchLedger.hasPendingCutSwitchBackupUpload()) return
+        var okCount = 0
+        var failCount = 0
+        AutoSwitchLedger.forEachPendingCutSwitchBackupUpload { entry ->
+            val data = entry.report_data
+            val backupPath = data["backup_path"]?.toString()?.trim().orEmpty()
+            val backupName = data["backup_name"]?.toString()?.trim().orEmpty()
+            val user = data["username"]?.toString()?.trim().orEmpty()
+            val packageName = data["package_name"]?.toString()?.trim().orEmpty()
+                .ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
+            if (backupPath.isBlank() || user.isBlank()) {
+                AutoSwitchLedger.noteCutSwitchBackupUploadFailed(entry.op_id, "缺少 backup_path 或 username")
+                failCount++
+                return@forEachPendingCutSwitchBackupUpload
+            }
+            if (!File(backupPath).isFile) {
+                AutoSwitchLedger.noteCutSwitchBackupUploadFailed(entry.op_id, "本机文件不存在：$backupPath")
+                failCount++
+                return@forEachPendingCutSwitchBackupUpload
+            }
+            val name = backupName.ifBlank { File(backupPath).name }
+            val record = BackupRecord(
+                accountName = user,
+                packageName = packageName,
+                deviceAlias = alias,
+                deviceId = deviceId,
+                appAccount = PrefsStore.getAuthUsername().orEmpty(),
+                backupType = "backup",
+                backupScope = "cloud",
+                success = true,
+                path = backupPath,
+                filename = name,
+                message = "auto_switch cut_switch backup (deferred)",
+                uploadStatus = "pending",
+            )
+            val uploadOk = try {
+                BackupReporter().uploadBackupAndCreateTask(deviceId, alias, record).success
+            } catch (err: Exception) {
+                AutoSwitchLedger.noteCutSwitchBackupUploadFailed(entry.op_id, err.message ?: "上传异常")
+                false
+            }
+            if (uploadOk) {
+                AutoSwitchLedger.markCutSwitchBackupUploaded(entry.op_id, "切号备份文件已上传：$name")
+                okCount++
+            } else {
+                failCount++
+            }
+        }
+        if (alias.isNotBlank() && (okCount > 0 || failCount > 0)) {
+            LogCenter.op(
+                alias,
+                "【自动切号】切号备份批量上传：成功 $okCount，失败 $failCount（待传条目保留至下次对账）",
             )
         }
     }
@@ -3077,8 +3652,34 @@ object AppCoordinator {
         }
     }
 
+    /** 发作品/互点插入调度前：暂停涨粉、等当前步骤收尾、force-stop TikTok，独占通道。 */
+    private suspend fun preemptTikTokForInsertionPrep(alias: String, phaseLabel: String): Boolean {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return true
+        if (PublishPostGrowthGate.shouldDeferExclusivePreempt()) return true
+        pauseGrowthForAutoSwitchExclusiveOp()
+        awaitExecutionScopeIdleForAutoSwitch(alias, maxMs = 60_000L)
+        if (ExecutionScope.isActive()) {
+            LogCenter.op(alias, "【自动切号】$phaseLabel：涨粉未协作退出，本轮跳过")
+            releaseInsertionPrepExclusiveIfIdle("$phaseLabel-涨粉占用")
+            return false
+        }
+        forceStopTikTokForExclusiveEnqueue(phaseLabel)
+        return true
+    }
+
+    private fun releaseInsertionPrepExclusiveIfIdle(reason: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (autoSwitchLocalScheduler.isExclusiveWorkActive()) return
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        if (!manuallyPaused && !shouldHonorUserHardStop() && autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
+        }
+        maybeStartGrowthInAutoSwitchIdle(reason)
+    }
+
     /**
-     * 自动切号 tick 发作品入队前：bundle is_login + OCR 登录状态保障。
+     * 自动切号 tick 发作品入队前：先独占 TikTok，再 bundle is_login + OCR 登录状态保障。
      * 失败时不标记 publish_aborted，下分钟 tick 可重试。
      */
     private suspend fun verifyPublishInsertionLoginBeforeEnqueue(
@@ -3090,6 +3691,7 @@ object AppCoordinator {
         val user = targetUsername.trim()
         val sk = slotKey.trim()
         if (user.isBlank() || deviceId.isBlank()) return false
+        if (!preemptTikTokForInsertionPrep(alias, "发作品入队前")) return false
         PrefsStore.setLogContextUsername(user)
         applyBundledConfigFromAutoSwitch(user, logToUser = false)
 
@@ -3108,10 +3710,12 @@ object AppCoordinator {
                     if (sk.isNotEmpty()) {
                         autoSwitchLocalScheduler.invalidateSlotAlignment(sk, "发作品入队前账号切换")
                     }
+                    releaseInsertionPrepExclusiveIfIdle("发作品入队前账号切换")
                     return false
                 }
                 AccountLoginRetryOutcome.Aborted -> {
                     LogCenter.op(alias, "【自动切号】发作品入队前自动登录中止 slot=$sk")
+                    releaseInsertionPrepExclusiveIfIdle("发作品入队前自动登录中止")
                     return false
                 }
             }
@@ -3127,54 +3731,7 @@ object AppCoordinator {
         )
         if (!ocrOk) {
             LogCenter.op(alias, "【自动切号】发作品入队前 OCR 登录保障未通过 slot=$sk account=$user")
-        }
-        return ocrOk
-    }
-
-    /**
-     * 时段目标未 verified：登录 + OCR 保障后写对齐证明（不做 clear/restore）。
-     */
-    private suspend fun verifySlotAlignmentLightweightLogin(
-        alias: String,
-        deviceId: String,
-        targetUsername: String,
-        slotKey: String,
-        targetRowIndex: Int,
-    ): Boolean {
-        val user = targetUsername.trim()
-        val sk = slotKey.trim()
-        if (user.isBlank() || sk.isEmpty() || targetRowIndex < 0 || deviceId.isBlank()) return false
-        PrefsStore.setLogContextUsername(user)
-        applyBundledConfigFromAutoSwitch(user, logToUser = false)
-
-        // 每分钟 tick 内只做一轮尝试；失败由调度器下分钟重试，避免 ensureAccountLoggedInWithRetry
-        // 在 tickMutex 内无限重试导致本地调度器整体卡死。
-        if (!isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = user)) {
-            val loginOk = ensureAccountLoggedIn(
-                alias = alias,
-                deviceId = deviceId,
-                opId = "slot_align_${System.currentTimeMillis()}",
-                reason = "时段对齐校验",
-                strict = true,
-                forceRelogin = false,
-                preferredUsername = user,
-            )
-            if (!loginOk) {
-                LogCenter.op(alias, "【自动切号】时段对齐校验自动登录未通过 slot=$sk，下分钟重试")
-                return false
-            }
-        }
-
-        val ocrOk = launchTikTokWithLoginSafeguardWithRetry(
-            alias = alias,
-            deviceId = deviceId,
-            tag = "时段对齐校验",
-            forceStopBeforeLaunch = false,
-            safeguardSource = "时段对齐校验",
-            strict = true,
-        )
-        if (!ocrOk) {
-            LogCenter.op(alias, "【自动切号】时段对齐校验 OCR 未通过 slot=$sk account=$user")
+            releaseInsertionPrepExclusiveIfIdle("发作品入队前 OCR 未通过")
         }
         return ocrOk
     }
@@ -3186,7 +3743,7 @@ object AppCoordinator {
         taskLabel: String,
         clearPublishOnAccountChange: Boolean = false,
     ): Boolean {
-        val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+        val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
         if (isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = expectedUser)) {
             return true
         }
@@ -3204,7 +3761,6 @@ object AppCoordinator {
                 if (clearPublishOnAccountChange) {
                     PrefsStore.clearPublishPostState()
                 }
-                PrefsStore.clearAutoSwitchPublishContext()
                 false
             }
             AccountLoginRetryOutcome.Aborted -> {
@@ -3229,7 +3785,7 @@ object AppCoordinator {
             LogCenter.op(alias, "发作品：未绑定 deviceId，中止发布独占阶段")
             return false
         }
-        val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+        val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
         if (!isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = expectedUser)) {
             when (
                 ensureAccountLoggedInWithRetry(
@@ -3271,7 +3827,7 @@ object AppCoordinator {
                     } else {
                         PrefsStore.clearPublishPostState()
                         autoSwitchLocalScheduler.notifyPublishOutcome(
-                            slotKey = PrefsStore.getAutoSwitchPublishSlotKey().orEmpty(),
+                            slotKey = AutoSwitchLocalPlanStore.activePublishSlotKey().orEmpty(),
                             completed = false,
                             loginFailed = false,
                             accountChanged = false,
@@ -3701,6 +4257,7 @@ object AppCoordinator {
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
             if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) return true
             if (isPublishPostSwitchActive()) return true
+            if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return true
         }
         return false
     }
@@ -3741,36 +4298,29 @@ object AppCoordinator {
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (deviceId.isBlank() || alias.isBlank()) return false
-        val sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
         val revision = PrefsStore.getAutoSwitchBundleRevision()
-        return runCatching {
-            val resp = ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
-            if (resp.code == 0 && resp.bundle != null) {
-                val equivalent = applyAutoSwitchBundle(
-                    alias,
-                    deviceId,
-                    resp.bundle,
-                    revision,
-                    startSchedulerIfStopped = false,
-                )
-                if (!equivalent || !autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()) {
-                    autoSwitchLocalScheduler.requestImmediateTick()
-                    maybeStartGrowthInAutoSwitchIdle("周计划刷新")
-                } else {
-                    LogCenter.op(
-                        alias,
-                        "【自动切号】周计划幂等刷新（时段+账号未变且本时段已对齐），不打断自治涨粉",
-                    )
-                }
-                true
-            } else {
-                LogCenter.op(alias, "【自动切号】周计划 bundle 拉取失败：${resp.msg}")
-                false
-            }
-        }.getOrElse { err ->
-            LogCenter.op(alias, "【自动切号】周计划 bundle 拉取异常：${err.message}")
-            false
+        val outcome = fetchAutoSwitchBundleFromCloud(alias, deviceId, "周计划刷新")
+        if (!outcome.loaded || outcome.bundle == null) {
+            LogCenter.op(alias, "【自动切号】周计划 bundle 拉取失败：${outcome.msg}")
+            return false
         }
+        val equivalent = applyAutoSwitchBundle(
+            alias,
+            deviceId,
+            outcome.bundle,
+            revision,
+            startSchedulerIfStopped = false,
+        )
+        if (!equivalent || !autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()) {
+            autoSwitchLocalScheduler.requestImmediateTick()
+            maybeStartGrowthInAutoSwitchIdle("周计划刷新")
+        } else {
+            LogCenter.op(
+                alias,
+                "【自动切号】周计划幂等刷新（账号未变且本时段已对齐），不打断自治涨粉",
+            )
+        }
+        return true
     }
 
     /** 时段边界：收尾上一时段活动统计（切号链随后执行备份/还原/登录）。 */
@@ -3806,8 +4356,7 @@ object AppCoordinator {
             PrefsStore.setAutoSwitchWeekRange(weekStart, weekEnd)
         }
         val wasSchedulerRunning = autoSwitchLocalScheduler.isRunning()
-        AutoSwitchBundleHolder.persistToPrefs(bundle)
-        val scheduleEquivalent = if (wasSchedulerRunning) {
+        val accountsEquivalent = if (wasSchedulerRunning) {
             autoSwitchLocalScheduler.refreshWeeklyBundle(bundle)
         } else {
             false
@@ -3819,7 +4368,7 @@ object AppCoordinator {
             PrefsStore.setAutoSwitchLastConfigFetchRevision(-1)
         }
         val skipDisruptiveConfigApply =
-            scheduleEquivalent && autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()
+            accountsEquivalent && autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()
         if (!skipDisruptiveConfigApply) {
             val logUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
             val slotTargetUser = bundle.resolveCurrentSlotTargetAccount(
@@ -3832,23 +4381,27 @@ object AppCoordinator {
                 logUser.ifBlank { slotTargetUser }.ifBlank { null },
                 logToUser = true,
             )
+            if (!accountsEquivalent && alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】云端账号变更，已按新资料重新配置")
+            }
         } else if (alias.isNotBlank()) {
             LogCenter.op(
                 alias,
-                "【自动切号】bundle 幂等刷新：本时段已对齐，跳过配置重载以免打断涨粉",
+                "【自动切号】bundle 幂等刷新：账号未变且本时段已对齐，跳过配置重载以免打断涨粉",
             )
         }
         scheduleBackupDirectoryReconcile(
             alias = alias,
             deviceId = deviceId,
-            accounts = bundle.accounts.orEmpty(),
+            accounts = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
+                .ifEmpty { bundle.accounts.orEmpty() },
             logPrefix = "【备份目录整理】",
         )
         bundle.smart_template_debug?.toAuditLines()?.takeIf { it.isNotEmpty() }?.let { lines ->
             val label = if (!wasSchedulerRunning && startSchedulerIfStopped) "enter 打包" else "bundle 更新"
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
         }
-        return scheduleEquivalent
+        return accountsEquivalent
     }
 
     private fun beijingMinuteOfDayForBundle(): Int {
@@ -3856,80 +4409,16 @@ object AppCoordinator {
         return cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
     }
 
-    private fun requestAutoSwitchSchedulerResume() {
+    private suspend fun resumeAutoSwitchSchedulerIfNeeded(reason: String = "恢复调度") {
         if (PrefsStore.getAutoSwitchMode() != "on") return
-        if (autoSwitchLocalScheduler.isRunning()) return
-        if (autoSwitchResumeJob?.isActive == true) return
-        val now = System.currentTimeMillis()
-        if (
-            AutoSwitchBundleHolder.getBundle() == null &&
-            AutoSwitchBundleHolder.restoreFromPrefs() == null &&
-            now - lastAutoSwitchCloudResumeFailMs < 30_000L
-        ) {
+        recoverStaleAutoSwitchExclusiveState(reason)
+        if (autoSwitchLocalScheduler.isRunning()) {
+            autoSwitchLocalScheduler.recoverAllStaleInflightOnStart()
+            autoSwitchLocalScheduler.requestImmediateTick()
+            maybeStartGrowthInAutoSwitchIdle("调度器已运行")
             return
         }
-        autoSwitchResumeJob = scope.launch {
-            resumeAutoSwitchSchedulerIfNeeded()
-        }
-    }
-
-    private suspend fun resumeAutoSwitchSchedulerIfNeeded() {
-        if (PrefsStore.getAutoSwitchMode() != "on") return
-        if (autoSwitchLocalScheduler.isRunning()) return
-        AutoSwitchLedger.restoreFromPrefs()
-        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
-        val alias = PrefsStore.getAlias()?.trim().orEmpty()
-        if (deviceId.isBlank() || alias.isBlank()) return
-        val sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
-        val revision = PrefsStore.getAutoSwitchBundleRevision()
-
-        var startedFromCache = false
-        val cachedBundle = AutoSwitchBundleHolder.getBundle()
-            ?: AutoSwitchBundleHolder.restoreFromPrefs()?.also { AutoSwitchBundleHolder.setBundle(it) }
-        if (
-            cachedBundle != null &&
-            AutoSwitchBundleHolder.isUsableForAutonomousResume(cachedBundle, sessionId)
-        ) {
-            applyAutoSwitchBundle(alias, deviceId, cachedBundle, revision)
-            scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
-            LogCenter.op(alias, "【自动切号】已用本地缓存立即恢复调度（后台同步云端 bundle）")
-            updateRuntime(lastMessage = "自动切号自治：本地调度中")
-            autoSwitchLocalScheduler.requestImmediateTick()
-            maybeStartGrowthInAutoSwitchIdle("本地 bundle 恢复")
-            startedFromCache = true
-        }
-
-        val cloudResult = runCatching {
-            ApiService.fetchAutoSwitchBundle(deviceId, alias, sessionId, revision)
-        }
-        cloudResult.fold(
-            onSuccess = { resp ->
-                if (resp.code == 0 && resp.bundle != null) {
-                    applyAutoSwitchBundle(alias, deviceId, resp.bundle, revision)
-                    scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
-                    if (startedFromCache) {
-                        LogCenter.op(alias, "【自动切号】云端 bundle 已后台同步")
-                    } else {
-                        LogCenter.op(alias, "【自动切号】已恢复本地调度（重启后重拉 bundle）")
-                        updateRuntime(lastMessage = "自动切号自治：本地调度中")
-                    }
-                    autoSwitchLocalScheduler.requestImmediateTick()
-                    maybeStartGrowthInAutoSwitchIdle(if (startedFromCache) "云端 bundle 同步" else "重启恢复")
-                    lastAutoSwitchCloudResumeFailMs = 0L
-                } else if (!startedFromCache) {
-                    lastAutoSwitchCloudResumeFailMs = System.currentTimeMillis()
-                    LogCenter.op(alias, "【自动切号】恢复本地调度失败：${resp.msg}")
-                    updateRuntime(lastMessage = "自动切号自治：等待 bundle")
-                }
-            },
-            onFailure = { err ->
-                if (!startedFromCache) {
-                    lastAutoSwitchCloudResumeFailMs = System.currentTimeMillis()
-                    LogCenter.op(alias, "【自动切号】恢复本地调度异常：${err.message}")
-                    updateRuntime(lastMessage = "自动切号自治：等待 bundle")
-                }
-            },
-        )
+        recoverAutoSwitchAutonomousWork(reason)
     }
 
     private fun beijingDateString(): String {
@@ -4030,6 +4519,7 @@ object AppCoordinator {
     }
 
     private suspend fun flushDeferredFailureReports(alias: String, deviceId: String) {
+        if (!FailureReportUploader.UPLOAD_ENABLED) return
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (AutoSwitchLedger.getEntryCount() == 0) {
             AutoSwitchLedger.restoreFromPrefs()
@@ -4063,6 +4553,7 @@ object AppCoordinator {
         reconcileKey: String = "",
     ): Boolean {
         flushDeferredFailureReports(alias, deviceId)
+        flushDeferredCutSwitchBackupUploads(alias, deviceId)
         if (AutoSwitchLedger.getEntryCount() == 0) {
             AutoSwitchLedger.restoreFromPrefs()
         }
@@ -4089,7 +4580,7 @@ object AppCoordinator {
                 val resp = ApiService.postAutoSwitchSessionSummary(summary)
                 if (resp.code == 0) {
                     uploaded = true
-                    LogCenter.op(alias, summary.human_log)
+                    LogCenter.op(alias, AutoSwitchLedger.buildOneLineSummary(alias, kind, reconcile))
                     val notes = resp.reconciliation?.get("notes")
                     if (notes is List<*>) {
                         notes.filterIsInstance<String>().forEach { note ->
@@ -4105,7 +4596,10 @@ object AppCoordinator {
             if (!uploaded && attempt < 2) delay(2_000)
         }
         if (!uploaded) {
-            LogCenter.op(alias, summary.human_log)
+            LogCenter.op(
+                alias,
+                AutoSwitchLedger.buildOneLineSummary(alias, kind, reconcile) + "（上报未成功，详情仅保留 ledger）",
+            )
         }
         return uploaded
     }
@@ -4116,6 +4610,7 @@ object AppCoordinator {
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (deviceId.isBlank() || alias.isBlank()) return
+        flushDeferredCutSwitchBackupUploads(alias, deviceId)
         if (uploadAutoSwitchSessionSummary(alias, deviceId)) {
             AutoSwitchLedger.clear()
             AutoSwitchAccountActivityTracker.reset()
@@ -4289,18 +4784,38 @@ object AppCoordinator {
             op.op_type == "mutual_click_comment_only_start" ||
             op.op_type == "mutual_click_follow_only_start"
         ) {
-            val commentOnly = op.op_type == "mutual_click_comment_only_start"
-            val followOnly = op.op_type == "mutual_click_follow_only_start"
+            val isAutoSwitchMutual = payload?.source?.trim() == "auto_switch"
+            val mutualAccount = payload?.account_username?.trim().orEmpty()
+            if (isAutoSwitchMutual && mutualAccount.isNotBlank()) {
+                applyBundledConfigFromAutoSwitch(mutualAccount, logToUser = false)
+            }
+            val followOnly = if (isAutoSwitchMutual) {
+                _config.value.mutual_traffic_follow_only
+            } else {
+                op.op_type == "mutual_click_follow_only_start"
+            }
+            val commentOnly = !isAutoSwitchMutual && op.op_type == "mutual_click_comment_only_start"
             PrefsStore.setMutualCommentOnlySession(commentOnly)
             PrefsStore.setMutualFollowOnlySession(followOnly)
             val sessionLabel = when {
-                followOnly -> "仅关注"
+                followOnly -> "引流互点·仅关注"
                 commentOnly -> "仅评论"
+                isAutoSwitchMutual -> "引流互点"
                 else -> "完整"
             }
             val mutualLogLine =
-                "[OP][$opId] 收到互点引流指令（$sessionLabel），开始引流会话"
+                "[OP][$opId] 收到${sessionLabel}指令，开始 teamwork Videos 引流会话"
             LogCenter.op(alias, mutualLogLine)
+            if (isAutoSwitchMutual) {
+                AutoSwitchLocalPlanStore.beginActiveMutual(
+                    slotKey = payload?.auto_switch_slot_key?.trim().orEmpty(),
+                    opId = opId,
+                    accountUsername = payload?.account_username?.trim().orEmpty(),
+                    opType = op.op_type,
+                )
+            } else {
+                AutoSwitchLocalPlanStore.clearActiveMutual()
+            }
             PrefsStore.setMutualClickRequested(true)
             PrefsStore.setMutualClickPending(true)
             triggerMutualSwitchNow(alias)
@@ -4323,7 +4838,7 @@ object AppCoordinator {
             val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
             val isAutoSwitchPublish = payload?.source == "auto_switch"
             if (isAutoSwitchPublish && slotKey.isNotBlank()) {
-                if (AutoSwitchLedger.isPublishSlotDone(slotKey)) {
+                if (AutoSwitchLocalPlanStore.isPublishDone(slotKey)) {
                     reportDeviceOpToCloud(
                         deviceId = deviceId,
                         alias = alias,
@@ -4334,7 +4849,7 @@ object AppCoordinator {
                     )
                     return
                 }
-                if (AutoSwitchLedger.isPublishSlotAborted(slotKey)) {
+                if (AutoSwitchLocalPlanStore.isPublishTerminalFailure(slotKey)) {
                     reportDeviceOpToCloud(
                         deviceId = deviceId,
                         alias = alias,
@@ -4345,19 +4860,55 @@ object AppCoordinator {
                     )
                     return
                 }
-                if (AutoSwitchLedger.isPublishSlotInflight(slotKey)) {
+                if (AutoSwitchLocalPlanStore.isPublishInflight(slotKey)) {
                     val activeOpId = PrefsStore.getPublishPostTaskOpId().orEmpty()
-                    if (activeOpId.isNotBlank() && activeOpId != opId) {
+                    if (activeOpId.isNotBlank()) {
                         reportDeviceOpToCloud(
                             deviceId = deviceId,
                             alias = alias,
                             opId = opId,
                             status = "success",
-                            message = "时段发作品执行中，跳过重复入队",
+                            message = if (activeOpId == opId) {
+                                "时段发作品执行中（幂等跳过）"
+                            } else {
+                                "时段发作品执行中，跳过重复入队"
+                            },
                             data = publishPostStartReportData(deviceId, opId, payload, slotKey),
                         )
                         return
                     }
+                    if (tryResumeStaleAutoSwitchPublish(slotKey)) {
+                        reportDeviceOpToCloud(
+                            deviceId = deviceId,
+                            alias = alias,
+                            opId = opId,
+                            status = "success",
+                            message = "发作品 stale 状态已续发",
+                            data = publishPostStartReportData(deviceId, opId, payload, slotKey),
+                        )
+                        return
+                    }
+                    resetStalePublishInflightForRetry(slotKey, alias)
+                    LogCenter.op(
+                        alias,
+                        "【自动切号】plan RUNNING 无 active_publish，已重置为 PENDING，继续处理新发作品 OP",
+                    )
+                }
+                val activePublish = AutoSwitchLocalPlanStore.getActivePublish()
+                if (
+                    activePublish != null &&
+                    activePublish.slot_key == slotKey &&
+                    activePublish.op_id == opId
+                ) {
+                    reportDeviceOpToCloud(
+                        deviceId = deviceId,
+                        alias = alias,
+                        opId = opId,
+                        status = "success",
+                        message = "时段发作品上下文一致，幂等跳过",
+                        data = publishPostStartReportData(deviceId, opId, payload, slotKey),
+                    )
+                    return
                 }
             }
             if (pubPkg.isBlank()) {
@@ -4378,26 +4929,30 @@ object AppCoordinator {
             val prevTaskOpId = PrefsStore.getPublishPostTaskOpId()
             val publishAccountKey =
                 PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
-            if (!prevTaskOpId.isNullOrBlank() && prevTaskOpId != opId) {
+            if (!prevTaskOpId.isNullOrBlank() && prevTaskOpId != opId && payload?.source != "auto_switch") {
                 PrefsStore.clearPublishPostResumeProgress(publishAccountKey)
                 LogCenter.op(
                     alias,
                     "[OP][$opId] 新发作品指令，已清除上一指令（$prevTaskOpId）的断点续发",
                 )
             }
-            PrefsStore.setPublishPostTaskOpId(opId)
-            PrefsStore.setPublishPostPackageName(pubPkg)
-            val publishCount = payload?.publish_count
-            PrefsStore.setPublishPostTargetCount(publishCount)
-            PrefsStore.setPublishPostRequested(true)
-            PrefsStore.setPublishPostPending(true)
             if (payload?.source == "auto_switch") {
-                PrefsStore.setAutoSwitchPublishAccountUsername(payload.account_username)
-                PrefsStore.setAutoSwitchPublishSlotKey(payload.auto_switch_slot_key)
-                PrefsStore.setPublishPostSource("auto_switch")
+                AutoSwitchLocalPlanStore.beginActivePublish(
+                    slotKey = slotKey,
+                    opId = opId,
+                    accountUsername = payload.account_username.orEmpty(),
+                    packageName = pubPkg,
+                    targetCount = payload?.publish_count,
+                )
             } else {
-                PrefsStore.clearAutoSwitchPublishContext()
+                AutoSwitchLocalPlanStore.clearActivePublish()
+                PrefsStore.setPublishPostTaskOpId(opId)
+                PrefsStore.setPublishPostPackageName(pubPkg)
+                PrefsStore.setPublishPostTargetCount(payload?.publish_count)
+                PrefsStore.setPublishPostRequested(true)
+                PrefsStore.setPublishPostPending(true)
             }
+            val publishCount = payload?.publish_count
             val countHint =
                 if (publishCount != null && publishCount > 0) "，目标发布 $publishCount 条" else ""
             val autoSwitchHint =
@@ -4424,17 +4979,6 @@ object AppCoordinator {
             }
             PrefsStore.setPublishPostQueuedAfterMutual(false)
             LogCenter.op(alias, lineStart)
-            if (isAutoSwitchPublish && slotKey.isNotBlank()) {
-                AutoSwitchLedger.record(
-                    opId = opId,
-                    opType = "publish_post_start",
-                    status = "running",
-                    message = "发作品入口已触发",
-                    slotKey = slotKey,
-                    username = payload?.account_username?.trim().orEmpty(),
-                    phaseOverride = "running",
-                )
-            }
             triggerPublishPostNow(alias)
             reportDeviceOpToCloud(
                 deviceId = deviceId,
@@ -5094,6 +5638,9 @@ object AppCoordinator {
                     notifyAutoSwitchCutSwitchStepFailed(payload)
                 }
                 if (clearOk && isCutSwitch) {
+                    payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
+                        AutoSwitchLocalPlanStore.markCutSwitchClearDone(sk)
+                    }
                     val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
                     if (cutMode == "exclusive_activate_target") {
                         finishExclusiveCutSwitchIfLoginOk(
@@ -5393,6 +5940,9 @@ object AppCoordinator {
                     data = reportData,
                 )
                 if (ok && isCutSwitch) {
+                    payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
+                        AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped)
+                    }
                     val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
                     if (cutMode == "exclusive_activate_target") {
                         finishExclusiveCutSwitchIfLoginOk(
@@ -5776,6 +6326,7 @@ object AppCoordinator {
         }
         mutualSwitchJob = scope.launch {
             ExecutionScope.enter()
+            var switchResult = ""
             try {
                 val beforeRequested = PrefsStore.isMutualClickRequested()
                 val beforePending = PrefsStore.isMutualClickPending()
@@ -5794,15 +6345,18 @@ object AppCoordinator {
                     "互点切换任务准备执行特殊用户名：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
                 )
                 val deviceId = PrefsStore.getDeviceId()
-                if (!deviceId.isNullOrBlank()) {
+                val autoSwitchMutualSk = AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim().orEmpty()
+                    .ifBlank { PrefsStore.getAutoSwitchMutualSlotKey()?.trim().orEmpty() }
+                if (!deviceId.isNullOrBlank() && autoSwitchMutualSk.isBlank()) {
                     fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL)
                 }
                 val deviceIdForMutual = deviceId.orEmpty()
                 if (deviceIdForMutual.isNotBlank() && !ensureLoggedInBeforeExclusiveTask(alias, deviceIdForMutual, "互点切换")) {
                     LogCenter.op(alias, "互点切换：is_login 未就绪，已跳过互点入口流程")
+                    switchResult = "互点：is_login 未就绪"
                     return@launch
                 }
-                var switchResult = runCatching {
+                var switchResultLocal = runCatching {
                     executor.executeForUsername("__mutual_switch__", _config.value)
                 }.getOrElse { err ->
                     when (err) {
@@ -5816,7 +6370,7 @@ object AppCoordinator {
                         else -> "互点流程切换异常：${err.message ?: "unknown"}"
                     }
                 }
-                if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForMutual.isNotBlank()) {
+                if (switchResultLocal == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForMutual.isNotBlank()) {
                     val loginReady = ensureAccountLoggedInWithRetry(
                         alias = alias,
                         deviceId = deviceIdForMutual,
@@ -5825,15 +6379,16 @@ object AppCoordinator {
                         resumeFromLoginEntryScreen = true,
                     ) == AccountLoginRetryOutcome.LoggedIn
                     if (loginReady) {
-                        switchResult = runCatching {
+                        switchResultLocal = runCatching {
                             executor.executeForUsername("__mutual_switch__", _config.value)
                         }.getOrElse { err ->
                             "互点流程切换异常：${err.message ?: "unknown"}"
                         }
                     } else {
-                        switchResult = "互点：登录保障后仍未登录"
+                        switchResultLocal = "互点：登录保障后仍未登录"
                     }
                 }
+                switchResult = switchResultLocal
                 if (!deviceId.isNullOrBlank()) {
                     fetchConfig()
                 }
@@ -5844,6 +6399,17 @@ object AppCoordinator {
                     "互点切换任务结束：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
                 )
             } finally {
+                val autoSwitchMutualSk = AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim().orEmpty()
+                    .ifBlank { PrefsStore.getAutoSwitchMutualSlotKey()?.trim().orEmpty() }
+                if (PrefsStore.isAutoSwitchAutonomousMode() && autoSwitchMutualSk.isNotBlank()) {
+                    val completed = switchResult.isNotBlank() &&
+                        !switchResult.contains("跳过") &&
+                        !switchResult.contains("未就绪") &&
+                        !switchResult.contains("仍未登录") &&
+                        !switchResult.contains("异常")
+                    autoSwitchLocalScheduler.notifyMutualOutcome(autoSwitchMutualSk, completed)
+                    PrefsStore.clearMutualClickState()
+                }
                 val wasQueued = PrefsStore.isPublishPostQueuedAfterMutual()
                 PrefsStore.setPublishPostQueuedAfterMutual(false)
                 if (wasQueued && PrefsStore.isPublishPostRequested() && PrefsStore.isPublishPostPending()) {
@@ -5882,10 +6448,12 @@ object AppCoordinator {
         loginFailed: Boolean,
         accountChanged: Boolean,
         message: String,
-        slotKey: String = PrefsStore.getAutoSwitchPublishSlotKey().orEmpty(),
+        slotKey: String = AutoSwitchLocalPlanStore.activePublishSlotKey().orEmpty(),
     ) {
-        val slotKeyResolved = slotKey.trim().ifBlank { PrefsStore.getAutoSwitchPublishSlotKey().orEmpty() }
-        val account = PrefsStore.getAutoSwitchPublishAccountUsername().orEmpty()
+        val slotKeyResolved = slotKey.trim().ifBlank {
+            AutoSwitchLocalPlanStore.activePublishSlotKey().orEmpty()
+        }
+        val account = AutoSwitchLocalPlanStore.activePublishAccountUsername().orEmpty()
         val accountKey = account.trim().ifBlank {
             PrefsStore.getLogContextUsername()?.trim().orEmpty()
         }.ifBlank { alias }
@@ -5928,7 +6496,7 @@ object AppCoordinator {
         }
         if (!PrefsStore.isAutoSwitchPublishTask()) return
         if (slotKeyResolved.isBlank() || opId.isBlank()) return
-        val accountCloud = account.ifBlank { PrefsStore.getAutoSwitchPublishAccountUsername().orEmpty() }
+        val accountCloud = account.ifBlank { AutoSwitchLocalPlanStore.activePublishAccountUsername().orEmpty() }
         val status = if (completed) "success" else "failed"
         runCatching {
             withContext(Dispatchers.IO) {
@@ -5969,15 +6537,14 @@ object AppCoordinator {
         loginFailed: Boolean,
         accountChanged: Boolean,
     ) {
-        val accountKey = PrefsStore.getAutoSwitchPublishAccountUsername()
+        val accountKey = AutoSwitchLocalPlanStore.activePublishAccountUsername()
             ?.trim()?.takeIf { it.isNotEmpty() }
             ?: PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
             ?: alias
         val keepForResume = !completed && !loginFailed && !accountChanged &&
             PrefsStore.getPublishPostResumeNextIndex(accountKey) > 0
         if (keepForResume) {
-            PrefsStore.setPublishPostPending(true)
-            PrefsStore.setPublishPostRequested(true)
+            AutoSwitchLocalPlanStore.setActivePublishPendingFlags(requested = true, pending = true)
         } else {
             PrefsStore.clearPublishPostState()
         }
@@ -6006,9 +6573,8 @@ object AppCoordinator {
             )
             val deviceIdForPublish = PrefsStore.getDeviceId().orEmpty()
             val publishOpId = PrefsStore.getPublishPostTaskOpId().orEmpty()
-            val publishSlotKeyAtStart = PrefsStore.getAutoSwitchPublishSlotKey()?.trim().orEmpty()
-            val autoSwitchPublishAtStart =
-                PrefsStore.getPublishPostSource() == "auto_switch" && publishSlotKeyAtStart.isNotBlank()
+            val publishSlotKeyAtStart = AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim().orEmpty()
+            val autoSwitchPublishAtStart = AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()
             if (deviceIdForPublish.isBlank()) {
                 LogCenter.op(alias, "发作品切换任务：未绑定 deviceId，已跳过")
                 if (PrefsStore.isAutoSwitchPublishTask() && publishOpId.isNotBlank()) {
@@ -6039,7 +6605,7 @@ object AppCoordinator {
                 }
             }
             if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
-                val expectedUser = PrefsStore.getAutoSwitchPublishAccountUsername()
+                val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
                 val loginReady = ensureAccountLoggedInWithRetry(
                     alias = alias,
                     deviceId = deviceIdForPublish,
@@ -6134,7 +6700,7 @@ object AppCoordinator {
                 }
                 if (!PrefsStore.isHardStopRequested() && !manuallyPaused) {
                     if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                        val resumeAccount = PrefsStore.getAutoSwitchPublishAccountUsername()?.trim()
+                        val resumeAccount = AutoSwitchLocalPlanStore.activePublishAccountUsername()?.trim()
                             ?: PrefsStore.getLogContextUsername()?.trim()
                             ?: alias
                         if (
@@ -6160,23 +6726,24 @@ object AppCoordinator {
         }
     }
 
-    /** 发作品协程异常/取消后，防止 pending 或 ledger 残留阻塞自治调度。 */
+    /** 发作品协程异常/取消后，防止 pending 或 plan 残留阻塞自治调度。 */
     private fun cleanupOrphanedAutoSwitchPublishState(alias: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (isPublishPostSwitchActive()) return
-        val slotKey = PrefsStore.getAutoSwitchPublishSlotKey().orEmpty()
+        val slotKey = AutoSwitchLocalPlanStore.activePublishSlotKey().orEmpty()
         val sk = slotKey.ifBlank { PrefsStore.getAutoSwitchLastSlotKey().orEmpty() }
-        val ledgerInflight = sk.isNotBlank() && AutoSwitchLedger.isPublishSlotInflight(sk)
+        val planInflight = sk.isNotBlank() && AutoSwitchLocalPlanStore.isPublishInflight(sk)
         val hasLocalPublishState = PrefsStore.isAutoSwitchPublishTask() || PrefsStore.isPublishPostPending()
-        if (!ledgerInflight && !hasLocalPublishState) return
-        val accountKey = PrefsStore.getAutoSwitchPublishAccountUsername()
+        if (!planInflight && !hasLocalPublishState) return
+        val accountKey = AutoSwitchLocalPlanStore.activePublishAccountUsername()
             ?.trim()?.takeIf { it.isNotEmpty() }
             ?: PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
             ?: alias
         if (PrefsStore.getPublishPostResumeNextIndex(accountKey) > 0) return
         if (PrefsStore.isPublishPostMaterialReady() && tryResumeStaleAutoSwitchPublish(sk)) return
-        if (ledgerInflight && sk.isNotBlank()) {
-            abortStaleAutoSwitchPublishInflight(sk)
+        if (planInflight && sk.isNotBlank()) {
+            resetStalePublishInflightForRetry(sk, alias)
+            return
         }
         if (hasLocalPublishState) {
             LogCenter.op(alias, "【自动切号】清理残留发作品本地状态（协程已结束）")
@@ -6192,20 +6759,21 @@ object AppCoordinator {
         }
     }
 
-    private fun abortStaleAutoSwitchPublishInflight(
-        slotKey: String,
-        message: String = "发作品本机已结束，清理残留 in-flight",
-    ) {
+    /**
+     * plan 为 RUNNING 但无有效 active_publish：重置为 PENDING 以便 tick/新 OP 重试（非终态 FAILED）。
+     */
+    private fun resetStalePublishInflightForRetry(slotKey: String, alias: String) {
         val sk = slotKey.trim()
         if (sk.isBlank()) return
-        AutoSwitchLedger.abortStalePublishSlot(sk, message)
+        if (!AutoSwitchLocalPlanStore.isPublishInflight(sk) &&
+            AutoSwitchLocalPlanStore.insertionState(sk, "publish") != PlanStepState.FAILED
+        ) {
+            return
+        }
+        autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
         PrefsStore.clearPublishPostState()
-        autoSwitchLocalScheduler.notifyPublishOutcome(
-            slotKey = sk,
-            completed = false,
-            loginFailed = false,
-            accountChanged = false,
-        )
+        AutoSwitchLocalPlanStore.resetStalePublishInflight(sk)
+        LogCenter.op(alias, "【自动切号】发作品 stale in-flight 已重置为 PENDING slot=$sk")
     }
 
     /**
@@ -6221,7 +6789,6 @@ object AppCoordinator {
         if (alias.isBlank()) return false
 
         autoSwitchLocalScheduler.clearSlotPublishAborted(sk)
-        AutoSwitchLedger.reopenPublishSlotForResume(sk)
         PrefsStore.setPublishPostPending(true)
         PrefsStore.setPublishPostRequested(true)
 
@@ -6809,6 +7376,7 @@ object AppCoordinator {
             return
         }
         ExecutionScope.enter()
+        ProcessDiagnostics.setCurrentUsername(username)
         try {
         val runMode = _config.value.run_mode.trim().lowercase()
         // 涨粉、直客：失败后不重试；主播 live：保留重试。
@@ -6973,6 +7541,7 @@ object AppCoordinator {
             LogCenter.op(alias, "主播/直客：本用户失败，将按策略重试或跳过")
         }
         } finally {
+            ProcessDiagnostics.setCurrentUsername(null)
             ExecutionScope.exit()
         }
     }
@@ -7017,6 +7586,18 @@ object AppCoordinator {
         updateRuntime(serviceRunning = isRunning)
         if (isRunning && !PrefsStore.isHardStopRequested()) {
             ensureLoopsRunning()
+            if (PrefsStore.isAutoSwitchAutonomousMode() && PrefsStore.getAutoSwitchMode() == "on") {
+                // 涨粉协程仍在跑时勿重拉 bundle，避免打断进行中的 OCR/帧差。
+                if (pullLoopJob?.isActive == true && PrefsStore.getLocalStatus() == "running") {
+                    manuallyPaused = false
+                    if (!autoSwitchLocalScheduler.isRunning()) {
+                        scope.launch { resumeAutoSwitchGrowthLightweight("后台服务恢复-涨粉进行中") }
+                    }
+                    maybeStartGrowthInAutoSwitchIdle("后台服务恢复-涨粉进行中")
+                } else {
+                    scope.launch { recoverAutoSwitchAutonomousWork("后台服务恢复") }
+                }
+            }
         }
         // 停止服务时的 online 同步已在 stopAllWork() 内统一处理（含重试），此处不再重复请求。
     }
@@ -7129,8 +7710,18 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * WorkerService 被系统回收后重建（非用户 stop）：不 cancel 涨粉协程、不置 manuallyPaused。
+     * 协程挂在 Application 作用域，与前台 Service 生命周期解耦。
+     */
+    fun stopWorkForServiceDestroy() {
+        updateRuntime(
+            serviceRunning = false,
+            lastMessage = "后台服务重建中",
+        )
+    }
+
     fun stopAllWork(requestHardStop: Boolean = true) {
-        // 注意：服务销毁(onDestroy)也会走到这里；避免在“正在重启服务”场景把硬停标记回写为 true。
         if (requestHardStop) {
             PrefsStore.setHardStopRequested(true)
         }
@@ -7144,6 +7735,7 @@ object AppCoordinator {
         deviceOpsJob = null
         manuallyPaused = true
         started.set(false)
+        autoSwitchLocalScheduler.stop(clearState = false)
         updateRuntime(
             serviceRunning = false,
             localStatus = "paused",

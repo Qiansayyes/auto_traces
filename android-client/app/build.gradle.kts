@@ -55,7 +55,7 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("com.google.code.gson:gson:2.11.0")
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
     implementation("org.opencv:opencv:4.10.0")
 
     // Retrofit 网络请求

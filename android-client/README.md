@@ -67,8 +67,23 @@
 ## 导入方式
 
 1. 使用 Android Studio 打开 `android-client` 目录。
-2. 等待 Gradle 同步完成。
+2. 等待 Gradle 同步完成（项目已包含 Gradle Wrapper，固定使用 Gradle 8.7，与 AGP 8.5.2 匹配）。
 3. 如需真机访问本机服务端，请修改 `app/src/main/res/values/strings.xml` 中的 `server_base_url`。
+
+### Gradle 同步失败排查
+
+若出现 `Could not install Gradle distribution` 或 `Connection refused`：
+
+1. **确认使用 Wrapper**：Android Studio 中打开 `File > Settings > Build, Execution, Deployment > Build Tools > Gradle`，将 `Gradle` 选为 **Gradle Wrapper**（不要选固定版本 9.x）。
+2. **国内网络**：`gradle/wrapper/gradle-wrapper.properties` 已配置腾讯云镜像；依赖仓库在 `settings.gradle.kts` 中优先走阿里云镜像。
+3. **代理环境**：若公司网络需要代理，在 `gradle.properties` 中取消注释并填写：
+   ```properties
+   systemProp.http.proxyHost=127.0.0.1
+   systemProp.http.proxyPort=7890
+   systemProp.https.proxyHost=127.0.0.1
+   systemProp.https.proxyPort=7890
+   ```
+4. **命令行预下载**（可选）：在项目根目录执行 `gradlew.bat --version`，成功后再回到 Android Studio 点 **Sync Now**。
 
 说明：
 

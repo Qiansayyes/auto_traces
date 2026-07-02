@@ -16,6 +16,10 @@ private const val ACTION_STOP_BACKGROUND_SERVICE = "com.autotraces.app.action.ST
 
 class WorkerService : Service() {
 
+    /** stopImmediate 已走完整 stopAllWork，onDestroy 勿重复 cancel 协程。 */
+    @Volatile
+    private var intentionalStopInProgress: Boolean = false
+
     override fun onCreate() {
         super.onCreate()
         NotificationHelper.ensureChannel(this)
@@ -26,6 +30,7 @@ class WorkerService : Service() {
         }
         WorkerServiceTracker.isRunning = true
         AppCoordinator.onWorkerServiceChanged(true)
+        ProcessDiagnostics.startHeartbeat()
         AppCoordinator.startIfNeeded()
         val notifyText =
             if (PrefsStore.isHardStopRequested()) {
@@ -62,14 +67,20 @@ class WorkerService : Service() {
     }
 
     override fun onDestroy() {
+        ProcessDiagnostics.stopHeartbeat("后台服务 onDestroy")
         WorkerServiceTracker.isRunning = false
-        AppCoordinator.stopAllWork(requestHardStop = false)
+        if (!intentionalStopInProgress) {
+            // 系统回收/服务重建：涨粉协程归属 App 作用域，不在此当作用户暂停。
+            AppCoordinator.stopWorkForServiceDestroy()
+        }
+        intentionalStopInProgress = false
         AppCoordinator.onWorkerServiceChanged(false)
         LogCenter.op(PrefsStore.getAlias(), "后台服务已停止")
         super.onDestroy()
     }
 
     private fun stopImmediate() {
+        intentionalStopInProgress = true
         PrefsStore.setHardStopRequested(true)
         WorkerServiceTracker.isRunning = false
         AppCoordinator.stopAllWork(requestHardStop = true)

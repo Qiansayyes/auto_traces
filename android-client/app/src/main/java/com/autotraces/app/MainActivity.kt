@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
                 logStickToBottom = true
                 if (WorkerServiceTracker.isRunning) {
                     AppCoordinator.forceStartRunningNow("设备端点击启动后台服务")
-                    LogCenter.op(alias, "后台服务已启动")
+                    LogCenter.op(alias, "后台服务已启动，已按本地计划请求恢复自动任务")
                 } else {
                     LogCenter.op(alias, "后台服务未能启动")
                 }

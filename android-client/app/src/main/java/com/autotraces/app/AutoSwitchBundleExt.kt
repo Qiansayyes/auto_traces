@@ -1,51 +1,49 @@
 package com.autotraces.app
 
+import android.content.Context
 import com.google.gson.Gson
 import java.io.File
 import java.util.Calendar
+import java.util.Locale
 import java.util.TimeZone
 
-/** 自动切号 bundle 内存真源（与 [AutoSwitchLocalScheduler] 同步）。 */
+/** 自动切号 bundle 内存缓存（账号运行时字段以 [AutoSwitchLocalPlanStore] 为准）。 */
 object AutoSwitchBundleHolder {
+    private const val CACHE_FILE_NAME = "auto_switch_bundle_cache.json"
+    private val gson = Gson()
+    private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
+
     @Volatile
     private var bundle: AutoSwitchBundle? = null
 
-    private val bundleGson = Gson()
-    private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
+    @Volatile
+    private var cacheFile: File? = null
+
+    fun init(context: Context) {
+        cacheFile = File(context.filesDir, CACHE_FILE_NAME)
+        bundle = loadCachedBundle()
+    }
 
     fun setBundle(value: AutoSwitchBundle?) {
         bundle = value
+        if (value != null) {
+            persistCache(value)
+        }
     }
 
     fun getBundle(): AutoSwitchBundle? = bundle
 
-    fun persistToPrefs(value: AutoSwitchBundle) {
-        runCatching {
-            PrefsStore.saveAutoSwitchBundleJson(bundleGson.toJson(value))
-        }
-    }
-
-    fun restoreFromPrefs(): AutoSwitchBundle? {
-        val json = PrefsStore.getAutoSwitchBundleJson() ?: return null
+    fun loadCachedBundle(): AutoSwitchBundle? {
+        val file = cacheFile ?: return null
+        if (!file.isFile) return null
         return runCatching {
-            bundleGson.fromJson(json, AutoSwitchBundle::class.java)
+            gson.fromJson(file.readText(), AutoSwitchBundle::class.java)
         }.getOrNull()
     }
 
-    /** 进程重启后判断本地缓存 bundle 是否仍可驱动自治调度。 */
-    fun isUsableForAutonomousResume(
-        value: AutoSwitchBundle,
-        expectedSessionId: String = PrefsStore.getAutoSwitchSessionId().orEmpty(),
-    ): Boolean {
-        if (value.accounts.isNullOrEmpty()) return false
-        val hasPlan = !value.weekly_plan?.day_plans.isNullOrEmpty() || value.daily_plan != null
-        if (!hasPlan) return false
-        val expectedSid = expectedSessionId.trim()
-        val bundleSid = value.session_id?.trim().orEmpty()
-        if (expectedSid.isNotEmpty() && bundleSid.isNotEmpty() && !bundleSid.equals(expectedSid, ignoreCase = true)) {
-            return false
-        }
-        return true
+    private fun persistCache(value: AutoSwitchBundle) {
+        val file = cacheFile ?: return
+        runCatching { file.writeText(gson.toJson(value)) }
     }
 
     fun resolveAssignedAccount(
@@ -67,29 +65,20 @@ object AutoSwitchBundleHolder {
     fun notifyAccountLoggedIn(username: String) {
         val uname = username.trim()
         if (uname.isEmpty()) return
-        val current = bundle ?: return
-        val accounts = current.accounts.orEmpty().map { acc ->
-            if (acc.username?.trim().equals(uname, ignoreCase = true)) {
-                acc.copy(is_login = true)
-            } else {
-                acc
-            }
-        }
-        bundle = current.copy(accounts = accounts)
+        AutoSwitchLocalPlanStore.notifyAccountLoggedIn(uname)
+        refreshFromPlan()
     }
 
     fun notifyBasicProfileModified(username: String) {
         val uname = username.trim()
         if (uname.isEmpty()) return
+        AutoSwitchLocalPlanStore.notifyBasicProfileModified(uname)
+        refreshFromPlan()
+    }
+
+    private fun refreshFromPlan() {
         val current = bundle ?: return
-        val accounts = current.accounts.orEmpty().map { acc ->
-            if (acc.username?.trim().equals(uname, ignoreCase = true)) {
-                acc.copy(basic_profile_modified = "是")
-            } else {
-                acc
-            }
-        }
-        bundle = current.copy(accounts = accounts)
+        bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(current)
     }
 
     private fun beijingMinuteOfDay(): Int =
@@ -275,7 +264,8 @@ fun AutoSwitchBundle.scheduleAndAccountsFingerprint(): String {
                     val start = slot.start_min ?: 0
                     val end = slot.end_min ?: 1440
                     val pub = slot.auto_publish_minute
-                    "$idx:$ri:$start-$end:p$pub"
+                    val mut = slot.auto_mutual_minute
+                    "$idx:$ri:$start-$end:p$pub:m$mut"
                 }
                 .sorted()
                 .joinToString(",")
@@ -302,29 +292,57 @@ fun AutoSwitchBundle.scheduleAndAccountsFingerprint(): String {
     return "acc[$accountPart]|plan[${planPart.ifBlank { legacy }}]"
 }
 
+/** 仅账号 row + username 的幂等键（云端重下发时：账号一致则幂等，否则走重新配置）。 */
+fun AutoSwitchBundle.accountsFingerprint(): String =
+    accounts.orEmpty()
+        .mapNotNull { acc ->
+            val ri = acc.row_index ?: return@mapNotNull null
+            val user = acc.username?.trim().orEmpty().lowercase(Locale.US)
+            if (user.isEmpty()) return@mapNotNull null
+            "$ri:$user"
+        }
+        .sorted()
+        .joinToString("|")
+
+fun accountsFingerprint(accounts: List<LocalPlanAccount>): String =
+    accounts
+        .mapNotNull { acc ->
+            val user = acc.username.trim().lowercase(Locale.US)
+            if (user.isEmpty()) return@mapNotNull null
+            "${acc.row_index}:$user"
+        }
+        .sorted()
+        .joinToString("|")
+
+fun AutoSwitchBundle.isAccountsEquivalentTo(other: AutoSwitchBundle?): Boolean {
+    if (other == null) return false
+    return accountsFingerprint() == other.accountsFingerprint()
+}
+
+fun AutoSwitchBundle.isAccountsEquivalentTo(planAccounts: List<LocalPlanAccount>): Boolean =
+    accountsFingerprint() == accountsFingerprint(planAccounts)
+
 fun AutoSwitchBundle.isScheduleAndAccountsEquivalentTo(other: AutoSwitchBundle?): Boolean {
     if (other == null) return false
     return scheduleAndAccountsFingerprint() == other.scheduleAndAccountsFingerprint()
 }
 
-/** 云端重下发时保留本机时段高亮与本机存在的备份路径，避免打断自治。 */
-fun AutoSwitchBundle.mergePreservingLocalRuntimeState(local: AutoSwitchBundle?): AutoSwitchBundle {
-    val prev = local ?: return this.withCurrentTimeSlotHighlight()
-    var mergedAccounts = withCurrentTimeSlotHighlight().accounts.orEmpty()
-    val localByRow = prev.accounts.orEmpty().associateBy { it.row_index ?: -1 }
-    mergedAccounts = mergedAccounts.map { acc ->
-        val ri = acc.row_index ?: return@map acc
-        val localAcc = localByRow[ri] ?: return@map acc
-        val localPath = localAcc.backup_path?.trim().orEmpty()
-        val localName = localAcc.backup_name?.trim().orEmpty()
-        if (localPath.isNotEmpty() && File(localPath).exists()) {
-            acc.copy(
-                backup_path = localPath,
-                backup_name = localName.ifBlank { acc.backup_name },
-            )
-        } else {
-            acc
-        }
+/** bundle 内该账号是否配置了可执行的引流互点（动作开关至少一项）。 */
+fun AutoSwitchBundle.isMutualTrafficConfiguredFor(username: String): Boolean {
+    val cfg = resolveBundledConfigForUsername(username)?.config ?: return false
+    if (cfg.mutual_traffic_follow_only) return true
+    return cfg.mutual_traffic_comment ||
+        cfg.mutual_traffic_author_follow ||
+        cfg.mutual_traffic_followers_follow
+}
+
+/** 引流互点设备 OP 类型：仅关注 vs 完整引流（评论/作者区/Followers 按配置组合）。 */
+fun AutoSwitchBundle.mutualTrafficOpTypeFor(username: String): String? {
+    if (!isMutualTrafficConfiguredFor(username)) return null
+    val cfg = resolveBundledConfigForUsername(username)?.config ?: return null
+    return if (cfg.mutual_traffic_follow_only) {
+        "mutual_click_follow_only_start"
+    } else {
+        "mutual_click_start"
     }
-    return copy(accounts = mergedAccounts)
 }

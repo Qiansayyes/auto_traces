@@ -64,12 +64,7 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX = "publish_post_resume_op_id_"
     /** 当前进行中的发作品云端指令 op_id；新指令或硬停后清除，断点不再跨指令复用。 */
     private const val KEY_PUBLISH_POST_TASK_OP_ID = "publish_post_task_op_id"
-    /** 自动切号发作品：时段键 `{date}|{slot_index}`，用于回传结果。 */
-    private const val KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY = "auto_switch_publish_slot_key"
-    /** 自动切号发作品：本指令对应账号 username，用于登录重试时段门禁。 */
-    private const val KEY_AUTO_SWITCH_PUBLISH_ACCOUNT = "auto_switch_publish_account_username"
-    /** 发作品来源：auto_switch 等。 */
-    private const val KEY_PUBLISH_POST_SOURCE = "publish_post_source"
+    private const val KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY = "auto_switch_mutual_slot_key"
     /** 本轮发作品实际成功条数（全部完成后写入，供 ledger 写回 video_count）。 */
     private const val KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT = "publish_post_last_actual_success_count"
     /** 发作品素材已拉取并就绪；进程被杀后可凭此跳过清库/重拉并续发。 */
@@ -78,19 +73,17 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_MODE = "auto_switch_mode"
     private const val KEY_AUTO_SWITCH_SESSION_ID = "auto_switch_session_id"
     private const val KEY_AUTO_SWITCH_BUNDLE_REVISION = "auto_switch_bundle_revision"
-    /** enter 后冻结的周计划 bundle JSON，进程重启后本地自治可立即恢复，不必等云端拉取。 */
-    private const val KEY_AUTO_SWITCH_BUNDLE_JSON = "auto_switch_bundle_json"
     /** 自治期 getConfig 与 bundle_revision 对齐，未变则跳过拉取。 */
     private const val KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION = "auto_switch_last_config_fetch_revision"
     /** 最近一次从 bundle 成功应用的 TikTok 账号（fetchConfig 早退校验用）。 */
     private const val KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME = "auto_switch_last_bundled_username"
     private const val KEY_AUTO_SWITCH_LAST_SLOT_KEY = "auto_switch_last_slot_key"
-    /** 本机已验证对齐的时段键 `{date}|{slot_index}`（切号链终端成功后写入）。 */
-    private const val KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY = "auto_switch_verified_slot_key"
-    /** 与 [KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY] 配对的 row_index。 */
-    private const val KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX = "auto_switch_verified_row_index"
     /** 改资料三步断点续接：按账号键存 JSON（[ProfileEditStepState]）。 */
     private const val KEY_PROFILE_EDIT_STEP_STATE_PREFIX = "profile_edit_step_state_"
+    /** 最近一次进程心跳快照（进程被杀后可对照断档前卡点）。 */
+    private const val KEY_LAST_PROCESS_HEARTBEAT_LINE = "last_process_heartbeat_line"
+    /** 最近一次未捕获崩溃快照。 */
+    private const val KEY_LAST_PROCESS_CRASH_LINE = "last_process_crash_line"
     private const val KEY_AUTO_SWITCH_SCHEDULE_DATE = "auto_switch_schedule_date"
     private const val KEY_AUTO_SWITCH_WEEK_START = "auto_switch_week_start_date"
     private const val KEY_AUTO_SWITCH_WEEK_END = "auto_switch_week_end_date"
@@ -98,8 +91,6 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_LEDGER_JSON = "auto_switch_ledger_json"
     private const val KEY_AUTO_SWITCH_PENDING_SUMMARY = "auto_switch_pending_summary"
     private const val KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION = "auto_switch_last_scheduler_revision"
-    private const val KEY_AUTO_SWITCH_PUBLISH_DONE_KEY = "auto_switch_publish_done_key"
-    private const val KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY = "auto_switch_publish_aborted_key"
     private const val KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID = "auto_switch_enter_done_event_id"
     private const val KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID = "auto_switch_exit_done_event_id"
     private const val KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE = "auto_switch_daily_reconcile_date"
@@ -224,16 +215,30 @@ object PrefsStore {
         prefs.getBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, false)
 
     fun setMutualClickRequested(requested: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchMutualActive()) {
+            AutoSwitchLocalPlanStore.mutateActiveMutual { it.copy(requested = requested) }
+            return
+        }
         prefs.edit().putBoolean(KEY_MUTUAL_CLICK_REQUESTED, requested).apply()
     }
 
-    fun isMutualClickRequested(): Boolean = prefs.getBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
+    fun isMutualClickRequested(): Boolean {
+        AutoSwitchLocalPlanStore.getActiveMutual()?.let { return it.requested }
+        return prefs.getBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
+    }
 
     fun setMutualClickPending(pending: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchMutualActive()) {
+            AutoSwitchLocalPlanStore.mutateActiveMutual { it.copy(pending = pending) }
+            return
+        }
         prefs.edit().putBoolean(KEY_MUTUAL_CLICK_PENDING, pending).apply()
     }
 
-    fun isMutualClickPending(): Boolean = prefs.getBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+    fun isMutualClickPending(): Boolean {
+        AutoSwitchLocalPlanStore.getActiveMutual()?.let { return it.pending }
+        return prefs.getBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+    }
 
     fun setMutualCommentOnlySession(active: Boolean) {
         prefs.edit().putBoolean(KEY_MUTUAL_COMMENT_ONLY_SESSION, active).apply()
@@ -261,24 +266,50 @@ object PrefsStore {
     }
 
     fun setPublishPostRequested(requested: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(requested = requested) }
+            return
+        }
         prefs.edit().putBoolean(KEY_PUBLISH_POST_REQUESTED, requested).apply()
     }
 
-    fun isPublishPostRequested(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_REQUESTED, false)
+    fun isPublishPostRequested(): Boolean {
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { return it.requested }
+        return prefs.getBoolean(KEY_PUBLISH_POST_REQUESTED, false)
+    }
 
     fun setPublishPostPending(pending: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(pending = pending) }
+            return
+        }
         prefs.edit().putBoolean(KEY_PUBLISH_POST_PENDING, pending).apply()
     }
 
-    fun isPublishPostPending(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_PENDING, false)
+    fun isPublishPostPending(): Boolean {
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { return it.pending }
+        return prefs.getBoolean(KEY_PUBLISH_POST_PENDING, false)
+    }
 
     fun setPublishPostQueuedAfterMutual(queued: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            AutoSwitchLocalPlanStore.setActivePublishQueuedAfterMutual(queued)
+            return
+        }
         prefs.edit().putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, queued).apply()
     }
 
-    fun isPublishPostQueuedAfterMutual(): Boolean = prefs.getBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
+    fun isPublishPostQueuedAfterMutual(): Boolean {
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { return it.queued_after_mutual }
+        return prefs.getBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
+    }
 
     fun setPublishPostPackageName(packageName: String?) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            val v = packageName?.trim().orEmpty()
+            AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(package_name = v) }
+            return
+        }
         val v = packageName?.trim()?.takeIf { it.isNotEmpty() }
         if (v == null) {
             prefs.edit().remove(KEY_PUBLISH_POST_PACKAGE).apply()
@@ -287,16 +318,27 @@ object PrefsStore {
         }
     }
 
-    fun getPublishPostPackageName(): String? =
-        prefs.getString(KEY_PUBLISH_POST_PACKAGE, null)?.trim()?.takeIf { it.isNotEmpty() }
+    fun getPublishPostPackageName(): String? {
+        AutoSwitchLocalPlanStore.getActivePublish()?.package_name?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        return prefs.getString(KEY_PUBLISH_POST_PACKAGE, null)?.trim()?.takeIf { it.isNotEmpty() }
+    }
 
     fun getPublishPostTargetCount(): Int? {
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { ap ->
+            return if (ap.target_count > 0) ap.target_count.coerceIn(1, 5) else null
+        }
         if (!prefs.contains(KEY_PUBLISH_POST_TARGET_COUNT)) return null
         val v = prefs.getInt(KEY_PUBLISH_POST_TARGET_COUNT, 0)
         return if (v > 0) v.coerceIn(1, 5) else null
     }
 
     fun setPublishPostTargetCount(count: Int?) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            val v = count?.coerceIn(1, 5) ?: -1
+            AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(target_count = v) }
+            return
+        }
         val v = count?.coerceIn(1, 5) ?: 0
         if (v > 0) {
             prefs.edit().putInt(KEY_PUBLISH_POST_TARGET_COUNT, v).apply()
@@ -331,10 +373,20 @@ object PrefsStore {
     private fun publishPostResumeOpIdKey(accountKey: String): String =
         KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX + accountKey.trim().lowercase(Locale.US)
 
-    fun getPublishPostTaskOpId(): String? =
-        prefs.getString(KEY_PUBLISH_POST_TASK_OP_ID, null)?.trim()?.takeIf { it.isNotEmpty() }
+    fun getPublishPostTaskOpId(): String? {
+        AutoSwitchLocalPlanStore.activePublishOpId()?.let { return it }
+        return prefs.getString(KEY_PUBLISH_POST_TASK_OP_ID, null)?.trim()?.takeIf { it.isNotEmpty() }
+    }
 
     fun setPublishPostTaskOpId(opId: String?) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            if (opId.isNullOrBlank()) {
+                AutoSwitchLocalPlanStore.clearActivePublish()
+            } else {
+                AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(op_id = opId.trim()) }
+            }
+            return
+        }
         val v = opId?.trim()?.takeIf { it.isNotEmpty() }
         if (v == null) {
             prefs.edit().remove(KEY_PUBLISH_POST_TASK_OP_ID).apply()
@@ -351,6 +403,11 @@ object PrefsStore {
     fun getPublishPostResumeNextIndex(accountKey: String): Int {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return 0
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { ap ->
+            val apAccount = ap.account_username.trim().lowercase(Locale.US).removePrefix("@")
+            val key = a.removePrefix("@")
+            if (apAccount == key) return ap.resume_next_index.coerceAtLeast(0)
+        }
         val taskOpId = getPublishPostTaskOpId() ?: return 0
         val resumeOpId = prefs.getString(publishPostResumeOpIdKey(a), null)?.trim().orEmpty()
         if (resumeOpId != taskOpId) return 0
@@ -364,6 +421,18 @@ object PrefsStore {
     ) {
         val a = accountKey.trim().lowercase(Locale.US)
         if (a.isEmpty()) return
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { ap ->
+            val apAccount = ap.account_username.trim().lowercase(Locale.US).removePrefix("@")
+            val key = a.removePrefix("@")
+            if (apAccount == key) {
+                AutoSwitchLocalPlanStore.setActivePublishResumeNextIndex(nextIndex)
+                if (markFirstDailyPermOcrDone) {
+                    val today = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+                    prefs.edit().putString(publishPostPermOcrPrefsKeyForAlias(a), today).apply()
+                }
+                return
+            }
+        }
         val taskOpId = getPublishPostTaskOpId() ?: return
         val editor = prefs.edit()
             .putInt(publishPostResumeNextIndexKey(a), nextIndex.coerceAtLeast(0))
@@ -411,45 +480,27 @@ object PrefsStore {
         prefs.edit().remove(key).apply()
     }
 
-    fun setAutoSwitchPublishAccountUsername(username: String?) {
-        val v = username?.trim()?.takeIf { it.isNotEmpty() }
-        if (v == null) {
-            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT).apply()
-        } else {
-            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT, v).apply()
+    fun setAutoSwitchMutualSlotKey(slotKey: String?) {
+        AutoSwitchLocalPlanStore.getActiveMutual()?.let { am ->
+            if (slotKey.isNullOrBlank()) {
+                AutoSwitchLocalPlanStore.clearActiveMutual()
+            } else {
+                AutoSwitchLocalPlanStore.mutateActiveMutual { it.copy(slot_key = slotKey.trim()) }
+            }
+            return
         }
-    }
-
-    fun getAutoSwitchPublishAccountUsername(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT, null)?.trim()?.takeIf { it.isNotEmpty() }
-
-    fun clearAutoSwitchPublishAccountUsername() {
-        prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT).apply()
-    }
-
-    fun setAutoSwitchPublishSlotKey(slotKey: String?) {
         val v = slotKey?.trim()?.takeIf { it.isNotEmpty() }
         if (v == null) {
-            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY).apply()
+            prefs.edit().remove(KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY).apply()
         } else {
-            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY, v).apply()
+            prefs.edit().putString(KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY, v).apply()
         }
     }
 
-    fun getAutoSwitchPublishSlotKey(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
-
-    fun setPublishPostSource(source: String?) {
-        val v = source?.trim()?.takeIf { it.isNotEmpty() }
-        if (v == null) {
-            prefs.edit().remove(KEY_PUBLISH_POST_SOURCE).apply()
-        } else {
-            prefs.edit().putString(KEY_PUBLISH_POST_SOURCE, v).apply()
-        }
+    fun getAutoSwitchMutualSlotKey(): String? {
+        AutoSwitchLocalPlanStore.activeMutualSlotKey()?.let { return it }
+        return prefs.getString(KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
     }
-
-    fun getPublishPostSource(): String? =
-        prefs.getString(KEY_PUBLISH_POST_SOURCE, null)?.trim()?.takeIf { it.isNotEmpty() }
 
     fun setPublishPostLastActualSuccessCount(count: Int) {
         prefs.edit()
@@ -465,42 +516,26 @@ object PrefsStore {
         return v
     }
 
-    fun clearAutoSwitchPublishContext() {
-        prefs.edit()
-            .remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT)
-            .remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY)
-            .remove(KEY_PUBLISH_POST_SOURCE)
-            .apply()
-    }
-
-    fun isAutoSwitchPublishTask(): Boolean =
-        getPublishPostSource() == "auto_switch" && getAutoSwitchPublishSlotKey() != null
-
     fun setPublishPostMaterialReady(ready: Boolean) {
+        if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
+            AutoSwitchLocalPlanStore.setActivePublishMaterialReady(ready)
+            return
+        }
         prefs.edit().putBoolean(KEY_PUBLISH_POST_MATERIAL_READY, ready).apply()
     }
 
-    fun isPublishPostMaterialReady(): Boolean =
-        prefs.getBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
-
-    /**
-     * 进程被杀/服务重启后，本时段发作品是否仍可恢复（有 op、slot 且素材已就绪或 pending 未清）。
-     */
-    fun hasRecoverableAutoSwitchPublish(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return false
-        if (getPublishPostSource() != "auto_switch") return false
-        if (getAutoSwitchPublishSlotKey()?.trim() != sk) return false
-        if (getPublishPostTaskOpId().isNullOrBlank()) return false
-        if (isPublishPostMaterialReady()) return true
-        if (isPublishPostPending() || isPublishPostRequested()) return true
-        val accountKey = getAutoSwitchPublishAccountUsername()?.trim().orEmpty()
-            .ifBlank { getLogContextUsername()?.trim().orEmpty() }
-            .ifBlank { getAlias().orEmpty() }
-        return getPublishPostResumeNextIndex(accountKey) > 0
+    fun isPublishPostMaterialReady(): Boolean {
+        AutoSwitchLocalPlanStore.getActivePublish()?.let { return it.material_ready }
+        return prefs.getBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
     }
 
+    fun isAutoSwitchPublishTask(): Boolean = AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()
+
+    fun hasRecoverableAutoSwitchPublish(slotKey: String): Boolean =
+        AutoSwitchLocalPlanStore.hasRecoverableActivePublish(slotKey)
+
     fun clearPublishPostState() {
+        AutoSwitchLocalPlanStore.clearActivePublish()
         prefs.edit()
             .putBoolean(KEY_PUBLISH_POST_REQUESTED, false)
             .putBoolean(KEY_PUBLISH_POST_PENDING, false)
@@ -509,16 +544,15 @@ object PrefsStore {
             .remove(KEY_PUBLISH_POST_PACKAGE)
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)
-            .remove(KEY_AUTO_SWITCH_PUBLISH_ACCOUNT)
-            .remove(KEY_AUTO_SWITCH_PUBLISH_SLOT_KEY)
-            .remove(KEY_PUBLISH_POST_SOURCE)
             .apply()
     }
 
     fun clearMutualClickState() {
+        AutoSwitchLocalPlanStore.clearActiveMutual()
         prefs.edit()
             .putBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
             .putBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+            .remove(KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY)
             .apply()
     }
 
@@ -730,17 +764,6 @@ object PrefsStore {
     fun getAutoSwitchBundleRevision(): Int =
         prefs.getInt(KEY_AUTO_SWITCH_BUNDLE_REVISION, 0)
 
-    fun getAutoSwitchBundleJson(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_BUNDLE_JSON, null)?.takeIf { it.isNotEmpty() }
-
-    fun saveAutoSwitchBundleJson(json: String) {
-        prefs.edit().putString(KEY_AUTO_SWITCH_BUNDLE_JSON, json).commit()
-    }
-
-    fun clearAutoSwitchBundleJson() {
-        prefs.edit().remove(KEY_AUTO_SWITCH_BUNDLE_JSON).apply()
-    }
-
     fun getLastModeEventId(): Int =
         prefs.getInt(KEY_LAST_MODE_EVENT_ID, 0).coerceAtLeast(0)
 
@@ -815,30 +838,6 @@ object PrefsStore {
         prefs.edit().putInt(KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION, revision.coerceAtLeast(0)).apply()
     }
 
-    fun getAutoSwitchPublishDoneKey(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
-
-    fun setAutoSwitchPublishDoneKey(key: String?) {
-        val v = key?.trim()?.takeIf { it.isNotEmpty() }
-        if (v == null) {
-            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY).apply()
-        } else {
-            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY, v).apply()
-        }
-    }
-
-    fun getAutoSwitchPublishAbortedKey(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
-
-    fun setAutoSwitchPublishAbortedKey(key: String?) {
-        val v = key?.trim()?.takeIf { it.isNotEmpty() }
-        if (v == null) {
-            prefs.edit().remove(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY).apply()
-        } else {
-            prefs.edit().putString(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY, v).apply()
-        }
-    }
-
     fun getAutoSwitchEnterDoneEventId(): Int =
         prefs.getInt(KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID, 0).coerceAtLeast(0)
 
@@ -905,7 +904,6 @@ object PrefsStore {
             .putString(KEY_AUTO_SWITCH_MODE, "off")
             .remove(KEY_AUTO_SWITCH_SESSION_ID)
             .remove(KEY_AUTO_SWITCH_BUNDLE_REVISION)
-            .remove(KEY_AUTO_SWITCH_BUNDLE_JSON)
             .remove(KEY_AUTO_SWITCH_LAST_SLOT_KEY)
             .remove(KEY_AUTO_SWITCH_SCHEDULE_DATE)
             .remove(KEY_AUTO_SWITCH_WEEK_START)
@@ -913,8 +911,6 @@ object PrefsStore {
             .remove(KEY_AUTO_SWITCH_SESSION_STARTED_AT)
             .remove(KEY_AUTO_SWITCH_PENDING_SUMMARY)
             .remove(KEY_AUTO_SWITCH_LAST_SCHEDULER_REVISION)
-            .remove(KEY_AUTO_SWITCH_PUBLISH_DONE_KEY)
-            .remove(KEY_AUTO_SWITCH_PUBLISH_ABORTED_KEY)
             .remove(KEY_AUTO_SWITCH_ENTER_DONE_EVENT_ID)
             .remove(KEY_AUTO_SWITCH_EXIT_DONE_EVENT_ID)
             .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_DATE)
@@ -922,8 +918,6 @@ object PrefsStore {
             .remove(KEY_AUTO_SWITCH_DAILY_RECONCILE_TARGET_MS)
             .remove(KEY_AUTO_SWITCH_LAST_CONFIG_FETCH_REVISION)
             .remove(KEY_AUTO_SWITCH_LAST_BUNDLED_USERNAME)
-            .remove(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY)
-            .remove(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX)
             .apply()
     }
 
@@ -937,34 +931,6 @@ object PrefsStore {
         } else {
             prefs.edit().putString(KEY_AUTO_SWITCH_LAST_SLOT_KEY, v).apply()
         }
-    }
-
-    fun setAutoSwitchVerifiedAlignment(slotKey: String, rowIndex: Int) {
-        val sk = slotKey.trim()
-        if (sk.isEmpty() || rowIndex < 0) return
-        prefs.edit()
-            .putString(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY, sk)
-            .putInt(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX, rowIndex)
-            .apply()
-    }
-
-    fun getAutoSwitchVerifiedSlotKey(): String? =
-        prefs.getString(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY, null)?.trim()?.takeIf { it.isNotEmpty() }
-
-    fun getAutoSwitchVerifiedRowIndex(): Int =
-        prefs.getInt(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX, -1)
-
-    fun isAutoSwitchVerifiedAligned(slotKey: String, rowIndex: Int): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isEmpty() || rowIndex < 0) return false
-        return getAutoSwitchVerifiedSlotKey() == sk && getAutoSwitchVerifiedRowIndex() == rowIndex
-    }
-
-    fun clearAutoSwitchVerifiedAlignment() {
-        prefs.edit()
-            .remove(KEY_AUTO_SWITCH_VERIFIED_SLOT_KEY)
-            .remove(KEY_AUTO_SWITCH_VERIFIED_ROW_INDEX)
-            .apply()
     }
 
     fun getProfileEditStepStateJson(accountKey: String): String? =
@@ -983,4 +949,18 @@ object PrefsStore {
         if (key.isEmpty()) return
         prefs.edit().remove(KEY_PROFILE_EDIT_STEP_STATE_PREFIX + key).apply()
     }
+
+    fun saveLastProcessHeartbeatLine(line: String) {
+        prefs.edit().putString(KEY_LAST_PROCESS_HEARTBEAT_LINE, line.trim()).apply()
+    }
+
+    fun getLastProcessHeartbeatLine(): String? =
+        prefs.getString(KEY_LAST_PROCESS_HEARTBEAT_LINE, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun saveLastProcessCrashLine(line: String) {
+        prefs.edit().putString(KEY_LAST_PROCESS_CRASH_LINE, line.trim()).apply()
+    }
+
+    fun getLastProcessCrashLine(): String? =
+        prefs.getString(KEY_LAST_PROCESS_CRASH_LINE, null)?.trim()?.takeIf { it.isNotEmpty() }
 }

@@ -6,7 +6,8 @@ import kotlin.random.Random
 
 /**
  * 自动切号时段策略：账号分配窗口 [start_min, end_min) 内，默认运行涨粉基线；
- * 发作品/互点等「插入操作」在窗口内到点触发，暂停涨粉 → 独占 TikTok → 结束后恢复涨粉。
+ * 发作品/引流互点等「插入操作」在窗口内到点触发，暂停涨粉 → 独占 TikTok → 结束后恢复涨粉；
+ * 距时段结束前 [AutoSwitchLocalScheduler.SWITCH_SAFE_BUFFER_MIN] 分钟进入切号安全缓冲，不再启动新高优插入。
  *
  * 扩展新插入：实现 [AutoSwitchSlotInsertion]，注册到 [AutoSwitchLocalScheduler] 的 insertions 列表。
  */
@@ -55,6 +56,16 @@ object AutoSwitchSlotWindow {
         return minute >= triggerMinute && minute < end
     }
 
+    /** 切号安全缓冲：距时段结束 [bufferMin] 分钟内不再启动新高优插入。 */
+    fun isWithinSwitchSafeBuffer(minuteOfDay: Int, slot: AutoSwitchPlanSlot, bufferMin: Int): Boolean {
+        if (bufferMin <= 0) return false
+        val start = slot.start_min ?: 0
+        val end = slotEndMin(slot)
+        val minute = minuteOfDay.coerceIn(0, 1439)
+        val bufferStart = (end - bufferMin).coerceAtLeast(start)
+        return minute >= bufferStart && minute < end
+    }
+
     fun formatMinute(minuteOfDay: Int): String {
         val minute = minuteOfDay.coerceIn(0, 1439)
         return String.format("%02d:%02d", minute / 60, minute % 60)
@@ -74,7 +85,7 @@ data class AutoSwitchSlotTickContext(
 )
 
 /**
- * 插入操作宿主：由调度器实现，负责入队、状态与 ledger。
+ * 插入操作宿主：由调度器实现，负责入队与 plan 状态。
  * 新插入类型只依赖此接口，无需改 tick 主流程。
  */
 interface AutoSwitchSlotInsertionHost {
@@ -82,8 +93,14 @@ interface AutoSwitchSlotInsertionHost {
     fun isInsertionInflight(kind: String, slotKey: String): Boolean
     fun markInsertionInflight(slotKey: String, kind: String)
     fun graduateNewAccountVideoCount(account: AutoSwitchAccount)
-    /** 插入入队前：OCR/自动登录保障目标账号已登录；失败时不入队（下分钟 tick 可重试）。 */
+    /** 本时段切号链是否已完成（可触发插入）。 */
+    fun isSlotReady(slotKey: String, targetRowIndex: Int): Boolean
+    /** 是否处于切号前安全缓冲（不再启动新高优插入）。 */
+    fun isWithinSwitchSafeBuffer(minuteOfDay: Int, slot: AutoSwitchPlanSlot): Boolean
+    /** 插入入队前登录保障（简化调度下默认跳过）。 */
     suspend fun verifyInsertionAccountLoggedIn(ctx: AutoSwitchSlotTickContext, kind: String): Boolean
+    /** 本地计划文件中该插入任务的状态。 */
+    fun insertionState(kind: String, slotKey: String): PlanStepState? = null
 }
 
 /** 自动切号发作品：video_count 解析与条数策略（客户端与 [PublishPostSlotInsertion] 共用）。 */
@@ -133,6 +150,16 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             }
             return false
         }
+        if (host.isWithinSwitchSafeBuffer(ctx.minuteOfDay, ctx.slot)) {
+            logOnce(ctx.alias, slotKey, "switch_buffer") {
+                LogCenter.op(
+                    ctx.alias,
+                    "【自动切号】跳过发作品：slot=$slotKey 处于切号安全缓冲（距时段结束不足 ${AutoSwitchLocalScheduler.SWITCH_SAFE_BUFFER_MIN} 分钟）",
+                )
+            }
+            return false
+        }
+
         if (!AutoSwitchSlotWindow.isWithinInsertionTrigger(ctx.minuteOfDay, ctx.slot, pubMinute)) {
             if (ctx.minuteOfDay < pubMinute) {
                 logOnce(ctx.alias, slotKey, "wait|$pubMinute") {
@@ -145,24 +172,27 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             return false
         }
 
-        val doneKey = "$slotKey|publish"
-        val abortKey = "$slotKey|publish_aborted"
-        if (PrefsStore.getAutoSwitchPublishDoneKey() == doneKey) {
-            return false
-        }
-        if (PrefsStore.getAutoSwitchPublishAbortedKey() == abortKey) {
-            if (PrefsStore.hasRecoverableAutoSwitchPublish(slotKey)) {
-                PrefsStore.setAutoSwitchPublishAbortedKey(null)
-            } else {
+        val planState = host.insertionState(kind, slotKey)
+            ?: AutoSwitchLocalPlanStore.slot(slotKey)?.publish?.state
+        when (planState) {
+            PlanStepState.DONE, PlanStepState.SKIPPED, PlanStepState.RUNNING -> return false
+            PlanStepState.FAILED -> {
+                logOnce(ctx.alias, slotKey, "aborted") {
+                    LogCenter.op(
+                        ctx.alias,
+                        "【自动切号】跳过发作品：时段 $slotKey 本时段已失败/中止（不再重试）",
+                    )
+                }
                 return false
             }
+            else -> Unit
         }
         if (host.isInsertionInflight(kind, slotKey)) return false
         val resumeAccount = ctx.account.username?.trim().orEmpty()
             .ifBlank { PrefsStore.getLogContextUsername()?.trim().orEmpty() }
         if (
             PrefsStore.isPublishPostPending() &&
-            PrefsStore.getAutoSwitchPublishSlotKey()?.trim() == slotKey &&
+            AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim() == slotKey &&
             (
                 PrefsStore.getPublishPostResumeNextIndex(resumeAccount.ifBlank { ctx.alias }) > 0 ||
                     PrefsStore.isPublishPostMaterialReady()
@@ -176,28 +206,13 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             }
             return false
         }
-        if (AutoSwitchLedger.isPublishSlotDone(slotKey)) {
-            PrefsStore.setAutoSwitchPublishDoneKey(doneKey)
-            return false
-        }
-        if (AutoSwitchLedger.isPublishSlotAborted(slotKey)) {
-            PrefsStore.setAutoSwitchPublishAbortedKey(abortKey)
-            logOnce(ctx.alias, slotKey, "aborted") {
-                LogCenter.op(
-                    ctx.alias,
-                    "【自动切号】跳过发作品：时段 $slotKey 本时段已失败/中止（不再重试）",
-                )
-            }
-            return false
-        }
-        if (AutoSwitchLedger.isPublishSlotInflight(slotKey)) return false
 
         val targetRi = ctx.account.row_index ?: -1
-        if (!PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)) {
-            logOnce(ctx.alias, slotKey, "not_verified") {
+        if (!host.isSlotReady(slotKey, targetRi)) {
+            logOnce(ctx.alias, slotKey, "slot_not_ready") {
                 LogCenter.op(
                     ctx.alias,
-                    "【自动切号】跳过发作品：slot=$slotKey 未验证对齐（row=$targetRi）",
+                    "【自动切号】跳过发作品：slot=$slotKey 本时段切号未完成（row=$targetRi）",
                 )
             }
             return false
@@ -213,15 +228,13 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
 
         val rawVc = AutoSwitchPublishVideoCount.parseRaw(ctx.account.video_count)
         if (rawVc == AutoSwitchPublishVideoCount.NEW_ACCOUNT_COOLDOWN) {
-            // 基线阶段 [AutoSwitchLocalScheduler.tryGraduateNewAccountCooldownAtPublishMinute] 应已处理；
-            // 此处仅作兜底，且绝不走独占入队/登录校验。
             host.graduateNewAccountVideoCount(ctx.account)
             AutoSwitchLedger.recordVideoCountGraduate(
                 username = ctx.account.username?.trim().orEmpty(),
                 rowIndex = ctx.account.row_index ?: -1,
                 slotKey = slotKey,
             )
-            PrefsStore.setAutoSwitchPublishDoneKey(doneKey)
+            AutoSwitchLocalPlanStore.markInsertionState(slotKey, "publish", PlanStepState.SKIPPED)
             LogCenter.op(
                 ctx.alias,
                 "【自动切号】跳过发作品：新号冷却 video_count=-1→0 account=${ctx.account.username}（本时段不发作品，继续涨粉基线）",
@@ -229,17 +242,17 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             return false
         }
 
+        val publishCount = AutoSwitchPublishVideoCount.autoPublishCountFor(rawVc)
+        val targetUserForLogin = ctx.account.username?.trim().orEmpty()
         if (!host.verifyInsertionAccountLoggedIn(ctx, kind)) {
-            logOnce(ctx.alias, slotKey, "login_safeguard") {
+            logOnce(ctx.alias, slotKey, "login_not_ready") {
                 LogCenter.op(
                     ctx.alias,
-                    "【自动切号】跳过发作品：slot=$slotKey 入队前登录保障未通过 account=$targetUser（下分钟重试）",
+                    "【自动切号】跳过发作品：slot=$slotKey 登录保障未通过 account=$targetUserForLogin",
                 )
             }
             return false
         }
-
-        val publishCount = AutoSwitchPublishVideoCount.autoPublishCountFor(rawVc)
         val pkg = ctx.bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
         val aliasClean = ctx.bundle.device_alias?.trim().orEmpty().ifBlank { ctx.alias }
         val opId = newLocalOpId("publish")
@@ -257,21 +270,6 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
                 account_username = ctx.account.username?.trim(),
             ),
         )
-        AutoSwitchLedger.record(
-            opId = opId,
-            opType = "publish_post_start",
-            status = "queued",
-            message = "已入队发作品",
-            slotKey = slotKey,
-            username = ctx.account.username?.trim().orEmpty(),
-            reportData = mapOf(
-                "op_type" to "publish_post_start",
-                "account_username" to ctx.account.username?.trim().orEmpty(),
-                "auto_switch_slot_key" to slotKey,
-                "publish_count" to publishCount,
-            ),
-            phaseOverride = "queued",
-        )
         host.enqueueInsertion(op, slotKey, kind)
         LogCenter.op(
             ctx.alias,
@@ -288,6 +286,67 @@ class PublishPostSlotInsertion : AutoSwitchSlotInsertion {
             if (onceLogKeys.add(key)) block()
         }
 
+        private fun newLocalOpId(prefix: String): String =
+            "local-as-$prefix-${System.currentTimeMillis()}-${Random.nextInt(1000)}"
+    }
+}
+
+/** 引流互点：在 auto_mutual_minute 到点触发 teamwork Videos 引流会话（读 bundle 内 mutual_traffic_* 配置）。 */
+class MutualTrafficSlotInsertion : AutoSwitchSlotInsertion {
+    override val kind: String = "mutual_traffic"
+
+    override suspend fun trySchedule(
+        ctx: AutoSwitchSlotTickContext,
+        host: AutoSwitchSlotInsertionHost,
+    ): Boolean {
+        val slotKey = ctx.slotKey
+        val mutualMinute = ctx.slot.auto_mutual_minute ?: return false
+        val targetUser = ctx.account.username?.trim().orEmpty()
+        if (targetUser.isBlank()) return false
+        if (!ctx.bundle.isMutualTrafficConfiguredFor(targetUser)) {
+            AutoSwitchLocalPlanStore.markInsertionState(slotKey, kind, PlanStepState.SKIPPED)
+            return false
+        }
+        val opType = ctx.bundle.mutualTrafficOpTypeFor(targetUser) ?: return false
+        if (host.isWithinSwitchSafeBuffer(ctx.minuteOfDay, ctx.slot)) return false
+        if (!AutoSwitchSlotWindow.isWithinInsertionTrigger(ctx.minuteOfDay, ctx.slot, mutualMinute)) {
+            return false
+        }
+        when (
+            host.insertionState(kind, slotKey)
+                ?: AutoSwitchLocalPlanStore.slot(slotKey)?.mutual_traffic?.state
+        ) {
+            PlanStepState.DONE, PlanStepState.SKIPPED, PlanStepState.FAILED, PlanStepState.RUNNING -> return false
+            else -> Unit
+        }
+        if (host.isInsertionInflight(kind, slotKey)) return false
+        val targetRi = ctx.account.row_index ?: -1
+        if (!host.isSlotReady(slotKey, targetRi)) return false
+        val pkg = ctx.bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+        val aliasClean = ctx.bundle.device_alias?.trim().orEmpty().ifBlank { ctx.alias }
+        val opId = newLocalOpId("mutual-traffic")
+        val op = DeviceOp(
+            op_id = opId,
+            op_type = opType,
+            payload = DeviceOpPayload(
+                device_id = ctx.deviceId,
+                alias = aliasClean,
+                package_name = pkg,
+                source = "auto_switch",
+                auto_switch_slot_key = slotKey,
+                account_username = targetUser,
+            ),
+        )
+        host.enqueueInsertion(op, slotKey, kind)
+        val modeLabel = if (opType == "mutual_click_follow_only_start") "仅关注" else "引流"
+        LogCenter.op(
+            ctx.alias,
+            "【自动切号】已入队引流互点（$modeLabel）slot=$slotKey 计划=${AutoSwitchSlotWindow.formatMinute(mutualMinute)} account=$targetUser",
+        )
+        return true
+    }
+
+    companion object {
         private fun newLocalOpId(prefix: String): String =
             "local-as-$prefix-${System.currentTimeMillis()}-${Random.nextInt(1000)}"
     }

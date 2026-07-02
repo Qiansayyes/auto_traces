@@ -498,6 +498,8 @@ data class DeviceModeWaitResponse(
     val event: DeviceModeEvent? = null,
     val log_pull_requested: Boolean? = null,
     val log_pull_max_lines: Int? = null,
+    /** 云端该设备 auto_switch_enabled 真源；自治期设备可据此对账退出。 */
+    val auto_switch_enabled: Boolean? = null,
 )
 
 data class DeviceModeAckRequest(
@@ -621,6 +623,8 @@ data class AutoSwitchPlanSlot(
     val row_index: Int? = null,
     val username: String? = null,
     val auto_publish_minute: Int? = null,
+    /** 引流互点（teamwork Videos）时间点；与 [auto_publish_minute] 同级，每 slot 一个。 */
+    val auto_mutual_minute: Int? = null,
 )
 
 data class AutoSwitchRetryPolicy(

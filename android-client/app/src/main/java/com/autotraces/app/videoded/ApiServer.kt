@@ -44,6 +44,7 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                 session.method == Method.GET && session.uri.startsWith("/api/v1/tasks/") -> handleGetTask(session)
                 session.method == Method.POST && session.uri.startsWith("/api/v1/tasks/") && session.uri.endsWith("/retry") -> handleRetry(session)
                 session.method == Method.POST && session.uri == "/api/v1/adb/prepare" -> handleAdbPrepare(session)
+                session.method == Method.GET && session.uri == "/api/v1/system/memory" -> handleSystemMemory(session)
                 else -> jsonResponse(404, errorJson("not_found"))
             }
         } catch (t: Throwable) {
@@ -222,6 +223,14 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         val task = TaskStore.loadTasks(context).firstOrNull { it.taskId == taskId }
             ?: return jsonResponse(404, errorJson("task_not_found"))
         return jsonResponse(200, task.toJson())
+    }
+
+    private fun handleSystemMemory(session: IHTTPSession): Response {
+        val params = session.parms
+        val limit = params["limit"]?.toIntOrNull()?.coerceIn(1, 200) ?: 40
+        val minPssKb = params["minPssKb"]?.toIntOrNull()?.coerceAtLeast(0) ?: 1_024
+        val snapshot = RuntimeMemoryProbe.capture(context.applicationContext, limit, minPssKb)
+        return jsonResponse(200, RuntimeMemoryProbe.toJson(snapshot))
     }
 
     private fun handleAdbPrepare(session: IHTTPSession): Response {

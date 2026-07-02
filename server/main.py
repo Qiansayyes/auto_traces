@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import hashlib
 import inspect
 import json
@@ -207,6 +208,7 @@ BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
 MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
 MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD = 5000
+# 临时方案（涨粉）：pull_username 从 tiktok_roots 随机只读下发；原 mobile_pending 队列消费见 pull_username 内注释块。
 
 # 应用关闭信号：后台调度线程与 shutdown 钩子共享，避免 uvicorn 长时间卡在 Shutting down。
 _APP_SHUTDOWN_EVENT = Event()
@@ -246,6 +248,12 @@ _DEVICE_EDITOR_PRUNE_INTERVAL_SEC = 120.0
 _device_editor_prune_last_at: dict[str, float] = {}
 _DEVICE_EDITOR_RECONCILE_INTERVAL_SEC = 300.0
 _device_editor_reconcile_last_at: dict[str, float] = {}
+# 备份档案等读接口：prune/reconcile/materialize 合并限频，避免翻页/刷新与设备 pull_username 抢写锁。
+_DEVICE_EDITOR_READ_MAINTAIN_INTERVAL_SEC = 600.0
+_device_editor_read_maintain_last_at: dict[str, float] = {}
+_USER_RUNTIME_STATE_CACHE_TTL_SEC = 45.0
+_user_runtime_state_cache: dict[str, tuple[dict, float]] = {}
+_user_runtime_state_cache_lock = Lock()
 DEVICE_EDITOR_UNASSIGNED_ALIAS_BUCKET = "__UNASSIGNED__"
 _DEVICE_OPS_POLL_MIN_INTERVAL_SEC = 10.0
 _device_ops_poll_last_at: dict[str, float] = {}
@@ -421,6 +429,46 @@ def _maybe_reconcile_editor_alias_bindings(conn: sqlite3.Connection, owner_usern
             print(f"[{now_text()}] device_editor.reconcile | skipped_db_busy | owner={owner}")
             return 0, 0
         raise
+
+
+def _reset_device_editor_read_maintain_schedule(owner_username: str) -> None:
+    """写操作后允许下次读接口尽快做一次对齐（管理台刚改完档案时）。"""
+    owner = str(owner_username or "").strip()
+    if owner:
+        _device_editor_read_maintain_last_at.pop(owner, None)
+
+
+def _maybe_maintain_device_editor_on_read(conn: sqlite3.Connection, owner_username: str) -> None:
+    """读接口用：限频 prune + reconcile + materialize，默认 10 分钟最多写库一次。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return
+    now = time.monotonic()
+    last = _device_editor_read_maintain_last_at.get(owner, 0.0)
+    if now - last < _DEVICE_EDITOR_READ_MAINTAIN_INTERVAL_SEC:
+        return
+    try:
+        pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
+        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
+        forced_accounts, forced_devices = _ensure_device_editor_rows_materialized(conn, owner)
+        dirty = bool(pruned or to_accounts or to_devices or forced_accounts or forced_devices)
+        if dirty:
+            _ensure_device_editor_switch_highlight_invariants(conn, owner)
+            conn.commit()
+        _device_editor_read_maintain_last_at[owner] = now
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            print(f"[{now_text()}] device_editor.read_maintain | skipped_db_busy | owner={owner}")
+            return
+        raise
+
+
+def _invalidate_user_runtime_state_cache(username: str | None = None) -> None:
+    with _user_runtime_state_cache_lock:
+        if not username:
+            _user_runtime_state_cache.clear()
+            return
+        _user_runtime_state_cache.pop(str(username or "").strip(), None)
 
 
 def _table_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1781,12 +1829,23 @@ def _load_persisted_runtime_state():
         conn.close()
 
 
-def _load_user_runtime_state(username: str) -> dict:
+def _load_user_runtime_state(username: str, *, use_cache: bool = True) -> dict:
+    owner = str(username or "").strip()
+    if not owner:
+        return {}
+    if use_cache:
+        now = time.monotonic()
+        with _user_runtime_state_cache_lock:
+            cached = _user_runtime_state_cache.get(owner)
+            if cached:
+                payload, expires_at = cached
+                if now < expires_at:
+                    return copy.deepcopy(payload)
     conn = _get_db()
     try:
         rows = conn.execute(
             "SELECT config_key, config_json FROM user_runtime_configs WHERE username = ?",
-            (username,),
+            (owner,),
         ).fetchall()
         result: dict = {}
         for key, raw in rows:
@@ -1794,9 +1853,15 @@ def _load_user_runtime_state(username: str) -> dict:
                 result[str(key)] = json.loads(raw or "{}")
             except Exception:
                 continue
-        return result
     finally:
         conn.close()
+    if use_cache:
+        with _user_runtime_state_cache_lock:
+            _user_runtime_state_cache[owner] = (
+                copy.deepcopy(result),
+                time.monotonic() + _USER_RUNTIME_STATE_CACHE_TTL_SEC,
+            )
+    return result
 
 
 def _save_user_runtime_state(username: str, payload: dict):
@@ -1810,6 +1875,7 @@ def _save_user_runtime_state(username: str, payload: dict):
         conn.commit()
         u = (username or "").strip()
         if u:
+            _invalidate_user_runtime_state_cache(u)
             try:
                 with _store_lock("save_user_runtime_state:push_rev", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
                     store.user_config_push_revision[u] = int(store.user_config_push_revision.get(u, 0)) + 1
@@ -2703,6 +2769,8 @@ def _resolve_template_for_mode_alias(
     mode: str,
     alias: str,
     tiktok_username: str | None = None,
+    *,
+    emit_log: bool = True,
 ) -> tuple[str, Dict[str, object], Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
     templates, template_meta = _build_effective_template_bundle(owner_username, data)
     if not templates:
@@ -2730,12 +2798,13 @@ def _resolve_template_for_mode_alias(
             tiktok_username=account_clean or None,
         )
         config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
-        print(
-            f"[{now_text()}] 智能模板 | owner={owner_username} mode={mode_key} alias={alias_clean} "
-            f"account={account_clean or '-'} branch={smart_debug.get('branch')} "
-            f"followers={smart_debug.get('follower_count')} videos={smart_debug.get('video_count')} "
-            f"selected={selected_name}"
-        )
+        if emit_log:
+            print(
+                f"[{now_text()}] 智能模板 | owner={owner_username} mode={mode_key} alias={alias_clean} "
+                f"account={account_clean or '-'} branch={smart_debug.get('branch')} "
+                f"followers={smart_debug.get('follower_count')} videos={smart_debug.get('video_count')} "
+                f"selected={selected_name}"
+            )
         return selected_name, config, templates, template_meta
 
     alias_map_all = data.get("alias_template_by_mode", {})
@@ -2785,9 +2854,10 @@ def _resolve_template_for_mode_alias(
 
     selected_name = raw_ref if raw_ref in templates else fallback_name
     config = dict(templates.get(selected_name, MODE_DEFAULT_CONFIGS["growth"]))
-    print(
-        f"[{now_text()}] 模板解析 | owner={owner_username} mode={mode_key} alias={alias_clean} account={account_clean or '-'} account_key={account_key or '-'} source={template_source_hint or '-'} raw_ref={raw_ref or '-'} cross_mode_hit={cross_mode_hit or '-'} selected={selected_name} fallback={fallback_name} templates={','.join(sorted(templates.keys()))}"
-    )
+    if emit_log:
+        print(
+            f"[{now_text()}] 模板解析 | owner={owner_username} mode={mode_key} alias={alias_clean} account={account_clean or '-'} account_key={account_key or '-'} source={template_source_hint or '-'} raw_ref={raw_ref or '-'} cross_mode_hit={cross_mode_hit or '-'} selected={selected_name} fallback={fallback_name} templates={','.join(sorted(templates.keys()))}"
+        )
     return selected_name, config, templates, template_meta
 
 
@@ -3133,7 +3203,7 @@ async def log_request_timing(request: Request, call_next):
         return JSONResponse(status_code=503, content={"code": 1, "msg": "服务正在关闭"})
     started = time.perf_counter()
     path = request.url.path
-    quiet_poll = path in ("/api/device/mode_wait", "/api/check_start", "/api/device_ops/poll")
+    quiet_poll = path in ("/api/device/mode_wait", "/api/device/mode_ack", "/api/check_start", "/api/device_ops/poll")
     if not quiet_poll:
         print(f"[{now_text()}] HTTP {request.method} {path} | enter")
     try:
@@ -4209,21 +4279,30 @@ def _ensure_device_editor_rows_materialized(conn: sqlite3.Connection, owner: str
     return _reconcile_editor_alias_bindings(conn, owner_key)
 
 
+def _normalized_search_keyword(keyword: str) -> str:
+    return str(keyword or "").strip().lower()
+
+
+def _case_insensitive_like_pattern(keyword: str) -> str:
+    q = _normalized_search_keyword(keyword)
+    return f"%{q}%" if q else ""
+
+
 def _device_editor_search_sql(
     search: str,
     *,
     search_field: str = "",
     table_alias: str = "device_editor_rows",
 ) -> tuple[str, list[Any]]:
-    """备份档案列表模糊筛选：可按 alias / username / region 或全字段。"""
-    q = str(search or "").strip().lower()
+    """备份档案列表模糊筛选：username / 别名 / 地区 / device_id / ip（忽略大小写）。"""
+    q = _normalized_search_keyword(search)
     if not q:
         return "", []
-    pattern = f"%{q}%"
+    pattern = _case_insensitive_like_pattern(search)
     ta = table_alias
     field = str(search_field or "").strip().lower()
     if field == "username":
-        return f" AND LOWER(TRIM({ta}.username)) LIKE ?", [pattern]
+        return f" AND LOWER(LTRIM(TRIM({ta}.username), '@')) LIKE ?", [pattern]
     if field == "region":
         sql = f"""
         AND (
@@ -4231,7 +4310,7 @@ def _device_editor_search_sql(
             OR EXISTS (
                 SELECT 1 FROM account_editor_rows a
                 WHERE a.owner_username = {ta}.owner_username
-                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND {_editor_username_key_sql('a.username')} = {_editor_username_key_sql(f'{ta}.username')}
                   AND LOWER(TRIM(a.region)) LIKE ?
             )
         )
@@ -4245,40 +4324,32 @@ def _device_editor_search_sql(
             OR EXISTS (
                 SELECT 1 FROM account_editor_rows a
                 WHERE a.owner_username = {ta}.owner_username
-                  AND LOWER(TRIM(a.username)) = LOWER(TRIM({ta}.username))
+                  AND {_editor_username_key_sql('a.username')} = {_editor_username_key_sql(f'{ta}.username')}
                   AND LOWER(TRIM(a.assigned_alias)) LIKE ?
             )
         )
         """
         return sql, [pattern, pattern, pattern]
-    alias_match = _backup_record_alias_expr(ta)
     sql = f"""
         AND (
-            LOWER(TRIM({ta}.username)) LIKE ?
+            LOWER(LTRIM(TRIM({ta}.username), '@')) LIKE ?
             OR LOWER(TRIM({ta}.device_alias)) LIKE ?
             OR LOWER(TRIM({ta}.assigned_alias)) LIKE ?
-            OR LOWER(TRIM({ta}.backup_name)) LIKE ?
-            OR LOWER(TRIM({ta}.backup_path)) LIKE ?
+            OR LOWER(TRIM({ta}.region)) LIKE ?
+            OR LOWER(TRIM({ta}.device_id)) LIKE ?
+            OR LOWER(TRIM({ta}.ip)) LIKE ?
             OR EXISTS (
                 SELECT 1 FROM account_editor_rows a
                 WHERE a.owner_username = {ta}.owner_username
                   AND {_editor_username_key_sql('a.username')} = {_editor_username_key_sql(f'{ta}.username')}
                   AND (
-                    LOWER(TRIM(a.username)) LIKE ?
-                    OR LOWER(TRIM(a.assigned_alias)) LIKE ?
-                    OR LOWER(TRIM(a.email)) LIKE ?
+                    LOWER(TRIM(a.assigned_alias)) LIKE ?
                     OR LOWER(TRIM(a.region)) LIKE ?
                   )
             )
-            OR EXISTS (
-                SELECT 1 FROM client_devices cd
-                WHERE cd.owner_username = {ta}.owner_username
-                  AND TRIM(cd.alias) = TRIM({alias_match})
-                  AND LOWER(TRIM(COALESCE(cd.device_group, ''))) LIKE ?
-            )
         )
     """
-    return sql, [pattern] * 10
+    return sql, [pattern] * 8
 
 
 def _sync_account_assigned_alias_for_username(
@@ -5091,6 +5162,47 @@ def _ensure_auto_publish_minutes_in_plan(plan: dict[str, Any]) -> bool:
     return modified
 
 
+def _random_auto_mutual_minute(start_min: int, end_min: int, publish_min: int | None) -> int | None:
+    """在发作品点之后（或时段开始+10 分钟）至切号前 10 分钟内随机取一分钟触发引流互点。"""
+    base = int(start_min) + 10
+    window_start = (int(publish_min) + 5) if publish_min is not None else base
+    window_end = int(end_min) - 10
+    if window_end <= window_start:
+        return None
+    return random.randint(window_start, window_end)
+
+
+def _ensure_auto_mutual_minutes_in_plan(plan: dict[str, Any]) -> bool:
+    """为缺少 auto_mutual_minute 的时段补齐随机引流互点时间点；有变更则返回 True。"""
+    slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
+    modified = False
+    for slot in slots:
+        if "auto_mutual_minute" in slot:
+            continue
+        try:
+            start = int(slot.get("start_min") or 0)
+            end = int(slot.get("end_min") or 0)
+        except (TypeError, ValueError):
+            start, end = 0, 0
+        pub = slot.get("auto_publish_minute")
+        try:
+            pub_min = int(pub) if pub is not None else None
+        except (TypeError, ValueError):
+            pub_min = None
+        slot["auto_mutual_minute"] = _random_auto_mutual_minute(start, end, pub_min)
+        modified = True
+    return modified
+
+
+def _ensure_slot_timed_insertions_in_plan(plan: dict[str, Any]) -> bool:
+    modified = False
+    if _ensure_auto_publish_minutes_in_plan(plan):
+        modified = True
+    if _ensure_auto_mutual_minutes_in_plan(plan):
+        modified = True
+    return modified
+
+
 def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(rows, key=lambda r: int(r.get("row_index") or 0))
     shuffled = list(ordered)
@@ -5105,6 +5217,7 @@ def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, An
         end = start + span
         if idx == n - 1:
             end = 1440
+        pub_min = _random_auto_publish_minute(start, end)
         slots.append(
             {
                 "slot_index": idx,
@@ -5112,7 +5225,8 @@ def _generate_auto_switch_daily_plan(rows: List[dict[str, Any]]) -> dict[str, An
                 "end_min": end,
                 "row_index": int(row.get("row_index") or 0),
                 "username": str(row.get("username") or "").strip(),
-                "auto_publish_minute": _random_auto_publish_minute(start, end),
+                "auto_publish_minute": pub_min,
+                "auto_mutual_minute": _random_auto_mutual_minute(start, end, pub_min),
             }
         )
         start = end
@@ -5245,7 +5359,7 @@ def _ensure_auto_publish_minutes_in_weekly_plan(plan: dict[str, Any]) -> bool:
     if not isinstance(days, dict):
         return False
     for day_plan in days.values():
-        if isinstance(day_plan, dict) and _ensure_auto_publish_minutes_in_plan(day_plan):
+        if isinstance(day_plan, dict) and _ensure_slot_timed_insertions_in_plan(day_plan):
             modified = True
     return modified
 
@@ -5264,7 +5378,7 @@ def _ensure_auto_switch_weekly_plan(
         if _ensure_auto_publish_minutes_in_weekly_plan(existing):
             _save_auto_switch_weekly_plan(owner_username, alias, week_start, existing)
             _auto_switch_log(
-                f"已补齐本周发作品随机时间点 | owner={owner_username} alias={alias} week={week_start}~{week_end}"
+                f"已补齐本周发作品/互点随机时间点 | owner={owner_username} alias={alias} week={week_start}~{week_end}"
             )
         return existing
     plan = _generate_auto_switch_weekly_plan(rows, week_start, week_end)
@@ -5362,10 +5476,10 @@ def _ensure_auto_switch_daily_plan(owner_username: str, alias: str, rows: List[d
         return day_plan
     existing = _load_auto_switch_daily_plan(owner_username, alias, date_key)
     if existing and isinstance(existing.get("slots"), list) and len(existing["slots"]) == len(rows):
-        if _ensure_auto_publish_minutes_in_plan(existing):
+        if _ensure_slot_timed_insertions_in_plan(existing):
             _save_auto_switch_daily_plan(owner_username, alias, date_key, existing)
             _auto_switch_log(
-                f"已补齐今日发作品随机时间点 | owner={owner_username} alias={alias} date={date_key}"
+                f"已补齐今日发作品/互点随机时间点 | owner={owner_username} alias={alias} date={date_key}"
             )
         return existing
     plan = _generate_auto_switch_daily_plan(rows)
@@ -6582,6 +6696,24 @@ def _count_mobile_pending_pending() -> int:
         conn.close()
 
 
+def _count_tiktok_roots() -> int:
+    conn = _get_db()
+    try:
+        return int(conn.execute("SELECT COUNT(1) FROM tiktok_roots").fetchone()[0] or 0)
+    finally:
+        conn.close()
+
+
+def _pull_growth_usernames_random_from_roots(conn: sqlite3.Connection, safe_count: int) -> List[str]:
+    """涨粉临时方案：从 tiktok_roots 随机取 N 个根用户名，只读不写库。"""
+    n = max(1, min(int(safe_count or 1), 100))
+    rows = conn.execute(
+        "SELECT root_username FROM tiktok_roots ORDER BY RANDOM() LIMIT ?",
+        (n,),
+    ).fetchall()
+    return [str(r[0]).strip() for r in rows if str(r[0] or "").strip()]
+
+
 def _refill_mobile_pending_from_all_roots() -> dict:
     """将全部 tiktok_roots 写入待下发队列（与后台「将所有根用户加入待下发队列」一致）。"""
     conn = _get_db()
@@ -6625,6 +6757,8 @@ def _mobile_pending_auto_refill_worker(pending_before: int, threshold: int) -> N
 
 
 def _mobile_pending_auto_refill_tick() -> None:
+    # 临时方案：涨粉随机下发不写 mobile_pending，自动补队列无意义，整段逻辑先跳过。
+    return
     threshold = MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD
     cooldown_sec = MOBILE_PENDING_AUTO_REFILL_DEFAULT_COOLDOWN_SEC
     with store.lock:
@@ -7367,12 +7501,12 @@ def _replace_device_log(device_id: str, lines: List[str]) -> None:
     if not did:
         return
     cleaned = [str(x).rstrip("\r\n") for x in (lines or []) if str(x).strip()]
+    if not cleaned:
+        # 设备今日本地日志为空：保留服务端已有累积日志，避免 pull 回传把历史日志清空。
+        return
     path = _device_log_file_path(did)
     try:
-        if cleaned:
-            path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
-        elif path.is_file():
-            path.write_text("", encoding="utf-8")
+        path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
         with _device_log_dedup_cache_lock:
             _device_log_dedup_cache.pop(did, None)
     except Exception as exc:
@@ -9330,7 +9464,6 @@ def pull_username(
                 print(f"[{now_text()}] pull_username | store_lock_busy_count_round | device_id={device_id}")
         return payload
 
-    consumed_mobile_pending = False
     selected: List[str] = []
     conn = _get_db()
     try:
@@ -9365,27 +9498,30 @@ def pull_username(
             )
             conn.commit()
         else:
-            consumed_mobile_pending = True
-            rows = conn.execute(
-                "SELECT id, username FROM mobile_pending_usernames WHERE consume_status = 'pending' ORDER BY created_at, id LIMIT ?",
-                (safe_count,),
-            ).fetchall()
-            if not rows:
-                return {"code": 1, "msg": "暂无待执行的用户名"}
-
-            selected_ids = [r[0] for r in rows]
-            selected = [r[1] for r in rows]
-
-            bump_usage_for_usernames(conn, selected)
-            conn.executemany(
-                "DELETE FROM mobile_pending_usernames WHERE id = ?",
-                [(rid,) for rid in selected_ids],
-            )
-            conn.commit()
+            # 涨粉（growth）。mutual（互点引流）设备端不调用 pull_username，搜索词来自模板 mutual_traffic_target_texts。
+            # 临时：从 tiktok_roots 随机只读，不写库。
+            selected = _pull_growth_usernames_random_from_roots(conn, safe_count)
+            if not selected:
+                return {"code": 1, "msg": "暂无根用户（tiktok_roots 为空）"}
+            # --- 原涨粉队列消费（恢复时取消下方注释，并注释掉上面随机下发）---
+            # rows = conn.execute(
+            #     "SELECT id, username FROM mobile_pending_usernames WHERE consume_status = 'pending' ORDER BY created_at, id LIMIT ?",
+            #     (safe_count,),
+            # ).fetchall()
+            # if not rows:
+            #     return {"code": 1, "msg": "暂无待执行的用户名"}
+            # selected_ids = [r[0] for r in rows]
+            # selected = [r[1] for r in rows]
+            # bump_usage_for_usernames(conn, selected)
+            # conn.executemany(
+            #     "DELETE FROM mobile_pending_usernames WHERE id = ?",
+            #     [(rid,) for rid in selected_ids],
+            # )
+            # conn.commit()
     finally:
         conn.close()
 
-    print(f"[{now_text()}] 设备别名：{alias} | 拉取用户名：{selected}")
+    print(f"[{now_text()}] 设备别名：{alias} | 拉取用户名({mode})：{selected}")
     return _finish_pull_username_response({"code": 0, "usernames": selected}, count_round=True)
 
 
@@ -9400,27 +9536,29 @@ def report_mutual_copied_username(payload: ReportMutualCopiedUsernameRequest):
     if not normalized:
         return {"code": 1, "msg": "用户名为空或格式无效"}
 
-    conn = _get_db()
-    try:
-        ts = now_text()
-        conn.execute(
-            """
-            INSERT INTO mutual_click_copied_usernames (username, created_at, usage_count)
-            VALUES (?, ?, 1)
-            ON CONFLICT(username) DO UPDATE SET
-                usage_count = mutual_click_copied_usernames.usage_count + 1
-            """,
-            (normalized, ts),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT username, created_at, usage_count FROM mutual_click_copied_usernames WHERE username = ?",
-            (normalized,),
-        ).fetchone()
-        uc = int(row["usage_count"]) if row else 1
-        return {"code": 0, "msg": "已记录", "username": normalized, "usage_count": uc}
-    finally:
-        conn.close()
+    # 临时：互点复制用户名不写库（恢复时取消下方注释，并删掉本 return）。
+    return {"code": 0, "msg": "临时跳过入库", "username": normalized, "usage_count": 0}
+    # conn = _get_db()
+    # try:
+    #     ts = now_text()
+    #     conn.execute(
+    #         """
+    #         INSERT INTO mutual_click_copied_usernames (username, created_at, usage_count)
+    #         VALUES (?, ?, 1)
+    #         ON CONFLICT(username) DO UPDATE SET
+    #             usage_count = mutual_click_copied_usernames.usage_count + 1
+    #         """,
+    #         (normalized, ts),
+    #     )
+    #     conn.commit()
+    #     row = conn.execute(
+    #         "SELECT username, created_at, usage_count FROM mutual_click_copied_usernames WHERE username = ?",
+    #         (normalized,),
+    #     ).fetchone()
+    #     uc = int(row["usage_count"]) if row else 1
+    #     return {"code": 0, "msg": "已记录", "username": normalized, "usage_count": uc}
+    # finally:
+    #     conn.close()
 
 
 @app.post("/api/report_result")
@@ -9465,6 +9603,7 @@ async def device_mode_wait(
         return error
     safe_timeout = max(5, min(int(timeout_sec or 120), 180))
     deadline = time.monotonic() + float(safe_timeout)
+    cloud_auto_switch_enabled = _device_auto_switch_enabled(device_id)
     while time.monotonic() < deadline:
         pull_req = _peek_device_log_pull_request(device_id)
         if pull_req:
@@ -9474,6 +9613,7 @@ async def device_mode_wait(
                 "msg": "log_pull",
                 "log_pull_requested": True,
                 "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
+                "auto_switch_enabled": cloud_auto_switch_enabled,
             }
         event = _fetch_pending_device_mode_event(device_id, since_event_id)
         if event:
@@ -9481,11 +9621,20 @@ async def device_mode_wait(
                 f"[{now_text()}] device_mode.wait | hit | device_id={device_id} "
                 f"event_id={event.get('event_id')} type={event.get('type')}"
             )
-            return {"code": 0, "event": event}
+            return {
+                "code": 0,
+                "event": event,
+                "auto_switch_enabled": cloud_auto_switch_enabled,
+            }
         if _APP_SHUTDOWN_EVENT.is_set():
             break
         await asyncio.sleep(1.0)
-    return {"code": 0, "event": None, "msg": "none"}
+    return {
+        "code": 0,
+        "event": None,
+        "msg": "none",
+        "auto_switch_enabled": cloud_auto_switch_enabled,
+    }
 
 
 @app.post("/api/device/mode_ack")
@@ -9493,19 +9642,14 @@ def device_mode_ack(payload: DeviceModeAckRequest):
     error, device = auth_or_error(payload.device_id, payload.alias)
     if error:
         return error
-    ok = _ack_device_mode_event(
+    _ack_device_mode_event(
         payload.device_id,
         payload.event_id,
         payload.phase,
         session_id=payload.session_id,
     )
-    if not ok:
-        return {"code": 1, "msg": "事件不存在或已确认"}
-    print(
-        f"[{now_text()}] device_mode.ack | device_id={payload.device_id} "
-        f"event_id={payload.event_id} phase={payload.phase}"
-    )
-    return {"code": 0, "msg": "已确认", "event_id": payload.event_id, "phase": payload.phase}
+    # 尽力投递模型：ACK 失败不影响控制面，设备不依赖回执重试。
+    return {"code": 0, "msg": "已记录", "event_id": payload.event_id, "phase": payload.phase}
 
 
 @app.post("/api/device_ops/poll")
@@ -10921,9 +11065,7 @@ def export_device_editor_backup_rows(authorization: str | None = Header(default=
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
-        if to_accounts or to_devices:
-            conn.commit()
+        _maybe_maintain_device_editor_on_read(conn, owner)
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, updated_at
@@ -10947,17 +11089,15 @@ def search_tiktok_backup_records(username: str = "", mobile_alias: str = "", lim
     try:
         owner = str(session.get("username") or "").strip()
         if owner:
-            pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
-            if pruned:
-                conn.commit()
+            _maybe_maintain_device_editor_on_read(conn, owner)
         clauses = []
         params: List[Any] = []
         if username.strip():
-            clauses.append("username LIKE ?")
-            params.append(f"%{username.strip()}%")
+            clauses.append("LOWER(LTRIM(TRIM(username), '@')) LIKE ?")
+            params.append(_case_insensitive_like_pattern(username))
         if mobile_alias.strip():
-            clauses.append(f"{_backup_record_alias_expr()} = ?")
-            params.append(mobile_alias.strip())
+            clauses.append(f"LOWER(TRIM({_backup_record_alias_expr()})) LIKE ?")
+            params.append(_case_insensitive_like_pattern(mobile_alias))
         owner_sql, owner_params = _backup_owner_scope(session)
         where_sql = " WHERE " + " AND ".join(clauses) if clauses else " WHERE 1=1"
         sql = f"""
@@ -11187,9 +11327,7 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
-        if to_accounts or to_devices:
-            conn.commit()
+        _maybe_maintain_device_editor_on_read(conn, owner)
         rows = conn.execute(
             """
             SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
@@ -11319,6 +11457,7 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 commit=False,
             )
         conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
         return {"code": 0, "msg": "账号记录已保存", "row_index": payload.row_index, "assigned_alias_locked": alias_locked or bool(persisted_alias)}
     finally:
         conn.close()
@@ -11371,6 +11510,7 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
             _shift_account_editor_row_indices_after_delete(conn, owner, row_index)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
         return {
             "code": 0,
             "msg": "账号记录已删除",
@@ -11476,14 +11616,7 @@ def list_device_editor_rows(
     conn = _get_db()
     try:
         owner = str(session["username"] or "").strip()
-        pruned = _maybe_prune_orphan_device_editor_rows(conn, owner)
-        to_accounts, to_devices = _maybe_reconcile_editor_alias_bindings(conn, owner)
-        forced_accounts, forced_devices = _ensure_device_editor_rows_materialized(conn, owner)
-        to_accounts += forced_accounts
-        to_devices += forced_devices
-        if pruned or to_accounts or to_devices:
-            _ensure_device_editor_switch_highlight_invariants(conn, owner)
-            conn.commit()
+        _maybe_maintain_device_editor_on_read(conn, owner)
         paged_alias_expr = _device_editor_paged_alias_expr(alias_expr)
         count_row = conn.execute(
             f"""
@@ -12281,6 +12414,7 @@ def upsert_device_editor_row(payload: DeviceEditorRowUpsertRequest, authorizatio
             )
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
         return {"code": 0, "msg": "设备记录已保存", "row_index": payload.row_index}
     finally:
         conn.close()
@@ -12337,6 +12471,7 @@ def set_device_editor_switch_highlight(payload: DeviceEditorSwitchHighlightReque
         )
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
         return {"code": 0, "msg": "切号高亮已更新", "row_index": row_index}
     finally:
         conn.close()
@@ -12358,6 +12493,7 @@ def delete_device_editor_row(payload: DeviceEditorRowDeleteRequest, authorizatio
         )
         _ensure_device_editor_switch_highlight_invariants(conn, str(session["username"] or "").strip())
         conn.commit()
+        _reset_device_editor_read_maintain_schedule(str(session["username"] or "").strip())
         return {"code": 0, "msg": "设备记录已删除", "row_index": payload.row_index}
     finally:
         conn.close()
@@ -14876,6 +15012,7 @@ def _build_auto_switch_account_configs(
                 mode_key,
                 alias_key,
                 username,
+                emit_log=False,
             )
             accounts_debug[account_key] = {
                 "tiktok_username": account_key,
@@ -14888,6 +15025,21 @@ def _build_auto_switch_account_configs(
             "active_template": selected_name,
             "config": config,
         }
+
+    if configs_by_username:
+        from collections import Counter
+
+        template_counts = Counter(
+            str(entry.get("active_template") or "").strip()
+            for entry in configs_by_username.values()
+            if str(entry.get("active_template") or "").strip()
+        )
+        summary = ",".join(f"{name}×{cnt}" for name, cnt in sorted(template_counts.items()))
+        path = "smart_template" if smart_enabled else "alias_binding"
+        print(
+            f"[{now_text()}] 模板解析 | owner={owner} mode={mode_key} alias={alias_key} "
+            f"accounts={len(configs_by_username)} selected={summary or '-'} path={path}"
+        )
 
     highlight_user = _resolve_switch_highlight_tiktok_username(owner, alias_key)
     highlight_key = _normalize_tiktok_username_key(highlight_user)
@@ -15009,6 +15161,10 @@ def _build_auto_switch_bundle_for_device(
 
 
 def _fetch_pending_device_mode_event(device_id: str, since_event_id: int = 0) -> dict[str, Any] | None:
+    """尽力投递：每条模式事件仅按 since_event_id 投递一次，不依赖 ACK 决定是否重发。
+
+    管理台 auto_switch_enabled 为开关真源；ACK 仅作可观测回执，丢指令由设备端对账兜底。
+    """
     did = str(device_id or "").strip()
     if not did:
         return None
@@ -15019,25 +15175,12 @@ def _fetch_pending_device_mode_event(device_id: str, since_event_id: int = 0) ->
             """
             SELECT id, event_type, session_id, bundle_revision, payload_json, created_at
             FROM device_mode_events
-            WHERE device_id = ? AND acked_at IS NULL AND id > ?
+            WHERE device_id = ? AND id > ?
             ORDER BY id ASC
             LIMIT 1
             """,
             (did, since),
         ).fetchone()
-        # 兼容设备端 since_event_id 过大（如服务端重启/迁移后 id 重置），导致永远收不到未 ACK 事件。
-        # 若存在未 ACK 事件，则回退为从最早未 ACK 事件开始投递，避免设备端卡在“仅监听模式事件”。
-        if not row and since > 0:
-            row = conn.execute(
-                """
-                SELECT id, event_type, session_id, bundle_revision, payload_json, created_at
-                FROM device_mode_events
-                WHERE device_id = ? AND acked_at IS NULL
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (did,),
-            ).fetchone()
     finally:
         conn.close()
     if not row:
@@ -15084,7 +15227,6 @@ def _ack_device_mode_event(
             return False
         event_type = str(event_row[0] or "").strip()
         if event_row[1]:
-            # 幂等：终端已 ACK 过则直接成功，避免 mode_wait 反复投递同一事件。
             return True
         is_terminal = ph in _AUTO_SWITCH_MODE_ACK_TERMINAL_PHASES
 
@@ -16995,8 +17137,8 @@ def get_auto_switch_daily_plans(
         return err
     owner = str(session.get("username") or "").strip()
     date_key = str(schedule_date or "").strip() or _beijing_date_str()
-    # 今日时段为预分配计划；管理台展示与设备是否当前开启自动切号无关。
-    view = _auto_switch_plans_view_for_owner(owner, date_key, ensure=True)
+    # 管理台只读展示已有计划；生成/补齐周计划由设备拉取或切号流程触发，避免每次翻页/搜索写库抢锁。
+    view = _auto_switch_plans_view_for_owner(owner, date_key, ensure=False)
     return {"code": 0, "data": view}
 
 
@@ -17131,15 +17273,16 @@ def admin_table_page(table: str, page: int = 1, page_size: int = 100, search_fie
     where_sql = ""
     params: list[Any] = []
     if safe_search_keyword:
+        pattern = _case_insensitive_like_pattern(safe_search_keyword)
         if safe_search_field:
             if safe_search_field not in allowed[table]:
                 return {"code": 1, "msg": f"不支持的搜索字段: {safe_search_field}"}
-            where_sql = f"WHERE CAST({safe_search_field} AS TEXT) LIKE ?"
-            params.append(f"%{safe_search_keyword}%")
+            where_sql = f"WHERE LOWER(CAST({safe_search_field} AS TEXT)) LIKE ?"
+            params.append(pattern)
         else:
-            like_clauses = [f"CAST({field} AS TEXT) LIKE ?" for field in allowed[table]]
+            like_clauses = [f"LOWER(CAST({field} AS TEXT)) LIKE ?" for field in allowed[table]]
             where_sql = "WHERE " + " OR ".join(like_clauses)
-            params.extend([f"%{safe_search_keyword}%"] * len(allowed[table]))
+            params.extend([pattern] * len(allowed[table]))
 
     conn = _get_db()
     try:
@@ -17174,16 +17317,25 @@ def _load_overview_queue_stats_from_db(*, preview_limit: int = 200) -> dict[str,
         follow_done = conn.execute(
             "SELECT COUNT(1) FROM follower_queue WHERE COALESCE(following_fetch_success, 0) = 1"
         ).fetchone()[0]
-        pending_count = conn.execute(
-            "SELECT COUNT(1) FROM mobile_pending_usernames WHERE consume_status = 'pending'"
-        ).fetchone()[0]
+        # 临时：待下发数字 = tiktok_roots 全量；恢复队列方案时改回 mobile_pending 查询（见下方注释）。
+        pending_count = conn.execute("SELECT COUNT(1) FROM tiktok_roots").fetchone()[0]
         pending_preview = [
             str(r[0])
             for r in conn.execute(
-                "SELECT username FROM mobile_pending_usernames WHERE consume_status = 'pending' ORDER BY created_at, id LIMIT ?",
+                "SELECT root_username FROM tiktok_roots ORDER BY root_username ASC LIMIT ?",
                 (preview_limit,),
             ).fetchall()
         ]
+        # pending_count = conn.execute(
+        #     "SELECT COUNT(1) FROM mobile_pending_usernames WHERE consume_status = 'pending'"
+        # ).fetchone()[0]
+        # pending_preview = [
+        #     str(r[0])
+        #     for r in conn.execute(
+        #         "SELECT username FROM mobile_pending_usernames WHERE consume_status = 'pending' ORDER BY created_at, id LIMIT ?",
+        #         (preview_limit,),
+        #     ).fetchall()
+        # ]
         live_count = conn.execute("SELECT COUNT(1) FROM live_customer").fetchone()[0]
         return {
             "follow_total": int(follow_total or 0),

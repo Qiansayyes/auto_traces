@@ -16,48 +16,23 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * 自动切号自治调度器。
+ * 自动切号自治调度器：读本地 [AutoSwitchLocalPlan] 计划文件，按时间执行下一 pending 任务。
  *
- * 时段模型：
- * 1. **切号阶段**（本时段未 verified）：上一时段收尾 → 备份并即时上报 → 有备份还原 / 无备份自动登录 → 写 verified；
- * 2. **基线阶段**：本时段已 verified → 涨粉占满空档，不再做对齐校验打断；
- * 3. **插入阶段**：在 [start_min, end_min) 内到点的发作品/互点等 → 暂停涨粉 → 独占 TikTok → 结束后恢复涨粉。
- * 云端重复下发且时段+账号指纹不变时幂等刷新，已对齐时段不打断自治。
+ * 每个 slot：切号（backup → clear → restore/自动登录）→ 涨粉 → 到点发作品 / 引流互点。
+ * 切号三步与插入任务状态持久化在计划文件中，支持断点续跑。
  */
 class AutoSwitchLocalScheduler(
     private val scope: CoroutineScope,
     private val executeOp: suspend (alias: String, deviceId: String, op: DeviceOp) -> Unit,
     private val onPauseGrowth: () -> Unit = {},
-    /** 切号/发作品入队前：force-stop TikTok 并 pidof 校验（由 [AppCoordinator] 注入）。 */
     private val onForceStopTikTokForExclusive: suspend (phaseLabel: String) -> Unit = {},
     private val onExclusiveQueueDrained: () -> Unit = {},
     private val onTryResumeGrowth: () -> Unit = {},
     private val onRefreshWeeklyBundle: suspend () -> Boolean = { false },
     private val isPublishExecutionActive: () -> Boolean = { false },
+    private val isMutualExecutionActive: () -> Boolean = { false },
     private val onStalePublishInflight: (slotKey: String) -> Unit = {},
-    /** 时段切换：收尾上一时段活动统计等（由 [AppCoordinator] 注入）。 */
     private val onSlotTransition: (prevSlotKey: String, newSlotKey: String) -> Unit = { _, _ -> },
-    private val onVerifyPublishInsertionLogin: suspend (
-        alias: String,
-        deviceId: String,
-        targetUsername: String,
-        slotKey: String,
-    ) -> Boolean = { _, _, _, _ -> true },
-    /** OCR 缓存命中时：bundle is_login 仍为真才跳过完整登录保障。 */
-    private val onPublishLoginCacheStillValid: suspend (
-        alias: String,
-        deviceId: String,
-        targetUsername: String,
-    ) -> Boolean = { _, _, _ -> true },
-    /** 时段目标未 verified：登录校验对齐（跳过 clear/restore）。 */
-    private val onVerifySlotAlignmentLogin: suspend (
-        alias: String,
-        deviceId: String,
-        targetUsername: String,
-        slotKey: String,
-        targetRowIndex: Int,
-    ) -> Boolean = { _, _, _, _, _ -> false },
-    /** 还原前解析本机可用备份（由 [AppCoordinator] 注入）。 */
     private val resolveRestoreBackupArchive: (
         backupName: String,
         backupPathHint: String,
@@ -65,6 +40,8 @@ class AutoSwitchLocalScheduler(
         alias: String,
         deviceId: String,
     ) -> Pair<String, String>? = { _, _, _, _, _ -> null },
+    private val verifyInsertionLogin: suspend (AutoSwitchSlotTickContext, String) -> Boolean =
+        { _, _ -> true },
     private val slotInsertions: List<AutoSwitchSlotInsertion> = DEFAULT_INSERTIONS,
 ) : AutoSwitchSlotInsertionHost {
     private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
@@ -76,43 +53,23 @@ class AutoSwitchLocalScheduler(
 
     private var tickJob: Job? = null
     private var drainJob: Job? = null
-    /** 轻量对齐后台任务；登录/OCR 在 mutex 外执行，不阻塞 tick/涨粉基线。 */
-    private var lightweightVerifyJob: Job? = null
-    /** 每时段轻量对齐连续失败次数，达上限后改走切号链。 */
-    private val lightweightVerifyFailCountBySlot = mutableMapOf<String, Int>()
 
     @Volatile
     private var bundle: AutoSwitchBundle? = null
     private var alias: String = ""
     private var deviceId: String = ""
+    private var sessionId: String = ""
 
     private var lastSlotKey: String? = null
-    private var publishDoneKey: String? = null
-    private var publishAbortedKey: String? = null
-    /** 当前插入操作 in-flight：slotKey → kind（如 publish / mutual） */
     @Volatile
     private var insertionInflight: Pair<String, String>? = null
-    /** 本 slot 发作品入队前登录保障已通过（避免 publish 窗口内每分钟重复 OCR）。 */
-    private var publishLoginVerifiedSlotKey: String? = null
     private var alignOnNextTick = false
     private var cutSwitchInflightSlotKey: String? = null
-    /** 轻量登录校验对齐进行中（避免与 tick 并发重复入队）。 */
-    private var lightweightVerifyInflightSlotKey: String? = null
     private var lastProcessedScheduleDate: String? = null
     private var lastWeeklyRefreshAttemptMs: Long = 0L
-
-    /** 本分钟 tick 判定：本时段是否已 verified（切号链已完成）。 */
-    @Volatile
-    private var accountAlignedWithSlot: Boolean = false
-
-    /** 设备已是时段目标账号、仅缺 verified 时允许涨粉基线（后台异步写证明）。 */
-    @Volatile
-    private var provisionalGrowthWhileVerifyPending: Boolean = false
-
-    private data class SlotAlignment(
-        val needsCutSwitch: Boolean,
-        val verifiedAligned: Boolean,
-    )
+    private var pendingCutSwitchSlotKey: String? = null
+    private var lastTickSkipLogKey: String? = null
+    private var lastTickSkipLogMs: Long = 0L
 
     fun notifyPublishOutcome(
         slotKey: String,
@@ -122,45 +79,58 @@ class AutoSwitchLocalScheduler(
     ) {
         val sk = slotKey.trim()
         if (sk.isBlank()) return
-        clearInsertionInflightIfKind("publish", sk)
-        when {
-            completed -> {
-                publishDoneKey = "$sk|publish"
-                PrefsStore.setAutoSwitchPublishDoneKey(publishDoneKey)
-            }
-            loginFailed || accountChanged -> {
-                publishAbortedKey = "$sk|publish_aborted"
-                PrefsStore.setAutoSwitchPublishAbortedKey(publishAbortedKey)
-            }
+        val state = when {
+            completed -> PlanStepState.DONE
+            loginFailed || accountChanged -> PlanStepState.FAILED
             else -> {
-                // 素材拉取失败等不可续发场景：本时段不再每分钟重入队
-                val accountKey = PrefsStore.getAutoSwitchPublishAccountUsername()
-                    ?.trim()?.takeIf { it.isNotEmpty() }
-                    ?: PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
-                    ?: alias
+                val accountKey = AutoSwitchLocalPlanStore.activePublishAccountUsername()?.trim().orEmpty()
+                    .ifBlank { PrefsStore.getLogContextUsername()?.trim().orEmpty() }
+                    .ifBlank { alias }
                 val resumeIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
                 val materialReady = PrefsStore.isPublishPostMaterialReady()
                 if (resumeIdx <= 0 && !materialReady) {
-                    publishAbortedKey = "$sk|publish_aborted"
-                    PrefsStore.setAutoSwitchPublishAbortedKey(publishAbortedKey)
-                    LogCenter.op(
-                        alias,
-                        "【自动切号】发作品本时段终止（无断点续发），slot=$sk 不再重试",
-                    )
-                } else if (alias.isNotBlank()) {
-                    LogCenter.op(
-                        alias,
-                        "【自动切号】发作品未完成但可恢复（materialReady=$materialReady resumeIdx=$resumeIdx），slot=$sk 本时段稍后重试",
-                    )
+                    PlanStepState.FAILED
+                } else {
+                    PlanStepState.PENDING
                 }
             }
         }
+        if (state != PlanStepState.PENDING) {
+            clearInsertionInflightIfKind("publish", sk)
+        }
+        AutoSwitchLocalPlanStore.markInsertionState(sk, "publish", state)
+        if (state == PlanStepState.FAILED && alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】发作品本时段终止 slot=$sk")
+        }
+        maybeResumePendingCutSwitch()
     }
 
-    fun requestImmediateTick() {
+    fun notifyMutualOutcome(slotKey: String, completed: Boolean) {
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        clearInsertionInflightIfKind("mutual_traffic", sk)
+        AutoSwitchLocalPlanStore.markInsertionState(
+            sk,
+            "mutual_traffic",
+            if (completed) PlanStepState.DONE else PlanStepState.FAILED,
+        )
+        maybeResumePendingCutSwitch()
+    }
+
+    @Volatile
+    private var forceLogNextTick = false
+
+    fun hasBundleLoaded(): Boolean = bundle != null
+
+    fun requestImmediateTick(forceLog: Boolean = false) {
         scope.launch {
-            runCatching { tickOnce() }.onFailure { err ->
-                LogCenter.op(alias, "【自动切号】即时调度 tick 异常：${err.message}")
+            if (forceLog) forceLogNextTick = true
+            try {
+                runCatching { tickOnce() }.onFailure { err ->
+                    LogCenter.op(alias, "【自动切号】即时调度 tick 异常：${err.message}")
+                }
+            } finally {
+                forceLogNextTick = false
             }
         }
     }
@@ -169,90 +139,76 @@ class AutoSwitchLocalScheduler(
         cutSwitchInflightSlotKey = null
     }
 
-    /** 进程恢复续发时清除本时段 publish_aborted 内存标记。 */
+    fun clearPublishInsertionInflight(slotKey: String) {
+        clearInsertionInflightIfKind("publish", slotKey.trim())
+    }
+
     fun clearSlotPublishAborted(slotKey: String) {
         val sk = slotKey.trim()
         if (sk.isBlank()) return
-        val abortKey = "$sk|publish_aborted"
-        if (publishAbortedKey == abortKey) {
-            publishAbortedKey = null
-        }
-        if (PrefsStore.getAutoSwitchPublishAbortedKey() == abortKey) {
-            PrefsStore.setAutoSwitchPublishAbortedKey(null)
+        val slot = AutoSwitchLocalPlanStore.slot(sk) ?: return
+        if (slot.publish.state == PlanStepState.FAILED) {
+            AutoSwitchLocalPlanStore.markInsertionState(sk, "publish", PlanStepState.PENDING)
         }
     }
 
-    /** 切号证明失效：清本地 persisted verified，下分钟 tick 将重试切号链（ledger 仅作审计，不参与闸门）。 */
     fun invalidateSlotAlignment(slotKey: String, reason: String) {
         val sk = slotKey.trim()
-        PrefsStore.clearAutoSwitchVerifiedAlignment()
-        if (sk.isEmpty() || publishLoginVerifiedSlotKey == sk) {
-            publishLoginVerifiedSlotKey = null
-        }
-        accountAlignedWithSlot = false
-        cancelLightweightVerifyWork(clearFailCountForSlot = sk.ifBlank { null })
+        AutoSwitchLocalPlanStore.resetCutSwitch(sk)
+        pendingCutSwitchSlotKey = sk.ifBlank { pendingCutSwitchSlotKey }
         if (alias.isNotBlank()) {
-            val slotLabel = sk.ifBlank { "-" }
-            LogCenter.op(alias, "【自动切号】对齐证明失效 slot=$slotLabel：$reason")
+            LogCenter.op(alias, "【自动切号】切号计划重置 slot=${sk.ifBlank { "-"}}：$reason")
         }
     }
 
-    /** 切号链前序步骤失败（如硬停）时，丢弃同 slot 尚未执行的还原 OP，避免在错误状态下还原。 */
     fun cancelPendingCutSwitchFollowUps(slotKey: String) {
         cancelDuplicatePendingCutSwitchOps(slotKey.trim(), restoreOnly = true)
     }
 
-    /** 对齐已完成或需去重时：移除同 slot 队列中待执行的切号 OP，并清理 ledger queued。 */
-    private fun cancelDuplicatePendingCutSwitchOps(slotKey: String, restoreOnly: Boolean = false) {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return
-        val removed = mutableListOf<String>()
-        val kept = opQueue.filterNot { op ->
-            val opSk = op.payload?.auto_switch_slot_key?.trim().orEmpty()
-            if (opSk != sk) return@filterNot false
-            val match = when {
-                restoreOnly -> op.op_type == "tiktok_restore"
-                else -> op.op_type in cutSwitchQueueOpTypes
-            }
-            if (match) removed.add(op.op_id)
-            match
-        }
-        if (kept.size == opQueue.size) return
-        opQueue.clear()
-        opQueue.addAll(kept)
-        if (!restoreOnly) {
-            AutoSwitchLedger.cancelQueuedCutSwitchOpsForSlot(sk, "对齐已完成，取消重复切号 OP")
-        }
-        if (alias.isNotBlank()) {
-            val label = if (restoreOnly) "还原" else "切号"
-            LogCenter.op(alias, "【自动切号】已取消同 slot 待执行$label OP ${removed.size} 个")
-        }
-    }
-
     fun isRunning(): Boolean = tickJob?.isActive == true
 
-    /** 当前是否允许涨粉基线（已 verified，或已是目标账号且后台校验中 + 无独占 OP/插入）。 */
-    fun shouldAllowGrowthBaseline(): Boolean {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
-        if (!accountAlignedWithSlot && !provisionalGrowthWhileVerifyPending) return false
-        return !shouldBlockGrowthPull()
+    fun shouldAllowGrowthBaseline(): Boolean = growthBaselineBlockReason() == null
+
+    /** null 表示允许涨粉；非 null 为拦截原因（含 plan 切号进度摘要）。 */
+    fun growthBaselineBlockReason(): String? {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return "非自治模式"
+        val plan = AutoSwitchLocalPlanStore.get() ?: return "plan 文件不可用"
+        val entry = currentSlotEntry(plan) ?: return "当前不在任何计划时段"
+        if (!AutoSwitchLocalPlanStore.isCutSwitchDone(entry.slot_key)) {
+            return AutoSwitchLocalPlanStore.formatCutSwitchProgressLine(entry.slot_key)
+                ?: "切号未完成 slot=${entry.slot_key}"
+        }
+        return growthPullBlockReason()
     }
 
-    /** 切号/插入 OP 队列或插入 in-flight 时涨粉应让路。 */
-    fun shouldBlockGrowthPull(): Boolean {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
-        if (PrefsStore.getAutoSwitchMode() == "exiting") return true
-        if (busy.get()) return true
-        if (opQueue.isNotEmpty()) return true
-        val inflight = insertionInflight ?: return false
-        return isInsertionKindStillActive(inflight.second)
+    private fun growthPullBlockReason(): String? {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return null
+        if (PrefsStore.getAutoSwitchMode() == "exiting") return "自治退出中"
+        if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return "发作品占用中"
+        if (AutoSwitchLocalPlanStore.isMutualContextOccupying()) return "互点占用中"
+        if (busy.get()) return "独占 OP 执行中"
+        if (opQueue.isNotEmpty()) return "独占 OP 队列非空（${opQueue.size}）"
+        if (pendingCutSwitchSlotKey != null) return "切号等待高优插入 slot=$pendingCutSwitchSlotKey"
+        val inflight = insertionInflight ?: return null
+        return if (isInsertionKindStillActive(inflight.second)) {
+            "插入任务进行中 slot=${inflight.first} kind=${inflight.second}"
+        } else {
+            null
+        }
     }
 
-    // --- AutoSwitchSlotInsertionHost ---
+    fun shouldBlockGrowthPull(): Boolean = growthPullBlockReason() != null
+
+    override fun isSlotReady(slotKey: String, targetRowIndex: Int): Boolean =
+        AutoSwitchLocalPlanStore.isSlotReady(slotKey)
+
+    override fun isWithinSwitchSafeBuffer(minuteOfDay: Int, slot: AutoSwitchPlanSlot): Boolean =
+        AutoSwitchSlotWindow.isWithinSwitchSafeBuffer(minuteOfDay, slot, SWITCH_SAFE_BUFFER_MIN)
 
     override suspend fun enqueueInsertion(op: DeviceOp, slotKey: String, kind: String) {
         beginExclusiveEnqueue("插入操作")
         markInsertionInflight(slotKey, kind)
+        AutoSwitchLocalPlanStore.markInsertionState(slotKey, kind, PlanStepState.RUNNING)
         opQueue.add(op)
     }
 
@@ -272,141 +228,51 @@ class AutoSwitchLocalScheduler(
     override suspend fun verifyInsertionAccountLoggedIn(
         ctx: AutoSwitchSlotTickContext,
         kind: String,
-    ): Boolean {
-        if (kind != "publish") return true
-        val slotKey = ctx.slotKey.trim()
-        val targetUser = ctx.account.username?.trim().orEmpty()
-        if (slotKey.isNotEmpty() && publishLoginVerifiedSlotKey == slotKey) {
-            if (targetUser.isNotBlank() && onPublishLoginCacheStillValid(alias, deviceId, targetUser)) {
-                return true
-            }
-            publishLoginVerifiedSlotKey = null
-            if (alias.isNotBlank()) {
-                LogCenter.op(
-                    alias,
-                    "【自动切号】发作品登录 OCR 缓存失效（bundle is_login 未就绪），重新校验 slot=$slotKey",
-                )
-            }
-        }
-        if (targetUser.isBlank() || alias.isBlank() || deviceId.isBlank()) return false
-        beginExclusiveEnqueue("发作品入队前登录校验")
-        val ok = runCatching {
-            onVerifyPublishInsertionLogin(alias, deviceId, targetUser, slotKey)
-        }.getOrElse { err ->
-            LogCenter.op(alias, "【自动切号】发作品入队前登录校验异常：${err.message}")
-            false
-        }
-        if (ok) {
-            publishLoginVerifiedSlotKey = slotKey
-        } else {
-            releaseExclusivePreemptAfterFailedInsertionVerify()
-        }
-        return ok
-    }
+    ): Boolean = verifyInsertionLogin(ctx, kind)
 
-    private fun releaseExclusivePreemptAfterFailedInsertionVerify() {
-        onExclusiveQueueDrained()
-        onTryResumeGrowth()
-    }
-
-    // --- bundle / lifecycle ---
+    override fun insertionState(kind: String, slotKey: String): PlanStepState? =
+        AutoSwitchLocalPlanStore.insertionState(slotKey, kind)
 
     fun refreshBundle(bundle: AutoSwitchBundle) {
-        this.bundle = bundle
-        syncBundleHolder()
+        syncPlanFromBundle(bundle)
     }
 
-    /** 跨天仍在本周内：仅刷新内存 bundle；跨周由 [onRefreshWeeklyBundle] 拉新包。返回是否时段+账号指纹未变。 */
     fun refreshWeeklyBundle(bundle: AutoSwitchBundle): Boolean {
         val local = this.bundle
-        val equivalent = local != null && local.isScheduleAndAccountsEquivalentTo(bundle)
-        val mergedIncoming = bundle.mergePreservingLocalRuntimeState(local)
-        val merged = mergedIncoming
-        this.bundle = merged
-        syncBundleHolder()
+        val planAccounts = AutoSwitchLocalPlanStore.get()?.accounts.orEmpty()
+        val accountsEquivalent = local != null &&
+            (local.isAccountsEquivalentTo(bundle) ||
+                (planAccounts.isNotEmpty() && bundle.isAccountsEquivalentTo(planAccounts)))
+        syncPlanFromBundle(bundle)
         lastWeeklyRefreshAttemptMs = 0L
+        val merged = this.bundle ?: return accountsEquivalent
         val weekStart = merged.week_start_date?.trim().orEmpty()
         val weekEnd = merged.week_end_date?.trim().orEmpty()
         if (weekStart.isNotBlank() && weekEnd.isNotBlank()) {
             PrefsStore.setAutoSwitchWeekRange(weekStart, weekEnd)
         }
-        if (equivalent) {
-            accountAlignedWithSlot = isCurrentSlotEnvironmentCommitted()
-        }
-        val fpNote = if (equivalent) "（时段+账号未变，幂等刷新）" else ""
+        val fpNote = if (accountsEquivalent) "（账号未变，幂等刷新）" else "（账号变更，将重新配置）"
         LogCenter.op(
             alias,
             "【自动切号】已刷新周计划 bundle week=$weekStart~$weekEnd days=${merged.weekly_plan?.day_plans?.size ?: 0}$fpNote",
         )
-        return equivalent
+        return accountsEquivalent
     }
 
-    /** 本时段环境已让位给目标账号（还原/自动登录成功并 verified）。 */
     fun isCurrentSlotEnvironmentCommitted(): Boolean {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
-        val b = bundle ?: return false
-        val scheduleDate = beijingDateStr()
-        val minuteOfDay = beijingMinuteOfDay()
-        val plan = b.dailyPlanForDate(scheduleDate) ?: return false
-        val slotIndex = AutoSwitchSlotWindow.resolveSlotIndex(plan, minuteOfDay)
-        val slotKey = "$scheduleDate|$slotIndex"
-        val targetRi = b.resolveCurrentSlotTargetAccount(scheduleDate, minuteOfDay)?.row_index ?: return false
-        return PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
+        val plan = AutoSwitchLocalPlanStore.get() ?: return false
+        val entry = currentSlotEntry(plan) ?: return false
+        return AutoSwitchLocalPlanStore.isCutSwitchDone(entry.slot_key)
     }
 
     fun notifyCutSwitchAligned(targetRowIndex: Int, slotKey: String) {
-        val ri = targetRowIndex
         val sk = slotKey.trim()
-        if (ri < 0 || sk.isEmpty()) {
-            accountAlignedWithSlot = false
-            return
-        }
+        if (targetRowIndex < 0 || sk.isEmpty()) return
         cancelDuplicatePendingCutSwitchOps(sk)
         cutSwitchInflightSlotKey = null
-        PrefsStore.setAutoSwitchVerifiedAlignment(sk, ri)
-        accountAlignedWithSlot = true
-        provisionalGrowthWhileVerifyPending = false
-        lightweightVerifyFailCountBySlot.remove(sk)
-    }
-
-    private fun cancelLightweightVerifyWork(clearFailCountForSlot: String? = null) {
-        provisionalGrowthWhileVerifyPending = false
-        lightweightVerifyJob?.cancel()
-        lightweightVerifyJob = null
-        lightweightVerifyInflightSlotKey = null
-        if (!clearFailCountForSlot.isNullOrBlank()) {
-            lightweightVerifyFailCountBySlot.remove(clearFailCountForSlot.trim())
-        }
-    }
-
-    private fun shouldEscalateLightweightToCutSwitch(slotKey: String): Boolean =
-        (lightweightVerifyFailCountBySlot[slotKey.trim()] ?: 0) >= LIGHTWEIGHT_VERIFY_ESCALATE_AFTER
-
-    private fun recordLightweightVerifyFailure(slotKey: String) {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return
-        val next = (lightweightVerifyFailCountBySlot[sk] ?: 0) + 1
-        lightweightVerifyFailCountBySlot[sk] = next
-        if (next >= LIGHTWEIGHT_VERIFY_ESCALATE_AFTER && alias.isNotBlank()) {
-            LogCenter.op(
-                alias,
-                "【自动切号】时段 $sk 轻量对齐已连续失败 $next 次，下轮 tick 将改走切号链",
-            )
-        }
-    }
-
-    private fun syncBundleHolder() {
-        AutoSwitchBundleHolder.setBundle(bundle)
-    }
-
-    private fun graduateNewAccountVideoCountInBundle(targetRow: AutoSwitchAccount) {
-        val targetRi = targetRow.row_index ?: return
-        val current = bundle ?: return
-        val accounts = current.accounts.orEmpty().map { acc ->
-            if ((acc.row_index ?: -1) == targetRi) acc.copy(video_count = "0") else acc
-        }
-        bundle = current.copy(accounts = accounts)
-        syncBundleHolder()
+        pendingCutSwitchSlotKey = null
+        AutoSwitchLocalPlanStore.markCutSwitchDone(sk)
     }
 
     fun start(alias: String, deviceId: String, bundle: AutoSwitchBundle, revision: Int = -1) {
@@ -422,37 +288,29 @@ class AutoSwitchLocalScheduler(
         stop(clearState = false)
         this.alias = alias.trim()
         this.deviceId = deviceId.trim()
-        this.bundle = bundle.withCurrentTimeSlotHighlight()
-        syncBundleHolder()
+        this.sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
+        syncPlanFromBundle(bundle)
         this.alignOnNextTick = true
         lastSlotKey = PrefsStore.getAutoSwitchLastSlotKey()
-        publishDoneKey = PrefsStore.getAutoSwitchPublishDoneKey()
-        publishAbortedKey = PrefsStore.getAutoSwitchPublishAbortedKey()
         insertionInflight = null
-        recoverStalePublishInflightOnStart()
-        recoverStaleCutSwitchInflightOnStart()
-        accountAlignedWithSlot = isCurrentSlotEnvironmentCommitted()
+        pendingCutSwitchSlotKey = null
+        recoverAllStaleInflightOnStart()
         lastProcessedScheduleDate = null
         PrefsStore.setAutoSwitchLastSchedulerRevision(rev)
         drainJob = scope.launch { drainQueueLoop() }
         tickJob = scope.launch { tickLoop() }
         LogCenter.op(
             this.alias,
-            "【自动切号】本地调度器已启动 schedule=${bundle.schedule_date} accounts=${bundle.accounts?.size ?: 0} revision=$rev",
+            "【自动切号】本地调度器已启动（计划文件驱动） schedule=${bundle.schedule_date} " +
+                "accounts=${AutoSwitchLocalPlanStore.get()?.accounts?.size ?: 0} revision=$rev",
         )
     }
 
     fun isExclusiveWorkActive(): Boolean = busy.get() || opQueue.isNotEmpty()
 
-    /**
-     * 等待独占 OP（切号/还原/插入）收尾。exit 前必须调用，否则 [stop] 会 cancel drainJob 打断进行中的自动登录。
-     */
     suspend fun awaitExclusiveIdle(maxWaitMs: Long = 600_000L): Boolean {
         if (alias.isNotBlank() && isExclusiveWorkActive()) {
-            LogCenter.op(
-                alias,
-                "【自动切号】等待独占 OP 收尾（队列=${opQueue.size} busy=${busy.get()}）…",
-            )
+            LogCenter.op(alias, "【自动切号】等待独占 OP 收尾（队列=${opQueue.size} busy=${busy.get()}）…")
         }
         var waited = 0L
         val interval = 250L
@@ -460,17 +318,9 @@ class AutoSwitchLocalScheduler(
             delay(interval)
             waited += interval
         }
-        val idle = !isExclusiveWorkActive()
-        if (!idle && alias.isNotBlank()) {
-            LogCenter.op(
-                alias,
-                "【自动切号】独占 OP 等待超时（${maxWaitMs / 1000}s），仍将停止调度器",
-            )
-        }
-        return idle
+        return !isExclusiveWorkActive()
     }
 
-    /** 先等独占 OP 结束再 [stop]，避免会话关闭打断切号链。 */
     suspend fun stopAfterIdle(clearState: Boolean = true, maxWaitMs: Long = 600_000L) {
         awaitExclusiveIdle(maxWaitMs)
         stop(clearState)
@@ -481,8 +331,6 @@ class AutoSwitchLocalScheduler(
         tickJob = null
         drainJob?.cancel()
         drainJob = null
-        lightweightVerifyJob?.cancel()
-        lightweightVerifyJob = null
         opQueue.clear()
         busy.set(false)
         if (clearState) {
@@ -490,27 +338,38 @@ class AutoSwitchLocalScheduler(
             syncBundleHolder()
             alignOnNextTick = false
             lastSlotKey = null
-            publishDoneKey = null
-            publishAbortedKey = null
             insertionInflight = null
             cutSwitchInflightSlotKey = null
-            lightweightVerifyInflightSlotKey = null
-            publishLoginVerifiedSlotKey = null
-            accountAlignedWithSlot = false
-            provisionalGrowthWhileVerifyPending = false
-            lightweightVerifyFailCountBySlot.clear()
-            PrefsStore.clearAutoSwitchVerifiedAlignment()
-            PrefsStore.setAutoSwitchPublishDoneKey(null)
-            PrefsStore.setAutoSwitchPublishAbortedKey(null)
+            pendingCutSwitchSlotKey = null
+            AutoSwitchLocalPlanStore.clear()
         }
+    }
+
+    private fun syncPlanFromBundle(cloud: AutoSwitchBundle) {
+        val rev = PrefsStore.getAutoSwitchBundleRevision()
+        AutoSwitchLocalPlanStore.mergeFromBundle(
+            cloud,
+            rev,
+            sessionId.ifBlank { PrefsStore.getAutoSwitchSessionId().orEmpty() },
+        )
+        refreshBundleFromPlan(cloud)
+    }
+
+    private fun refreshBundleFromPlan(cloud: AutoSwitchBundle) {
+        bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(cloud.withCurrentTimeSlotHighlight())
+        syncBundleHolder()
+    }
+
+    private fun currentSlotEntry(plan: AutoSwitchLocalPlan): SlotPlanEntry? {
+        val date = beijingDateStr()
+        val minute = beijingMinuteOfDay()
+        return AutoSwitchLocalPlanStore.resolveSlotForMinute(plan, date, minute)
     }
 
     private suspend fun tickLoop() {
         if (alignOnNextTick) {
             alignOnNextTick = false
-            runCatching { tickOnce() }.onFailure { err ->
-                LogCenter.op(alias, "【自动切号】启动即时 tick 异常：${err.message}")
-            }
+            runCatching { tickOnce() }
         }
         alignToNextBeijingMinuteBoundary()
         while (scope.coroutineContext.isActive) {
@@ -523,9 +382,7 @@ class AutoSwitchLocalScheduler(
 
     private suspend fun alignToNextBeijingMinuteBoundary() {
         val waitMs = msUntilNextBeijingMinuteBoundary()
-        if (waitMs in 1..59_999) {
-            delay(waitMs)
-        }
+        if (waitMs in 1..59_999) delay(waitMs)
         runCatching { tickOnce() }
     }
 
@@ -557,484 +414,356 @@ class AutoSwitchLocalScheduler(
             if (opQueue.isEmpty() && shouldAllowGrowthBaseline()) {
                 onTryResumeGrowth()
             }
+            maybeResumePendingCutSwitch()
         }
     }
 
-    private suspend fun tryRefreshWeeklyBundle(reason: String): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastWeeklyRefreshAttemptMs < WEEKLY_REFRESH_COOLDOWN_MS) {
-            return false
+    private fun maybeResumePendingCutSwitch() {
+        if (pendingCutSwitchSlotKey != null && !hasActiveHighPriorityInsertion()) {
+            AutoSwitchLocalPlanStore.resumeCutSwitchFromWaiting(pendingCutSwitchSlotKey!!)
+            pendingCutSwitchSlotKey = null
+            requestImmediateTick()
         }
-        lastWeeklyRefreshAttemptMs = now
-        LogCenter.op(alias, "【自动切号】$reason，向云端拉取周计划 bundle…")
-        return onRefreshWeeklyBundle()
     }
 
     private suspend fun tickOnce() {
-        tickMutex.withLock {
-            tickOnceUnlocked()
-        }
+        tickMutex.withLock { tickOnceUnlocked() }
     }
 
     private suspend fun tickOnceUnlocked() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (PublishPostGrowthGate.isBlockingGrowth()) {
-            LogCenter.op(alias, "【自动切号】调度暂缓：发作品独占发布中")
+            logTickSkipThrottled("发作品独占发布中")
             return
         }
+
         val currentBundle = bundle ?: run {
-            accountAlignedWithSlot = false
             LogCenter.op(alias, "【自动切号】调度跳过：bundle 为空")
             return
+        }
+        val plan = AutoSwitchLocalPlanStore.get() ?: run {
+            syncPlanFromBundle(currentBundle)
+            AutoSwitchLocalPlanStore.get() ?: run {
+                logTickSkip("本地 plan 文件不可用")
+                return
+            }
         }
 
         val scheduleDate = beijingDateStr()
         if (lastProcessedScheduleDate != null && lastProcessedScheduleDate != scheduleDate) {
+            AutoSwitchLocalPlanStore.onScheduleDateChanged(lastProcessedScheduleDate!!)
             onPauseGrowth()
-            cutSwitchInflightSlotKey = null
-            lightweightVerifyInflightSlotKey = null
-            publishDoneKey = null
-            publishAbortedKey = null
-            insertionInflight = null
-            publishLoginVerifiedSlotKey = null
             opQueue.clear()
             busy.set(false)
+            insertionInflight = null
+            pendingCutSwitchSlotKey = null
             AutoSwitchLedger.cancelQueuedCutSwitchOpsForScheduleDate(lastProcessedScheduleDate!!)
-            PrefsStore.clearAutoSwitchVerifiedAlignment()
-            PrefsStore.setAutoSwitchPublishDoneKey(null)
-            PrefsStore.setAutoSwitchPublishAbortedKey(null)
-            provisionalGrowthWhileVerifyPending = false
-            lightweightVerifyFailCountBySlot.clear()
-            lightweightVerifyJob?.cancel()
-            lightweightVerifyJob = null
-            LogCenter.op(
-                alias,
-                "【自动切号】日期切换 $lastProcessedScheduleDate → $scheduleDate，已暂停涨粉并清理昨日发作品状态",
-            )
+            LogCenter.op(alias, "【自动切号】日期切换 $lastProcessedScheduleDate → $scheduleDate")
         }
         lastProcessedScheduleDate = scheduleDate
 
         if (!currentBundle.isDateInWeekRange(scheduleDate)) {
-            accountAlignedWithSlot = false
-            if (tryRefreshWeeklyBundle("今日 $scheduleDate 不在当前周计划内")) {
-                return
-            }
-            LogCenter.op(alias, "【自动切号】周计划刷新冷却中或失败，本分钟 tick 暂缓")
-            return
-        }
-
-        val plan = currentBundle.dailyPlanForDate(scheduleDate)
-        if (plan == null) {
-            accountAlignedWithSlot = false
-            if (tryRefreshWeeklyBundle("周计划缺少今日 $scheduleDate 的 daily_plan")) {
-                return
-            }
-            LogCenter.op(alias, "【自动切号】调度跳过：周计划缺少今日 $scheduleDate 的 daily_plan")
-            return
-        }
-        val slots = plan.slots.orEmpty()
-        if (slots.isEmpty()) {
-            accountAlignedWithSlot = false
-            LogCenter.op(alias, "【自动切号】调度跳过：时段 slots 为空")
+            if (tryRefreshWeeklyBundle("今日 $scheduleDate 不在当前周计划内")) return
+            logTickSkipThrottled("今日 $scheduleDate 不在当前周计划内")
             return
         }
 
         val minuteOfDay = beijingMinuteOfDay()
-        val targetSlot = AutoSwitchSlotWindow.resolveTargetSlot(plan, minuteOfDay) ?: run {
-            accountAlignedWithSlot = false
-            LogCenter.op(alias, "【自动切号】调度跳过：当前分钟 $minuteOfDay 无匹配时段")
+        if (forceLogNextTick) {
+            AutoSwitchLocalPlanStore.abandonExpiredIncompleteCutSwitches(scheduleDate, minuteOfDay)
+        }
+        val currentSlotEntry = AutoSwitchLocalPlanStore.resolveSlotForMinute(plan, scheduleDate, minuteOfDay)
+        val incompleteRecovery = if (forceLogNextTick) {
+            findRecoverableIncompleteCutSwitch(currentSlotEntry)
+        } else {
+            null
+        }
+        val slotEntry = incompleteRecovery
+            ?: currentSlotEntry
+            ?: run {
+                logTickSkip("当前 $scheduleDate ${formatMinuteOfDay(minuteOfDay)} 不在任何计划时段内")
+                return
+            }
+        if (incompleteRecovery != null && alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】续跑：恢复 crash 未完成切号 slot=${slotEntry.slot_key}（仅当前时段）",
+            )
+        }
+
+        val slotScheduleDate = slotEntry.schedule_date
+        val planSlot = currentBundle.dailyPlanForDate(slotScheduleDate)?.slots.orEmpty()
+            .firstOrNull { (it.slot_index ?: -1) == slotEntry.slot_index }
+            ?: run {
+                logTickSkip("时段 slot=${slotEntry.slot_key} 在 bundle 中缺失")
+                return
+            }
+
+        if (!AutoSwitchSlotWindow.isWithinSlot(minuteOfDay, planSlot)) {
+            logTickSkip("当前分钟不在时段 ${slotEntry.slot_key} 有效窗口内")
             return
         }
 
-        if (!AutoSwitchSlotWindow.isWithinSlot(minuteOfDay, targetSlot)) {
-            accountAlignedWithSlot = false
-            return
-        }
-
-        val slotIndex = AutoSwitchSlotWindow.resolveSlotIndex(plan, minuteOfDay)
-        val slotKey = "$scheduleDate|$slotIndex"
-
-        refreshInsertionSlotState(slotKey, minuteOfDay, targetSlot)
-        maybeSweepOrphanedPublishState(slotKey)
-        maybeSweepOrphanedCutSwitchState(slotKey)
-
-        val accounts = currentBundle.accounts.orEmpty()
-        val targetRi = targetSlot.row_index ?: -1
-        val targetRow = accounts.firstOrNull { (it.row_index ?: -1) == targetRi } ?: run {
-            accountAlignedWithSlot = false
-            LogCenter.op(alias, "【自动切号】调度跳过：时段目标 row_index=$targetRi 不在 bundle.accounts")
-            return
-        }
-        bundle = currentBundle.withTimeSlotHighlight(scheduleDate, minuteOfDay)
+        bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(
+            currentBundle.withTimeSlotHighlight(slotScheduleDate, minuteOfDay),
+        )
         syncBundleHolder()
 
-        val alignment = evaluateSlotAlignment(slotKey, targetRi)
-        val needsCutSwitch = alignment.needsCutSwitch
-        accountAlignedWithSlot = alignment.verifiedAligned
-
-        if (lastSlotKey != null && lastSlotKey != slotKey) {
-            cancelLightweightVerifyWork()
+        val slotKey = slotEntry.slot_key
+        val slotChanged = lastSlotKey != null && lastSlotKey != slotKey
+        if (slotChanged) {
+            AutoSwitchLocalPlanStore.onActiveSlotChanged(slotKey, lastSlotKey!!)
             onSlotTransition(lastSlotKey!!, slotKey)
-            lastSlotKey = slotKey
-            PrefsStore.setAutoSwitchLastSlotKey(slotKey)
+            LogCenter.op(alias, "【自动切号】时段切换 ${lastSlotKey} → $slotKey")
         }
+        lastSlotKey = slotKey
+        PrefsStore.setAutoSwitchLastSlotKey(slotKey)
 
-        val busyReason = if (needsCutSwitch) {
-            deviceBusyReasonForCutSwitch()
-        } else {
-            deviceBusyReasonForInsertionScheduling()
-        }
-        if (busyReason != null) {
-            LogCenter.op(alias, "【自动切号】调度暂缓：$busyReason")
+        maybeSweepOrphanedPublishState(slotKey)
+
+        if (!AutoSwitchLocalPlanStore.isCutSwitchDone(slotKey)) {
+            if (hasActiveHighPriorityInsertion()) {
+                pendingCutSwitchSlotKey = slotKey
+                AutoSwitchLocalPlanStore.markCutSwitchWaiting(slotKey)
+                LogCenter.op(alias, "【自动切号】切号等待高优插入完成 slot=$slotKey")
+                return
+            }
+            deviceBusyReasonForCutSwitch()?.let { reason ->
+                logTickSkip("切号等待：$reason")
+                return
+            }
+            pendingCutSwitchSlotKey = null
+            handleCutSwitchFromPlan(currentBundle, slotEntry)
             return
         }
 
-        if (!needsCutSwitch) {
-            cutSwitchInflightSlotKey = null
-            if (lastSlotKey != null && !lastSlotKey!!.startsWith("$scheduleDate|")) {
-                publishDoneKey = null
-                publishAbortedKey = null
-                PrefsStore.setAutoSwitchPublishDoneKey(null)
-                PrefsStore.setAutoSwitchPublishAbortedKey(null)
-            }
-            lastSlotKey = slotKey
-            PrefsStore.setAutoSwitchLastSlotKey(slotKey)
-            val enqueuedInsertion = scheduleSlotInsertions(
-                bundle ?: currentBundle, targetSlot, targetRow, scheduleDate, slotKey, minuteOfDay,
-            )
-            tryResumeGrowthBaseline(enqueuedInsertion = enqueuedInsertion)
+        cutSwitchInflightSlotKey = null
+        pendingCutSwitchSlotKey = null
+
+        deviceBusyReasonForInsertionScheduling()?.let { reason ->
+            logTickSkipThrottled("插入调度等待：$reason")
             return
         }
 
-        val targetUser = targetRow.username?.trim().orEmpty()
-        val deviceCommittedRow = resolveDeviceCommittedAccount(accounts, targetRow, slotKey)
-        val cutEnqueued = when {
-            deviceCommittedRow == null -> {
-                val logUser = PrefsStore.getLogContextUsername()?.trim()?.lowercase().orEmpty()
-                val targetUserKey = targetRow.username?.trim()?.lowercase().orEmpty()
-                if (logUser.isNotBlank() && logUser == targetUserKey) {
-                    if (!shouldEscalateLightweightToCutSwitch(slotKey)) {
-                        scheduleLightweightSlotAlignmentVerify(targetRow, slotKey)
-                        tryResumeGrowthBaseline(enqueuedInsertion = false)
-                        return
-                    }
-                    LogCenter.op(alias, "【自动切号】时段 $slotKey 轻量对齐多次失败，改走初始切号")
-                    provisionalGrowthWhileVerifyPending = false
-                    if (enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)) {
-                        cutSwitchInflightSlotKey = slotKey
-                    }
-                    return
-                }
-                provisionalGrowthWhileVerifyPending = false
-                if (accounts.size <= 1) {
-                    val soleRi = accounts.firstOrNull()?.row_index ?: -1
-                    if (soleRi != targetRi) {
-                        LogCenter.op(alias, "【自动切号】调度跳过：无法推断设备当前账号且仅 1 个 bundle 账号，无法切号")
-                        return
-                    }
-                    if (!shouldEscalateLightweightToCutSwitch(slotKey)) {
-                        scheduleLightweightSlotAlignmentVerify(targetRow, slotKey)
-                        tryResumeGrowthBaseline(enqueuedInsertion = false)
-                        return
-                    }
-                    LogCenter.op(alias, "【自动切号】时段 $slotKey 轻量对齐多次失败，改走初始切号")
-                    provisionalGrowthWhileVerifyPending = false
-                    if (enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)) {
-                        cutSwitchInflightSlotKey = slotKey
-                    }
-                    return
-                } else {
-                    enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)
-                }
-            }
-            (deviceCommittedRow.row_index ?: -1) == targetRi -> {
-                if (!shouldEscalateLightweightToCutSwitch(slotKey)) {
-                    scheduleLightweightSlotAlignmentVerify(targetRow, slotKey)
-                    tryResumeGrowthBaseline(enqueuedInsertion = false)
-                    false
-                } else {
-                    LogCenter.op(alias, "【自动切号】时段 $slotKey 轻量对齐多次失败，改走初始切号")
-                    provisionalGrowthWhileVerifyPending = false
-                    enqueueBootstrapCutSwitch(bundle ?: currentBundle, targetRow, slotKey)
-                }
-            }
-            else -> {
-                provisionalGrowthWhileVerifyPending = false
-                val sourceUser = deviceCommittedRow.username?.trim().orEmpty()
-                LogCenter.op(
-                    alias,
-                    "【自动切号】时段 $slotKey 应对齐 $targetUser（设备当前 $sourceUser），入队切号",
-                )
-                if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
-                    LogCenter.op(alias, "【自动切号】时段 $slotKey 已有切号 OP 进行中，跳过重复入队")
-                    false
-                } else {
-                    enqueueCutSwitch(bundle ?: currentBundle, deviceCommittedRow, targetRow, slotKey)
-                }
-            }
-        }
-        if (cutEnqueued) {
-            cutSwitchInflightSlotKey = slotKey
-        }
-    }
+        val targetRow = currentBundle.accounts.orEmpty()
+            .firstOrNull { (it.row_index ?: -1) == slotEntry.target_row_index }
+            ?: return
 
-    private suspend fun scheduleSlotInsertions(
-        bundle: AutoSwitchBundle,
-        targetSlot: AutoSwitchPlanSlot,
-        targetRow: AutoSwitchAccount,
-        scheduleDate: String,
-        slotKey: String,
-        minuteOfDay: Int,
-    ): Boolean {
         val ctx = AutoSwitchSlotTickContext(
             alias = alias,
             deviceId = deviceId,
-            bundle = bundle,
+            bundle = currentBundle,
             scheduleDate = scheduleDate,
             slotKey = slotKey,
-            slot = targetSlot,
+            slot = planSlot,
             account = targetRow,
             minuteOfDay = minuteOfDay,
         )
+        var enqueued = false
         for (insertion in slotInsertions) {
             if (insertion.trySchedule(ctx, this)) {
-                return true
+                enqueued = true
+                break
             }
         }
-        return false
-    }
-
-    private fun tryResumeGrowthBaseline(enqueuedInsertion: Boolean) {
-        if (enqueuedInsertion) return
-        if (!shouldAllowGrowthBaseline()) return
-        onTryResumeGrowth()
-    }
-
-    private fun enqueueExclusiveOp(op: DeviceOp) {
-        onPauseGrowth()
-        opQueue.add(op)
-    }
-
-    private fun hasRealCutSwitchQueueWork(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return false
-        if (opQueue.any { isCutSwitchOpForSlot(it, sk) }) return true
-        if (AutoSwitchLedger.isCutSwitchSlotInflight(sk)) return true
-        if (busy.get() && cutSwitchInflightSlotKey == sk) return true
-        return false
-    }
-
-    private fun hasCutSwitchWorkInProgress(slotKey: String, targetRi: Int): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return false
-        if (lightweightVerifyInflightSlotKey == sk) return true
-        if (opQueue.any { isCutSwitchOpForSlot(it, sk) }) return true
-        if (AutoSwitchLedger.isCutSwitchSlotInflight(sk)) return true
-        if (busy.get() && cutSwitchInflightSlotKey == sk) return true
-        return false
-    }
-
-    private fun isCutSwitchOpForSlot(op: DeviceOp, slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return false
-        return op.payload?.auto_switch_slot_key?.trim() == sk &&
-            op.op_type in cutSwitchQueueOpTypes
-    }
-
-    /**
-     * 异步启动轻量对齐：不占用 tickMutex，不主动抢占涨粉；设备已是目标账号时 provisional 允许涨粉基线。
-     * @return true 表示已 verified；false 表示已调度或进行中。
-     */
-    private fun scheduleLightweightSlotAlignmentVerify(
-        targetRow: AutoSwitchAccount,
-        slotKey: String,
-    ): Boolean {
-        val targetRi = targetRow.row_index ?: return false
-        val targetUser = targetRow.username?.trim().orEmpty()
-        if (targetUser.isBlank()) return false
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return false
-        if (PrefsStore.isAutoSwitchVerifiedAligned(sk, targetRi)) {
-            provisionalGrowthWhileVerifyPending = false
-            notifyCutSwitchAligned(targetRi, sk)
-            return true
-        }
-        provisionalGrowthWhileVerifyPending = true
-        if (lightweightVerifyJob?.isActive == true) {
-            return false
-        }
-        if (hasRealCutSwitchQueueWork(sk)) {
-            return false
-        }
-        lightweightVerifyInflightSlotKey = sk
-        cutSwitchInflightSlotKey = sk
-        lightweightVerifyJob = scope.launch {
-            try {
+        if (!enqueued && shouldAllowGrowthBaseline()) {
+            if (alias.isNotBlank()) {
+                val progress = AutoSwitchLocalPlanStore.formatCutSwitchProgressLine(slotKey)
                 LogCenter.op(
                     alias,
-                    "【自动切号】时段 $sk 后台登录校验对齐 @$targetUser（不阻塞调度 tick）",
+                    "【自动切号】空档无插入任务，允许涨粉" +
+                        (progress?.let { "：$it" } ?: ""),
                 )
-                // 实际占用 TikTok 前再暂停涨粉，避免与 OCR/登录并发；tick 与 mode_wait 不受影响。
-                onPauseGrowth()
-                val loginOk = onVerifySlotAlignmentLogin(alias, deviceId, targetUser, sk, targetRi)
-                if (loginOk) {
-                    AutoSwitchLedger.recordCutSwitchSlotVerified(sk, targetRi, targetUser)
-                    notifyCutSwitchAligned(targetRi, sk)
-                    LogCenter.op(alias, "【自动切号】时段 $sk 登录校验对齐完成 @$targetUser")
+            }
+            onTryResumeGrowth()
+        } else if (!enqueued && alias.isNotBlank()) {
+            growthBaselineBlockReason()?.let { reason ->
+                LogCenter.op(alias, "【自动切号】空档暂不允许涨粉：$reason")
+            }
+        }
+    }
+
+    private suspend fun handleCutSwitchFromPlan(bundle: AutoSwitchBundle, entry: SlotPlanEntry) {
+        val slotKey = entry.slot_key
+        val targetRi = entry.target_row_index
+        val accounts = bundle.accounts.orEmpty()
+        val targetRow = accounts.firstOrNull { (it.row_index ?: -1) == targetRi } ?: run {
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】切号跳过：slot=$slotKey 目标 row=$targetRi 在 bundle 中不存在")
+            }
+            return
+        }
+
+        val planSlot = AutoSwitchLocalPlanStore.slot(slotKey) ?: entry
+        val cs = planSlot.cut_switch
+        // 切号是否完成只看 plan 文件 cut_switch 进度；未 DONE 则 strictly 按 nextPendingStep 续跑，不因 logContext 等推断「已对齐」。
+        val needsLoginFinish = !cs.isDone() &&
+            cs.restore_or_login != PlanStepState.DONE &&
+            cs.restore_or_login != PlanStepState.SKIPPED &&
+            (cs.backup == PlanStepState.DONE || cs.backup == PlanStepState.SKIPPED) &&
+            (cs.clear == PlanStepState.DONE || cs.clear == PlanStepState.SKIPPED)
+        if (needsLoginFinish) {
+            if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
+                logCutSwitchSkip("切号进行中 slot=$slotKey step=RESTORE_OR_LOGIN（plan 续跑还原/自动登录）")
+                return
+            }
+            val sourceRow = resolveSourceAccount(accounts, entry)
+            val enqueued = enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
+            if (enqueued) {
+                cutSwitchInflightSlotKey = slotKey
+            } else if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】切号入队失败 slot=$slotKey step=RESTORE_OR_LOGIN（plan 续跑）")
+            }
+            return
+        }
+
+        val sourceRow = resolveSourceAccount(accounts, entry)
+        val nextStep = planSlot.cut_switch.nextPendingStep() ?: run {
+            if (!AutoSwitchLocalPlanStore.isCutSwitchDone(slotKey)) {
+                logCutSwitchSkip("切号计划无待执行步骤 slot=$slotKey state=${planSlot.cut_switch}")
+            }
+            return
+        }
+
+        if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
+            logCutSwitchSkip("切号进行中 slot=$slotKey step=$nextStep")
+            return
+        }
+
+        val enqueued = when (nextStep) {
+            CutSwitchStepKind.BACKUP -> {
+                if (sourceRow == null) {
+                    AutoSwitchLocalPlanStore.setCutSwitchMode(slotKey, "bootstrap", null, null)
+                    enqueueBootstrapCutSwitch(bundle, targetRow, slotKey)
                 } else {
-                    recordLightweightVerifyFailure(sk)
-                    LogCenter.op(alias, "【自动切号】时段 $sk 登录校验未通过，下分钟 tick 将重试")
+                    AutoSwitchLocalPlanStore.setCutSwitchMode(
+                        slotKey,
+                        "switch",
+                        sourceRow.row_index,
+                        sourceRow.username?.trim(),
+                    )
+                    enqueueCutSwitch(bundle, sourceRow, targetRow, slotKey)
                 }
-            } catch (err: Exception) {
-                recordLightweightVerifyFailure(sk)
-                LogCenter.op(alias, "【自动切号】时段 $sk 后台对齐异常：${err.message}")
-            } finally {
-                if (lightweightVerifyInflightSlotKey == sk) {
-                    lightweightVerifyInflightSlotKey = null
-                }
-                if (cutSwitchInflightSlotKey == sk && !hasCutSwitchWorkInProgress(sk, targetRi)) {
-                    cutSwitchInflightSlotKey = null
-                }
-                lightweightVerifyJob = null
-                onTryResumeGrowth()
+            }
+            CutSwitchStepKind.CLEAR -> {
+                AutoSwitchLocalPlanStore.setCutSwitchMode(slotKey, "bootstrap", null, null)
+                enqueueBootstrapClearOnly(bundle, targetRow, slotKey)
+            }
+            CutSwitchStepKind.RESTORE_OR_LOGIN -> {
+                enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
             }
         }
-        return false
+        if (enqueued) {
+            cutSwitchInflightSlotKey = slotKey
+        } else if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】切号入队失败 slot=$slotKey step=$nextStep target=@${entry.target_username}")
+        }
     }
 
-    /** 切号/发作品入队前：暂停涨粉拉取，等待当前 TikTok 步骤收尾（超时后仍入队）。 */
-    private suspend fun beginExclusiveEnqueue(forceEnqueueLabel: String) {
-        onPauseGrowth()
-        onForceStopTikTokForExclusive("切号入队前")
-        awaitTikTokExclusiveIdle(forceEnqueueLabel = forceEnqueueLabel)
-        // 等待涨粉收尾期间 TikTok 可能被再次拉起，收尾后再关一次
-        onForceStopTikTokForExclusive("切号入队前（涨粉收尾后）")
-    }
-
-    private suspend fun awaitTikTokExclusiveIdle(
-        maxMs: Long = 20_000L,
-        forceEnqueueLabel: String = "操作",
-    ) {
-        var waited = 0L
-        while (ExecutionScope.isActive() && waited < maxMs) {
-            delay(250)
-            waited += 250
-            if (waited > 0L && waited % 2_000L == 0L) {
-                onForceStopTikTokForExclusive("切号等待涨粉收尾")
+    /** 切号源账号：只读 plan 文件（source_row_index、上一已完成时段目标），不用 logContext 推断。 */
+    private fun resolveSourceAccount(
+        accounts: List<AutoSwitchAccount>,
+        entry: SlotPlanEntry,
+    ): AutoSwitchAccount? {
+        entry.cut_switch.source_row_index?.let { ri ->
+            accounts.firstOrNull { (it.row_index ?: -1) == ri }?.let { return it }
+        }
+        entry.cut_switch.source_username?.trim()?.takeIf { it.isNotEmpty() }?.let { uname ->
+            accounts.firstOrNull { it.username?.trim().equals(uname, ignoreCase = true) }?.let { return it }
+        }
+        val prevSk = lastSlotKey?.trim().orEmpty()
+        if (prevSk.isNotBlank() && prevSk != entry.slot_key) {
+            AutoSwitchLocalPlanStore.slot(prevSk)?.let { prev ->
+                if (AutoSwitchLocalPlanStore.isCutSwitchDone(prev.slot_key)) {
+                    accounts.firstOrNull { (it.row_index ?: -1) == prev.target_row_index }?.let { return it }
+                }
             }
         }
-        if (ExecutionScope.isActive()) {
-            LogCenter.op(
-                alias,
-                "【自动切号】等待 TikTok 独占任务收尾超时（${maxMs / 1000}s），仍将${forceEnqueueLabel}入队",
-            )
+        if (accounts.size == 1) return accounts[0]
+        return null
+    }
+
+    private fun cancelDuplicatePendingCutSwitchOps(slotKey: String, restoreOnly: Boolean = false) {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return
+        val removed = mutableListOf<String>()
+        val kept = opQueue.filterNot { op ->
+            val opSk = op.payload?.auto_switch_slot_key?.trim().orEmpty()
+            if (opSk != sk) return@filterNot false
+            val match = when {
+                restoreOnly -> op.op_type == "tiktok_restore"
+                else -> op.op_type in cutSwitchQueueOpTypes
+            }
+            if (match) removed.add(op.op_id)
+            match
         }
+        if (kept.size == opQueue.size) return
+        opQueue.clear()
+        opQueue.addAll(kept)
+        if (!restoreOnly) {
+            AutoSwitchLedger.cancelQueuedCutSwitchOpsForSlot(sk, "切号已完成，取消重复切号 OP")
+        }
+    }
+
+    private suspend fun tryRefreshWeeklyBundle(reason: String): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastWeeklyRefreshAttemptMs < WEEKLY_REFRESH_COOLDOWN_MS) return false
+        lastWeeklyRefreshAttemptMs = now
+        LogCenter.op(alias, "【自动切号】$reason，向云端拉取周计划 bundle…")
+        return onRefreshWeeklyBundle()
+    }
+
+    private fun hasActiveHighPriorityInsertion(): Boolean {
+        val inflight = insertionInflight ?: return false
+        return isInsertionKindStillActive(inflight.second)
     }
 
     private fun isInsertionKindStillActive(kind: String): Boolean = when (kind) {
         "publish" -> isPublishInsertionStillActive()
+        "mutual_traffic" -> isMutualInsertionStillActive()
         else -> insertionInflight?.second == kind
+    }
+
+    private fun isPublishInsertionStillActive(): Boolean {
+        if (isPublishExecutionActive()) return true
+        if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return true
+        val sk = insertionInflight?.first?.trim().orEmpty()
+        if (sk.isBlank()) return false
+        return !AutoSwitchLocalPlanStore.isPublishDone(sk) &&
+            !AutoSwitchLocalPlanStore.isPublishTerminalFailure(sk)
+    }
+
+    private fun isMutualInsertionStillActive(): Boolean {
+        if (isMutualExecutionActive()) return true
+        if (AutoSwitchLocalPlanStore.isMutualContextOccupying()) return true
+        val sk = insertionInflight?.first?.trim().orEmpty()
+        if (sk.isBlank()) return false
+        val state = AutoSwitchLocalPlanStore.insertionState(sk, "mutual_traffic")
+        return state == PlanStepState.RUNNING
     }
 
     private fun recoverStalePublishInflightOnStart() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (isPublishExecutionActive()) return
-        val sk = PrefsStore.getAutoSwitchPublishSlotKey()
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?: lastSlotKey?.trim().orEmpty()
+        val sk = AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim().orEmpty()
+            .ifBlank { lastSlotKey.orEmpty() }
         if (sk.isBlank()) return
-        val recoverable = PrefsStore.hasRecoverableAutoSwitchPublish(sk)
-        if (!recoverable && !AutoSwitchLedger.isPublishSlotInflight(sk)) return
+        if (!AutoSwitchLocalPlanStore.hasRecoverableActivePublish(sk) &&
+            !AutoSwitchLocalPlanStore.isPublishInflight(sk)
+        ) return
         onStalePublishInflight(sk)
-        if (!recoverable) {
-            LogCenter.op(alias, "【自动切号】启动时发现残留发作品 in-flight，已清理：slot=$sk")
-        }
-    }
-
-    private fun isAutoSwitchPublishLocallyActive(): Boolean {
-        if (isPublishExecutionActive()) return true
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
-        if (PrefsStore.isAutoSwitchPublishTask()) return true
-        return PrefsStore.getPublishPostSource() == "auto_switch" && PrefsStore.isPublishPostPending()
-    }
-
-    /**
-     * 自治发作品：以发作品协程是否在跑为准；prefs/ledger 仅作辅助。
-     * 协程已结束但 prefs 仍 pending 时视为非 active，由 [refreshInsertionSlotState] 触发残留清理。
-     */
-    private fun isPublishInsertionStillActive(): Boolean {
-        if (isPublishExecutionActive()) return true
-        val sk = insertionInflight?.first?.trim().orEmpty()
-        if (sk.isNotBlank()) {
-            if (AutoSwitchLedger.isPublishSlotDone(sk) || AutoSwitchLedger.isPublishSlotAborted(sk)) {
-                return false
-            }
-        }
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) {
-            return PrefsStore.isPublishPostPending()
-        }
-        return false
     }
 
     private fun maybeSweepOrphanedPublishState(slotKey: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (isPublishExecutionActive()) return
-        if (!isAutoSwitchPublishLocallyActive()) return
-        val sk = PrefsStore.getAutoSwitchPublishSlotKey()?.trim().orEmpty()
-            .ifBlank { insertionInflight?.first?.trim().orEmpty() }
-            .ifBlank { slotKey.trim() }
+        if (!AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) return
+        val sk = AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim().orEmpty()
+            .ifBlank { insertionInflight?.first.orEmpty() }
+            .ifBlank { slotKey }
         if (sk.isBlank()) return
         onStalePublishInflight(sk)
-        LogCenter.op(alias, "【自动切号】发作品协程已结束，清理残留 prefs/ledger：slot=$sk")
-    }
-
-    private fun recoverStaleCutSwitchInflightOnStart() {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        if (busy.get() || opQueue.isNotEmpty()) return
-        val sk = cutSwitchInflightSlotKey?.trim().orEmpty()
-            .ifBlank { lightweightVerifyInflightSlotKey?.trim().orEmpty() }
-            .ifBlank { PrefsStore.getAutoSwitchLastSlotKey()?.trim().orEmpty() }
-        if (sk.isBlank()) return
-        if (!hasOrphanedCutSwitchInflight(sk)) return
-        sweepOrphanedCutSwitchInflight(sk, "调度器启动时发现残留切号 in-flight")
-    }
-
-    private fun maybeSweepOrphanedCutSwitchState(slotKey: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return
-        if (!hasOrphanedCutSwitchInflight(sk)) return
-        sweepOrphanedCutSwitchInflight(sk, "本机无切号执行上下文，清理残留 in-flight")
-    }
-
-    private fun hasOrphanedCutSwitchInflight(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return false
-        if (busy.get()) return false
-        if (opQueue.any { isCutSwitchOpForSlot(it, sk) }) return false
-        if (lightweightVerifyJob?.isActive == true && lightweightVerifyInflightSlotKey == sk) {
-            return false
-        }
-        if (AutoSwitchLedger.isCutSwitchSlotInflight(sk)) return true
-        if (lightweightVerifyInflightSlotKey == sk) return true
-        return cutSwitchInflightSlotKey == sk
-    }
-
-    private fun sweepOrphanedCutSwitchInflight(slotKey: String, reason: String) {
-        val sk = slotKey.trim()
-        if (sk.isEmpty()) return
-        AutoSwitchLedger.abortStaleCutSwitchSlot(sk, reason)
-        if (lightweightVerifyInflightSlotKey == sk && lightweightVerifyJob?.isActive != true) {
-            lightweightVerifyInflightSlotKey = null
-            lightweightVerifyJob = null
-        }
-        if (cutSwitchInflightSlotKey == sk) {
-            cutSwitchInflightSlotKey = null
-        }
-        if (alias.isNotBlank()) {
-            LogCenter.op(alias, "【自动切号】清理残留切号 in-flight：slot=$sk")
-        }
+        maybeResumePendingCutSwitch()
     }
 
     private fun clearInsertionInflightIfKind(kind: String, slotKey: String) {
@@ -1044,110 +773,143 @@ class AutoSwitchLocalScheduler(
         }
     }
 
-    private fun evaluateSlotAlignment(
-        slotKey: String,
-        targetRi: Int,
-    ): SlotAlignment {
-        val verified = PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
-        return SlotAlignment(
-            needsCutSwitch = !verified,
-            verifiedAligned = verified,
-        )
+    private fun hasCutSwitchWorkInProgress(slotKey: String, targetRi: Int): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return false
+        if (opQueue.any { isCutSwitchOpForSlot(it, sk) }) return true
+        if (busy.get() && cutSwitchInflightSlotKey == sk) return true
+        if (AutoSwitchLocalPlanStore.isCutSwitchInflight(sk)) {
+            if (tryRecoverStaleCutSwitchInflight(sk)) return false
+            return true
+        }
+        return false
     }
 
-    /** 设备环境当前归属账号（用于切号源推断；高亮只认时段，不在此使用）。 */
-    private fun resolveDeviceCommittedAccount(
-        accounts: List<AutoSwitchAccount>,
-        targetRow: AutoSwitchAccount,
-        slotKey: String,
-    ): AutoSwitchAccount? {
-        val targetRi = targetRow.row_index ?: -1
-        val targetUser = targetRow.username?.trim()?.lowercase().orEmpty()
-        if (PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)) {
-            return accounts.firstOrNull { (it.row_index ?: -1) == targetRi }
+    private fun tryRecoverStaleCutSwitchInflight(slotKey: String): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return false
+        if (busy.get() || opQueue.any { isCutSwitchOpForSlot(it, sk) } || cutSwitchInflightSlotKey == sk) {
+            return false
         }
-        val logUser = PrefsStore.getLogContextUsername()?.trim()?.lowercase().orEmpty()
-        if (logUser.isNotBlank() && targetUser.isNotBlank() && logUser == targetUser) {
-            return targetRow
+        AutoSwitchLocalPlanStore.resetStaleCutSwitchInflight(sk)
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】切号 stale in-flight 已重置为 PENDING slot=$sk")
         }
-        val verifiedSk = PrefsStore.getAutoSwitchVerifiedSlotKey().orEmpty()
-        val verifiedRi = PrefsStore.getAutoSwitchVerifiedRowIndex()
-        if (verifiedRi >= 0 && verifiedSk.isNotBlank() &&
-            !PrefsStore.isAutoSwitchVerifiedAligned(slotKey, targetRi)
-        ) {
-            accounts.firstOrNull { (it.row_index ?: -1) == verifiedRi }?.let { return it }
-        }
-        if (logUser.isNotBlank()) {
-            accounts.firstOrNull { it.username?.trim()?.lowercase() == logUser }?.let { return it }
-        }
-        if (accounts.size == 1) return accounts[0]
-        return null
+        return true
     }
 
-    /**
-     * 切号调度：仅阻塞本地 OP 队列/in-flight。
-     * 涨粉基线运行中 [ExecutionScope] 为 active 是正常态，不在此拦截——到时段边界时由
-     * [enqueueCutSwitch] / [enqueueBootstrapCutSwitch] 主动 pause 涨粉并等待后再入队。
-     */
+    /** 进程重启 / 人为启动后：按本地 plan 文件清理 stale RUNNING，便于 tick 续跑。 */
+    fun recoverAllStaleInflightOnStart() {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        AutoSwitchLocalPlanStore.recoverStaleRunningStepsAfterProcessDeath()
+        recoverStalePublishInflightOnStart()
+        insertionInflight = null
+        cutSwitchInflightSlotKey = null
+        pendingCutSwitchSlotKey = null
+        val plan = AutoSwitchLocalPlanStore.get() ?: return
+        for (entry in plan.slots) {
+            if (AutoSwitchLocalPlanStore.isCutSwitchInflight(entry.slot_key)) {
+                tryRecoverStaleCutSwitchInflight(entry.slot_key)
+            }
+        }
+        lastSlotKey?.trim()?.takeIf { it.isNotEmpty() }?.let { tryRecoverStaleCutSwitchInflight(it) }
+    }
+
+    /** 仅当「当前分钟所属时段」存在未完成切号时才续跑；过期/其它日期的 slot 由 [abandonExpiredIncompleteCutSwitches] 清理。 */
+    private fun findRecoverableIncompleteCutSwitch(currentSlot: SlotPlanEntry?): SlotPlanEntry? {
+        val entry = currentSlot ?: return null
+        if (AutoSwitchLocalPlanStore.isCutSwitchDone(entry.slot_key)) return null
+        val cs = AutoSwitchLocalPlanStore.slot(entry.slot_key)?.cut_switch ?: entry.cut_switch
+        return if (cs.nextPendingStep() != null) entry else null
+    }
+
+    private fun logCutSwitchSkip(reason: String) {
+        if (forceLogNextTick) {
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】切号暂缓：$reason")
+            }
+            return
+        }
+        logTickSkipThrottled(reason)
+    }
+
+    private fun logTickSkip(reason: String) {
+        if (forceLogNextTick) {
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】调度暂缓：$reason")
+            }
+            return
+        }
+        logTickSkipThrottled(reason)
+    }
+
+    private fun logTickSkipThrottled(reason: String) {
+        val now = System.currentTimeMillis()
+        if (reason == lastTickSkipLogKey && now - lastTickSkipLogMs < TICK_SKIP_LOG_COOLDOWN_MS) return
+        lastTickSkipLogKey = reason
+        lastTickSkipLogMs = now
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】调度暂缓：$reason")
+        }
+    }
+
+    private fun formatMinuteOfDay(minuteOfDay: Int): String {
+        val h = minuteOfDay / 60
+        val m = minuteOfDay % 60
+        return "%02d:%02d".format(h, m)
+    }
+
+    private fun isCutSwitchOpForSlot(op: DeviceOp, slotKey: String): Boolean =
+        op.payload?.auto_switch_slot_key?.trim() == slotKey.trim() &&
+            op.op_type in cutSwitchQueueOpTypes
+
+    private suspend fun beginExclusiveEnqueue(forceEnqueueLabel: String) {
+        onPauseGrowth()
+        onForceStopTikTokForExclusive("切号入队前")
+        awaitTikTokExclusiveIdle(forceEnqueueLabel = forceEnqueueLabel)
+        onForceStopTikTokForExclusive("切号入队前（涨粉收尾后）")
+    }
+
+    private suspend fun awaitTikTokExclusiveIdle(maxMs: Long = 20_000L, forceEnqueueLabel: String = "操作") {
+        var waited = 0L
+        while (ExecutionScope.isActive() && waited < maxMs) {
+            delay(250)
+            waited += 250
+        }
+        if (ExecutionScope.isActive()) {
+            LogCenter.op(alias, "【自动切号】等待 TikTok 独占收尾超时（${maxMs / 1000}s），仍将${forceEnqueueLabel}入队")
+        }
+    }
+
     private fun deviceBusyReasonForCutSwitch(): String? {
-        if (busy.get()) return "本地 OP 执行中（切号/还原/插入，本分钟 tick 暂缓）"
+        if (busy.get()) return "本地 OP 执行中"
         if (opQueue.isNotEmpty()) return "本地 OP 队列非空（${opQueue.size}）"
         return null
     }
 
-    /**
-     * 插入调度：仅阻塞本地 OP 队列/in-flight。
-     * 涨粉基线运行中 [ExecutionScope] 为 active 是正常态，不在此拦截——到点发作品时由
-     * [enqueueInsertion] 主动 pause 涨粉并 [awaitTikTokExclusiveIdle] 后再入队。
-     */
     private fun deviceBusyReasonForInsertionScheduling(): String? {
-        if (busy.get()) return "本地 OP 执行中（切号/还原/插入，本分钟 tick 暂缓）"
+        if (ExecutionScope.isActive()) return "涨粉任务执行中"
+        if (PrefsStore.isAutoSwitchExclusivePreempt()) return "独占抢占中"
+        if (busy.get()) return "本地 OP 执行中"
         if (opQueue.isNotEmpty()) return "本地 OP 队列非空（${opQueue.size}）"
         insertionInflight?.let { (sk, kind) ->
-            if (isInsertionKindStillActive(kind)) {
-                return "插入操作 in-flight：$kind slot=$sk"
-            }
+            if (isInsertionKindStillActive(kind)) return "插入 in-flight：$kind slot=$sk"
         }
         return null
     }
 
-    private fun refreshInsertionSlotState(slotKey: String, minuteOfDay: Int, targetSlot: AutoSwitchPlanSlot) {
-        val endMin = targetSlot.end_min ?: 1440
-        insertionInflight?.let { (sk, kind) ->
-            if (sk != slotKey) {
-                insertionInflight = null
-            } else if (!isInsertionKindStillActive(kind)) {
-                if (kind == "publish" && PrefsStore.isAutoSwitchAutonomousMode()) {
-                    val doneKey = "$sk|publish"
-                    val slotAlreadyDone =
-                        PrefsStore.getAutoSwitchPublishDoneKey() == doneKey ||
-                            AutoSwitchLedger.isPublishSlotDone(sk)
-                    if (!slotAlreadyDone) {
-                        val hasOrphanedPublishState =
-                            AutoSwitchLedger.isPublishSlotInflight(sk) || isAutoSwitchPublishLocallyActive()
-                        if (hasOrphanedPublishState) {
-                            onStalePublishInflight(sk)
-                        }
-                    }
-                    if (!isPublishExecutionActive() && !isAutoSwitchPublishLocallyActive()) {
-                        LogCenter.op(alias, "【自动切号】清理残留发作品 in-flight：slot=$sk")
-                    }
-                }
-                insertionInflight = null
-            }
-        }
-        if (minuteOfDay >= endMin) {
-            insertionInflight = null
-        }
-        if (publishDoneKey != null && !publishDoneKey!!.startsWith("$slotKey|")) {
-            publishDoneKey = null
-        }
-        if (publishAbortedKey != null && !publishAbortedKey!!.startsWith("$slotKey|")) {
-            publishAbortedKey = null
-        }
+    private fun enqueueExclusiveOp(op: DeviceOp) {
+        onPauseGrowth()
+        opQueue.add(op)
     }
 
     private suspend fun enqueueBootstrapCutSwitch(
+        bundle: AutoSwitchBundle,
+        targetRow: AutoSwitchAccount,
+        slotKey: String,
+    ): Boolean = enqueueClearRestoreChain(bundle, targetRow, slotKey, bootstrap = true)
+
+    private suspend fun enqueueBootstrapClearOnly(
         bundle: AutoSwitchBundle,
         targetRow: AutoSwitchAccount,
         slotKey: String,
@@ -1155,49 +917,93 @@ class AutoSwitchLocalScheduler(
         val targetRi = targetRow.row_index ?: return false
         val targetUser = targetRow.username?.trim().orEmpty()
         if (targetUser.isBlank()) return false
-        if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
-            LogCenter.op(alias, "【自动切号】时段 $slotKey 已有切号 OP 进行中，跳过重复入队")
-            return false
-        }
-        beginExclusiveEnqueue("切号")
-        val pkg = bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
-        val aliasClean = bundle.device_alias?.trim().orEmpty().ifBlank { alias }
-        val targetBackup = targetRow.backup_name?.trim().orEmpty()
+        beginExclusiveEnqueue("切号清理")
+        val pkg = pkg(bundle)
+        val aliasClean = aliasClean(bundle)
         val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
-        if (targetBackup.isNotEmpty() && targetBackup != "-" && resolved == null) {
-            logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, File(targetBackup).name)
-        }
-        val canRestore = resolved != null
-        val cutMode = if (canRestore) "clear_source_for_restore" else "exclusive_activate_target"
+        val cutMode = if (resolved != null) "clear_source_for_restore" else "exclusive_activate_target"
+        AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.CLEAR)
+        enqueueExclusiveOp(buildClearOp(aliasClean, pkg, targetRi, targetUser, slotKey, cutMode))
+        return true
+    }
 
-        val clearOpId = newLocalOpId("clear")
-        val clearPayload = DeviceOpPayload(
+    private suspend fun enqueueRestoreOnly(
+        bundle: AutoSwitchBundle,
+        targetRow: AutoSwitchAccount,
+        slotKey: String,
+        sourceRi: Int?,
+    ): Boolean {
+        val targetRi = targetRow.row_index ?: return false
+        val targetUser = targetRow.username?.trim().orEmpty()
+        if (targetUser.isBlank()) return false
+        val aliasClean = aliasClean(bundle)
+        val cloudRaw = targetRow.backup_name?.trim().orEmpty()
+        val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
+        beginExclusiveEnqueue("切号还原")
+        AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.RESTORE_OR_LOGIN)
+        val (backupName, backupPath) = if (resolved != null) {
+            resolved
+        } else {
+            val cloudBackupLabel = when {
+                cloudRaw.isEmpty() || cloudRaw == "-" -> "-"
+                else -> File(cloudRaw).name
+            }
+            logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, cloudBackupLabel)
+            LogCenter.op(
+                alias,
+                "【自动切号】断点续跑：@$targetUser 备份本机不可用，入队还原并改走自动登录",
+            )
+            val name = if (cloudRaw.isEmpty() || cloudRaw == "-") "" else File(cloudRaw).name
+            val path = targetRow.backup_path?.trim().orEmpty().ifBlank { cloudRaw }
+            name to path
+        }
+        val restoreOpId = newLocalOpId("restore")
+        val restorePayload = DeviceOpPayload(
             device_id = deviceId,
             alias = aliasClean,
-            package_name = pkg,
-            cut_switch_after_backup = cutMode,
-            cut_switch_target_row_index = targetRi,
+            package_name = pkg(bundle),
+            backup_name = backupName,
+            backup_path = backupPath,
+            username = targetUser,
+            skip_pm_clear = true,
+            restore_highlight_row_index = targetRi,
+            backup_record_id = sourceRi,
             source = "auto_switch",
             auto_switch_slot_key = slotKey,
         )
-        val clearOp = DeviceOp(
-            op_id = clearOpId,
-            op_type = "tiktok_clear",
-            payload = clearPayload,
-        )
-        AutoSwitchLedger.recordCutSwitchQueued(
-            clearOpId, "tiktok_clear", slotKey, targetUser, clearPayload,
-        )
-        enqueueExclusiveOp(clearOp)
-        LogCenter.op(alias, "【自动切号】已入队初始对齐清理 → $targetUser")
+        AutoSwitchLedger.recordCutSwitchQueued(restoreOpId, "tiktok_restore", slotKey, targetUser, restorePayload)
+        enqueueExclusiveOp(DeviceOp(op_id = restoreOpId, op_type = "tiktok_restore", payload = restorePayload))
+        LogCenter.op(alias, "【自动切号】断点续跑：已入队还原 → $targetUser")
+        return true
+    }
 
-        if (canRestore) {
-            val (backupName, backupPath) = resolved!!
+    private suspend fun enqueueClearRestoreChain(
+        bundle: AutoSwitchBundle,
+        targetRow: AutoSwitchAccount,
+        slotKey: String,
+        bootstrap: Boolean,
+    ): Boolean {
+        val targetRi = targetRow.row_index ?: return false
+        val targetUser = targetRow.username?.trim().orEmpty()
+        if (targetUser.isBlank()) return false
+        beginExclusiveEnqueue("切号")
+        val aliasClean = aliasClean(bundle)
+        val pkgName = pkg(bundle)
+        val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
+        if (targetRow.backup_name?.trim()?.isNotEmpty() == true && targetRow.backup_name != "-" && resolved == null) {
+            logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, File(targetRow.backup_name!!).name)
+        }
+        val canRestore = resolved != null
+        val cutMode = if (canRestore) "clear_source_for_restore" else "exclusive_activate_target"
+        AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.CLEAR)
+        enqueueExclusiveOp(buildClearOp(aliasClean, pkgName, targetRi, targetUser, slotKey, cutMode))
+        if (canRestore && resolved != null) {
+            val (backupName, backupPath) = resolved
             val restoreOpId = newLocalOpId("restore")
             val restorePayload = DeviceOpPayload(
                 device_id = deviceId,
                 alias = aliasClean,
-                package_name = pkg,
+                package_name = pkgName,
                 backup_name = backupName,
                 backup_path = backupPath,
                 username = targetUser,
@@ -1206,19 +1012,33 @@ class AutoSwitchLocalScheduler(
                 source = "auto_switch",
                 auto_switch_slot_key = slotKey,
             )
-            AutoSwitchLedger.recordCutSwitchQueued(
-                restoreOpId, "tiktok_restore", slotKey, targetUser, restorePayload,
-            )
-            enqueueExclusiveOp(
-                DeviceOp(
-                    op_id = restoreOpId,
-                    op_type = "tiktok_restore",
-                    payload = restorePayload,
-                ),
-            )
-            LogCenter.op(alias, "【自动切号】已入队初始对齐还原 → $targetUser")
+            AutoSwitchLedger.recordCutSwitchQueued(restoreOpId, "tiktok_restore", slotKey, targetUser, restorePayload)
+            enqueueExclusiveOp(DeviceOp(op_id = restoreOpId, op_type = "tiktok_restore", payload = restorePayload))
         }
+        LogCenter.op(alias, "【自动切号】已入队初始切号 → $targetUser")
         return true
+    }
+
+    private fun buildClearOp(
+        aliasClean: String,
+        pkgName: String,
+        targetRi: Int,
+        targetUser: String,
+        slotKey: String,
+        cutMode: String,
+    ): DeviceOp {
+        val clearOpId = newLocalOpId("clear")
+        val clearPayload = DeviceOpPayload(
+            device_id = deviceId,
+            alias = aliasClean,
+            package_name = pkgName,
+            cut_switch_after_backup = cutMode,
+            cut_switch_target_row_index = targetRi,
+            source = "auto_switch",
+            auto_switch_slot_key = slotKey,
+        )
+        AutoSwitchLedger.recordCutSwitchQueued(clearOpId, "tiktok_clear", slotKey, targetUser, clearPayload)
+        return DeviceOp(op_id = clearOpId, op_type = "tiktok_clear", payload = clearPayload)
     }
 
     private suspend fun enqueueCutSwitch(
@@ -1233,26 +1053,17 @@ class AutoSwitchLocalScheduler(
         val sourceUser = sourceRow.username?.trim().orEmpty()
         val targetUser = targetRow.username?.trim().orEmpty()
         if (sourceUser.isBlank() || targetUser.isBlank()) return false
-        if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
-            LogCenter.op(alias, "【自动切号】时段 $slotKey 已有切号 OP 进行中，跳过重复入队")
-            return false
-        }
         beginExclusiveEnqueue("切号")
-
-        val pkg = bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
-        val aliasClean = bundle.device_alias?.trim().orEmpty().ifBlank { alias }
-        val targetBackup = targetRow.backup_name?.trim().orEmpty()
+        val aliasClean = aliasClean(bundle)
+        val pkgName = pkg(bundle)
         val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
-        if (targetBackup.isNotEmpty() && targetBackup != "-" && resolved == null) {
-            logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, File(targetBackup).name)
-        }
         val canRestore = resolved != null
-
+        AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.BACKUP)
         val backupOpId = newLocalOpId("backup")
         val backupPayload = DeviceOpPayload(
             device_id = deviceId,
             alias = aliasClean,
-            package_name = pkg,
+            package_name = pkgName,
             backup_record_id = sourceRi,
             username = sourceUser,
             previous_backup_path = sourceRow.backup_path?.trim()?.takeIf { it.isNotEmpty() },
@@ -1261,25 +1072,16 @@ class AutoSwitchLocalScheduler(
             cut_switch_target_row_index = targetRi,
             auto_switch_slot_key = slotKey,
         )
-        AutoSwitchLedger.recordCutSwitchQueued(
-            backupOpId, "tiktok_backup_and_clear", slotKey, sourceUser, backupPayload,
-        )
-        enqueueExclusiveOp(
-            DeviceOp(
-                op_id = backupOpId,
-                op_type = "tiktok_backup_and_clear",
-                payload = backupPayload,
-            ),
-        )
+        AutoSwitchLedger.recordCutSwitchQueued(backupOpId, "tiktok_backup_and_clear", slotKey, sourceUser, backupPayload)
+        enqueueExclusiveOp(DeviceOp(op_id = backupOpId, op_type = "tiktok_backup_and_clear", payload = backupPayload))
         LogCenter.op(alias, "【自动切号】已入队切号备份 $sourceUser → $targetUser")
-
-        if (canRestore) {
-            val (backupName, backupPath) = resolved!!
+        if (canRestore && resolved != null) {
+            val (backupName, backupPath) = resolved
             val restoreOpId = newLocalOpId("restore")
             val restorePayload = DeviceOpPayload(
                 device_id = deviceId,
                 alias = aliasClean,
-                package_name = pkg,
+                package_name = pkgName,
                 backup_name = backupName,
                 backup_path = backupPath,
                 username = targetUser,
@@ -1289,17 +1091,8 @@ class AutoSwitchLocalScheduler(
                 source = "auto_switch",
                 auto_switch_slot_key = slotKey,
             )
-            AutoSwitchLedger.recordCutSwitchQueued(
-                restoreOpId, "tiktok_restore", slotKey, targetUser, restorePayload,
-            )
-            enqueueExclusiveOp(
-                DeviceOp(
-                    op_id = restoreOpId,
-                    op_type = "tiktok_restore",
-                    payload = restorePayload,
-                ),
-            )
-            LogCenter.op(alias, "【自动切号】已入队切号还原 → $targetUser")
+            AutoSwitchLedger.recordCutSwitchQueued(restoreOpId, "tiktok_restore", slotKey, targetUser, restorePayload)
+            enqueueExclusiveOp(DeviceOp(op_id = restoreOpId, op_type = "tiktok_restore", payload = restorePayload))
         }
         return true
     }
@@ -1316,22 +1109,33 @@ class AutoSwitchLocalScheduler(
         return resolveRestoreBackupArchive(backupName, pathHint, targetUser, aliasClean, deviceId)
     }
 
-    private fun logCutSwitchMissingBackupUseAutoLogin(
-        slotKey: String,
-        targetUser: String,
-        cloudBackupName: String,
-    ) {
+    private fun logCutSwitchMissingBackupUseAutoLogin(slotKey: String, targetUser: String, cloudBackupName: String) {
         AutoSwitchLedger.recordCutSwitchMissingBackup(
             username = targetUser,
             slotKey = slotKey,
             cloudBackupName = cloudBackupName,
             phase = "enqueue",
         )
-        LogCenter.op(
-            alias,
-            "【自动切号】目标 @$targetUser 备份包本机不可用，跳过还原，备份清理后自动登录",
-        )
+        LogCenter.op(alias, "【自动切号】目标 @$targetUser 备份包本机不可用，清理后自动登录")
     }
+
+    private fun syncBundleHolder() {
+        AutoSwitchBundleHolder.setBundle(bundle)
+    }
+
+    private fun graduateNewAccountVideoCountInBundle(targetRow: AutoSwitchAccount) {
+        val targetRi = targetRow.row_index ?: return
+        AutoSwitchLocalPlanStore.graduateVideoCount(targetRi)
+        val current = bundle ?: return
+        bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(current)
+        syncBundleHolder()
+    }
+
+    private fun pkg(bundle: AutoSwitchBundle) =
+        bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+
+    private fun aliasClean(bundle: AutoSwitchBundle) =
+        bundle.device_alias?.trim().orEmpty().ifBlank { alias }
 
     private fun beijingMinuteOfDay(): Int {
         val cal = Calendar.getInstance(beijingTz)
@@ -1340,10 +1144,12 @@ class AutoSwitchLocalScheduler(
 
     private fun beijingDateStr(): String {
         val cal = Calendar.getInstance(beijingTz)
-        val y = cal.get(Calendar.YEAR)
-        val m = cal.get(Calendar.MONTH) + 1
-        val d = cal.get(Calendar.DAY_OF_MONTH)
-        return String.format("%04d-%02d-%02d", y, m, d)
+        return String.format(
+            "%04d-%02d-%02d",
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH) + 1,
+            cal.get(Calendar.DAY_OF_MONTH),
+        )
     }
 
     private fun newLocalOpId(prefix: String): String =
@@ -1351,10 +1157,11 @@ class AutoSwitchLocalScheduler(
 
     companion object {
         private const val WEEKLY_REFRESH_COOLDOWN_MS = 5 * 60 * 1000L
-        private const val LIGHTWEIGHT_VERIFY_ESCALATE_AFTER = 3
+        private const val TICK_SKIP_LOG_COOLDOWN_MS = 5 * 60 * 1000L
+        const val SWITCH_SAFE_BUFFER_MIN = 5
         private val DEFAULT_INSERTIONS: List<AutoSwitchSlotInsertion> = listOf(
             PublishPostSlotInsertion(),
-            // 未来互点：MutualClickSlotInsertion()，读取 slot.auto_mutual_minute
+            MutualTrafficSlotInsertion(),
         )
     }
 }

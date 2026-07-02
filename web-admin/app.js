@@ -1180,6 +1180,18 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function downloadTextAsFile(text, filename) {
+  const blob = new Blob([String(text || "")], { type: "text/plain;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 async function downloadDeviceLogFile(deviceId) {
   const did = String(deviceId || "").trim();
   if (!did) return false;
@@ -1246,12 +1258,21 @@ async function pullDeviceLogsFromDevices(ids) {
     }
     let downloaded = 0;
     let emptyToday = 0;
+    let cachedFallback = 0;
     for (const did of ids) {
       try {
         const ok = await downloadDeviceLogFile(did);
         if (ok) downloaded += 1;
       } catch (err) {
         if (err?.httpStatus === 404) {
+          const cached = Array.isArray(latestDeviceLogs?.[did]) ? latestDeviceLogs[did] : [];
+          const text = compactDeviceLogLines(cached).join("\n").trim();
+          if (text) {
+            const day = new Date().toISOString().slice(0, 10);
+            downloadTextAsFile(`${text}\n`, `device_${did}_${day}.txt`);
+            cachedFallback += 1;
+            continue;
+          }
           emptyToday += 1;
           continue;
         }
@@ -1262,8 +1283,10 @@ async function pullDeviceLogsFromDevices(ids) {
     }
     if (downloaded > 0) {
       setStatus(`已下载 ${downloaded} 台设备今日日志`, "success");
+    } else if (cachedFallback > 0) {
+      setStatus(`设备今日本地日志为空，已下载 ${cachedFallback} 台设备的云端缓存日志`, "info");
     } else if (emptyToday > 0) {
-      setStatus("设备已回传，但今日暂无本地日志文件", "info");
+      setStatus("设备已回传，但今日本地与服务端均无可用日志", "info");
     }
   } catch (err) {
     appendDebugLog("DEVICE_LOG_PULL", { error: String(err?.message || err) });
@@ -7872,10 +7895,8 @@ function backupArchiveRecordMatchesSearch(row = {}) {
     row.mobile_alias,
     row.account_assigned_alias,
     acct?.assigned_alias,
-    acct?.email,
-    row.backup_name,
-    row.backup_path,
     row.region,
+    acct?.region,
   ]);
 }
 
@@ -10009,18 +10030,8 @@ function renderBackupGroups(items = []) {
     deviceAliasGroupsEl.innerHTML = `<div class="hint">${emptyHint}</div>`;
     return;
   }
-  const filteredItems = backupArchiveSearchQuery
-    ? items.filter((item) => backupArchiveRecordMatchesSearch(item))
-    : items;
-  if (!filteredItems.length) {
-    const emptyHint = backupArchiveSearchQuery
-      ? `未找到匹配「${backupArchiveSearchQuery}」的备份档案`
-      : "暂无备份档案";
-    deviceAliasGroupsEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
-    return;
-  }
   const groups = new Map();
-  filteredItems.forEach((item) => {
+  items.forEach((item) => {
     const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
     if (!groups.has(alias)) groups.set(alias, []);
     groups.get(alias).push(item);
@@ -10298,6 +10309,23 @@ function scheduleBackupArchiveSlotHighlightRefresh() {
   }, delayMs);
 }
 
+async function refreshAutoSwitchDailyPlansInBackground() {
+  try {
+    const plansResp = await request("/api/admin/auto_switch/daily_plans");
+    const plansPayload = plansResp?.data || {};
+    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
+    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
+    if (!Array.isArray(backupArchivePageItems) || !backupArchivePageItems.length) return;
+    renderBackupGroups(backupArchivePageItems);
+    syncBackupArchiveExportCheckboxes();
+    updateBackupArchiveSelectionUi();
+    applyAutoSwitchManualOpsUi();
+    scheduleBackupArchiveSlotHighlightRefresh();
+  } catch (_) {
+    /* 时段计划展示失败不影响档案列表 */
+  }
+}
+
 async function loadBackupArchiveRecords() {
   if (!deviceAliasGroupsEl) return;
   try {
@@ -10309,17 +10337,7 @@ async function loadBackupArchiveRecords() {
     });
     const searchQ = String(backupArchiveSearchQuery || "").trim();
     if (searchQ) params.set("search", searchQ);
-    // 今日时段是云端预分配信息，与“当前是否已开启自动切号”无关；
-    // 始终拉取，避免设备未开启时只显示 "--" 造成误解。
-    const plansPromise = request("/api/admin/auto_switch/daily_plans")
-      .catch(() => ({ data: {} }));
-    const [data, plansResp] = await Promise.all([
-      request(`/api/admin/editor/device_rows?${params.toString()}`),
-      plansPromise,
-    ]);
-    const plansPayload = plansResp?.data || {};
-    autoSwitchDailyPlansByAlias = normalizeAutoSwitchPlansByAlias(plansPayload.plans_by_alias || {});
-    autoSwitchDailyPlanDate = String(plansPayload.schedule_date || "").trim();
+    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
     backupArchiveAliasTotal = Number(data?.total ?? 0) || 0;
     if (Number.isFinite(Number(data?.page))) currentBackupArchivePage = Number(data.page) || 1;
     const rows = Array.isArray(data.items) ? data.items : [];
@@ -10348,6 +10366,7 @@ async function loadBackupArchiveRecords() {
     updateBackupArchiveSelectionUi();
     applyAutoSwitchManualOpsUi();
     scheduleBackupArchiveSlotHighlightRefresh();
+    void refreshAutoSwitchDailyPlansInBackground();
   } catch (error) {
     if (backupArchiveSlotHighlightTimer) {
       clearTimeout(backupArchiveSlotHighlightTimer);
@@ -10527,16 +10546,23 @@ if (accountRecordsPageSizeInput) {
 }
 if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
+  const runBackupArchiveSearch = () => {
+    syncBackupArchiveSearchFromInput();
+    currentBackupArchivePage = 1;
+    void loadBackupArchiveRecords();
+  };
   const onBackupArchiveSearchChanged = () => {
     syncBackupArchiveSearchFromInput();
     clearTimeout(backupSearchTimer);
-    backupSearchTimer = setTimeout(() => {
-      currentBackupArchivePage = 1;
-      void loadBackupArchiveRecords();
-    }, 300);
+    backupSearchTimer = setTimeout(runBackupArchiveSearch, 300);
   };
   backupArchiveSearchInput.addEventListener("input", onBackupArchiveSearchChanged);
   backupArchiveSearchInput.addEventListener("search", onBackupArchiveSearchChanged);
+  backupArchiveSearchInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    clearTimeout(backupSearchTimer);
+    runBackupArchiveSearch();
+  });
 }
 if (accountEditorListEl) {
   accountEditorListEl.addEventListener("input", (event) => {

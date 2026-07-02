@@ -74,9 +74,13 @@ object AutoSwitchLedger {
     private val phaseRank = mapOf(
         "queued" to 0,
         "running" to 1,
+        "pending_upload" to 1,
         "success" to 2,
+        "uploaded" to 2,
         "failed" to 2,
     )
+
+    private const val CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE = "cut_switch_backup_deferred"
 
     private var sessionId: String = ""
     private var bundleRevision: Int = 0
@@ -135,96 +139,7 @@ object AutoSwitchLedger {
         return phase == "success" || phase == "failed"
     }
 
-    fun getPublishSlotPhase(slotKey: String): String? {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return null
-        for (i in entries.indices.reversed()) {
-            val e = entries[i]
-            if (e.slot_key != sk) continue
-            when (e.op_type) {
-                "publish_post_outcome" -> return e.phase
-                "publish_post_start" -> {
-                    if (e.phase == "running" || e.phase == "queued") return e.phase
-                    if (e.phase == "success" || e.phase == "failed") return e.phase
-                }
-            }
-        }
-        return null
-    }
-
-    fun isPublishSlotDone(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return false
-        return entries.any {
-            it.slot_key == sk &&
-                it.op_type == "publish_post_outcome" &&
-                it.phase == "success"
-        }
-    }
-
-    fun isPublishSlotAborted(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return false
-        return entries.any {
-            it.slot_key == sk &&
-                it.op_type == "publish_post_outcome" &&
-                it.phase == "failed" &&
-                !isPublishOutcomeResumable(it) &&
-                publishOutcomeMessageBlocksSlotRetry(it.message)
-        }
-    }
-
-    private fun isPublishOutcomeResumable(entry: LedgerEntry): Boolean {
-        val data = entry.report_data
-        if (data.isEmpty()) return false
-        if (data["publish_post_resumable"] == true) return true
-        val resumeRaw = data["publish_post_resume_next_index"]
-        return when (resumeRaw) {
-            is Number -> resumeRaw.toInt() > 0
-            is String -> resumeRaw.trim().toIntOrNull()?.let { it > 0 } == true
-            else -> false
-        }
-    }
-
-    /** 失败 outcome 是否表示本时段不应再调度发作品（不含 stale 清理类消息，清理后允许重试）。 */
-    private fun publishOutcomeMessageBlocksSlotRetry(message: String): Boolean {
-        val m = message.trim()
-        if (m.isEmpty()) return false
-        if (m.contains("清理残留")) return false
-        if (m.contains("登录") || m.contains("时段已切换")) return true
-        if (m.contains("素材") || m.contains("no_video") || m.contains("未完成")) return true
-        return false
-    }
-
-    fun isPublishSlotInflight(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return false
-        if (isPublishSlotDone(slotKey) || isPublishSlotAborted(slotKey)) return false
-        val phase = getPublishSlotPhase(slotKey) ?: return false
-        if (phase == "failed") return false
-        if (phase == "success" && !PrefsStore.isAutoSwitchPublishTask()) return false
-        return phase == "running" || phase == "queued" || phase == "success"
-    }
-
     private val cutSwitchOpTypes = setOf("tiktok_backup_and_clear", "tiktok_clear", "tiktok_restore")
-    private const val SLOT_VERIFIED_OP_TYPE = "auto_switch_slot_verified"
-
-    fun isCutSwitchSlotInflight(slotKey: String): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return false
-        return entries.any {
-            it.slot_key == sk &&
-                it.op_type in cutSwitchOpTypes &&
-                (it.phase == "queued" || it.phase == "running")
-        }
-    }
-
-    /** 审计用：解析 ledger 中本 slot 切号是否曾成功（不参与切号闸门，闸门仅认 [PrefsStore] verified）。 */
-    fun isCutSwitchSlotVerified(slotKey: String, targetRowIndex: Int): Boolean {
-        val sk = slotKey.trim()
-        if (sk.isBlank() || targetRowIndex < 0) return false
-        return resolveCutSwitchVerifiedRowIndex(sk) == targetRowIndex
-    }
 
     fun recordCutSwitchSlotAborted(slotKey: String, message: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
@@ -242,124 +157,6 @@ object AutoSwitchLedger {
             ),
             phaseOverride = "failed",
         )
-    }
-
-    private fun resolveCutSwitchVerifiedRowIndex(slotKey: String): Int? {
-        for (i in entries.indices.reversed()) {
-            val e = entries[i]
-            if (e.slot_key != slotKey) continue
-            if (
-                e.op_type !in cutSwitchOpTypes &&
-                    e.op_type != SLOT_VERIFIED_OP_TYPE &&
-                    e.op_type != "auto_switch_cut_switch_abort"
-            ) continue
-            if (e.op_type == "auto_switch_cut_switch_abort") return null
-            when (e.phase) {
-                "failed" -> return null
-                "cancelled" -> continue
-                "queued", "running" -> return null
-                "success" -> {
-                    when (e.op_type) {
-                        SLOT_VERIFIED_OP_TYPE -> {
-                            return parseLedgerRowIndex(e.report_data["cut_switch_target_row_index"])
-                        }
-                        "tiktok_restore" -> {
-                            return parseLedgerRowIndex(
-                                e.report_data["restore_highlight_row_index"]
-                                    ?: e.report_data["cut_switch_target_row_index"],
-                            )
-                        }
-                        "tiktok_clear", "tiktok_backup_and_clear" -> {
-                            val mode = e.report_data["cut_switch_after_backup"]?.toString()?.trim()?.lowercase()
-                            if (mode == "exclusive_activate_target") {
-                                return parseLedgerRowIndex(e.report_data["cut_switch_target_row_index"])
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return null
-    }
-
-    private fun parseLedgerRowIndex(raw: Any?): Int? = when (raw) {
-        is Number -> raw.toInt()
-        is String -> raw.trim().toIntOrNull()
-        else -> null
-    }
-
-    /** 本机已无发作品执行上下文时，将 ledger 标为失败以便本时段可重新调度。 */
-    fun abortStalePublishSlot(slotKey: String, message: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return
-        if (isPublishSlotDone(sk) || isPublishSlotAborted(sk)) return
-        if (!isPublishSlotInflight(sk)) return
-        var opId = PrefsStore.getPublishPostTaskOpId().orEmpty()
-        var username = PrefsStore.getAutoSwitchPublishAccountUsername().orEmpty()
-        if (opId.isBlank()) {
-            for (i in entries.indices.reversed()) {
-                val e = entries[i]
-                if (e.slot_key == sk && e.op_type == "publish_post_start") {
-                    opId = e.op_id
-                    if (username.isBlank()) username = e.username
-                    break
-                }
-            }
-        }
-        if (opId.isBlank()) {
-            opId = "stale-publish-${System.currentTimeMillis()}"
-        }
-        recordPublishOutcome(
-            opId = opId,
-            completed = false,
-            loginFailed = false,
-            accountChanged = false,
-            message = message,
-            slotKey = sk,
-            username = username,
-        )
-    }
-
-    /** 进程恢复续发：撤销 stale 失败 outcome，将 publish_post_start 重置为 running。 */
-    fun reopenPublishSlotForResume(slotKey: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return
-        var changed = false
-        val removeIdx = entries.indices.reversed().filter { i ->
-            val e = entries[i]
-            e.slot_key == sk &&
-                e.op_type == "publish_post_outcome" &&
-                e.phase == "failed" &&
-                (e.message.contains("清理残留") ||
-                    e.message.contains("本机已结束") ||
-                    isPublishOutcomeResumable(e))
-        }
-        for (i in removeIdx) {
-            val opId = entries[i].op_id
-            entries.removeAt(i)
-            entryIndexByOpId.remove(opId)
-            changed = true
-        }
-        if (removeIdx.isNotEmpty()) {
-            entryIndexByOpId.clear()
-            entries.forEachIndexed { index, entry -> entryIndexByOpId[entry.op_id] = index }
-        }
-        for (i in entries.indices.reversed()) {
-            val e = entries[i]
-            if (e.slot_key != sk || e.op_type != "publish_post_start") continue
-            if (e.phase == "running") break
-            entries[i] = e.copy(
-                at = nowBeijingText(),
-                status = "running",
-                phase = "running",
-                message = "进程恢复续发",
-            )
-            changed = true
-            break
-        }
-        if (changed) persist()
     }
 
     fun recordOpFailure(op: DeviceOp, message: String) {
@@ -591,6 +388,7 @@ object AutoSwitchLedger {
         summary: String,
         ocrRelated: Boolean,
     ) {
+        if (!FailureReportUploader.UPLOAD_ENABLED) return
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         val biz = business.trim()
         val err = FailureReportUploader.normalizeErrorType(errorType)
@@ -618,6 +416,94 @@ object AutoSwitchLedger {
         for (entry in entries.filter { it.op_type == "failure_report_deferred" && it.phase == "success" }) {
             block(entry)
         }
+    }
+
+    /** 切号备份 tar：自治期不上传文件，exit/每日对账前批量上传。 */
+    fun recordCutSwitchBackupDeferred(
+        sourceOpId: String,
+        username: String,
+        packageName: String,
+        backupName: String,
+        backupPath: String,
+        slotKey: String = "",
+        backupRecordId: Int? = null,
+    ) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val user = username.trim().removePrefix("@")
+        val path = backupPath.trim()
+        if (user.isBlank() || path.isBlank()) return
+        val srcOp = sourceOpId.trim()
+        if (srcOp.isBlank()) return
+        if (
+            entries.any {
+                it.op_type == CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE &&
+                    it.report_data["source_op_id"]?.toString() == srcOp &&
+                    (it.phase == "pending_upload" || it.phase == "uploaded")
+            }
+        ) {
+            return
+        }
+        ensureSessionContext()
+        val reportData = linkedMapOf<String, Any>(
+            "op_type" to CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE,
+            "source_op_id" to srcOp,
+            "username" to user,
+            "package_name" to packageName.trim(),
+            "backup_name" to backupName.trim(),
+            "backup_path" to path,
+        )
+        backupRecordId?.takeIf { it >= 0 }?.let { reportData["backup_record_id"] = it }
+        slotKey.trim().takeIf { it.isNotEmpty() }?.let { reportData["auto_switch_slot_key"] = it }
+        record(
+            opId = "backup-defer-$srcOp",
+            opType = CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE,
+            status = "pending",
+            message = "切号备份待对账上传：$backupName",
+            slotKey = slotKey.trim(),
+            username = user,
+            reportData = reportData,
+            phaseOverride = "pending_upload",
+        )
+    }
+
+    suspend fun forEachPendingCutSwitchBackupUpload(block: suspend (LedgerEntry) -> Unit) {
+        for (entry in entries.filter {
+            it.op_type == CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE && it.phase == "pending_upload"
+        }) {
+            block(entry)
+        }
+    }
+
+    fun hasPendingCutSwitchBackupUpload(): Boolean =
+        entries.any { it.op_type == CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE && it.phase == "pending_upload" }
+
+    fun markCutSwitchBackupUploaded(opId: String, detail: String = "") {
+        val oid = opId.trim()
+        if (oid.isBlank()) return
+        val idx = entryIndexByOpId[oid] ?: return
+        val existing = entries.getOrNull(idx) ?: return
+        if (existing.op_type != CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE) return
+        val msg = detail.trim().ifBlank { "切号备份文件已上传" }
+        entries[idx] = existing.copy(
+            at = nowBeijingText(),
+            status = "success",
+            phase = "uploaded",
+            message = msg.take(2000),
+        )
+        persist()
+    }
+
+    fun noteCutSwitchBackupUploadFailed(opId: String, reason: String) {
+        val oid = opId.trim()
+        if (oid.isBlank()) return
+        val idx = entryIndexByOpId[oid] ?: return
+        val existing = entries.getOrNull(idx) ?: return
+        if (existing.op_type != CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE) return
+        entries[idx] = existing.copy(
+            at = nowBeijingText(),
+            message = "切号备份待上传（失败：${reason.trim().take(500)}）",
+        )
+        persist()
     }
 
     /** 新号冷却 -1→0：写入 ledger，关会话时对账写回 DB。 */
@@ -724,6 +610,23 @@ object AutoSwitchLedger {
         )
     }
 
+    /** 会话总结一行摘要（仅 UI/本地日志；完整 human_log 只随云端上报）。 */
+    fun buildOneLineSummary(
+        alias: String,
+        summaryKind: String = "final",
+        reconcileKey: String = "",
+    ): String {
+        val stats = buildStats()
+        val kind = summaryKind.trim().lowercase().ifBlank { "final" }
+        val reconcile = reconcileKey.trim().ifBlank {
+            if (kind == "daily") beijingDateString() else "final"
+        }
+        val prefix = if (kind == "daily") "【每日对账 $reconcile】" else "【自动切号会话总结】"
+        val missingBackupCount = stats["cut_switch_missing_backup"] as? Int ?: 0
+        val missingPart = if (missingBackupCount > 0) "；备份包缺失改自动登录 $missingBackupCount 次" else ""
+        return "$prefix 合计 ${stats["total"]} 项，成功 ${stats["success"]}，失败 ${stats["failed"]}$missingPart"
+    }
+
     fun buildHumanLog(alias: String): String {
         val stats = buildStats()
         val lines = mutableListOf<String>()
@@ -785,7 +688,7 @@ object AutoSwitchLedger {
             schedule_date = scheduleDate.ifBlank { PrefsStore.getAutoSwitchScheduleDate().orEmpty() },
             started_at = startedAt.ifBlank { PrefsStore.getAutoSwitchSessionStartedAt().orEmpty() },
             ended_at = nowBeijingText(),
-            ledger = entries.map {
+            ledger = entries.filter { it.op_type != CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE }.map {
                 AutoSwitchLedgerEntryPayload(
                     at = it.at,
                     op_id = it.op_id,
@@ -862,60 +765,12 @@ object AutoSwitchLedger {
         )
     }
 
-    /** 高亮已对齐、登录校验通过后写入 verified（无需 clear/restore）。 */
-    fun recordCutSwitchSlotVerified(slotKey: String, targetRowIndex: Int, username: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        val sk = slotKey.trim()
-        val user = username.trim().removePrefix("@")
-        if (sk.isBlank() || targetRowIndex < 0 || user.isBlank()) return
-        ensureSessionContext()
-        record(
-            opId = "local-as-slot-verified-${System.currentTimeMillis()}-$sk-${targetRowIndex}",
-            opType = SLOT_VERIFIED_OP_TYPE,
-            status = "success",
-            message = "登录校验对齐 @$user",
-            slotKey = sk,
-            username = user,
-            reportData = mapOf(
-                "op_type" to SLOT_VERIFIED_OP_TYPE,
-                "auto_switch_slot_key" to sk,
-                "cut_switch_target_row_index" to targetRowIndex,
-                "username" to user,
-            ),
-            phaseOverride = "success",
-        )
-    }
-
-    /** 本机已无切号执行上下文时，将 ledger 中 queued/running 切号 OP 标为 failed，避免挡住重新入队。 */
-    fun abortStaleCutSwitchSlot(slotKey: String, message: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        val sk = slotKey.trim()
-        if (sk.isBlank()) return
-        if (!isCutSwitchSlotInflight(sk)) return
-        val detail = message.trim().ifBlank { "残留切号 in-flight 已清理" }
-        var changed = false
-        for (i in entries.indices) {
-            val e = entries[i]
-            if (e.slot_key != sk) continue
-            if (e.op_type !in cutSwitchOpTypes) continue
-            if (e.phase != "queued" && e.phase != "running") continue
-            entries[i] = e.copy(
-                at = nowBeijingText(),
-                status = "failed",
-                phase = "failed",
-                message = detail,
-            )
-            changed = true
-        }
-        if (changed) persist()
-    }
-
-    /** 对齐已完成时取消 ledger 中同 slot 仍为 queued 的切号 OP，避免 inflight 挡住 verified。 */
+    /** 切号已完成时取消 ledger 中同 slot 仍为 queued 的切号 OP，避免 inflight 挡住 plan 切号完成态。 */
     fun cancelQueuedCutSwitchOpsForSlot(slotKey: String, reason: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         val sk = slotKey.trim()
         if (sk.isBlank()) return
-        val detail = reason.trim().ifBlank { "对齐已完成，取消重复切号 OP" }
+        val detail = reason.trim().ifBlank { "切号已完成，取消重复切号 OP" }
         var changed = false
         for (i in entries.indices) {
             val e = entries[i]
@@ -1143,9 +998,9 @@ object AutoSwitchLedger {
         "account_mark_login" -> "登录成功(待对账)"
         "account_username_update" -> "用户名变更(待对账)"
         "failure_report_deferred" -> "失败采集(待对账)"
+        CUT_SWITCH_BACKUP_DEFERRED_OP_TYPE -> "切号备份(待上传)"
         "auto_switch_account_activity" -> "账号任务段"
         "cut_switch_missing_backup" -> "切号备份缺失(改自动登录)"
-        SLOT_VERIFIED_OP_TYPE -> "时段登录校验对齐"
         else -> opType.ifBlank { "操作" }
     }
 

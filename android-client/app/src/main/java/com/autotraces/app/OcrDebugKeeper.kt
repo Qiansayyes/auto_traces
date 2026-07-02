@@ -4,14 +4,13 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
-/**
- * OCR 失败时保留最近若干张截屏，供 [FailureReportUploader] 打包上传。
- */
+/** OCR 失败调试截屏（失败采集关闭时不保留）。 */
 object OcrDebugKeeper {
     private const val MAX_FILES = 24
     private val lock = Any()
 
     fun saveOnFailure(source: File, tag: String) {
+        if (!FailureReportUploader.UPLOAD_ENABLED) return
         if (!source.isFile || source.length() <= 0L) return
         val ctx = runCatching { PrefsStore.applicationContext() }.getOrNull() ?: return
         synchronized(lock) {
