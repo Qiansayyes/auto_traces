@@ -103,12 +103,23 @@ set +e
 BACKEND_HEALTH="$(curl -sS -m 10 "http://127.0.0.1:${BACKEND_PORT}/api/health" || true)"
 NGINX_LOCAL_CODE="$(curl -sS -o /dev/null -m 10 -w "%{http_code}" "http://127.0.0.1/" || true)"
 PUBLIC_CODE="$(curl -sS -o /dev/null -m 10 -w "%{http_code}" "http://${SERVER_NAME}/" || true)"
+MAIL_ADMIN_SNIPPET="$(curl -sS -m 10 "http://127.0.0.1/mail-admin/email" 2>/dev/null | head -c 120 || true)"
+MAIL_ADMIN_OK=0
+if [[ "${MAIL_ADMIN_SNIPPET}" == *"MS_OAuth2API"* ]]; then
+  MAIL_ADMIN_OK=1
+fi
 set -e
 
 echo "----------------------------------------"
 echo "Backend health response: ${BACKEND_HEALTH:-<empty>}"
 echo "Nginx local status code: ${NGINX_LOCAL_CODE:-<empty>}"
 echo "Public access status code: ${PUBLIC_CODE:-<empty>}"
+if [[ "${MAIL_ADMIN_OK}" -eq 1 ]]; then
+  echo "Mail admin proxy: OK (/mail-admin/email -> MS_OAuth2API)"
+else
+  echo "Mail admin proxy: FAIL (got: ${MAIL_ADMIN_SNIPPET:-<empty>})"
+  echo "  -> Check nginx location /mail-admin/ in ${NGINX_SITE}"
+fi
 echo "----------------------------------------"
 
 echo "[8/8] Current service status:"
