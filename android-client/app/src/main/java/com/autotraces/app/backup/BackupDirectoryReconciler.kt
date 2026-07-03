@@ -9,6 +9,7 @@ import java.util.Locale
  * 按云端 bundle 账号档案 + 备份包命名规则整理 [UnifiedBackupPaths] 目录：
  * - 每个已分配 username 仅保留 1 个包（优先云端 [backup_name] 且本机存在，否则保留最新）
  * - 删除同 username 重复包、别名下未分配 username 的包、不符合命名规则的 .tar.gz
+ * - 云端 [backup_name] 解析出的 username 与档案 username 不一致时删除该备份包
  * - 云端有 [backup_name] 但本机不存在时记入 [ReconcileResult.missingCloud]（需重新登录备份）
  */
 object BackupDirectoryReconciler {
@@ -33,6 +34,8 @@ object BackupDirectoryReconciler {
         val deleted: List<String> = emptyList(),
         val failed: List<String> = emptyList(),
         val missingCloud: List<MissingCloudBackup> = emptyList(),
+        /** backup_name 解析 username 与档案 username 不一致而删除的包 */
+        val usernameMismatchDeleted: List<String> = emptyList(),
     )
 
     fun policiesFromAccounts(accounts: List<AutoSwitchAccount>): List<AccountBackupPolicy> =
@@ -79,17 +82,41 @@ object BackupDirectoryReconciler {
         val kept = mutableSetOf<String>()
         val toDelete = mutableSetOf<String>()
         val missingCloud = mutableListOf<MissingCloudBackup>()
+        val usernameMismatchDeleted = mutableListOf<String>()
+        val allCandidateUsers = policyByUser.keys.toList()
 
         // 1) 已分配账号：每个 username 只保留“最新可用”的 1 个包。
-        //    云端 backup_name 仅作提示/对账，不再作为删包的唯一依据，避免云端名与设备实际文件名不一致时误删。
         for ((userKey, policy) in policyByUser) {
             val userToken = UnifiedBackupPaths.sanitizeUsernameForBackupFilename(userKey)
             if (userToken.isEmpty()) continue
             val prefix = "${aliasToken}_${userToken}_"
+            val cloudName = policy.cloudBackupName.trim().let { if (it == "-") "" else it }
+
+            // backup_name 与档案 username 不一致 → 删除该备份包
+            if (cloudName.isNotEmpty()) {
+                val parsedFromCloud = UnifiedBackupPaths.parseUsernameFromBackupArchiveName(
+                    cloudName,
+                    alias,
+                    allCandidateUsers,
+                )
+                if (parsedFromCloud != null &&
+                    normalizeUsername(parsedFromCloud) != normalizeUsername(userKey)
+                ) {
+                    allArchives.filter { file ->
+                        file.name.equals(cloudName, ignoreCase = true) ||
+                            file.name.equals(File(cloudName).name, ignoreCase = true)
+                    }.forEach { file ->
+                        val path = file.canonicalOrAbsolute()
+                        toDelete.add(path)
+                        usernameMismatchDeleted.add(path)
+                    }
+                    // 仅删 backup_name 指向的错误包，继续按档案 username 处理本机其它合法包
+                }
+            }
+
             val userFiles = allArchives.filter { it.name.lowercase(Locale.US).startsWith(prefix) }
             if (userFiles.isEmpty()) {
-                val cloudName = policy.cloudBackupName.trim()
-                if (cloudName.isNotEmpty() && cloudName != "-") {
+                if (cloudName.isNotEmpty()) {
                     missingCloud.add(MissingCloudBackup(userKey, cloudName))
                 }
                 continue
@@ -102,17 +129,17 @@ object BackupDirectoryReconciler {
             invalidFiles.forEach { toDelete.add(it.canonicalOrAbsolute()) }
 
             val keepFile = validFiles.maxByOrNull { it.lastModified() }
-            val cloudName = policy.cloudBackupName.trim().let { if (it == "-") "" else it }
-            if (cloudName.isNotEmpty()) {
+            val cloudNameForMatch = cloudName
+            if (cloudNameForMatch.isNotEmpty()) {
                 val cloudMatchesLocal = validFiles.any { file ->
-                    file.name.equals(cloudName, ignoreCase = true) ||
-                        file.name.equals(File(cloudName).name, ignoreCase = true)
+                    file.name.equals(cloudNameForMatch, ignoreCase = true) ||
+                        file.name.equals(File(cloudNameForMatch).name, ignoreCase = true)
                 }
                 if (!cloudMatchesLocal) {
                     missingCloud.add(
                         MissingCloudBackup(
                             userKey,
-                            cloudName,
+                            cloudNameForMatch,
                             keptLocalFallbackName = keepFile?.name.orEmpty(),
                         ),
                     )
@@ -173,6 +200,7 @@ object BackupDirectoryReconciler {
             deleted = deleted.sorted(),
             failed = failed.sorted(),
             missingCloud = missingCloud.distinctBy { it.username.lowercase() },
+            usernameMismatchDeleted = usernameMismatchDeleted.distinct().sorted(),
         )
     }
 

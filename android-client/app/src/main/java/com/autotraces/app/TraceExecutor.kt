@@ -257,7 +257,61 @@ class RealTraceExecutor(
 
     private fun isMlKitHardStopError(err: String): Boolean = err == "hard_stop"
 
-    /** 发作品步骤失败收尾：硬停不重启；否则可选重启 TikTok（不发作品冷启专用 Don't allow OCR）。恒返回 false。 */
+    /** 发作品恢复结果：统一入口优先返回首页，失败再重启；上层只关心是否已准备好继续发作品。 */
+    private enum class PublishPostEntryRecoveryResult {
+        AlreadyReady,
+        RecoveredByBack,
+        RecoveredByRestart,
+        Failed,
+    }
+
+    private fun publishPostRecoveryResultLabel(result: PublishPostEntryRecoveryResult): String = when (result) {
+        PublishPostEntryRecoveryResult.AlreadyReady -> "已是首页"
+        PublishPostEntryRecoveryResult.RecoveredByBack -> "回首页成功"
+        PublishPostEntryRecoveryResult.RecoveredByRestart -> "重启兜底成功"
+        PublishPostEntryRecoveryResult.Failed -> "恢复失败"
+    }
+
+    private fun publishPostRecoveryScopeLabel(reason: String): String = when {
+        reason.contains("任务头") -> "发作品恢复[任务头]"
+        reason.contains("条间") -> "发作品恢复[条间]"
+        reason.contains("同条续作") -> "发作品恢复[同条续作]"
+        reason.contains("同条重试") -> "发作品恢复[同条重试]"
+        else -> "发作品恢复"
+    }
+
+    private suspend fun recoverPublishPostEntry(service: Context, reason: String): PublishPostEntryRecoveryResult {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, reason)) return PublishPostEntryRecoveryResult.Failed
+        if (growthYieldOrNull(alias, reason)) return PublishPostEntryRecoveryResult.Failed
+        val ctx = service.applicationContext
+        if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
+            val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+            val (vision, err) = mlKitRecognizeFullScreen(service, "$reason-precheck")
+            if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前已是主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}），直接继续发作品")
+                return PublishPostEntryRecoveryResult.AlreadyReady
+            }
+            if (vision == null) {
+                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：主 Feed 预检 OCR 失败：$err，先尝试导航返回恢复")
+            } else {
+                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前前台但未确认主 Feed，先尝试导航返回恢复")
+            }
+        }
+        val backOk = recoverToHomeViaBackOrRestart(ctx, "$reason·回首页优先", skipDontAllowOcr = true)
+        if (backOk) {
+            devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：回首页成功，紧接着继续发作品")
+            return PublishPostEntryRecoveryResult.RecoveredByBack
+        }
+        devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：导航返回回首页未成功，改按原方案强关重启")
+        return if (restartTikTokForRecovery(skipDontAllowOcr = true)) {
+            devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：重启兜底成功，紧接着继续发作品")
+            PublishPostEntryRecoveryResult.RecoveredByRestart
+        } else {
+            PublishPostEntryRecoveryResult.Failed
+        }
+    }
+
     private suspend fun publishPostFail(alias: String, phase: String, tryRestart: Boolean): Boolean {
         if (hardStopOrNull(alias, phase)) return false
         if (tryRestart) restartTikTokForRecovery(skipDontAllowOcr = true)
@@ -7462,13 +7516,19 @@ class RealTraceExecutor(
         return true
     }
 
-    /** 帧差判定界面错乱后：关开 TikTok 并重新搜索进入 teamwork Videos（带连续重试，不跳过左/右侧）。 */
+    /**
+     * 帧差判定界面错乱后：先多次导航返回并用 OCR 复核主 Feed；
+     * 若仍不能确认回到主 Feed，再按原有方案关开 TikTok 并重新搜索进入 teamwork Videos。
+     */
     private suspend fun reopenMutualTeamworkVideosTabWithRetries(
         service: Context,
         config: AppConfig,
         launchCheckTag: String,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
+        if (!recoverToHomeViaBackOrRestart(service, "$launchCheckTag·回首页兜底")) {
+            devOp(alias, "互点：$launchCheckTag 回首页兜底失败，进入原始关开 TikTok 恢复")
+        }
         for (attempt in 1..MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS) {
             if (reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "$launchCheckTag·$attempt")) {
                 return true
@@ -8237,6 +8297,27 @@ class RealTraceExecutor(
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
         val pkg = packageName.trim().ifEmpty { Config.TIKTOK_PACKAGE_NAME }
         if (pkg == Config.TIKTOK_PACKAGE_NAME) {
+            val skipSafeguardAfterRelogin = PrefsStore.consumePublishPostSkipNextColdLaunchSafeguard()
+            if (skipSafeguardAfterRelogin) {
+                devOp(alias, "发作品冷启：发作品保障重登后跳过 force-stop 与登录保障，仅确认 TikTok 前台")
+                val foregroundOk = ensureTikTokInForeground(
+                    service,
+                    alias,
+                    "发作品冷启(重登后)",
+                    allowForceRestart = false,
+                ) || launchTikTokOnceWithCheck(
+                    service,
+                    alias,
+                    "发作品冷启(重登后)",
+                    launchWaitMs,
+                    forceStopBeforeLaunch = false,
+                    skipDontAllowOcr = true,
+                )
+                if (!foregroundOk) {
+                    devOp(alias, "发作品冷启(重登后)：前台确认未通过")
+                }
+                return foregroundOk
+            }
             val launched = launchTikTokOnceWithCheck(
                 service,
                 alias,
@@ -9191,7 +9272,16 @@ class RealTraceExecutor(
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
         publishPostEntryLayout = publishPostLoadDeviceEntryLayout(alias)
         if (resumeStartIdx <= 0) {
-            if (!publishPostColdLaunch(service, packageName, alias, config)) return false
+            when (val recovery = recoverPublishPostEntry(service, "发作品任务头")) {
+                PublishPostEntryRecoveryResult.AlreadyReady,
+                PublishPostEntryRecoveryResult.RecoveredByBack,
+                PublishPostEntryRecoveryResult.RecoveredByRestart,
+                -> devOp(alias, "${publishPostRecoveryScopeLabel("发作品任务头")}:${publishPostRecoveryResultLabel(recovery)}，继续执行发作品")
+                PublishPostEntryRecoveryResult.Failed -> {
+                    devOp(alias, "${publishPostRecoveryScopeLabel("发作品任务头")}:恢复失败，终止本轮发作品")
+                    return false
+                }
+            }
         } else {
             devOp(alias, "发作品：续发断点进入，跳过任务头冷启（已成功 $resumeStartIdx 条）")
         }
@@ -9204,12 +9294,15 @@ class RealTraceExecutor(
                         if (idx > startIdx) "（上一条已成功，不冷启）" else "（续发断点，不冷启）",
                 )
                 delay(PUBLISH_POST_INTER_ITEM_DELAY_MS)
-                if (!ensureTikTokInForeground(service, alias, "发作品条间续作")) {
-                    devOp(alias, "发作品 第 ${idx + 1}/$publishRounds 条：条间恢复拉起未通过，尝试冷启后继续")
-                    if (!publishPostColdLaunch(service, packageName, alias, config)) {
-                        devOp(alias, "发作品 第 ${idx + 1}/$publishRounds 条：条间冷启失败，保存断点")
+                when (val recovery = recoverPublishPostEntry(service, "发作品条间续作")) {
+                    PublishPostEntryRecoveryResult.AlreadyReady,
+                    PublishPostEntryRecoveryResult.RecoveredByBack,
+                    PublishPostEntryRecoveryResult.RecoveredByRestart,
+                    -> devOp(alias, "${publishPostRecoveryScopeLabel("发作品条间")}：${publishPostRecoveryResultLabel(recovery)}，继续执行第 ${idx + 1}/$publishRounds 条")
+                    PublishPostEntryRecoveryResult.Failed -> {
+                        devOp(alias, "${publishPostRecoveryScopeLabel("发作品条间")}:恢复失败，保存断点")
                         PrefsStore.setPublishPostResumeNextIndex(accountKey, idx)
-                        lastPublishPostEntryFailureReason = "条间冷启失败"
+                        lastPublishPostEntryFailureReason = "条间恢复失败"
                         return false
                     }
                 }
@@ -9228,9 +9321,13 @@ class RealTraceExecutor(
                             "等待 ${PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS}ms 后重试",
                     )
                     delay(PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS)
-                    if (!ensureTikTokInForeground(service, alias, "发作品同条续发")) {
-                        if (!publishPostColdLaunch(service, packageName, alias, config)) {
-                            devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：同条续发冷启失败")
+                    when (val recovery = recoverPublishPostEntry(service, "发作品同条续作")) {
+                        PublishPostEntryRecoveryResult.AlreadyReady,
+                        PublishPostEntryRecoveryResult.RecoveredByBack,
+                        PublishPostEntryRecoveryResult.RecoveredByRestart,
+                        -> devOp(alias, "${publishPostRecoveryScopeLabel("发作品同条续作")}：${publishPostRecoveryResultLabel(recovery)}，继续执行第 ${videoIndex + 1}/$publishRounds 条")
+                        PublishPostEntryRecoveryResult.Failed -> {
+                            devOp(alias, "${publishPostRecoveryScopeLabel("发作品同条续作")}:恢复失败")
                             if (isHardStopActive()) return false
                             continue
                         }
@@ -9243,10 +9340,16 @@ class RealTraceExecutor(
                     lastPublishAttempts = publishAttempts
                     if (publishAttempts > 1) {
                         devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：第 $publishAttempts 次重试，重新拉起 TikTok 后继续同一条作品")
-                        if (!publishPostColdLaunch(service, packageName, alias, config)) {
-                            devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：重启 TikTok 失败，继续等待下一轮重试")
-                            if (isHardStopActive()) return false
-                            continue
+                        when (val recovery = recoverPublishPostEntry(service, "发作品同条重试")) {
+                            PublishPostEntryRecoveryResult.AlreadyReady,
+                            PublishPostEntryRecoveryResult.RecoveredByBack,
+                            PublishPostEntryRecoveryResult.RecoveredByRestart,
+                            -> devOp(alias, "${publishPostRecoveryScopeLabel("发作品同条重试")}：${publishPostRecoveryResultLabel(recovery)}，继续执行第 ${videoIndex + 1}/$publishRounds 条")
+                            PublishPostEntryRecoveryResult.Failed -> {
+                                devOp(alias, "${publishPostRecoveryScopeLabel("发作品同条重试")}:恢复失败，继续等待下一轮重试")
+                                if (isHardStopActive()) return false
+                                continue
+                            }
                         }
                     }
                     if (
@@ -14167,6 +14270,45 @@ class RealTraceExecutor(
         findLabelHitContainingIgnoreCase(vision, "add another account")
             ?: findLabelHitContainingIgnoreCase(vision, "another account")
 
+    /** Profile 未登录入口：Log in 按钮/文案（全屏 OCR，含 Welcome back 中央按钮；排除 log in to）。 */
+    private fun findLogInEntryTapHit(vision: Text): StrictLabelHit? {
+        findStrictExactLabelHit(vision, "Log in")?.let { return it }
+        findStrictExactLabelHit(vision, "log in")?.let { return it }
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    val low = el.text.lowercase(Locale.US)
+                    if (low.contains("log in") && !low.contains("log in to")) {
+                        el.boundingBox?.let { return StrictLabelHit(Point(it.centerX(), it.centerY()), it) }
+                    }
+                }
+                val lowLine = line.text.lowercase(Locale.US)
+                if (lowLine.contains("log in") && !lowLine.contains("log in to")) {
+                    line.boundingBox?.let { return StrictLabelHit(Point(it.centerX(), it.centerY()), it) }
+                }
+            }
+        }
+        return null
+    }
+
+    /** Profile 未登录入口：Sign up 文案（全屏 OCR，含底栏与页内链接）。 */
+    private fun findSignUpEntryTapHit(vision: Text): StrictLabelHit? =
+        findStrictExactLabelHit(vision, "Sign up")
+            ?: findStrictExactLabelHit(vision, "sign up")
+            ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "sign up")
+
+    /** 定位 Profile 时见以下任一文案，即已登出、无需再点底栏 Profile。 */
+    private fun visionShowsProfileLoginEntryMarkers(vision: Text): Boolean =
+        findAddAnotherAccountTapHit(vision) != null ||
+            findLogInEntryTapHit(vision) != null ||
+            findSignUpEntryTapHit(vision) != null
+
+    private enum class ProfileLoginEntryTapOutcome {
+        ProfileTapped,
+        OnLoginEntryScreen,
+        Failed,
+    }
+
     private suspend fun autoLoginResolveEntryPath(
         ctx: Context,
         alias: String,
@@ -14180,6 +14322,12 @@ class RealTraceExecutor(
                 return AutoLoginEntryPath.None
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_entry_$pass") ?: continue
+
+            if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, h)) {
+                val preview = buildProfileEditOcrPreview(vision).take(400)
+                devOp(alias, "自动登录：Profile+Edit 同屏，立即判定已登录；OCR=$preview")
+                return AutoLoginEntryPath.AlreadyLoggedIn
+            }
 
             val addAnotherHit = findAddAnotherAccountTapHit(vision)
             if (addAnotherHit != null) {
@@ -14195,11 +14343,11 @@ class RealTraceExecutor(
                 continue
             }
 
-            val logInBottom = findBottomBandLabelContaining(vision, h, "log in")
-            if (logInBottom != null) {
+            val logInHit = findLogInEntryTapHit(vision)
+            if (logInHit != null) {
                 loginEntryMissStreak = 0
-                val tap = autoLoginTapWithJitter(logInBottom.point, w, h)
-                devOp(alias, "自动登录：底栏 Log in，点 Log in（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})")
+                val tap = autoLoginTapWithJitter(logInHit.point, w, h)
+                devOp(alias, "自动登录：点 Log in（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})")
                 if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                     autoLoginDelay(alias, 550L, "Log in 点击后")
                     return AutoLoginEntryPath.ViaLogIn
@@ -14207,10 +14355,10 @@ class RealTraceExecutor(
                 continue
             }
 
-            val signUpBottom = findBottomBandLabelContaining(vision, h, "sign up")
-            if (signUpBottom != null) {
+            val signUpHit = findSignUpEntryTapHit(vision)
+            if (signUpHit != null) {
                 loginEntryMissStreak = 0
-                devOp(alias, "自动登录：底栏 Sign up（已在 Log in 之后），不点底栏，进入 Username×2")
+                devOp(alias, "自动登录：见 Sign up（已在 Log in 之后），不点 Sign up，进入 Username×2")
                 autoLoginDelay(alias, 550L, "Sign up 识别后")
                 return AutoLoginEntryPath.ViaSignUp
             }
@@ -14625,19 +14773,24 @@ class RealTraceExecutor(
     private suspend fun autoLoginTapProfileForLoginEntry(
         ctx: Context,
         alias: String,
-    ): Boolean {
+    ): ProfileLoginEntryTapOutcome {
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
         for (pass in 1..3) {
-            if (hardStopOrNull(alias, "自动登录-入口Profile")) return false
-            if (pass > 1 && !autoLoginDelay(alias, 1000L, "入口Profile")) return false
+            if (hardStopOrNull(alias, "自动登录-入口Profile")) return ProfileLoginEntryTapOutcome.Failed
+            if (pass > 1 && !autoLoginDelay(alias, 1000L, "入口Profile")) return ProfileLoginEntryTapOutcome.Failed
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_entry_profile_$pass") ?: continue
             if (ocrVisionHasSwipePrompt(vision)) {
                 devOp(alias, "自动登录：入口 Profile 定位前识别到 Swipe，上滑两次后继续")
-                if (!autoLoginPerformSwipeUpTwice(alias, w, h, "入口Profile-Swipe")) return false
-                if (!autoLoginDelay(alias, 600L, "入口Profile Swipe后")) return false
+                if (!autoLoginPerformSwipeUpTwice(alias, w, h, "入口Profile-Swipe")) return ProfileLoginEntryTapOutcome.Failed
+                if (!autoLoginDelay(alias, 600L, "入口Profile Swipe后")) return ProfileLoginEntryTapOutcome.Failed
                 continue
+            }
+            if (visionShowsProfileLoginEntryMarkers(vision)) {
+                val preview = buildProfileEditOcrPreview(vision).take(280)
+                devOp(alias, "自动登录：定位 Profile 时见登录入口（Add another account/Log in/Sign up），已登出；OCR=$preview")
+                return ProfileLoginEntryTapOutcome.OnLoginEntryScreen
             }
             val hit = findBottomBandLabelContaining(vision, h, "profile")
                 ?: findLabelHitContainingIgnoreCase(vision, "profile")
@@ -14646,10 +14799,10 @@ class RealTraceExecutor(
             devOp(alias, "自动登录：预处理点 Profile 进登录入口 (${tap.x},${tap.y})")
             if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                 autoLoginDelay(alias, 450L, "入口Profile 后")
-                return true
+                return ProfileLoginEntryTapOutcome.ProfileTapped
             }
         }
-        return false
+        return ProfileLoginEntryTapOutcome.Failed
     }
 
     private fun ocrVisionHasStrictEdit(result: Text): Boolean =
@@ -14756,13 +14909,36 @@ class RealTraceExecutor(
         LoggedIn,
         /** Log in / Sign up / 登录表单等 → 需自动登录。 */
         NeedsLogin,
-        /** 底栏 Home+Profile 但未见 Edit（可能已在 Feed）。 */
+        /** 底栏 Home+Profile 但未见 Edit（可能仍在 Feed 或 Profile 未加载完）。 */
         MainFeedNavOnly,
         Unknown,
     }
 
+    /** Profile 底栏与 Edit 同屏：强登录态信号（用于保障放行与自动登录 AlreadyLoggedIn）。 */
+    private fun safeguardVisionShowsProfileEditLoggedInSameScreen(vision: Text, screenH: Int): Boolean {
+        if (!ocrVisionHasStrictEdit(vision)) return false
+        if (visionShowsAccountStatusLogoutDialog(vision)) return false
+        return hasBottomBandContaining(vision, screenH, "profile") ||
+            findBottomBandLabelContaining(vision, screenH, "profile") != null
+    }
+
+    private fun recordLoginSuccessFromProfileEditSafeguard(alias: String) {
+        val username = PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return
+        AutoSwitchBundleHolder.notifyAccountLoggedIn(username)
+        if (PrefsStore.isAutoSwitchAutonomousMode()) {
+            AutoSwitchLedger.recordAccountLoginSuccess(username)
+            devOp(alias, "登录状态保障：Profile+Edit 同屏，is_login 已记入 ledger（对账写回）")
+        } else {
+            devOp(alias, "登录状态保障：Profile+Edit 同屏已登录（自治外模式由协调器上报 is_login）")
+        }
+    }
+
     private fun classifySafeguardProfileScreen(vision: Text, screenH: Int): SafeguardProfileScreenKind {
-        if (ocrVisionHasStrictEdit(vision)) return SafeguardProfileScreenKind.LoggedIn
+        if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, screenH)) {
+            return SafeguardProfileScreenKind.LoggedIn
+        }
         if (autoLoginSeesInterestPicker(vision)) return SafeguardProfileScreenKind.LoggedIn
         if (safeguardVisionNeedsAutoLogin(vision, screenH)) return SafeguardProfileScreenKind.NeedsLogin
         if (autoLoginSeesMainFeedBottomNav(vision, screenH)) return SafeguardProfileScreenKind.MainFeedNavOnly
@@ -14771,9 +14947,9 @@ class RealTraceExecutor(
 
     /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Add another account 由 [probeAddAnotherAccountLogoutFromOcrVision] 统一处理。 */
     private fun safeguardVisionNeedsAutoLogin(vision: Text, screenH: Int): Boolean {
+        if (visionShowsProfileLoginEntryMarkers(vision)) return true
         if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
         if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
-        if (findAddAnotherAccountTapHit(vision) != null) return true
         if (findAutoLoginUsernameTapHit(vision) != null) return true
         if (ocrVisionHasVerifyEmailMarker(vision)) return true
         if (findLabelHitContainingIgnoreCase(vision, "verification code") != null) return true
@@ -14844,20 +15020,34 @@ class RealTraceExecutor(
             return LoginSafeguardOutcome.Failed
         }
 
-        if (!autoLoginTapProfileForLoginEntry(ctx, alias)) {
-            devOp(alias, "登录状态保障：未能点击底栏 Profile")
-            return LoginSafeguardOutcome.Failed
+        when (autoLoginTapProfileForLoginEntry(ctx, alias)) {
+            ProfileLoginEntryTapOutcome.OnLoginEntryScreen -> {
+                devOp(alias, "登录状态保障：定位 Profile 时见登录入口，判定未登录，接入自动登录")
+                return LoginSafeguardOutcome.RequiresAutoLogin
+            }
+            ProfileLoginEntryTapOutcome.Failed -> {
+                devOp(alias, "登录状态保障：未能点击底栏 Profile")
+                return LoginSafeguardOutcome.Failed
+            }
+            ProfileLoginEntryTapOutcome.ProfileTapped -> Unit
         }
         if (!autoLoginDelay(alias, 900L, "登录状态保障 Profile 后")) return LoginSafeguardOutcome.Failed
 
+        var sawExplicitLoginMarkers = false
+        var lastVision: Text? = null
         for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, "登录状态保障-判定")) return LoginSafeguardOutcome.Failed
             if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "登录状态保障-判定")) {
                 return LoginSafeguardOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "login_safeguard_profile_$pass") ?: continue
+            lastVision = vision
+            if (safeguardVisionNeedsAutoLogin(vision, h)) {
+                sawExplicitLoginMarkers = true
+            }
             when (classifySafeguardProfileScreen(vision, h)) {
                 SafeguardProfileScreenKind.LoggedIn -> {
+                    val profileEditSameScreen = safeguardVisionShowsProfileEditLoggedInSameScreen(vision, h)
                     if (autoLoginSeesInterestPicker(vision)) {
                         devOp(alias, "登录状态保障：识别兴趣页，先跳过")
                         when (autoLoginHandleInterestPicker(ctx, alias, w, h)) {
@@ -14871,7 +15061,17 @@ class RealTraceExecutor(
                         }
                     }
                     if (safeguardTapBottomHome(ctx, alias, w, h)) {
-                        devOp(alias, "登录状态保障：Profile 见 Edit/兴趣页，已点 Home，可继续")
+                        if (profileEditSameScreen) {
+                            recordLoginSuccessFromProfileEditSafeguard(alias)
+                        }
+                        devOp(
+                            alias,
+                            if (profileEditSameScreen) {
+                                "登录状态保障：Profile+Edit 同屏，已点 Home，可继续"
+                            } else {
+                                "登录状态保障：Profile 见兴趣页，已点 Home，可继续"
+                            },
+                        )
                         return LoginSafeguardOutcome.Ready
                     }
                     devOp(alias, "登录状态保障：已登录但点 Home 失败")
@@ -14879,23 +15079,57 @@ class RealTraceExecutor(
                 }
                 SafeguardProfileScreenKind.NeedsLogin -> {
                     val preview = buildProfileEditOcrPreview(vision).take(320)
-                    devOp(alias, "登录状态保障：判定未登录（Log in/Sign up/登录表单等）；OCR=$preview")
+                    devOp(alias, "登录状态保障：判定未登录（Log in/Sign up/Add another account 等）；OCR=$preview")
                     return LoginSafeguardOutcome.RequiresAutoLogin
                 }
                 SafeguardProfileScreenKind.MainFeedNavOnly -> {
                     val preview = buildProfileEditOcrPreview(vision).take(320)
-                    devOp(alias, "登录状态保障：底栏 Home+Profile 无 Edit，判定未登录；OCR=$preview")
-                    return LoginSafeguardOutcome.RequiresAutoLogin
+                    devOp(
+                        alias,
+                        "登录状态保障：底栏 Home+Profile 无 Edit，未见登录入口，可能 Profile 未切页（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）；OCR=$preview",
+                    )
+                    if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
+                        autoLoginTapProfileForLoginEntry(ctx, alias)
+                        autoLoginDelay(alias, 900L, "登录状态保障 Profile 重试")
+                    }
                 }
                 SafeguardProfileScreenKind.Unknown -> {
                     val preview = buildProfileEditOcrPreview(vision).take(280)
                     devOp(alias, "登录状态保障：第 $pass 次 Profile 状态未明；OCR=$preview")
+                    if (pass >= 3 && pass < AUTO_LOGIN_OCR_MAX_PASSES) {
+                        autoLoginTapProfileForLoginEntry(ctx, alias)
+                        autoLoginDelay(alias, 900L, "登录状态保障 Profile 重试")
+                    }
                 }
             }
         }
 
-        devOp(alias, "登录状态保障：多轮 OCR 无法确认已登录，需自动登录")
-        return LoginSafeguardOutcome.RequiresAutoLogin
+        if (sawExplicitLoginMarkers) {
+            devOp(alias, "登录状态保障：多轮 OCR 命中 Log in/Sign up/Add another account 等登录入口，需自动登录")
+            return LoginSafeguardOutcome.RequiresAutoLogin
+        }
+        val lenientPreview = lastVision?.let { buildProfileEditOcrPreview(it).take(320) }.orEmpty()
+        devOp(
+            alias,
+            "登录状态保障：多轮未见 Edit 亦未见登录入口文案，宽松判定可继续（不以缺 Edit 单独判未登录）；OCR=$lenientPreview",
+        )
+        val lenientProfileEdit = lastVision?.let { safeguardVisionShowsProfileEditLoggedInSameScreen(it, h) } == true
+        if (safeguardTapBottomHome(ctx, alias, w, h)) {
+            if (lenientProfileEdit) {
+                recordLoginSuccessFromProfileEditSafeguard(alias)
+            }
+            devOp(alias, "登录状态保障：宽松放行已点 Home，可继续")
+            return LoginSafeguardOutcome.Ready
+        }
+        if (lastVision != null && autoLoginSeesMainFeedBottomNav(lastVision!!, h)) {
+            if (lenientProfileEdit) {
+                recordLoginSuccessFromProfileEditSafeguard(alias)
+            }
+            devOp(alias, "登录状态保障：宽松放行（已在主 Feed 底栏），可继续")
+            return LoginSafeguardOutcome.Ready
+        }
+        devOp(alias, "登录状态保障：宽松放行但未能点 Home，仍允许继续")
+        return LoginSafeguardOutcome.Ready
     }
 
     /** @return null 表示登录状态保障通过；非 null 为应中止当前流程的返回文案。 */
@@ -16311,7 +16545,12 @@ class RealTraceExecutor(
             val entryPath = autoLoginResolveEntryPath(ctx, alias, w, h)
             when (entryPath) {
                 AutoLoginEntryPath.AlreadyLoggedIn -> {
-                    devOp(alias, "自动登录：入口页已识别 Edit，跳过登录表单，判定登录成功")
+                    devOp(alias, "自动登录：Profile+Edit 同屏，跳过登录表单，判定登录成功")
+                    if (!safeguardTapBottomHome(ctx, alias, w, h)) {
+                        devOp(alias, "自动登录：AlreadyLoggedIn 但点 Home 失败")
+                        return false
+                    }
+                    devOp(alias, "自动登录：AlreadyLoggedIn 已点 Home，与登录状态保障一致")
                     return true
                 }
                 AutoLoginEntryPath.None -> {

@@ -161,6 +161,22 @@ class AutoSwitchLocalScheduler(
         }
     }
 
+    /**
+     * 还原/自动登录失败：保留备份+清理进度，仅重置还原/登录步（TikTok 已清理，禁止重跑备份+清理）。
+     */
+    fun invalidateSlotAlignmentRestoreOnly(slotKey: String, reason: String) {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return
+        AutoSwitchLocalPlanStore.resetCutSwitchRestoreOrLogin(sk, reason)
+        cancelPendingCutSwitchFollowUps(sk)
+        cutSwitchInflightSlotKey = null
+        pendingCutSwitchSlotKey = sk
+        AutoSwitchLedger.recordCutSwitchSlotAborted(sk, reason)
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】切号续跑还原/登录 slot=$sk：$reason")
+        }
+    }
+
     fun cancelPendingCutSwitchFollowUps(slotKey: String) {
         cancelDuplicatePendingCutSwitchOps(slotKey.trim(), restoreOnly = true)
     }
@@ -986,24 +1002,21 @@ class AutoSwitchLocalScheduler(
         val aliasClean = aliasClean(bundle)
         val cloudRaw = targetRow.backup_name?.trim().orEmpty()
         val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
-        beginExclusiveEnqueue("切号还原")
+        beginExclusiveEnqueue(if (resolved != null) "切号还原" else "切号自动登录")
         AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.RESTORE_OR_LOGIN)
-        val (backupName, backupPath) = if (resolved != null) {
-            resolved
-        } else {
+        if (resolved == null) {
             val cloudBackupLabel = when {
                 cloudRaw.isEmpty() || cloudRaw == "-" -> "-"
                 else -> File(cloudRaw).name
             }
             logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, cloudBackupLabel)
-            LogCenter.op(
-                alias,
-                "【自动切号】断点续跑：@$targetUser 备份本机不可用，入队还原并改走自动登录",
+            enqueueExclusiveOp(
+                buildClearOp(aliasClean, pkg(bundle), targetRi, targetUser, slotKey, "exclusive_activate_target"),
             )
-            val name = if (cloudRaw.isEmpty() || cloudRaw == "-") "" else File(cloudRaw).name
-            val path = targetRow.backup_path?.trim().orEmpty().ifBlank { cloudRaw }
-            name to path
+            LogCenter.op(alias, "【自动切号】断点续跑：@$targetUser 无本地备份，入队自动登录")
+            return true
         }
+        val (backupName, backupPath) = resolved
         val restoreOpId = newLocalOpId("restore")
         val restorePayload = DeviceOpPayload(
             device_id = deviceId,

@@ -69,6 +69,8 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT = "publish_post_last_actual_success_count"
     /** 发作品素材已拉取并就绪；进程被杀后可凭此跳过清库/重拉并续发。 */
     private const val KEY_PUBLISH_POST_MATERIAL_READY = "publish_post_material_ready"
+    /** 发作品保障重登成功后跳过一次冷启 force-stop 与登录保障（一次性消费）。 */
+    private const val KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD = "publish_post_skip_next_cold_launch_safeguard"
     /** 自动切号自治模式：off | on | exiting */
     private const val KEY_AUTO_SWITCH_MODE = "auto_switch_mode"
     private const val KEY_AUTO_SWITCH_SESSION_ID = "auto_switch_session_id"
@@ -529,6 +531,23 @@ object PrefsStore {
         return prefs.getBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
     }
 
+    fun setPublishPostSkipNextColdLaunchSafeguard(skip: Boolean) {
+        if (skip) {
+            prefs.edit().putBoolean(KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD, true).apply()
+        } else {
+            prefs.edit().remove(KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD).apply()
+        }
+    }
+
+    /** 发作品保障重登后消费：返回 true 表示本次应跳过冷启强停与登录保障。 */
+    fun consumePublishPostSkipNextColdLaunchSafeguard(): Boolean {
+        val v = prefs.getBoolean(KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD, false)
+        if (v) {
+            prefs.edit().remove(KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD).apply()
+        }
+        return v
+    }
+
     fun isAutoSwitchPublishTask(): Boolean = AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()
 
     fun hasRecoverableAutoSwitchPublish(slotKey: String): Boolean =
@@ -541,6 +560,7 @@ object PrefsStore {
             .putBoolean(KEY_PUBLISH_POST_PENDING, false)
             .putBoolean(KEY_PUBLISH_POST_QUEUED_AFTER_MUTUAL, false)
             .putBoolean(KEY_PUBLISH_POST_MATERIAL_READY, false)
+            .remove(KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD)
             .remove(KEY_PUBLISH_POST_PACKAGE)
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)

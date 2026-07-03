@@ -12,6 +12,9 @@ import java.util.Locale
  */
 object UnifiedBackupPaths {
 
+    /** 切号备份：低于此大小的 .tar.gz 视为无效（空包/打包失败）。 */
+    const val MIN_VALID_BACKUP_FILE_BYTES: Long = 1024L
+
     fun backupsDir(context: Context): File {
         val base = context.getExternalFilesDir(null)
             ?: File(context.filesDir, "external_files_fallback")
@@ -117,6 +120,74 @@ object UnifiedBackupPaths {
 
     fun hasExistingUsernameBackup(context: Context, username: String, alias: String, deviceId: String): Boolean =
         listUsernameBackupArchives(context, username, alias, deviceId).isNotEmpty()
+
+    /**
+     * 从备份包文件名解析 username（须在 [candidateUsernames] 中匹配最长前缀）。
+     * 包名格式：{alias}_{username}_{deviceId}_{yyyyMMdd_HHmmss}.tar.gz
+     */
+    fun parseUsernameFromBackupArchiveName(
+        archiveName: String,
+        alias: String,
+        candidateUsernames: Collection<String>,
+    ): String? {
+        val baseName = File(archiveName.trim()).name
+            .removeSuffix(".tar.gz")
+            .removeSuffix(".TAR.GZ")
+        val aliasToken = sanitizePathToken(alias, "alias").lowercase(Locale.US)
+        if (aliasToken.isEmpty()) return null
+        val lower = baseName.lowercase(Locale.US)
+        if (!lower.startsWith("${aliasToken}_")) return null
+        val afterAlias = lower.removePrefix("${aliasToken}_")
+        val sorted = candidateUsernames
+            .map { it.trim().removePrefix("@") }
+            .filter { it.isNotEmpty() }
+            .distinctBy { sanitizeUsernameForBackupFilename(it) }
+            .sortedByDescending { sanitizeUsernameForBackupFilename(it).length }
+        for (user in sorted) {
+            val token = sanitizeUsernameForBackupFilename(user)
+            if (token.isNotEmpty() && afterAlias.startsWith("${token}_")) {
+                return user
+            }
+        }
+        return null
+    }
+
+    /**
+     * 校验本机是否存在指定账号的有效备份包。
+     * @return Pair(是否有效, 失败原因或有效路径)
+     */
+    fun verifyLocalBackupArchive(
+        context: Context,
+        username: String,
+        alias: String,
+        deviceId: String,
+        expectedAbsolutePath: String? = null,
+    ): Pair<Boolean, String> {
+        val expected = expectedAbsolutePath?.trim().orEmpty()
+        if (expected.isNotEmpty()) {
+            val file = File(expected)
+            return when {
+                !file.isFile ->
+                    false to "本地备份文件不存在：$expected"
+                file.length() < MIN_VALID_BACKUP_FILE_BYTES ->
+                    false to "本地备份文件过小（${file.length()}B < ${MIN_VALID_BACKUP_FILE_BYTES}B）：$expected"
+                else -> true to file.absolutePath
+            }
+        }
+        val user = username.trim().removePrefix("@")
+        if (user.isEmpty()) {
+            return false to "缺少 username，无法校验本地备份"
+        }
+        val local = listUsernameBackupArchives(context, user, alias, deviceId).firstOrNull()
+            ?: listLegacyBackupsForAccount(context, user, alias).firstOrNull()
+        if (local == null) {
+            return false to "未找到 @$user 的本地备份包（目录：${ensureBackupsDir(context).absolutePath}）"
+        }
+        if (local.length() < MIN_VALID_BACKUP_FILE_BYTES) {
+            return false to "本地备份包过小（${local.length()}B）：${local.absolutePath}"
+        }
+        return true to local.absolutePath
+    }
 
     data class ResolvedBackupArchive(
         val fileName: String,

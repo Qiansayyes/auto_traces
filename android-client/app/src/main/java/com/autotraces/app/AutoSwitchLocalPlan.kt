@@ -45,7 +45,7 @@ data class CutSwitchPlanSteps(
         if (mode == "bootstrap") {
             return clear == PlanStepState.DONE || clear == PlanStepState.SKIPPED
         }
-        return (backup == PlanStepState.DONE || backup == PlanStepState.SKIPPED) &&
+        return (backup == PlanStepState.DONE) &&
             (clear == PlanStepState.DONE || clear == PlanStepState.SKIPPED)
     }
 
@@ -71,7 +71,7 @@ data class CutSwitchPlanSteps(
             }
             return null
         }
-        if (backup != PlanStepState.DONE && backup != PlanStepState.SKIPPED) return CutSwitchStepKind.BACKUP
+        if (backup != PlanStepState.DONE) return CutSwitchStepKind.BACKUP
         if (clear != PlanStepState.DONE && clear != PlanStepState.SKIPPED) return CutSwitchStepKind.CLEAR
         if (restore_or_login != PlanStepState.DONE && restore_or_login != PlanStepState.SKIPPED) {
             return CutSwitchStepKind.RESTORE_OR_LOGIN
@@ -765,6 +765,25 @@ object AutoSwitchLocalPlanStore {
         }
     }
 
+    /**
+     * 还原/自动登录失败后：保留已完成的备份+清理，仅重置还原/登录步以便续跑（TikTok 已被清理，不得重跑备份）。
+     */
+    fun resetCutSwitchRestoreOrLogin(slotKey: String, reason: String = "") {
+        val action = if (reason.isBlank()) {
+            "重置切号还原/登录步"
+        } else {
+            "重置切号还原/登录步：$reason"
+        }
+        mutateCutSwitchSlot(slotKey, action) { slot ->
+            val cs = slot.cut_switch
+            slot.copy(
+                cut_switch = cs.copy(
+                    restore_or_login = PlanStepState.PENDING,
+                ),
+            )
+        }
+    }
+
     fun markCutSwitchWaiting(slotKey: String) {
         mutateCutSwitchSlot(slotKey, "切号等待高优插入") { slot ->
             val cs = slot.cut_switch
@@ -814,10 +833,19 @@ object AutoSwitchLocalPlanStore {
         val detail = if (backupSkipped) "备份已跳过" else "备份已完成"
         mutateCutSwitchSlot(slotKey, "切号步骤完成：$detail + 清理") { slot ->
             val cs = slot.cut_switch
+            val backupState = when {
+                cs.mode == "bootstrap" && backupSkipped -> PlanStepState.SKIPPED
+                backupSkipped -> PlanStepState.PENDING
+                else -> PlanStepState.DONE
+            }
             slot.copy(
                 cut_switch = cs.copy(
-                    backup = if (backupSkipped) PlanStepState.SKIPPED else PlanStepState.DONE,
-                    clear = PlanStepState.DONE,
+                    backup = backupState,
+                    clear = if (backupSkipped && cs.mode != "bootstrap") {
+                        PlanStepState.PENDING
+                    } else {
+                        PlanStepState.DONE
+                    },
                 ),
             )
         }
@@ -845,6 +873,7 @@ object AutoSwitchLocalPlanStore {
     /**
      * 进程重启后：放弃已过期时段内未完成的切号（跨日或当前分钟已越过 end_min），
      * 避免 LMK 杀进程后反复续跑 2026-06-29 等旧 slot。
+     * 未真实完成的 backup/clear 标 SKIPPED，不得假标 DONE。
      */
     fun abandonExpiredIncompleteCutSwitches(scheduleDate: String, minuteOfDay: Int) {
         val date = scheduleDate.trim()
@@ -864,8 +893,8 @@ object AutoSwitchLocalPlanStore {
                     val cs = slot.cut_switch
                     slot.copy(
                         cut_switch = cs.copy(
-                            backup = terminalDone(cs.backup),
-                            clear = terminalDone(cs.clear),
+                            backup = abandonExpiredStep(cs.backup),
+                            clear = abandonExpiredStep(cs.clear),
                             restore_or_login = PlanStepState.SKIPPED,
                         ),
                     )
@@ -992,6 +1021,14 @@ object AutoSwitchLocalPlanStore {
         when (s) {
             PlanStepState.DONE, PlanStepState.SKIPPED -> s
             else -> PlanStepState.DONE
+        }
+
+    /** 过期放弃：仅保留真实 DONE，未完成步骤标 SKIPPED（禁止假标 DONE）。 */
+    private fun abandonExpiredStep(s: PlanStepState): PlanStepState =
+        when (s) {
+            PlanStepState.DONE -> PlanStepState.DONE
+            PlanStepState.SKIPPED -> PlanStepState.SKIPPED
+            else -> PlanStepState.SKIPPED
         }
 
     private fun planStepLabel(state: PlanStepState): String = when (state) {

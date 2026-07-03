@@ -299,6 +299,18 @@ object AppCoordinator {
         }
     }
 
+    /** enter/exit 事件类型优先于 mode_wait 携带的开关字段（服务端长轮询可能曾缓存陈旧值）。 */
+    private fun resolveCloudAutoSwitchEnabledFromModeWait(
+        event: DeviceModeEvent?,
+        reported: Boolean?,
+    ): Boolean? {
+        return when (event?.type?.trim()) {
+            "auto_switch_enter" -> true
+            "auto_switch_exit" -> false
+            else -> reported
+        }
+    }
+
     private fun isCloudAutoSwitchDisabled(): Boolean = lastCloudAutoSwitchEnabled == false
 
     /** mode_wait 携带的云端开关对账：本地仍在自治但云端已关时，不等 exit 事件丢失也能退出。 */
@@ -902,16 +914,48 @@ object AppCoordinator {
                 "$logPrefix 云端备份缺失 @${miss.username}：${miss.cloudBackupName} $detail",
             )
         }
+        result.usernameMismatchDeleted.forEach { path ->
+            LogCenter.op(
+                alias,
+                "$logPrefix 已删除 backup_name 与档案 username 不一致的备份：${File(path).name}",
+            )
+        }
     }
 
-    private fun notifyAutoSwitchCutSwitchStepFailed(payload: DeviceOpPayload?) {
+    private enum class CutSwitchFailureKind {
+        BACKUP_OR_CLEAR,
+        RESTORE_OR_LOGIN,
+    }
+
+    private fun notifyAutoSwitchCutSwitchStepFailed(
+        payload: DeviceOpPayload?,
+        kind: CutSwitchFailureKind = CutSwitchFailureKind.BACKUP_OR_CLEAR,
+        detail: String = "",
+    ) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
         if (slotKey.isEmpty()) return
-        autoSwitchLocalScheduler.cancelPendingCutSwitchFollowUps(slotKey)
-        autoSwitchLocalScheduler.clearCutSwitchInflight()
-        autoSwitchLocalScheduler.invalidateSlotAlignment(slotKey, "切号前序步骤失败")
-        AutoSwitchLedger.recordCutSwitchSlotAborted(slotKey, "切号前序步骤失败")
+        val reason = detail.trim().ifBlank {
+            when (kind) {
+                CutSwitchFailureKind.BACKUP_OR_CLEAR -> "切号备份/清理失败"
+                CutSwitchFailureKind.RESTORE_OR_LOGIN -> "切号还原/登录失败"
+            }
+        }
+        when (kind) {
+            CutSwitchFailureKind.BACKUP_OR_CLEAR -> {
+                autoSwitchLocalScheduler.cancelPendingCutSwitchFollowUps(slotKey)
+                autoSwitchLocalScheduler.clearCutSwitchInflight()
+                autoSwitchLocalScheduler.invalidateSlotAlignment(slotKey, reason)
+                AutoSwitchLedger.recordCutSwitchSlotAborted(slotKey, reason)
+            }
+            CutSwitchFailureKind.RESTORE_OR_LOGIN -> {
+                autoSwitchLocalScheduler.invalidateSlotAlignmentRestoreOnly(slotKey, reason)
+            }
+        }
+        scope.launch {
+            delay(300)
+            autoSwitchLocalScheduler.requestImmediateTick()
+        }
     }
 
     /** 拉取循环被 cancel 时，executeForUsername 可能抛出带 cancelled 文案的异常。 */
@@ -1636,11 +1680,7 @@ object AppCoordinator {
                     val growthHint =
                         if (pullLoopJob?.isActive == true) "空档涨粉中" else "调度中"
                     updateRuntime(lastMessage = "自动切号自治：$growthHint")
-                    if (isCloudAutoSwitchDisabled()) {
-                        modeEventMutex.withLock {
-                            reconcileCloudAutoSwitchState(alias, deviceId, false)
-                        }
-                    }
+                    // 开关对账仅由 mode_wait 携带的云端真源触发；此处勿用本地缓存硬判 false。
                     maybeRunDailyAutoSwitchReconcile(alias, deviceId)
                     delay(60_000)
                     continue
@@ -2141,8 +2181,10 @@ object AppCoordinator {
                         continue
                     }
                     authErrorRounds = 0
-                    noteCloudAutoSwitchEnabled(resp.auto_switch_enabled)
                     val event = resp.event
+                    noteCloudAutoSwitchEnabled(
+                        resolveCloudAutoSwitchEnabledFromModeWait(event, resp.auto_switch_enabled),
+                    )
                     if (event != null && event.event_id > 0) {
                         val ev = event
                         val dId = deviceId
@@ -2238,6 +2280,7 @@ object AppCoordinator {
         eventId: Int,
         sessionId: String,
     ) {
+        noteCloudAutoSwitchEnabled(true)
         cancelAutoSwitchBundleRetry()
         PrefsStore.markAutoSwitchEnterDone(eventId)
         PrefsStore.saveLastModeEventId(eventId)
@@ -2318,6 +2361,7 @@ object AppCoordinator {
         }
         when (type) {
             "auto_switch_enter" -> {
+                noteCloudAutoSwitchEnabled(true)
                 if (PrefsStore.isAutoSwitchEnterDone(eventId)) {
                     if (isCloudAutoSwitchDisabled()) {
                         performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
@@ -2393,6 +2437,7 @@ object AppCoordinator {
                 }
             }
             "auto_switch_exit" -> {
+                noteCloudAutoSwitchEnabled(false)
                 if (PrefsStore.isAutoSwitchExitDone(eventId)) {
                     return
                 }
@@ -3174,8 +3219,11 @@ object AppCoordinator {
                         completionMethod = "exclusive_auto_login",
                     )
                 } else {
-                    notifyAutoSwitchCutSwitchStepFailed(payload)
-                    finishCutSwitchAfterFailureFallback(alias, deviceId, opId, slotKey)
+                    notifyAutoSwitchCutSwitchStepFailed(
+                        payload,
+                        CutSwitchFailureKind.RESTORE_OR_LOGIN,
+                        "切号自动登录失败",
+                    )
                 }
             }
             return
@@ -3218,14 +3266,10 @@ object AppCoordinator {
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
             autoSwitchLocalScheduler.clearCutSwitchInflight()
             val sk = slotKey.trim()
-            if (sk.isNotEmpty()) {
-                autoSwitchLocalScheduler.invalidateSlotAlignment(sk, "切号还原失败")
-                AutoSwitchLedger.recordCutSwitchSlotAborted(sk, "切号还原失败")
-            }
             if (PrefsStore.isHardStopRequested()) {
                 LogCenter.op(alias, "【自动切号】切号已硬停，中止重试")
-            } else {
-                LogCenter.op(alias, "【自动切号】切号还原失败，等待下一 tick 重试")
+            } else if (sk.isNotEmpty()) {
+                LogCenter.op(alias, "【自动切号】切号还原/登录失败，等待下一 tick 续跑（plan 已保留备份+清理进度）")
             }
             return
         }
@@ -5837,10 +5881,22 @@ object AppCoordinator {
                     val backupOk = if (!stopOk) {
                         false
                     } else if (backupSkipped) {
-                        opStep(
-                            cutStepLabel("数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份"),
-                        )
-                        true
+                        if (isCutSwitch) {
+                            val reason =
+                                "切号备份失败：TikTok 数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，" +
+                                    "源账号 @$reportUsername 必须有有效本地备份才能清理"
+                            opStep(cutStepLabel(reason))
+                            recordCutSwitchFailure(reason)
+                            LogCenter.op(alias, "【切号·备份失败】$reason")
+                            false
+                        } else {
+                            opStep(
+                                cutStepLabel(
+                                    "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份",
+                                ),
+                            )
+                            true
+                        }
                     } else {
                         opStep(cutStepLabel("第3步：打包前再次关闭 TikTok"))
                         val stopBeforeTarFail = forceStopTikTokPackageAndVerify(
@@ -5874,8 +5930,25 @@ object AppCoordinator {
                                 if (suppressLocalAutoSwitchUiLog) {
                                     LogCenter.op(alias, "【切号】$detail")
                                 }
+                                false
+                            } else {
+                                val (verified, verifyMsg) = UnifiedBackupPaths.verifyLocalBackupArchive(
+                                    context = appContext,
+                                    username = reportUsername,
+                                    alias = alias,
+                                    deviceId = deviceId,
+                                    expectedAbsolutePath = backupPath,
+                                )
+                                if (!verified) {
+                                    recordCutSwitchFailure(verifyMsg)
+                                    if (isCutSwitch) {
+                                        LogCenter.op(alias, "【切号·备份失败】$verifyMsg")
+                                    }
+                                    false
+                                } else {
+                                    true
+                                }
                             }
-                            tarOk
                         }
                     }
 
@@ -5893,9 +5966,28 @@ object AppCoordinator {
                         backupPathReportedImmediately = true
                     }
 
-                    val clearOk = if (backupOk) {
-                        opStep(cutStepLabel(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据"))
-                        runSu("pm clear $packageName")
+                    val clearOk = if (backupOk && (!isCutSwitch || !backupSkipped)) {
+                        if (isCutSwitch) {
+                            val (verified, verifyMsg) = UnifiedBackupPaths.verifyLocalBackupArchive(
+                                context = appContext,
+                                username = reportUsername,
+                                alias = alias,
+                                deviceId = deviceId,
+                                expectedAbsolutePath = backupPath,
+                            )
+                            if (!verified) {
+                                opStep(cutStepLabel("清理前校验失败：$verifyMsg"))
+                                recordCutSwitchFailure("清理前校验失败：$verifyMsg")
+                                LogCenter.op(alias, "【切号·备份失败】清理前校验：$verifyMsg")
+                                false
+                            } else {
+                                opStep(cutStepLabel("第4步：清理 TikTok 数据"))
+                                runSu("pm clear $packageName")
+                            }
+                        } else {
+                            opStep(cutStepLabel(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据"))
+                            runSu("pm clear $packageName")
+                        }
                     } else {
                         opStep(cutStepLabel("备份未成功，已跳过清理以免误删数据"))
                         false
@@ -5915,15 +6007,27 @@ object AppCoordinator {
                             lastCutSwitchFailureReason.ifBlank {
                                 "第1步关闭 TikTok 失败（am force-stop $packageName）"
                             }
-                        !backupOk && !backupSkipped ->
-                            lastCutSwitchFailureReason.ifBlank {
-                                "第3步打包备份失败，目标：$backupPath（备份目录：$backupDir）"
+                        !backupOk ->
+                            when {
+                                backupSkipped && isCutSwitch ->
+                                    lastCutSwitchFailureReason.ifBlank {
+                                        "切号备份失败：TikTok 数据过小，源账号 @$reportUsername 未生成有效备份"
+                                    }
+                                else ->
+                                    lastCutSwitchFailureReason.ifBlank {
+                                        "第3步打包备份失败，目标：$backupPath（备份目录：$backupDir）"
+                                    }
                             }
                         !clearOk ->
                             "第${if (backupSkipped) 3 else 4}步 pm clear 失败（需 root）：$packageName"
                         else -> "切号备份/清理未知失败"
                     }
                     if (!delayAutoSwitchCutSwitchRetryIfRetryable(alias, attempt, failReason)) break
+                }
+
+                if (!ok && isCutSwitch) {
+                    val failDetail = lastCutSwitchFailureReason.ifBlank { "切号备份/清理失败" }
+                    LogCenter.op(alias, "【切号·备份失败】@$reportUsername：$failDetail")
                 }
 
                 if (ok && !backupSkipped) {
@@ -5965,8 +6069,11 @@ object AppCoordinator {
                 opDone(
                     ok,
                     when {
-                        !ok -> if (isCutSwitch) "切号步骤失败" else "备份或清理失败"
-                        backupSkipped && isCutSwitch -> "切号步骤完成"
+                        !ok -> if (isCutSwitch) {
+                            lastCutSwitchFailureReason.ifBlank { "切号步骤失败" }
+                        } else {
+                            "备份或清理失败"
+                        }
                         backupSkipped -> "数据过小已跳过备份，清理完成"
                         isCutSwitch -> "切号步骤完成"
                         else -> "备份并清理完成"
@@ -6005,9 +6112,13 @@ object AppCoordinator {
                     status = if (ok) "success" else "failed",
                     message = when {
                         !ok -> cutSwitchFailMessage(
-                            if (isCutSwitch) "切号步骤失败" else "备份或清理失败",
+                            if (isCutSwitch) {
+                                lastCutSwitchFailureReason.ifBlank { "切号步骤失败" }
+                            } else {
+                                "备份或清理失败"
+                            },
                         )
-                        backupSkipped -> if (isCutSwitch) "切号步骤完成" else "数据过小已跳过备份，清理完成"
+                        backupSkipped -> "数据过小已跳过备份，清理完成"
                         isCutSwitch -> "切号步骤完成"
                         else -> "备份并清理完成"
                     },
@@ -6015,7 +6126,7 @@ object AppCoordinator {
                 )
                 if (ok && isCutSwitch) {
                     payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
-                        AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped)
+                        AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped = false)
                     }
                     val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
                     if (cutMode == "exclusive_activate_target") {
@@ -6028,7 +6139,11 @@ object AppCoordinator {
                         )
                     }
                 } else if (!ok && isCutSwitch && retryUntilSuccess) {
-                    notifyAutoSwitchCutSwitchStepFailed(payload)
+                    notifyAutoSwitchCutSwitchStepFailed(
+                        payload,
+                        CutSwitchFailureKind.BACKUP_OR_CLEAR,
+                        lastCutSwitchFailureReason.ifBlank { "切号备份/清理失败" },
+                    )
                 }
             }
 
@@ -6355,14 +6470,19 @@ object AppCoordinator {
                         )
                     } else {
                         if (retryUntilSuccess) {
-                            notifyAutoSwitchCutSwitchStepFailed(payload)
+                            notifyAutoSwitchCutSwitchStepFailed(
+                                payload,
+                                CutSwitchFailureKind.RESTORE_OR_LOGIN,
+                                lastCutSwitchFailureReason.ifBlank { "切号还原失败" },
+                            )
+                        } else {
+                            finishCutSwitchAfterFailureFallback(
+                                alias,
+                                deviceId,
+                                opId,
+                                payload?.auto_switch_slot_key?.trim().orEmpty(),
+                            )
                         }
-                        finishCutSwitchAfterFailureFallback(
-                            alias,
-                            deviceId,
-                            opId,
-                            payload?.auto_switch_slot_key?.trim().orEmpty(),
-                        )
                     }
                 }
             }
@@ -6689,10 +6809,20 @@ object AppCoordinator {
                     resumeFromLoginEntryScreen = true,
                 ) == AccountLoginRetryOutcome.LoggedIn
                 if (loginReady) {
+                    PrefsStore.setPublishPostSkipNextColdLaunchSafeguard(true)
                     switchResult = runCatching {
                         executor.executeForUsername("__publish_post__", _config.value)
                     }.getOrElse { err ->
-                        "发作品入口流程异常：${err.message ?: "unknown"}"
+                        when (err) {
+                            is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                            is AccountStatusLoggedOutException -> {
+                                if (deviceIdForPublish.isNotBlank()) {
+                                    recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
+                                }
+                                "发作品掉登录：${err.message ?: "account_status"}"
+                            }
+                            else -> "发作品入口流程异常：${err.message ?: "unknown"}"
+                        }
                     }
                 } else {
                     switchResult = "发作品：登录保障后仍未登录"

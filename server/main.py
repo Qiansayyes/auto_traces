@@ -9550,7 +9550,6 @@ async def device_mode_wait(
         return error
     safe_timeout = max(5, min(int(timeout_sec or 120), 180))
     deadline = time.monotonic() + float(safe_timeout)
-    cloud_auto_switch_enabled = _device_auto_switch_enabled(device_id)
     while time.monotonic() < deadline:
         pull_req = _peek_device_log_pull_request(device_id)
         if pull_req:
@@ -9560,7 +9559,8 @@ async def device_mode_wait(
                 "msg": "log_pull",
                 "log_pull_requested": True,
                 "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
-                "auto_switch_enabled": cloud_auto_switch_enabled,
+                # 返回时现读开关，避免长轮询期间管理台已开启但携带轮询开始时的陈旧 false。
+                "auto_switch_enabled": _device_auto_switch_enabled(device_id),
             }
         event = _fetch_pending_device_mode_event(device_id, since_event_id)
         if event:
@@ -9571,7 +9571,7 @@ async def device_mode_wait(
             return {
                 "code": 0,
                 "event": event,
-                "auto_switch_enabled": cloud_auto_switch_enabled,
+                "auto_switch_enabled": _device_auto_switch_enabled(device_id),
             }
         if _APP_SHUTDOWN_EVENT.is_set():
             break
@@ -9580,7 +9580,7 @@ async def device_mode_wait(
         "code": 0,
         "event": None,
         "msg": "none",
-        "auto_switch_enabled": cloud_auto_switch_enabled,
+        "auto_switch_enabled": _device_auto_switch_enabled(device_id),
     }
 
 
