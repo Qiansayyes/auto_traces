@@ -2242,7 +2242,6 @@ object AppCoordinator {
         return m.contains("无备份档案") ||
             m.contains("缺少今日计划") ||
             m.contains("鉴权") ||
-            m.contains("未开启自动切号") ||
             m.contains("无权") ||
             m.contains("不存在")
     }
@@ -2330,11 +2329,11 @@ object AppCoordinator {
                     return@launch
                 }
                 if (outcome.cloudDisabled) {
-                    noteCloudAutoSwitchEnabled(false)
-                    performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
-                    return@launch
-                }
-                if (isAutoSwitchBundlePermanentFailure(outcome.msg)) {
+                    LogCenter.op(
+                        alias,
+                        "【自动切号】bundle 重试仍被拒（云端开关滞后），继续退避",
+                    )
+                } else if (isAutoSwitchBundlePermanentFailure(outcome.msg)) {
                     LogCenter.op(alias, "【自动切号】bundle 重试停止（不可恢复）：${outcome.msg}")
                     return@launch
                 }
@@ -2423,8 +2422,18 @@ object AppCoordinator {
                     bundleOutcome.loaded ->
                         finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
                     bundleOutcome.cloudDisabled -> {
-                        noteCloudAutoSwitchEnabled(false)
-                        performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                        LogCenter.op(
+                            alias,
+                            "【自动切号】enter 拉 bundle 被拒（云端开关滞后），将退避重试",
+                        )
+                        scheduleAutoSwitchBundleEnterRetry(
+                            alias,
+                            deviceId,
+                            eventId,
+                            sessionId,
+                            bundleRevision,
+                            bundleOutcome.msg.ifBlank { "该设备未开启自动切号" },
+                        )
                     }
                     else -> scheduleAutoSwitchBundleEnterRetry(
                         alias,

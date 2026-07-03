@@ -9560,7 +9560,7 @@ async def device_mode_wait(
                 "log_pull_requested": True,
                 "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
                 # 返回时现读开关，避免长轮询期间管理台已开启但携带轮询开始时的陈旧 false。
-                "auto_switch_enabled": _device_auto_switch_enabled(device_id),
+                "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
             }
         event = _fetch_pending_device_mode_event(device_id, since_event_id)
         if event:
@@ -9571,7 +9571,7 @@ async def device_mode_wait(
             return {
                 "code": 0,
                 "event": event,
-                "auto_switch_enabled": _device_auto_switch_enabled(device_id),
+                "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
             }
         if _APP_SHUTDOWN_EVENT.is_set():
             break
@@ -9580,7 +9580,7 @@ async def device_mode_wait(
         "code": 0,
         "event": None,
         "msg": "none",
-        "auto_switch_enabled": _device_auto_switch_enabled(device_id),
+        "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
     }
 
 
@@ -14646,6 +14646,74 @@ def _device_auto_switch_enabled(device_id: str) -> bool:
         return bool(dev and dev.auto_switch_enabled)
 
 
+def _auto_switch_enter_session_active(session_id: str) -> bool:
+    """enter session 行仍标记为 enabled 且未 closed（管理台开启时同步写入 DB）。"""
+    sid = str(session_id or "").strip()
+    if not sid or not sid.startswith("as_on_"):
+        return False
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT enabled, closed_at FROM auto_switch_sessions WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return False
+    enabled = row[0] if not hasattr(row, "keys") else row["enabled"]
+    closed_at = row[1] if not hasattr(row, "keys") else row["closed_at"]
+    return bool(int(enabled or 0)) and not str(closed_at or "").strip()
+
+
+def _latest_auto_switch_enter_session_id(device_id: str) -> str:
+    did = str(device_id or "").strip()
+    if not did:
+        return ""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT session_id FROM device_mode_events
+            WHERE device_id = ? AND event_type = 'auto_switch_enter'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (did,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return ""
+    return str((row[0] if not hasattr(row, "keys") else row["session_id"]) or "").strip()
+
+
+def _sync_device_auto_switch_enabled(device_id: str, enabled: bool, *, force_persist: bool = False) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            _hydrate_device_from_db(did)
+            dev = store.devices.get(did)
+        if dev:
+            dev.auto_switch_enabled = bool(enabled)
+    if force_persist or enabled:
+        _persist_client_device_to_db(did, force=True)
+
+
+def _device_auto_switch_enabled_resolved(device_id: str, session_id: str = "") -> bool:
+    """内存开关 + enter session 真源（修复多 worker / 异步落库滞后导致 bundle 被拒）。"""
+    if _device_auto_switch_enabled(device_id):
+        return True
+    sid = str(session_id or "").strip() or _latest_auto_switch_enter_session_id(device_id)
+    if sid and _auto_switch_enter_session_active(sid):
+        _sync_device_auto_switch_enabled(device_id, True, force_persist=True)
+        return True
+    return False
+
+
 def _any_device_auto_switch_enabled() -> bool:
     with store.lock:
         return any(bool(d.auto_switch_enabled) for d in store.devices.values())
@@ -15295,6 +15363,8 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
         turning_on = False
         turning_off = False
         owner = ""
+        if not store.devices.get(did):
+            _hydrate_device_from_db(did)
         with store.lock:
             dev = store.devices.get(did)
             if not dev:
@@ -15306,7 +15376,7 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
                 turning_on = True
             elif (not target_enabled) and was_enabled:
                 turning_off = True
-        _persist_client_device_to_db(did)
+        _persist_client_device_to_db(did, force=True)
         if turning_on or turning_off:
             changed += 1
         if turning_on:
@@ -15376,7 +15446,7 @@ def get_auto_switch_bundle(
     error, _device = auth_or_error(device_id, alias)
     if error:
         return error
-    if not _device_auto_switch_enabled(device_id):
+    if not _device_auto_switch_enabled_resolved(device_id, session_id):
         return {"code": 1, "msg": "该设备未开启自动切号"}
     try:
         bundle = _build_auto_switch_bundle_for_device(device_id, alias, session_id, revision)
