@@ -2105,8 +2105,10 @@ def _pick_device_editor_bucket_row(
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     if owner and alias_key:
+        sched = schedule_date if schedule_date is not None else _beijing_date_str()
+        minute = minute_of_day if minute_of_day is not None else _beijing_minute_of_day()
         ri = _resolve_slot_highlight_row_index(
-            owner, alias_key, schedule_date, minute_of_day, matched,
+            owner, alias_key, sched, minute, matched,
         )
         if ri >= 0:
             for row in matched:
@@ -2318,7 +2320,7 @@ def _get_highlight_account_stats(owner_username: str, alias: str) -> dict[str, o
         "tiktok_username": _normalize_tiktok_username_key(pick.get("username")),
         "follower_count": _parse_stat_int(pick.get("follower_count")),
         "video_count": _parse_stat_int(pick.get("video_count")),
-        "switch_highlight": str(pick.get("switch_highlight") or "否"),
+        "switch_highlight": "是",
     }
 
 
@@ -4564,9 +4566,9 @@ def _db_set_env_status(
 
 def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, owner_username: str) -> None:
     """
-    切号高亮不变量：
+    切号高亮不变量（仅单账号桶）：
     - 单账号桶：强制 switch_highlight = 是；
-    - 多账号自动切号桶：按当前北京时段计划派生高亮（不认切号 OP 写入）。
+    - 多账号桶：高亮由 bundle 下发时段计划派生，不在此写库（自治期也不认设备 OP 回传改高亮）。
     """
     owner_username = str(owner_username or "").strip()
     if not owner_username:
@@ -4591,21 +4593,19 @@ def _ensure_device_editor_switch_highlight_invariants(conn: sqlite3.Connection, 
         buckets.setdefault(key, []).append(r)
 
     now = now_text()
-    for bucket_key, grp in buckets.items():
-        if len(grp) == 1:
-            rid = int(grp[0]["row_index"])
-            if _normalize_switch_highlight(grp[0].get("switch_highlight")) != "是":
-                conn.execute(
-                    """
-                    UPDATE device_editor_rows
-                    SET switch_highlight = '是', updated_at = ?
-                    WHERE owner_username = ? AND row_index = ?
-                    """,
-                    (now, owner_username, rid),
-                )
+    for _bucket_key, grp in buckets.items():
+        if len(grp) != 1:
             continue
-        if bucket_key:
-            _sync_switch_highlight_from_slot(conn, owner_username, bucket_key)
+        rid = int(grp[0]["row_index"])
+        if _normalize_switch_highlight(grp[0].get("switch_highlight")) != "是":
+            conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET switch_highlight = '是', updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (now, owner_username, rid),
+            )
 
 
 def _db_apply_switch_highlight_exclusive(conn: sqlite3.Connection, owner_username: str, row_index: int, now: str | None = None) -> None:
@@ -4679,8 +4679,6 @@ def _apply_cut_switch_highlight_intent(owner_username: str, target_row_index: in
                 (now, owner, bucket, tid),
             )
             _db_set_env_status(conn, owner, tid, ENV_STATUS_PENDING, now)
-            if bucket:
-                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         return True
@@ -4715,7 +4713,6 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
     conn = _get_db()
     try:
         now = now_text()
-        bucket = ""
         if mode == "clear_source_for_restore":
             tr = data.get("cut_switch_target_row_index")
             try:
@@ -4724,17 +4721,6 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
                 tid = -1
             if tid >= 0:
                 _db_set_env_status(conn, owner_username, tid, ENV_STATUS_PENDING, now)
-                row = conn.execute(
-                    """
-                    SELECT assigned_alias, device_alias
-                    FROM device_editor_rows
-                    WHERE owner_username = ? AND row_index = ?
-                    LIMIT 1
-                    """,
-                    (owner_username, tid),
-                ).fetchone()
-                if row:
-                    bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
         elif mode == "exclusive_activate_target":
             tr = data.get("cut_switch_target_row_index")
             try:
@@ -4743,19 +4729,6 @@ def _device_ops_apply_cut_switch_after_backup(owner_username: str, data: dict) -
                 tid = -1
             if tid >= 0:
                 _db_set_env_status(conn, owner_username, tid, ENV_STATUS_ACTIVE, now)
-                row = conn.execute(
-                    """
-                    SELECT assigned_alias, device_alias
-                    FROM device_editor_rows
-                    WHERE owner_username = ? AND row_index = ?
-                    LIMIT 1
-                    """,
-                    (owner_username, tid),
-                ).fetchone()
-                if row:
-                    bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
-        if bucket:
-            _sync_switch_highlight_from_slot(conn, owner_username, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner_username)
         conn.commit()
     finally:
@@ -4774,19 +4747,6 @@ def _device_ops_apply_cut_switch_after_restore(owner_username: str, data: dict) 
     try:
         now = now_text()
         _db_set_env_status(conn, owner, tid, ENV_STATUS_ACTIVE, now)
-        row = conn.execute(
-            """
-            SELECT assigned_alias, device_alias
-            FROM device_editor_rows
-            WHERE owner_username = ? AND row_index = ?
-            LIMIT 1
-            """,
-            (owner, tid),
-        ).fetchone()
-        if row:
-            bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
-            if bucket:
-                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
     finally:
@@ -4832,19 +4792,6 @@ def _device_ops_rollback_cut_switch_highlight(owner_username: str, data: dict) -
     try:
         now = now_text()
         _db_set_env_status(conn, owner, source_row, ENV_STATUS_ACTIVE, now)
-        row = conn.execute(
-            """
-            SELECT assigned_alias, device_alias
-            FROM device_editor_rows
-            WHERE owner_username = ? AND row_index = ?
-            LIMIT 1
-            """,
-            (owner, source_row),
-        ).fetchone()
-        if row:
-            bucket = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
-            if bucket:
-                _sync_switch_highlight_from_slot(conn, owner, bucket)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
     finally:
@@ -9416,17 +9363,17 @@ def pull_username(
     # 模板「不休息」或最短/最长均为 0：关闭休息（仍按批次数清零轮次，但不返回 code=2）
     rest_enabled = not no_rest_cfg and not (break_min_cfg == 0 and break_max_cfg == 0)
 
-    account_logged_in = False
-    conn_login = _get_db()
-    try:
-        acct_row = _fetch_device_assigned_account_row(conn_login, device.owner_username, alias)
-        account_logged_in = bool(int((acct_row or {}).get("is_login") or 0))
-    finally:
-        conn_login.close()
-
-    # 未登录：不拉取用户名、不触发休息、不计休息轮次
-    if not account_logged_in:
-        return {"code": 1, "msg": "账号未登录，请先完成自动登录"}
+    # 涨粉（growth）：设备端已在拉取前完成登录门禁；自治期凭据来自 bundle，此处不再查 assigned_account。
+    if mode != "growth":
+        account_logged_in = False
+        conn_login = _get_db()
+        try:
+            acct_row = _fetch_device_assigned_account_row(conn_login, device.owner_username, alias)
+            account_logged_in = bool(int((acct_row or {}).get("is_login") or 0))
+        finally:
+            conn_login.close()
+        if not account_logged_in:
+            return {"code": 1, "msg": "账号未登录，请先完成自动登录"}
 
     # ——按“拉取批次”触发休息：已完成 N 次有效拉取后，下一次拉取直接返回休息（不查库）——
     try:
@@ -15093,8 +15040,7 @@ def _build_auto_switch_bundle_for_device(
     accounts: list[dict[str, Any]] = []
     conn = _get_db()
     try:
-        _sync_switch_highlight_from_slot(conn, owner, alias_key, schedule_date, minute_of_day)
-        conn.commit()
+        # 切号高亮落库在 device_ops 回传 / ledger 写回时同步；bundle 只读排班派生高亮，避免每次拉包写库。
         for row in rows:
             username = str(row.get("username") or "").strip()
             ri = int(row.get("row_index") or 0)
@@ -16893,7 +16839,7 @@ def _replay_auto_switch_ledger_to_device_editor_rows(
 ) -> dict[str, Any]:
     """
     按 ledger 时间顺序回放自治期间 OP 结果，写回 device_editor_rows。
-    逻辑与 device_ops/report 中档案更新保持一致（备份字段、切号高亮、环境状态）。
+    备份/env 状态与 device_ops/report 一致；切号高亮由时段计划派生，不在此写库。
     """
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
@@ -17660,3 +17606,20 @@ except Exception as _mail_module_exc:
     import logging as _mail_logging
 
     _mail_logging.getLogger("mail_integration").warning("Mail module not attached: %s", _mail_module_exc)
+
+
+def _attach_web_admin_static(fastapi_app: FastAPI) -> None:
+    """本地 uvicorn 单进程托管控制台静态页（VPS 生产环境仍由 Nginx 提供 /）。"""
+    admin_dir = Path(__file__).resolve().parent.parent / "web-admin"
+    if not admin_dir.is_dir():
+        return
+    from fastapi.staticfiles import StaticFiles
+
+    fastapi_app.mount(
+        "/",
+        StaticFiles(directory=str(admin_dir), html=True),
+        name="web-admin-static",
+    )
+
+
+_attach_web_admin_static(app)
