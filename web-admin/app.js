@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260623-1";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260703-1";
 
 {
 
@@ -1583,7 +1583,23 @@ function mailAdminOrigin() {
 
 function mailAdminUrl(route = "email") {
   const safeRoute = String(route || "email").replace(/^\/+/, "");
-  return `${mailAdminOrigin()}/mail-admin/${safeRoute}?embed=1`;
+  const build = String(window.__AUTO_TRACES_WEB_ADMIN_BUILD__ || "").trim();
+  const bust = build || String(Date.now());
+  return `${mailAdminOrigin()}/mail-admin/${safeRoute}?embed=1&v=${encodeURIComponent(bust)}`;
+}
+
+function isMailModuleFrameLoadedWrong(frame) {
+  try {
+    const doc = frame?.contentDocument || frame?.contentWindow?.document;
+    if (!doc) return false;
+    const title = String(doc.title || "");
+    if (/MS_OAuth2API/i.test(title)) return false;
+    if (doc.getElementById("authShell") || doc.getElementById("appShell")) return true;
+    if (/Auto Traces/i.test(title)) return true;
+  } catch (_) {
+    // 跨域或 iframe 未就绪时不判定
+  }
+  return false;
 }
 
 function pushMailAuthToFrame(frame) {
@@ -1608,6 +1624,15 @@ function navigateMailModuleFrame(route = "email") {
   placeholder?.classList.add("hidden");
 
   const onLoad = () => {
+    if (isMailModuleFrameLoadedWrong(frame)) {
+      placeholder?.classList.remove("hidden");
+      const hint = document.getElementById("mailModuleTargetHint");
+      if (hint) {
+        hint.textContent = `iframe 内仍是主控制台（浏览器缓存了修复前的页面）。请按 Ctrl+Shift+R 强刷，或新标签打开：${mailAdminOrigin()}/mail-admin/${safeRoute}`;
+      }
+      setStatus("邮箱模块加载异常：iframe 缓存了旧页面，请强刷浏览器", "error");
+      return;
+    }
     pushMailAuthToFrame(frame);
     placeholder?.classList.add("hidden");
   };
