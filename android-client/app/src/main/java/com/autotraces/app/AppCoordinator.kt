@@ -2813,22 +2813,41 @@ object AppCoordinator {
         opId: String,
         targetRowIndex: Int,
         slotKey: String,
+        completionMethod: String,
     ) {
         val sk = slotKey.trim()
+        val targetAcc = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
+            .firstOrNull { (it.row_index ?: -1) == targetRowIndex }
+        val targetUser = targetAcc?.username?.trim().orEmpty()
         if (targetRowIndex >= 0 && sk.isNotEmpty()) {
-            autoSwitchLocalScheduler.notifyCutSwitchAligned(targetRowIndex, sk)
-            AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
-                .firstOrNull { (it.row_index ?: -1) == targetRowIndex }
-                ?.let { acc ->
-                    recordProfileEditRequiredIfNeeded(
-                        acc.username.orEmpty(),
-                        acc.basic_profile_modified,
-                    )
-                    acc.username?.trim()?.takeIf { it.isNotEmpty() }?.let {
-                        PrefsStore.setLogContextUsername(it)
-                        applyBundledConfigFromAutoSwitch(it, logToUser = false)
-                    }
+            if (!AutoSwitchLocalPlanStore.canMarkCutSwitchDone(sk)) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】切号 OP 收尾失败：备份/清理未完成，不能标切号完成 slot=$sk",
+                )
+                autoSwitchLocalScheduler.invalidateSlotAlignment(sk, "切号链前序未完成")
+                return
+            }
+            autoSwitchLocalScheduler.notifyCutSwitchAligned(
+                targetRowIndex = targetRowIndex,
+                slotKey = sk,
+                completionMethod = completionMethod,
+                targetUsername = targetUser,
+            )
+            if (!AutoSwitchLocalPlanStore.isCutSwitchDone(sk)) {
+                LogCenter.op(alias, "【自动切号】切号完成未写入计划文件，本时段继续跑切号链")
+                return
+            }
+            targetAcc?.let { acc ->
+                recordProfileEditRequiredIfNeeded(
+                    acc.username.orEmpty(),
+                    acc.basic_profile_modified,
+                )
+                acc.username?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                    PrefsStore.setLogContextUsername(it)
+                    applyBundledConfigFromAutoSwitch(it, logToUser = false)
                 }
+            }
         } else {
             autoSwitchLocalScheduler.clearCutSwitchInflight()
             autoSwitchLocalScheduler.invalidateSlotAlignment(
@@ -3084,6 +3103,44 @@ object AppCoordinator {
         finishExclusiveCutSwitchIfLoginOk(alias, deviceId, opId, payload, reportResp = null)
     }
 
+    /** 切号链跑完后：OCR 确认 TikTok 已登录；失败则强制自动登录。通过后才允许标 plan 切号完成。 */
+    private suspend fun verifyAutoSwitchCutSwitchSessionAfterChain(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        targetUsername: String,
+        phase: String,
+    ): Boolean {
+        val user = targetUsername.trim()
+        if (user.isBlank()) {
+            LogCenter.op(alias, "【自动切号】切号后登录校验失败（$phase）：缺少目标 username")
+            return false
+        }
+        val launched = executor.launchTikTokWithForegroundVerification(
+            ctx = appContext,
+            alias = alias,
+            tag = "切号后校验",
+            forceStopBeforeLaunch = false,
+            timingConfig = _config.value,
+        )
+        if (!launched) {
+            LogCenter.op(alias, "【自动切号】切号后登录校验失败（$phase）：TikTok 拉起失败")
+            return false
+        }
+        if (ensureLoginSafeguardMeasure(alias, deviceId, "切号后校验-$phase", strict = true)) {
+            return true
+        }
+        return ensureAccountLoggedIn(
+            alias = alias,
+            deviceId = deviceId,
+            opId = opId,
+            reason = "切号后登录校验($phase)",
+            strict = true,
+            forceRelogin = true,
+            preferredUsername = user,
+        )
+    }
+
     /** 无备份 exclusive 切号：自治模式下须登录校验通过后才记为已对齐。 */
     private suspend fun finishExclusiveCutSwitchIfLoginOk(
         alias: String,
@@ -3101,28 +3158,20 @@ object AppCoordinator {
             ?.username?.trim().orEmpty()
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
             withContext(NonCancellable) {
-                val loginOk = if (targetUser.isNotBlank()) {
-                    ensureAccountLoggedIn(
-                        alias = alias,
-                        deviceId = deviceId,
-                        opId = opId,
-                        reason = "切号 exclusive 后登录校验",
-                        strict = true,
-                        forceRelogin = true,
-                        preferredUsername = targetUser,
-                    )
-                } else {
-                    LogCenter.op(alias, "【自动切号】exclusive 切号缺少目标 username，登录校验跳过")
-                    false
-                }
+                val loginOk = verifyAutoSwitchCutSwitchSessionAfterChain(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = opId,
+                    targetUsername = targetUser,
+                    phase = "exclusive_auto_login",
+                )
                 if (loginOk) {
-                    finishCutSwitchAfterSuccess(
+                    finishAutoSwitchCutSwitchAfterSuccess(
                         alias,
-                        deviceId,
                         opId,
-                        reportResp,
                         targetRowIndex = targetRi,
-                        slotKey = slotKey,
+                        slotKey = slotKey.trim(),
+                        completionMethod = "exclusive_auto_login",
                     )
                 } else {
                     notifyAutoSwitchCutSwitchStepFailed(payload)
@@ -3257,7 +3306,32 @@ object AppCoordinator {
         slotKey: String = "",
     ) {
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
-            finishAutoSwitchCutSwitchAfterSuccess(alias, opId, targetRowIndex, slotKey)
+            val sk = slotKey.trim()
+            val targetUser = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
+                .firstOrNull { (it.row_index ?: -1) == targetRowIndex }
+                ?.username?.trim().orEmpty()
+            val loginOk = verifyAutoSwitchCutSwitchSessionAfterChain(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                targetUsername = targetUser,
+                phase = "restore_chain",
+            )
+            if (!loginOk) {
+                if (sk.isNotEmpty()) {
+                    AutoSwitchLocalPlanStore.markCutSwitchStepFailed(sk, CutSwitchStepKind.RESTORE_OR_LOGIN)
+                    autoSwitchLocalScheduler.clearCutSwitchInflight()
+                }
+                finishCutSwitchAfterFailureFallback(alias, deviceId, opId, sk)
+                return
+            }
+            finishAutoSwitchCutSwitchAfterSuccess(
+                alias,
+                opId,
+                targetRowIndex,
+                sk,
+                completionMethod = "restore_chain",
+            )
             return
         }
         restoreCloudAutoStartParticipation(alias, deviceId, opId, "切号成功")

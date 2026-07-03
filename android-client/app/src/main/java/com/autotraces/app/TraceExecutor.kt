@@ -692,6 +692,8 @@ class RealTraceExecutor(
         private const val AUTO_LOGIN_ENTRY_MISS_BEFORE_EDIT_PROBE = 3
         /** 验证码输入后 OCR 轮询最长时长（毫秒）。 */
         private const val AUTO_LOGIN_CODE_AFTER_OCR_MAX_DURATION_MS = 180_000L
+        /** 已拿到验证码后 OCR 轮询间隔（毫秒）；等待页跳转无需高频探页。 */
+        private const val AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS = 5000L
         /** 密码页后 Don't allow OCR。 */
         private const val AUTO_LOGIN_DONT_ALLOW_OCR_MAX_PASSES = 16
         /** 通用 OCR 顺手点击 Don't allow 的冷却，避免同帧重复触发。 */
@@ -722,6 +724,8 @@ class RealTraceExecutor(
         private const val AUTO_LOGIN_MAX_CHAIN_RESTARTS = 3
         /** 密码页 Continue/Next 后 OCR 轮询最长时长（毫秒），判定直达首页或兴趣页。 */
         private const val AUTO_LOGIN_POST_PASSWORD_ROUTE_MAX_DURATION_MS = 180_000L
+        /** 密码提交后 OCR 轮询间隔（毫秒）；等待页跳转无需高频探页。 */
+        private const val AUTO_LOGIN_POST_PASSWORD_ROUTE_OCR_INTERVAL_MS = 5000L
         private const val AUTO_LOGIN_RESEND_WAIT_MS = 5000L
         /** 验证码页识别 expired 后：冷却等待再返回重走 Continue→Resend code（毫秒）。 */
         private const val AUTO_LOGIN_EXPIRED_RECOVERY_WAIT_MS = 58_000L
@@ -13829,12 +13833,13 @@ class RealTraceExecutor(
         devOp(alias, "自动登录：关开 TikTok 后整链重来")
         runSuCommand("am force-stop $pkg")
         if (!autoLoginDelay(alias, forceStopWaitMs, "强停后")) return false
+        invalidateForegroundProbeCache()
         return launchTikTokOnceWithCheck(
             ctx = ctx,
             alias = alias,
             tag = "自动登录重来",
             launchWaitMs = launchWaitMs,
-            forceStopBeforeLaunch = false,
+            forceStopBeforeLaunch = true,
         )
     }
 
@@ -14878,10 +14883,9 @@ class RealTraceExecutor(
                     return LoginSafeguardOutcome.RequiresAutoLogin
                 }
                 SafeguardProfileScreenKind.MainFeedNavOnly -> {
-                    if (safeguardTapBottomHome(ctx, alias, w, h)) {
-                        devOp(alias, "登录状态保障：底栏 Home+Profile 无 Edit，已点 Home 继续")
-                        return LoginSafeguardOutcome.Ready
-                    }
+                    val preview = buildProfileEditOcrPreview(vision).take(320)
+                    devOp(alias, "登录状态保障：底栏 Home+Profile 无 Edit，判定未登录；OCR=$preview")
+                    return LoginSafeguardOutcome.RequiresAutoLogin
                 }
                 SafeguardProfileScreenKind.Unknown -> {
                     val preview = buildProfileEditOcrPreview(vision).take(280)
@@ -15058,7 +15062,7 @@ class RealTraceExecutor(
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             if (hardStopOrNull(alias, "自动登录-密码后路由")) return AutoLoginStepOutcome.Failed
             ocrPass++
-            if (ocrPass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "密码后路由 OCR")) {
+            if (ocrPass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_POST_PASSWORD_ROUTE_OCR_INTERVAL_MS, "密码后路由 OCR")) {
                 return AutoLoginStepOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_post_password_$ocrPass") ?: continue
@@ -15244,7 +15248,9 @@ class RealTraceExecutor(
         while (System.currentTimeMillis() - startedAt < AUTO_LOGIN_CODE_AFTER_OCR_MAX_DURATION_MS) {
             if (hardStopOrNull(alias, "自动登录-验证码后")) return AutoLoginStepOutcome.Failed
             ocrPass++
-            if (ocrPass > 1 && !autoLoginDelay(alias, 1000L, "验证码后 OCR")) return AutoLoginStepOutcome.Failed
+            if (ocrPass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS, "验证码后 OCR")) {
+                return AutoLoginStepOutcome.Failed
+            }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_after_code_$ocrPass") ?: continue
 
             if (findLabelHitContainingIgnoreCase(vision, "expired") != null) {
@@ -15380,6 +15386,7 @@ class RealTraceExecutor(
         tagPrefix: String,
         markerGone: (Text) -> Boolean,
         allowVerifySuccess: Boolean,
+        ocrIntervalMs: Long = AUTO_LOGIN_OCR_RETRY_DELAY_MS,
     ): AutoLoginCutSwitchTransitionOutcome {
         val startedAt = System.currentTimeMillis()
         var pass = 0
@@ -15390,7 +15397,7 @@ class RealTraceExecutor(
                 return AutoLoginCutSwitchTransitionOutcome.Failed
             }
             pass++
-            if (pass > 1 && !autoLoginDelay(alias, 1000L, phaseLog)) {
+            if (pass > 1 && !autoLoginDelay(alias, ocrIntervalMs, phaseLog)) {
                 return AutoLoginCutSwitchTransitionOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass") ?: continue
@@ -15679,6 +15686,7 @@ class RealTraceExecutor(
                 tagPrefix = "${tagPrefix}_after_code",
                 markerGone = { v -> !autoLoginVisionOnVerificationPage(v) },
                 allowVerifySuccess = false,
+                ocrIntervalMs = AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS,
             )
             return when (transition) {
                 AutoLoginCutSwitchTransitionOutcome.ReachedInterest ->
@@ -15762,7 +15770,7 @@ class RealTraceExecutor(
                 return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
             }
             ocrPass++
-            if (ocrPass > 1 && !autoLoginDelay(alias, 1000L, "验证码轮询")) {
+            if (ocrPass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS, "验证码轮询")) {
                 return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
             }
             val vision = autoLoginOcrOnce(ctx, alias, "cut_switch_code_poll_$ocrPass") ?: continue
@@ -16291,12 +16299,15 @@ class RealTraceExecutor(
                 if (dontAllowHandledEarly) {
                     autoLoginDontAllowHandledInThisChain = true
                 }
+                if (!ensureTikTokInForeground(ctx, alias, "自动登录-上滑前")) return false
                 if (!autoLoginSwipeUpTwice(ctx, alias, w, h)) return false
+                if (!ensureTikTokInForeground(ctx, alias, "自动登录-Profile前")) return false
                 runCatching {
                     autoLoginTapProfileForLoginEntry(ctx, alias)
                 }
             }
 
+            if (!ensureTikTokInForeground(ctx, alias, "自动登录-入口解析前")) return false
             val entryPath = autoLoginResolveEntryPath(ctx, alias, w, h)
             when (entryPath) {
                 AutoLoginEntryPath.AlreadyLoggedIn -> {

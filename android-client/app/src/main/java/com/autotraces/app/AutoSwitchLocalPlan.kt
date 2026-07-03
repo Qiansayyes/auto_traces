@@ -36,8 +36,21 @@ data class CutSwitchPlanSteps(
     val source_row_index: Int? = null,
     val source_username: String? = null,
 ) {
+    /** 切号完成：还原/登录步终态（与云端 is_login 无关）。 */
     fun isDone(): Boolean =
         restore_or_login == PlanStepState.DONE || restore_or_login == PlanStepState.SKIPPED
+
+    /** 备份/清理已走完，可执行还原或自动登录。 */
+    fun isReadyForRestoreOrLogin(): Boolean {
+        if (mode == "bootstrap") {
+            return clear == PlanStepState.DONE || clear == PlanStepState.SKIPPED
+        }
+        return (backup == PlanStepState.DONE || backup == PlanStepState.SKIPPED) &&
+            (clear == PlanStepState.DONE || clear == PlanStepState.SKIPPED)
+    }
+
+    /** 切号链前序步骤已完成，允许把 restore_or_login 标为 DONE。 */
+    fun isChainReadyForCompletion(): Boolean = isReadyForRestoreOrLogin()
 
     fun isFailed(): Boolean =
         backup == PlanStepState.FAILED ||
@@ -651,16 +664,94 @@ object AutoSwitchLocalPlanStore {
             else -> fresh.copy(state = old.state)
         }
 
-    fun markCutSwitchDone(slotKey: String, sourceRowIndex: Int? = null, sourceUsername: String? = null) {
-        mutateCutSwitchSlot(slotKey, "标记切号完成") { slot ->
+    fun canMarkCutSwitchDone(slotKey: String): Boolean {
+        val cs = slot(slotKey)?.cut_switch ?: return false
+        return cs.isChainReadyForCompletion()
+    }
+
+    /**
+     * 仅在本时段切号链前序（备份、清理）已在 plan 中完成后，将还原/登录标为 DONE。
+     * 不得用 terminalDone 把未执行的备份/清理强行标完成。
+     */
+    fun markCutSwitchDone(slotKey: String, sourceRowIndex: Int? = null, sourceUsername: String? = null): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return false
+        var marked = false
+        mutateCutSwitchSlot(sk, "标记切号完成") { slot ->
+            val cs = slot.cut_switch
+            if (!cs.isChainReadyForCompletion()) {
+                return@mutateCutSwitchSlot slot
+            }
+            marked = true
             slot.copy(
-                cut_switch = slot.cut_switch.copy(
-                    backup = terminalDone(slot.cut_switch.backup),
-                    clear = terminalDone(slot.cut_switch.clear),
+                cut_switch = cs.copy(
                     restore_or_login = PlanStepState.DONE,
-                    source_row_index = sourceRowIndex ?: slot.cut_switch.source_row_index,
-                    source_username = sourceUsername ?: slot.cut_switch.source_username,
+                    source_row_index = sourceRowIndex ?: cs.source_row_index,
+                    source_username = sourceUsername ?: cs.source_username,
                 ),
+            )
+        }
+        return marked
+    }
+
+    /**
+     * plan 标切号完成与 ledger 记 cut_switch_chain_completed 同一事务：
+     * 先写 plan，ledger 失败则回滚 plan；任一步失败则返回 false。
+     */
+    fun commitCutSwitchChainCompleted(
+        slotKey: String,
+        username: String,
+        method: String,
+        sourceRowIndex: Int? = null,
+        sourceUsername: String? = null,
+    ): Boolean {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
+        val sk = slotKey.trim()
+        val user = username.trim().removePrefix("@")
+        if (sk.isEmpty() || user.isBlank()) return false
+
+        synchronized(writeLock) {
+            val before = getInternal() ?: return false
+            val slot = before.slots.firstOrNull { it.slot_key == sk } ?: return false
+            val cs = slot.cut_switch
+            if (!cs.isChainReadyForCompletion()) return false
+
+            val after = before.copy(
+                slots = before.slots.map { entry ->
+                    if (entry.slot_key != sk) entry
+                    else entry.copy(
+                        cut_switch = cs.copy(
+                            restore_or_login = PlanStepState.DONE,
+                            source_row_index = sourceRowIndex ?: cs.source_row_index,
+                            source_username = sourceUsername ?: cs.source_username,
+                        ),
+                    )
+                },
+            )
+            saveInternal(after)
+            val ledgerOk = AutoSwitchLedger.tryRecordCutSwitchChainCompleted(sk, user, method)
+            if (!ledgerOk) {
+                saveInternal(before)
+                return false
+            }
+            logPlanCutSwitchProgress(sk, "标记切号完成（plan+ledger 同事务）")
+            return true
+        }
+    }
+
+    /**
+     * 计划文件若标「切号完成」但 ledger 无 [cut_switch_chain_completed]，视为无效状态，整段切号重置重跑。
+     */
+    fun revalidateCutSwitchCompletionsAgainstLedger(
+        hasChainCompleted: (slotKey: String) -> Boolean,
+    ) {
+        val plan = get() ?: return
+        for (slot in plan.slots) {
+            if (!slot.cut_switch.isDone()) continue
+            if (hasChainCompleted(slot.slot_key)) continue
+            resetCutSwitch(
+                slot.slot_key,
+                "计划文件标切号完成但 ledger 无本时段切号链完成记录，将重跑切号",
             )
         }
     }

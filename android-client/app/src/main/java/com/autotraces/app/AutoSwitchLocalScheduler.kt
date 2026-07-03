@@ -266,13 +266,51 @@ class AutoSwitchLocalScheduler(
         return AutoSwitchLocalPlanStore.isCutSwitchDone(entry.slot_key)
     }
 
-    fun notifyCutSwitchAligned(targetRowIndex: Int, slotKey: String) {
+    fun notifyCutSwitchAligned(
+        targetRowIndex: Int,
+        slotKey: String,
+        completionMethod: String,
+        targetUsername: String = "",
+    ) {
         val sk = slotKey.trim()
         if (targetRowIndex < 0 || sk.isEmpty()) return
+        if (!AutoSwitchLocalPlanStore.canMarkCutSwitchDone(sk)) {
+            val progress = AutoSwitchLocalPlanStore.formatCutSwitchProgressLine(sk).orEmpty()
+            invalidateSlotAlignment(sk, "切号链前序未完成，拒绝标切号完成")
+            if (alias.isNotBlank()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】拒绝标记切号完成：前序步骤未完成 slot=$sk" +
+                        (progress.takeIf { it.isNotBlank() }?.let { "；$it" } ?: ""),
+                )
+            }
+            return
+        }
+        val user = targetUsername.trim().removePrefix("@").ifBlank {
+            AutoSwitchLocalPlanStore.slot(sk)?.target_username?.trim()?.removePrefix("@").orEmpty()
+        }
+        if (user.isBlank()) {
+            invalidateSlotAlignment(sk, "切号完成缺少目标 username")
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】拒绝标记切号完成：缺少目标 username slot=$sk")
+            }
+            return
+        }
+        val committed = AutoSwitchLocalPlanStore.commitCutSwitchChainCompleted(
+            slotKey = sk,
+            username = user,
+            method = completionMethod,
+        )
+        if (!committed) {
+            invalidateSlotAlignment(sk, "plan+ledger 切号完成写入失败")
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】切号完成同事务写入失败 slot=$sk")
+            }
+            return
+        }
         cancelDuplicatePendingCutSwitchOps(sk)
         cutSwitchInflightSlotKey = null
         pendingCutSwitchSlotKey = null
-        AutoSwitchLocalPlanStore.markCutSwitchDone(sk)
     }
 
     fun start(alias: String, deviceId: String, bundle: AutoSwitchBundle, revision: Int = -1) {
@@ -352,7 +390,16 @@ class AutoSwitchLocalScheduler(
             rev,
             sessionId.ifBlank { PrefsStore.getAutoSwitchSessionId().orEmpty() },
         )
+        revalidateCutSwitchCompletionsAgainstLedger()
         refreshBundleFromPlan(cloud)
+    }
+
+    private fun revalidateCutSwitchCompletionsAgainstLedger() {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        AutoSwitchLedger.restoreFromPrefs()
+        AutoSwitchLocalPlanStore.revalidateCutSwitchCompletionsAgainstLedger { sk ->
+            AutoSwitchLedger.hasCutSwitchChainCompleted(sk)
+        }
     }
 
     private fun refreshBundleFromPlan(cloud: AutoSwitchBundle) {
@@ -600,8 +647,7 @@ class AutoSwitchLocalScheduler(
         val needsLoginFinish = !cs.isDone() &&
             cs.restore_or_login != PlanStepState.DONE &&
             cs.restore_or_login != PlanStepState.SKIPPED &&
-            (cs.backup == PlanStepState.DONE || cs.backup == PlanStepState.SKIPPED) &&
-            (cs.clear == PlanStepState.DONE || cs.clear == PlanStepState.SKIPPED)
+            cs.isReadyForRestoreOrLogin()
         if (needsLoginFinish) {
             if (hasCutSwitchWorkInProgress(slotKey, targetRi)) {
                 logCutSwitchSkip("切号进行中 slot=$slotKey step=RESTORE_OR_LOGIN（plan 续跑还原/自动登录）")
@@ -801,6 +847,7 @@ class AutoSwitchLocalScheduler(
     /** 进程重启 / 人为启动后：按本地 plan 文件清理 stale RUNNING，便于 tick 续跑。 */
     fun recoverAllStaleInflightOnStart() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        revalidateCutSwitchCompletionsAgainstLedger()
         AutoSwitchLocalPlanStore.recoverStaleRunningStepsAfterProcessDeath()
         recoverStalePublishInflightOnStart()
         insertionInflight = null

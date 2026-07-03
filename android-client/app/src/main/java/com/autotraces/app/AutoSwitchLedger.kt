@@ -331,6 +331,53 @@ object AutoSwitchLedger {
         )
     }
 
+    /**
+     * 本时段切号链（备份→清理→还原/自动登录→权限）全部跑完后写入。
+     * 计划文件「切号完成」必须与 ledger 中此记录一一对应，禁止仅靠 merge 继承 DONE。
+     */
+    fun recordCutSwitchChainCompleted(slotKey: String, username: String, method: String) {
+        tryRecordCutSwitchChainCompleted(slotKey, username, method)
+    }
+
+    /** @return ledger 是否成功写入（session 不匹配等前置条件不满足时 false） */
+    fun tryRecordCutSwitchChainCompleted(slotKey: String, username: String, method: String): Boolean {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
+        val sk = slotKey.trim()
+        val user = username.trim().removePrefix("@")
+        if (sk.isEmpty() || user.isBlank()) return false
+        if (sessionId.isBlank() && PrefsStore.getAutoSwitchSessionId().isNullOrBlank()) return false
+        ensureSessionContext()
+        if (!sessionContextMatchesPrefs()) return false
+        val methodKey = method.trim().ifBlank { "unknown" }
+        record(
+            opId = "cut-switch-chain-done-$sk",
+            opType = "cut_switch_chain_completed",
+            status = "success",
+            message = "切号链完成 @$user（$methodKey）",
+            slotKey = sk,
+            username = user,
+            reportData = mapOf(
+                "op_type" to "cut_switch_chain_completed",
+                "username" to user,
+                "account_username" to user,
+                "auto_switch_slot_key" to sk,
+                "completion_method" to methodKey,
+            ),
+            phaseOverride = "success",
+        )
+        return hasCutSwitchChainCompleted(sk)
+    }
+
+    fun hasCutSwitchChainCompleted(slotKey: String): Boolean {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return false
+        return entries.any { entry ->
+            entry.op_type == "cut_switch_chain_completed" &&
+                entry.phase == "success" &&
+                entry.slot_key.trim() == sk
+        }
+    }
+
     /** 自动登录成功：自治期不写 mark_login API，对账时写 account_editor_rows.is_login。 */
     fun recordAccountLoginSuccess(username: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
