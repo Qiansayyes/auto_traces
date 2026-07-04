@@ -236,6 +236,8 @@ class RealTraceExecutor(
             devOp(alias, "$action：自动切号关闭中，协作退出")
             return true
         }
+        // 发作品独占发布阶段自身持有 TikTok，不得因入队时设置的独占抢占标志误协作退出。
+        if (PublishPostGrowthGate.shouldDeferExclusivePreempt()) return false
         return exclusivePreemptOrNull(alias, action)
     }
 
@@ -245,15 +247,6 @@ class RealTraceExecutor(
             PrefsStore.getAutoSwitchMode() == "exiting" -> "自动切号关闭中，跳过 $username"
             else -> "独占操作抢占，跳过 $username"
         }
-
-    /** 独占抢占或自动切号关闭时顺带 force-stop，避免涨粉步骤退出后 TikTok 仍留前台。 */
-    private fun forceStopTikTokIfExclusivePreempt(alias: String, phase: String) {
-        if (!isExclusivePreemptActive() && PrefsStore.getAutoSwitchMode() != "exiting") return
-        val pkg = Config.TIKTOK_PACKAGE_NAME
-        runSuCommand(DeviceBackupShell.forceStopCommand(pkg))
-        runSuCommand(DeviceBackupShell.supplementalKillCommand(pkg))
-        devOp(alias, "$phase：独占抢占协作 force-stop $pkg")
-    }
 
     private fun isMlKitHardStopError(err: String): Boolean = err == "hard_stop"
 
@@ -335,10 +328,7 @@ class RealTraceExecutor(
     private suspend fun growthDelay(alias: String, ms: Long, phase: String): Boolean {
         var left = ms.coerceAtLeast(0L)
         while (left > 0) {
-            if (growthYieldOrNull(alias, phase)) {
-                forceStopTikTokIfExclusivePreempt(alias, phase)
-                return false
-            }
+            if (growthYieldOrNull(alias, phase)) return false
             coroutineContext.ensureActive()
             val chunk = minOf(left, 200L)
             delay(chunk)
@@ -425,7 +415,8 @@ class RealTraceExecutor(
     /** 重登期内顺手点 Account status OK 的次数（登录结束后清零）。 */
     private var accountStatusInlineOkTapCount: Int = 0
 
-    /** 涨粉 / 互点 / 发作品：该深度 >0 时 OCR 须观察 Account status 弹窗；Add another account 在所有 OCR 步骤检测（auto_login 除外）。 */
+    /** 涨粉 / 互点 / 发作品：该深度 >0 时 OCR 须观察 Account status 弹窗；
+     * Log in / Sign up / 登录入口文案与 Add another account 在所有 OCR 步骤检测（auto_login 除外）。 */
     @Volatile
     private var accountStatusOcrWatchDepth: Int = 0
 
@@ -489,6 +480,17 @@ class RealTraceExecutor(
         return true
     }
 
+    private fun shouldObserveLoginSafeguardLogoutOnOcr(fileTag: String?): Boolean {
+        if (!isLogoutProbeContextActive() && !loginSafeguardLogoutProbeActive) return false
+        val tag = fileTag?.trim().orEmpty()
+        if (tag.startsWith("profile_edit")) return false
+        if (loginSafeguardLogoutProbeActive) {
+            return tag.isEmpty() || !tag.startsWith("auto_login") || tag.startsWith("login_safeguard")
+        }
+        if (tag.startsWith("auto_login")) return false
+        return true
+    }
+
     /** 任意 OCR 结果：见 Add another account / another account 则中止并触发自动登录。 */
     private suspend fun probeAddAnotherAccountLogoutFromOcrVision(
         ctx: Context,
@@ -500,11 +502,35 @@ class RealTraceExecutor(
         maybeHandleAddAnotherAccountLogoutFromVision(ctx, alias, vision, fileTag)
     }
 
+    /**
+     * 涨粉/互点/发作品 OCR：见 Log in / Sign up / 登录表单等（与 [safeguardVisionNeedsAutoLogin] 一致），
+     * 中止当前步骤并由协调器从登录入口续接自动登录。
+     */
+    private suspend fun probeLoginEntryLogoutFromOcrVision(
+        ctx: Context,
+        vision: Text,
+        fileTag: String?,
+    ) {
+        if (!shouldObserveLoginSafeguardLogoutOnOcr(fileTag)) return
+        if (accountStatusRecoveryInProgress) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val h = ctx.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, h)) return
+        if (!safeguardVisionNeedsAutoLogin(vision, h)) return
+        devOp(
+            alias,
+            "掉登录：OCR 见 Log in/Sign up/登录入口（tag=${fileTag ?: "unknown"}），" +
+                "与登录状态保障一致，中止当前步骤待自动登录",
+        )
+        throw LoginSafeguardRequiresAutoLoginException()
+    }
+
     private suspend fun observeAccountStatusOnOcrText(
         ctx: Context,
         vision: Text,
         fileTag: String?,
     ): Boolean {
+        probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
         probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
         if (accountStatusRecoveryInProgress) return false
         if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return false
@@ -532,6 +558,7 @@ class RealTraceExecutor(
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
+            probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
             if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return
             probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
@@ -5797,10 +5824,7 @@ class RealTraceExecutor(
             devOp(alias, "For You 预滑：检测到刚经历硬停恢复，跳过本次休息/预滑")
             return
         }
-        if (growthYieldOrNull(alias, "For You 预滑")) {
-            forceStopTikTokIfExclusivePreempt(alias, "For You 预滑")
-            return
-        }
+        if (growthYieldOrNull(alias, "For You 预滑")) return
         if (!ensureTikTokInForeground(service, alias, "For You 预滑")) return
 
         val likeProb = config.for_you_like_prob.coerceIn(0.0, 1.0)
@@ -5834,10 +5858,7 @@ class RealTraceExecutor(
         var logoutProbesDone = 0
         var swipeCount = 0
         while (System.currentTimeMillis() - startedAt < totalMs) {
-            if (growthYieldOrNull(alias, "For You 预滑")) {
-                forceStopTikTokIfExclusivePreempt(alias, "For You 预滑")
-                return
-            }
+            if (growthYieldOrNull(alias, "For You 预滑")) return
             if (mutualClickOrNull(alias, "For You 预滑")) return
             val elapsedBeforeSegment = System.currentTimeMillis() - startedAt
             val probeSchedule = logoutProbeAtMs
@@ -5978,7 +5999,6 @@ class RealTraceExecutor(
             }
         }
         if (growthYieldOrNull(alias, "执行用户名流程 $username")) {
-            forceStopTikTokIfExclusivePreempt(alias, "执行用户名流程 $username")
             return growthYieldSkipMessage(username)
         }
         return withAccountStatusOcrWatch {
@@ -6031,7 +6051,6 @@ class RealTraceExecutor(
             }
         } else {
             if (growthYieldOrNull(alias, "打开 TikTok")) {
-                forceStopTikTokIfExclusivePreempt(alias, "打开 TikTok")
                 return growthYieldSkipMessage(username)
             }
             if (!ensureTikTokInForeground(ctx, alias, "打开 TikTok")) {
@@ -7984,7 +8003,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * For You 预滑：每段开始前整屏 OCR，探测 Account status / Add another account 并走既有掉登录分支。
+     * For You 预滑：每段开始前整屏 OCR，探测 Account status / Log in / Sign up / Add another account 并走既有掉登录分支。
      * 仅当 [FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS] ≤ 配置总时长时由 [runForYouWarmupIfNeeded] 调用。
      */
     private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
@@ -7994,7 +8013,7 @@ class RealTraceExecutor(
     ) {
         devOp(
             alias,
-            "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 时间段开始前掉登录检测（Account status / Add another account）",
+            "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 时间段开始前掉登录检测（Account status / Log in / Sign up / Add another account）",
         )
         val tag = "for_you_warmup_logout_probe_$phase"
         val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)
@@ -12336,19 +12355,13 @@ class RealTraceExecutor(
 
     private suspend fun processFollowersList(service: Context, config: AppConfig) {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        if (growthYieldOrNull(alias, "处理粉丝列表")) {
-            forceStopTikTokIfExclusivePreempt(alias, "处理粉丝列表")
-            return
-        }
+        if (growthYieldOrNull(alias, "处理粉丝列表")) return
         var reachedEnd = false
         var rounds = 0
         var singleDigitTotal: Int? = null
         // 主循环：固定最多 7 轮；若中途判定到底则提前结束
         while (!reachedEnd && rounds < 7) {
-            if (growthYieldOrNull(alias, "处理粉丝列表循环")) {
-                forceStopTikTokIfExclusivePreempt(alias, "处理粉丝列表循环")
-                return
-            }
+            if (growthYieldOrNull(alias, "处理粉丝列表循环")) return
             if (mutualClickOrNull(alias, "处理粉丝列表循环")) {
                 return
             }
@@ -12367,10 +12380,7 @@ class RealTraceExecutor(
                 singleDigitTotal = inferSingleDigitFollowersTotal(service, followers.size)
             }
             for (entry in followers) {
-                if (growthYieldOrNull(alias, "处理粉丝列表单条")) {
-                    forceStopTikTokIfExclusivePreempt(alias, "处理粉丝列表单条")
-                    return
-                }
+                if (growthYieldOrNull(alias, "处理粉丝列表单条")) return
                 runSuCommand("input tap ${entry.clickPoint.x} ${entry.clickPoint.y}")
                 devOp(alias, "粉丝列表：点头像 (${entry.clickPoint.x},${entry.clickPoint.y})")
                 if (!growthDelay(alias, Random.nextLong(1200, 1600), "粉丝列表-点头像")) return
@@ -14164,7 +14174,7 @@ class RealTraceExecutor(
             devOp(alias, "自动登录 OCR 失败：$errTag [$tag]")
         }
         if (vision != null) {
-            // 顺带处理：每次 autoLogin OCR 后，尝试点击下方 agree and / Don't allow / 各类弹窗。
+            // 顺带处理：每次 autoLogin OCR 后，尝试 agree and / Don't allow / Swipe 引导 / 各类弹窗。
             val overlayDismissed = runCatching {
                 autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
             }.getOrDefault(false)
@@ -14208,7 +14218,15 @@ class RealTraceExecutor(
             if (tapped) autoLoginDelay(alias, 450L, "Don't allow 后")
         }
 
-        // 3) Viewer history 弹窗：同屏见 Viewer history + Save 时点 Save
+        // 3) Swipe 引导：识别到 swipe 文案则上滑两次并重 OCR
+        if (ocrVisionHasSwipePrompt(vision)) {
+            devOp(alias, "自动登录(顺带) Swipe 引导：上滑两次")
+            if (!autoLoginPerformSwipeUpTwice(alias, w, h, "顺带-Swipe")) return false
+            autoLoginDelay(alias, 600L, "Swipe 后")
+            return true
+        }
+
+        // 4) Viewer history 弹窗：同屏见 Viewer history + Save 时点 Save
         if (
             tryDismissViewerHistoryPopupFromVision(
                 ctx = ctx,
@@ -14222,7 +14240,7 @@ class RealTraceExecutor(
             return true
         }
 
-        // 4) 登录后「Save login for next time?」弹窗：点偏下方 Save login
+        // 5) 登录后「Save login for next time?」弹窗：点偏下方 Save login
         if (
             tryDismissSaveLoginForNextTimePopupFromVision(
                 ctx = ctx,
@@ -14236,7 +14254,7 @@ class RealTraceExecutor(
             return true
         }
 
-        // 5) 「Continue editing this post?」草稿弹窗：点 Save draft
+        // 6) 「Continue editing this post?」草稿弹窗：点 Save draft
         if (
             tryDismissContinueEditingPostPopupFromVision(
                 ctx = ctx,
@@ -14250,7 +14268,7 @@ class RealTraceExecutor(
             return true
         }
 
-        // 6) Security checkup 弹窗：点屏顶 20% 遮罩关闭
+        // 7) Security checkup 弹窗：点屏顶 20% 遮罩关闭
         if (
             tryDismissSecurityCheckupPopupFromVision(
                 ctx = ctx,
@@ -14632,60 +14650,6 @@ class RealTraceExecutor(
         return false
     }
 
-    /**
-     * 启动后预处理：每轮 1 次整屏 OCR，固定顺序尝试下方 agree and → Don't allow。
-     * 各自至多 [maxPasses] 次机会（共享轮次）；找不到跳过。返回是否点中 Don't allow。
-     * 若本轮刚点 agree，本轮不再用旧 OCR 帧查 Don't allow（与原先分两段 fresh OCR 一致）。
-     */
-    private suspend fun autoLoginPreprocessDismissAgreeAndDontAllow(
-        ctx: Context,
-        alias: String,
-        maxPasses: Int = 3,
-        retryDelayMs: Long = 1000L,
-    ): Boolean {
-        val dm = ctx.resources.displayMetrics
-        val w = dm.widthPixels.coerceAtLeast(1)
-        val h = dm.heightPixels.coerceAtLeast(1)
-        val passes = maxPasses.coerceIn(1, 10)
-        var agreeHandled = false
-        var dontAllowHandled = false
-
-        for (pass in 1..passes) {
-            if (hardStopOrNull(alias, "自动登录-预处理 agree and / Don't allow")) return dontAllowHandled
-            if (agreeHandled && dontAllowHandled) return dontAllowHandled
-            if (pass > 1 && !autoLoginDelay(alias, retryDelayMs, "预处理 agree and / Don't allow")) {
-                return dontAllowHandled
-            }
-
-            val vision = autoLoginOcrOnce(ctx, alias, "auto_login_preprocess_agree_dont_$pass") ?: continue
-
-            var agreeTappedThisPass = false
-            if (!agreeHandled) {
-                val agreeHit = findBottomBandLabelContaining(vision, h, "agree and")
-                if (agreeHit != null) {
-                    val tap = autoLoginTapWithJitter(agreeHit.point, w, h)
-                    devOp(alias, "自动登录 agree and(下方)：tap (${tap.x},${tap.y})")
-                    if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                        if (!autoLoginDelay(alias, 450L, "agree and 后")) return dontAllowHandled
-                        agreeHandled = true
-                        agreeTappedThisPass = true
-                    }
-                }
-            }
-
-            if (!dontAllowHandled && !agreeTappedThisPass) {
-                val dontAllowHit = findDontAllowLabelHit(vision) ?: continue
-                val tap = autoLoginTapWithJitter(dontAllowHit.point, w, h)
-                devOp(alias, "自动登录 Don't allow(预处理)：tap (${tap.x},${tap.y})")
-                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                    if (!autoLoginDelay(alias, 450L, "Don't allow 后")) return true
-                    dontAllowHandled = true
-                }
-            }
-        }
-        return dontAllowHandled
-    }
-
     private fun ocrVisionHasSwipePrompt(result: Text): Boolean =
         ocrVisionHasSwipeUpPrompt(result) ||
             findStrictExactLabelHit(result, "swipe") != null ||
@@ -14708,21 +14672,6 @@ class RealTraceExecutor(
             if (!autoLoginDelay(alias, 450L, "$logTag 后")) return false
         }
         return true
-    }
-
-    private suspend fun autoLoginSwipeUpTwice(ctx: Context, alias: String, w: Int, h: Int): Boolean {
-        if (hardStopOrNull(alias, "自动登录-上滑前OCR")) return false
-        val swipeVision = autoLoginOcrOnce(ctx, alias, "auto_login_swipe_gate")
-        if (swipeVision == null) {
-            devOp(alias, "自动登录：上滑前 OCR 失败，跳过上滑两次")
-            return true
-        }
-        if (!ocrVisionHasSwipePrompt(swipeVision)) {
-            devOp(alias, "自动登录：未识别到 swipe 文案，跳过上滑两次")
-            return true
-        }
-        devOp(alias, "自动登录：已识别 swipe，执行上滑两次")
-        return autoLoginPerformSwipeUpTwice(alias, w, h)
     }
 
     private suspend fun autoLoginTryDismissAgreeAndThenDontAllow(
@@ -14781,12 +14730,6 @@ class RealTraceExecutor(
             if (hardStopOrNull(alias, "自动登录-入口Profile")) return ProfileLoginEntryTapOutcome.Failed
             if (pass > 1 && !autoLoginDelay(alias, 1000L, "入口Profile")) return ProfileLoginEntryTapOutcome.Failed
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_entry_profile_$pass") ?: continue
-            if (ocrVisionHasSwipePrompt(vision)) {
-                devOp(alias, "自动登录：入口 Profile 定位前识别到 Swipe，上滑两次后继续")
-                if (!autoLoginPerformSwipeUpTwice(alias, w, h, "入口Profile-Swipe")) return ProfileLoginEntryTapOutcome.Failed
-                if (!autoLoginDelay(alias, 600L, "入口Profile Swipe后")) return ProfileLoginEntryTapOutcome.Failed
-                continue
-            }
             if (visionShowsProfileLoginEntryMarkers(vision)) {
                 val preview = buildProfileEditOcrPreview(vision).take(280)
                 devOp(alias, "自动登录：定位 Profile 时见登录入口（Add another account/Log in/Sign up），已登出；OCR=$preview")
@@ -14859,12 +14802,6 @@ class RealTraceExecutor(
                 return false
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_success_profile_$pass") ?: continue
-            if (ocrVisionHasSwipePrompt(vision)) {
-                devOp(alias, "自动登录成功校验：识别到 Swipe，上滑两次后继续定位 Profile")
-                if (!autoLoginPerformSwipeUpTwice(alias, w, h, "成功校验-Swipe")) return false
-                if (!autoLoginDelay(alias, 600L, "成功校验 Swipe后")) return false
-                continue
-            }
             val profileHit = findAutoLoginProfileTabHit(vision, h)
             if (profileHit == null) {
                 val preview = buildProfileEditOcrPreview(vision).take(300)
@@ -15010,15 +14947,6 @@ class RealTraceExecutor(
         val h = dm.heightPixels.coerceAtLeast(1)
 
         devOp(alias, "登录状态保障：开始（来源=$sourceTag）")
-
-        runCatching {
-            autoLoginPreprocessDismissAgreeAndDontAllow(ctx, alias, maxPasses = 2, retryDelayMs = 800L)
-        }
-
-        if (!autoLoginSwipeUpTwice(ctx, alias, w, h)) {
-            devOp(alias, "登录状态保障：上滑门禁失败")
-            return LoginSafeguardOutcome.Failed
-        }
 
         when (autoLoginTapProfileForLoginEntry(ctx, alias)) {
             ProfileLoginEntryTapOutcome.OnLoginEntryScreen -> {
@@ -16526,19 +16454,12 @@ class RealTraceExecutor(
             }
 
             if (!skipColdBootstrap) {
-                // 打开 TikTok 之后的预处理链：agree and → Don't allow → 上滑两次 → 点 Profile 进登录入口
-                dontAllowHandledEarly = runCatching {
-                    autoLoginPreprocessDismissAgreeAndDontAllow(ctx, alias, maxPasses = 3, retryDelayMs = 1000L)
-                }.getOrDefault(false)
-                if (dontAllowHandledEarly) {
-                    autoLoginDontAllowHandledInThisChain = true
-                }
-                if (!ensureTikTokInForeground(ctx, alias, "自动登录-上滑前")) return false
-                if (!autoLoginSwipeUpTwice(ctx, alias, w, h)) return false
+                // 打开 TikTok 后：首帧 OCR 由 autoLoginOcrOnce 顺带处理 agree and / Don't allow / Swipe，再点 Profile
                 if (!ensureTikTokInForeground(ctx, alias, "自动登录-Profile前")) return false
                 runCatching {
                     autoLoginTapProfileForLoginEntry(ctx, alias)
                 }
+                dontAllowHandledEarly = autoLoginDontAllowHandledInThisChain
             }
 
             if (!ensureTikTokInForeground(ctx, alias, "自动登录-入口解析前")) return false

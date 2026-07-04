@@ -344,6 +344,10 @@ class AutoSwitchLocalScheduler(
         this.deviceId = deviceId.trim()
         this.sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
         syncPlanFromBundle(bundle)
+        AutoSwitchLocalPlanStore.refreshDeviceActiveFromRuntime(
+            PrefsStore.getLogContextUsername(),
+            "自治启动刷新活跃标记",
+        )
         this.alignOnNextTick = true
         lastSlotKey = PrefsStore.getAutoSwitchLastSlotKey()
         insertionInflight = null
@@ -573,14 +577,13 @@ class AutoSwitchLocalScheduler(
         syncBundleHolder()
 
         val slotKey = slotEntry.slot_key
-        val slotChanged = lastSlotKey != null && lastSlotKey != slotKey
-        if (slotChanged) {
-            AutoSwitchLocalPlanStore.onActiveSlotChanged(slotKey, lastSlotKey!!)
-            onSlotTransition(lastSlotKey!!, slotKey)
-            LogCenter.op(alias, "【自动切号】时段切换 ${lastSlotKey} → $slotKey")
+        val previousSlotKey = lastSlotKey?.trim()?.takeIf { it.isNotEmpty() && it != slotKey }
+        val slotChanged = previousSlotKey != null
+        if (slotChanged && previousSlotKey != null) {
+            AutoSwitchLocalPlanStore.onActiveSlotChanged(slotKey, previousSlotKey)
+            onSlotTransition(previousSlotKey, slotKey)
+            LogCenter.op(alias, "【自动切号】时段切换 $previousSlotKey → $slotKey")
         }
-        lastSlotKey = slotKey
-        PrefsStore.setAutoSwitchLastSlotKey(slotKey)
 
         maybeSweepOrphanedPublishState(slotKey)
 
@@ -589,22 +592,31 @@ class AutoSwitchLocalScheduler(
                 pendingCutSwitchSlotKey = slotKey
                 AutoSwitchLocalPlanStore.markCutSwitchWaiting(slotKey)
                 LogCenter.op(alias, "【自动切号】切号等待高优插入完成 slot=$slotKey")
+                lastSlotKey = slotKey
+                PrefsStore.setAutoSwitchLastSlotKey(slotKey)
                 return
             }
             deviceBusyReasonForCutSwitch()?.let { reason ->
                 logTickSkip("切号等待：$reason")
+                lastSlotKey = slotKey
+                PrefsStore.setAutoSwitchLastSlotKey(slotKey)
                 return
             }
             pendingCutSwitchSlotKey = null
-            handleCutSwitchFromPlan(currentBundle, slotEntry)
+            handleCutSwitchFromPlan(currentBundle, slotEntry, previousSlotKey)
+            lastSlotKey = slotKey
+            PrefsStore.setAutoSwitchLastSlotKey(slotKey)
             return
         }
+
+        lastSlotKey = slotKey
+        PrefsStore.setAutoSwitchLastSlotKey(slotKey)
 
         cutSwitchInflightSlotKey = null
         pendingCutSwitchSlotKey = null
 
         deviceBusyReasonForInsertionScheduling()?.let { reason ->
-            logTickSkipThrottled("插入调度等待：$reason")
+            logTickSkipThrottled("插入任务暂缓：$reason")
             return
         }
 
@@ -646,8 +658,13 @@ class AutoSwitchLocalScheduler(
         }
     }
 
-    private suspend fun handleCutSwitchFromPlan(bundle: AutoSwitchBundle, entry: SlotPlanEntry) {
+    private suspend fun handleCutSwitchFromPlan(
+        bundle: AutoSwitchBundle,
+        entry: SlotPlanEntry,
+        previousSlotKey: String?,
+    ) {
         val slotKey = entry.slot_key
+        AutoSwitchLocalPlanStore.ensureSlotCutSwitchSourcePersisted(slotKey, previousSlotKey)
         val targetRi = entry.target_row_index
         val accounts = bundle.accounts.orEmpty()
         val targetRow = accounts.firstOrNull { (it.row_index ?: -1) == targetRi } ?: run {
@@ -659,7 +676,8 @@ class AutoSwitchLocalScheduler(
 
         val planSlot = AutoSwitchLocalPlanStore.slot(slotKey) ?: entry
         val cs = planSlot.cut_switch
-        // 切号是否完成只看 plan 文件 cut_switch 进度；未 DONE 则 strictly 按 nextPendingStep 续跑，不因 logContext 等推断「已对齐」。
+        // 切号是否完成只看 plan 文件 cut_switch 进度；未 DONE 则 strictly 按 nextPendingStep 续跑，
+        // 不因 device_active / logContext 等推断「已对齐」（避免涨粉误刷活跃标记后假完成切号）。
         val needsLoginFinish = !cs.isDone() &&
             cs.restore_or_login != PlanStepState.DONE &&
             cs.restore_or_login != PlanStepState.SKIPPED &&
@@ -669,7 +687,7 @@ class AutoSwitchLocalScheduler(
                 logCutSwitchSkip("切号进行中 slot=$slotKey step=RESTORE_OR_LOGIN（plan 续跑还原/自动登录）")
                 return
             }
-            val sourceRow = resolveSourceAccount(accounts, entry)
+            val sourceRow = resolveSourceAccount(accounts, entry, previousSlotKey)
             val enqueued = enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
             if (enqueued) {
                 cutSwitchInflightSlotKey = slotKey
@@ -679,7 +697,7 @@ class AutoSwitchLocalScheduler(
             return
         }
 
-        val sourceRow = resolveSourceAccount(accounts, entry)
+        val sourceRow = resolveSourceAccount(accounts, entry, previousSlotKey)
         val nextStep = planSlot.cut_switch.nextPendingStep() ?: run {
             if (!AutoSwitchLocalPlanStore.isCutSwitchDone(slotKey)) {
                 logCutSwitchSkip("切号计划无待执行步骤 slot=$slotKey state=${planSlot.cut_switch}")
@@ -694,7 +712,28 @@ class AutoSwitchLocalScheduler(
 
         val enqueued = when (nextStep) {
             CutSwitchStepKind.BACKUP -> {
-                if (sourceRow == null) {
+                val targetUser = entry.target_username.trim().removePrefix("@")
+                if (sourceRow != null && isCutSwitchAlreadyOnTarget(sourceRow, targetRow, targetUser)) {
+                    if (alias.isNotBlank()) {
+                        LogCenter.op(alias, "【自动切号】当前时段已是 @$targetUser，跳过切号直接进入业务")
+                    }
+                    if (AutoSwitchLocalPlanStore.commitCutSwitchAlreadyActive(slotKey, targetUser)) {
+                        cutSwitchInflightSlotKey = null
+                        pendingCutSwitchSlotKey = null
+                        cancelDuplicatePendingCutSwitchOps(slotKey)
+                        onTryResumeGrowth()
+                        requestImmediateTick(forceLog = true)
+                    }
+                    false
+                } else if (sourceRow == null) {
+                    val reason = AutoSwitchLocalPlanStore.describeCutSwitchSourceResolutionFailure(
+                        slotKey,
+                        previousSlotKey,
+                        accounts.size,
+                    )
+                    if (alias.isNotBlank()) {
+                        LogCenter.op(alias, "【自动切号】计划文件无法解析切号源，bootstrap（不备份）：$reason")
+                    }
                     AutoSwitchLocalPlanStore.setCutSwitchMode(slotKey, "bootstrap", null, null)
                     enqueueBootstrapCutSwitch(bundle, targetRow, slotKey)
                 } else {
@@ -704,12 +743,22 @@ class AutoSwitchLocalScheduler(
                         sourceRow.row_index,
                         sourceRow.username?.trim(),
                     )
+                    if (alias.isNotBlank()) {
+                        LogCenter.op(
+                            alias,
+                            "【自动切号】计划文件切号源=@${sourceRow.username?.trim()} " +
+                                "→ 目标=@${entry.target_username.trim()}（备份→清理→还原）",
+                        )
+                    }
                     enqueueCutSwitch(bundle, sourceRow, targetRow, slotKey)
                 }
             }
             CutSwitchStepKind.CLEAR -> {
-                AutoSwitchLocalPlanStore.setCutSwitchMode(slotKey, "bootstrap", null, null)
-                enqueueBootstrapClearOnly(bundle, targetRow, slotKey)
+                if (planSlot.cut_switch.mode == "bootstrap") {
+                    enqueueBootstrapClearOnly(bundle, targetRow, slotKey)
+                } else {
+                    enqueueSwitchClearOnly(bundle, targetRow, slotKey)
+                }
             }
             CutSwitchStepKind.RESTORE_OR_LOGIN -> {
                 enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
@@ -722,24 +771,27 @@ class AutoSwitchLocalScheduler(
         }
     }
 
-    /** 切号源账号：只读 plan 文件（source_row_index、上一已完成时段目标），不用 logContext 推断。 */
+    /** 当前时段切号源与目标一致，无需备份/清理/还原（不得仅凭 device_active 推断）。 */
+    private fun isCutSwitchAlreadyOnTarget(
+        sourceRow: AutoSwitchAccount,
+        targetRow: AutoSwitchAccount,
+        targetUser: String,
+    ): Boolean {
+        val sourceRi = sourceRow.row_index ?: -1
+        val targetRi = targetRow.row_index ?: -1
+        if (sourceRi >= 0 && targetRi >= 0 && sourceRi == targetRi) return true
+        val sourceUser = sourceRow.username?.trim()?.removePrefix("@").orEmpty()
+        return sourceUser.isNotEmpty() && sourceUser.equals(targetUser, ignoreCase = true)
+    }
+
+    /** 切号源账号：只读 plan 文件（source、device_active、上一已完成时段），不用 TikTok 前台推断。 */
     private fun resolveSourceAccount(
         accounts: List<AutoSwitchAccount>,
         entry: SlotPlanEntry,
+        previousSlotKey: String?,
     ): AutoSwitchAccount? {
-        entry.cut_switch.source_row_index?.let { ri ->
+        AutoSwitchLocalPlanStore.resolveCutSwitchSourceIdentity(entry.slot_key, previousSlotKey)?.let { (ri, _) ->
             accounts.firstOrNull { (it.row_index ?: -1) == ri }?.let { return it }
-        }
-        entry.cut_switch.source_username?.trim()?.takeIf { it.isNotEmpty() }?.let { uname ->
-            accounts.firstOrNull { it.username?.trim().equals(uname, ignoreCase = true) }?.let { return it }
-        }
-        val prevSk = lastSlotKey?.trim().orEmpty()
-        if (prevSk.isNotBlank() && prevSk != entry.slot_key) {
-            AutoSwitchLocalPlanStore.slot(prevSk)?.let { prev ->
-                if (AutoSwitchLocalPlanStore.isCutSwitchDone(prev.slot_key)) {
-                    accounts.firstOrNull { (it.row_index ?: -1) == prev.target_row_index }?.let { return it }
-                }
-            }
         }
         if (accounts.size == 1) return accounts[0]
         return null
@@ -990,6 +1042,28 @@ class AutoSwitchLocalScheduler(
         return true
     }
 
+    /** switch 模式断点续跑：备份已完成，仅清理（保留 plan 内 source，不得改 bootstrap）。 */
+    private suspend fun enqueueSwitchClearOnly(
+        bundle: AutoSwitchBundle,
+        targetRow: AutoSwitchAccount,
+        slotKey: String,
+    ): Boolean {
+        val targetRi = targetRow.row_index ?: return false
+        val targetUser = targetRow.username?.trim().orEmpty()
+        if (targetUser.isBlank()) return false
+        beginExclusiveEnqueue("切号清理")
+        val pkgName = pkg(bundle)
+        val aliasClean = aliasClean(bundle)
+        val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
+        val cutMode = if (resolved != null) "clear_source_for_restore" else "exclusive_activate_target"
+        AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.CLEAR)
+        enqueueExclusiveOp(buildClearOp(aliasClean, pkgName, targetRi, targetUser, slotKey, cutMode))
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】计划文件续跑：清理（源已备份）→ @$targetUser")
+        }
+        return true
+    }
+
     private suspend fun enqueueRestoreOnly(
         bundle: AutoSwitchBundle,
         targetRow: AutoSwitchAccount,
@@ -1102,20 +1176,26 @@ class AutoSwitchLocalScheduler(
     }
 
     private suspend fun enqueueCutSwitch(
-        bundle: AutoSwitchBundle,
+        switchBundle: AutoSwitchBundle,
         sourceRow: AutoSwitchAccount,
         targetRow: AutoSwitchAccount,
         slotKey: String,
     ): Boolean {
         val sourceRi = sourceRow.row_index ?: return false
         val targetRi = targetRow.row_index ?: return false
-        if (sourceRi == targetRi) return false
         val sourceUser = sourceRow.username?.trim().orEmpty()
         val targetUser = targetRow.username?.trim().orEmpty()
         if (sourceUser.isBlank() || targetUser.isBlank()) return false
+        AutoSwitchLocalPlanStore.setDeviceActive(sourceRi, sourceUser, "切号入队备份前确认活跃标记")
+        val backupAttr = AutoSwitchLocalPlanStore.resolveCutSwitchBackupAttribution(sourceUser, sourceRi)
+            ?: return false
+        val (backupRi, backupUser) = backupAttr
+        val accounts = switchBundle.accounts.orEmpty()
+        val backupAccount = accounts.firstOrNull { (it.row_index ?: -1) == backupRi }
+            ?: sourceRow.copy(row_index = backupRi, username = backupUser)
         beginExclusiveEnqueue("切号")
-        val aliasClean = aliasClean(bundle)
-        val pkgName = pkg(bundle)
+        val aliasClean = aliasClean(switchBundle)
+        val pkgName = pkg(switchBundle)
         val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
         val canRestore = resolved != null
         AutoSwitchLocalPlanStore.markCutSwitchStepRunning(slotKey, CutSwitchStepKind.BACKUP)
@@ -1124,17 +1204,17 @@ class AutoSwitchLocalScheduler(
             device_id = deviceId,
             alias = aliasClean,
             package_name = pkgName,
-            backup_record_id = sourceRi,
-            username = sourceUser,
-            previous_backup_path = sourceRow.backup_path?.trim()?.takeIf { it.isNotEmpty() },
+            backup_record_id = backupRi,
+            username = backupUser,
+            previous_backup_path = backupAccount.backup_path?.trim()?.takeIf { it.isNotEmpty() },
             source = "auto_switch",
             cut_switch_after_backup = if (canRestore) "clear_source_for_restore" else "exclusive_activate_target",
             cut_switch_target_row_index = targetRi,
             auto_switch_slot_key = slotKey,
         )
-        AutoSwitchLedger.recordCutSwitchQueued(backupOpId, "tiktok_backup_and_clear", slotKey, sourceUser, backupPayload)
+        AutoSwitchLedger.recordCutSwitchQueued(backupOpId, "tiktok_backup_and_clear", slotKey, backupUser, backupPayload)
         enqueueExclusiveOp(DeviceOp(op_id = backupOpId, op_type = "tiktok_backup_and_clear", payload = backupPayload))
-        LogCenter.op(alias, "【自动切号】已入队切号备份 $sourceUser → $targetUser")
+        LogCenter.op(alias, "【自动切号】已入队切号备份 $backupUser → $targetUser（活跃标记归属 @$backupUser）")
         if (canRestore && resolved != null) {
             val (backupName, backupPath) = resolved
             val restoreOpId = newLocalOpId("restore")
@@ -1147,7 +1227,7 @@ class AutoSwitchLocalScheduler(
                 username = targetUser,
                 skip_pm_clear = true,
                 restore_highlight_row_index = targetRi,
-                backup_record_id = sourceRi,
+                backup_record_id = backupRi,
                 source = "auto_switch",
                 auto_switch_slot_key = slotKey,
             )

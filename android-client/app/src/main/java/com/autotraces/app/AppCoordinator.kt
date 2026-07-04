@@ -784,6 +784,10 @@ object AppCoordinator {
             "无法生成备份包名",
             "需在管理台重新备份或通过 PC 传输导入",
             "备份目录内无 .tar.gz",
+            "数据目录",
+            "数据过小",
+            "61440KB",
+            "跳过打包备份",
         )
         return nonRetryableMarkers.none { r.contains(it) }
     }
@@ -2365,6 +2369,11 @@ object AppCoordinator {
                     if (isCloudAutoSwitchDisabled()) {
                         performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
                     }
+                    return
+                }
+                if (PrefsStore.isAutoSwitchAutonomousMode() && autoSwitchLocalScheduler.isRunning()) {
+                    LogCenter.op(alias, "【自动切号】收到资料重同步 enter session=$sessionId revision=$bundleRevision")
+                    handleAutoSwitchEnterResync(alias, deviceId, eventId, sessionId, bundleRevision)
                     return
                 }
                 // 自治模式：切号/发作品与涨粉互斥；空档时段账号对齐后恢复涨粉。
@@ -4517,13 +4526,22 @@ object AppCoordinator {
                 "【自动切号】bundle 幂等刷新：账号未变且本时段已对齐，跳过配置重载以免打断涨粉",
             )
         }
-        scheduleBackupDirectoryReconcile(
-            alias = alias,
-            deviceId = deviceId,
-            accounts = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
-                .ifEmpty { bundle.accounts.orEmpty() },
-            logPrefix = "【备份目录整理】",
-        )
+        val usernameUnchanged = isBundleTargetUsernameSameAsDevice(bundle)
+        if (!usernameUnchanged) {
+            scheduleBackupDirectoryReconcile(
+                alias = alias,
+                deviceId = deviceId,
+                accounts = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
+                    .ifEmpty { bundle.accounts.orEmpty() },
+                logPrefix = "【备份目录整理】",
+            )
+        } else if (alias.isNotBlank()) {
+            val current = PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty()
+            LogCenter.op(
+                alias,
+                "【自动切号】资料重同步：当前账号 @$current 与云端一致，跳过备份目录整理",
+            )
+        }
         bundle.smart_template_debug?.toAuditLines()?.takeIf { it.isNotEmpty() }?.let { lines ->
             val label = if (!wasSchedulerRunning && startSchedulerIfStopped) "enter 打包" else "bundle 更新"
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
@@ -4534,6 +4552,70 @@ object AppCoordinator {
     private fun beijingMinuteOfDayForBundle(): Int {
         val cal = java.util.Calendar.getInstance(beijingTz)
         return cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    }
+
+    /** 云端 bundle 当前时段应对齐的 TikTok 账号（用于资料重同步 username 对账）。 */
+    private fun resolveBundleCurrentTargetUsername(bundle: AutoSwitchBundle): String {
+        val scheduleDate = bundle.schedule_date?.trim().orEmpty()
+            .ifBlank { PrefsStore.getAutoSwitchScheduleDate().orEmpty() }
+        val logUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
+        return bundle.resolveCurrentSlotTargetAccount(scheduleDate, beijingMinuteOfDayForBundle())
+            ?.username?.trim()?.removePrefix("@").orEmpty()
+            .ifBlank {
+                bundle.resolveHighlightedAccount(logUser)?.username?.trim()?.removePrefix("@").orEmpty()
+            }
+    }
+
+    private fun isBundleTargetUsernameSameAsDevice(bundle: AutoSwitchBundle): Boolean {
+        val current = PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty()
+        if (current.isBlank()) return false
+        val target = resolveBundleCurrentTargetUsername(bundle)
+        if (target.isBlank()) return false
+        return current.equals(target, ignoreCase = true)
+    }
+
+    private suspend fun handleAutoSwitchEnterResync(
+        alias: String,
+        deviceId: String,
+        eventId: Int,
+        sessionId: String,
+        bundleRevision: Int,
+    ) {
+        noteCloudAutoSwitchEnabled(true)
+        PrefsStore.saveAutoSwitchSessionContext(sessionId, bundleRevision)
+        cancelAutoSwitchBundleRetry()
+        val bundleOutcome = tryLoadAutoSwitchBundleForEnter(
+            alias,
+            deviceId,
+            sessionId,
+            bundleRevision,
+        )
+        if (!bundleOutcome.loaded) {
+            val failMsg = bundleOutcome.msg.ifBlank { "未知错误" }
+            LogCenter.op(alias, "【自动切号】资料重同步 bundle 拉取失败：$failMsg")
+        }
+        when {
+            bundleOutcome.loaded ->
+                finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
+            bundleOutcome.cloudDisabled ->
+                scheduleAutoSwitchBundleEnterRetry(
+                    alias,
+                    deviceId,
+                    eventId,
+                    sessionId,
+                    bundleRevision,
+                    bundleOutcome.msg.ifBlank { "该设备未开启自动切号" },
+                )
+            else ->
+                scheduleAutoSwitchBundleEnterRetry(
+                    alias,
+                    deviceId,
+                    eventId,
+                    sessionId,
+                    bundleRevision,
+                    bundleOutcome.msg,
+                )
+        }
     }
 
     private suspend fun resumeAutoSwitchSchedulerIfNeeded(reason: String = "恢复调度") {
@@ -5786,7 +5868,16 @@ object AppCoordinator {
                 val backupDir = backupRoot.absolutePath
                 val qBackupDir = DeviceBackupShell.shellQuote(backupDir)
                 val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
-                val reportUsername = payload?.username?.trim().orEmpty()
+                val payloadUsername = payload?.username?.trim().orEmpty()
+                val isCutSwitchEarly = !payload?.cut_switch_after_backup.isNullOrBlank()
+                val reportUsername = if (isCutSwitchEarly) {
+                    AutoSwitchLocalPlanStore.resolveCutSwitchBackupAttribution(
+                        payloadUsername,
+                        payload?.backup_record_id,
+                    )?.second?.trim().orEmpty().ifBlank { payloadUsername }
+                } else {
+                    payloadUsername
+                }
                 val backupName = UnifiedBackupPaths.buildTikTokBackupArchiveName(
                     alias = alias,
                     username = reportUsername,
@@ -5794,7 +5885,6 @@ object AppCoordinator {
                     timestamp = ts,
                 )
                 if (backupName == null) {
-                    val isCutSwitchEarly = !payload?.cut_switch_after_backup.isNullOrBlank()
                     val missingUserReason =
                         "缺少有效 username，无法生成备份包名（包名须含 username）；备份目录：${cutSwitchBackupDirPath()}"
                     recordCutSwitchFailure(missingUserReason)
@@ -5891,13 +5981,29 @@ object AppCoordinator {
                         false
                     } else if (backupSkipped) {
                         if (isCutSwitch) {
-                            val reason =
-                                "切号备份失败：TikTok 数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，" +
-                                    "源账号 @$reportUsername 必须有有效本地备份才能清理"
-                            opStep(cutStepLabel(reason))
-                            recordCutSwitchFailure(reason)
-                            LogCenter.op(alias, "【切号·备份失败】$reason")
-                            false
+                            val (existingOk, _) = UnifiedBackupPaths.verifyLocalBackupArchive(
+                                context = appContext,
+                                username = reportUsername,
+                                alias = alias,
+                                deviceId = deviceId,
+                            )
+                            val skipNote = if (existingOk) {
+                                "（本机已有有效备份）"
+                            } else {
+                                "（无有效备份，仍继续清理切号）"
+                            }
+                            opStep(
+                                cutStepLabel(
+                                    "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份$skipNote",
+                                ),
+                            )
+                            if (suppressLocalAutoSwitchUiLog) {
+                                LogCenter.op(
+                                    alias,
+                                    "【切号】@${reportUsername} TikTok 数据过小，跳过备份$skipNote",
+                                )
+                            }
+                            true
                         } else {
                             opStep(
                                 cutStepLabel(
@@ -5975,27 +6081,34 @@ object AppCoordinator {
                         backupPathReportedImmediately = true
                     }
 
-                    val clearOk = if (backupOk && (!isCutSwitch || !backupSkipped)) {
-                        if (isCutSwitch) {
-                            val (verified, verifyMsg) = UnifiedBackupPaths.verifyLocalBackupArchive(
-                                context = appContext,
-                                username = reportUsername,
-                                alias = alias,
-                                deviceId = deviceId,
-                                expectedAbsolutePath = backupPath,
-                            )
-                            if (!verified) {
-                                opStep(cutStepLabel("清理前校验失败：$verifyMsg"))
-                                recordCutSwitchFailure("清理前校验失败：$verifyMsg")
-                                LogCenter.op(alias, "【切号·备份失败】清理前校验：$verifyMsg")
-                                false
-                            } else {
-                                opStep(cutStepLabel("第4步：清理 TikTok 数据"))
+                    val clearOk = if (backupOk) {
+                        when {
+                            isCutSwitch && !backupSkipped -> {
+                                val (verified, verifyMsg) = UnifiedBackupPaths.verifyLocalBackupArchive(
+                                    context = appContext,
+                                    username = reportUsername,
+                                    alias = alias,
+                                    deviceId = deviceId,
+                                    expectedAbsolutePath = backupPath,
+                                )
+                                if (!verified) {
+                                    opStep(cutStepLabel("清理前校验失败：$verifyMsg"))
+                                    recordCutSwitchFailure("清理前校验失败：$verifyMsg")
+                                    LogCenter.op(alias, "【切号·备份失败】清理前校验：$verifyMsg")
+                                    false
+                                } else {
+                                    opStep(cutStepLabel("第4步：清理 TikTok 数据"))
+                                    runSu("pm clear $packageName")
+                                }
+                            }
+                            isCutSwitch && backupSkipped -> {
+                                opStep(cutStepLabel("第4步：清理 TikTok 数据（备份已跳过）"))
                                 runSu("pm clear $packageName")
                             }
-                        } else {
-                            opStep(cutStepLabel(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据"))
-                            runSu("pm clear $packageName")
+                            else -> {
+                                opStep(cutStepLabel(if (backupSkipped) "第3步：清理 TikTok 数据" else "第4步：清理 TikTok 数据"))
+                                runSu("pm clear $packageName")
+                            }
                         }
                     } else {
                         opStep(cutStepLabel("备份未成功，已跳过清理以免误删数据"))
@@ -6135,7 +6248,7 @@ object AppCoordinator {
                 )
                 if (ok && isCutSwitch) {
                     payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
-                        AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped = false)
+                        AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped = backupSkipped)
                     }
                     val cutMode = payload?.cut_switch_after_backup?.trim()?.lowercase().orEmpty()
                     if (cutMode == "exclusive_activate_target") {
@@ -7651,7 +7764,8 @@ object AppCoordinator {
             if (errThrowable is LoginSafeguardRequiresAutoLoginException) {
                 LogCenter.op(
                     alias,
-                    "涨粉：OCR 见 Add another account（与登录状态保障一致），终止 $username 并从登录入口续接自动登录",
+                    "涨粉：OCR 见 Log in/Sign up/Add another account 等登录入口（与登录状态保障一致），" +
+                        "终止 $username 并从登录入口续接自动登录",
                 )
                 pendingUsernames.add(0, username)
                 ensureGrowthAccountLoggedInWithRetry(

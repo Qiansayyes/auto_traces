@@ -14707,6 +14707,9 @@ def _device_auto_switch_enabled_resolved(device_id: str, session_id: str = "") -
     """内存开关 + enter session 真源（修复多 worker / 异步落库滞后导致 bundle 被拒）。"""
     if _device_auto_switch_enabled(device_id):
         return True
+    # 管理台已关且有待投递 exit 时，不得凭陈旧 enter session 把开关复活。
+    if _has_pending_auto_switch_exit_event(device_id):
+        return False
     sid = str(session_id or "").strip() or _latest_auto_switch_enter_session_id(device_id)
     if sid and _auto_switch_enter_session_active(sid):
         _sync_device_auto_switch_enabled(device_id, True, force_persist=True)
@@ -14781,6 +14784,71 @@ def _persist_auto_switch_session_row(session_id: str, *, enabled: bool, bundle_r
             ),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _close_active_auto_switch_enter_sessions_for_device(
+    device_id: str,
+    *,
+    except_session_id: str = "",
+) -> int:
+    """关闭设备仍标记为开启的 enter session，避免 resolved() 用过期 session 复活开关。"""
+    did = str(device_id or "").strip()
+    if not did:
+        return 0
+    except_sid = str(except_session_id or "").strip()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT e.session_id
+            FROM device_mode_events e
+            INNER JOIN auto_switch_sessions s ON s.session_id = e.session_id
+            WHERE e.device_id = ?
+              AND e.event_type = 'auto_switch_enter'
+              AND e.session_id LIKE 'as_on_%'
+              AND s.closed_at IS NULL
+              AND s.enabled = 1
+            """,
+            (did,),
+        ).fetchall()
+        closed = 0
+        ts = now_text()
+        for row in rows:
+            sid = str((row[0] if not hasattr(row, "keys") else row["session_id"]) or "").strip()
+            if not sid or sid == except_sid:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE auto_switch_sessions
+                SET enabled = 0, closed_at = COALESCE(closed_at, ?)
+                WHERE session_id = ? AND closed_at IS NULL
+                """,
+                (ts, sid),
+            )
+            closed += int(cur.rowcount or 0)
+        conn.commit()
+        return closed
+    finally:
+        conn.close()
+
+
+def _has_pending_auto_switch_exit_event(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM device_mode_events
+            WHERE device_id = ? AND event_type = 'auto_switch_exit' AND acked_at IS NULL
+            LIMIT 1
+            """,
+            (did,),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 
@@ -15358,10 +15426,12 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
 
     changed = 0
     notified = 0
+    resynced = 0
     cancelled_ops = 0
     for did in device_ids:
         turning_on = False
         turning_off = False
+        resync_bundle = False
         owner = ""
         if not store.devices.get(did):
             _hydrate_device_from_db(did)
@@ -15374,12 +15444,21 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
             dev.auto_switch_enabled = bool(target_enabled)
             if target_enabled and not was_enabled:
                 turning_on = True
+            elif target_enabled and was_enabled:
+                resync_bundle = True
             elif (not target_enabled) and was_enabled:
                 turning_off = True
         _persist_client_device_to_db(did, force=True)
         if turning_on or turning_off:
             changed += 1
         if turning_on:
+            closed_sessions = _close_active_auto_switch_enter_sessions_for_device(
+                did, except_session_id=session_id
+            )
+            if closed_sessions > 0:
+                _auto_switch_log(
+                    f"开启前关闭 {closed_sessions} 个陈旧 enter session device={did} session={session_id}"
+                )
             superseded = _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
             if superseded > 0:
                 _auto_switch_log(
@@ -15390,7 +15469,35 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
                 _append_device_log(did, f"[{now_text()}] 自动切号 | 已开启自治 session={session_id}")
                 with store.lock:
                     store.auto_switch_align_on_next_tick = True
+        elif resync_bundle:
+            # 管理台再次点「开启」：设备可能已在自治中，仍须推送 bundle 供终端对账 username / 整理本地文件。
+            closed_sessions = _close_active_auto_switch_enter_sessions_for_device(
+                did, except_session_id=session_id
+            )
+            if closed_sessions > 0:
+                _auto_switch_log(
+                    f"资料重同步前关闭 {closed_sessions} 个陈旧 enter session device={did} session={session_id}"
+                )
+            superseded = _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+            if superseded > 0:
+                _auto_switch_log(
+                    f"资料重同步前作废 {superseded} 条待投递 exit 事件 device={did} session={session_id}"
+                )
+            if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
+                notified += 1
+                resynced += 1
+                _append_device_log(
+                    did,
+                    f"[{now_text()}] 自动切号 | 资料重同步 session={session_id} revision={bundle_revision}",
+                )
+                with store.lock:
+                    store.auto_switch_align_on_next_tick = True
         elif turning_off:
+            closed_sessions = _close_active_auto_switch_enter_sessions_for_device(did)
+            if closed_sessions > 0:
+                _auto_switch_log(
+                    f"关闭时结束 {closed_sessions} 个活跃 enter session device={did} session={session_id}"
+                )
             superseded = _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
             if superseded > 0:
                 _auto_switch_log(
@@ -15403,7 +15510,8 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
 
     if target_enabled:
         _auto_switch_log(
-            f"已为 {changed} 台设备开启自动切号 session={session_id} revision={bundle_revision} notified={notified}"
+            f"已为 {changed} 台设备开启自动切号、{resynced} 台资料重同步 "
+            f"session={session_id} revision={bundle_revision} notified={notified}"
         )
     else:
         _auto_switch_log(
@@ -15418,6 +15526,7 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
             "bundle_revision": bundle_revision if target_enabled else 0,
             "devices_changed": changed,
             "devices_notified": notified,
+            "devices_resynced": resynced,
             "cancelled_ops": cancelled_ops,
         },
     }

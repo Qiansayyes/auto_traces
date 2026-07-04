@@ -4928,10 +4928,15 @@ async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
     await refreshTaskStatus();
   }
   const resp = data?.data || {};
+  const notified = Number(resp.devices_notified || 0);
+  const changed = Number(resp.devices_changed || 0);
+  const resynced = Number(resp.devices_resynced || 0);
   setStatus(
     enabled
-      ? `已为 ${Number(resp.devices_changed || 0)} 台设备开启自动切号（已通知 ${Number(resp.devices_notified || 0)} 台）`
-      : `已为 ${Number(resp.devices_changed || 0)} 台设备关闭自动切号`,
+      ? resynced > 0 && changed === 0
+        ? `已向 ${notified} 台设备推送自动切号资料（${resynced} 台资料重同步）`
+        : `已向 ${notified} 台设备推送资料（${changed} 台新开启${resynced > 0 ? `，${resynced} 台重同步` : ""}）`
+      : `已为 ${changed} 台设备关闭自动切号`,
     "success",
   );
 }

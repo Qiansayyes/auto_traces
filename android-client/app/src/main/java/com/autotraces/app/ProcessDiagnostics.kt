@@ -111,7 +111,10 @@ object ProcessDiagnostics {
         val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
         val line = buildSnapshotLine(alias, trigger = trigger)
         PrefsStore.saveLastProcessHeartbeatLine(line)
-        LogCenter.op(alias, line)
+        // 周期心跳仅落盘供进程被杀后对照，不打日志避免刷屏。
+        if (trigger != "周期") {
+            LogCenter.op(alias, line)
+        }
     }
 
     private fun buildSnapshotLine(
