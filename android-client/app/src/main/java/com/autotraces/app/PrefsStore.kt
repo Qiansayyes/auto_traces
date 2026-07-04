@@ -36,6 +36,16 @@ object PrefsStore {
     private const val KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP = "transient_paused_for_destructive_op"
     /** 自治切号/发作品等独占 OP 已抢占 TikTok：涨粉应协作退出且不得再拉起 TikTok。 */
     private const val KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT = "auto_switch_exclusive_preempt"
+    /**
+     * 登录保障未通过后的防抖门闩：阻止涨粉恢复 + 发作品入队前每分钟 OCR 刷屏。
+     * [KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE] 为真时登录恢复协程持续重试，hold 到期仅续期防抖、不停止登录。
+     * 登录成功或账号切换时 [clearAutoSwitchTikTokLoginHold]。
+     */
+    private const val KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS = "auto_switch_tiktok_login_hold_until_ms"
+    private const val KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY = "auto_switch_tiktok_login_hold_slot_key"
+    private const val KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_REASON = "auto_switch_tiktok_login_hold_reason"
+    private const val KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE = "auto_switch_login_recovery_active"
+    private const val AUTO_SWITCH_TIKTOK_LOGIN_HOLD_DEFAULT_MS = 5L * 60_000L
     private const val KEY_MUTUAL_CLICK_REQUESTED = "mutual_click_requested"
     private const val KEY_MUTUAL_CLICK_PENDING = "mutual_click_pending"
     /** 下一趟 teamwork Videos 单元：为 true 时跳过左滑与作者主页，仅点赞/收藏/互点评论（历史指令 `mutual_click_comment_only_start`；管理台已合并入口，服务端仍可下发兼容）。 */
@@ -215,6 +225,71 @@ object PrefsStore {
 
     fun isAutoSwitchExclusivePreempt(): Boolean =
         prefs.getBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, false)
+
+    fun isAutoSwitchLoginRecoveryActive(): Boolean =
+        prefs.getBoolean(KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE, false)
+
+    fun activateAutoSwitchTikTokLoginHold(
+        slotKey: String,
+        reason: String,
+        holdMs: Long = AUTO_SWITCH_TIKTOK_LOGIN_HOLD_DEFAULT_MS,
+    ) {
+        val until = System.currentTimeMillis() + holdMs.coerceAtLeast(60_000L)
+        prefs.edit()
+            .putLong(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS, until)
+            .putString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY, slotKey.trim())
+            .putString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_REASON, reason.trim())
+            .putBoolean(KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE, true)
+            .apply()
+    }
+
+    private fun renewAutoSwitchTikTokLoginHoldDebounce() {
+        if (!isAutoSwitchLoginRecoveryActive()) return
+        val slotKey = prefs.getString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY, null)?.trim().orEmpty()
+        val reason = prefs.getString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_REASON, null)?.trim().orEmpty()
+            .ifBlank { "登录保障恢复中" }
+        activateAutoSwitchTikTokLoginHold(slotKey, reason)
+    }
+
+    fun isAutoSwitchTikTokLoginHoldActive(slotKey: String? = null): Boolean {
+        if (isAutoSwitchLoginRecoveryActive()) {
+            val until = prefs.getLong(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS, 0L)
+            if (until <= System.currentTimeMillis()) {
+                renewAutoSwitchTikTokLoginHoldDebounce()
+            }
+            val heldSlot = prefs.getString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY, null)?.trim().orEmpty()
+            val probe = slotKey?.trim().orEmpty()
+            if (probe.isNotEmpty() && heldSlot.isNotEmpty() && probe != heldSlot) return false
+            return true
+        }
+        val until = prefs.getLong(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS, 0L)
+        if (until <= System.currentTimeMillis()) {
+            if (until > 0L) clearAutoSwitchTikTokLoginHold()
+            return false
+        }
+        val heldSlot = prefs.getString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY, null)?.trim().orEmpty()
+        val probe = slotKey?.trim().orEmpty()
+        if (probe.isNotEmpty() && heldSlot.isNotEmpty() && probe != heldSlot) return false
+        return true
+    }
+
+    fun autoSwitchTikTokLoginHoldReason(): String? =
+        prefs.getString(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_REASON, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun autoSwitchTikTokLoginHoldRemainingMinutes(): Int {
+        val until = prefs.getLong(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS, 0L)
+        if (until <= System.currentTimeMillis()) return 0
+        return ((until - System.currentTimeMillis()) / 60_000L).toInt().coerceAtLeast(1)
+    }
+
+    fun clearAutoSwitchTikTokLoginHold() {
+        prefs.edit()
+            .remove(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_UNTIL_MS)
+            .remove(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_SLOT_KEY)
+            .remove(KEY_AUTO_SWITCH_TIKTOK_LOGIN_HOLD_REASON)
+            .putBoolean(KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE, false)
+            .apply()
+    }
 
     fun setMutualClickRequested(requested: Boolean) {
         if (AutoSwitchLocalPlanStore.isAutoSwitchMutualActive()) {

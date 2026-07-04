@@ -221,6 +221,11 @@ object AppCoordinator {
     private const val AUTO_SWITCH_BUNDLE_RETRY_INITIAL_MS = 30_000L
     private const val AUTO_SWITCH_BUNDLE_RETRY_MAX_MS = 300_000L
 
+    /** 登录保障失败后：暂停涨粉/发作品/引流调度刷屏，并按此间隔周期重试登录（非放弃）。 */
+    private const val AUTO_SWITCH_LOGIN_RECOVERY_INTERVAL_MS = 60_000L
+
+    private var autoSwitchLoginRecoveryJob: Job? = null
+
     private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
 
     private fun isAutoSwitchPublishLocallyActive(): Boolean = isPublishPostSwitchActive()
@@ -429,6 +434,18 @@ object AppCoordinator {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (PrefsStore.getAutoSwitchMode() == "exiting") return
         if (PublishPostGrowthGate.isBlockingGrowth()) return
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (alias.isNotBlank()) {
+                val detail = PrefsStore.autoSwitchTikTokLoginHoldReason().orEmpty()
+                val remain = PrefsStore.autoSwitchTikTokLoginHoldRemainingMinutes()
+                LogCenter.op(
+                    alias,
+                    "【自动切号】登录保障恢复中（${if (detail.isNotEmpty()) "$detail，" else ""}暂停涨粉/发作品/引流调度）",
+                )
+            }
+            return
+        }
         val wasRunning = PrefsStore.getLocalStatus() == "running"
         releaseAutoSwitchExclusivePreemptIfIdle(reason)
         if (manuallyPaused || shouldHonorUserHardStop()) return
@@ -492,6 +509,7 @@ object AppCoordinator {
         if (cleared && alias.isNotBlank()) {
             LogCenter.op(alias, "【自动切号】$reason：已清除 crash 遗留独占/暂停标记，将按本地计划文件续跑")
         }
+        restartAutoSwitchLoginRecoveryIfNeeded(reason)
     }
 
     /** 云端 bundle 拉取失败时，用磁盘 plan + bundle 缓存恢复调度器。 */
@@ -1998,29 +2016,24 @@ object AppCoordinator {
                 return
             }
             // 配置与批次拉取绑定：每次拉一批用户名前先拉一次最新配置。
-            fetchConfig()
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                applyBundledConfigFromAutoSwitch(
+                    PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias,
+                    logToUser = false,
+                )
+            } else {
+                fetchConfig()
+            }
             val pullN = _config.value.pull_batch_size.let { if (it < 1) 5 else it }.coerceIn(1, 100)
             val accountForPull = PrefsStore.getLogContextUsername()
-            var response = ApiService.pullUsername(
-                deviceId,
-                alias,
-                pullN,
-                queueRunMode(),
-                accountForPull,
-            )
+            var response = pullUsernameForGrowth(deviceId, alias, pullN, queueRunMode(), accountForPull)
             if (response.code == 2 && _config.value.no_rest) {
                 LogCenter.op(
                     alias,
                     "模板已开启「不休息」：忽略云端休息指令（code=2），立即重新拉取用户名",
                 )
                 updateRuntime(lastMessage = "不休息模式：已跳过云端休息")
-                response = ApiService.pullUsername(
-                    deviceId,
-                    alias,
-                    pullN,
-                    queueRunMode(),
-                    accountForPull,
-                )
+                response = pullUsernameForGrowth(deviceId, alias, pullN, queueRunMode(), accountForPull)
                 if (response.code == 2) {
                     LogCenter.op(
                         alias,
@@ -2078,12 +2091,13 @@ object AppCoordinator {
                     LogCenter.op(alias, "本批用户都已做过或重复，没有新的可执行用户")
                 }
             } else {
+                val statusMsg = growthPullEmptyStatusMessage(response)
                 LogCenter.op(
                     alias,
-                    response.msg?.takeIf { it.isNotBlank() }
+                    statusMsg.takeIf { it.isNotBlank() }
                         ?: "暂时没有新的用户可执行，稍后再试",
                 )
-                updateRuntime(lastMessage = response.msg ?: "暂无待执行用户名")
+                updateRuntime(lastMessage = statusMsg)
             }
         } catch (error: Exception) {
             LogCenter.op(alias, "拉取用户名失败：${error.message}")
@@ -2096,13 +2110,204 @@ object AppCoordinator {
             return
         }
         try {
-            // 拉取循环内本地已是 running，必须向服务端同步为 running，
-            // 若同步为 online 会覆盖服务端状态，导致 pull_username 返回「设备未启动」
+            // 拉取循环内本地已是 running，尽量向服务端同步为 running（自治期失败不阻断本机调度）。
             syncCloudStatus("running", CloudStatusSyncKind.GROWTH)
-            updateRuntime(lastMessage = "拉取前已同步运行状态")
+            if (!PrefsStore.isAutoSwitchAutonomousMode()) {
+                updateRuntime(lastMessage = "拉取前已同步运行状态")
+            }
         } catch (error: Exception) {
-            LogCenter.op(alias, "同步运行状态失败：${error.message}")
-            updateRuntime(lastMessage = "拉取前同步状态失败")
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                LogCenter.op(alias, "自治涨粉：拉取前同步 running 失败（不阻断本机拉取）：${error.message}")
+            } else {
+                LogCenter.op(alias, "同步运行状态失败：${error.message}")
+                updateRuntime(lastMessage = "拉取前同步状态失败")
+            }
+        }
+    }
+
+    private fun isLegacyCloudNotStartedPullMsg(msg: String?): Boolean =
+        msg?.contains("设备未启动") == true || msg?.contains("一键启动") == true
+
+    /** 自治涨粉：本机调度为准；忽略云端陈旧「未启动」门闩并重试一次。 */
+    private suspend fun pullUsernameForGrowth(
+        deviceId: String,
+        alias: String,
+        pullN: Int,
+        runMode: String,
+        accountForPull: String?,
+    ): PullUsernameResponse {
+        var response = ApiService.pullUsername(deviceId, alias, pullN, runMode, accountForPull)
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return response
+        if (response.code == 0 || !isLegacyCloudNotStartedPullMsg(response.msg)) return response
+        LogCenter.op(alias, "自治涨粉：忽略云端「未启动」陈旧提示，同步 running 后重试拉取")
+        runCatching { syncCloudStatus("running", CloudStatusSyncKind.GROWTH) }
+        response = ApiService.pullUsername(deviceId, alias, pullN, runMode, accountForPull)
+        if (isLegacyCloudNotStartedPullMsg(response.msg)) {
+            LogCenter.op(alias, "自治涨粉：服务端仍返回「未启动」，本机继续自治调度（不视为致命错误）")
+        }
+        return response
+    }
+
+    private fun growthPullEmptyStatusMessage(response: PullUsernameResponse): String {
+        val raw = response.msg?.trim().orEmpty()
+        if (raw.isEmpty()) return "暂无待执行用户名"
+        if (PrefsStore.isAutoSwitchAutonomousMode() && isLegacyCloudNotStartedPullMsg(raw)) {
+            return "自治涨粉：云端状态滞后，本机调度继续"
+        }
+        return raw
+    }
+
+    private fun isPublishLoginFailure(msg: String): Boolean {
+        val m = msg.trim()
+        if (m.isEmpty()) return false
+        return m == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE ||
+            m.contains("登录保障") ||
+            m.contains("掉登录") ||
+            (m.contains("自动登录") && m.contains("失败"))
+    }
+
+    private fun activateAutoSwitchTikTokLoginHold(slotKey: String, reason: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        PrefsStore.activateAutoSwitchTikTokLoginHold(slotKey, reason)
+        PrefsStore.saveLocalStatus("paused")
+        growthModeLoginSafeguardPending = true
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val intervalMin = AUTO_SWITCH_LOGIN_RECOVERY_INTERVAL_MS / 60_000L
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】登录保障未通过：已暂停涨粉/发作品/引流调度；持续重试登录，约每 ${intervalMin} 分钟一轮（$reason）",
+            )
+        }
+        val sk = slotKey.trim()
+        if (sk.isNotBlank()) {
+            autoSwitchLocalScheduler.notifyPublishOutcome(
+                slotKey = sk,
+                completed = false,
+                loginFailed = true,
+                accountChanged = false,
+            )
+        }
+        if (alias.isNotBlank() && deviceId.isNotBlank()) {
+            scheduleAutoSwitchLoginRecovery(alias, deviceId, sk, reason)
+        }
+    }
+
+    /** 防抖期间周期重试登录；成功则清除门闩并恢复涨粉，失败则续期门闩（不恢复涨粉/发作品入队刷屏）。 */
+    private fun scheduleAutoSwitchLoginRecovery(
+        alias: String,
+        deviceId: String,
+        slotKey: String,
+        reason: String,
+    ) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        autoSwitchLoginRecoveryJob?.cancel()
+        autoSwitchLoginRecoveryJob = scope.launch {
+            var firstAttempt = true
+            while (isActive) {
+                if (!PrefsStore.isAutoSwitchAutonomousMode()) return@launch
+                if (shouldHonorUserHardStop() || manuallyPaused) return@launch
+                if (!PrefsStore.isAutoSwitchLoginRecoveryActive()) return@launch
+                while (PublishPostGrowthGate.isBlockingGrowth() || ExecutionScope.isActive()) {
+                    if (!delayUnlessHardStop(5_000L)) return@launch
+                    if (!PrefsStore.isAutoSwitchLoginRecoveryActive()) return@launch
+                }
+                if (!firstAttempt) {
+                    if (!delayUnlessHardStop(AUTO_SWITCH_LOGIN_RECOVERY_INTERVAL_MS)) return@launch
+                }
+                firstAttempt = false
+                if (!PrefsStore.isAutoSwitchLoginRecoveryActive()) return@launch
+                LogCenter.op(alias, "【自动切号】登录保障恢复重试（来源=$reason）")
+                val ok = launchTikTokWithLoginSafeguardWithRetry(
+                    alias = alias,
+                    deviceId = deviceId,
+                    tag = "登录保障恢复",
+                    forceStopBeforeLaunch = false,
+                    safeguardSource = "登录保障恢复",
+                    strict = true,
+                )
+                if (ok) {
+                    PrefsStore.clearAutoSwitchTikTokLoginHold()
+                    growthModeLoginSafeguardPending = false
+                    autoSwitchLoginRecoveryJob = null
+                    if (!manuallyPaused && !shouldHonorUserHardStop()) {
+                        PrefsStore.saveLocalStatus("running")
+                        updateRuntime(localStatus = "running", lastMessage = "登录保障恢复成功")
+                    }
+                    LogCenter.op(alias, "【自动切号】登录保障恢复成功，可继续涨粉/发作品")
+                    maybeStartGrowthInAutoSwitchIdle("登录保障恢复成功")
+                    return@launch
+                }
+                val sk = slotKey.ifBlank { PrefsStore.getAutoSwitchLastSlotKey().orEmpty() }
+                PrefsStore.activateAutoSwitchTikTokLoginHold(
+                    sk,
+                    reason,
+                )
+                growthModeLoginSafeguardPending = true
+                LogCenter.op(
+                    alias,
+                    "【自动切号】登录保障恢复仍未通过，${AUTO_SWITCH_LOGIN_RECOVERY_INTERVAL_MS / 60_000L} 分钟后再次重试登录",
+                )
+            }
+        }
+    }
+
+    private fun restartAutoSwitchLoginRecoveryIfNeeded(reason: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (!PrefsStore.isAutoSwitchLoginRecoveryActive()) return
+        if (autoSwitchLoginRecoveryJob?.isActive == true) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        if (alias.isBlank() || deviceId.isBlank()) return
+        val sk = PrefsStore.getAutoSwitchLastSlotKey().orEmpty()
+        val holdReason = PrefsStore.autoSwitchTikTokLoginHoldReason().orEmpty().ifBlank { reason }
+        growthModeLoginSafeguardPending = true
+        scheduleAutoSwitchLoginRecovery(alias, deviceId, sk, holdReason)
+    }
+
+    /**
+     * 切号/跨时段：清掉上一账号遗留的登录保障、发作品、引流、涨粉衔接等运行时脏数据，避免污染下一账号。
+     */
+    private fun clearAutoSwitchPerAccountDirtyState(
+        reason: String,
+        prevSlotKey: String? = null,
+        newSlotKey: String? = null,
+    ) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val hadLoginRecovery = PrefsStore.isAutoSwitchLoginRecoveryActive() ||
+            PrefsStore.isAutoSwitchTikTokLoginHoldActive()
+        autoSwitchLoginRecoveryJob?.cancel()
+        autoSwitchLoginRecoveryJob = null
+        growthModeLoginSafeguardPending = false
+        if (hadLoginRecovery) {
+            PrefsStore.clearAutoSwitchTikTokLoginHold()
+        }
+        PrefsStore.clearPublishPostState()
+        PrefsStore.clearMutualClickState()
+        PrefsStore.setGrowthContinueFromPublishHome(false)
+        executor.clearAccountStatusReloginState()
+        prevSlotKey?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
+            autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
+        }
+        if (isPublishPostSwitchActive()) {
+            publishPostSwitchJob?.cancel()
+            publishPostSwitchJob = null
+        }
+        if (isMutualSwitchActive()) {
+            mutualSwitchJob?.cancel()
+            mutualSwitchJob = null
+        }
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        if (alias.isNotBlank()) {
+            val slotNote = when {
+                !prevSlotKey.isNullOrBlank() && !newSlotKey.isNullOrBlank() ->
+                    " $prevSlotKey→$newSlotKey"
+                else -> ""
+            }
+            LogCenter.op(alias, "【自动切号】账号切换清理脏状态：$reason$slotNote")
         }
     }
 
@@ -2628,6 +2833,7 @@ object AppCoordinator {
             PrefsStore.isAutoSwitchAutonomousMode() &&
             opType in setOf("tiktok_backup_and_clear", "tiktok_clear", "tiktok_restore")
         ) {
+            clearAutoSwitchPerAccountDirtyState(reason = "切号开始")
             AutoSwitchAccountActivityTracker.finalizeSegment("cut_switch")
         }
         pullLoopJob?.cancel()
@@ -3807,6 +4013,19 @@ object AppCoordinator {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (autoSwitchLocalScheduler.isExclusiveWorkActive()) return
         PrefsStore.setAutoSwitchExclusivePreempt(false)
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+            PrefsStore.saveLocalStatus("paused")
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            val detail = PrefsStore.autoSwitchTikTokLoginHoldReason().orEmpty()
+            if (alias.isNotBlank()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】$reason：登录保障恢复中${if (detail.isNotEmpty()) "（$detail）" else ""}，不恢复涨粉",
+                )
+            }
+            updateRuntime(localStatus = "paused", lastMessage = detail.ifBlank { "登录保障恢复中" })
+            return
+        }
         if (!manuallyPaused && !shouldHonorUserHardStop() && autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
             PrefsStore.saveLocalStatus("running")
             updateRuntime(localStatus = "running", lastMessage = "自动切号自治：$reason")
@@ -3816,7 +4035,7 @@ object AppCoordinator {
 
     /**
      * 自动切号 tick 发作品入队前：先独占 TikTok，再 bundle is_login + OCR 登录状态保障。
-     * 失败时不标记 publish_aborted，下分钟 tick 可重试。
+     * 失败时标记本时段发作品 FAILED 并进入登录保障恢复，避免每分钟 tick 重试入队前 OCR。
      */
     private suspend fun verifyPublishInsertionLoginBeforeEnqueue(
         alias: String,
@@ -3827,6 +4046,10 @@ object AppCoordinator {
         val user = targetUsername.trim()
         val sk = slotKey.trim()
         if (user.isBlank() || deviceId.isBlank()) return false
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive(sk)) {
+            LogCenter.op(alias, "【自动切号】发作品入队前跳过：登录保障恢复中 slot=$sk")
+            return false
+        }
         if (!preemptTikTokForInsertionPrep(alias, "发作品入队前")) return false
         PrefsStore.setLogContextUsername(user)
         applyBundledConfigFromAutoSwitch(user, logToUser = false)
@@ -3851,6 +4074,7 @@ object AppCoordinator {
                 }
                 AccountLoginRetryOutcome.Aborted -> {
                     LogCenter.op(alias, "【自动切号】发作品入队前自动登录中止 slot=$sk")
+                    activateAutoSwitchTikTokLoginHold(sk, "发作品入队前自动登录中止")
                     releaseInsertionPrepExclusiveIfIdle("发作品入队前自动登录中止")
                     return false
                 }
@@ -3867,7 +4091,10 @@ object AppCoordinator {
         )
         if (!ocrOk) {
             LogCenter.op(alias, "【自动切号】发作品入队前 OCR 登录保障未通过 slot=$sk account=$user")
+            activateAutoSwitchTikTokLoginHold(sk, "发作品入队前 OCR 登录保障未通过")
             releaseInsertionPrepExclusiveIfIdle("发作品入队前 OCR 未通过")
+        } else {
+            PrefsStore.clearAutoSwitchTikTokLoginHold()
         }
         return ocrOk
     }
@@ -3989,10 +4216,8 @@ object AppCoordinator {
         reason: String,
     ) {
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
-            LogCenter.op(
-                alias,
-                "涨粉：$reason，自治模式不全局暂停（调度继续，待下次重试登录状态保障）",
-            )
+            val sk = PrefsStore.getAutoSwitchLastSlotKey().orEmpty()
+            activateAutoSwitchTikTokLoginHold(sk, reason)
             growthModeLoginSafeguardPending = true
             return
         }
@@ -4284,6 +4509,7 @@ object AppCoordinator {
         executor.clearAccountStatusReloginState()
         if (loginOk) {
             lastEnsureLoginPerformedFreshAutoLogin = true
+            PrefsStore.clearAutoSwitchTikTokLoginHold()
             AutoSwitchBundleHolder.notifyAccountLoggedIn(username)
             if (PrefsStore.isAutoSwitchAutonomousMode()) {
                 AutoSwitchLedger.recordAccountLoginSuccess(username)
@@ -4381,12 +4607,13 @@ object AppCoordinator {
     private fun isGrowthTaskInterruptedResult(message: String): Boolean =
         isHardStopSkippedResult(message) || isExclusivePreemptSkippedResult(message)
 
-    /** 涨粉拉取/执行前应中止（硬停、手动暂停、独占抢占、非 running、自治独占 OP）。 */
+    /** 涨粉拉取/执行前应中止（硬停、手动暂停、独占抢占、非 running、自治独占 OP、登录保障恢复中）。 */
     private fun shouldAbortPullExecution(): Boolean {
         if (manuallyPaused) return true
         if (shouldHonorUserHardStop()) return true
         if (PrefsStore.getAutoSwitchMode() == "exiting") return true
         if (PrefsStore.isAutoSwitchExclusivePreempt()) return true
+        if (PrefsStore.isAutoSwitchAutonomousMode() && PrefsStore.isAutoSwitchTikTokLoginHoldActive()) return true
         if (basicProfileEditRunning) return true
 
         if (PrefsStore.getLocalStatus() != "running") return true
@@ -4459,10 +4686,15 @@ object AppCoordinator {
         return true
     }
 
-    /** 时段边界：收尾上一时段活动统计（切号链随后执行备份/还原/登录）。 */
+    /** 时段边界：收尾上一时段活动统计，并清理上一账号运行时脏数据。 */
     private fun handleAutoSwitchSlotTransition(prevSlotKey: String, newSlotKey: String) {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        clearAutoSwitchPerAccountDirtyState(
+            reason = "跨时段切换",
+            prevSlotKey = prevSlotKey,
+            newSlotKey = newSlotKey,
+        )
         AutoSwitchAccountActivityTracker.finalizeSegment("slot_transition")
         if (alias.isNotBlank()) {
             LogCenter.op(
@@ -6948,6 +7180,10 @@ object AppCoordinator {
                     }
                 } else {
                     switchResult = "发作品：登录保障后仍未登录"
+                    activateAutoSwitchTikTokLoginHold(
+                        publishSlotKeyAtStart,
+                        "发作品保障自动登录失败",
+                    )
                     if (publishOpId.isNotBlank()) {
                         reportAutoSwitchPublishOutcomeIfNeeded(
                             alias = alias,
@@ -6964,7 +7200,14 @@ object AppCoordinator {
                     return@launch
                 }
             }
-            val publishCompleted = switchResult.contains("已完成")
+            val publishLoginFailed = isPublishLoginFailure(switchResult)
+            if (publishLoginFailed) {
+                activateAutoSwitchTikTokLoginHold(
+                    publishSlotKeyAtStart,
+                    switchResult.take(120),
+                )
+            }
+            val publishCompleted = switchResult.contains("已完成") && !publishLoginFailed
             if (autoSwitchPublishAtStart && publishOpId.isNotBlank()) {
                 reportAutoSwitchPublishOutcomeIfNeeded(
                     alias = alias,
@@ -6972,7 +7215,7 @@ object AppCoordinator {
                     opId = publishOpId,
                     slotKey = publishSlotKeyAtStart,
                     completed = publishCompleted,
-                    loginFailed = false,
+                    loginFailed = publishLoginFailed,
                     accountChanged = false,
                     message = switchResult,
                 )
@@ -6982,7 +7225,7 @@ object AppCoordinator {
                     deviceId = deviceIdForPublish,
                     opId = publishOpId,
                     completed = publishCompleted,
-                    loginFailed = false,
+                    loginFailed = publishLoginFailed,
                     accountChanged = false,
                     message = switchResult,
                 )
@@ -7026,6 +7269,10 @@ object AppCoordinator {
                 }
                 if (!PrefsStore.isHardStopRequested() && !manuallyPaused) {
                     if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+                            LogCenter.op(alias, "【自动切号】发作品切换结束：登录保障恢复中，不恢复涨粉")
+                            return@invokeOnCompletion
+                        }
                         val resumeAccount = AutoSwitchLocalPlanStore.activePublishAccountUsername()?.trim()
                             ?: PrefsStore.getLogContextUsername()?.trim()
                             ?: alias
@@ -7091,6 +7338,10 @@ object AppCoordinator {
     private fun resetStalePublishInflightForRetry(slotKey: String, alias: String) {
         val sk = slotKey.trim()
         if (sk.isBlank()) return
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive(sk)) {
+            LogCenter.op(alias, "【自动切号】发作品 stale 重置跳过：登录保障恢复中 slot=$sk")
+            return
+        }
         if (!AutoSwitchLocalPlanStore.isPublishInflight(sk) &&
             AutoSwitchLocalPlanStore.insertionState(sk, "publish") != PlanStepState.FAILED
         ) {
@@ -7108,6 +7359,7 @@ object AppCoordinator {
     private fun tryResumeStaleAutoSwitchPublish(slotKey: String): Boolean {
         val sk = slotKey.trim()
         if (sk.isBlank()) return false
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive(sk)) return false
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
         if (isPublishPostSwitchActive()) return false
         if (!PrefsStore.hasRecoverableAutoSwitchPublish(sk)) return false

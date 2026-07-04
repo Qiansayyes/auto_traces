@@ -9293,17 +9293,18 @@ def pull_username(
         print(f"[{now_text()}] pull_username | auth_failed | device_id={device_id} alias={alias}")
         return error
 
+    # 设备主动拉取即下发：不要求云端先「一键启动」；顺手把内存态标为 running 便于看板展示。
     promoted = False
     try:
         with _tracked_store_lock("pull_username", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
-            if device.status != "running":
+            if device.status != "running" or device.pending_start or device.paused:
                 if device.pending_start:
                     device.pending_start = False
+                if device.paused:
+                    device.paused = False
+                if device.status != "running":
                     device.status = "running"
                     promoted = True
-                else:
-                    print(f"[{now_text()}] pull_username | not_running | device_id={device_id}")
-                    return {"code": 3, "msg": "设备未启动，请先从云端一键启动"}
     except StoreLockBusy:
         print(f"[{now_text()}] pull_username | store_lock_busy | device_id={device_id} alias={alias}")
         return _store_lock_busy_response()

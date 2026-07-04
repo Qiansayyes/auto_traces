@@ -199,6 +199,10 @@ class AutoSwitchLocalScheduler(
 
     private fun growthPullBlockReason(): String? {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return null
+        if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+            return PrefsStore.autoSwitchTikTokLoginHoldReason()?.let { "登录保障恢复中：$it" }
+                ?: "登录保障恢复中（暂停涨粉/发作品/引流调度）"
+        }
         if (PrefsStore.getAutoSwitchMode() == "exiting") return "自治退出中"
         if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return "发作品占用中"
         if (AutoSwitchLocalPlanStore.isMutualContextOccupying()) return "互点占用中"

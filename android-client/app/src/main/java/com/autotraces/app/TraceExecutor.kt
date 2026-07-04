@@ -607,6 +607,10 @@ class RealTraceExecutor(
     @Volatile
     private var publishPostEntryLayout: PublishPostEntryLayout = PublishPostEntryLayout.UNKNOWN
 
+    /** 发作品任务内：第 1 条文案屏记下的 description 固定坐标，同任务后续条复用。 */
+    @Volatile
+    private var publishPostCachedDescriptionTap: Point? = null
+
     private enum class PublishPostEntryLayout {
         /** 未确认：右下固定点 + Recents 试探，必要时走布局 B */
         UNKNOWN,
@@ -717,8 +721,6 @@ class RealTraceExecutor(
         private const val RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS = 10
         /** 导航返回后等待 UI 稳定再 OCR（毫秒）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_DELAY_MS = 520L
-        /** 返回导致 TikTok 退出后，软拉起前台再额外等待 UI 稳定（毫秒）。 */
-        private const val RECOVER_TO_HOME_AFTER_RELANCE_STABILIZE_MS = 720L
         /** 发作品全部完成后的收尾：OCR 点底栏 Home（顺手处理 Don't allow）。 */
         private const val PUBLISH_POST_FINAL_HOME_TAP_MAX_PASSES = 8
         private const val PUBLISH_POST_FINAL_HOME_TAP_RETRY_DELAY_MS = 500L
@@ -1159,6 +1161,7 @@ class RealTraceExecutor(
      * 优先 [navBack] 回首页（底栏 Home+Profile 同见视为已回首页，不强关）；
      * 导航返回过程中 OCR 已见底栏 Home+Profile 时，再执行最后一次返回（搜索/内页也可能误命中底栏）；
      * 首次 OCR 已见底栏 Home+Profile 则判定可能仍在搜索/内页，未按返回键，改为强关重启；
+     * 导航返回期间若 dumpsys 判定 TikTok 非前台，则立即停止返回并强关重启（不再软拉起）；
      * 超过 [RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS] 次仍未回首页则 fallback 强关重启。
      *
      * [PrefsStore.peekGrowthContinueFromPublishHome] 为 true 时（发作品全部完成且已点 Home 后），
@@ -1192,53 +1195,27 @@ class RealTraceExecutor(
 
         val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
 
         /**
-         * 每次 OCR 前先验 TikTok 仍在前台；若返回已把 TikTok 退出到桌面/后台，
-         * 则不强停、软拉起前台并等待稳定后再做 OCR。
+         * 导航返回期间 dumpsys 校验 TikTok 前台；非前台则立即停止返回并强关重启。
+         * @return null 表示仍在前台可继续；非 null 为强关重启结果，调用方应直接结束本恢复流程。
          */
-        suspend fun ensureTikTokForegroundStableBeforeRecoverOcr(passLabel: String): Boolean {
+        suspend fun abortRecoverReturnsIfNotForeground(passLabel: String): Boolean? {
             invalidateForegroundProbeCache()
-            if (isPackageVisible(pkg)) return true
+            if (isPackageVisible(pkg)) return null
 
-            devOp(alias, "$reason：$passLabel 后 TikTok 非前台，疑似返回已退出 App，尝试拉回前台")
-            if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$reason·$passLabel·权限")) {
-                devOp(alias, "$reason：$passLabel 后经权限页恢复 TikTok 前台")
-            } else if (
-                launchTikTokOnceWithCheck(
-                    ctx,
-                    alias,
-                    "$reason·$passLabel·切前台",
-                    launchWaitMs,
-                    forceStopBeforeLaunch = false,
-                    skipDontAllowOcr = skipDontAllowOcr,
-                )
-            ) {
-                devOp(alias, "$reason：$passLabel 后已软拉起 TikTok 至前台")
-            } else if (bringTikTokToForegroundAndConfirm(ctx, alias, "$reason·$passLabel·补拉")) {
-                devOp(alias, "$reason：$passLabel 后补拉 TikTok 至前台")
-            } else {
-                devOp(alias, "$reason：$passLabel 后拉回 TikTok 前台失败")
+            devOp(alias, "$reason：$passLabel TikTok 非前台，终止导航返回并强关重启")
+            if (blockForceRestart) {
+                devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
                 return false
             }
-
-            invalidateForegroundProbeCache()
-            if (!isPackageVisible(pkg)) {
-                devOp(alias, "$reason：$passLabel 后拉回前台仍未通过 dumpsys 校验")
-                return false
+            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
             }
-            if (!growthDelay(alias, RECOVER_TO_HOME_AFTER_RELANCE_STABILIZE_MS, "$reason·拉回稳定")) {
-                return false
-            }
-            return true
         }
 
         suspend fun evaluateRecoverHomeOcr(tagSuffix: String, passLabel: String): RecoverHomeOcrOutcome {
             if (hardStopOrNull(alias, reason)) return RecoverHomeOcrOutcome.HardStop
-            if (!ensureTikTokForegroundStableBeforeRecoverOcr(passLabel)) {
-                return RecoverHomeOcrOutcome.ForegroundUnavailable
-            }
             val (vision, err) = mlKitRecognizeFullScreen(service, "recover_home_$tagSuffix")
             if (vision == null) {
                 devOp(alias, "$reason：回首页 OCR 失败：$err")
@@ -1255,6 +1232,7 @@ class RealTraceExecutor(
             return RecoverHomeOcrOutcome.NotOnMainFeed
         }
 
+        abortRecoverReturnsIfNotForeground("首次 OCR 前")?.let { return it }
         when (val precheck = evaluateRecoverHomeOcr("precheck", "首次 OCR 前")) {
             RecoverHomeOcrOutcome.OnMainFeed -> {
                 devOp(
@@ -1268,13 +1246,7 @@ class RealTraceExecutor(
                 }
             }
             RecoverHomeOcrOutcome.HardStop -> return false
-            RecoverHomeOcrOutcome.ForegroundUnavailable -> {
-                devOp(alias, "$reason：首次 OCR 前 TikTok 前台不可用，未按返回键，改为强关重启")
-                if (blockForceRestart) return false
-                return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-                    if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
-                }
-            }
+            RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
             RecoverHomeOcrOutcome.NotOnMainFeed -> {
                 devOp(alias, "$reason：OCR 未见主 Feed 底栏，开始导航返回回首页")
             }
@@ -1282,15 +1254,19 @@ class RealTraceExecutor(
 
         for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
             if (hardStopOrNull(alias, reason)) return false
-            invalidateForegroundProbeCache()
-            if (!isPackageVisible(pkg)) {
-                if (!ensureTikTokForegroundStableBeforeRecoverOcr("第 $pass 次返回前")) {
-                    devOp(alias, "$reason：第 $pass 次返回前 TikTok 非前台且无法拉回，终止导航返回恢复")
-                    break
-                }
+            abortRecoverReturnsIfNotForeground("第 $pass 次返回前")?.let { return it }
+            if (
+                !navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
+                    service,
+                    alias,
+                    reason,
+                    pass,
+                    RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS,
+                )
+            ) {
+                return false
             }
-            navBack(alias, "$reason 回首页（$pass/$RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS）")
-            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) return false
+            abortRecoverReturnsIfNotForeground("第 $pass 次返回后")?.let { return it }
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
                     devOp(
@@ -1298,28 +1274,15 @@ class RealTraceExecutor(
                         "$reason：第 $pass 次导航返回后 OCR 已见回首页信息，再执行最后一次返回",
                     )
                     if (hardStopOrNull(alias, reason)) return false
-                    invalidateForegroundProbeCache()
-                    if (!isPackageVisible(pkg)) {
-                        if (!ensureTikTokForegroundStableBeforeRecoverOcr("回首页后补返前")) {
-                            devOp(alias, "$reason：回首页后最后一次返回前 TikTok 非前台且无法拉回")
-                            return false
-                        }
-                    }
+                    abortRecoverReturnsIfNotForeground("回首页后补返前")?.let { return it }
                     navBack(alias, "$reason 回首页·最后一次返回（第 $pass 次已命中）")
                     if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·最后一次返回后")) {
                         return false
                     }
+                    abortRecoverReturnsIfNotForeground("最后一次返回后")?.let { return it }
                     when (evaluateRecoverHomeOcr("final_back_$pass", "最后一次返回")) {
                         RecoverHomeOcrOutcome.HardStop -> return false
-                        RecoverHomeOcrOutcome.ForegroundUnavailable -> {
-                            if (ensureTikTokForegroundStableBeforeRecoverOcr("最后一次返回后")) {
-                                devOp(alias, "$reason：最后一次返回后已拉回 TikTok 前台，视为恢复完成")
-                                markSkipForYouWarmupAfterRecoverHome(alias)
-                                return true
-                            }
-                            devOp(alias, "$reason：最后一次返回后无法保持 TikTok 前台")
-                            return false
-                        }
+                        RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
                         RecoverHomeOcrOutcome.OnMainFeed,
                         RecoverHomeOcrOutcome.NotOnMainFeed,
                         -> {
@@ -1330,10 +1293,7 @@ class RealTraceExecutor(
                     }
                 }
                 RecoverHomeOcrOutcome.HardStop -> return false
-                RecoverHomeOcrOutcome.ForegroundUnavailable -> {
-                    devOp(alias, "$reason：第 $pass 次返回后无法拉回 TikTok 前台，终止导航返回恢复")
-                    break
-                }
+                RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
                 RecoverHomeOcrOutcome.NotOnMainFeed -> Unit
             }
         }
@@ -5668,6 +5628,53 @@ class RealTraceExecutor(
         runSuCommand("input keyevent 4")
     }
 
+    /** 创作相机底栏同时出现 POST + CREATE 时，单次返回无法退出，须连按两次。 */
+    private fun ocrSeesPublishPostCameraBottomNav(vision: Text): Boolean {
+        fun hasNavLabel(vararg labels: String): Boolean =
+            labels.any { findStrictExactLabelHit(vision, it) != null }
+        return hasNavLabel("CREATE", "Create") && hasNavLabel("POST", "Post")
+    }
+
+    /**
+     * 回首页恢复流程中的导航返回：发作品期间若 OCR 同时见 POST+CREATE（创作相机底栏），连续执行两次返回。
+     */
+    private suspend fun navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
+        service: Context,
+        alias: String,
+        reason: String,
+        pass: Int,
+        maxAttempts: Int,
+    ): Boolean {
+        if (hardStopOrNull(alias, reason)) return false
+        var doubleBack = false
+        if (PrefsStore.isPublishPostPending()) {
+            val (vision, err) = mlKitRecognizeFullScreen(service, "recover_home_pre_back_$pass")
+            if (vision != null) {
+                if (ocrSeesPublishPostCameraBottomNav(vision)) {
+                    doubleBack = true
+                    devOp(
+                        alias,
+                        "$reason：第 $pass/$maxAttempts 次返回前 OCR 已见 POST+CREATE（创作相机底栏），" +
+                            "发作品期间连续执行两次返回",
+                    )
+                }
+            } else if (isMlKitHardStopError(err)) {
+                return false
+            } else {
+                devOp(alias, "$reason：第 $pass/$maxAttempts 次返回前 OCR 失败：$err，按单次返回继续")
+            }
+        }
+        val passLabel = "（$pass/$maxAttempts）"
+        if (doubleBack) {
+            navBack(alias, "$reason 回首页·创作相机双返 1/2$passLabel")
+            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return false
+            navBack(alias, "$reason 回首页·创作相机双返 2/2$passLabel")
+        } else {
+            navBack(alias, "$reason 回首页$passLabel")
+        }
+        return growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")
+    }
+
     /**
      * dumpsys 判定 TikTok 非前台时尽量恢复任务，不因「当前不在 TikTok 界面」直接放弃：
      * 1) 先不切前台强停，尝试把已在后台的 TikTok 拉到前台（部分机型有效）；
@@ -7611,6 +7618,32 @@ class RealTraceExecutor(
      * 第 1 张基准 X≈16%*W、Y≈30%*H；第 2 张屏宽水平中点、Y 同第 1；第 3 张与第 1 关于竖直中线对称；
      * 第 4 张 X 同第 1、Y≈49%*H；第 5 张屏宽水平中点、Y 同第 4。
      */
+    /** 发作品文案屏：点击 description 输入区。第 1 条从文案屏 OCR 记固定坐标，同任务后续条直接复用、不再 OCR。 */
+    private suspend fun publishPostTapDescriptionField(
+        alias: String,
+        videoIndex: Int,
+        captionVision: Text,
+        w: Int,
+        h: Int,
+    ): Boolean {
+        publishPostCachedDescriptionTap?.let { cached ->
+            devOp(alias, "发作品 第${videoIndex + 1} 条：复用第 1 条 description 固定坐标 (${cached.x},${cached.y})")
+            return runSuCommand("input tap ${cached.x} ${cached.y}")
+        }
+        val hit = findLabelHitContainingIgnoreCase(captionVision, "description")
+            ?: run {
+                devOp(
+                    alias,
+                    "发作品：第 1 条文案屏未命中 description，认定当前作品发布步骤混乱，关闭并重新打开 TikTok",
+                )
+                return publishPostFail(alias, "发作品 description 坐标", tryRestart = true)
+            }
+        val tap = coerceTapToScreen(hit.point, w, h)
+        publishPostCachedDescriptionTap = tap
+        devOp(alias, "发作品：第 1 条记 description 固定坐标 (${tap.x},${tap.y})，同任务后续条复用")
+        return runSuCommand("input tap ${tap.x} ${tap.y}")
+    }
+
     private fun publishPostGalleryMediaTap(w: Int, h: Int, videoIndex: Int): Point {
         val y1 = (h * 0.3f).toInt().coerceIn(1, h - 1)
         val x1 = (w * 0.16f).toInt().coerceIn(1, w - 1)
@@ -8853,7 +8886,7 @@ class RealTraceExecutor(
      * 7) [已禁用] OCR 定位并点击 Sound
      * 8) [已禁用] 再次点击音频位置
      * 9) 沿用第一次 Next 的坐标再次点击 Next
-     * 10) OCR 定位 description（忽略大小写包含即命中）并点击聚焦，最多 3 次；均未命中则认定步骤混乱并重启 TikTok
+     * 10) 第 1 条文案屏 OCR 记 description 固定坐标并点击；同任务后续条复用该坐标、不再 OCR 定位
      * 11) 使用运行配置中的 [AppConfig.comment_texts] 随机文案输入
      * 12) OCR 定位 Done（偏下）或屏幕上方含 post 的 Post（优先 Done）并点击；点 Done 后再点一次第一次 Next；点顶部 Post 则等价 Done+Next+确认 Post，跳过后续 Next
      * 13)（仅 Done 路径）再次点击第一次 Next 的坐标，进入后续确认页
@@ -9000,20 +9033,9 @@ class RealTraceExecutor(
         val captionPool = config.comment_texts.map { it.trim() }.filter { it.isNotBlank() }
         val phrase = captionPool.randomOrNull() ?: "Nice"
         devOp(alias, "发作品：准备输入文案，来源=config.comment_texts，候选数=${captionPool.size}，选中文案 len=${phrase.length} preview=${phrase.take(40)}")
-        devOp(alias, "发作品：输入文案前 OCR 定位 description 并点击（至多 3 次）")
-        if (!publishPostOcrTapByFinder(
-                service,
-                alias,
-                "publish_post_description_${videoIndex}",
-                "description 聚焦",
-                3,
-            ) { findLabelHitContainingIgnoreCase(it, "description") }
-        ) {
-            devOp(
-                alias,
-                "发作品：description OCR 连续 3 次未命中，认定当前作品发布步骤混乱，关闭并重新打开 TikTok",
-            )
-            return publishPostFail(alias, "发作品 description OCR", tryRestart = true)
+        devOp(alias, "发作品：输入文案前点击 description 聚焦（第 1 条记坐标，后续条复用固定点）")
+        if (!publishPostTapDescriptionField(alias, videoIndex, vCap, w, h)) {
+            return false
         }
         devOp(alias, "发作品：description 已点击，等待页面/键盘稳定")
         delay(1000)
@@ -9289,6 +9311,7 @@ class RealTraceExecutor(
             PrefsStore.setPublishPostMaterialReady(true)
         }
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+        publishPostCachedDescriptionTap = null
         publishPostEntryLayout = publishPostLoadDeviceEntryLayout(alias)
         if (resumeStartIdx <= 0) {
             when (val recovery = recoverPublishPostEntry(service, "发作品任务头")) {
