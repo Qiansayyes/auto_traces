@@ -247,6 +247,8 @@ data class DeviceOpPayload(
     val status_column: Int? = null,
     /** 批量带流：本设备待处理行 */
     val rows: List<BatchStreamRowPayload>? = null,
+    /** PC 投屏/伴侣服务地址，如 http://192.168.1.6:5088 */
+    val windows_base_url: String? = null,
 )
 
 data class BatchStreamRowPayload(

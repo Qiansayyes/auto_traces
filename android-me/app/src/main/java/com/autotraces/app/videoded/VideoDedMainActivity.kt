@@ -38,7 +38,6 @@ class VideoDedMainActivity : ComponentActivity() {
     private lateinit var apiLocalUrlView: TextView
     private lateinit var apiToggleView: TextView
     private lateinit var historyButton: Button
-    private lateinit var apiToggleButton: Button
     private lateinit var copyTokenButton: Button
     private lateinit var mirrorAddrView: TextView
     private lateinit var adbTcpPortInput: EditText
@@ -193,15 +192,6 @@ class VideoDedMainActivity : ComponentActivity() {
             text = "本地 Base URL："
             setPadding(0, 0, 0, 8)
         }
-        apiToggleButton = Button(this).apply {
-            text = "切换 API 开关"
-            setOnClickListener {
-                val next = !ApiSettings.isApiEnabled(this@VideoDedMainActivity)
-                Log.d(TAG, "toggle api enabled -> $next")
-                ApiSettings.setApiEnabled(this@VideoDedMainActivity, next)
-                refreshApiSection()
-            }
-        }
         copyTokenButton = Button(this).apply {
             text = "刷新并显示 Token"
             setOnClickListener {
@@ -211,7 +201,6 @@ class VideoDedMainActivity : ComponentActivity() {
         section.addView(apiToggleView)
         section.addView(apiTokenView)
         section.addView(apiLocalUrlView)
-        section.addView(apiToggleButton)
         section.addView(copyTokenButton)
         return section
     }
@@ -279,7 +268,7 @@ class VideoDedMainActivity : ComponentActivity() {
     }
 
     private fun refreshApiSection() {
-        apiToggleView.text = "API：${if (ApiSettings.isApiEnabled(this)) "已启用" else "已关闭"}"
+        apiToggleView.text = "API：已启用（常开）"
         apiTokenView.text = "Token：${ApiSettings.getToken(this)}"
         val p = ApiSettings.getListenPort(this)
         apiLocalUrlView.text =

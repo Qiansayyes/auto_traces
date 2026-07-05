@@ -240,7 +240,18 @@ object AutoSwitchLocalPlanStore {
         return get()?.slots?.firstOrNull { it.slot_key == sk }
     }
 
-    fun isCutSwitchDone(slotKey: String): Boolean = slot(slotKey)?.cut_switch?.isDone() == true
+    fun isCutSwitchDone(slotKey: String): Boolean {
+        val cs = slot(slotKey)?.cut_switch ?: return false
+        if (!cs.isDone()) return false
+        // 历史假完成：三步全 SKIPPED（未经真实 backup→clear→restore 链）
+        if (cs.backup == PlanStepState.SKIPPED &&
+            cs.clear == PlanStepState.SKIPPED &&
+            cs.restore_or_login == PlanStepState.SKIPPED
+        ) {
+            return false
+        }
+        return true
+    }
 
     fun isSlotReady(slotKey: String): Boolean = isCutSwitchDone(slotKey)
 
@@ -254,72 +265,33 @@ object AutoSwitchLocalPlanStore {
         return ri to uname
     }
 
-    /**
-     * 写入 plan 级活跃标记并立即落盘。
-     * 切号备份前：应为 TikTok 当前登录源账号；切号链成功：应为切过来的目标账号。
-     */
-    fun setDeviceActive(rowIndex: Int?, username: String, action: String) {
-        if (action.contains("涨粉")) {
-            return
-        }
-        val uname = username.trim().removePrefix("@")
-        if (uname.isEmpty()) return
-        val ri = rowIndex?.takeIf { it >= 0 }
-            ?: get()?.accounts?.firstOrNull { it.username.equals(uname, ignoreCase = true) }?.row_index
-            ?: return
-        mutatePlan { plan ->
-            plan.copy(
-                device_active_row_index = ri,
-                device_active_username = uname,
-            )
-        }
-        LogCenter.op(
-            PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" },
-            "【自动切号·计划文件】$action：活跃标记=@$uname row=$ri",
-        )
-    }
-
-    /**
-     * 切号备份：tar 包名与 accounts[] 归属只看 plan 活跃标记；无标记时才用 OP 下发 username。
-     */
+    /** 切号备份 tar 归属：入队 OP 显式指定的源账号优先；device_active 仅作无 OP 上下文回退。 */
     fun resolveCutSwitchBackupAttribution(
         fallbackUsername: String,
         fallbackRowIndex: Int?,
     ): Pair<Int, String>? {
-        getDeviceActiveIdentity()?.let { return it }
         val uname = fallbackUsername.trim().removePrefix("@")
-        if (uname.isEmpty()) return null
-        val ri = fallbackRowIndex?.takeIf { it >= 0 }
-            ?: get()?.accounts?.firstOrNull { it.username.equals(uname, ignoreCase = true) }?.row_index
-            ?: return null
-        return ri to uname
+        if (uname.isNotEmpty()) {
+            val ri = fallbackRowIndex?.takeIf { it >= 0 }
+                ?: get()?.accounts?.firstOrNull { it.username.equals(uname, ignoreCase = true) }?.row_index
+            if (ri != null && ri >= 0) return ri to uname
+        }
+        return getDeviceActiveIdentity()
     }
 
-    /** 自治启动等：用运行时账号刷新活跃标记（仅当与 plan 不一致时落盘，避免涨粉循环误刷）。 */
+    /** 禁止用 logContext/涨粉运行时刷新活跃标记；活跃标记只在切号链成功后变更。 */
     fun refreshDeviceActiveFromRuntime(runtimeUsername: String?, action: String) {
-        if (action.contains("涨粉")) return
-        val uname = runtimeUsername?.trim()?.removePrefix("@").orEmpty()
-        if (uname.isEmpty()) return
-        val plan = get() ?: return
-        val existingUser = plan.device_active_username?.trim()?.removePrefix("@").orEmpty()
-        val targetRi = plan.accounts.firstOrNull { it.username.equals(uname, ignoreCase = true) }?.row_index
-        if (existingUser.equals(uname, ignoreCase = true)) {
-            val existingRi = plan.device_active_row_index
-            if (existingRi != null && existingRi >= 0 && (targetRi == null || existingRi == targetRi)) {
-                return
-            }
-        }
-        setDeviceActive(rowIndex = targetRi, username = uname, action = action)
+        // no-op by design
     }
 
     /** 从 plan 历史推导「设备当前应对齐账号」，供切号源解析与断电恢复。 */
     fun findLastCompletedSlotEntry(plan: AutoSwitchLocalPlan? = null): SlotPlanEntry? {
         val p = plan ?: get() ?: return null
         p.last_completed_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
-            p.slots.firstOrNull { it.slot_key == sk && it.cut_switch.isDone() }?.let { return it }
+            p.slots.firstOrNull { it.slot_key == sk && isCutSwitchDone(sk) }?.let { return it }
         }
         return p.slots
-            .filter { it.cut_switch.isDone() }
+            .filter { isCutSwitchDone(it.slot_key) }
             .maxByOrNull { "${it.schedule_date}|${it.slot_index.toString().padStart(5, '0')}" }
     }
 
@@ -336,23 +308,13 @@ object AutoSwitchLocalPlanStore {
     }
 
     /**
-     * 自治进入时：把当前运行账号写入 plan（仅 device_active 缺失时），避免首次切号误 bootstrap。
+     * 自治进入时：device_active 缺失则仅从已完成切号历史推导，禁止用 logContext 写入。
      */
     fun seedDeviceActiveOnAutonomousEnterIfMissing(preferredUsername: String?) {
-        val uname = preferredUsername?.trim()?.removePrefix("@").orEmpty()
         mutatePlan { plan ->
             val existingRi = plan.device_active_row_index
             val existingUser = plan.device_active_username?.trim()?.removePrefix("@").orEmpty()
             if (existingRi != null && existingRi >= 0 && existingUser.isNotEmpty()) return@mutatePlan plan
-            if (uname.isNotEmpty()) {
-                val ri = plan.accounts.firstOrNull { it.username.equals(uname, ignoreCase = true) }?.row_index
-                if (ri != null && ri >= 0) {
-                    return@mutatePlan plan.copy(
-                        device_active_row_index = ri,
-                        device_active_username = uname,
-                    )
-                }
-            }
             syncDeviceActiveFromPlanHistoryIfMissing(plan)
         }
     }
@@ -964,49 +926,9 @@ object AutoSwitchLocalPlanStore {
     }
 
     /**
-     * 当前时段目标账号与设备活跃账号一致：跳过备份/清理/还原，直接标切号完成并写活跃标记。
-     */
-    fun commitCutSwitchAlreadyActive(slotKey: String, username: String): Boolean {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
-        val sk = slotKey.trim()
-        val user = username.trim().removePrefix("@")
-        if (sk.isEmpty() || user.isBlank()) return false
-
-        synchronized(writeLock) {
-            val before = getInternal() ?: return false
-            val slot = before.slots.firstOrNull { it.slot_key == sk } ?: return false
-            if (slot.cut_switch.isDone()) return true
-
-            val after = updateDeviceActiveAfterCutSwitch(
-                before.copy(
-                    slots = before.slots.map { entry ->
-                        if (entry.slot_key != sk) entry
-                        else entry.copy(
-                            cut_switch = entry.cut_switch.copy(
-                                backup = PlanStepState.SKIPPED,
-                                clear = PlanStepState.SKIPPED,
-                                restore_or_login = PlanStepState.SKIPPED,
-                            ),
-                        )
-                    },
-                ),
-                sk,
-            )
-            saveInternal(after)
-            val ledgerOk = AutoSwitchLedger.tryRecordCutSwitchChainCompleted(sk, user, "already_active")
-            if (!ledgerOk) {
-                saveInternal(before)
-                return false
-            }
-            logPlanCutSwitchProgress(sk, "当前时段已是目标账号，跳过切号链")
-            logDeviceActiveCommittedAfterCutSwitch(sk, user)
-            return true
-        }
-    }
-
-    /**
      * plan 标切号完成与 ledger 记 cut_switch_chain_completed 同一事务：
      * 先写 plan，ledger 失败则回滚 plan；任一步失败则返回 false。
+     * 活跃标记仅在此处（及同路径的 [updateDeviceActiveAfterCutSwitch]）写入。
      */
     fun commitCutSwitchChainCompleted(
         slotKey: String,
@@ -1189,7 +1111,6 @@ object AutoSwitchLocalPlanStore {
         if (date.isEmpty()) return
         val minute = minuteOfDay.coerceIn(0, 1439)
         var abandoned = 0
-        val abandonedSlotKeys = mutableListOf<String>()
         mutatePlan { plan ->
             plan.copy(
                 slots = plan.slots.map { slot ->
@@ -1198,7 +1119,6 @@ object AutoSwitchLocalPlanStore {
                         (slot.schedule_date == date && minute >= slot.end_min)
                     if (!expired) return@map slot
                     abandoned++
-                    abandonedSlotKeys.add(slot.slot_key)
                     val cs = slot.cut_switch
                     slot.copy(
                         cut_switch = cs.copy(
@@ -1215,9 +1135,6 @@ object AutoSwitchLocalPlanStore {
                 PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" },
                 "【自动切号】已放弃 $abandoned 个过期未完成切号 slot（当前 $date ${minute / 60}:${"%02d".format(minute % 60)}）",
             )
-        }
-        abandonedSlotKeys.forEach { sk ->
-            logPlanCutSwitchProgress(sk, "放弃过期未完成切号")
         }
     }
 

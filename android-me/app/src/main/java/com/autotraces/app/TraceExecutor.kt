@@ -584,10 +584,6 @@ class RealTraceExecutor(
     @Volatile
     private var publishPostEntryLayout: PublishPostEntryLayout = PublishPostEntryLayout.UNKNOWN
 
-    /** 发作品任务内：第 1 条文案屏记下的 description 固定坐标，同任务后续条复用。 */
-    @Volatile
-    private var publishPostCachedDescriptionTap: Point? = null
-
     private enum class PublishPostEntryLayout {
         /** 未确认：右下固定点 + Recents 试探，必要时走布局 B */
         UNKNOWN,
@@ -699,6 +695,10 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS = 2_000L
         /** 进入创作流后 OCR「Continue」最多次数；均未命中则跳过，不判失败。 */
         private const val PUBLISH_POST_CONTINUE_OCR_MAX_PASSES = 3
+        /** 点击相册（Recents→Pictures）前：可能连续出现的权限弹窗轮数（每轮尝试 OCR 点 Don't allow）。 */
+        private const val PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_POPUP_ROUNDS = 2
+        /** 每轮 Don't allow OCR 最多次数；均未命中跳过，不判失败。 */
+        private const val PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_OCR_PASSES = 3
         /** 右下固定点后探测「Recents」最多次数（仅识别不点击）。 */
         private const val PUBLISH_POST_RECENTS_OCR_MAX_PASSES = 3
         /** 未见 Recents 时备用入口 X = 屏宽 / 12。 */
@@ -7646,30 +7646,19 @@ class RealTraceExecutor(
      * 第 1 张基准 X≈16%*W、Y≈30%*H；第 2 张屏宽水平中点、Y 同第 1；第 3 张与第 1 关于竖直中线对称；
      * 第 4 张 X 同第 1、Y≈49%*H；第 5 张屏宽水平中点、Y 同第 4。
      */
-    /** 发作品文案屏：点击 description 输入区。第 1 条从文案屏 OCR 记固定坐标，同任务后续条直接复用、不再 OCR。 */
+    /** 发作品文案屏 description 固定坐标：与图库首条作品 [publishPostGalleryMediaTap] 点击坐标一致。 */
+    private fun publishPostDescriptionTapPoint(w: Int, h: Int): Point =
+        publishPostGalleryMediaTap(w, h, 0)
+
+    /** 发作品文案屏：固定坐标点击 description 输入区，不做 OCR。 */
     private suspend fun publishPostTapDescriptionField(
-        service: Context,
         alias: String,
         videoIndex: Int,
-        captionVision: Text,
         w: Int,
         h: Int,
     ): Boolean {
-        publishPostCachedDescriptionTap?.let { cached ->
-            devOp(alias, "发作品 第${videoIndex + 1} 条：复用第 1 条 description 固定坐标 (${cached.x},${cached.y})")
-            return runSuCommand("input tap ${cached.x} ${cached.y}")
-        }
-        val hit = findLabelHitContainingIgnoreCase(captionVision, "description")
-            ?: run {
-                devOp(
-                    alias,
-                    "发作品：第 1 条文案屏未命中 description，认定当前作品发布步骤混乱，关闭并重新打开 TikTok",
-                )
-                return publishPostFail(service, alias, "发作品 description 坐标", tryRestart = true)
-            }
-        val tap = coerceTapToScreen(hit.point, w, h)
-        publishPostCachedDescriptionTap = tap
-        devOp(alias, "发作品：第 1 条记 description 固定坐标 (${tap.x},${tap.y})，同任务后续条复用")
+        val tap = publishPostDescriptionTapPoint(w, h)
+        devOp(alias, "发作品 第${videoIndex + 1} 条：固定坐标点击 description (${tap.x},${tap.y})（同图库首条 X≈16%*W Y≈30%*H）")
         return runSuCommand("input tap ${tap.x} ${tap.y}")
     }
 
@@ -8457,7 +8446,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 资料入口比例点 →（仅本任务第 1 条）可选 OCR「Continue」与「While using the app」→ **右下角**固定点：
+     * 资料入口比例点 →（仅本任务第 1 条）可选 OCR「Continue」→ 点击相册前 OCR「Don't allow」（最多 2 轮，未命中不判失败）→ **右下角**固定点：
      * 距右约 15% 屏宽、距底约 1/5 屏高（不是贴边到最右下角，而是右下区域偏内一点）。
      * → 右下固定点后（仅布局未确认时）可选 OCR「Allow all」（最多 [PUBLISH_POST_ALLOW_ALL_OCR_MAX_PASSES] 次 OCR、累计命中点击最多 [PUBLISH_POST_ALLOW_ALL_MAX_CLICKS] 次）→ OCR 探测 Recents；
      * 仍未见则备用点 (W/12, CREATE/POST 的 Y)，再 Allow all → 再 OCR 探测 Recents（同样最多 [PUBLISH_POST_RECENTS_OCR_MAX_PASSES] 次），仍无则本条失败。
@@ -8574,6 +8563,11 @@ class RealTraceExecutor(
         clickRecents: Boolean = false,
         clickPictures: Boolean = false,
     ): Boolean {
+        if (clickPictures) {
+            if (!publishPostTryDismissDontAllowBeforeGallery(service, alias, "Recents→Pictures")) {
+                return false
+            }
+        }
         for (pass in 1..PUBLISH_POST_RECENTS_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, hardStopLabel)) return false
             if (pass > 1) delay(700)
@@ -8741,12 +8735,72 @@ class RealTraceExecutor(
         return null
     }
 
+    /**
+     * 点击相册（Recents→Pictures）前：OCR 尝试拒绝系统权限弹窗（Don't allow / 不允许 / 取消等）。
+     * 可能连续出现最多 [PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_POPUP_ROUNDS] 个弹窗；均未命中不判失败。
+     */
+    private suspend fun publishPostTryDismissDontAllowBeforeGallery(
+        service: Context,
+        alias: String,
+        phaseTag: String,
+    ): Boolean {
+        val dm = service.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        devOp(
+            alias,
+            "发作品：$phaseTag 前尝试 OCR 拒绝权限弹窗（Don't allow 等，最多 " +
+                "${PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_POPUP_ROUNDS} 轮；未命中不判失败）",
+        )
+        for (round in 1..PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_POPUP_ROUNDS) {
+            var tappedThisRound = false
+            for (pass in 1..PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_OCR_PASSES) {
+                if (hardStopOrNull(alias, "发作品 $phaseTag Don't allow OCR")) return false
+                if (pass > 1) delay(700)
+                val (vision, errTag) =
+                    mlKitRecognizeFullScreen(service, "publish_post_dont_allow_${phaseTag}_r${round}_$pass")
+                if (vision == null) {
+                    devOp(
+                        alias,
+                        "发作品：$phaseTag Don't allow 第 $round 轮 OCR 第 $pass/" +
+                            "${PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_OCR_PASSES} 次失败：$errTag",
+                    )
+                    if (isMlKitHardStopError(errTag)) return false
+                    continue
+                }
+                val preview = buildProfileEditOcrPreview(vision).take(480)
+                devOp(alias, "发作品：$phaseTag Don't allow 第 $round 轮 OCR 第 $pass 次摘要=$preview")
+                val hit = findLaunchPermissionDismissHit(vision)
+                if (hit == null) {
+                    devOp(alias, "发作品：$phaseTag Don't allow 第 $round 轮 OCR 第 $pass 次未命中")
+                    continue
+                }
+                val tap = coerceTapToScreen(hit.point, w, h)
+                devOp(
+                    alias,
+                    "发作品：$phaseTag Don't allow 第 $round 轮 OCR 第 $pass 次命中，tap (${tap.x},${tap.y})",
+                )
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    devOp(alias, "发作品：$phaseTag Don't allow 第 $round 轮已点击")
+                    tappedThisRound = true
+                    delay(500)
+                    break
+                }
+                devOp(alias, "发作品：$phaseTag Don't allow 第 $round 轮 tap 失败，继续 OCR")
+            }
+            if (!tappedThisRound) {
+                devOp(alias, "发作品：$phaseTag Don't allow 第 $round 轮未点到，跳过（可选）")
+            }
+        }
+        return true
+    }
+
     private suspend fun publishPostTapProfileRatioWhileUsingAndLeftBottom(
         service: Context,
         alias: String,
         launchWaitMs: Long,
         skipLaunchWait: Boolean = false,
-        /** 本任务第 1 条（videoIndex==0）才跑 Continue / While using；续发 startIdx>0 时整条任务均跳过。 */
+        /** 本任务第 1 条（videoIndex==0）才跑 Continue；续发 startIdx>0 时跳过 Continue。 */
         isFirstItemInTask: Boolean = false,
     ): Boolean {
         if (!skipLaunchWait && launchWaitMs > 0L) {
@@ -8791,50 +8845,10 @@ class RealTraceExecutor(
             } else {
                 devOp(alias, "发作品：${PUBLISH_POST_CONTINUE_OCR_MAX_PASSES} 次均未命中「Continue」，跳过（可选）")
             }
-            val label = "While using the app"
-            val maxOcrPasses = 3
-            var whileUsingTapped = false
-            var lastTappedPoint: Point? = null
-            for (pass in 1..maxOcrPasses) {
-                if (hardStopOrNull(alias, "发作品 While using OCR")) return false
-                if (pass > 1) delay(700)
-                val (vision, errTag) = mlKitRecognizeFullScreen(service, "publish_post_while_using_$pass")
-                if (vision == null) {
-                    devOp(alias, "发作品：OCR「$label」第 $pass/$maxOcrPasses 次失败：$errTag")
-                    if (isMlKitHardStopError(errTag)) return false
-                    continue
-                }
-                val pv = buildProfileEditOcrPreview(vision).take(480)
-                devOp(alias, "发作品：OCR 第 $pass/$maxOcrPasses 次摘要=$pv")
-                val hit = findStrictExactAcrossAdjacentLines(vision, label)
-                    ?: findWhileUsingTheAppOcrRelaxed(vision)
-                if (hit == null) {
-                    devOp(alias, "发作品：第 $pass/$maxOcrPasses 次未命中「$label」")
-                    continue
-                }
-                val tap = coerceTapToScreen(hit.point, w, h)
-                lastTappedPoint = tap
-                devOp(alias, "发作品：第 $pass/$maxOcrPasses 次命中「$label」拟 tap (${tap.x},${tap.y})")
-                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                    devOp(alias, "发作品：已点击「$label」")
-                    if (pass < maxOcrPasses) {
-                        delay(500)
-                        continue
-                    }
-                    whileUsingTapped = true
-                    break
-                }
-            }
-            if (whileUsingTapped) {
-                devOp(alias, "发作品：已完成「$label」的连续点击尝试（最多 $maxOcrPasses 次）")
-            } else if (lastTappedPoint != null) {
-                devOp(alias, "发作品：${maxOcrPasses} 次中已点过「$label」，但未进入需要重复点击的确认状态，跳过该项")
-            } else {
-                devOp(alias, "发作品：${maxOcrPasses} 次仍未点击「$label」，跳过该项")
-            }
         } else {
-            devOp(alias, "发作品：非本任务第 1 条，跳过 OCR「Continue」与「While using the app」")
+            devOp(alias, "发作品：非本任务第 1 条，跳过 OCR「Continue」（可选）")
         }
+        if (!publishPostTryDismissDontAllowBeforeGallery(service, alias, "资料入口后")) return false
 
         val createPostMaxPasses = 4
         var createPostSeen = false
@@ -8906,7 +8920,7 @@ class RealTraceExecutor(
      * 「发布作品」单条素材的核心选择流程。
      *
      * 阶段顺序：
-     * 1) 底部入口（上一段：资料比例点 →（仅本任务第 1 条）Continue / While using → …；首条试探 A/B 并缓存；布局确认后每条仍执行 Recents→Pictures OCR 点击）
+     * 1) 底部入口（上一段：资料比例点 →（仅本任务第 1 条）Continue → 点击相册前 Don't allow → …；首条试探 A/B 并缓存；布局确认后每条仍执行 Recents→Pictures OCR 点击）
      * 2) 图库选素材：第 1 张 X≈16%*W、Y≈30%*H，第 2～3 相对第 1；第 4 张 X 同第 1、Y≈49%*H，第 5 屏宽中点且 Y 同第 4（最多 5 条）
      * 3) 图库点选后等待 [PUBLISH_POST_AFTER_GALLERY_DELAY_MS]，再 OCR 定位 Next（最多 [PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES] 次，间隔 500~1000ms）；同一轮命中时记录 Recents / Videos 分界 Y 等
      * 4) 通过 OCR 反复校验 Your Story 是否出现，最多 7 次，间隔 1s；若失败则整条任务失败重来
@@ -8915,7 +8929,7 @@ class RealTraceExecutor(
      * 7) [已禁用] OCR 定位并点击 Sound
      * 8) [已禁用] 再次点击音频位置
      * 9) 沿用第一次 Next 的坐标再次点击 Next
-     * 10) 第 1 条文案屏 OCR 记 description 固定坐标并点击；同任务后续条复用该坐标、不再 OCR 定位
+     * 10) 固定坐标点击 description（同图库首条 X≈16%*W Y≈30%*H），各条一致、不做 OCR
      * 11) 使用运行配置中的 [AppConfig.comment_texts] 随机文案输入
      * 12) OCR 定位 Done（偏下）或屏幕上方含 post 的 Post（优先 Done）并点击；点 Done 后再点一次第一次 Next；点顶部 Post 则等价 Done+Next+确认 Post，跳过后续 Next
      * 13)（仅 Done 路径）再次点击第一次 Next 的坐标，进入后续确认页
@@ -9062,20 +9076,9 @@ class RealTraceExecutor(
         val captionPool = config.comment_texts.map { it.trim() }.filter { it.isNotBlank() }
         val phrase = captionPool.randomOrNull() ?: "Nice"
         devOp(alias, "发作品：准备输入文案，来源=config.comment_texts，候选数=${captionPool.size}，选中文案 len=${phrase.length} preview=${phrase.take(40)}")
-        devOp(alias, "发作品：输入文案前 OCR 定位 description 并点击（至多 3 次）")
-        if (!publishPostOcrTapByFinder(
-                service,
-                alias,
-                "publish_post_description_${videoIndex}",
-                "description 聚焦",
-                3,
-            ) { findLabelHitContainingIgnoreCase(it, "description") }
-        ) {
-            devOp(
-                alias,
-                "发作品：description OCR 连续 3 次未命中，认定当前作品发布步骤混乱，关闭并重新打开 TikTok",
-            )
-            return publishPostFail(service, alias, "发作品 description OCR", tryRestart = true)
+        devOp(alias, "发作品：输入文案前固定坐标点击 description（同图库首条）")
+        if (!publishPostTapDescriptionField(alias, videoIndex, w, h)) {
+            return false
         }
         devOp(alias, "发作品：description 已点击，等待页面/键盘稳定")
         delay(1000)
@@ -9244,7 +9247,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 管理台「发布作品」：冷启 TikTok → 资料比例点 →（仅本任务第 1 条）Continue / While using → 右下固定点 →（布局未确认时）Allow all → Recents/布局 B；
+     * 管理台「发布作品」：冷启 TikTok → 资料比例点 →（仅本任务第 1 条）Continue → 点击相册前 Don't allow → 右下固定点 →（布局未确认时）Allow all → Recents/布局 B；
      * 再按 `Pictures` 目录树内图片+视频总数循环发作品（su find 递归统计，**不含** `Pictures/AutoTraces`）；
      * 单次任务发布条数 = min(素材条数, PUBLISH_POST_MAX_ITEMS_PER_TASK)（当前上限为 5），超出部分本次不发并在日志说明；
      * 任务开始（或单条失败重试）时冷启 TikTok；条与条之间不冷启（上一条底栏校验通过后直接进下一条入口）。
@@ -9351,7 +9354,6 @@ class RealTraceExecutor(
             PrefsStore.setPublishPostMaterialReady(true)
         }
         val launchWaitMs = config.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-        publishPostCachedDescriptionTap = null
         publishPostEntryLayout = publishPostLoadDeviceEntryLayout(alias)
         if (resumeStartIdx <= 0) {
             when (val recovery = recoverPublishPostEntry(service, "发作品任务头")) {
@@ -14378,11 +14380,26 @@ class RealTraceExecutor(
             ?: findStrictExactLabelHit(vision, "sign up")
             ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "sign up")
 
-    /** 定位 Profile 时见以下任一文案，即已登出、无需再点底栏 Profile。 */
-    private fun visionShowsProfileLoginEntryMarkers(vision: Text): Boolean =
-        findAddAnotherAccountTapHit(vision) != null ||
-            findLogInEntryTapHit(vision) != null ||
-            findSignUpEntryTapHit(vision) != null
+    /** For You 广告/电商流：Sponsored / Replay / Shop 等与 Sign up 同屏时不代表账号掉登录。 */
+    private fun visionShowsFeedAdPageMarkers(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCase(vision, "sponsored") != null) return true
+        if (findLabelHitContainingIgnoreCase(vision, "replay") != null) return true
+        if (findLabelHitContainingIgnoreCase(vision, "shop") != null) return true
+        return false
+    }
+
+    /**
+     * Sign up / Log in 登录入口文案；同屏为广告流（Sponsored/Replay/Shop）时忽略（Add another account 除外）。
+     */
+    private fun visionShowsSignUpLogInLogoutMarkers(vision: Text, screenH: Int): Boolean {
+        if (findAddAnotherAccountTapHit(vision) != null) return true
+        if (visionShowsFeedAdPageMarkers(vision)) return false
+        if (findLogInEntryTapHit(vision) != null) return true
+        if (findSignUpEntryTapHit(vision) != null) return true
+        if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
+        if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
+        return false
+    }
 
     private enum class ProfileLoginEntryTapOutcome {
         ProfileTapped,
@@ -14425,6 +14442,7 @@ class RealTraceExecutor(
             }
 
             val logInHit = findLogInEntryTapHit(vision)
+                ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
             if (logInHit != null) {
                 loginEntryMissStreak = 0
                 val tap = autoLoginTapWithJitter(logInHit.point, w, h)
@@ -14437,6 +14455,7 @@ class RealTraceExecutor(
             }
 
             val signUpHit = findSignUpEntryTapHit(vision)
+                ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
             if (signUpHit != null) {
                 loginEntryMissStreak = 0
                 devOp(alias, "自动登录：见 Sign up（已在 Log in 之后），不点 Sign up，进入 Username×2")
@@ -14793,7 +14812,7 @@ class RealTraceExecutor(
             if (hardStopOrNull(alias, "自动登录-入口Profile")) return ProfileLoginEntryTapOutcome.Failed
             if (pass > 1 && !autoLoginDelay(alias, 1000L, "入口Profile")) return ProfileLoginEntryTapOutcome.Failed
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_entry_profile_$pass") ?: continue
-            if (visionShowsProfileLoginEntryMarkers(vision)) {
+            if (visionShowsSignUpLogInLogoutMarkers(vision, h)) {
                 val preview = buildProfileEditOcrPreview(vision).take(280)
                 devOp(alias, "自动登录：定位 Profile 时见登录入口（Add another account/Log in/Sign up），已登出；OCR=$preview")
                 return ProfileLoginEntryTapOutcome.OnLoginEntryScreen
@@ -14947,9 +14966,7 @@ class RealTraceExecutor(
 
     /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Add another account 由 [probeAddAnotherAccountLogoutFromOcrVision] 统一处理。 */
     private fun safeguardVisionNeedsAutoLogin(vision: Text, screenH: Int): Boolean {
-        if (visionShowsProfileLoginEntryMarkers(vision)) return true
-        if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
-        if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
+        if (visionShowsSignUpLogInLogoutMarkers(vision, screenH)) return true
         if (findAutoLoginUsernameTapHit(vision) != null) return true
         if (ocrVisionHasVerifyEmailMarker(vision)) return true
         if (findLabelHitContainingIgnoreCase(vision, "verification code") != null) return true

@@ -101,6 +101,22 @@ object AutoSwitchLedger {
         val report_data: Map<String, Any> = emptyMap(),
     )
 
+    /**
+     * 进程重启 / bundle 刷新后：从 prefs 恢复 ledger 并同步 session/revision，不清空已有 entries。
+     * enter 路径会调 [startSession]；续跑路径须显式调本方法，否则 revision 漂移会导致 ledger 写入静默失败。
+     */
+    fun syncSessionContextFromPrefs() {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        restoreFromPrefs()
+        val sid = PrefsStore.getAutoSwitchSessionId().orEmpty()
+        if (sid.isBlank()) return
+        startSession(
+            sid,
+            scheduleDate = PrefsStore.getAutoSwitchScheduleDate().orEmpty(),
+            bundleRevision = PrefsStore.getAutoSwitchBundleRevision(),
+        )
+    }
+
     fun startSession(sessionId: String, scheduleDate: String = "", bundleRevision: Int = -1) {
         val sid = sessionId.trim()
         val rev = if (bundleRevision >= 0) bundleRevision else PrefsStore.getAutoSwitchBundleRevision()
@@ -976,8 +992,12 @@ object AutoSwitchLedger {
         if (sessionId.isBlank()) {
             sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
         }
-        if (bundleRevision <= 0) {
-            bundleRevision = PrefsStore.getAutoSwitchBundleRevision()
+        val prefRev = PrefsStore.getAutoSwitchBundleRevision()
+        if (prefRev > 0) {
+            // bundle 刷新后 prefs revision 为准；内存 ledger 若仍停留在旧 revision 会导致 record 静默失败
+            bundleRevision = prefRev
+        } else if (bundleRevision <= 0) {
+            bundleRevision = prefRev
         }
         if (scheduleDate.isBlank()) {
             scheduleDate = PrefsStore.getAutoSwitchScheduleDate().orEmpty()

@@ -36,6 +36,8 @@ import com.autotraces.app.backup.DeviceBackupShell
 import com.autotraces.app.backup.UnifiedBackupPaths
 import com.autotraces.app.backup.model.BackupRecord
 import com.autotraces.app.backup.network.BackupReporter
+import com.autotraces.app.videoded.CompanionApi
+import com.autotraces.app.videoded.VideoDedSettingsRegistrar
 
 object AppCoordinator {
     private fun prettyTemplateName(raw: String?): String {
@@ -122,6 +124,9 @@ object AppCoordinator {
                     resetStalePublishInflightForRetry(slotKey, alias)
                 }
             }
+        },
+        onPreemptForCutSwitch = { slotKey, reason ->
+            preemptAutoSwitchForCutSwitch(slotKey, reason)
         },
         onSlotTransition = { prevSlotKey, newSlotKey ->
             handleAutoSwitchSlotTransition(prevSlotKey, newSlotKey)
@@ -522,6 +527,7 @@ object AppCoordinator {
         val cachedBundle = AutoSwitchBundleHolder.getBundle() ?: AutoSwitchBundleHolder.loadCachedBundle()
             ?: return false
         val revision = PrefsStore.getAutoSwitchBundleRevision().coerceAtLeast(plan.revision)
+        AutoSwitchLedger.syncSessionContextFromPrefs()
         applyAutoSwitchBundle(alias, deviceId, cachedBundle, revision)
         LogCenter.op(
             alias,
@@ -665,7 +671,7 @@ object AppCoordinator {
             fetchOutcome.loaded && fetchOutcome.bundle != null -> {
                 val revision = PrefsStore.getAutoSwitchBundleRevision()
                 noteCloudAutoSwitchEnabled(true)
-                AutoSwitchLedger.restoreFromPrefs()
+                AutoSwitchLedger.syncSessionContextFromPrefs()
                 applyAutoSwitchBundle(alias, deviceId, fetchOutcome.bundle, revision)
                 scheduleAutoSwitchDailyReconcileTargetIfNeeded(alias)
                 if (!fetchOutcome.skippedNetwork) {
@@ -1309,7 +1315,7 @@ object AppCoordinator {
         }
     }
 
-    /** 打开 App 或云端登录成功后调用：检测 TikTok 图库/相机/麦克风/通知/联系人权限未开放则 root 授予。 */
+    /** 打开 App 或云端登录成功后调用：检测 TikTok 图库/通知/联系人权限未开放则 root 授予。 */
     fun ensureTikTokGalleryPermissionIfNeeded() {
         if (PrefsStore.getAuthToken().isNullOrBlank()) return
         scope.launch {
@@ -1328,8 +1334,6 @@ object AppCoordinator {
                 listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
         val base = mediaPerms + listOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_CONTACTS,
         )
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1358,7 +1362,7 @@ object AppCoordinator {
     }
 
     /**
-     * 已登录云端时：检测 TikTok 图库/相机/麦克风/通知/联系人 runtime 权限，未开放则 root 授予，避免发布流程卡在系统授权弹窗。
+     * 已登录云端时：检测 TikTok 图库/通知/联系人 runtime 权限，未开放则 root 授予，避免发布流程卡在系统授权弹窗。
      */
     private suspend fun ensureTikTokGalleryPermissionGrantedIfNeeded() {
         if (PrefsStore.getAuthToken().isNullOrBlank()) return
@@ -1371,7 +1375,7 @@ object AppCoordinator {
             true
         }.getOrElse { err ->
             if (err is PackageManager.NameNotFoundException) {
-                LogCenter.op(alias, "TikTok 未安装，跳过图库/相机/麦克风/通知/联系人权限检测")
+                LogCenter.op(alias, "TikTok 未安装，跳过图库/通知/联系人权限检测")
             } else {
                 LogCenter.op(alias, "读取 TikTok 安装信息失败：${err.message}")
             }
@@ -1380,15 +1384,13 @@ object AppCoordinator {
         if (!packageInstalled) return
         if (isTikTokGalleryPermissionGranted()) return
 
-        forceStopTikTokCleanly(pkg, alias, "TikTok 图库/相机/麦克风/通知/联系人权限未开放")
-        LogCenter.op(alias, "TikTok 图库/相机/麦克风/通知/联系人权限未开放，开始 root 授予…")
+        forceStopTikTokCleanly(pkg, alias, "TikTok 图库/通知/联系人权限未开放")
+        LogCenter.op(alias, "TikTok 图库/通知/联系人权限未开放，开始 root 授予…")
         val commands = buildList {
             add("pm grant $pkg android.permission.READ_MEDIA_IMAGES")
             add("pm grant $pkg android.permission.READ_MEDIA_VIDEO")
             add("pm grant $pkg android.permission.READ_EXTERNAL_STORAGE")
             add("pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE")
-            add("pm grant $pkg android.permission.CAMERA")
-            add("pm grant $pkg android.permission.RECORD_AUDIO")
             add("pm grant $pkg android.permission.READ_CONTACTS")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add("pm grant $pkg android.permission.POST_NOTIFICATIONS")
@@ -1398,8 +1400,6 @@ object AppCoordinator {
             add("appops set $pkg READ_EXTERNAL_STORAGE allow")
             add("appops set $pkg WRITE_EXTERNAL_STORAGE allow")
             add("appops set $pkg LEGACY_STORAGE allow")
-            add("appops set $pkg CAMERA allow")
-            add("appops set $pkg RECORD_AUDIO allow")
             add("appops set $pkg READ_CONTACTS allow")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add("appops set $pkg POST_NOTIFICATION allow")
@@ -1416,9 +1416,9 @@ object AppCoordinator {
             }
         }
         if (failed == 0) {
-            LogCenter.op(alias, "TikTok 图库/相机/麦克风/通知/联系人权限开放完成")
+            LogCenter.op(alias, "TikTok 图库/通知/联系人权限开放完成")
         } else {
-            LogCenter.op(alias, "TikTok 图库/相机/麦克风/通知/联系人权限开放存在失败：$failed/${commands.size}")
+            LogCenter.op(alias, "TikTok 图库/通知/联系人权限开放存在失败：$failed/${commands.size}")
             failLogs.take(4).forEach { item ->
                 LogCenter.op(alias, "TikTok 权限开放失败命令：$item")
             }
@@ -2100,6 +2100,20 @@ object AppCoordinator {
                 updateRuntime(lastMessage = statusMsg)
             }
         } catch (error: Exception) {
+            if (error is CancellationException || isPullLoopJobCancellation(error)) {
+                val reason =
+                    when {
+                        PrefsStore.getAutoSwitchMode() == "exiting" -> "自动切号关闭"
+                        PrefsStore.isAutoSwitchExclusivePreempt() -> "独占操作（发作品/切号）"
+                        else -> "任务切换"
+                    }
+                LogCenter.op(alias, "涨粉拉取被${reason}打断（预期行为）")
+                throw if (error is CancellationException) {
+                    error
+                } else {
+                    CancellationException(error.message ?: "cancelled")
+                }
+            }
             LogCenter.op(alias, "拉取用户名失败：${error.message}")
             updateRuntime(lastMessage = "用户名拉取失败")
         }
@@ -2266,6 +2280,49 @@ object AppCoordinator {
         scheduleAutoSwitchLoginRecovery(alias, deviceId, sk, holdReason)
     }
 
+    /** PLAN 切号待执行：清空发作品/互点/涨粉等运行时占用，强制让位切号链。 */
+    private fun preemptAutoSwitchForCutSwitch(slotKey: String, reason: String) {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return
+        val oldPublishSlot = AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim().orEmpty()
+        val oldMutualSlot = AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim().orEmpty()
+        clearAutoSwitchPerAccountDirtyState(
+            reason = reason,
+            prevSlotKey = oldPublishSlot.takeIf { it.isNotBlank() && it != sk }
+                ?: oldMutualSlot.takeIf { it.isNotBlank() && it != sk },
+            newSlotKey = sk,
+        )
+        AutoSwitchLocalPlanStore.clearActivePublish()
+        AutoSwitchLocalPlanStore.clearActiveMutual()
+        listOf(oldPublishSlot, oldMutualSlot).distinct().filter { it.isNotBlank() && it != sk }.forEach { prevSk ->
+            autoSwitchLocalScheduler.clearPublishInsertionInflight(prevSk)
+            AutoSwitchLocalPlanStore.resetStalePublishInflight(prevSk)
+        }
+        if (sk.isNotBlank()) {
+            autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
+            AutoSwitchLocalPlanStore.resetStalePublishInflight(sk)
+        }
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】PLAN 切号抢占完成 slot=$sk：$reason")
+        }
+    }
+
+    /** 残留发作品续发不得抢在 PLAN 切号之前（含跨时段旧 slot）。 */
+    private fun planCutSwitchBlocksStalePublishResume(staleSlotKey: String): Boolean {
+        val plan = AutoSwitchLocalPlanStore.get() ?: return false
+        val scheduleDate = beijingDateString()
+        val currentSlot = AutoSwitchLocalPlanStore.resolveSlotForMinute(
+            plan,
+            scheduleDate,
+            beijingMinuteOfDayForBundle(),
+        ) ?: return false
+        val sk = staleSlotKey.trim()
+        if (!AutoSwitchLocalPlanStore.isCutSwitchDone(currentSlot.slot_key)) return true
+        return currentSlot.slot_key != sk
+    }
+
     /**
      * 切号/跨时段：清掉上一账号遗留的登录保障、发作品、引流、涨粉衔接等运行时脏数据，避免污染下一账号。
      */
@@ -2287,6 +2344,7 @@ object AppCoordinator {
         PrefsStore.clearPublishPostState()
         PrefsStore.clearMutualClickState()
         PrefsStore.setGrowthContinueFromPublishHome(false)
+        PublishPostGrowthGate.exitExclusivePublishPhase()
         executor.clearAccountStatusReloginState()
         prevSlotKey?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
             autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
@@ -5093,7 +5151,7 @@ object AppCoordinator {
         }
         if (
             isBatchStreamActive() &&
-            op.op_type !in setOf("batch_stream_stop", "batch_stream_start")
+            op.op_type !in setOf("batch_stream_stop", "batch_stream_start", "set_pc_service_url")
         ) {
             LogCenter.op(alias, "[OP][$opId] 批量带流进行中，已屏蔽 ${op.op_type}")
             reportDeviceOpToCloud(
@@ -5200,6 +5258,10 @@ object AppCoordinator {
                     "operation_logs" to listOf(line),
                 ),
             )
+            return
+        }
+        if (op.op_type == "set_pc_service_url") {
+            handleSetPcServiceUrlOp(alias, deviceId, op)
             return
         }
         val packageNameEarly = payload?.package_name?.trim().orEmpty()
@@ -7365,6 +7427,17 @@ object AppCoordinator {
         if (!PrefsStore.hasRecoverableAutoSwitchPublish(sk)) return false
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (alias.isBlank()) return false
+        if (planCutSwitchBlocksStalePublishResume(sk)) {
+            LogCenter.op(
+                alias,
+                "【自动切号】PLAN 切号优先，放弃残留发作品续发 slot=$sk",
+            )
+            PrefsStore.clearPublishPostState()
+            AutoSwitchLocalPlanStore.clearActivePublish()
+            autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
+            AutoSwitchLocalPlanStore.resetStalePublishInflight(sk)
+            return false
+        }
 
         autoSwitchLocalScheduler.clearSlotPublishAborted(sk)
         PrefsStore.setPublishPostPending(true)
@@ -7869,6 +7942,90 @@ object AppCoordinator {
         }.onFailure { err ->
             log?.invoke("写入图库失败：$fileName（${err.message ?: "unknown"}）")
         }.getOrDefault(false)
+    }
+
+    private suspend fun handleSetPcServiceUrlOp(alias: String, deviceId: String, op: DeviceOp) {
+        val opId = op.op_id
+        val operationLogs = mutableListOf<String>()
+        fun opLog(text: String) {
+            val line = "[OP][$opId] $text"
+            operationLogs.add(line)
+            LogCenter.op(alias, line)
+        }
+
+        val url = op.payload?.windows_base_url?.trim()?.trimEnd('/').orEmpty()
+        if (url.isBlank()) {
+            reportDeviceOpToCloud(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "failed",
+                message = "缺少 windows_base_url",
+                data = mapOf(
+                    "op_type" to "set_pc_service_url",
+                    "device_id" to deviceId,
+                    "operation_logs" to listOf("[OP][$opId] 缺少 windows_base_url"),
+                ),
+            )
+            return
+        }
+
+        val currentUrl = CompanionApi.windowsBaseUrl(appContext).trim().trimEnd('/')
+        if (currentUrl == url) {
+            opLog("PC 地址未变化：$url")
+            val result = VideoDedSettingsRegistrar.saveAndRegister(
+                appContext,
+                input = VideoDedSettingsRegistrar.SaveInput(windowsUrl = url),
+                logSave = false,
+                logRegistration = true,
+            )
+            val ok = result.error == null
+            reportDeviceOpToCloud(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = if (ok) "success" else "failed",
+                message = if (ok) "PC 地址未变化，已重新注册" else (result.error?.message ?: "重新注册失败"),
+                data = mapOf(
+                    "op_type" to "set_pc_service_url",
+                    "device_id" to deviceId,
+                    "windows_base_url" to url,
+                    "pc_adb_state" to result.pcAdbState,
+                    "unchanged" to true,
+                    "operation_logs" to operationLogs,
+                ),
+            )
+            return
+        }
+
+        opLog("更新 PC 投屏地址：$currentUrl → $url")
+        val result = VideoDedSettingsRegistrar.saveAndRegister(
+            appContext,
+            input = VideoDedSettingsRegistrar.SaveInput(windowsUrl = url),
+            logSave = true,
+            logRegistration = true,
+        )
+        val ok = result.error == null
+        if (ok) {
+            opLog("PC 地址已保存并完成注册（pcAdbState=${result.pcAdbState.ifBlank { "—" }}）")
+        } else {
+            opLog("PC 地址已保存，但注册失败：${result.error?.message}")
+        }
+        reportDeviceOpToCloud(
+            deviceId = deviceId,
+            alias = alias,
+            opId = opId,
+            status = if (ok) "success" else "failed",
+            message = if (ok) "PC 地址已更新并重新注册" else (result.error?.message ?: "注册失败"),
+            data = mapOf(
+                "op_type" to "set_pc_service_url",
+                "device_id" to deviceId,
+                "windows_base_url" to url,
+                "previous_windows_base_url" to currentUrl,
+                "pc_adb_state" to result.pcAdbState,
+                "operation_logs" to operationLogs,
+            ),
+        )
     }
 
     private suspend fun handleGalleryImportOp(alias: String, deviceId: String, op: DeviceOp) {

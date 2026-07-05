@@ -827,6 +827,10 @@ def init_auth_db():
             conn.execute("ALTER TABLE client_devices ADD COLUMN device_group TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE client_devices ADD COLUMN pc_service_url TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_owner ON client_devices(owner_username)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_group ON client_devices(device_group)")
         conn.commit()
@@ -3701,6 +3705,16 @@ class MutualClickRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
     package_name: str = Field(..., min_length=1, max_length=255)
+
+
+class DevicePcServiceUrlSetItem(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(default="", max_length=64)
+    windows_base_url: str = Field(..., min_length=8, max_length=512)
+
+
+class DevicePcServiceUrlBatchSetRequest(BaseModel):
+    items: List[DevicePcServiceUrlSetItem] = Field(..., min_length=1, max_length=500)
 
 
 class DeviceTikTokEmailCodeRequest(BaseModel):
@@ -10625,7 +10639,7 @@ def _resume_device_for_cloud_op(device_id: str, log_line: str) -> None:
 
 
 def _enqueue_tiktok_device_op(device_id: str, op_type: str, payload: dict[str, Any]) -> str:
-    allowed_during_batch_stream = {"batch_stream_stop", "batch_stream_start"}
+    allowed_during_batch_stream = {"batch_stream_stop", "batch_stream_start", "set_pc_service_url"}
     if _batch_stream_device_in_active(device_id) and op_type not in allowed_during_batch_stream:
         raise HTTPException(status_code=409, detail=f"设备正在批量带流中，暂不可下发 {op_type}")
     op_id = f"op_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -10639,6 +10653,132 @@ def _enqueue_tiktok_device_op(device_id: str, op_type: str, payload: dict[str, A
         },
     )
     return op_id
+
+
+def _normalize_windows_base_url(raw: str) -> str:
+    url = str(raw or "").strip().rstrip("/")
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("PC 服务地址须以 http:// 或 https:// 开头")
+    return url
+
+
+def _resolve_device_alias_for_admin(device_id: str, alias: str = "") -> str:
+    resolved = str(alias or "").strip()
+    if resolved:
+        return resolved
+    did = str(device_id or "").strip()
+    if not did:
+        return ""
+    with store.lock:
+        dev = store.devices.get(did)
+        if dev and str(dev.alias or "").strip():
+            return str(dev.alias).strip()
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT alias FROM client_devices WHERE device_id = ?", (did,)).fetchone()
+        return str(row["alias"] if row else "").strip()
+    finally:
+        conn.close()
+
+
+def _persist_device_pc_service_url(device_id: str, url: str) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    conn = _get_db()
+    try:
+        conn.execute(
+            "UPDATE client_devices SET pc_service_url = ?, updated_at = ? WHERE device_id = ?",
+            (url, now_text(), did),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _enqueue_pc_service_url_op(device_id: str, alias: str, windows_base_url: str) -> str:
+    return _enqueue_tiktok_device_op(
+        device_id,
+        "set_pc_service_url",
+        {
+            "device_id": device_id,
+            "alias": alias,
+            "windows_base_url": windows_base_url,
+        },
+    )
+
+
+@app.post("/api/admin/device_pc_service/batch_set")
+def admin_device_pc_service_batch_set(
+    payload: DevicePcServiceUrlBatchSetRequest,
+    authorization: str | None = Header(default=None),
+):
+    """批量下发 PC 投屏/伴侣服务地址；设备轮询 device_ops 后自动保存并重新注册。"""
+    err, _session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+
+    results: list[dict[str, Any]] = []
+    enqueued = 0
+    failed = 0
+    for item in payload.items:
+        did = item.device_id.strip()
+        try:
+            url = _normalize_windows_base_url(item.windows_base_url)
+        except ValueError as exc:
+            results.append({"device_id": did, "code": 1, "msg": str(exc)})
+            failed += 1
+            continue
+
+        eff_alias = _resolve_device_alias_for_admin(did, item.alias)
+        if not eff_alias:
+            results.append({"device_id": did, "code": 1, "msg": "设备未绑定或缺少 alias"})
+            failed += 1
+            continue
+
+        err2, _device = _require_login_and_owning_device(did, eff_alias, authorization)
+        if err2:
+            results.append(
+                {
+                    "device_id": did,
+                    "alias": eff_alias,
+                    "code": int(err2.get("code") or 1),
+                    "msg": str(err2.get("msg") or "无权操作该设备"),
+                }
+            )
+            failed += 1
+            continue
+
+        try:
+            _persist_device_pc_service_url(did, url)
+            _append_device_log(
+                did,
+                f"[{now_text()}] 云端后台 | 已入队更新 PC 投屏地址 → {url}（alias={eff_alias}）",
+            )
+            op_id = _enqueue_pc_service_url_op(did, eff_alias, url)
+            _append_device_log(did, f"[{now_text()}] 设备任务已入队 op_id={op_id} type=set_pc_service_url")
+            results.append(
+                {
+                    "device_id": did,
+                    "alias": eff_alias,
+                    "code": 0,
+                    "msg": "已下发",
+                    "op_id": op_id,
+                    "windows_base_url": url,
+                }
+            )
+            enqueued += 1
+        except HTTPException as exc:
+            results.append({"device_id": did, "alias": eff_alias, "code": exc.status_code, "msg": str(exc.detail)})
+            failed += 1
+
+    return {
+        "code": 0 if enqueued else 1,
+        "msg": f"已入队 {enqueued} 台，失败 {failed} 台",
+        "enqueued": enqueued,
+        "failed": failed,
+        "results": results,
+    }
 
 
 @app.post("/api/admin/device_tiktok/clear")

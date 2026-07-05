@@ -302,8 +302,9 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_API_LISTEN_PORT, port).apply()
     }
 
-    fun isApiEnabled(context: Context): Boolean = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        .getBoolean(KEY_API_ENABLED, true)
+    /** 本地 HTTP API 常开，供 PC / Companion 轮询内存等诊断接口。 */
+    @Suppress("UNUSED_PARAMETER")
+    fun isApiEnabled(context: Context): Boolean = true
 
     /** 未写入前默认为 [CompanionBridge.API_PORT]（与 HTTP 监听一致）。 */
     fun getListenPort(context: Context): Int {
@@ -327,8 +328,9 @@ object ApiSettings {
         editor.apply()
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun setApiEnabled(context: Context, enabled: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_API_ENABLED, enabled).apply()
+        // 常开：忽略历史偏好与外部写入
     }
 
     fun getToken(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

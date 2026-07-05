@@ -32,6 +32,8 @@ class AutoSwitchLocalScheduler(
     private val isPublishExecutionActive: () -> Boolean = { false },
     private val isMutualExecutionActive: () -> Boolean = { false },
     private val onStalePublishInflight: (slotKey: String) -> Unit = {},
+    /** PLAN 切号待执行：清空当前账号发作品/互点等运行时占用，让位切号链。 */
+    private val onPreemptForCutSwitch: (slotKey: String, reason: String) -> Unit = { _, _ -> },
     private val onSlotTransition: (prevSlotKey: String, newSlotKey: String) -> Unit = { _, _ -> },
     private val resolveRestoreBackupArchive: (
         backupName: String,
@@ -316,15 +318,17 @@ class AutoSwitchLocalScheduler(
             }
             return
         }
+        AutoSwitchLedger.syncSessionContextFromPrefs()
         val committed = AutoSwitchLocalPlanStore.commitCutSwitchChainCompleted(
             slotKey = sk,
             username = user,
             method = completionMethod,
         )
         if (!committed) {
-            invalidateSlotAlignment(sk, "plan+ledger 切号完成写入失败")
+            // 备份/清理已完成：ledger 写入失败时不得整段重置，否则会在本时段无限重跑切号链
+            invalidateSlotAlignmentRestoreOnly(sk, "plan+ledger 切号完成写入失败")
             if (alias.isNotBlank()) {
-                LogCenter.op(alias, "【自动切号】切号完成同事务写入失败 slot=$sk")
+                LogCenter.op(alias, "【自动切号】切号完成同事务写入失败 slot=$sk（已保留备份/清理，仅续跑还原/登录）")
             }
             return
         }
@@ -348,10 +352,6 @@ class AutoSwitchLocalScheduler(
         this.deviceId = deviceId.trim()
         this.sessionId = PrefsStore.getAutoSwitchSessionId().orEmpty()
         syncPlanFromBundle(bundle)
-        AutoSwitchLocalPlanStore.refreshDeviceActiveFromRuntime(
-            PrefsStore.getLogContextUsername(),
-            "自治启动刷新活跃标记",
-        )
         this.alignOnNextTick = true
         lastSlotKey = PrefsStore.getAutoSwitchLastSlotKey()
         insertionInflight = null
@@ -420,7 +420,7 @@ class AutoSwitchLocalScheduler(
 
     private fun revalidateCutSwitchCompletionsAgainstLedger() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        AutoSwitchLedger.restoreFromPrefs()
+        AutoSwitchLedger.syncSessionContextFromPrefs()
         AutoSwitchLocalPlanStore.revalidateCutSwitchCompletionsAgainstLedger { sk ->
             AutoSwitchLedger.hasCutSwitchChainCompleted(sk)
         }
@@ -503,10 +503,6 @@ class AutoSwitchLocalScheduler(
 
     private suspend fun tickOnceUnlocked() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
-        if (PublishPostGrowthGate.isBlockingGrowth()) {
-            logTickSkipThrottled("发作品独占发布中")
-            return
-        }
 
         val currentBundle = bundle ?: run {
             LogCenter.op(alias, "【自动切号】调度跳过：bundle 为空")
@@ -591,15 +587,10 @@ class AutoSwitchLocalScheduler(
 
         maybeSweepOrphanedPublishState(slotKey)
 
+        ensurePlanSlotEnvironment(slotEntry)
+
         if (!AutoSwitchLocalPlanStore.isCutSwitchDone(slotKey)) {
-            if (hasActiveHighPriorityInsertion()) {
-                pendingCutSwitchSlotKey = slotKey
-                AutoSwitchLocalPlanStore.markCutSwitchWaiting(slotKey)
-                LogCenter.op(alias, "【自动切号】切号等待高优插入完成 slot=$slotKey")
-                lastSlotKey = slotKey
-                PrefsStore.setAutoSwitchLastSlotKey(slotKey)
-                return
-            }
+            preemptForCutSwitchIfNeeded(slotKey, "PLAN 切号待执行")
             deviceBusyReasonForCutSwitch()?.let { reason ->
                 logTickSkip("切号等待：$reason")
                 lastSlotKey = slotKey
@@ -716,20 +707,7 @@ class AutoSwitchLocalScheduler(
 
         val enqueued = when (nextStep) {
             CutSwitchStepKind.BACKUP -> {
-                val targetUser = entry.target_username.trim().removePrefix("@")
-                if (sourceRow != null && isCutSwitchAlreadyOnTarget(sourceRow, targetRow, targetUser)) {
-                    if (alias.isNotBlank()) {
-                        LogCenter.op(alias, "【自动切号】当前时段已是 @$targetUser，跳过切号直接进入业务")
-                    }
-                    if (AutoSwitchLocalPlanStore.commitCutSwitchAlreadyActive(slotKey, targetUser)) {
-                        cutSwitchInflightSlotKey = null
-                        pendingCutSwitchSlotKey = null
-                        cancelDuplicatePendingCutSwitchOps(slotKey)
-                        onTryResumeGrowth()
-                        requestImmediateTick(forceLog = true)
-                    }
-                    false
-                } else if (sourceRow == null) {
+                if (sourceRow == null) {
                     val reason = AutoSwitchLocalPlanStore.describeCutSwitchSourceResolutionFailure(
                         slotKey,
                         previousSlotKey,
@@ -773,19 +751,6 @@ class AutoSwitchLocalScheduler(
         } else if (alias.isNotBlank()) {
             LogCenter.op(alias, "【自动切号】切号入队失败 slot=$slotKey step=$nextStep target=@${entry.target_username}")
         }
-    }
-
-    /** 当前时段切号源与目标一致，无需备份/清理/还原（不得仅凭 device_active 推断）。 */
-    private fun isCutSwitchAlreadyOnTarget(
-        sourceRow: AutoSwitchAccount,
-        targetRow: AutoSwitchAccount,
-        targetUser: String,
-    ): Boolean {
-        val sourceRi = sourceRow.row_index ?: -1
-        val targetRi = targetRow.row_index ?: -1
-        if (sourceRi >= 0 && targetRi >= 0 && sourceRi == targetRi) return true
-        val sourceUser = sourceRow.username?.trim()?.removePrefix("@").orEmpty()
-        return sourceUser.isNotEmpty() && sourceUser.equals(targetUser, ignoreCase = true)
     }
 
     /** 切号源账号：只读 plan 文件（source、device_active、上一已完成时段），不用 TikTok 前台推断。 */
@@ -834,6 +799,45 @@ class AutoSwitchLocalScheduler(
     private fun hasActiveHighPriorityInsertion(): Boolean {
         val inflight = insertionInflight ?: return false
         return isInsertionKindStillActive(inflight.second)
+    }
+
+    /** PLAN 时段目标与 device_active 不一致：假完成切号，重置并抢占。 */
+    private fun ensurePlanSlotEnvironment(slotEntry: SlotPlanEntry) {
+        val sk = slotEntry.slot_key.trim()
+        if (sk.isEmpty() || !AutoSwitchLocalPlanStore.isCutSwitchDone(sk)) return
+        val targetUser = slotEntry.target_username.trim().removePrefix("@")
+        if (targetUser.isEmpty()) return
+        val active = AutoSwitchLocalPlanStore.getDeviceActiveIdentity() ?: return
+        val (activeRi, activeUser) = active
+        val targetRi = slotEntry.target_row_index
+        val aligned = (targetRi >= 0 && activeRi == targetRi) ||
+            activeUser.equals(targetUser, ignoreCase = true)
+        if (aligned) return
+        invalidateSlotAlignment(
+            sk,
+            "PLAN 时段目标 @$targetUser 与活跃标记 @$activeUser 不一致",
+        )
+        preemptForCutSwitchIfNeeded(sk, "活跃标记与 PLAN 目标不一致")
+    }
+
+    /** PLAN 切号优先：发作品/互点等占用一律清空，不得阻塞切号调度。 */
+    private fun preemptForCutSwitchIfNeeded(slotKey: String, reason: String) {
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return
+        val occupied = PublishPostGrowthGate.isBlockingGrowth() ||
+            hasActiveHighPriorityInsertion() ||
+            AutoSwitchLocalPlanStore.isPublishContextOccupying() ||
+            AutoSwitchLocalPlanStore.isMutualContextOccupying() ||
+            isPublishExecutionActive() ||
+            isMutualExecutionActive()
+        if (!occupied) return
+        onPreemptForCutSwitch(sk, reason)
+        insertionInflight = null
+        pendingCutSwitchSlotKey = null
+        AutoSwitchLocalPlanStore.resumeCutSwitchFromWaiting(sk)
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】PLAN 切号抢占 slot=$sk：$reason")
+        }
     }
 
     private fun isInsertionKindStillActive(kind: String): Boolean = when (kind) {
@@ -1190,7 +1194,6 @@ class AutoSwitchLocalScheduler(
         val sourceUser = sourceRow.username?.trim().orEmpty()
         val targetUser = targetRow.username?.trim().orEmpty()
         if (sourceUser.isBlank() || targetUser.isBlank()) return false
-        AutoSwitchLocalPlanStore.setDeviceActive(sourceRi, sourceUser, "切号入队备份前确认活跃标记")
         val backupAttr = AutoSwitchLocalPlanStore.resolveCutSwitchBackupAttribution(sourceUser, sourceRi)
             ?: return false
         val (backupRi, backupUser) = backupAttr

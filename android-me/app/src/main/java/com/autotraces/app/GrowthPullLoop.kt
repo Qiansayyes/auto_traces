@@ -304,7 +304,16 @@ class GrowthPullLoop(
                 onRuntimeMessage(statusMsg)
             }
         } catch (err: Exception) {
-            if (err is CancellationException) throw err
+            if (err is CancellationException) {
+                val reason =
+                    when {
+                        PrefsStore.getAutoSwitchMode() == "exiting" -> "自动切号关闭"
+                        PrefsStore.isAutoSwitchExclusivePreempt() -> "独占操作（发作品/切号）"
+                        else -> "任务切换"
+                    }
+                LogCenter.op(alias, "涨粉拉取被${reason}打断（预期行为）")
+                throw err
+            }
             LogCenter.op(alias, "拉取用户名失败：${err.message}")
             onRuntimeMessage("用户名拉取失败")
         }
