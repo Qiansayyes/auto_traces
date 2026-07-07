@@ -747,6 +747,11 @@
             </div>
           </div>
           <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <select id="accountRecordsBatchProfileSelect" class="ui-select account-records-batch-profile-select" title="批量设置「资料」为">
+              <option value="是">是</option>
+              <option value="否">否</option>
+            </select>
+            <button id="accountRecordsBatchProfileBtn" type="button" class="ghost" disabled title="将勾选记录的「资料」批量设为左侧所选值">批量改资料</button>
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
             <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>

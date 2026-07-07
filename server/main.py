@@ -3642,6 +3642,24 @@ class AccountEditorRowBatchDeleteRequest(BaseModel):
 ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX = 100
 
 
+class AccountEditorRowBatchSetBasicProfileItem(BaseModel):
+    row_index: int = Field(..., ge=0)
+    username: str = Field(default="", max_length=256)
+
+
+class AccountEditorRowBatchSetBasicProfileRequest(BaseModel):
+    basic_profile_modified: str = "否"
+    items: list[AccountEditorRowBatchSetBasicProfileItem] = Field(..., min_length=1)
+
+    @field_validator("basic_profile_modified", mode="before")
+    @classmethod
+    def _normalize_basic_profile_modified(cls, v: object) -> str:
+        return _normalize_switch_highlight(v)
+
+
+ACCOUNT_EDITOR_ROW_BATCH_SET_BASIC_PROFILE_MAX = 100
+
+
 class DeviceEditorRowDeleteRequest(BaseModel):
     row_index: int = Field(..., ge=0)
 
@@ -11741,6 +11759,113 @@ def batch_delete_account_editor_rows(
     except Exception as exc:
         print(f"[{now_text()}] account_rows.batch_delete | owner={owner} count={len(row_indices)} EXC={exc}")
         return {"code": 1, "msg": f"批量删除失败：{exc}"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/editor/account_rows/batch_set_basic_profile")
+def batch_set_account_editor_rows_basic_profile(
+    payload: AccountEditorRowBatchSetBasicProfileRequest, authorization: str | None = Header(default=None)
+):
+    """批量设置账号记录「资料」(basic_profile_modified) 为「是」或「否」。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    raw_items = payload.items or []
+    if len(raw_items) > ACCOUNT_EDITOR_ROW_BATCH_SET_BASIC_PROFILE_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多修改 {ACCOUNT_EDITOR_ROW_BATCH_SET_BASIC_PROFILE_MAX} 条，请分批操作",
+        }
+    target_value = _normalize_switch_highlight(payload.basic_profile_modified)
+    deduped: dict[int, str] = {}
+    for item in raw_items:
+        row_index = int(item.row_index)
+        if row_index in deduped:
+            continue
+        deduped[row_index] = _normalized_alias(item.username).lstrip("@")
+    conn = _get_db()
+    try:
+        updated_count = 0
+        not_found_count = 0
+        unchanged_count = 0
+        now = now_text()
+        for row_index, username in deduped.items():
+            existing = conn.execute(
+                """
+                SELECT username, basic_profile_modified
+                FROM account_editor_rows
+                WHERE owner_username = ? AND row_index = ?
+                LIMIT 1
+                """,
+                (owner, row_index),
+            ).fetchone()
+            if not existing:
+                not_found_count += 1
+                continue
+            existing_username = str(existing["username"] or "").strip()
+            if username and existing_username and existing_username.lower() != username.lower():
+                not_found_count += 1
+                continue
+            current_value = _normalize_switch_highlight(existing["basic_profile_modified"])
+            if current_value == target_value:
+                unchanged_count += 1
+                continue
+            cur = conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET basic_profile_modified = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (target_value, now, owner, row_index),
+            )
+            if int(cur.rowcount or 0) > 0:
+                updated_count += 1
+        if updated_count <= 0:
+            if unchanged_count <= 0 and not_found_count > 0:
+                return {
+                    "code": 1,
+                    "msg": "未修改任何账号记录（可能已不存在）",
+                    "updated_count": 0,
+                    "not_found_count": not_found_count,
+                    "unchanged_count": unchanged_count,
+                }
+            msg_parts: list[str] = []
+            if unchanged_count > 0:
+                msg_parts.append(f"{unchanged_count} 条已是「{target_value}」")
+            if not_found_count > 0:
+                msg_parts.append(f"{not_found_count} 条已不存在")
+            msg = "未修改任何记录"
+            if msg_parts:
+                msg += f"（{'，'.join(msg_parts)}）"
+            return {
+                "code": 0,
+                "msg": msg,
+                "updated_count": 0,
+                "not_found_count": not_found_count,
+                "unchanged_count": unchanged_count,
+                "basic_profile_modified": target_value,
+            }
+        conn.commit()
+        return {
+            "code": 0,
+            "msg": f"已批量将 {updated_count} 条账号记录「资料」设为「{target_value}」",
+            "updated_count": updated_count,
+            "not_found_count": not_found_count,
+            "unchanged_count": unchanged_count,
+            "basic_profile_modified": target_value,
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
+        return {"code": 1, "msg": f"批量修改失败：{exc}"}
+    except Exception as exc:
+        print(
+            f"[{now_text()}] account_rows.batch_set_basic_profile | owner={owner} "
+            f"count={len(deduped)} EXC={exc}"
+        )
+        return {"code": 1, "msg": f"批量修改失败：{exc}"}
     finally:
         conn.close()
 

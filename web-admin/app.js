@@ -274,6 +274,8 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
+const accountRecordsBatchProfileBtn = document.getElementById("accountRecordsBatchProfileBtn");
+const accountRecordsBatchProfileSelect = document.getElementById("accountRecordsBatchProfileSelect");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
@@ -298,6 +300,7 @@ let accountRecordsFilteredTotal = 0;
 /** 账号记录批量删除勾选，键为数据库 row_index */
 const accountRecordsSelectedRowIndexes = new Set();
 const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
+const ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX = 100;
 let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
@@ -2691,11 +2694,20 @@ function onAccountRecordsPageSizeChanged() {
   renderAccountEditorRows();
 }
 
-function updateAccountRecordsBatchDeleteBtn() {
-  if (!accountRecordsBatchDeleteBtn) return;
+function updateAccountRecordsBatchActionBtns() {
   const count = accountRecordsSelectedRowIndexes.size;
-  accountRecordsBatchDeleteBtn.disabled = count <= 0;
-  accountRecordsBatchDeleteBtn.textContent = count > 0 ? `批量删除 (${count})` : "批量删除";
+  if (accountRecordsBatchDeleteBtn) {
+    accountRecordsBatchDeleteBtn.disabled = count <= 0;
+    accountRecordsBatchDeleteBtn.textContent = count > 0 ? `批量删除 (${count})` : "批量删除";
+  }
+  if (accountRecordsBatchProfileBtn) {
+    accountRecordsBatchProfileBtn.disabled = count <= 0;
+    accountRecordsBatchProfileBtn.textContent = count > 0 ? `批量改资料 (${count})` : "批量改资料";
+  }
+}
+
+function updateAccountRecordsBatchDeleteBtn() {
+  updateAccountRecordsBatchActionBtns();
 }
 
 function setAccountRecordRowSelected(rowIndex, checked) {
@@ -2790,6 +2802,136 @@ function collectSelectedAccountDeleteSnapshots() {
       assignedAlias: buildAccountRecordDeletePayload(row, idx).assigned_alias
         || getEffectiveAccountAssignedAlias(row),
     }));
+}
+
+function collectSelectedAccountBasicProfileSnapshots() {
+  return (accountEditorRows || [])
+    .map((row, idx) => ({ row, idx, rowIndex: resolveAccountRowIndex(row, idx) }))
+    .filter(({ rowIndex }) => accountRecordsSelectedRowIndexes.has(rowIndex))
+    .map(({ row, idx }) => ({
+      key: accountRecordStableDeleteKey(row, idx),
+      row_index: resolveAccountRowIndex(row, idx),
+      username: String(row?.username || "").trim(),
+      currentValue: normalizeBasicProfileModifiedField(row?.basic_profile_modified),
+    }));
+}
+
+async function batchSetSelectedAccountBasicProfile() {
+  if (!accountRecordsSelectedRowIndexes.size) {
+    setStatus("请先勾选要修改的账号记录", "warning");
+    return;
+  }
+  const targetValue = normalizeBasicProfileModifiedField(accountRecordsBatchProfileSelect?.value);
+  let pendingSnapshots = collectSelectedAccountBasicProfileSnapshots();
+  if (!pendingSnapshots.length) {
+    clearAccountRecordsSelection();
+    renderAccountEditorRows();
+    setStatus("勾选的记录已不存在，请刷新后重试", "warning");
+    return;
+  }
+  const needUpdateCount = pendingSnapshots.filter((item) => item.currentValue !== targetValue).length;
+  const confirmLines = [
+    `确认将 ${pendingSnapshots.length} 条账号记录的「资料」批量设为「${targetValue}」？`,
+  ];
+  if (needUpdateCount < pendingSnapshots.length) {
+    confirmLines.push(`其中 ${pendingSnapshots.length - needUpdateCount} 条已是「${targetValue}」，将跳过`);
+  }
+  const previewNames = pendingSnapshots
+    .map((item) => item.username)
+    .filter(Boolean)
+    .slice(0, 8);
+  if (previewNames.length) {
+    confirmLines.push(`账号：${previewNames.join("、")}${pendingSnapshots.length > previewNames.length ? " …" : ""}`);
+  }
+  if (!window.confirm(confirmLines.join("\n"))) return;
+
+  if (accountRecordsBatchProfileBtn) accountRecordsBatchProfileBtn.disabled = true;
+  setStatus(`正在批量修改 ${pendingSnapshots.length} 条账号记录的「资料」...`, "info");
+  let updatedCount = 0;
+  let unchangedCount = 0;
+  let notFoundCount = 0;
+  let failedBatches = 0;
+  try {
+    while (pendingSnapshots.length) {
+      await loadEditorState();
+      pendingSnapshots = pendingSnapshots
+        .map((snap) => {
+          const matched = findAccountEditorRowByStableKey(snap.key);
+          if (!matched) return null;
+          return {
+            ...snap,
+            row_index: resolveAccountRowIndex(matched.row, matched.idx),
+            username: String(matched.row?.username || "").trim(),
+            currentValue: normalizeBasicProfileModifiedField(matched.row?.basic_profile_modified),
+          };
+        })
+        .filter(Boolean);
+      if (!pendingSnapshots.length) break;
+
+      const batch = [];
+      const batchKeys = [];
+      for (const snap of pendingSnapshots) {
+        if (batch.length >= ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX) break;
+        batch.push({ row_index: snap.row_index, username: snap.username });
+        batchKeys.push(snap.key);
+      }
+      if (!batch.length) break;
+
+      try {
+        const resp = await request(`${ACCOUNT_ROWS_API}/batch_set_basic_profile`, {
+          method: "POST",
+          body: JSON.stringify({
+            basic_profile_modified: targetValue,
+            items: batch,
+          }),
+        });
+        updatedCount += Number(resp?.updated_count || 0);
+        unchangedCount += Number(resp?.unchanged_count || 0);
+        notFoundCount += Number(resp?.not_found_count || 0);
+        const batchUpdated = Number(resp?.updated_count || 0);
+        const batchUnchanged = Number(resp?.unchanged_count || 0);
+        if (batchUpdated <= 0 && batchUnchanged <= 0) break;
+        const doneKeySet = new Set(batchKeys);
+        pendingSnapshots = pendingSnapshots.filter((snap) => !doneKeySet.has(snap.key));
+      } catch (chunkError) {
+        failedBatches += 1;
+        if (updatedCount > 0 || unchangedCount > 0) break;
+        throw chunkError;
+      }
+    }
+    clearAccountRecordsSelection();
+    await loadEditorState();
+    renderAccountEditorRows();
+    const backupActive = document.getElementById("backup-section")?.classList.contains("active");
+    if (backupActive) {
+      await loadBackupArchiveRecords();
+    }
+    if (failedBatches > 0) {
+      setStatus(
+        `部分批次修改失败：已成功 ${updatedCount} 条，请刷新后检查剩余记录`,
+        "warning",
+      );
+      return;
+    }
+    if (updatedCount <= 0) {
+      if (notFoundCount > 0) {
+        setStatus("所选记录已不存在", "warning");
+      } else {
+        setStatus(`所选记录「资料」已是「${targetValue}」`, "info");
+      }
+      return;
+    }
+    const parts = [`已批量将 ${updatedCount} 条账号记录「资料」设为「${targetValue}」`];
+    if (unchangedCount > 0) parts.push(`${unchangedCount} 条无需修改`);
+    if (notFoundCount > 0) parts.push(`${notFoundCount} 条已不存在`);
+    setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
+  } catch (error) {
+    await loadEditorState();
+    renderAccountEditorRows();
+    throw error;
+  } finally {
+    updateAccountRecordsBatchActionBtns();
+  }
 }
 
 async function deleteSelectedAccountRecords() {
@@ -9915,7 +10057,7 @@ function renderAccountEditorRows() {
       const rowChecked = accountRecordsSelectedRowIndexes.has(dbRowIndex);
       return `<tr>
         <td class="account-editor-table__select">
-          <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量删除"${rowChecked ? " checked" : ""} />
+          <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量操作"${rowChecked ? " checked" : ""} />
         </td>
         <td class="account-editor-table__num">${displayNum}</td>
         <td>${accountEditorCellInput(idx, "username", row.username)}</td>
@@ -11194,6 +11336,11 @@ if (backupArchiveSearchInput) {
     if (event.key !== "Enter") return;
     clearTimeout(backupSearchTimer);
     runBackupArchiveSearch();
+  });
+}
+if (accountRecordsBatchProfileBtn) {
+  accountRecordsBatchProfileBtn.addEventListener("click", () => {
+    batchSetSelectedAccountBasicProfile().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "批量改资料失败", "error"));
   });
 }
 if (accountRecordsBatchDeleteBtn) {
