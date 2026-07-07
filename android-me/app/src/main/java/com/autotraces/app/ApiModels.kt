@@ -528,6 +528,8 @@ data class AutoSwitchBundle(
     val owner_username: String? = null,
     val device_alias: String? = null,
     val device_id: String? = null,
+    /** 云端为该设备配置的 PC 伴侣服务地址；与本地不一致时由 applyAutoSwitchBundle 同步。 */
+    val pc_service_url: String? = null,
     val run_config: AutoSwitchRunConfig? = null,
     /** 按 TikTok 用户名（小写）打包的 enter 冻结配置；切号时本地切换，不再拉 getConfig。 */
     val configs_by_username: Map<String, AutoSwitchBundledAccountConfig>? = null,

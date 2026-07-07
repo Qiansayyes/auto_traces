@@ -238,6 +238,8 @@ class RealTraceExecutor(
         }
         // 发作品独占发布阶段自身持有 TikTok，不得因入队时设置的独占抢占标志误协作退出。
         if (PublishPostGrowthGate.shouldDeferExclusivePreempt()) return false
+        // 互点独占引流阶段自身持有 TikTok，不得因入队时设置的独占抢占标志误协作退出。
+        if (PrefsStore.isMutualClickRequested() && PrefsStore.isMutualClickPending()) return false
         return exclusivePreemptOrNull(alias, action)
     }
 
@@ -410,6 +412,7 @@ class RealTraceExecutor(
     private var lastSaveLoginForNextTimePopupDismissAtMs: Long = 0L
     private var lastContinueEditingPostPopupDismissAtMs: Long = 0L
     private var lastSecurityCheckupPopupDismissAtMs: Long = 0L
+    private var lastMoreResultForTapAtMs: Long = 0L
     @Volatile
     private var inlineIdentityVerificationInProgress: Boolean = false
     /** Check your inbox 分支：验证码页默认已聚焦，无需再点输入区。 */
@@ -533,6 +536,21 @@ class RealTraceExecutor(
                 result
             }
             if (vision == null) return
+            if (
+                !inlineIdentityVerificationInProgress &&
+                isGrowthOrMutualTrafficInlineOcrContext() &&
+                fileTagEligibleForMoreResultForDismiss(fileTag)
+            ) {
+                if (tapMoreResultForIfPresent(ctx, vision, "截图OCR顺手")) {
+                    val safeTag = fileTag.replace(Regex("[^a-zA-Z0-9_]+"), "_").take(40)
+                    val (redo, err) = mlKitRecognizeFullScreenCore(ctx, "${safeTag}_more_result_for_redo")
+                    if (redo != null) {
+                        vision = redo
+                    } else if (err == "hard_stop") {
+                        return
+                    }
+                }
+            }
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
@@ -684,6 +702,12 @@ class RealTraceExecutor(
         private const val USERS_TAB_OCR_RETRY_DELAY_MS = 3_000L
         /** 评论区列表上滑约 40% 屏高（换批） */
         private const val MUTUAL_FOLLOW_ONLY_COMMENT_SWIPE_HEIGHT_RATIO = 0.40f
+        /** 引流互点：作品页评论入口固定坐标（与 [tapMutualTrafficCommentEntryFixedPoint] 一致）。 */
+        private const val MUTUAL_COMMENT_ENTRY_X_FRACTION = 0.924f
+        private const val MUTUAL_COMMENT_ENTRY_Y_FRACTION = 0.666f
+        /** 涨粉/引流发评：评论区底部输入框固定坐标（与 [tapGrowthCommentInputFixedPoint] 一致）。 */
+        private const val GROWTH_COMMENT_INPUT_X_FRACTION = 0.5f
+        private const val GROWTH_COMMENT_INPUT_Y_FRACTION = 0.98f
         /** 完整互点：未达 Follow 上限时 teamwork Videos 外圈最大轮数（每轮含左+右双侧），防止死循环。 */
         private const val MUTUAL_FULL_VIDEOS_SAFETY_ROUNDS = 500
         /** 单次「发布作品」任务最多连发条数（临时上限）；实际条数 = min(Pictures 图片+视频数, 本常量)。 */
@@ -726,6 +750,8 @@ class RealTraceExecutor(
         private const val FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS = 5 * 60 * 1000L
         /** 页面错乱恢复：优先导航返回回首页的最多次数（每次返回后 OCR 验 Home+Profile）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS = 10
+        /** 回首页恢复：前 N 轮导航返回每次连按两次（跳过中间页/叠层）。 */
+        private const val RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES = 2
         /** 导航返回后等待 UI 稳定再 OCR（毫秒）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_DELAY_MS = 520L
         /** 返回导致 TikTok 退出后，软拉起前台再额外等待 UI 稳定（毫秒）。 */
@@ -802,6 +828,8 @@ class RealTraceExecutor(
         private const val SECURITY_CHECKUP_POPUP_DISMISS_TOP_Y_FRACTION = 0.20f
         /** 通用 OCR 顺手消 Swipe up 提示：单次最多上滑次数。 */
         private const val INLINE_SWIPE_UP_DISMISS_MAX_PASSES = 8
+        /** 涨粉/引流互点：more result for 顺手点击冷却。 */
+        private const val INLINE_MORE_RESULT_FOR_TAP_COOLDOWN_MS = 1200L
         /** 身份验证（Before you continue）：OCR 轮询间隔。 */
         private const val INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS = 1500L
         /** 身份验证：点 Outlook+Next 后等待 Before you continue 消失的最大 OCR 次数。 */
@@ -2212,6 +2240,15 @@ class RealTraceExecutor(
                 result
             }
             if (vision == null) return null to "hard_stop"
+            if (
+                !inlineIdentityVerificationInProgress &&
+                isGrowthOrMutualTrafficInlineOcrContext() &&
+                fileTagEligibleForMoreResultForDismiss(fileTag)
+            ) {
+                if (tapMoreResultForIfPresent(ctx, vision, "OCR顺手处理")) {
+                    return mlKitRecognizeFullScreen(ctx, "${fileTag}_more_result_for_tap")
+                }
+            }
             val accountStatusDismissedInline = observeAccountStatusOnOcrText(ctx, vision, fileTag)
             if (
                 accountStatusDismissedInline &&
@@ -3271,24 +3308,8 @@ class RealTraceExecutor(
         h: Int,
         logLabel: String,
     ): Long {
-        val baseXFrac = 0.46f + Random.nextFloat() * 0.10f
-        val startYFrac = 0.74f + Random.nextFloat() * 0.08f
-        val swipeSpanFrac = 0.36f + Random.nextFloat() * 0.14f
-        val endYFrac = (startYFrac - swipeSpanFrac).coerceIn(0.24f, 0.40f)
-        val xDriftPx = Random.nextInt(-40, 41)
-        val startX = (w * baseXFrac).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
-        val endX = (startX + xDriftPx).coerceIn(1, (w - 1).coerceAtLeast(1))
-        val startY = (h * startYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
-        val endY = (h * endYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
-        val quickFlick = Random.nextDouble() < 0.06
-        val (y0, y1, swipeMs) = if (quickFlick) {
-            val midY = ((startY + endY) / 2).coerceIn(1, (h - 1).coerceAtLeast(1))
-            Triple(startY, midY, Random.nextInt(200, 301))
-        } else {
-            Triple(startY, endY, Random.nextInt(360, 661))
-        }
-        devOp(logAlias, "$logLabel：swipe ($startX,$y0)→($endX,$y1) ${swipeMs}ms")
-        runSuCommand("input swipe $startX $y0 $endX $y1 $swipeMs")
+        val gesture = computeForYouFeedSwipeGesture(w, h)
+        performHumanizedSwipe(logAlias, gesture, logLabel)
         return Random.nextLong(380, 920)
     }
 
@@ -3309,6 +3330,153 @@ class RealTraceExecutor(
 
     private fun ocrVisionHasSwipeUpPrompt(result: Text): Boolean =
         findLabelHitContainingIgnoreCase(result, "swipe up") != null
+
+    private fun isGrowthOrMutualTrafficInlineOcrContext(): Boolean {
+        if (PrefsStore.isMutualClickRequested() && PrefsStore.isMutualClickPending()) return true
+        val mode = lastConfigSnapshot.run_mode.trim().lowercase()
+        return mode == ServerRunMode.GROWTH || mode == ServerRunMode.MUTUAL
+    }
+
+    private fun mutualTrafficCommentEntryTapPoint(ctx: Context): Point {
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        return Point(
+            (w * MUTUAL_COMMENT_ENTRY_X_FRACTION).toInt().coerceIn(1, w - 1),
+            (h * MUTUAL_COMMENT_ENTRY_Y_FRACTION).toInt().coerceIn(1, h - 1),
+        )
+    }
+
+    /** 引流互点：点击作品页评论入口固定坐标（屏比 0.924×0.666）。 */
+    private suspend fun tapMutualTrafficCommentEntryFixedPoint(
+        ctx: Context,
+        phaseLog: String,
+        settleMs: Long = 450L,
+    ): Boolean {
+        if (isHardStopActive()) return false
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        val tap = mutualTrafficCommentEntryTapPoint(ctx)
+        alias?.let {
+            devOp(
+                it,
+                "$phaseLog：重新点击评论区域 (${tap.x},${tap.y}) 屏比 " +
+                    "$MUTUAL_COMMENT_ENTRY_X_FRACTION×$MUTUAL_COMMENT_ENTRY_Y_FRACTION",
+            )
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        if (settleMs > 0L) delay(settleMs)
+        return true
+    }
+
+    private fun growthCommentInputTapPoint(ctx: Context): Point {
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        return Point(
+            (w * GROWTH_COMMENT_INPUT_X_FRACTION).toInt().coerceIn(1, w - 1),
+            (h * GROWTH_COMMENT_INPUT_Y_FRACTION).toInt().coerceIn(1, h - 1),
+        )
+    }
+
+    /** 涨粉/引流发评：点击评论区底部输入框固定坐标（屏比 0.5×0.98）。 */
+    private suspend fun tapGrowthCommentInputFixedPoint(
+        ctx: Context,
+        phaseLog: String,
+        settleMs: Long = 900L,
+    ): Boolean {
+        if (isHardStopActive()) return false
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        val tap = growthCommentInputTapPoint(ctx)
+        alias?.let {
+            devOp(
+                it,
+                "$phaseLog：点击评论输入框 (${tap.x},${tap.y}) 屏比 " +
+                    "$GROWTH_COMMENT_INPUT_X_FRACTION×$GROWTH_COMMENT_INPUT_Y_FRACTION",
+            )
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        if (settleMs > 0L) delay(settleMs)
+        return true
+    }
+
+    private fun fileTagEligibleForMoreResultForDismiss(fileTag: String?): Boolean {
+        if (fileTag == null) return true
+        if (fileTag.startsWith("auto_login_")) return false
+        if (fileTag.startsWith("login_safeguard_")) return false
+        if (fileTag.startsWith("profile_edit_")) return false
+        if (fileTag.startsWith("publish_post_")) return false
+        return true
+    }
+
+    /**
+     * 涨粉/引流互点：识别到 more result for 时点击该文案，由调用方重 OCR。
+     */
+    private suspend fun tapMoreResultForIfPresent(
+        ctx: Context,
+        vision: Text,
+        phaseLog: String,
+    ): Boolean {
+        val hit = findLabelHitContainingIgnoreCaseRelaxed(vision, "more result for") ?: return false
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastMoreResultForTapAtMs < INLINE_MORE_RESULT_FOR_TAP_COOLDOWN_MS) {
+            return false
+        }
+        if (isHardStopActive()) return false
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = coerceTapToScreen(hit.point, w, h)
+        alias?.let {
+            devOp(it, "$phaseLog：识别到 more result for，tap (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        delay(450L)
+        lastMoreResultForTapAtMs = SystemClock.elapsedRealtime()
+        return true
+    }
+
+    private data class HumanizedSwipeGesture(
+        val startX: Int,
+        val startY: Int,
+        val endX: Int,
+        val endY: Int,
+        val swipeMs: Int,
+    )
+
+    private fun computeForYouFeedSwipeGesture(w: Int, h: Int): HumanizedSwipeGesture {
+        val baseXFrac = 0.46f + Random.nextFloat() * 0.10f
+        val startYFrac = 0.74f + Random.nextFloat() * 0.08f
+        val swipeSpanFrac = 0.36f + Random.nextFloat() * 0.14f
+        val endYFrac = (startYFrac - swipeSpanFrac).coerceIn(0.24f, 0.40f)
+        val xDriftPx = Random.nextInt(-40, 41)
+        val startX = (w * baseXFrac).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
+        val endX = (startX + xDriftPx).coerceIn(1, (w - 1).coerceAtLeast(1))
+        val startY = (h * startYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val endY = (h * endYFrac).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val quickFlick = Random.nextDouble() < 0.06
+        val (y0, y1, swipeMs) = if (quickFlick) {
+            val midY = ((startY + endY) / 2).coerceIn(1, (h - 1).coerceAtLeast(1))
+            Triple(startY, midY, Random.nextInt(200, 301))
+        } else {
+            Triple(startY, endY, Random.nextInt(360, 661))
+        }
+        return HumanizedSwipeGesture(startX, y0, endX, y1, swipeMs)
+    }
+
+    private suspend fun performHumanizedSwipe(
+        logAlias: String,
+        gesture: HumanizedSwipeGesture,
+        logLabel: String,
+    ) {
+        devOp(
+            logAlias,
+            "$logLabel：swipe (${gesture.startX},${gesture.startY})→(${gesture.endX},${gesture.endY}) ${gesture.swipeMs}ms",
+        )
+        runSuCommand(
+            "input swipe ${gesture.startX} ${gesture.startY} ${gesture.endX} ${gesture.endY} ${gesture.swipeMs}",
+        )
+    }
 
     /**
      * 识别到 Swipe up 时按 For You 预划同向上滑，直至文案消失或达上限。
@@ -5656,7 +5824,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 回首页恢复流程中的导航返回：发作品期间若 OCR 同时见 POST+CREATE（创作相机底栏），连续执行两次返回。
+     * 回首页恢复流程中的导航返回：前 [RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES] 轮每次连按两次；
+     * 其后发作品期间若 OCR 同时见 POST+CREATE（创作相机底栏），亦连续执行两次返回。
      */
     private suspend fun navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
         service: Context,
@@ -5666,8 +5835,13 @@ class RealTraceExecutor(
         maxAttempts: Int,
     ): Boolean {
         if (hardStopOrNull(alias, reason)) return false
-        var doubleBack = false
-        if (PrefsStore.isPublishPostPending()) {
+        var doubleBack = pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES
+        if (doubleBack) {
+            devOp(
+                alias,
+                "$reason：第 $pass/$maxAttempts 次返回采用双返（前 $RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES 轮）",
+            )
+        } else if (PrefsStore.isPublishPostPending()) {
             val (vision, err) = mlKitRecognizeFullScreen(service, "recover_home_pre_back_$pass")
             if (vision != null) {
                 if (ocrSeesPublishPostCameraBottomNav(vision)) {
@@ -5686,9 +5860,10 @@ class RealTraceExecutor(
         }
         val passLabel = "（$pass/$maxAttempts）"
         if (doubleBack) {
-            navBack(alias, "$reason 回首页·创作相机双返 1/2$passLabel")
+            val doubleTag = if (pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES) "双返" else "创作相机双返"
+            navBack(alias, "$reason 回首页·${doubleTag} 1/2$passLabel")
             if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return false
-            navBack(alias, "$reason 回首页·创作相机双返 2/2$passLabel")
+            navBack(alias, "$reason 回首页·${doubleTag} 2/2$passLabel")
         } else {
             navBack(alias, "$reason 回首页$passLabel")
         }
@@ -6046,8 +6221,7 @@ class RealTraceExecutor(
             }
             devOp(alias, "$modeName：收到互点切换请求，准备重启 TikTok 并进入首页放大镜")
             lastEndedAtUsersSelection = false
-            PrefsStore.setMutualClickPending(false)
-            PrefsStore.setMutualClickRequested(false)
+            // 互点执行期间保留 requested/pending，避免独占抢占标志误触发协作退出；收尾由调度层清理。
             return enterMutualClickMode(service, config, commentOnlyForMessage, followOnlyForMessage)
         }
         if ((runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) && restartFromMagnifierForGrowth) {
@@ -6201,6 +6375,7 @@ class RealTraceExecutor(
         val alias = PrefsStore.getAlias() ?: "unknown"
         return withTikTokGuard(alias, "点击放大镜") {
             if (!ensureTikTokInForeground(service, alias, "点击放大镜")) return@withTikTokGuard false
+            devOp(alias, "点击放大镜前：开始 Don't allow OCR（无副作用整屏）")
             tryDismissDontAllowBeforeMagnifier(service, alias)
             val metrics = service.resources.displayMetrics
             val width = metrics.widthPixels
@@ -6221,7 +6396,7 @@ class RealTraceExecutor(
      * - 未命中直接继续后续流程
      */
     private suspend fun tryDismissDontAllowBeforeMagnifier(service: Context, alias: String) {
-        val (vision, err) = mlKitRecognizeFullScreen(service, "magnifier_before_dont_allow")
+        val (vision, err) = mlKitRecognizeFullScreenCore(service, "magnifier_before_dont_allow")
         if (vision == null) {
             devOp(alias, "点击放大镜前：Don't allow OCR 失败：$err（忽略，继续）")
             return
@@ -7497,41 +7672,52 @@ class RealTraceExecutor(
     }
 
     /**
-     * 互点：force-stop → 启动 TikTok → 搜索模板配置的引流关键词 → OCR 进入 Videos（与旧版 [enterMutualClickMode] 前半段一致）。
+     * 互点：启动/确认 TikTok 前台 → 搜索模板配置的引流关键词 → OCR 进入 Videos。
+     * [forceStopBeforeLaunch]=true 时 force-stop 后完整拉起并走登录保障；false 时假定已在主 Feed，直接从放大镜重搜。
      * 不调用 [PrefsStore.clearMutualClickState]，供帧差三连败后的界面恢复复用。
      */
     private suspend fun reopenTikTokAndOpenMutualTeamworkVideosTab(
         service: Context,
         config: AppConfig,
         launchCheckTag: String,
+        forceStopBeforeLaunch: Boolean = true,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val mutualSearchText = pickMutualTikTokSearchKeyword(config)
         val safeSearchText = shellEscape(mutualSearchText)
 
-        // 关开 TikTok 须走 launchTikTokWithForegroundVerification（强停→拉起→等待→dumpsys 校验→日志），
-        // 不可仅用 ensureTikTokInForeground：force-stop 后 dumpsys 残留包名会静默误判为已前台而跳过拉起。
-        didRestartTikTokInCurrentRun = true
-        if (!launchTikTokWithForegroundVerification(
-                ctx = service,
-                alias = alias,
-                tag = "互点·$launchCheckTag",
-                forceStopBeforeLaunch = true,
-                timingConfig = config,
-            )
-        ) {
-            devOp(alias, "互点：TikTok 拉起未通过前台校验（$launchCheckTag）")
-            return false
-        }
-
-        delay(800)
-
-        runLoginSafeguardMeasureOrAbortMessage(service, "互点-$launchCheckTag")?.let { msg ->
-            devOp(alias, "互点：登录状态保障未通过（$launchCheckTag）")
-            if (msg == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE) {
-                throw LoginSafeguardRequiresAutoLoginException()
+        if (forceStopBeforeLaunch) {
+            // 关开 TikTok 须走 launchTikTokWithForegroundVerification（强停→拉起→等待→dumpsys 校验→日志），
+            // 不可仅用 ensureTikTokInForeground：force-stop 后 dumpsys 残留包名会静默误判为已前台而跳过拉起。
+            didRestartTikTokInCurrentRun = true
+            if (!launchTikTokWithForegroundVerification(
+                    ctx = service,
+                    alias = alias,
+                    tag = "互点·$launchCheckTag",
+                    forceStopBeforeLaunch = true,
+                    timingConfig = config,
+                )
+            ) {
+                devOp(alias, "互点：TikTok 拉起未通过前台校验（$launchCheckTag）")
+                return false
             }
-            return false
+
+            delay(800)
+
+            runLoginSafeguardMeasureOrAbortMessage(service, "互点-$launchCheckTag")?.let { msg ->
+                devOp(alias, "互点：登录状态保障未通过（$launchCheckTag）")
+                if (msg == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE) {
+                    throw LoginSafeguardRequiresAutoLoginException()
+                }
+                return false
+            }
+        } else {
+            devOp(alias, "互点：回首页已成功，跳过 force-stop，直接从放大镜重搜（$launchCheckTag）")
+            if (!ensureTikTokInForeground(service, alias, "互点·$launchCheckTag", allowForceRestart = false)) {
+                devOp(alias, "互点：TikTok 非前台，轻量重搜失败（$launchCheckTag）")
+                return false
+            }
+            delay(500)
         }
 
         if (!clickMagnifier(service)) {
@@ -7564,7 +7750,7 @@ class RealTraceExecutor(
 
     /**
      * 帧差判定界面错乱后：先多次导航返回并用 OCR 复核主 Feed；
-     * 若仍不能确认回到主 Feed，再按原有方案关开 TikTok 并重新搜索进入 teamwork Videos。
+     * 回首页成功则跳过 force-stop、直接从放大镜重搜；失败才关开 TikTok 并重新搜索进入 teamwork Videos。
      */
     private suspend fun reopenMutualTeamworkVideosTabWithRetries(
         service: Context,
@@ -7572,17 +7758,29 @@ class RealTraceExecutor(
         launchCheckTag: String,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        if (!recoverToHomeViaBackOrRestart(service, "$launchCheckTag·回首页兜底")) {
-            devOp(alias, "互点：$launchCheckTag 回首页兜底失败，进入原始关开 TikTok 恢复")
+        val homeRecovered = recoverToHomeViaBackOrRestart(service, "$launchCheckTag·回首页兜底")
+        if (!homeRecovered) {
+            devOp(alias, "互点：$launchCheckTag 回首页兜底失败，进入关开 TikTok 恢复")
         }
         for (attempt in 1..MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS) {
-            if (reopenTikTokAndOpenMutualTeamworkVideosTab(service, config, "$launchCheckTag·$attempt")) {
+            val forceStopBeforeLaunch = !homeRecovered || attempt > 1
+            if (reopenTikTokAndOpenMutualTeamworkVideosTab(
+                    service,
+                    config,
+                    "$launchCheckTag·$attempt",
+                    forceStopBeforeLaunch = forceStopBeforeLaunch,
+                )
+            ) {
                 return true
             }
             if (attempt < MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS) {
                 devOp(
                     alias,
-                    "互点：teamwork 恢复失败（$launchCheckTag 第 $attempt/$MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS 次），${2000}ms 后再次关开 TikTok 重试",
+                    if (forceStopBeforeLaunch) {
+                        "互点：teamwork 恢复失败（$launchCheckTag 第 $attempt/$MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS 次），${2000}ms 后再次关开 TikTok 重试"
+                    } else {
+                        "互点：teamwork 轻量重搜失败（$launchCheckTag 第 $attempt/$MUTUAL_TEAMWORK_RECOVERY_REOPEN_MAX_ATTEMPTS 次），${2000}ms 后改为关开 TikTok 重试"
+                    },
                 )
                 delay(Random.nextLong(2000, 3501))
             }
@@ -9587,7 +9785,6 @@ class RealTraceExecutor(
         val alias = PrefsStore.getAlias() ?: "unknown"
         var entryOk = false
         try {
-            PrefsStore.clearMutualClickState()
             mutualSessionFollowTapCount = 0
             mutualFollowLimitReached = false
             devOp(alias, "互点模式：先关闭 TikTok，再重新打开并搜索引流目标关键词")
@@ -13052,13 +13249,8 @@ class RealTraceExecutor(
     private suspend fun performCommentTextDirectFixed(service: Context, config: AppConfig) {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val metrics = service.resources.displayMetrics
-
-        val commentX = (metrics.widthPixels * 0.5f).toInt().coerceIn(1, metrics.widthPixels - 1)
-        val commentY = (metrics.heightPixels * 0.98f).toInt().coerceIn(1, metrics.heightPixels - 1)
         val t0 = System.currentTimeMillis()
-        devOp(alias, "点击评论输入区域")
-        runSuCommand("input tap $commentX $commentY")
-        delay(900)
+        tapGrowthCommentInputFixedPoint(service, "涨粉发评")
 
         val text = config.comment_texts.randomOrNull() ?: "Nice"
         devOp(alias, "输入评论文案：$text")
@@ -13094,13 +13286,7 @@ class RealTraceExecutor(
 
     /** 互点-仅关注：作品页右侧评论入口固定坐标（非底部评论输入条）。 */
     private suspend fun openMutualCommentPanelOnly(service: Context) {
-        val alias = PrefsStore.getAlias() ?: "unknown"
-        val metrics = service.resources.displayMetrics
-        val tapX = (metrics.widthPixels * 0.924f).toInt().coerceIn(1, metrics.widthPixels - 1)
-        val tapY = (metrics.heightPixels * 0.626f).toInt().coerceIn(1, metrics.heightPixels - 1)
-        devOp(alias, "互点仅关注：点击评论入口固定点 ($tapX,$tapY) 屏比 0.924×0.626")
-        runSuCommand("input tap $tapX $tapY")
-        delay(900)
+        tapMutualTrafficCommentEntryFixedPoint(service, "互点仅关注打开评论区", settleMs = 900L)
     }
 
     private fun isMutualFollowOnlyReplyOcrLabel(normalized: String): Boolean {
@@ -13473,7 +13659,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 互点：固定坐标打开评论输入并发评；文案仅 [pickMutualCommentPhrase]（仅 mutual_comment_texts）。
+     * 互点：右侧评论按钮打开评论区后，再点涨粉同款底部输入框并发评；
+     * 文案仅 [pickMutualCommentPhrase]（仅 mutual_comment_texts）。
      */
     private suspend fun performMutualCommentTextDirectFixedCoordinate(
         service: Context,
@@ -13481,12 +13668,9 @@ class RealTraceExecutor(
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val metrics = service.resources.displayMetrics
-        val commentX = (metrics.widthPixels * 0.5f).toInt().coerceIn(1, metrics.widthPixels - 1)
-        val commentY = (metrics.heightPixels * 0.98f).toInt().coerceIn(1, metrics.heightPixels - 1)
         val t0 = System.currentTimeMillis()
-        devOp(alias, "点击评论输入区域（直客模式同款）")
-        runSuCommand("input tap $commentX $commentY")
-        delay(900)
+        tapMutualTrafficCommentEntryFixedPoint(service, "互点发评打开评论区", settleMs = 900L)
+        tapGrowthCommentInputFixedPoint(service, "互点发评聚焦输入框")
 
         // 剪贴板在 Android 14 后台常不可读：先把剪贴板粘贴进评论框，再用 uiautomator dump 读 EditText.text。
         // 已达粉丝列表 Follow 上限后的「仅互点评论」阶段未再复制主页用户名，禁止粘贴与 /api/report_mutual_copied_username 回传。
@@ -13545,12 +13729,8 @@ class RealTraceExecutor(
     ) {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val metrics = service.resources.displayMetrics
-        val commentX = (metrics.widthPixels * 0.5f).toInt().coerceIn(1, metrics.widthPixels - 1)
-        val commentY = (metrics.heightPixels * 0.98f).toInt().coerceIn(1, metrics.heightPixels - 1)
         val t0 = System.currentTimeMillis()
-        devOp(alias, "点击评论输入区域（直客模式同款）")
-        runSuCommand("input tap $commentX $commentY")
-        delay(900)
+        tapGrowthCommentInputFixedPoint(service, "直客发评")
 
         val text = config.comment_texts.map { it.trim() }.filter { it.isNotBlank() }.randomOrNull() ?: "Nice"
         devOp(alias, "root 一次性输入评论文案：$text")

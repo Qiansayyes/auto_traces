@@ -1165,6 +1165,7 @@ def _device_row_to_overview_entry(row: Any, session: dict) -> dict[str, Any]:
         "status": str(row["status"] or "offline"),
         "pending_start": bool(int(row["pending_start"] or 0)),
         "auto_start_opt_out": bool(int(row["auto_start_opt_out"] or 0)),
+        "pc_service_url": str(row["pc_service_url"] or "").strip() if "pc_service_url" in row.keys() else "",
     }
     if session.get("role") == "admin":
         entry["owner_username"] = str(row["owner_username"])
@@ -1231,7 +1232,7 @@ def _load_visible_devices_page_from_db(
         )
         rows = conn.execute(
             f"""
-            SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out
+            SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out, pc_service_url
             FROM client_devices
             WHERE owner_username = ?{group_sql}
             ORDER BY LOWER(TRIM(alias)), device_id
@@ -3627,6 +3628,18 @@ class AccountEditorRowDeleteRequest(BaseModel):
     row_index: int = Field(..., ge=0)
     username: str = Field(default="", max_length=256)
     assigned_alias: str = Field(default="", max_length=64)
+
+
+class AccountEditorRowBatchDeleteItem(BaseModel):
+    row_index: int = Field(..., ge=0)
+    username: str = Field(default="", max_length=256)
+
+
+class AccountEditorRowBatchDeleteRequest(BaseModel):
+    items: list[AccountEditorRowBatchDeleteItem] = Field(..., min_length=1)
+
+
+ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX = 100
 
 
 class DeviceEditorRowDeleteRequest(BaseModel):
@@ -10681,6 +10694,21 @@ def _resolve_device_alias_for_admin(device_id: str, alias: str = "") -> str:
         conn.close()
 
 
+def _load_device_pc_service_url(device_id: str) -> str:
+    did = str(device_id or "").strip()
+    if not did:
+        return ""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT pc_service_url FROM client_devices WHERE device_id = ?",
+            (did,),
+        ).fetchone()
+        return str(row["pc_service_url"] if row else "").strip()
+    finally:
+        conn.close()
+
+
 def _persist_device_pc_service_url(device_id: str, url: str) -> None:
     did = str(device_id or "").strip()
     if not did:
@@ -11551,6 +11579,65 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
         conn.close()
 
 
+def _delete_one_account_editor_row_in_conn(
+    conn: sqlite3.Connection,
+    owner: str,
+    row_index: int,
+    username: str = "",
+) -> dict:
+    """删除单条账号记录并级联清理 device_editor_rows；调用方负责 commit。"""
+    row_index = int(row_index)
+    username = _normalized_alias(username).lstrip("@")
+    existing = conn.execute(
+        """
+        SELECT username, assigned_alias
+        FROM account_editor_rows
+        WHERE owner_username = ? AND row_index = ?
+        LIMIT 1
+        """,
+        (owner, row_index),
+    ).fetchone()
+    if not existing:
+        return {
+            "found": False,
+            "row_index": row_index,
+            "username": username,
+            "deleted_accounts": 0,
+            "deleted_device_rows": 0,
+        }
+    if not username:
+        username = _normalized_alias(existing["username"]).lstrip("@")
+
+    deleted_device_rows = 0
+    if username:
+        device_cur = conn.execute(
+            """
+            DELETE FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+            """,
+            (owner, username),
+        )
+        deleted_device_rows = int(device_cur.rowcount or 0)
+
+    account_cur = conn.execute(
+        """
+        DELETE FROM account_editor_rows
+        WHERE owner_username = ? AND row_index = ?
+        """,
+        (owner, row_index),
+    )
+    deleted_accounts = int(account_cur.rowcount or 0)
+    if deleted_accounts > 0:
+        _shift_account_editor_row_indices_after_delete(conn, owner, row_index)
+    return {
+        "found": True,
+        "row_index": row_index,
+        "username": username,
+        "deleted_accounts": deleted_accounts,
+        "deleted_device_rows": deleted_device_rows,
+    }
+
+
 @app.post("/api/admin/editor/account_rows/delete")
 def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorization: str | None = Header(default=None)):
     """删除指定账号记录；已分配别名也可删，并级联删除 device_editor_rows 中该 username 的备份档案。"""
@@ -11562,40 +11649,9 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
     username = _normalized_alias(payload.username).lstrip("@")
     conn = _get_db()
     try:
-        existing = conn.execute(
-            """
-            SELECT username, assigned_alias
-            FROM account_editor_rows
-            WHERE owner_username = ? AND row_index = ?
-            LIMIT 1
-            """,
-            (owner, row_index),
-        ).fetchone()
-        if not existing:
+        result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, username)
+        if not result["found"]:
             return {"code": 1, "msg": "账号记录不存在或已删除"}
-        if not username:
-            username = _normalized_alias(existing["username"]).lstrip("@")
-
-        deleted_device_rows = 0
-        if username:
-            device_cur = conn.execute(
-                """
-                DELETE FROM device_editor_rows
-                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
-                """,
-                (owner, username),
-            )
-            deleted_device_rows = int(device_cur.rowcount or 0)
-
-        account_cur = conn.execute(
-            """
-            DELETE FROM account_editor_rows
-            WHERE owner_username = ? AND row_index = ?
-            """,
-            (owner, row_index),
-        )
-        if int(account_cur.rowcount or 0) > 0:
-            _shift_account_editor_row_indices_after_delete(conn, owner, row_index)
         _ensure_device_editor_switch_highlight_invariants(conn, owner)
         conn.commit()
         _reset_device_editor_read_maintain_schedule(owner)
@@ -11603,9 +11659,9 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
             "code": 0,
             "msg": "账号记录已删除",
             "row_index": row_index,
-            "username": username,
-            "deleted_accounts": int(account_cur.rowcount or 0),
-            "deleted_device_rows": deleted_device_rows,
+            "username": result["username"],
+            "deleted_accounts": int(result["deleted_accounts"] or 0),
+            "deleted_device_rows": int(result["deleted_device_rows"] or 0),
         }
     except sqlite3.OperationalError as exc:
         if _is_db_lock_error(exc):
@@ -11614,6 +11670,70 @@ def delete_account_editor_row(payload: AccountEditorRowDeleteRequest, authorizat
     except Exception as exc:
         print(f"[{now_text()}] account_rows.delete | owner={owner} row_index={row_index} EXC={exc}")
         return {"code": 1, "msg": f"删除失败：{exc}"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/editor/account_rows/batch_delete")
+def batch_delete_account_editor_rows(
+    payload: AccountEditorRowBatchDeleteRequest, authorization: str | None = Header(default=None)
+):
+    """批量删除账号记录；按 row_index 从大到小逐条删除，单事务提交，避免索引重排冲突。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    raw_items = payload.items or []
+    if len(raw_items) > ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多删除 {ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX} 条，请分批操作",
+        }
+    deduped: dict[int, str] = {}
+    for item in raw_items:
+        row_index = int(item.row_index)
+        if row_index in deduped:
+            continue
+        deduped[row_index] = _normalized_alias(item.username).lstrip("@")
+    row_indices = sorted(deduped.keys(), reverse=True)
+    conn = _get_db()
+    try:
+        deleted_accounts = 0
+        deleted_device_rows = 0
+        not_found_count = 0
+        deleted_usernames: list[str] = []
+        for row_index in row_indices:
+            result = _delete_one_account_editor_row_in_conn(
+                conn, owner, row_index, deduped.get(row_index, "")
+            )
+            if not result["found"]:
+                not_found_count += 1
+                continue
+            deleted_accounts += int(result["deleted_accounts"] or 0)
+            deleted_device_rows += int(result["deleted_device_rows"] or 0)
+            username = str(result.get("username") or "").strip()
+            if username:
+                deleted_usernames.append(username)
+        if deleted_accounts <= 0:
+            return {"code": 1, "msg": "未删除任何账号记录（可能已不存在）", "not_found_count": not_found_count}
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"已批量删除 {deleted_accounts} 条账号记录",
+            "deleted_accounts": deleted_accounts,
+            "deleted_device_rows": deleted_device_rows,
+            "not_found_count": not_found_count,
+            "deleted_usernames": deleted_usernames,
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
+        return {"code": 1, "msg": f"批量删除失败：{exc}"}
+    except Exception as exc:
+        print(f"[{now_text()}] account_rows.batch_delete | owner={owner} count={len(row_indices)} EXC={exc}")
+        return {"code": 1, "msg": f"批量删除失败：{exc}"}
     finally:
         conn.close()
 
@@ -15352,6 +15472,7 @@ def _build_auto_switch_bundle_for_device(
         mat_fetch_n = int(mat_fetch)
     except (TypeError, ValueError):
         mat_fetch_n = 3
+    pc_service_url = _load_device_pc_service_url(str(device_id or "").strip())
     return {
         "session_id": str(session_id or "").strip(),
         "revision": int(revision or 0),
@@ -15363,6 +15484,7 @@ def _build_auto_switch_bundle_for_device(
         "owner_username": owner,
         "device_alias": alias_key,
         "device_id": str(device_id or "").strip(),
+        "pc_service_url": pc_service_url,
         "run_config": {
             "run_mode": mode,
             "active_template": str(active_template or ""),

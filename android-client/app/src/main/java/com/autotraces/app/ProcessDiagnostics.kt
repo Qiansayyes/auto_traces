@@ -17,7 +17,7 @@ import java.util.Locale
 
 /**
  * 进程存活与卡点诊断：周期性心跳、OCR 挂起观测、崩溃/OOM 前快照落盘。
- * 进程被杀后下次冷启会打出「上次心跳/上次崩溃」便于对照日志断档。
+ * 进程被杀后下次冷启会打出「上次崩溃」便于对照日志断档；心跳快照仅落盘不打日志。
  */
 object ProcessDiagnostics {
     private const val HEARTBEAT_INTERVAL_MS = 30_000L
@@ -69,25 +69,19 @@ object ProcessDiagnostics {
     fun noteProcessColdStart() {
         processStartElapsedMs = SystemClock.elapsedRealtime()
         val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
-        val lastHeartbeat = PrefsStore.getLastProcessHeartbeatLine()
         val lastCrash = PrefsStore.getLastProcessCrashLine()
         LogCenter.op(
             alias,
             "[进程启动] pid=${Process.myPid()} 时间=${formatter.format(Date())}",
         )
-        if (!lastHeartbeat.isNullOrBlank()) {
-            LogCenter.op(alias, "[进程恢复] 上次心跳：$lastHeartbeat")
-        }
         if (!lastCrash.isNullOrBlank()) {
             LogCenter.op(alias, "[进程恢复] 上次崩溃：$lastCrash")
         }
     }
 
     fun noteTrimMemory(level: Int) {
-        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
-        val line = buildSnapshotLine(alias, extra = "trimMemory=$level")
+        val line = buildSnapshotLine(extra = "trimMemory=$level")
         PrefsStore.saveLastProcessHeartbeatLine(line)
-        LogCenter.op(alias, "[内存压力] $line")
     }
 
     fun startHeartbeat() {
@@ -103,22 +97,14 @@ object ProcessDiagnostics {
     fun stopHeartbeat(reason: String) {
         heartbeatJob?.cancel()
         heartbeatJob = null
-        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
-        LogCenter.op(alias, "[进程心跳] 已停止（$reason）")
     }
 
     fun emitHeartbeat(trigger: String = "周期") {
-        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
-        val line = buildSnapshotLine(alias, trigger = trigger)
+        val line = buildSnapshotLine(trigger = trigger)
         PrefsStore.saveLastProcessHeartbeatLine(line)
-        // 周期心跳仅落盘供进程被杀后对照，不打日志避免刷屏。
-        if (trigger != "周期") {
-            LogCenter.op(alias, line)
-        }
     }
 
     private fun buildSnapshotLine(
-        alias: String,
         trigger: String = "周期",
         extra: String? = null,
     ): String {

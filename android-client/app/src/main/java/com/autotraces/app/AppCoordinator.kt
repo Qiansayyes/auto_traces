@@ -699,7 +699,7 @@ object AppCoordinator {
 
         logAutoSwitchRecoverySnapshot(alias, reason)
         ProcessDiagnostics.emitHeartbeat("恢复:$reason")
-        autoSwitchLocalScheduler.requestImmediateTick(forceLog = true)
+        autoSwitchLocalScheduler.requestImmediateTick(recoveryTick = true)
         maybeStartGrowthInAutoSwitchIdle(reason)
     }
 
@@ -4836,7 +4836,39 @@ object AppCoordinator {
             val label = if (!wasSchedulerRunning && startSchedulerIfStopped) "enter 打包" else "bundle 更新"
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
         }
+        maybeSyncPcServiceUrlFromBundle(alias, bundle)
         return accountsEquivalent
+    }
+
+    /** bundle 携带云端 PC 地址时：仅在与本机不一致时保存并注册，相同则完全跳过。 */
+    private fun maybeSyncPcServiceUrlFromBundle(alias: String, bundle: AutoSwitchBundle) {
+        val remoteUrl = bundle.pc_service_url?.trim()?.trimEnd('/').orEmpty()
+        if (remoteUrl.isBlank()) return
+        if (
+            !remoteUrl.startsWith("http://", ignoreCase = true) &&
+            !remoteUrl.startsWith("https://", ignoreCase = true)
+        ) {
+            return
+        }
+        val currentUrl = CompanionApi.windowsBaseUrl(appContext).trim().trimEnd('/')
+        if (currentUrl == remoteUrl) return
+        scope.launch {
+            LogCenter.op(alias, "【自动切号】PC 地址与云端不一致，同步：$currentUrl → $remoteUrl")
+            val result = VideoDedSettingsRegistrar.saveAndRegister(
+                appContext,
+                input = VideoDedSettingsRegistrar.SaveInput(windowsUrl = remoteUrl),
+                logSave = true,
+                logRegistration = true,
+            )
+            if (result.error == null) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】PC 地址已同步（pcAdbState=${result.pcAdbState.ifBlank { "—" }}）",
+                )
+            } else {
+                LogCenter.op(alias, "【自动切号】PC 地址同步失败：${result.error?.message}")
+            }
+        }
     }
 
     private fun beijingMinuteOfDayForBundle(): Int {
@@ -5310,12 +5342,16 @@ object AppCoordinator {
                 "[OP][$opId] 收到${sessionLabel}指令，开始 teamwork Videos 引流会话"
             LogCenter.op(alias, mutualLogLine)
             if (isAutoSwitchMutual) {
+                val mutualSlotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
                 AutoSwitchLocalPlanStore.beginActiveMutual(
-                    slotKey = payload?.auto_switch_slot_key?.trim().orEmpty(),
+                    slotKey = mutualSlotKey,
                     opId = opId,
                     accountUsername = payload?.account_username?.trim().orEmpty(),
                     opType = op.op_type,
                 )
+                if (mutualSlotKey.isNotBlank()) {
+                    PrefsStore.setAutoSwitchMutualSlotKey(mutualSlotKey)
+                }
             } else {
                 AutoSwitchLocalPlanStore.clearActiveMutual()
             }
@@ -7009,17 +7045,10 @@ object AppCoordinator {
                     "互点切换任务结束：requested=${PrefsStore.isMutualClickRequested()} pending=${PrefsStore.isMutualClickPending()} hardStop=${PrefsStore.isHardStopRequested()} localStatus=${PrefsStore.getLocalStatus()}",
                 )
             } finally {
-                val autoSwitchMutualSk = AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim().orEmpty()
-                    .ifBlank { PrefsStore.getAutoSwitchMutualSlotKey()?.trim().orEmpty() }
-                if (PrefsStore.isAutoSwitchAutonomousMode() && autoSwitchMutualSk.isNotBlank()) {
-                    val completed = switchResult.isNotBlank() &&
-                        !switchResult.contains("跳过") &&
-                        !switchResult.contains("未就绪") &&
-                        !switchResult.contains("仍未登录") &&
-                        !switchResult.contains("异常")
-                    autoSwitchLocalScheduler.notifyMutualOutcome(autoSwitchMutualSk, completed)
-                    PrefsStore.clearMutualClickState()
+                if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                    autoSwitchLocalScheduler.finalizeMutualTrafficOutcome(switchResult)
                 }
+                PrefsStore.clearMutualClickState()
                 val wasQueued = PrefsStore.isPublishPostQueuedAfterMutual()
                 PrefsStore.setPublishPostQueuedAfterMutual(false)
                 if (wasQueued && PrefsStore.isPublishPostRequested() && PrefsStore.isPublishPostPending()) {
@@ -7034,11 +7063,22 @@ object AppCoordinator {
                         trigger = "after_mutual_exclusive",
                     )
                 }
+                if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                    releaseInsertionPrepExclusiveIfIdle("互点切换结束")
+                }
                 ExecutionScope.exit()
             }
         }.also { job ->
             job.invokeOnCompletion {
-                if (!PrefsStore.isHardStopRequested() && !manuallyPaused && PrefsStore.getLocalStatus() == "running") {
+                if (PrefsStore.isHardStopRequested() || manuallyPaused) return@invokeOnCompletion
+                if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                    if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+                        LogCenter.op(alias, "【自动切号】互点切换结束：登录保障恢复中，不恢复涨粉")
+                        return@invokeOnCompletion
+                    }
+                    // 互点启动时 pauseGrowth 会把 localStatus 置 paused；由 maybeStart 内 release 抢占再恢复
+                    maybeStartGrowthInAutoSwitchIdle("互点切换结束")
+                } else if (PrefsStore.getLocalStatus() == "running") {
                     if (queueRunMode() == ServerRunMode.MUTUAL) {
                         LogCenter.op(alias, "互点引流会话结束，云端队列模式为互点，将继续下一轮")
                     } else {

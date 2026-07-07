@@ -119,20 +119,55 @@ class AutoSwitchLocalScheduler(
         maybeResumePendingCutSwitch()
     }
 
+    /** 互点收尾：从 plan / prefs / in-flight / RUNNING 槽位多路解析 slot，避免 early clear 导致状态泄漏。 */
+    fun resolveMutualOutcomeSlotKey(): String {
+        AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        PrefsStore.getAutoSwitchMutualSlotKey()?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        insertionInflight
+            ?.takeIf { it.second == "mutual_traffic" }
+            ?.first?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        return AutoSwitchLocalPlanStore.get()?.slots
+            ?.firstOrNull { it.mutual_traffic.state == PlanStepState.RUNNING }
+            ?.slot_key?.trim().orEmpty()
+    }
+
+    fun finalizeMutualTrafficOutcome(switchResult: String) {
+        val completed = mutualSwitchResultCompleted(switchResult)
+        val sk = resolveMutualOutcomeSlotKey()
+        if (sk.isNotBlank()) {
+            notifyMutualOutcome(sk, completed)
+            return
+        }
+        AutoSwitchLocalPlanStore.get()?.slots.orEmpty()
+            .filter { it.mutual_traffic.state == PlanStepState.RUNNING }
+            .forEach { notifyMutualOutcome(it.slot_key, completed) }
+        insertionInflight?.takeIf { it.second == "mutual_traffic" }?.let { insertionInflight = null }
+    }
+
+    private fun mutualSwitchResultCompleted(switchResult: String): Boolean {
+        val msg = switchResult.trim()
+        if (msg.isBlank()) return false
+        if (msg.contains("跳过") || msg.contains("未就绪") || msg.contains("仍未登录") || msg.contains("异常")) {
+            return false
+        }
+        return msg.contains("已执行 teamwork Videos 互动")
+    }
+
     @Volatile
-    private var forceLogNextTick = false
+    private var recoveryTickNext = false
 
     fun hasBundleLoaded(): Boolean = bundle != null
 
-    fun requestImmediateTick(forceLog: Boolean = false) {
+    fun requestImmediateTick(recoveryTick: Boolean = false) {
         scope.launch {
-            if (forceLog) forceLogNextTick = true
+            if (recoveryTick) recoveryTickNext = true
             try {
                 runCatching { tickOnce() }.onFailure { err ->
                     LogCenter.op(alias, "【自动切号】即时调度 tick 异常：${err.message}")
                 }
             } finally {
-                forceLogNextTick = false
+                recoveryTickNext = false
             }
         }
     }
@@ -230,6 +265,9 @@ class AutoSwitchLocalScheduler(
     override suspend fun enqueueInsertion(op: DeviceOp, slotKey: String, kind: String) {
         beginExclusiveEnqueue("插入操作")
         markInsertionInflight(slotKey, kind)
+        if (kind == "mutual_traffic") {
+            PrefsStore.setAutoSwitchMutualSlotKey(slotKey.trim())
+        }
         AutoSwitchLocalPlanStore.markInsertionState(slotKey, kind, PlanStepState.RUNNING)
         opQueue.add(op)
     }
@@ -536,11 +574,11 @@ class AutoSwitchLocalScheduler(
         }
 
         val minuteOfDay = beijingMinuteOfDay()
-        if (forceLogNextTick) {
+        if (recoveryTickNext) {
             AutoSwitchLocalPlanStore.abandonExpiredIncompleteCutSwitches(scheduleDate, minuteOfDay)
         }
         val currentSlotEntry = AutoSwitchLocalPlanStore.resolveSlotForMinute(plan, scheduleDate, minuteOfDay)
-        val incompleteRecovery = if (forceLogNextTick) {
+        val incompleteRecovery = if (recoveryTickNext) {
             findRecoverableIncompleteCutSwitch(currentSlotEntry)
         } else {
             null
@@ -947,32 +985,20 @@ class AutoSwitchLocalScheduler(
     }
 
     private fun logCutSwitchSkip(reason: String) {
-        if (forceLogNextTick) {
-            if (alias.isNotBlank()) {
-                LogCenter.op(alias, "【自动切号】切号暂缓：$reason")
-            }
-            return
-        }
-        logTickSkipThrottled(reason)
+        logTickSkipThrottled(reason, "【自动切号】切号暂缓：")
     }
 
     private fun logTickSkip(reason: String) {
-        if (forceLogNextTick) {
-            if (alias.isNotBlank()) {
-                LogCenter.op(alias, "【自动切号】调度暂缓：$reason")
-            }
-            return
-        }
         logTickSkipThrottled(reason)
     }
 
-    private fun logTickSkipThrottled(reason: String) {
+    private fun logTickSkipThrottled(reason: String, prefix: String = "【自动切号】调度暂缓：") {
         val now = System.currentTimeMillis()
         if (reason == lastTickSkipLogKey && now - lastTickSkipLogMs < TICK_SKIP_LOG_COOLDOWN_MS) return
         lastTickSkipLogKey = reason
         lastTickSkipLogMs = now
         if (alias.isNotBlank()) {
-            LogCenter.op(alias, "【自动切号】调度暂缓：$reason")
+            LogCenter.op(alias, "$prefix$reason")
         }
     }
 

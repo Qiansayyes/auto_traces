@@ -1923,6 +1923,23 @@ button.danger {
   min-height: 0 !important;
 }
 
+.account-editor-table__select {
+  width: 36px;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.account-editor-table__select input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+
+#accountRecordsBatchDeleteBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .failure-reports-card {
   margin-top: 8px;
 }

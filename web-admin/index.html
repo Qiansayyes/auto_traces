@@ -93,6 +93,7 @@
       <nav id="mainNav">
         <div class="nav-group-title">设备管理模块</div>
         <button class="nav-item active" data-section="overview">设备概览</button>
+        <button class="nav-item" data-section="pc-service">PC投屏地址</button>
         <button class="nav-item" data-section="smart-template">智能模板</button>
         <button class="nav-item" data-section="config">运行配置</button>
         <div class="nav-group-title">账号管理模块</div>
@@ -235,6 +236,67 @@
             </div>
           </div>
           <pre id="deviceExecLogs" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin-top:10px;">暂无日志</pre>
+        </div>
+      </section>
+
+      <section id="pc-service" class="panel">
+        <header>
+          <h2>PC投屏地址</h2>
+          <p>批量下发 PC 伴侣服务地址（如 <code>http://192.168.1.6:5088</code>）；设备轮询云端任务后会自动保存并重新注册。</p>
+        </header>
+        <div class="panel-card">
+          <div class="field" style="max-width:520px;">
+            <label for="pcServiceUrlInput">PC 服务地址</label>
+            <input id="pcServiceUrlInput" type="text" class="ui-input" placeholder="http://192.168.1.6:5088" autocomplete="off" />
+            <div class="hint" style="margin-top:6px;">须以 <code>http://</code> 或 <code>https://</code> 开头；下发后写入数据库并排队 <code>set_pc_service_url</code> 设备任务。</div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px;">
+            <button id="pcServiceApplyBtn" type="button" class="primary">下发到所选设备</button>
+            <button id="pcServiceSelectPageBtn" type="button" class="ghost">全选本页</button>
+            <button id="pcServiceClearSelectionBtn" type="button" class="ghost">取消选择</button>
+            <button id="pcServiceRefreshBtn" type="button" class="ghost">刷新列表</button>
+            <span id="pcServiceSelectionHint" class="hint">已选 0 台</span>
+          </div>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <div class="toolbar-filters" style="margin-bottom:10px;">
+            <div class="search-input search-input--compact">
+              <span class="search-icon" aria-hidden="true"></span>
+              <input id="pcServiceAliasFilter" type="text" class="ui-input" placeholder="按别名筛选（本页）" />
+            </div>
+            <select id="pcServiceGroupSelect" class="ui-select ui-select--toolbar toolbar-group-select" title="按设备分组筛选">
+              <option value="">全部分组</option>
+              <option value="__ungrouped__">未分组</option>
+            </select>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>设备 ID</th>
+                  <th>别名</th>
+                  <th>分组</th>
+                  <th>状态</th>
+                  <th>当前 PC 地址</th>
+                </tr>
+              </thead>
+              <tbody id="pcServiceTableBody">
+                <tr><td colspan="6" style="padding:10px;color:#666;">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pager-bar" style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <button id="pcServicePrevPageBtn" type="button" class="ghost">上一页</button>
+            <span id="pcServicePageInfo" class="hint">第 1 / 1 页</span>
+            <button id="pcServiceNextPageBtn" type="button" class="ghost">下一页</button>
+            <label class="pager-size-label" for="pcServicePageSizeInput">每页</label>
+            <input id="pcServicePageSizeInput" type="number" class="pager-size-input" min="1" max="500" value="50" title="单页设备条数" />
+          </div>
+        </div>
+        <div class="panel-card" style="margin-top:12px;">
+          <h3 style="margin:0 0 8px;">下发结果</h3>
+          <pre id="pcServiceResultLog" style="white-space:pre-wrap;max-height:220px;overflow:auto;margin:0;">暂无记录</pre>
         </div>
       </section>
 
@@ -684,6 +746,7 @@
             </div>
           </div>
           <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
             <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
             <button id="accountRecordsNextPageBtn" type="button" class="ghost">下一页</button>
@@ -1570,6 +1633,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260703-1"></script>
+  <script src="app.js?v=20260707-1"></script>
 </body>
 </html>

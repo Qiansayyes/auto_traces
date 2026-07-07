@@ -59,6 +59,20 @@ const overviewPrevPageBtn = document.getElementById("overviewPrevPageBtn");
 const overviewNextPageBtn = document.getElementById("overviewNextPageBtn");
 const overviewPageInfoEl = document.getElementById("overviewPageInfo");
 const overviewPageSizeInput = document.getElementById("overviewPageSizeInput");
+const pcServiceUrlInput = document.getElementById("pcServiceUrlInput");
+const pcServiceApplyBtn = document.getElementById("pcServiceApplyBtn");
+const pcServiceSelectPageBtn = document.getElementById("pcServiceSelectPageBtn");
+const pcServiceClearSelectionBtn = document.getElementById("pcServiceClearSelectionBtn");
+const pcServiceRefreshBtn = document.getElementById("pcServiceRefreshBtn");
+const pcServiceSelectionHint = document.getElementById("pcServiceSelectionHint");
+const pcServiceAliasFilter = document.getElementById("pcServiceAliasFilter");
+const pcServiceGroupSelect = document.getElementById("pcServiceGroupSelect");
+const pcServiceTableBody = document.getElementById("pcServiceTableBody");
+const pcServicePrevPageBtn = document.getElementById("pcServicePrevPageBtn");
+const pcServiceNextPageBtn = document.getElementById("pcServiceNextPageBtn");
+const pcServicePageInfoEl = document.getElementById("pcServicePageInfo");
+const pcServicePageSizeInput = document.getElementById("pcServicePageSizeInput");
+const pcServiceResultLog = document.getElementById("pcServiceResultLog");
 const backupArchivePageSizeInput = document.getElementById("backupArchivePageSizeInput");
 const backupArchivePrevPageBtn = document.getElementById("backupArchivePrevPageBtn");
 const backupArchiveNextPageBtn = document.getElementById("backupArchiveNextPageBtn");
@@ -259,6 +273,7 @@ const accountRecordsPrevPageBtn = document.getElementById("accountRecordsPrevPag
 const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPageBtn");
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
+const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
@@ -280,12 +295,19 @@ let accountRecordsSearchQuery = "";
 let accountRecordsSearchField = "";
 let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
+/** 账号记录批量删除勾选，键为数据库 row_index */
+const accountRecordsSelectedRowIndexes = new Set();
+const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
 let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
 let customDeviceGroupNames = [];
 let currentDeviceGroupFilter = "";
 let currentOverviewPage = 1;
 let overviewDevicesTotal = 0;
+let pcServiceDevices = {};
+let pcServiceDevicesTotal = 0;
+let currentPcServicePage = 1;
+let pcServiceAliasFilterText = "";
 let currentBackupArchivePage = 1;
 let backupArchiveAliasTotal = 0;
 const DEFAULT_OVERVIEW_PAGE_SIZE = 20;
@@ -704,6 +726,10 @@ const AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY = "auto_traces_auto_switch_session
 const DEVICE_GROUP_CUSTOM_KEY = "auto_traces_device_group_custom_v1";
 const OVERVIEW_PAGE_KEY = "auto_traces_overview_page_v1";
 const OVERVIEW_PAGE_SIZE_KEY = "auto_traces_overview_page_size_v1";
+const PC_SERVICE_PAGE_KEY = "auto_traces_pc_service_page_v1";
+const PC_SERVICE_PAGE_SIZE_KEY = "auto_traces_pc_service_page_size_v1";
+const DEFAULT_PC_SERVICE_PAGE_SIZE = 50;
+const MAX_PC_SERVICE_PAGE_SIZE = 500;
 const BACKUP_ARCHIVE_PAGE_KEY = "auto_traces_backup_archive_page_v1";
 const BACKUP_ARCHIVE_PAGE_SIZE_KEY = "auto_traces_backup_archive_page_size_v1";
 const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1";
@@ -1703,6 +1729,13 @@ async function switchSection(id, options = {}) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
+  if (nextSectionId === "pc-service") {
+    try {
+      await loadPcServiceDevices();
+    } catch (_) {
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
+    }
+  }
   // 进入 follower_queue 页面时主动刷新表格与日志，避免必须翻页后才看到数据。
   if (nextSectionId === "cv-access-data") {
     try {
@@ -2546,17 +2579,19 @@ function selectedDeviceIdsByStatus(statuses = []) {
 }
 
 function getActiveDeviceGroupFilter() {
-  const fromOverview = String(deviceGroupSelect?.value ?? "").trim();
+  const fromSelect = String(deviceGroupSelect?.value ?? pcServiceGroupSelect?.value ?? "").trim();
   const stored = String(localStorage.getItem(DEVICE_GROUP_FILTER_KEY) || "").trim();
-  const raw = deviceGroupSelect ? fromOverview : stored;
+  const raw = (deviceGroupSelect || pcServiceGroupSelect) ? fromSelect : stored;
   return raw === "none" ? "" : raw;
 }
 
 function syncDeviceGroupFilterSelects(value = getActiveDeviceGroupFilter()) {
   currentDeviceGroupFilter = String(value || "").trim();
-  if (deviceGroupSelect && deviceGroupSelect.value !== currentDeviceGroupFilter) {
-    deviceGroupSelect.value = currentDeviceGroupFilter;
-  }
+  [deviceGroupSelect, pcServiceGroupSelect].forEach((selectEl) => {
+    if (selectEl && selectEl.value !== currentDeviceGroupFilter) {
+      selectEl.value = currentDeviceGroupFilter;
+    }
+  });
   try {
     localStorage.setItem(DEVICE_GROUP_FILTER_KEY, currentDeviceGroupFilter);
   } catch (_) {}
@@ -2577,6 +2612,7 @@ function populateDeviceGroupFilterOptions(groupNames = []) {
   const html = buildOptions();
   const prev = currentDeviceGroupFilter;
   if (deviceGroupSelect) deviceGroupSelect.innerHTML = html;
+  if (pcServiceGroupSelect) pcServiceGroupSelect.innerHTML = html;
   syncDeviceGroupFilterSelects(prev);
 }
 
@@ -2653,6 +2689,201 @@ function onAccountRecordsPageSizeChanged() {
   persistAccountRecordsPageSize();
   currentAccountRecordsPage = 1;
   renderAccountEditorRows();
+}
+
+function updateAccountRecordsBatchDeleteBtn() {
+  if (!accountRecordsBatchDeleteBtn) return;
+  const count = accountRecordsSelectedRowIndexes.size;
+  accountRecordsBatchDeleteBtn.disabled = count <= 0;
+  accountRecordsBatchDeleteBtn.textContent = count > 0 ? `批量删除 (${count})` : "批量删除";
+}
+
+function setAccountRecordRowSelected(rowIndex, checked) {
+  const ri = Number(rowIndex);
+  if (!Number.isFinite(ri) || ri < 0) return;
+  if (checked) accountRecordsSelectedRowIndexes.add(ri);
+  else accountRecordsSelectedRowIndexes.delete(ri);
+  updateAccountRecordsBatchDeleteBtn();
+}
+
+function clearAccountRecordsSelection() {
+  accountRecordsSelectedRowIndexes.clear();
+  updateAccountRecordsBatchDeleteBtn();
+}
+
+function getVisibleAccountRecordPageRows() {
+  const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
+  let visibleRows = accountFilterUnassignedOnly
+    ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
+    : indexedRows;
+  if (accountRecordsSearchQuery) {
+    visibleRows = visibleRows.filter(({ row }) => accountRecordMatchesSearch(row));
+  }
+  const pageSize = getAccountRecordsPageSize();
+  const start = (currentAccountRecordsPage - 1) * pageSize;
+  return visibleRows.slice(start, start + pageSize);
+}
+
+function syncAccountRecordsPageSelectAllCheckbox() {
+  if (!accountEditorListEl) return;
+  const selectAllEl = accountEditorListEl.querySelector(".account-records-select-all");
+  if (!(selectAllEl instanceof HTMLInputElement)) return;
+  const pageRows = getVisibleAccountRecordPageRows();
+  if (!pageRows.length) {
+    selectAllEl.checked = false;
+    selectAllEl.indeterminate = false;
+    return;
+  }
+  const selectedOnPage = pageRows.filter(({ row, idx }) => {
+    const ri = resolveAccountRowIndex(row, idx);
+    return accountRecordsSelectedRowIndexes.has(ri);
+  }).length;
+  selectAllEl.checked = selectedOnPage === pageRows.length;
+  selectAllEl.indeterminate = selectedOnPage > 0 && selectedOnPage < pageRows.length;
+}
+
+function buildAccountRecordDeletePayload(row, arrayIndex) {
+  const rowIndex = resolveAccountRowIndex(row, arrayIndex);
+  const username = String(row?.username || "").trim();
+  const assignedAlias = normalizeAliasValue(row?.assigned_alias)
+    || backupAliasByUsername.get(username.toLowerCase())
+    || "";
+  return { row_index: rowIndex, username, assigned_alias: assignedAlias };
+}
+
+async function refreshEditorTablesAfterAccountDelete() {
+  try {
+    await loadEditorState();
+  } catch (reloadError) {
+    setStatus(`账号已删除，但刷新列表失败：${humanizeRequestErrorMessage(reloadError)}`, "warning");
+  }
+  renderAccountEditorRows();
+  renderDeviceEditorRows();
+  const backupActive = document.getElementById("backup-section")?.classList.contains("active");
+  if (backupActive) {
+    await loadBackupArchiveRecords();
+  }
+}
+
+function accountRecordStableDeleteKey(row, arrayIndex) {
+  const username = String(row?.username || "").trim().toLowerCase();
+  const email = String(row?.email || "").trim().toLowerCase();
+  if (username) return `u:${username}|e:${email}`;
+  return `ri:${resolveAccountRowIndex(row, arrayIndex)}`;
+}
+
+function findAccountEditorRowByStableKey(key) {
+  for (let idx = 0; idx < (accountEditorRows || []).length; idx += 1) {
+    const row = accountEditorRows[idx];
+    if (accountRecordStableDeleteKey(row, idx) === key) return { row, idx };
+  }
+  return null;
+}
+
+function collectSelectedAccountDeleteSnapshots() {
+  return (accountEditorRows || [])
+    .map((row, idx) => ({ row, idx, rowIndex: resolveAccountRowIndex(row, idx) }))
+    .filter(({ rowIndex }) => accountRecordsSelectedRowIndexes.has(rowIndex))
+    .map(({ row, idx }) => ({
+      key: accountRecordStableDeleteKey(row, idx),
+      username: String(row?.username || "").trim(),
+      assignedAlias: buildAccountRecordDeletePayload(row, idx).assigned_alias
+        || getEffectiveAccountAssignedAlias(row),
+    }));
+}
+
+async function deleteSelectedAccountRecords() {
+  if (!accountRecordsSelectedRowIndexes.size) {
+    setStatus("请先勾选要删除的账号记录", "warning");
+    return;
+  }
+  let pendingSnapshots = collectSelectedAccountDeleteSnapshots();
+  if (!pendingSnapshots.length) {
+    clearAccountRecordsSelection();
+    renderAccountEditorRows();
+    setStatus("勾选的记录已不存在，请刷新后重试", "warning");
+    return;
+  }
+  const withAlias = pendingSnapshots.filter((item) => Boolean(item.assignedAlias));
+  const confirmLines = [`确认批量删除 ${pendingSnapshots.length} 条账号记录？`];
+  const previewNames = pendingSnapshots
+    .map((item) => item.username)
+    .filter(Boolean)
+    .slice(0, 8);
+  if (previewNames.length) {
+    confirmLines.push(`账号：${previewNames.join("、")}${pendingSnapshots.length > previewNames.length ? " …" : ""}`);
+  }
+  if (withAlias.length) {
+    confirmLines.push(`其中 ${withAlias.length} 条已分配别名，将同步删除设备备份档案中的对应数据`);
+  }
+  if (!window.confirm(confirmLines.join("\n"))) return;
+
+  if (accountRecordsBatchDeleteBtn) accountRecordsBatchDeleteBtn.disabled = true;
+  setStatus(`正在批量删除 ${pendingSnapshots.length} 条账号记录...`, "info");
+  let deletedAccounts = 0;
+  let deletedDeviceRows = 0;
+  let notFoundCount = 0;
+  let failedBatches = 0;
+  try {
+    while (pendingSnapshots.length) {
+      await loadEditorState();
+      pendingSnapshots = pendingSnapshots.filter((snap) => findAccountEditorRowByStableKey(snap.key));
+      if (!pendingSnapshots.length) break;
+
+      const batch = [];
+      const batchKeys = [];
+      for (const snap of pendingSnapshots) {
+        if (batch.length >= ACCOUNT_RECORDS_BATCH_DELETE_MAX) break;
+        const matched = findAccountEditorRowByStableKey(snap.key);
+        if (!matched) continue;
+        batch.push(buildAccountRecordDeletePayload(matched.row, matched.idx));
+        batchKeys.push(snap.key);
+      }
+      if (!batch.length) break;
+
+      try {
+        const resp = await request(`${ACCOUNT_ROWS_API}/batch_delete`, {
+          method: "POST",
+          body: JSON.stringify({
+            items: batch.map(({ row_index, username }) => ({ row_index, username })),
+          }),
+        });
+        const batchDeleted = Number(resp?.deleted_accounts || 0);
+        deletedAccounts += batchDeleted;
+        deletedDeviceRows += Number(resp?.deleted_device_rows || 0);
+        notFoundCount += Number(resp?.not_found_count || 0);
+        if (batchDeleted <= 0) break;
+        const deletedKeySet = new Set(batchKeys);
+        pendingSnapshots = pendingSnapshots.filter((snap) => !deletedKeySet.has(snap.key));
+      } catch (chunkError) {
+        failedBatches += 1;
+        if (deletedAccounts > 0) break;
+        throw chunkError;
+      }
+    }
+    clearAccountRecordsSelection();
+    await refreshEditorTablesAfterAccountDelete();
+    if (failedBatches > 0) {
+      setStatus(
+        `部分批次删除失败：已成功 ${deletedAccounts} 条，请刷新后检查剩余记录`,
+        "warning",
+      );
+      return;
+    }
+    if (deletedAccounts <= 0) {
+      setStatus(notFoundCount > 0 ? "所选记录已不存在" : "未删除任何记录", "warning");
+      return;
+    }
+    const parts = [`已批量删除 ${deletedAccounts} 条账号记录`];
+    if (deletedDeviceRows > 0) parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
+    if (notFoundCount > 0) parts.push(`${notFoundCount} 条已不存在`);
+    setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
+  } catch (error) {
+    await refreshEditorTablesAfterAccountDelete();
+    throw error;
+  } finally {
+    updateAccountRecordsBatchDeleteBtn();
+  }
 }
 
 function updateAccountRecordsPagerUi() {
@@ -3060,6 +3291,203 @@ async function applyTemplateToSelectedDevices() {
   }
 }
 
+function normalizePcServiceUrl(raw) {
+  const url = String(raw || "").trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error("PC 服务地址须以 http:// 或 https:// 开头");
+  }
+  return url;
+}
+
+function getPcServicePageSize() {
+  const fromInput = pcServicePageSizeInput?.value;
+  const fromStorage = localStorage.getItem(PC_SERVICE_PAGE_SIZE_KEY);
+  return clampPageSize(fromInput ?? fromStorage, DEFAULT_PC_SERVICE_PAGE_SIZE, MAX_PC_SERVICE_PAGE_SIZE);
+}
+
+function persistPcServicePageSize() {
+  const size = getPcServicePageSize();
+  try {
+    localStorage.setItem(PC_SERVICE_PAGE_SIZE_KEY, String(size));
+  } catch (_) {}
+  if (pcServicePageSizeInput && String(pcServicePageSizeInput.value) !== String(size)) {
+    pcServicePageSizeInput.value = String(size);
+  }
+}
+
+function pcServiceQueryString() {
+  const params = new URLSearchParams();
+  params.set("page", String(currentPcServicePage));
+  params.set("page_size", String(getPcServicePageSize()));
+  const group = getActiveDeviceGroupFilter();
+  if (group) params.set("device_group", group);
+  return params.toString();
+}
+
+function updatePcServicePagerUi() {
+  const pageSize = getPcServicePageSize();
+  const totalPages = Math.max(1, Math.ceil(pcServiceDevicesTotal / pageSize));
+  if (currentPcServicePage > totalPages) currentPcServicePage = totalPages;
+  if (pcServicePageInfoEl) {
+    pcServicePageInfoEl.textContent = `第 ${currentPcServicePage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${pcServiceDevicesTotal} 台`;
+  }
+  if (pcServicePrevPageBtn) pcServicePrevPageBtn.disabled = currentPcServicePage <= 1;
+  if (pcServiceNextPageBtn) pcServiceNextPageBtn.disabled = currentPcServicePage >= totalPages;
+}
+
+function getPcServiceVisibleEntries() {
+  const keyword = String(pcServiceAliasFilterText || "").trim().toLowerCase();
+  return Object.entries(pcServiceDevices || {}).filter(([, info]) => {
+    if (!keyword) return true;
+    const alias = String(info?.alias || "").trim().toLowerCase();
+    return alias.includes(keyword);
+  });
+}
+
+function selectedPcServiceDeviceIds() {
+  return Array.from(document.querySelectorAll(".pc-service-check:checked"))
+    .map((item) => item.dataset.device)
+    .filter(Boolean);
+}
+
+function updatePcServiceSelectionHint() {
+  if (!pcServiceSelectionHint) return;
+  const count = selectedPcServiceDeviceIds().length;
+  pcServiceSelectionHint.textContent = `已选 ${count} 台`;
+}
+
+function bindPcServiceSelection() {
+  pcServiceTableBody?.querySelectorAll(".pc-service-check").forEach((cb) => {
+    cb.addEventListener("change", updatePcServiceSelectionHint);
+  });
+  updatePcServiceSelectionHint();
+}
+
+function renderPcServiceTable(devices = pcServiceDevices) {
+  if (!pcServiceTableBody) return;
+  const entries = getPcServiceVisibleEntries();
+  if (!entries.length) {
+    pcServiceTableBody.innerHTML = '<tr><td colspan="6" style="padding:10px;color:#666;">暂无匹配设备</td></tr>';
+    updatePcServiceSelectionHint();
+    return;
+  }
+  pcServiceTableBody.innerHTML = entries.map(([deviceId, info]) => {
+    const alias = String(info?.alias || "").trim() || "—";
+    const group = displayGroupName(info?.device_group || "");
+    const status = String(info?.status || "offline");
+    const statusClass = escapeHtml(status);
+    const currentUrl = String(info?.pc_service_url || "").trim() || "—";
+    const rowStyle = status === "offline" ? ' style="opacity:.55;"' : "";
+    return `
+      <tr${rowStyle}>
+        <td><input type="checkbox" class="pc-service-check" data-device="${escapeHtml(deviceId)}" /></td>
+        <td>${escapeHtml(deviceId)}</td>
+        <td>${escapeHtml(alias)}</td>
+        <td>${escapeHtml(group)}</td>
+        <td><span class="badge ${statusClass}">${escapeHtml(status)}</span></td>
+        <td style="max-width:280px;word-break:break-all;">${escapeHtml(currentUrl)}</td>
+      </tr>
+    `;
+  }).join("");
+  bindPcServiceSelection();
+}
+
+async function loadPcServiceDevices() {
+  persistPcServicePageSize();
+  const data = await request(`/api/admin/overview?${pcServiceQueryString()}`);
+  pcServiceDevices = (data?.devices && typeof data.devices === "object") ? data.devices : {};
+  pcServiceDevicesTotal = Number(data?.devices_total ?? Object.keys(pcServiceDevices).length) || 0;
+  if (Number.isFinite(Number(data?.page))) currentPcServicePage = Number(data.page) || 1;
+  if (Array.isArray(data?.device_groups)) {
+    populateDeviceGroupFilterOptions(data.device_groups);
+  }
+  updatePcServicePagerUi();
+  renderPcServiceTable(pcServiceDevices);
+}
+
+function appendPcServiceResultLog(text) {
+  if (!pcServiceResultLog) return;
+  const line = String(text || "").trim();
+  if (!line) return;
+  if (pcServiceResultLog.textContent === "暂无记录") {
+    pcServiceResultLog.textContent = line;
+  } else {
+    pcServiceResultLog.textContent = `${pcServiceResultLog.textContent}\n${line}`;
+  }
+  pcServiceResultLog.scrollTop = pcServiceResultLog.scrollHeight;
+}
+
+async function requestPcServiceBatchSet(payload) {
+  const url = await buildApiUrl("/api/admin/device_pc_service/batch_set");
+  const headers = { "Content-Type": "application/json" };
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+  const data = await parseFetchJsonResponse(response);
+  return { ok: response.ok, data };
+}
+
+async function applyPcServiceUrlToSelectedDevices() {
+  let windowsBaseUrl = "";
+  try {
+    windowsBaseUrl = normalizePcServiceUrl(pcServiceUrlInput?.value);
+  } catch (error) {
+    setStatus(error.message || "PC 服务地址无效", "warning");
+    return;
+  }
+  const selectedIds = selectedPcServiceDeviceIds();
+  if (!selectedIds.length) {
+    setStatus("请先勾选要下发的设备", "warning");
+    return;
+  }
+  const items = selectedIds.map((deviceId) => {
+    const info = pcServiceDevices?.[deviceId] || {};
+    return {
+      device_id: deviceId,
+      alias: String(info?.alias || "").trim(),
+      windows_base_url: windowsBaseUrl,
+    };
+  });
+  setStatus(`正在下发 PC 地址到 ${items.length} 台设备...`, "info");
+  if (pcServiceApplyBtn) pcServiceApplyBtn.disabled = true;
+  try {
+    const { ok, data } = await requestPcServiceBatchSet({ items });
+    const results = Array.isArray(data?.results) ? data.results : [];
+    const enqueued = Number(data?.enqueued || 0);
+    const failed = Number(data?.failed || 0);
+    const stamp = new Date().toLocaleString();
+    appendPcServiceResultLog(`[${stamp}] ${data?.msg || "下发完成"} → ${windowsBaseUrl}`);
+    results.forEach((row) => {
+      const alias = String(row?.alias || "").trim();
+      const label = alias ? `${alias} (${row.device_id})` : String(row.device_id || "");
+      const status = Number(row?.code) === 0 ? "成功" : "失败";
+      appendPcServiceResultLog(`  · ${label}: ${status}${row?.msg ? ` — ${row.msg}` : ""}`);
+    });
+    if (!ok || Number(data?.code) !== 0) {
+      setStatus(data?.msg || "下发失败", failed > 0 && enqueued > 0 ? "warning" : "error");
+    } else if (failed > 0) {
+      setStatus(`下发完成：成功 ${enqueued} 台，失败 ${failed} 台`, "warning");
+    } else {
+      setStatus(`已入队 ${enqueued} 台，设备轮询后将自动更新`, "success");
+    }
+    await loadPcServiceDevices();
+  } catch (error) {
+    setStatus(humanizeRequestErrorMessage(error) || "下发失败", "error");
+  } finally {
+    if (pcServiceApplyBtn) pcServiceApplyBtn.disabled = false;
+  }
+}
+
+function onPcServicePageSizeChanged() {
+  persistPcServicePageSize();
+  currentPcServicePage = 1;
+  void loadPcServiceDevices().catch(() => {});
+}
+
 const MODE_DEFAULT_CONFIG_PAYLOADS = {
   growth: {
     break_min: 10,
@@ -3339,6 +3767,9 @@ async function handleRefresh() {
     setStatus("刷新中...", "info");
     await loadUserRuntimeConfig();
     await loadOverview();
+    if (document.getElementById("pc-service")?.classList.contains("active")) {
+      await loadPcServiceDevices();
+    }
     setStatus("已刷新概览", "success");
   } catch (error) {
     setStatus(error.message || "刷新失败", "error");
@@ -7198,19 +7629,81 @@ aliasFilterInput.addEventListener("input", () => {
 function onDeviceGroupFilterChanged(event) {
   const target = event?.target;
   let value;
-  if (target === deviceGroupSelect) {
-    value = String(deviceGroupSelect.value ?? "").trim();
+  if (target === deviceGroupSelect || target === pcServiceGroupSelect) {
+    value = String(target.value ?? "").trim();
   } else {
     value = getActiveDeviceGroupFilter();
   }
   syncDeviceGroupFilterSelects(value);
   currentOverviewPage = 1;
+  currentPcServicePage = 1;
   void loadOverview().catch(() => {});
+  if (document.getElementById("pc-service")?.classList.contains("active")) {
+    void loadPcServiceDevices().catch(() => {});
+  }
 }
 if (deviceGroupSelect) {
   const storedFilter = String(localStorage.getItem(DEVICE_GROUP_FILTER_KEY) || "").trim();
   if (storedFilter) syncDeviceGroupFilterSelects(storedFilter);
   deviceGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
+}
+if (pcServiceGroupSelect) {
+  pcServiceGroupSelect.addEventListener("change", onDeviceGroupFilterChanged);
+}
+if (pcServiceApplyBtn) {
+  pcServiceApplyBtn.addEventListener("click", () => {
+    applyPcServiceUrlToSelectedDevices().catch((error) => {
+      setStatus(humanizeRequestErrorMessage(error) || "下发失败", "error");
+    });
+  });
+}
+if (pcServiceRefreshBtn) {
+  pcServiceRefreshBtn.addEventListener("click", () => {
+    loadPcServiceDevices().catch((error) => {
+      setStatus(humanizeRequestErrorMessage(error) || "刷新失败", "error");
+    });
+  });
+}
+if (pcServiceSelectPageBtn) {
+  pcServiceSelectPageBtn.addEventListener("click", () => {
+    pcServiceTableBody?.querySelectorAll(".pc-service-check").forEach((cb) => {
+      cb.checked = true;
+    });
+    updatePcServiceSelectionHint();
+  });
+}
+if (pcServiceClearSelectionBtn) {
+  pcServiceClearSelectionBtn.addEventListener("click", () => {
+    pcServiceTableBody?.querySelectorAll(".pc-service-check").forEach((cb) => {
+      cb.checked = false;
+    });
+    updatePcServiceSelectionHint();
+  });
+}
+if (pcServiceAliasFilter) {
+  pcServiceAliasFilter.addEventListener("input", () => {
+    pcServiceAliasFilterText = String(pcServiceAliasFilter.value || "");
+    renderPcServiceTable(pcServiceDevices);
+  });
+}
+if (pcServicePrevPageBtn) {
+  pcServicePrevPageBtn.addEventListener("click", () => {
+    if (currentPcServicePage <= 1) return;
+    currentPcServicePage -= 1;
+    void loadPcServiceDevices().catch(() => {});
+  });
+}
+if (pcServiceNextPageBtn) {
+  pcServiceNextPageBtn.addEventListener("click", () => {
+    const totalPages = Math.max(1, Math.ceil(pcServiceDevicesTotal / getPcServicePageSize()));
+    if (currentPcServicePage >= totalPages) return;
+    currentPcServicePage += 1;
+    void loadPcServiceDevices().catch(() => {});
+  });
+}
+if (pcServicePageSizeInput) {
+  pcServicePageSizeInput.addEventListener("change", onPcServicePageSizeChanged);
+  pcServicePageSizeInput.addEventListener("blur", onPcServicePageSizeChanged);
 }
 if (autoSwitchSessionSummariesAliasSelect) {
   const storedAlias = String(localStorage.getItem(AUTO_SWITCH_SESSION_SUMMARIES_ALIAS_KEY) || "").trim();
@@ -9214,6 +9707,11 @@ function restoreUiStateSnapshot() {
   if (backupArchivePageSizeInput) {
     backupArchivePageSizeInput.value = String(clampPageSize(storedBackupSize, DEFAULT_BACKUP_ARCHIVE_PAGE_SIZE, MAX_BACKUP_ARCHIVE_PAGE_SIZE));
   }
+  const storedPcServiceSize = localStorage.getItem(PC_SERVICE_PAGE_SIZE_KEY);
+  if (pcServicePageSizeInput) {
+    pcServicePageSizeInput.value = String(clampPageSize(storedPcServiceSize, DEFAULT_PC_SERVICE_PAGE_SIZE, MAX_PC_SERVICE_PAGE_SIZE));
+  }
+  currentPcServicePage = Math.max(1, Number(localStorage.getItem(PC_SERVICE_PAGE_KEY) || 1) || 1);
   syncDeviceGroupFilterSelects(String(localStorage.getItem(DEVICE_GROUP_FILTER_KEY) || "").trim());
   customDeviceGroupNames = loadCustomDeviceGroupNames();
   if (dbSearchFieldSelect) dbSearchFieldSelect.value = "";
@@ -9273,6 +9771,13 @@ function accountEditorCellSelect(idx, field, innerHtml) {
 
 function renderAccountEditorRows() {
   if (!accountEditorListEl) return;
+  const existingRowIndexes = new Set(
+    (accountEditorRows || []).map((row, idx) => resolveAccountRowIndex(row, idx)),
+  );
+  accountRecordsSelectedRowIndexes.forEach((ri) => {
+    if (!existingRowIndexes.has(ri)) accountRecordsSelectedRowIndexes.delete(ri);
+  });
+  updateAccountRecordsBatchDeleteBtn();
   const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
   let visibleRows = accountFilterUnassignedOnly
     ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
@@ -9310,7 +9815,12 @@ function renderAccountEditorRows() {
         `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`
       );
       const displayNum = start + localIdx + 1;
+      const dbRowIndex = resolveAccountRowIndex(row, idx);
+      const rowChecked = accountRecordsSelectedRowIndexes.has(dbRowIndex);
       return `<tr>
+        <td class="account-editor-table__select">
+          <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量删除"${rowChecked ? " checked" : ""} />
+        </td>
         <td class="account-editor-table__num">${displayNum}</td>
         <td>${accountEditorCellInput(idx, "username", row.username)}</td>
         <td>${accountEditorCellInput(idx, "password", row.password)}</td>
@@ -9333,6 +9843,9 @@ function renderAccountEditorRows() {
         <table class="account-editor-table">
           <thead>
             <tr>
+              <th class="account-editor-table__select">
+                <input type="checkbox" class="account-records-select-all" title="全选本页" />
+              </th>
               <th>#</th>
               <th>username</th>
               <th>password</th>
@@ -9353,6 +9866,7 @@ function renderAccountEditorRows() {
           <tbody>${bodyHtml}</tbody>
         </table>
       </div>`;
+    syncAccountRecordsPageSelectAllCheckbox();
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
     const msg = (error && (error.message || error.toString?.())) || "unknown";
@@ -9687,10 +10201,9 @@ async function deleteEditorRow(scope, index) {
   if (scope === "account") {
     const deletedRow = accountEditorRows[index];
     if (!deletedRow) return;
-    const deletedUsername = String(deletedRow?.username || "").trim();
-    const deletedAlias = normalizeAliasValue(deletedRow?.assigned_alias)
-      || backupAliasByUsername.get(deletedUsername.toLowerCase())
-      || "";
+    const payload = buildAccountRecordDeletePayload(deletedRow, index);
+    const deletedUsername = payload.username;
+    const deletedAlias = payload.assigned_alias;
     const confirmLines = ["确认删除该账号记录？"];
     if (deletedUsername) confirmLines.push(`账号：${deletedUsername}`);
     if (deletedAlias) {
@@ -9700,24 +10213,12 @@ async function deleteEditorRow(scope, index) {
     try {
       const resp = await request(`${ACCOUNT_ROWS_API}/delete`, {
         method: "POST",
-        body: JSON.stringify({
-          row_index: resolveAccountRowIndex(deletedRow, index),
-          username: deletedUsername,
-          assigned_alias: deletedAlias,
-        }),
+        body: JSON.stringify(payload),
       });
       const cleanedBackup = Number(resp?.deleted_device_rows || 0);
-      try {
-        await loadEditorState();
-      } catch (reloadError) {
-        setStatus(`账号已删除，但刷新列表失败：${humanizeRequestErrorMessage(reloadError)}`, "warning");
-      }
-      renderAccountEditorRows();
-      renderDeviceEditorRows();
-      const backupActive = document.getElementById("backup-section")?.classList.contains("active");
-      if (backupActive) {
-        await loadBackupArchiveRecords();
-      }
+      accountRecordsSelectedRowIndexes.delete(payload.row_index);
+      updateAccountRecordsBatchDeleteBtn();
+      await refreshEditorTablesAfterAccountDelete();
       if (deletedUsername && cleanedBackup > 0) {
         setStatus(`已删除账号 ${deletedUsername}，并同步清理 ${cleanedBackup} 条设备备份档案`, "success");
       } else if (deletedUsername) {
@@ -9726,9 +10227,7 @@ async function deleteEditorRow(scope, index) {
         setStatus("账号记录已删除", "success");
       }
     } catch (error) {
-      await loadEditorState();
-      renderAccountEditorRows();
-      renderDeviceEditorRows();
+      await refreshEditorTablesAfterAccountDelete();
       throw error;
     }
   } else {
@@ -10594,7 +11093,34 @@ if (backupArchiveSearchInput) {
     runBackupArchiveSearch();
   });
 }
+if (accountRecordsBatchDeleteBtn) {
+  accountRecordsBatchDeleteBtn.addEventListener("click", () => {
+    deleteSelectedAccountRecords().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "批量删除失败", "error"));
+  });
+}
 if (accountEditorListEl) {
+  accountEditorListEl.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.classList.contains("account-records-row-select")) {
+      event.stopPropagation();
+      setAccountRecordRowSelected(target.dataset.accountRowIndex, target.checked);
+      syncAccountRecordsPageSelectAllCheckbox();
+      return;
+    }
+    if (target.classList.contains("account-records-select-all")) {
+      event.stopPropagation();
+      const checked = target.checked;
+      getVisibleAccountRecordPageRows().forEach(({ row, idx }) => {
+        setAccountRecordRowSelected(resolveAccountRowIndex(row, idx), checked);
+      });
+      accountEditorListEl.querySelectorAll(".account-records-row-select").forEach((el) => {
+        if (el instanceof HTMLInputElement) el.checked = checked;
+      });
+      target.indeterminate = false;
+      return;
+    }
+  });
   accountEditorListEl.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;

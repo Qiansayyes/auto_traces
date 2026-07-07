@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,13 +26,15 @@ import kotlin.coroutines.resumeWithException
  */
 object MlKitOcrGate {
     private val mutex = Mutex()
-    private val recognizer by lazy {
-        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    }
+    private val recognizerLock = Any()
+
+    @Volatile
+    private var recognizer: TextRecognizer? = null
+
     private val warnScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private const val MIN_INTERVAL_MS = 250L
-    /** 单次 OCR 最长等待；超时后打日志并抛 [OcrRecognizeTimeoutException]（native 可能仍在跑）。 */
+    /** 单次 OCR 最长等待；超时后 close 并重建 [TextRecognizer]，再抛 [OcrRecognizeTimeoutException]。 */
     const val RECOGNIZE_TIMEOUT_MS = 45_000L
     private const val SLOW_OCR_WARN_MS = 10_000L
 
@@ -49,6 +52,23 @@ object MlKitOcrGate {
         if (tag.isEmpty() || inFlightSinceMs <= 0L) return ""
         val sec = ((SystemClock.elapsedRealtime() - inFlightSinceMs) / 1000L).coerceAtLeast(0L)
         return "OCR进行中($tag,${sec}s)"
+    }
+
+    private fun client(): TextRecognizer {
+        recognizer?.let { return it }
+        synchronized(recognizerLock) {
+            recognizer?.let { return it }
+            return TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).also { recognizer = it }
+        }
+    }
+
+    private fun rebuildRecognizerAfterTimeout(tag: String) {
+        synchronized(recognizerLock) {
+            runCatching { recognizer?.close() }
+            recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        LogCenter.op(alias, "[OCR重建] tag=$tag 超时后已 close 并重建 TextRecognizer")
     }
 
     suspend fun recognize(image: InputImage, tag: String? = null): Text {
@@ -71,7 +91,7 @@ object MlKitOcrGate {
                 }
                 withTimeout(RECOGNIZE_TIMEOUT_MS) {
                     suspendCancellableCoroutine { cont ->
-                        recognizer.process(image)
+                        client().process(image)
                             .addOnSuccessListener { cont.resume(it) }
                             .addOnFailureListener { cont.resumeWithException(it) }
                     }
@@ -83,8 +103,9 @@ object MlKitOcrGate {
                 LogCenter.op(
                     alias,
                     "[OCR超时] tag=$label 已等待>${waitedSec}s（上限${RECOGNIZE_TIMEOUT_MS / 1000}s），" +
-                        "协程放弃等待；若后续仍无日志可能是 ML Kit native 挂死",
+                        "协程放弃等待并重建 TextRecognizer",
                 )
+                rebuildRecognizerAfterTimeout(label)
                 ProcessDiagnostics.emitHeartbeat("OCR超时")
                 throw OcrRecognizeTimeoutException(label, RECOGNIZE_TIMEOUT_MS, timeout)
             } finally {
