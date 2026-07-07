@@ -9565,22 +9565,27 @@ def report_result(payload: ReportResultRequest):
     return {"code": 0, "msg": "结果接收成功"}
 
 
+# mode_wait 挂起上限：须低于常见 nginx proxy_read_timeout（默认 60s），否则网关先返回 HTML 504。
+_MODE_WAIT_SERVER_MAX_SEC = 55
+
+
 @app.get("/api/device/mode_wait")
 async def device_mode_wait(
     device_id: str,
     alias: str,
     since_event_id: int = 0,
-    timeout_sec: int = 120,
+    timeout_sec: int = 45,
 ):
     """长轮询：等待自动切号 ENTER/EXIT 等模式事件（自治 P0 控制面）。"""
     error, _device = auth_or_error(device_id, alias)
     if error:
         return error
-    safe_timeout = max(5, min(int(timeout_sec or 120), 180))
+    safe_timeout = max(5, min(int(timeout_sec or 45), _MODE_WAIT_SERVER_MAX_SEC))
     deadline = time.monotonic() + float(safe_timeout)
     while time.monotonic() < deadline:
-        pull_req = _peek_device_log_pull_request(device_id)
+        pull_req = await asyncio.to_thread(_peek_device_log_pull_request, device_id)
         if pull_req:
+            enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
             return {
                 "code": 0,
                 "event": None,
@@ -9588,27 +9593,29 @@ async def device_mode_wait(
                 "log_pull_requested": True,
                 "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
                 # 返回时现读开关，避免长轮询期间管理台已开启但携带轮询开始时的陈旧 false。
-                "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
+                "auto_switch_enabled": enabled,
             }
-        event = _fetch_pending_device_mode_event(device_id, since_event_id)
+        event = await asyncio.to_thread(_fetch_pending_device_mode_event, device_id, since_event_id)
         if event:
             print(
                 f"[{now_text()}] device_mode.wait | hit | device_id={device_id} "
                 f"event_id={event.get('event_id')} type={event.get('type')}"
             )
+            enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
             return {
                 "code": 0,
                 "event": event,
-                "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
+                "auto_switch_enabled": enabled,
             }
         if _APP_SHUTDOWN_EVENT.is_set():
             break
         await asyncio.sleep(1.0)
+    enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
     return {
         "code": 0,
         "event": None,
         "msg": "none",
-        "auto_switch_enabled": _device_auto_switch_enabled_resolved(device_id),
+        "auto_switch_enabled": enabled,
     }
 
 

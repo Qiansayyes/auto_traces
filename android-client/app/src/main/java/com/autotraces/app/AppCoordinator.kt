@@ -220,7 +220,7 @@ object AppCoordinator {
      * mode_wait 长轮询秒数。须低于常见 nginx proxy_read_timeout（默认 60s），
      * 否则网关会先返回 HTML 504，设备端收不到 JSON 空轮询结果。
      */
-    private const val MODE_WAIT_TIMEOUT_SEC = 50
+    private const val MODE_WAIT_TIMEOUT_SEC = 45
 
     /** enter 后 bundle 拉取失败：首次 30s 退避重试，倍增至最多 5min（仅可恢复错误）。 */
     private const val AUTO_SWITCH_BUNDLE_RETRY_INITIAL_MS = 30_000L
@@ -2413,6 +2413,17 @@ object AppCoordinator {
         }
     }
 
+    /** 长轮询正常结束、读超时或 nginx 网关 502/504 均视为软超时，不必打错误日志。 */
+    private fun isModeWaitSoftTimeout(err: Throwable): Boolean {
+        val msg = err.message.orEmpty()
+        return err is SocketTimeoutException ||
+            msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("HTTP 502") ||
+            msg.contains("HTTP 504") ||
+            msg.contains("Gateway Time-out", ignoreCase = true) ||
+            msg.contains("Bad Gateway", ignoreCase = true)
+    }
+
     private fun startModeWaitLoop() {
         if (modeWaitJob?.isActive == true) return
         modeWaitJob = scope.launch {
@@ -2479,12 +2490,11 @@ object AppCoordinator {
                         delay((30_000L - elapsed).coerceAtLeast(5_000L))
                     }
                 } catch (err: Exception) {
-                    val msg = err.message ?: ""
-                    val isPollTimeout = err is SocketTimeoutException || msg.contains("timeout", ignoreCase = true)
+                    val isPollTimeout = isModeWaitSoftTimeout(err)
                     if (!isPollTimeout) {
-                        LogCenter.op(alias, "模式事件等待失败：$msg")
+                        LogCenter.op(alias, "模式事件等待失败：${err.message ?: ""}")
                     }
-                    // 超时视为“本轮无事件”，进入下一轮；异常场景下稍作退避避免打爆服务端
+                    // 超时/网关 502·504 视为“本轮无事件”，进入下一轮；其它异常稍作退避避免打爆服务端
                     delay(if (isPollTimeout) 500L else 5_000L)
                 }
             }
@@ -3025,6 +3035,27 @@ object AppCoordinator {
         )
     }
 
+    /** 切号标完成后串行衔接改资料；涨粉仅在改资料结束（或无需改资料）后恢复，避免与独占改资料抢 TikTok。 */
+    private fun scheduleCutSwitchDeferredBasicProfileEdit(
+        alias: String,
+        deviceId: String,
+        parentOpId: String,
+    ) {
+        scope.launch {
+            val ran = maybeRunPendingBasicProfileEditAfterLoginVerified(
+                alias = alias,
+                deviceId = deviceId,
+                parentOpId = "${parentOpId}_profile_after_cut",
+                trigger = "cut_switch_after_login",
+                skipOuterWarmup = true,
+                loginVerified = true,
+            )
+            if (!ran) {
+                maybeStartGrowthInAutoSwitchIdle("切号完成（无需改资料）")
+            }
+        }
+    }
+
     /**
      * 登录已就绪（自动登录成功 / 云端 is_login=是 / 登录状态保障通过）且云端「基本资料已修改」=否 时衔接改资料。
      * @param loginVerified 调用方已确认登录就绪时设为 true（避免 mark is_login 上报尚未落库导致误判）。
@@ -3197,12 +3228,11 @@ object AppCoordinator {
         updateRuntime(localStatus = "running", lastMessage = "自动切号自治：切号完成")
         LogCenter.op(
             alias,
-            "【自动切号】切号完成 row=$targetRowIndex，继续自治调度（空档恢复涨粉）",
+            "【自动切号】切号完成 row=$targetRowIndex，继续自治调度（涨粉在改资料结束或无需改资料后恢复）",
         )
         scope.launch {
             delay(500)
             autoSwitchLocalScheduler.requestImmediateTick()
-            maybeStartGrowthInAutoSwitchIdle("切号完成")
         }
     }
 
@@ -3454,7 +3484,14 @@ object AppCoordinator {
             LogCenter.op(alias, "【自动切号】切号后登录校验失败（$phase）：TikTok 拉起失败")
             return false
         }
-        if (ensureLoginSafeguardMeasure(alias, deviceId, "切号后校验-$phase", strict = true)) {
+        if (ensureLoginSafeguardMeasure(
+                alias,
+                deviceId,
+                "切号后校验-$phase",
+                strict = true,
+                deferBasicProfileEdit = true,
+            )
+        ) {
             return true
         }
         return ensureAccountLoggedIn(
@@ -3465,6 +3502,7 @@ object AppCoordinator {
             strict = true,
             forceRelogin = true,
             preferredUsername = user,
+            deferBasicProfileEdit = true,
         )
     }
 
@@ -3500,6 +3538,7 @@ object AppCoordinator {
                         slotKey = slotKey.trim(),
                         completionMethod = "exclusive_auto_login",
                     )
+                    scheduleCutSwitchDeferredBasicProfileEdit(alias, deviceId, opId)
                 } else {
                     notifyAutoSwitchCutSwitchStepFailed(
                         payload,
@@ -3658,6 +3697,7 @@ object AppCoordinator {
                 sk,
                 completionMethod = "restore_chain",
             )
+            scheduleCutSwitchDeferredBasicProfileEdit(alias, deviceId, opId)
             return
         }
         restoreCloudAutoStartParticipation(alias, deviceId, opId, "切号成功")
@@ -4308,20 +4348,23 @@ object AppCoordinator {
         deviceId: String,
         source: String,
         strict: Boolean = true,
+        deferBasicProfileEdit: Boolean = false,
     ): Boolean {
         fetchConfig(logToUser = false)
         return try {
             when (executor.runLoginSafeguardMeasure(appContext, source)) {
                 LoginSafeguardOutcome.Ready -> {
                     LogCenter.op(alias, "登录状态保障($source)：界面可继续，已回 Home")
-                    maybeRunPendingBasicProfileEditAfterLoginVerified(
-                        alias = alias,
-                        deviceId = deviceId,
-                        parentOpId = "safeguard_ready_${System.currentTimeMillis()}",
-                        trigger = "login_safeguard_ready",
-                        skipOuterWarmup = false,
-                        loginVerified = true,
-                    )
+                    if (!deferBasicProfileEdit) {
+                        maybeRunPendingBasicProfileEditAfterLoginVerified(
+                            alias = alias,
+                            deviceId = deviceId,
+                            parentOpId = "safeguard_ready_${System.currentTimeMillis()}",
+                            trigger = "login_safeguard_ready",
+                            skipOuterWarmup = false,
+                            loginVerified = true,
+                        )
+                    }
                     true
                 }
                 LoginSafeguardOutcome.RequiresAutoLogin -> {
@@ -4335,6 +4378,7 @@ object AppCoordinator {
                         strict = strict,
                         forceRelogin = true,
                         resumeFromLoginEntryScreen = true,
+                        deferBasicProfileEdit = deferBasicProfileEdit,
                     )
                 }
                 LoginSafeguardOutcome.Failed -> {
@@ -4352,6 +4396,7 @@ object AppCoordinator {
                 strict = strict,
                 forceRelogin = true,
                 resumeFromLoginEntryScreen = true,
+                deferBasicProfileEdit = deferBasicProfileEdit,
             )
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
@@ -4363,6 +4408,7 @@ object AppCoordinator {
                 reason = "登录状态保障($source)-Account status",
                 strict = strict,
                 forceRelogin = true,
+                deferBasicProfileEdit = deferBasicProfileEdit,
             )
         }
     }
@@ -4474,6 +4520,7 @@ object AppCoordinator {
         forceRelogin: Boolean = false,
         resumeFromLoginEntryScreen: Boolean = false,
         preferredUsername: String? = null,
+        deferBasicProfileEdit: Boolean = false,
     ): Boolean {
         lastEnsureLoginPerformedFreshAutoLogin = false
         val fromBundle = PrefsStore.isAutoSwitchAutonomousMode()
@@ -4494,14 +4541,16 @@ object AppCoordinator {
                 alias,
                 "[OP][$opId] 自动登录($reason)：已登录（username=${accountResp.username.orEmpty()}）",
             )
-            maybeRunPendingBasicProfileEditAfterLoginVerified(
-                alias = alias,
-                deviceId = deviceId,
-                parentOpId = opId,
-                trigger = "login_cloud_is_login",
-                skipOuterWarmup = false,
-                loginVerified = true,
-            )
+            if (!deferBasicProfileEdit) {
+                maybeRunPendingBasicProfileEditAfterLoginVerified(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = opId,
+                    trigger = "login_cloud_is_login",
+                    skipOuterWarmup = false,
+                    loginVerified = true,
+                )
+            }
             return true
         }
         val username = accountResp.username.orEmpty().trim()
@@ -4592,14 +4641,21 @@ object AppCoordinator {
                 reason.contains("登录状态保障") -> "login_safeguard_auto_login"
                 else -> "auto_login_success"
             }
-            maybeRunPendingBasicProfileEditAfterLoginVerified(
-                alias = alias,
-                deviceId = deviceId,
-                parentOpId = opId,
-                trigger = profileTrigger,
-                skipOuterWarmup = true,
-                loginVerified = true,
-            )
+            if (deferBasicProfileEdit) {
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] 自动登录($reason)成功，改资料延后至切号标完成后执行（trigger=$profileTrigger）",
+                )
+            } else {
+                maybeRunPendingBasicProfileEditAfterLoginVerified(
+                    alias = alias,
+                    deviceId = deviceId,
+                    parentOpId = opId,
+                    trigger = profileTrigger,
+                    skipOuterWarmup = true,
+                    loginVerified = true,
+                )
+            }
             return true
         }
         LogCenter.op(alias, "[OP][$opId] 自动登录($reason)失败")
@@ -4627,7 +4683,11 @@ object AppCoordinator {
             }.onFailure { err ->
                 LogCenter.op(alias, "[OP][$opId] 同步 running 失败：${err.message}")
             }
-            startPullLoop()
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                maybeStartGrowthInAutoSwitchIdle("改资料结束")
+            } else {
+                startPullLoop()
+            }
             LogCenter.op(alias, "[OP][$opId] 已恢复涨粉拉取")
         } else {
             LogCenter.op(alias, "[OP][$opId] 修改基本资料结束，保持暂停（resume=$resumePullAfter）")

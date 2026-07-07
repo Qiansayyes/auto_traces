@@ -341,6 +341,44 @@ class RealTraceExecutor(
         return true
     }
 
+    /**
+     * Viewers=Off 路径：点 Viewer history 后等待，并轮询关闭「Viewer history + Save」弹窗（Save 常延迟同屏出现）。
+     */
+    private suspend fun profileEditFinishViewerHistoryOffPath(
+        ctx: Context,
+        logAlias: String,
+        part2Round: Int,
+    ): Boolean {
+        devOp(logAlias, "「修改基本资料」已点 Viewer history，等待 3s 后② 完成")
+        if (!profileEditDelay(logAlias, 3000L, "Viewer history 后")) return false
+        for (pass in 1..3) {
+            if (hardStopOrNull(logAlias, "修改基本资料-Viewer history 弹窗")) return false
+            val (vision, errTag) = mlKitRecognizeFullScreen(
+                ctx,
+                "profile_edit_viewer_history_save_r${part2Round}_$pass",
+            )
+            if (vision == null) {
+                devOp(logAlias, "「修改基本资料」Viewer history 后 Save 弹窗 OCR 第 $pass/3 次失败：$errTag")
+                if (errTag == "hard_stop") return false
+            } else if (
+                tryDismissViewerHistoryPopupFromVision(
+                    ctx = ctx,
+                    alias = logAlias,
+                    vision = vision,
+                    phaseLog = "「修改基本资料」Viewer history 后",
+                    tapWithJitter = false,
+                )
+            ) {
+                devOp(logAlias, "「修改基本资料」Viewer history 后：已点 Save 关闭弹窗（第 $pass 次）")
+                if (!profileEditDelay(logAlias, 450, "Viewer history Save 后")) return false
+                break
+            }
+            if (pass < 3 && !profileEditDelay(logAlias, 500, "Viewer history 弹窗轮询")) return false
+        }
+        devOp(logAlias, "「修改基本资料」Viewer history 后 3s 等待完成，② 收尾")
+        return true
+    }
+
     private suspend fun growthDelay(alias: String, ms: Long, phase: String): Boolean {
         var left = ms.coerceAtLeast(0L)
         while (left > 0) {
@@ -4201,8 +4239,9 @@ class RealTraceExecutor(
                     if (isHardStopActive()) return false to "hard_stop"
                     return false to "viewer_history_ocr_miss"
                 }
-                devOp(logAlias, "「修改基本资料」已点 Viewer history，等待 3s 后② 完成")
-                if (!profileEditDelay(logAlias, 3000L, "Viewer history 后")) return false to "hard_stop"
+                if (!profileEditFinishViewerHistoryOffPath(ctx, logAlias, part2Round)) {
+                    return false to "hard_stop"
+                }
                 return true to ""
             }
             null -> {

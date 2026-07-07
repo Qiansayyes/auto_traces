@@ -312,6 +312,16 @@ object AppCoordinator {
 
     // --- mode_wait / enter / exit ---
 
+    private fun isModeWaitSoftTimeout(err: Throwable): Boolean {
+        val msg = err.message.orEmpty()
+        return err is SocketTimeoutException ||
+            msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("HTTP 502") ||
+            msg.contains("HTTP 504") ||
+            msg.contains("Gateway Time-out", ignoreCase = true) ||
+            msg.contains("Bad Gateway", ignoreCase = true)
+    }
+
     private fun startModeWaitLoop() {
         if (!PrefsStore.isBound()) return
         if (modeWaitJob?.isActive == true) return
@@ -364,10 +374,9 @@ object AppCoordinator {
                     }
                     delay(MODE_WAIT_IDLE_DELAY_MS)
                 } catch (err: Exception) {
-                    val msg = err.message ?: ""
-                    val isPollTimeout = err is SocketTimeoutException || msg.contains("timeout", ignoreCase = true)
+                    val isPollTimeout = isModeWaitSoftTimeout(err)
                     if (!isPollTimeout) {
-                        LogCenter.op(alias, "模式事件等待失败：$msg")
+                        LogCenter.op(alias, "模式事件等待失败：${err.message ?: ""}")
                     }
                     delay(if (isPollTimeout) MODE_WAIT_IDLE_DELAY_MS else 5_000L)
                 }

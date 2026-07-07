@@ -8618,25 +8618,19 @@ async function syncDeviceBackupAliasForAccount(username, assignedAlias) {
 
 async function ensureBackupArchiveEntryForAccount(row, assignedAlias) {
   const normalizedAlias = normalizeAliasValue(assignedAlias);
-  const username = String(row?.username || "").trim();
+  const username = String(row?.username || "").trim().toLowerCase();
   if (!normalizedAlias || !username) return;
-  const existing = backupArchiveRows.find((item) => {
-    const itemUsername = String(item?.username || "").trim().toLowerCase();
-    const itemAlias = normalizeAliasValue(item?.assigned_alias || item?.mobile_alias || item?.device_alias);
-    return itemUsername === username.toLowerCase() && itemAlias === normalizedAlias;
-  });
-  if (existing) return;
-  // 账号保存接口已负责把分配别名同步到 device_editor_rows，这里仅刷新前端缓存。
-  await loadBackupArchiveRecords();
+  // upsert 已在服务端同步 device_editor_rows；仅更新本地反查缓存，避免 loadBackupArchiveRecords 全量刷新。
+  backupAliasByUsername.set(username, normalizedAlias);
 }
 
 async function saveAccountRow(index, options = {}) {
   const row = accountEditorRows[index];
   if (!row) return;
-  const { skipReload = false, skipBackupEnsure = false } = options || {};
+  const { skipReload = false, skipBackupEnsure = false, fullReload = false } = options || {};
   const effectiveAlias = getEffectiveAccountAssignedAlias(row) || normalizeAliasValue(row?.assigned_alias);
   if (effectiveAlias) row.assigned_alias = effectiveAlias;
-  await request(`${ACCOUNT_ROWS_API}/upsert`, {
+  const resp = await request(`${ACCOUNT_ROWS_API}/upsert`, {
     method: "POST",
     body: JSON.stringify({
       row_index: resolveAccountRowIndex(row, index),
@@ -8644,14 +8638,20 @@ async function saveAccountRow(index, options = {}) {
       assigned_alias: effectiveAlias,
     }),
   });
+  if (resp?.row_index != null && Number.isFinite(Number(resp.row_index))) {
+    row.row_index = Number(resp.row_index);
+  }
   const persistedAlias = effectiveAlias || normalizeAliasValue(row.assigned_alias);
   if (!skipBackupEnsure && persistedAlias) {
     await ensureBackupArchiveEntryForAccount(row, persistedAlias);
   }
-  if (!skipReload) {
+  if (skipReload) return;
+  if (fullReload) {
     await loadEditorState();
     renderAccountEditorRows();
     renderDeviceEditorRows();
+  } else {
+    renderAccountEditorRows();
   }
 }
 
@@ -8773,12 +8773,25 @@ function setAccountBatchPreviewBusy(busy) {
   if (importAccountBatchBtn) importAccountBatchBtn.disabled = disabled;
 }
 
+function isAccountBatchPreviewItemCommittable(item) {
+  if (!item || !item.selected || item.kind === "duplicate") return false;
+  if (item.kind !== "skip") return true;
+  const incomingAlias = normalizeAliasValue(item.assigned_alias || item.row?.assigned_alias);
+  if (!incomingAlias) return false;
+  const existing = accountEditorRows[item.existingIndex];
+  return Boolean(existing && !getEffectiveAccountAssignedAlias(existing));
+}
+
 function applyPendingAccountBatchBulkAlias() {
   const alias = normalizeAliasValue(accountBatchPreviewBulkAliasEl?.value);
   if (!alias) return 0;
   let applied = 0;
   accountBatchPreviewItems.forEach((item) => {
-    if (!item.selected || item.kind === "duplicate" || item.kind === "skip") return;
+    if (!item.selected || item.kind === "duplicate") return;
+    if (item.kind === "skip") {
+      const existing = accountEditorRows[item.existingIndex];
+      if (!existing || getEffectiveAccountAssignedAlias(existing)) return;
+    }
     if (normalizeAliasValue(item.assigned_alias)) return;
     item.assigned_alias = alias;
     item.row.assigned_alias = alias;
@@ -8839,7 +8852,10 @@ function renderAccountBatchPreviewTable() {
         : item.kind === "duplicate"
           ? "文件内重复"
           : "无需更新";
-    const aliasDisabled = isDuplicate || item.kind === "skip" ? "disabled" : "";
+    const previewExisting = item.existingIndex != null ? accountEditorRows[item.existingIndex] : item.row;
+    const aliasDisabled = isDuplicate || (item.kind === "skip" && getEffectiveAccountAssignedAlias(previewExisting))
+      ? "disabled"
+      : "";
     const aliasHtml = buildAccountBatchPreviewAliasOptionsHtml(item.assigned_alias || "");
     return `<tr data-preview-index="${index}">
       <td><input type="checkbox" class="account-batch-preview-row-check" data-preview-index="${index}" ${item.selected && !isDuplicate ? "checked" : ""} ${isDuplicate ? "disabled" : ""} /></td>
@@ -8892,7 +8908,8 @@ function syncAccountBatchPreviewItemsFromDom() {
   accountBatchPreviewTableWrapEl.querySelectorAll(".account-batch-preview-alias-select").forEach((el) => {
     const index = Number(el.dataset.previewIndex);
     const item = accountBatchPreviewItems[index];
-    if (!item || item.kind === "duplicate" || item.kind === "skip") return;
+    if (!item || item.kind === "duplicate") return;
+    if (item.kind === "skip" && !isAccountBatchPreviewItemCommittable(item)) return;
     item.assigned_alias = normalizeAliasValue(el.value);
     item.row.assigned_alias = item.assigned_alias;
   });
@@ -8911,6 +8928,7 @@ function closeAccountBatchPreviewModal() {
   if (!accountBatchPreviewModalEl) return;
   accountBatchPreviewModalEl.classList.add("hidden");
   accountBatchPreviewModalEl.setAttribute("aria-hidden", "true");
+  if (accountBatchPreviewBulkAliasEl) accountBatchPreviewBulkAliasEl.value = "";
   accountBatchPreviewItems = [];
 }
 
@@ -8970,7 +8988,7 @@ async function commitAccountBatchImportFromPreview() {
     syncAccountBatchPreviewItemsFromDom();
     const bulkAliasApplied = applyPendingAccountBatchBulkAlias();
     if (bulkAliasApplied > 0) renderAccountBatchPreviewTable();
-    const selectedItems = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate" && item.kind !== "skip");
+    const selectedItems = accountBatchPreviewItems.filter(isAccountBatchPreviewItemCommittable);
     if (!selectedItems.length) {
       throw new Error("请至少勾选一条可导入的记录");
     }
@@ -8989,7 +9007,7 @@ async function commitAccountBatchImportFromPreview() {
         assigned_alias: normalizeAliasValue(item.assigned_alias || item.row?.assigned_alias),
       };
       if (!hasMeaningfulAccountValue(row.api)) parsedWithoutApi += 1;
-      const existingIndex = item.kind === "update" && item.existingIndex != null
+      const existingIndex = item.existingIndex != null
         ? item.existingIndex
         : existingUsernameIndex.get(normalizedUsername);
       if (existingIndex != null && accountEditorRows[existingIndex]) {
@@ -9030,27 +9048,12 @@ async function commitAccountBatchImportFromPreview() {
       accountEditorRows.push(row);
     });
     rowsToUpdate.forEach(({ index, row }) => {
-      accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
+      accountEditorRows[index] = row;
     });
     const saveIndexes = [
       ...rowsToUpdate.map(({ index }) => index),
       ...rowsToImport.map((_, offset) => startIndex + offset),
     ];
-    try {
-      for (const index of saveIndexes) {
-        await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
-      }
-    } catch (error) {
-      await loadEditorState();
-      renderAccountEditorRows();
-      renderDeviceEditorRows();
-      throw error;
-    }
-    await loadEditorState();
-    renderAccountEditorRows();
-    renderDeviceEditorRows();
-    if (accountBatchInputEl) accountBatchInputEl.value = "";
-    closeAccountBatchPreviewModal();
     const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
     const statusParts = [];
     if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
@@ -9060,7 +9063,25 @@ async function commitAccountBatchImportFromPreview() {
     if (bulkAliasApplied > 0) statusParts.push(`已自动分配别名 ${bulkAliasApplied} 条`);
     const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
     const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
+    try {
+      await Promise.all(saveIndexes.map((index) => saveAccountRow(index, { skipReload: true, skipBackupEnsure: true })));
+    } catch (error) {
+      await loadEditorState();
+      renderAccountEditorRows();
+      renderDeviceEditorRows();
+      throw error;
+    }
+    closeAccountBatchPreviewModal();
+    if (accountBatchInputEl) accountBatchInputEl.value = "";
     setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
+    try {
+      await loadEditorState();
+      renderAccountEditorRows();
+      renderDeviceEditorRows();
+    } catch (reloadError) {
+      const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError || "刷新失败");
+      setStatus(`批量导入已写入，但刷新列表失败：${reloadMsg}`, "warning");
+    }
   } finally {
     accountBatchImportInFlight = false;
     setAccountBatchPreviewBusy(false);
@@ -10148,10 +10169,10 @@ async function syncEditorField(scope, index, field, value, checked = false) {
 }
 
 async function addBlankEditorRow() {
-  accountEditorRows.push(getAccountRowTemplate({ video_count: "-1" }));
+  const [rowIndex] = allocateAccountRowIndexes(1);
+  accountEditorRows.push(getAccountRowTemplate({ row_index: rowIndex, video_count: "-1" }));
   const index = accountEditorRows.length - 1;
   await saveAccountRow(index);
-  renderAccountEditorRows();
 }
 
 function isAccountLoggedIn(row = {}) {
@@ -11053,7 +11074,11 @@ if (accountBatchPreviewApplyAliasBtn) {
     }
     let applied = 0;
     accountBatchPreviewItems.forEach((item) => {
-      if (!item.selected || item.kind === "duplicate" || item.kind === "skip") return;
+      if (!item.selected || item.kind === "duplicate") return;
+      if (item.kind === "skip") {
+        const existing = accountEditorRows[item.existingIndex];
+        if (!existing || getEffectiveAccountAssignedAlias(existing)) return;
+      }
       item.assigned_alias = alias;
       item.row.assigned_alias = alias;
       applied += 1;
