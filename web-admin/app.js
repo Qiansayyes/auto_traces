@@ -8674,7 +8674,8 @@ function mergeAccountImportRow(existing, incoming) {
       merged[field] = incomingValue;
     }
   }
-  merged.assigned_alias = preservedAlias;
+  const incomingAlias = normalizeAliasValue(incoming?.assigned_alias);
+  merged.assigned_alias = preservedAlias || incomingAlias;
   return merged;
 }
 
@@ -8706,9 +8707,12 @@ function resolveAccountBatchApi(normalizedCols) {
 
 function hasAccountImportRowChanges(existing, incoming) {
   const merged = mergeAccountImportRow(existing, incoming);
-  return ACCOUNT_IMPORT_MERGE_FIELDS.some((field) => {
+  const fieldsChanged = ACCOUNT_IMPORT_MERGE_FIELDS.some((field) => {
     return String(existing?.[field] || "").trim() !== String(merged?.[field] || "").trim();
   });
+  if (fieldsChanged) return true;
+  const incomingAlias = normalizeAliasValue(incoming?.assigned_alias);
+  return Boolean(incomingAlias && !getEffectiveAccountAssignedAlias(existing));
 }
 
 function getAccountImportOverwriteChanges(existing, incoming) {
@@ -8736,6 +8740,52 @@ function buildAccountImportOverwriteConfirmMessage(overwriteSummaries) {
 }
 
 let accountBatchPreviewItems = [];
+let accountBatchImportInFlight = false;
+
+function buildAccountUsernameIndex(rows = accountEditorRows) {
+  const index = new Map();
+  (rows || []).forEach((row, rowIndex) => {
+    const normalized = String(row?.username || "").trim().toLowerCase();
+    if (normalized && !index.has(normalized)) index.set(normalized, rowIndex);
+  });
+  return index;
+}
+
+function getMaxAccountRowIndex() {
+  return (accountEditorRows || []).reduce((max, row) => {
+    const ri = Number(row?.row_index);
+    return Number.isFinite(ri) ? Math.max(max, ri) : max;
+  }, -1);
+}
+
+function allocateAccountRowIndexes(count) {
+  const safeCount = Math.max(0, Math.floor(Number(count) || 0));
+  const start = getMaxAccountRowIndex() + 1;
+  return Array.from({ length: safeCount }, (_, i) => start + i);
+}
+
+function setAccountBatchPreviewBusy(busy) {
+  const disabled = Boolean(busy);
+  if (confirmAccountBatchPreviewBtn) {
+    confirmAccountBatchPreviewBtn.disabled = disabled;
+    confirmAccountBatchPreviewBtn.textContent = disabled ? "导入中…" : "确定导入";
+  }
+  if (importAccountBatchBtn) importAccountBatchBtn.disabled = disabled;
+}
+
+function applyPendingAccountBatchBulkAlias() {
+  const alias = normalizeAliasValue(accountBatchPreviewBulkAliasEl?.value);
+  if (!alias) return 0;
+  let applied = 0;
+  accountBatchPreviewItems.forEach((item) => {
+    if (!item.selected || item.kind === "duplicate" || item.kind === "skip") return;
+    if (normalizeAliasValue(item.assigned_alias)) return;
+    item.assigned_alias = alias;
+    item.row.assigned_alias = alias;
+    applied += 1;
+  });
+  return applied;
+}
 
 function buildAccountBatchPreviewAliasOptionsHtml(currentValue = "") {
   const current = normalizeAliasValue(currentValue);
@@ -8747,9 +8797,11 @@ function buildAccountBatchPreviewAliasOptionsHtml(currentValue = "") {
 }
 
 function refreshAccountBatchPreviewBulkAliasOptions() {
-  if (!accountBatchPreviewBulkAliasEl) return;
+  const datalistEl = document.getElementById("accountBatchPreviewBulkAliasList");
+  if (!accountBatchPreviewBulkAliasEl || !datalistEl) return;
   const previous = normalizeAliasValue(accountBatchPreviewBulkAliasEl.value);
-  accountBatchPreviewBulkAliasEl.innerHTML = buildAccountBatchPreviewAliasOptionsHtml(previous);
+  const aliases = collectAssignableAliases(previous);
+  datalistEl.innerHTML = aliases.map((alias) => `<option value="${escapeHtml(alias)}"></option>`).join("");
   if (previous) accountBatchPreviewBulkAliasEl.value = previous;
 }
 
@@ -8911,78 +8963,108 @@ function buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex) {
 }
 
 async function commitAccountBatchImportFromPreview() {
-  syncAccountBatchPreviewItemsFromDom();
-  const selectedItems = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate" && item.kind !== "skip");
-  if (!selectedItems.length) {
-    throw new Error("请至少勾选一条可导入的记录");
-  }
-  syncAccountAliasFromDeviceRows();
-  const startIndex = accountEditorRows.length;
-  let parsedWithoutApi = 0;
-  const rowsToImport = [];
-  const rowsToUpdate = [];
-  for (const item of selectedItems) {
-    const row = {
-      ...item.row,
-      assigned_alias: normalizeAliasValue(item.assigned_alias || item.row?.assigned_alias),
-    };
-    if (!hasMeaningfulAccountValue(row.api)) parsedWithoutApi += 1;
-    if (item.kind === "update" && item.existingIndex != null) {
-      rowsToUpdate.push({ index: item.existingIndex, row });
-      continue;
-    }
-    rowsToImport.push(row);
-  }
-  const overwriteSummaries = rowsToUpdate
-    .map(({ index, row }) => {
-      const existing = accountEditorRows[index];
-      const incoming = { ...row };
-      const changes = getAccountImportOverwriteChanges(existing, incoming);
-      if (!changes.length) return null;
-      return {
-        username: String(existing?.username || "").trim(),
-        changes,
-      };
-    })
-    .filter(Boolean);
-  if (overwriteSummaries.length) {
-    if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
-      setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
-      return;
-    }
-  }
-  rowsToImport.forEach((row) => accountEditorRows.push(row));
-  rowsToUpdate.forEach(({ index, row }) => {
-    accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
-  });
-  const saveIndexes = [
-    ...rowsToUpdate.map(({ index }) => index),
-    ...rowsToImport.map((_, offset) => startIndex + offset),
-  ];
+  if (accountBatchImportInFlight) return;
+  accountBatchImportInFlight = true;
+  setAccountBatchPreviewBusy(true);
   try {
-    for (const index of saveIndexes) {
-      await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
+    syncAccountBatchPreviewItemsFromDom();
+    const bulkAliasApplied = applyPendingAccountBatchBulkAlias();
+    if (bulkAliasApplied > 0) renderAccountBatchPreviewTable();
+    const selectedItems = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate" && item.kind !== "skip");
+    if (!selectedItems.length) {
+      throw new Error("请至少勾选一条可导入的记录");
     }
-  } catch (error) {
+    syncAccountAliasFromDeviceRows();
+    const existingUsernameIndex = buildAccountUsernameIndex();
+    const seenUsernames = new Set();
+    let parsedWithoutApi = 0;
+    const rowsToImport = [];
+    const rowsToUpdate = [];
+    for (const item of selectedItems) {
+      const normalizedUsername = String(item.row?.username || "").trim().toLowerCase();
+      if (!normalizedUsername || seenUsernames.has(normalizedUsername)) continue;
+      seenUsernames.add(normalizedUsername);
+      const row = {
+        ...item.row,
+        assigned_alias: normalizeAliasValue(item.assigned_alias || item.row?.assigned_alias),
+      };
+      if (!hasMeaningfulAccountValue(row.api)) parsedWithoutApi += 1;
+      const existingIndex = item.kind === "update" && item.existingIndex != null
+        ? item.existingIndex
+        : existingUsernameIndex.get(normalizedUsername);
+      if (existingIndex != null && accountEditorRows[existingIndex]) {
+        rowsToUpdate.push({
+          index: existingIndex,
+          row: mergeAccountImportRow(accountEditorRows[existingIndex], row),
+        });
+        continue;
+      }
+      rowsToImport.push(row);
+      existingUsernameIndex.set(normalizedUsername, accountEditorRows.length + rowsToImport.length - 1);
+    }
+    if (!rowsToImport.length && !rowsToUpdate.length) {
+      throw new Error("没有可导入的账号：所选记录均已存在或重复");
+    }
+    const newRowIndexes = allocateAccountRowIndexes(rowsToImport.length);
+    const startIndex = accountEditorRows.length;
+    const overwriteSummaries = rowsToUpdate
+      .map(({ index, row }) => {
+        const existing = accountEditorRows[index];
+        const incoming = { ...row };
+        const changes = getAccountImportOverwriteChanges(existing, incoming);
+        if (!changes.length) return null;
+        return {
+          username: String(existing?.username || "").trim(),
+          changes,
+        };
+      })
+      .filter(Boolean);
+    if (overwriteSummaries.length) {
+      if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
+        setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
+        return;
+      }
+    }
+    rowsToImport.forEach((row, offset) => {
+      row.row_index = newRowIndexes[offset];
+      accountEditorRows.push(row);
+    });
+    rowsToUpdate.forEach(({ index, row }) => {
+      accountEditorRows[index] = mergeAccountImportRow(accountEditorRows[index], row);
+    });
+    const saveIndexes = [
+      ...rowsToUpdate.map(({ index }) => index),
+      ...rowsToImport.map((_, offset) => startIndex + offset),
+    ];
+    try {
+      for (const index of saveIndexes) {
+        await saveAccountRow(index, { skipReload: true, skipBackupEnsure: true });
+      }
+    } catch (error) {
+      await loadEditorState();
+      renderAccountEditorRows();
+      renderDeviceEditorRows();
+      throw error;
+    }
     await loadEditorState();
     renderAccountEditorRows();
     renderDeviceEditorRows();
-    throw error;
+    if (accountBatchInputEl) accountBatchInputEl.value = "";
+    closeAccountBatchPreviewModal();
+    const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
+    const statusParts = [];
+    if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
+    if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
+    if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
+    if (duplicateCount) statusParts.push(`跳过文件内重复 ${duplicateCount} 条`);
+    if (bulkAliasApplied > 0) statusParts.push(`已自动分配别名 ${bulkAliasApplied} 条`);
+    const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
+    const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
+    setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
+  } finally {
+    accountBatchImportInFlight = false;
+    setAccountBatchPreviewBusy(false);
   }
-  await loadEditorState();
-  renderAccountEditorRows();
-  renderDeviceEditorRows();
-  if (accountBatchInputEl) accountBatchInputEl.value = "";
-  closeAccountBatchPreviewModal();
-  const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
-  const statusParts = [];
-  if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
-  if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
-  if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
-  if (duplicateCount) statusParts.push(`跳过文件内重复 ${duplicateCount} 条`);
-  const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
-  const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
-  setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
 }
 
 function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
@@ -9055,14 +9137,7 @@ async function importAccountBatchFromText() {
       throw new Error(`第 ${idx + 1} 行解析失败：${message}`);
     }
   }).filter(Boolean);
-  const normalizeUsername = (value) => String(value || "").trim().toLowerCase();
-  const existingUsernameIndex = new Map();
-  (accountEditorRows || []).forEach((row, index) => {
-    const normalized = normalizeUsername(row?.username);
-    if (normalized && !existingUsernameIndex.has(normalized)) {
-      existingUsernameIndex.set(normalized, index);
-    }
-  });
+  const existingUsernameIndex = buildAccountUsernameIndex();
   const previewItems = buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex);
   const importableCount = previewItems.filter((item) => item.kind === "new" || item.kind === "update").length;
   const duplicateCount = previewItems.filter((item) => item.kind === "duplicate").length;
@@ -10920,6 +10995,7 @@ if (addBlankRecordBtn) {
 }
 if (importAccountBatchBtn) {
   importAccountBatchBtn.addEventListener("click", () => {
+    if (accountBatchImportInFlight) return;
     importAccountBatchFromText().catch((e) => setStatus(e.message || "批量导入失败", "error"));
   });
 }
@@ -10992,7 +11068,9 @@ if (accountBatchPreviewApplyAliasBtn) {
 }
 if (confirmAccountBatchPreviewBtn) {
   confirmAccountBatchPreviewBtn.addEventListener("click", () => {
-    commitAccountBatchImportFromPreview().catch((e) => setStatus(e.message || "批量导入失败", "error"));
+    commitAccountBatchImportFromPreview().catch((e) => {
+      setStatus(e.message || "批量导入失败", "error");
+    });
   });
 }
 if (batchStreamFileInput) {
