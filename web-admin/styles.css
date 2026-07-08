@@ -311,10 +311,19 @@ nav {
   flex-wrap: wrap;
 }
 
+.account-records-batch-profile-label {
+  margin-right: -4px;
+}
+
 .account-records-batch-profile-select {
-  width: auto;
-  min-width: 64px;
-  padding: 6px 10px;
+  width: 72px;
+  max-width: 72px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 6px 28px 6px 10px;
+  min-height: 34px;
+  font-size: 12px;
+  background-position: right 8px center;
 }
 
 .pager-size-label {

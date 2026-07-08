@@ -1249,6 +1249,245 @@ def _load_visible_devices_page_from_db(
         conn.close()
 
 
+_OVERVIEW_QUEUE_STATS_GLOBAL_KEY = "__global__"
+_overview_snapshot_lock = Lock()
+_overview_dirty_owners: set[str] = set()
+_overview_queue_stats_dirty = False
+_overview_snapshot_wake = Event()
+_OVERVIEW_SNAPSHOT_WORKER_INTERVAL_SEC = 0.4
+
+
+def _ensure_overview_snapshot_tables() -> None:
+    """概览读模型 snapshot 表（读路径只查小表，重查询由后台单线程重建）。"""
+    conn = _get_db()
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS overview_devices_snapshot (
+                device_id TEXT NOT NULL PRIMARY KEY,
+                owner_username TEXT NOT NULL,
+                alias TEXT NOT NULL DEFAULT '',
+                device_group TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'offline',
+                pending_start INTEGER NOT NULL DEFAULT 0,
+                auto_start_opt_out INTEGER NOT NULL DEFAULT 0,
+                pc_service_url TEXT NOT NULL DEFAULT '',
+                sort_key TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_overview_devices_owner_sort
+                ON overview_devices_snapshot(owner_username, sort_key, device_id);
+            CREATE INDEX IF NOT EXISTS idx_overview_devices_owner_group
+                ON overview_devices_snapshot(owner_username, device_group);
+            CREATE TABLE IF NOT EXISTS overview_queue_stats_snapshot (
+                owner_key TEXT NOT NULL PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_overview_dirty(owner: str | None) -> None:
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return
+    with _overview_snapshot_lock:
+        _overview_dirty_owners.add(owner_key)
+    _overview_snapshot_wake.set()
+
+
+def _mark_queue_stats_dirty(_owner: str | None = None) -> None:
+    global _overview_queue_stats_dirty
+    with _overview_snapshot_lock:
+        _overview_queue_stats_dirty = True
+    _overview_snapshot_wake.set()
+
+
+def _invalidate_overview_queue_stats_cache() -> None:
+    """兼容旧调用点：队列统计改为 snapshot 标脏。"""
+    _mark_queue_stats_dirty()
+
+
+def _rebuild_overview_devices_snapshot(conn: sqlite3.Connection, owner: str) -> None:
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return
+    conn.execute("DELETE FROM overview_devices_snapshot WHERE owner_username = ?", (owner_key,))
+    rows = conn.execute(
+        """
+        SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out, pc_service_url
+        FROM client_devices
+        WHERE owner_username = ?
+        """,
+        (owner_key,),
+    ).fetchall()
+    now = now_text()
+    for row in rows:
+        alias = str(row["alias"] or "").strip()
+        conn.execute(
+            """
+            INSERT INTO overview_devices_snapshot (
+                device_id, owner_username, alias, device_group, status, pending_start,
+                auto_start_opt_out, pc_service_url, sort_key, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row["device_id"]),
+                owner_key,
+                alias,
+                str(row["device_group"] or "").strip(),
+                str(row["status"] or "offline"),
+                int(row["pending_start"] or 0),
+                int(row["auto_start_opt_out"] or 0),
+                str(row["pc_service_url"] or "").strip() if "pc_service_url" in row.keys() else "",
+                alias.lower(),
+                now,
+            ),
+        )
+
+
+def _rebuild_overview_queue_stats_snapshot(conn: sqlite3.Connection, *, preview_limit: int = 200) -> None:
+    payload = _load_overview_queue_stats_from_db(preview_limit=preview_limit)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO overview_queue_stats_snapshot (owner_key, payload_json, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (_OVERVIEW_QUEUE_STATS_GLOBAL_KEY, json.dumps(payload, ensure_ascii=False), now_text()),
+    )
+
+
+def _warm_overview_snapshots_blocking() -> None:
+    conn = _get_db()
+    try:
+        owners = [
+            str(r[0] or "").strip()
+            for r in conn.execute(
+                "SELECT DISTINCT owner_username FROM client_devices WHERE TRIM(COALESCE(owner_username, '')) <> ''"
+            ).fetchall()
+            if str(r[0] or "").strip()
+        ]
+        for owner in owners:
+            _rebuild_overview_devices_snapshot(conn, owner)
+        _rebuild_overview_queue_stats_snapshot(conn)
+        conn.commit()
+        print(f"[{now_text()}] overview_snapshot | warm_up | owners={len(owners)}")
+    except Exception as exc:
+        print(f"[{now_text()}] overview_snapshot | warm_up_failed | {exc}")
+    finally:
+        conn.close()
+
+
+def _overview_snapshot_worker_loop() -> None:
+    while not _APP_SHUTDOWN_EVENT.is_set():
+        _overview_snapshot_wake.wait(timeout=_OVERVIEW_SNAPSHOT_WORKER_INTERVAL_SEC)
+        _overview_snapshot_wake.clear()
+        if _APP_SHUTDOWN_EVENT.is_set():
+            break
+        with _overview_snapshot_lock:
+            owners = list(_overview_dirty_owners)
+            _overview_dirty_owners.clear()
+            queue_dirty = _overview_queue_stats_dirty
+            _overview_queue_stats_dirty = False
+        if not owners and not queue_dirty:
+            continue
+        conn = _get_db()
+        try:
+            for owner in owners:
+                _rebuild_overview_devices_snapshot(conn, owner)
+            if queue_dirty:
+                _rebuild_overview_queue_stats_snapshot(conn)
+            conn.commit()
+        except Exception as exc:
+            print(f"[{now_text()}] overview_snapshot | rebuild_failed | {exc}")
+        finally:
+            conn.close()
+
+
+def _start_overview_snapshot_worker() -> None:
+    Thread(target=_overview_snapshot_worker_loop, name="overview_snapshot", daemon=True).start()
+
+
+def _load_visible_devices_page_from_snapshot(
+    session: dict,
+    *,
+    device_group: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[dict[str, Any], int]:
+    """概览读路径：只查 overview_devices_snapshot。"""
+    owner = _client_devices_visible_owner(session)
+    if not owner:
+        return {}, 0
+    safe_page = max(1, int(page or 1))
+    safe_size = max(1, min(int(page_size or 50), 500))
+    offset = (safe_page - 1) * safe_size
+    group_sql, group_params = _client_devices_group_where_clause(device_group)
+    conn = _get_db()
+    try:
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(1) FROM overview_devices_snapshot WHERE owner_username = ?{group_sql}",
+                [owner, *group_params],
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT device_id, owner_username, alias, device_group, status, pending_start, auto_start_opt_out, pc_service_url
+            FROM overview_devices_snapshot
+            WHERE owner_username = ?{group_sql}
+            ORDER BY sort_key, device_id
+            LIMIT ? OFFSET ?
+            """,
+            [owner, *group_params, safe_size, offset],
+        ).fetchall()
+        devices = {
+            str(row["device_id"]): _device_row_to_overview_entry(row, session)
+            for row in rows
+        }
+        return devices, total
+    finally:
+        conn.close()
+
+
+def _device_stats_from_snapshot(session: dict, *, device_group: str = "") -> dict[str, int]:
+    owner = _client_devices_visible_owner(session)
+    stats = {"online": 0, "running": 0, "error": 0, "pending_start": 0}
+    if not owner:
+        return stats
+    group_sql, group_params = _client_devices_group_where_clause(device_group)
+    conn = _get_db()
+    try:
+        status_rows = conn.execute(
+            f"""
+            SELECT status, COUNT(1) AS cnt
+            FROM overview_devices_snapshot
+            WHERE owner_username = ?{group_sql}
+            GROUP BY status
+            """,
+            [owner, *group_params],
+        ).fetchall()
+        for row in status_rows:
+            st = str(row["status"] or "offline")
+            if st in stats:
+                stats[st] = int(row["cnt"] or 0)
+        pending_row = conn.execute(
+            f"""
+            SELECT COUNT(1) FROM overview_devices_snapshot
+            WHERE owner_username = ?{group_sql} AND pending_start = 1
+            """,
+            [owner, *group_params],
+        ).fetchone()
+        stats["pending_start"] = int(pending_row[0] if pending_row else 0)
+        return stats
+    finally:
+        conn.close()
+
+
 def _list_distinct_device_groups(session: dict) -> list[str]:
     owner = _client_devices_visible_owner(session)
     if not owner:
@@ -1258,7 +1497,7 @@ def _list_distinct_device_groups(session: dict) -> list[str]:
         rows = conn.execute(
             """
             SELECT DISTINCT TRIM(device_group) AS grp
-            FROM client_devices
+            FROM overview_devices_snapshot
             WHERE owner_username = ? AND COALESCE(TRIM(device_group), '') <> ''
             ORDER BY grp ASC
             """,
@@ -1295,6 +1534,7 @@ def init_databases():
     _ensure_user_runtime_configs()
     _ensure_template_permissions()
     migrate_backup_owner_history()
+    _ensure_overview_snapshot_tables()
 
 
 def prune_obsolete_tables():
@@ -1414,10 +1654,7 @@ _device_persist_pending: set[str] = set()
 _device_persist_last_written: Dict[str, tuple] = {}
 _device_persist_last_at: Dict[str, float] = {}
 _device_persist_wake = Event()
-# 管理台 overview 队列 COUNT 缓存，降低与设备写库叠加的读锁竞争。
-_OVERVIEW_QUEUE_STATS_CACHE_TTL_SEC = 45.0
-_overview_queue_stats_cache_lock = Lock()
-_overview_queue_stats_cache: Dict[str, Any] = {"expires_at": 0.0}
+# 管理台 overview 队列统计已迁至 SQLite snapshot + 后台 worker 重建（见 _overview_snapshot_worker_loop）。
 # 已有设备开启自动切号自治后，云端 minute tick 仅保活探测，大幅降频。
 AUTO_SWITCH_AUTONOMOUS_IDLE_SEC = 300
 

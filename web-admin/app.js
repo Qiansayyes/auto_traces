@@ -674,7 +674,8 @@ let overviewAutoRefreshInFlight = false;
 let deviceLogsFetchInFlight = false;
 let deviceLogsPullInFlight = false;
 const DEVICE_LOG_PULL_POLL_MS = 2500;
-const DEVICE_LOG_PULL_TIMEOUT_MS = 40000;
+// 设备端 mode_wait 常见 timeout_sec=50；管理台等待窗口需明显大于 50s，避免“设备尚未出轮询就被判超时”。
+const DEVICE_LOG_PULL_TIMEOUT_MS = 95000;
 let taskStatusRefreshInFlight = false;
 let backupStatsFullQueryInFlight = false;
 let lastGalleryDispatchLogLine = "";
@@ -1280,15 +1281,15 @@ async function pullDeviceLogsFromDevices(ids) {
       if (!pull_pending.length) break;
       await sleepMs(DEVICE_LOG_PULL_POLL_MS);
     }
+    const pendingSet = new Set(lastPending);
     if (lastPending.length) {
       appendDebugLog("DEVICE_LOG_PULL", { pending: lastPending, note: "timeout_or_offline" });
-      setStatus("设备未在时限内回传日志，请确认 App 在后台运行后重试", "error");
-      return;
     }
     let downloaded = 0;
     let emptyToday = 0;
     let cachedFallback = 0;
     for (const did of ids) {
+      if (pendingSet.has(did)) continue;
       try {
         const ok = await downloadDeviceLogFile(did);
         if (ok) downloaded += 1;
@@ -1311,11 +1312,16 @@ async function pullDeviceLogsFromDevices(ids) {
       }
     }
     if (downloaded > 0) {
-      setStatus(`已下载 ${downloaded} 台设备今日日志`, "success");
+      const suffix = lastPending.length ? `；另有 ${lastPending.length} 台设备未在时限内回传` : "";
+      setStatus(`已下载 ${downloaded} 台设备今日日志${suffix}`, lastPending.length ? "warning" : "success");
     } else if (cachedFallback > 0) {
-      setStatus(`设备今日本地日志为空，已下载 ${cachedFallback} 台设备的云端缓存日志`, "info");
+      const suffix = lastPending.length ? `；另有 ${lastPending.length} 台设备未在时限内回传` : "";
+      setStatus(`设备今日本地日志为空，已下载 ${cachedFallback} 台设备的云端缓存日志${suffix}`, "info");
     } else if (emptyToday > 0) {
-      setStatus("设备已回传，但今日本地与服务端均无可用日志", "info");
+      const suffix = lastPending.length ? `；${lastPending.length} 台设备未在时限内回传` : "";
+      setStatus(`设备已回传，但今日本地与服务端均无可用日志${suffix}`, "info");
+    } else if (lastPending.length) {
+      setStatus("设备未在时限内回传日志，请确认 App 在后台运行后重试", "error");
     }
   } catch (err) {
     appendDebugLog("DEVICE_LOG_PULL", { error: String(err?.message || err) });
@@ -2846,53 +2852,34 @@ async function batchSetSelectedAccountBasicProfile() {
   if (!window.confirm(confirmLines.join("\n"))) return;
 
   if (accountRecordsBatchProfileBtn) accountRecordsBatchProfileBtn.disabled = true;
-  setStatus(`正在批量修改 ${pendingSnapshots.length} 条账号记录的「资料」...`, "info");
+  const totalCount = pendingSnapshots.length;
+  let processedCount = 0;
+  setStatus(`正在批量修改 ${totalCount} 条账号记录的「资料」...`, "info");
   let updatedCount = 0;
   let unchangedCount = 0;
   let notFoundCount = 0;
   let failedBatches = 0;
   try {
     while (pendingSnapshots.length) {
-      await loadEditorState();
-      pendingSnapshots = pendingSnapshots
-        .map((snap) => {
-          const matched = findAccountEditorRowByStableKey(snap.key);
-          if (!matched) return null;
-          return {
-            ...snap,
-            row_index: resolveAccountRowIndex(matched.row, matched.idx),
-            username: String(matched.row?.username || "").trim(),
-            currentValue: normalizeBasicProfileModifiedField(matched.row?.basic_profile_modified),
-          };
-        })
-        .filter(Boolean);
-      if (!pendingSnapshots.length) break;
-
-      const batch = [];
-      const batchKeys = [];
-      for (const snap of pendingSnapshots) {
-        if (batch.length >= ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX) break;
-        batch.push({ row_index: snap.row_index, username: snap.username });
-        batchKeys.push(snap.key);
-      }
-      if (!batch.length) break;
+      const batch = pendingSnapshots.slice(0, ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX);
+      pendingSnapshots = pendingSnapshots.slice(ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX);
+      setStatus(`正在批量修改「资料」… ${processedCount}/${totalCount}`, "info");
 
       try {
         const resp = await request(`${ACCOUNT_ROWS_API}/batch_set_basic_profile`, {
           method: "POST",
           body: JSON.stringify({
             basic_profile_modified: targetValue,
-            items: batch,
+            items: batch.map(({ row_index, username }) => ({ row_index, username })),
           }),
         });
         updatedCount += Number(resp?.updated_count || 0);
         unchangedCount += Number(resp?.unchanged_count || 0);
         notFoundCount += Number(resp?.not_found_count || 0);
+        processedCount += batch.length;
         const batchUpdated = Number(resp?.updated_count || 0);
         const batchUnchanged = Number(resp?.unchanged_count || 0);
         if (batchUpdated <= 0 && batchUnchanged <= 0) break;
-        const doneKeySet = new Set(batchKeys);
-        pendingSnapshots = pendingSnapshots.filter((snap) => !doneKeySet.has(snap.key));
       } catch (chunkError) {
         failedBatches += 1;
         if (updatedCount > 0 || unchangedCount > 0) break;
@@ -2900,12 +2887,8 @@ async function batchSetSelectedAccountBasicProfile() {
       }
     }
     clearAccountRecordsSelection();
-    await loadEditorState();
+    await loadAccountEditorRows();
     renderAccountEditorRows();
-    const backupActive = document.getElementById("backup-section")?.classList.contains("active");
-    if (backupActive) {
-      await loadBackupArchiveRecords();
-    }
     if (failedBatches > 0) {
       setStatus(
         `部分批次修改失败：已成功 ${updatedCount} 条，请刷新后检查剩余记录`,
@@ -2926,7 +2909,7 @@ async function batchSetSelectedAccountBasicProfile() {
     if (notFoundCount > 0) parts.push(`${notFoundCount} 条已不存在`);
     setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
   } catch (error) {
-    await loadEditorState();
+    await loadAccountEditorRows();
     renderAccountEditorRows();
     throw error;
   } finally {
@@ -8624,6 +8607,15 @@ async function syncAssignableAliasOptionsIfNeeded() {
   }
 }
 
+async function loadAccountEditorRows() {
+  const accountsResp = await request(ACCOUNT_ROWS_API);
+  accountEditorRows = Array.isArray(accountsResp.items)
+    ? accountsResp.items.map((item) => getAccountRowTemplate(item))
+    : [];
+  syncAccountAliasFromDeviceRows();
+  enrichAccountStatsFromDeviceRows();
+}
+
 async function loadEditorState() {
   const [accountsResp, devicesResp, backupResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
@@ -10680,7 +10672,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
     : (accountAlias ? `<span class="backup-archive-record__alias-badge backup-archive-record__alias-badge--account" title="账号记录中的分配别名">${escapeHtml(accountAlias)}</span>` : "");
   const backupName = String(row?.backup_name || "").trim();
   const backupPath = String(row?.backup_path || "").trim();
-  const updatedAt = String(row?.updated_at || row?.created_at || "").trim();
+  const lastHighlightAt = String(row?.updated_at || row?.created_at || "").trim();
   const backupRecordId = Number(row?.row_index ?? row?.id ?? 0);
   const deviceRowIndex = Number(row?.row_index);
   const deviceId = String(row?.device_id || "").trim();
@@ -10715,11 +10707,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const rowIndexNum = exportRowIndex ?? -1;
   const hasCutSwitchRow = exportRowIndex != null;
   const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
-  const dailySlotLabel = dailySlotInfo?.label || (rows.length >= 2 ? "-" : "");
   const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
-  const dailyPublishAtHint = dailySlotInfo?.publishAt
-    ? ` · 计划 ${escapeHtml(dailySlotInfo.publishAt)}`
-    : "";
   const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
   const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
   const showRecordSelect = rows.length > 1;
@@ -10742,7 +10730,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
               ${envStatusBadge}
               ${dailyPublishBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
-              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · ${escapeHtml(updatedAt || "-")}${dailySlotLabel ? ` · 今日时段 <strong>${escapeHtml(dailySlotLabel)}</strong>${dailyPublishAtHint}` : ""}${switchActive ? ` · ${escapeHtml(envHintText)}` : ""}</span>
+              <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · 上次高亮 ${escapeHtml(lastHighlightAt || "-")}${switchActive ? ` · ${escapeHtml(envHintText)}` : ""}</span>
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>

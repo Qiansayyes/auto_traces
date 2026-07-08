@@ -784,6 +784,8 @@ class RealTraceExecutor(
         private const val RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS = 10
         /** 回首页恢复：前 N 轮导航返回每次连按两次（跳过中间页/叠层）。 */
         private const val RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES = 2
+        /** 回首页恢复：连续执行至少本次数返回后再校验 TikTok 是否仍在前台。 */
+        private const val RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS = 2
         /** 导航返回后等待 UI 稳定再 OCR（毫秒）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_DELAY_MS = 520L
         /** 发作品全部完成后的收尾：OCR 点底栏 Home（顺手处理 Don't allow）。 */
@@ -1228,8 +1230,11 @@ class RealTraceExecutor(
      * 优先 [navBack] 回首页（底栏 Home+Profile 同见视为已回首页，不强关）；
      * 导航返回过程中 OCR 已见底栏 Home+Profile 时，再执行最后一次返回（搜索/内页也可能误命中底栏）；
      * 首次 OCR 已见底栏 Home+Profile 则判定可能仍在搜索/内页，未按返回键，改为强关重启；
-     * 导航返回期间若 dumpsys 判定 TikTok 非前台，则立即停止返回并强关重启（不再软拉起）；
+     * 连续返回 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS] 次后若 dumpsys 判定 TikTok 非前台，
+     * 视为返回键已退出应用，优先重新打开 TikTok（不强停）；重开失败再 fallback 强关重启。
      * 超过 [RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS] 次仍未回首页则 fallback 强关重启。
+     *
+     * [allowInitialDoubleBack] 为 false 时（如 Users 标签恢复）不使用前 N 轮双返。
      *
      * [PrefsStore.peekGrowthContinueFromPublishHome] 为 true 时（发作品全部完成且已点 Home 后），
      * 短期内尽量避免强停重启，仅尝试 navBack 回首页；发作品进行中不受此限制。
@@ -1243,6 +1248,7 @@ class RealTraceExecutor(
         service: Context,
         reason: String,
         skipDontAllowOcr: Boolean = false,
+        allowInitialDoubleBack: Boolean = true,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         if (hardStopOrNull(alias, reason)) return false
@@ -1263,24 +1269,6 @@ class RealTraceExecutor(
         val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
         val pkg = Config.TIKTOK_PACKAGE_NAME
 
-        /**
-         * 导航返回期间 dumpsys 校验 TikTok 前台；非前台则立即停止返回并强关重启。
-         * @return null 表示仍在前台可继续；非 null 为强关重启结果，调用方应直接结束本恢复流程。
-         */
-        suspend fun abortRecoverReturnsIfNotForeground(passLabel: String): Boolean? {
-            invalidateForegroundProbeCache()
-            if (isPackageVisible(pkg)) return null
-
-            devOp(alias, "$reason：$passLabel TikTok 非前台，终止导航返回并强关重启")
-            if (blockForceRestart) {
-                devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
-                return false
-            }
-            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
-            }
-        }
-
         suspend fun evaluateRecoverHomeOcr(tagSuffix: String, passLabel: String): RecoverHomeOcrOutcome {
             if (hardStopOrNull(alias, reason)) return RecoverHomeOcrOutcome.HardStop
             val (vision, err) = mlKitRecognizeFullScreen(service, "recover_home_$tagSuffix")
@@ -1299,7 +1287,59 @@ class RealTraceExecutor(
             return RecoverHomeOcrOutcome.NotOnMainFeed
         }
 
-        abortRecoverReturnsIfNotForeground("首次 OCR 前")?.let { return it }
+        /**
+         * 连续返回达到阈值后校验 TikTok 前台；非前台则尝试重新打开（不强停）。
+         * @return null 仍在前台或已重开但未命中首页，可继续返回；非 null 为结束本恢复流程的结果。
+         */
+        suspend fun reopenTikTokIfBackClosedDuringRecover(
+            passLabel: String,
+            backsCompleted: Int,
+        ): Boolean? {
+            if (backsCompleted < RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS) return null
+            invalidateForegroundProbeCache()
+            if (isPackageVisible(pkg)) return null
+
+            devOp(
+                alias,
+                "$reason：$passLabel 已连续返回 $backsCompleted 次且 TikTok 非前台（返回可能已退出应用），" +
+                    "尝试重新打开 TikTok",
+            )
+            val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+            if (
+                launchTikTokOnceWithCheck(
+                    ctx,
+                    alias,
+                    "$reason·重新打开",
+                    launchWaitMs,
+                    forceStopBeforeLaunch = false,
+                    skipDontAllowOcr = skipDontAllowOcr,
+                )
+            ) {
+                devOp(alias, "$reason：TikTok 已重新打开，校验是否已在主 Feed")
+                when (evaluateRecoverHomeOcr("reopen", passLabel)) {
+                    RecoverHomeOcrOutcome.OnMainFeed -> {
+                        markSkipForYouWarmupAfterRecoverHome(alias)
+                        return true
+                    }
+                    RecoverHomeOcrOutcome.HardStop -> return false
+                    RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
+                    RecoverHomeOcrOutcome.NotOnMainFeed -> {
+                        devOp(alias, "$reason：重新打开后仍未见主 Feed 底栏，继续导航返回")
+                        return null
+                    }
+                }
+            }
+
+            devOp(alias, "$reason：重新打开 TikTok 失败，改为强关重启")
+            if (blockForceRestart) {
+                devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
+                return false
+            }
+            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
+                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+            }
+        }
+
         when (val precheck = evaluateRecoverHomeOcr("precheck", "首次 OCR 前")) {
             RecoverHomeOcrOutcome.OnMainFeed -> {
                 devOp(
@@ -1319,21 +1359,20 @@ class RealTraceExecutor(
             }
         }
 
+        var backsCompleted = 0
         for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
             if (hardStopOrNull(alias, reason)) return false
-            abortRecoverReturnsIfNotForeground("第 $pass 次返回前")?.let { return it }
-            if (
-                !navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
+            val backsThisPass =
+                navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
                     service,
                     alias,
                     reason,
                     pass,
                     RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS,
-                )
-            ) {
-                return false
-            }
-            abortRecoverReturnsIfNotForeground("第 $pass 次返回后")?.let { return it }
+                    allowInitialDoubleBack,
+                ) ?: return false
+            backsCompleted += backsThisPass
+            reopenTikTokIfBackClosedDuringRecover("第 $pass 次返回后", backsCompleted)?.let { return it }
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
                     devOp(
@@ -1341,12 +1380,12 @@ class RealTraceExecutor(
                         "$reason：第 $pass 次导航返回后 OCR 已见回首页信息，再执行最后一次返回",
                     )
                     if (hardStopOrNull(alias, reason)) return false
-                    abortRecoverReturnsIfNotForeground("回首页后补返前")?.let { return it }
                     navBack(alias, "$reason 回首页·最后一次返回（第 $pass 次已命中）")
+                    backsCompleted += 1
                     if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·最后一次返回后")) {
                         return false
                     }
-                    abortRecoverReturnsIfNotForeground("最后一次返回后")?.let { return it }
+                    reopenTikTokIfBackClosedDuringRecover("最后一次返回后", backsCompleted)?.let { return it }
                     when (evaluateRecoverHomeOcr("final_back_$pass", "最后一次返回")) {
                         RecoverHomeOcrOutcome.HardStop -> return false
                         RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -5860,9 +5899,10 @@ class RealTraceExecutor(
         reason: String,
         pass: Int,
         maxAttempts: Int,
-    ): Boolean {
-        if (hardStopOrNull(alias, reason)) return false
-        var doubleBack = pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES
+        allowInitialDoubleBack: Boolean = true,
+    ): Int? {
+        if (hardStopOrNull(alias, reason)) return null
+        var doubleBack = allowInitialDoubleBack && pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES
         if (doubleBack) {
             devOp(
                 alias,
@@ -5880,21 +5920,26 @@ class RealTraceExecutor(
                     )
                 }
             } else if (isMlKitHardStopError(err)) {
-                return false
+                return null
             } else {
                 devOp(alias, "$reason：第 $pass/$maxAttempts 次返回前 OCR 失败：$err，按单次返回继续")
             }
         }
         val passLabel = "（$pass/$maxAttempts）"
+        val backsThisPass = if (doubleBack) 2 else 1
         if (doubleBack) {
             val doubleTag = if (pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES) "双返" else "创作相机双返"
             navBack(alias, "$reason 回首页·${doubleTag} 1/2$passLabel")
-            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return false
+            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return null
             navBack(alias, "$reason 回首页·${doubleTag} 2/2$passLabel")
         } else {
             navBack(alias, "$reason 回首页$passLabel")
         }
-        return growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")
+        return if (growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) {
+            backsThisPass
+        } else {
+            null
+        }
     }
 
     /**
@@ -9993,7 +10038,7 @@ class RealTraceExecutor(
         }
 
         devOp(alias, "Users 标签 OCR 未命中，尝试返回首页或强关后重新进入搜索")
-        if (!recoverToHomeViaBackOrRestart(service, "Users 标签恢复")) {
+        if (!recoverToHomeViaBackOrRestart(service, "Users 标签恢复", allowInitialDoubleBack = false)) {
             devOp(alias, "Users 标签恢复：返回首页失败（导航返回与强关均未成功）")
             return false
         }
