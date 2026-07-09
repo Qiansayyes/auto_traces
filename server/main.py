@@ -5285,9 +5285,9 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias,
-                   backup_path, backup_name, switch_highlight, video_count
+                   backup_path, backup_name, switch_highlight, video_count, auto_switch_excluded
             FROM device_editor_rows
-            WHERE owner_username = ? AND TRIM(username) <> ''
+            WHERE owner_username = ? AND TRIM(username) <> '' AND COALESCE(auto_switch_excluded, 0) = 0
             ORDER BY row_index ASC
             """,
             (owner,),
@@ -5302,6 +5302,148 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
             continue
         buckets.setdefault(alias_key, []).append(item)
     return {k: v for k, v in buckets.items() if len(v) >= 2}
+
+
+def _delete_auto_switch_plans_for_alias(owner_username: str, alias: str) -> None:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return
+    conn = _get_db()
+    try:
+        conn.execute(
+            "DELETE FROM auto_switch_daily_plans WHERE owner_username = ? AND alias = ?",
+            (owner, alias_key),
+        )
+        conn.execute(
+            "DELETE FROM auto_switch_weekly_plans WHERE owner_username = ? AND alias = ?",
+            (owner, alias_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dict[str, Any]:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return {"bucket_size": 0, "plan_regenerated": False}
+    rows = _list_device_editor_buckets(owner).get(alias_key, [])
+    _delete_auto_switch_plans_for_alias(owner, alias_key)
+    if len(rows) < 2:
+        return {"bucket_size": len(rows), "plan_regenerated": False}
+    schedule_date = _beijing_date_str()
+    _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
+    _ensure_auto_switch_daily_plan(owner, alias_key, rows, schedule_date)
+    return {"bucket_size": len(rows), "plan_regenerated": True}
+
+
+def _enabled_auto_switch_device_ids_for_owner_alias(owner_username: str, alias: str) -> list[str]:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return []
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT device_id
+            FROM client_devices
+            WHERE owner_username = ?
+              AND LOWER(TRIM(alias)) = LOWER(TRIM(?))
+              AND COALESCE(auto_switch_enabled, 0) = 1
+            ORDER BY updated_at DESC, device_id ASC
+            """,
+            (owner, alias_key),
+        ).fetchall()
+        return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    finally:
+        conn.close()
+
+
+def _resync_auto_switch_devices_for_alias(owner_username: str, alias: str, bucket_size: int) -> dict[str, Any]:
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return {"notified": 0, "disabled": 0, "session_id": "", "bundle_revision": 0}
+    device_ids = _enabled_auto_switch_device_ids_for_owner_alias(owner, alias_key)
+    if not device_ids:
+        return {"notified": 0, "disabled": 0, "session_id": "", "bundle_revision": 0}
+
+    if bucket_size >= 2:
+        session_id = _new_auto_switch_session_id(entering=True)
+        with store.lock:
+            store.auto_switch_bundle_revision = int(store.auto_switch_bundle_revision or 0) + 1
+            bundle_revision = int(store.auto_switch_bundle_revision)
+            store.auto_switch_align_on_next_tick = True
+        persist_runtime_state()
+        _persist_auto_switch_session_row(session_id, enabled=True, bundle_revision=bundle_revision)
+        notified = 0
+        for did in device_ids:
+            if not store.devices.get(did):
+                _hydrate_device_from_db(did)
+            closed_sessions = _close_active_auto_switch_enter_sessions_for_device(
+                did, except_session_id=session_id
+            )
+            if closed_sessions > 0:
+                _auto_switch_log(
+                    f"账号排除切换后关闭 {closed_sessions} 个旧 enter session device={did} session={session_id}"
+                )
+            superseded = _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+            if superseded > 0:
+                _auto_switch_log(
+                    f"账号排除切换后作废 {superseded} 条 exit 事件 device={did} session={session_id}"
+                )
+            if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
+                notified += 1
+                _append_device_log(
+                    did,
+                    f"[{now_text()}] 自动切号 | 账号参与范围变更，已下发资料重同步 session={session_id} revision={bundle_revision}",
+                )
+        return {
+            "notified": notified,
+            "disabled": 0,
+            "session_id": session_id,
+            "bundle_revision": bundle_revision,
+        }
+
+    session_id = _new_auto_switch_session_id(entering=False)
+    _persist_auto_switch_session_row(session_id, enabled=False, bundle_revision=0)
+    notified = 0
+    disabled = 0
+    cancelled_ops = 0
+    for did in device_ids:
+        if not store.devices.get(did):
+            _hydrate_device_from_db(did)
+        with store.lock:
+            dev = store.devices.get(did)
+            if dev and dev.auto_switch_enabled:
+                dev.auto_switch_enabled = False
+                disabled += 1
+        _persist_client_device_to_db(did, force=True)
+        closed_sessions = _close_active_auto_switch_enter_sessions_for_device(did)
+        if closed_sessions > 0:
+            _auto_switch_log(
+                f"账号排除导致桶内不足 2 个账号，关闭 {closed_sessions} 个旧 enter session device={did} session={session_id}"
+            )
+        superseded = _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+        if superseded > 0:
+            _auto_switch_log(
+                f"账号排除导致桶内不足 2 个账号，作废 {superseded} 条 enter 事件 device={did} session={session_id}"
+            )
+        cancelled_ops += _cancel_pending_auto_switch_device_ops_for_device(did)
+        if _enqueue_device_mode_event(did, owner, "auto_switch_exit", session_id, bundle_revision=0):
+            notified += 1
+            _append_device_log(
+                did,
+                f"[{now_text()}] 自动切号 | 参与账号不足 2 个，已自动关闭自治 session={session_id}",
+            )
+    if cancelled_ops > 0:
+        _auto_switch_log(
+            f"账号排除导致关闭自动切号 alias={alias_key} cancelled_ops={cancelled_ops} session={session_id}"
+        )
+    return {"notified": notified, "disabled": disabled, "session_id": session_id, "bundle_revision": 0}
 
 
 def _auto_publish_count_for_video_count(video_count: int) -> int:
@@ -12455,7 +12597,7 @@ def list_device_editor_rows(
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
             f"""
-            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
+            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, auto_switch_excluded, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
             WHERE owner_username = ? AND {paged_alias_expr} IN ({placeholders}){search_sql}
             ORDER BY {paged_alias_expr} ASC, row_index ASC
@@ -12478,6 +12620,7 @@ def list_device_editor_rows(
         items: list[dict[str, Any]] = []
         for r in rows:
             item = dict(r)
+            item["auto_switch_excluded"] = bool(int(item.get("auto_switch_excluded") or 0))
             ukey = str(item.get("username") or "").strip().lower()
             if ukey and ukey in account_alias_by_user:
                 item["account_assigned_alias"] = account_alias_by_user[ukey]
@@ -13278,6 +13421,74 @@ def set_device_editor_switch_highlight(payload: DeviceEditorSwitchHighlightReque
         return {"code": 0, "msg": "切号高亮已更新", "row_index": row_index}
     finally:
         conn.close()
+
+
+@app.post("/api/admin/editor/device_rows/auto_switch_excluded")
+def set_device_editor_auto_switch_excluded(
+    payload: DeviceEditorAutoSwitchExcludedRequest, authorization: str | None = Header(default=None)
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "璇峰厛鐧诲綍"}
+    owner = str(session.get("username") or "").strip()
+    if not owner:
+        return {"code": 401, "msg": "璇峰厛鐧诲綍"}
+    row_index = int(payload.row_index)
+    excluded_i = 1 if bool(payload.excluded) else 0
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            LIMIT 1
+            """,
+            (owner, row_index),
+        ).fetchone()
+        if not row:
+            return {"code": 1, "msg": "设备记录不存在"}
+        item = {
+            "row_index": int(row["row_index"] or 0),
+            "username": str(row["username"] or "").strip(),
+            "assigned_alias": str(row["assigned_alias"] or "").strip(),
+            "device_alias": str(row["device_alias"] or "").strip(),
+        }
+        alias_key = _device_editor_effective_alias(item)
+        now = now_text()
+        cur = conn.execute(
+            """
+            UPDATE device_editor_rows
+            SET auto_switch_excluded = ?, updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (excluded_i, now, owner, row_index),
+        )
+        if int(cur.rowcount or 0) <= 0:
+            return {"code": 1, "msg": "未更新任何记录"}
+        conn.commit()
+    finally:
+        conn.close()
+
+    plan_info = _refresh_auto_switch_plans_for_alias(owner, alias_key)
+    sync_info = _resync_auto_switch_devices_for_alias(
+        owner, alias_key, int(plan_info.get("bucket_size") or 0)
+    )
+    _reset_device_editor_read_maintain_schedule(owner)
+    return {
+        "code": 0,
+        "msg": "自动切号参与状态已更新",
+        "row_index": row_index,
+        "excluded": bool(excluded_i),
+        "alias": alias_key,
+        "username": item["username"],
+        "bucket_size": int(plan_info.get("bucket_size") or 0),
+        "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+        "devices_notified": int(sync_info.get("notified") or 0),
+        "devices_disabled": int(sync_info.get("disabled") or 0),
+        "session_id": str(sync_info.get("session_id") or ""),
+        "bundle_revision": int(sync_info.get("bundle_revision") or 0),
+    }
 
 
 @app.post("/api/admin/editor/device_rows/delete")

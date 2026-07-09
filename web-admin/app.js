@@ -10747,6 +10747,10 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const hasCutSwitchRow = exportRowIndex != null;
   const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
   const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
+  const autoSwitchExcluded = Boolean(row?.auto_switch_excluded);
+  const autoSwitchExcludedBadge = autoSwitchExcluded
+    ? '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该账号已设置为不参加自动切号">不参加自动切号</span>'
+    : "";
   const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
   const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
   const showRecordSelect = rows.length > 1;
@@ -10766,6 +10770,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
               ${aliasBadge}
               ${autoSwitchBadge}
+              ${autoSwitchExcludedBadge}
               ${envStatusBadge}
               ${dailyPublishBadge}
               <span class="backup-archive-record__username">${escapeHtml(username || "-")}</span>
@@ -10773,6 +10778,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
             </div>
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
+              <button type="button" class="ghost" title="${escapeHtml(autoSwitchExcluded ? "恢复参加自动切号" : "将该账号从自动切号计划中排除")}" data-account-auto-switch-excluded="1" data-account-id="${backupRecordId || ""}" data-account-excluded="${autoSwitchExcluded ? "1" : "0"}">${autoSwitchExcluded ? "参加自动切号" : "不参加自动切号"}</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "仅清理设备内 TikTok 数据，不做备份")}" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先备份，再清理设备内 TikTok 数据")}" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原")}" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
@@ -11147,6 +11153,7 @@ async function loadBackupArchiveRecords() {
       backup_name: row?.backup_name || "",
       backup_path: row?.backup_path || "",
       username: row?.username || "",
+      auto_switch_excluded: Boolean(row?.auto_switch_excluded),
       video_count: row?.video_count || "",
       follower_count: row?.follower_count || "",
       follower_growth: row?.follower_growth || "",
@@ -11496,7 +11503,8 @@ if (deviceAliasGroupsEl) {
       const isActiveCard = archiveCardGuard.classList.contains("backup-archive-record--active");
       const isSwitchOnly = target.hasAttribute("data-account-switch");
       const isUnassignOnly = target.hasAttribute("data-account-unassign");
-      if (!isActiveCard && !isSwitchOnly && !isUnassignOnly) {
+      const isAutoSwitchExcludeOnly = target.hasAttribute("data-account-auto-switch-excluded");
+      if (!isActiveCard && !isSwitchOnly && !isUnassignOnly && !isAutoSwitchExcludeOnly) {
         event.preventDefault();
         return;
       }
@@ -11564,6 +11572,37 @@ if (deviceAliasGroupsEl) {
         `已删除分配：${username} -> ${assignedAlias}（账号 ${updatedAccounts}，备份档案 ${deletedDevices}）`,
         "success",
       );
+      return;
+    }
+    if (target.hasAttribute("data-account-auto-switch-excluded")) {
+      event.preventDefault();
+      const rowIndex = Number(target.getAttribute("data-account-id") || 0) || 0;
+      if (!rowIndex) return;
+      const currentExcluded = String(target.getAttribute("data-account-excluded") || "").trim() === "1";
+      const nextExcluded = !currentExcluded;
+      const actionText = nextExcluded ? "不参加自动切号" : "参加自动切号";
+      const detail = nextExcluded
+        ? "开启后，该账号将从自动切号计划和 bundle 中排除。"
+        : "关闭后，该账号会重新参与自动切号计划。";
+      if (!window.confirm(`确认设置为“${actionText}”？\n${detail}`)) return;
+      const resp = await request("/api/admin/editor/device_rows/auto_switch_excluded", {
+        method: "POST",
+        body: JSON.stringify({
+          row_index: rowIndex,
+          excluded: nextExcluded,
+        }),
+      });
+      await loadAutoSwitchConfig({ refreshArchive: false });
+      await loadBackupArchiveRecords();
+      await refreshAutoSwitchDailyPlansInBackground();
+      const bucketSize = Number(resp?.bucket_size || 0);
+      const disabledDevices = Number(resp?.devices_disabled || 0);
+      const notifiedDevices = Number(resp?.devices_notified || 0);
+      const parts = [`已设置为“${actionText}”`];
+      if (bucketSize > 0) parts.push(`当前参与自动切号账号 ${bucketSize} 个`);
+      if (disabledDevices > 0) parts.push(`已自动关闭 ${disabledDevices} 台设备自动切号`);
+      else if (notifiedDevices > 0) parts.push(`已重同步 ${notifiedDevices} 台设备`);
+      setStatus(parts.join("，"), disabledDevices > 0 ? "warning" : "success");
       return;
     }
     if (target.hasAttribute("data-account-switch")) {
