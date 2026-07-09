@@ -51,6 +51,10 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <receiver
+            android:name=".WorkerServiceWatchdogReceiver"
+            android:enabled="true"
+            android:exported="false" />
 
         <!-- video_ded 独立入口：WiFi 素材传输 + PC 投屏（与涨粉主流程隔离） -->
         <activity

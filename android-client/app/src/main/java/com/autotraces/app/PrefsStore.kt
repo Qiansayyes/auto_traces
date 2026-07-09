@@ -29,6 +29,11 @@ object PrefsStore {
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
     /** 最近一次请求硬停的时间；用于忽略 opt_out 同步前的 check_start 竞态。 */
     private const val KEY_HARD_STOP_AT_MS = "hard_stop_at_ms"
+    /** 后台 WorkerService 是否应该被 watchdog/自恢复持续保活。 */
+    private const val KEY_WORKER_SERVICE_SHOULD_RUN = "worker_service_should_run"
+    /** 最近一次请求拉起 WorkerService 的时间（用于节流与幂等）。 */
+    private const val KEY_WORKER_SERVICE_LAST_START_REQUEST_AT_MS = "worker_service_last_start_request_at_ms"
+    private const val KEY_WORKER_SERVICE_LAST_START_REASON = "worker_service_last_start_reason"
     /**
      * 备份/清理/切号前为收尾而 sync 的 paused；登录保障通过并恢复涨粉后清除。
      * 避免 check_start 仍返回 status=paused 时轮询把本机再次打回暂停。
@@ -169,6 +174,9 @@ object PrefsStore {
             .putLong(KEY_LAST_BIND_REFRESH_MS, 0L)
             .remove(KEY_LAST_APPLIED_CONFIG_PUSH_REVISION)
             .remove(KEY_LOG_CONTEXT_USERNAME)
+            .putBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, false)
+            .remove(KEY_WORKER_SERVICE_LAST_START_REQUEST_AT_MS)
+            .remove(KEY_WORKER_SERVICE_LAST_START_REASON)
             .apply()
     }
 
@@ -201,6 +209,26 @@ object PrefsStore {
         }
         editor.apply()
     }
+
+    fun setWorkerServiceShouldRun(shouldRun: Boolean) {
+        prefs.edit().putBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, shouldRun).apply()
+    }
+
+    fun shouldWorkerServiceRun(): Boolean =
+        prefs.getBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, false)
+
+    fun noteWorkerServiceStartRequested(reason: String) {
+        prefs.edit()
+            .putLong(KEY_WORKER_SERVICE_LAST_START_REQUEST_AT_MS, System.currentTimeMillis())
+            .putString(KEY_WORKER_SERVICE_LAST_START_REASON, reason.trim().ifBlank { "unknown" })
+            .apply()
+    }
+
+    fun getWorkerServiceLastStartRequestAtMs(): Long =
+        prefs.getLong(KEY_WORKER_SERVICE_LAST_START_REQUEST_AT_MS, 0L)
+
+    fun getWorkerServiceLastStartReason(): String? =
+        prefs.getString(KEY_WORKER_SERVICE_LAST_START_REASON, null)?.trim()?.takeIf { it.isNotEmpty() }
 
     fun isHardStopRequested(): Boolean = prefs.getBoolean(KEY_HARD_STOP_REQUESTED, false)
 

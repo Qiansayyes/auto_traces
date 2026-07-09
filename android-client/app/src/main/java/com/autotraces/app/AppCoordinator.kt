@@ -23,6 +23,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +32,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import com.autotraces.app.backup.BackupDirectoryReconciler
 import com.autotraces.app.backup.DeviceBackupShell
 import com.autotraces.app.backup.UnifiedBackupPaths
@@ -1165,7 +1167,7 @@ object AppCoordinator {
             PrefsStore.saveLocalStatus("running")
             updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = reason)
             if (!WorkerServiceTracker.isRunning) {
-                runCatching { WorkerService.start(appContext) }
+                runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "force_start_running_now") }
                     .onFailure {
                         if (!alias.isNullOrBlank()) {
                             LogCenter.op(alias, "自动拉起后台服务失败：${it.message}")
@@ -1800,7 +1802,7 @@ object AppCoordinator {
                                 LogCenter.op(alias, "管理台已下发「开始运行」，涨粉/任务即将启动")
                                 updateRuntime(localStatus = "running", lastMessage = "收到启动/继续指令")
                                 if (!WorkerServiceTracker.isRunning) {
-                                    runCatching { WorkerService.start(appContext) }
+                                    runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "check_start_resume") }
                                         .onFailure {
                                             LogCenter.op(alias, "收到启动指令后恢复后台服务失败：${it.message}")
                                         }
@@ -2674,7 +2676,7 @@ object AppCoordinator {
                     lastMessage = "自动切号自治启动",
                 )
                 if (!WorkerServiceTracker.isRunning) {
-                    runCatching { WorkerService.start(appContext) }
+                    runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "auto_switch_enter_resume") }
                 }
                 runCatching { syncRunningToCloud() }
                 PrefsStore.saveAutoSwitchSessionContext(sessionId, bundleRevision)
@@ -2861,7 +2863,7 @@ object AppCoordinator {
             )
         }
         if (!WorkerServiceTracker.isRunning) {
-            runCatching { WorkerService.start(appContext) }
+            runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "pause_for_exclusive_op") }
                 .onFailure { LogCenter.op(alias, "云端指令：拉起后台服务失败：${it.message}") }
         }
     }
@@ -2983,7 +2985,7 @@ object AppCoordinator {
             started.set(true)
         }
         if (!WorkerServiceTracker.isRunning) {
-            runCatching { WorkerService.start(appContext) }
+            runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "prepare_exclusive_ui_op") }
                 .onFailure { LogCenter.op(alias, "[OP][$opId] 拉起后台服务失败：${it.message}") }
         }
         val pkg = packageName.trim().ifBlank { com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME }
@@ -4755,7 +4757,22 @@ object AppCoordinator {
             AutoSwitchLedger.recordFromDeviceOpReport(opId, status, message, data)
             return null
         }
-        return ApiService.reportDeviceOp(deviceId, alias, opId, status, message, data)
+        return try {
+            withTimeout(15_000L) {
+                ApiService.reportDeviceOp(deviceId, alias, opId, status, message, data)
+            }
+        } catch (err: TimeoutCancellationException) {
+            LogCenter.op(alias, "[OP][$opId] 设备操作结果上报超时（15s），已跳过阻塞等待")
+            null
+        } catch (err: SocketTimeoutException) {
+            LogCenter.op(alias, "[OP][$opId] 设备操作结果上报超时：${err.message ?: "socket timeout"}")
+            null
+        } catch (err: CancellationException) {
+            throw err
+        } catch (err: Exception) {
+            LogCenter.op(alias, "[OP][$opId] 设备操作结果上报失败：${err.message ?: "unknown"}")
+            null
+        }
     }
 
     private fun publishPostStartReportData(

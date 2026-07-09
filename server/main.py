@@ -653,6 +653,7 @@ def init_follow_db():
                 backup_name TEXT NOT NULL DEFAULT '',
                 backup_time TEXT NOT NULL DEFAULT '',
                 backup_status TEXT NOT NULL DEFAULT '',
+                auto_switch_excluded INTEGER NOT NULL DEFAULT 0,
                 remark TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (owner_username, row_index)
@@ -698,6 +699,10 @@ def init_follow_db():
             pass
         try:
             conn.execute("ALTER TABLE device_editor_rows ADD COLUMN follower_growth TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE device_editor_rows ADD COLUMN auto_switch_excluded INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
@@ -3840,6 +3845,13 @@ class AccountEditorRowUpsertRequest(BaseModel):
         return _normalize_switch_highlight(v)
 
 
+class AccountEditorRowBatchUpsertRequest(BaseModel):
+    items: list[AccountEditorRowUpsertRequest] = Field(..., min_length=1)
+
+
+ACCOUNT_EDITOR_ROW_BATCH_UPSERT_MAX = 300
+
+
 class DeviceEditorRowUpsertRequest(BaseModel):
     row_index: int = Field(..., ge=0)
     device_alias: str = ""
@@ -3903,6 +3915,11 @@ class DeviceEditorRowDeleteRequest(BaseModel):
 
 class DeviceEditorSwitchHighlightRequest(BaseModel):
     row_index: int = Field(..., ge=0)
+
+
+class DeviceEditorAutoSwitchExcludedRequest(BaseModel):
+    row_index: int = Field(..., ge=0)
+    excluded: bool = False
 
 
 class SetDeviceGroupRequest(BaseModel):
@@ -5249,6 +5266,7 @@ def _auto_switch_row_dict(row: sqlite3.Row | tuple | dict) -> dict[str, Any]:
         "backup_name": row[6] if len(row) > 6 else "",
         "switch_highlight": row[7] if len(row) > 7 else "否",
         "video_count": row[8] if len(row) > 8 else "",
+        "auto_switch_excluded": bool(int(row[9] or 0)) if len(row) > 9 else False,
     }
 
 
@@ -11720,6 +11738,48 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
         conn.close()
 
 
+@app.get("/api/admin/editor/account_rows/support")
+def list_account_editor_row_support(authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "璇峰厛鐧诲綍"}
+    conn = _get_db()
+    try:
+        owner = str(session["username"] or "").strip()
+        rows = conn.execute(
+            """
+            SELECT username, assigned_alias, device_alias, video_count, follower_count, follower_growth, updated_at, row_index
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY updated_at DESC, row_index DESC
+            """,
+            (owner,),
+        ).fetchall()
+        seen: set[str] = set()
+        items: list[dict[str, str]] = []
+        for row in rows:
+            username = str(row["username"] or "").strip()
+            key = username.lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            assigned_alias = str(row["assigned_alias"] or "").strip() or str(row["device_alias"] or "").strip()
+            items.append(
+                {
+                    "username": username,
+                    "assigned_alias": assigned_alias,
+                    "device_alias": str(row["device_alias"] or "").strip(),
+                    "video_count": str(row["video_count"] or "").strip(),
+                    "follower_count": str(row["follower_count"] or "").strip(),
+                    "follower_growth": str(row["follower_growth"] or "").strip(),
+                    "updated_at": str(row["updated_at"] or "").strip(),
+                }
+            )
+        return {"code": 0, "items": items}
+    finally:
+        conn.close()
+
+
 @app.post("/api/admin/editor/account_rows/upsert")
 def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorization: str | None = Header(default=None)):
     session = _current_session({"authorization": authorization} if authorization else {})
@@ -11837,6 +11897,166 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
         conn.commit()
         _reset_device_editor_read_maintain_schedule(owner)
         return {"code": 0, "msg": "账号记录已保存", "row_index": payload.row_index, "assigned_alias_locked": alias_locked or bool(persisted_alias)}
+    finally:
+        conn.close()
+
+def _account_editor_blank_if_none(text: object | None) -> str:
+    if text is None:
+        return ""
+    return str(text).strip()
+
+
+def _account_editor_batch_upsert_one_in_conn(
+    conn: sqlite3.Connection,
+    owner: str,
+    payload: AccountEditorRowUpsertRequest,
+) -> dict[str, Any]:
+    now = now_text()
+    row_index = int(payload.row_index)
+    incoming_alias = _account_editor_blank_if_none(payload.assigned_alias)
+    existing = conn.execute(
+        """
+        SELECT username, assigned_alias
+        FROM account_editor_rows
+        WHERE owner_username = ? AND row_index = ?
+        LIMIT 1
+        """,
+        (owner, row_index),
+    ).fetchone()
+    existing_username = str(existing["username"] or "").strip() if existing else ""
+    existing_assigned_alias = _account_editor_blank_if_none(existing["assigned_alias"]) if existing else ""
+    if not existing_assigned_alias and existing_username:
+        existing_assigned_alias = _recover_assigned_alias_for_account_username(
+            conn, owner, existing_username
+        )
+    alias_locked = bool(existing_assigned_alias)
+    if existing and alias_locked and incoming_alias and incoming_alias != existing_assigned_alias:
+        raise ValueError("该账号已分配别名，不能修改别名；删除账号记录将同步清理设备备份档案")
+
+    persisted_alias = existing_assigned_alias or incoming_alias
+    new_username = payload.username.strip()
+    if not persisted_alias:
+        recover_username = new_username or existing_username
+        if recover_username:
+            persisted_alias = _recover_assigned_alias_for_account_username(
+                conn, owner, recover_username
+            )
+
+    vc_input = _account_editor_blank_if_none(payload.video_count)
+    if not vc_input and not existing:
+        vc_input = str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)
+
+    conn.execute(
+        """
+        INSERT INTO account_editor_rows
+            (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
+        ON CONFLICT(owner_username, row_index) DO UPDATE SET
+            username = excluded.username,
+            password = excluded.password,
+            email = excluded.email,
+            email_password = excluded.email_password,
+            api = CASE
+                WHEN TRIM(excluded.api) <> '' THEN excluded.api
+                ELSE account_editor_rows.api
+            END,
+            is_login = excluded.is_login,
+            login_time = excluded.login_time,
+            region = excluded.region,
+            assigned_alias = CASE
+                WHEN TRIM(COALESCE(account_editor_rows.assigned_alias, '')) <> '' THEN account_editor_rows.assigned_alias
+                WHEN TRIM(excluded.assigned_alias) <> '' THEN excluded.assigned_alias
+                ELSE account_editor_rows.assigned_alias
+            END,
+            video_count = COALESCE(excluded.video_count, ''),
+            follower_count = COALESCE(excluded.follower_count, ''),
+            follower_growth = COALESCE(excluded.follower_growth, ''),
+            basic_profile_modified = COALESCE(excluded.basic_profile_modified, '鍚?),
+            updated_at = excluded.updated_at
+        """,
+        (
+            owner,
+            row_index,
+            new_username,
+            payload.password.strip(),
+            payload.email.strip(),
+            payload.email_password.strip(),
+            payload.api.strip(),
+            1 if payload.is_login else 0,
+            payload.login_time.strip(),
+            payload.region.strip(),
+            persisted_alias,
+            vc_input,
+            _account_editor_blank_if_none(payload.follower_count),
+            _account_editor_blank_if_none(payload.follower_growth),
+            _normalize_switch_highlight(payload.basic_profile_modified),
+            now,
+        ),
+    )
+
+    if (
+        existing_username
+        and new_username
+        and existing_username.lower() != new_username.lower()
+    ):
+        _sync_device_editor_username_for_account(
+            conn, owner, existing_username, new_username, persisted_alias
+        )
+
+    link_username = new_username or existing_username
+    if persisted_alias and link_username:
+        _link_backup_record_alias_for_username(
+            link_username, persisted_alias, owner_username=owner, conn=conn, commit=False
+        )
+        _upsert_backup_record_for_account(
+            owner,
+            link_username,
+            persisted_alias,
+            payload.region,
+            conn=conn,
+            commit=False,
+        )
+
+    return {
+        "row_index": row_index,
+        "assigned_alias_locked": alias_locked or bool(persisted_alias),
+        "persisted_alias": persisted_alias,
+        "username": link_username,
+    }
+
+
+@app.post("/api/admin/editor/account_rows/batch_upsert")
+def batch_upsert_account_editor_rows(
+    payload: AccountEditorRowBatchUpsertRequest, authorization: str | None = Header(default=None)
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "璇峰厛鐧诲綍"}
+
+    items = list(payload.items or [])
+    if len(items) > ACCOUNT_EDITOR_ROW_BATCH_UPSERT_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多导入 {ACCOUNT_EDITOR_ROW_BATCH_UPSERT_MAX} 条，请分批操作",
+        }
+
+    owner = str(session["username"] or "").strip()
+    conn = _get_db()
+    try:
+        results: list[dict[str, Any]] = []
+        for item in items:
+            results.append(_account_editor_batch_upsert_one_in_conn(conn, owner, item))
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"已批量保存 {len(results)} 条账号记录",
+            "count": len(results),
+            "items": results,
+        }
+    except ValueError as exc:
+        conn.rollback()
+        return {"code": 1, "msg": str(exc)}
     finally:
         conn.close()
 

@@ -1762,7 +1762,7 @@ async function switchSection(id, options = {}) {
   if (nextSectionId === "account-manager") {
     try {
       await loadBoundDeviceAliases();
-      await loadEditorState();
+      await refreshAccountEditorLight();
       renderAccountEditorRows();
     } catch (_) {
       // 保持静默，避免打断页面切换；状态栏会显示已有错误。
@@ -1784,7 +1784,7 @@ async function switchSection(id, options = {}) {
   if (nextSectionId === "backup-section") {
     try {
       await loadBoundDeviceAliases();
-      await loadEditorState();
+      await loadAccountEditorRows();
       renderDeviceRegionPresetOptions();
       renderDeviceAliasPresetOptions();
       await loadAutoSwitchConfig({ refreshArchive: false });
@@ -2771,7 +2771,7 @@ function buildAccountRecordDeletePayload(row, arrayIndex) {
 
 async function refreshEditorTablesAfterAccountDelete() {
   try {
-    await loadEditorState();
+    await loadAccountEditorRows();
   } catch (reloadError) {
     setStatus(`账号已删除，但刷新列表失败：${humanizeRequestErrorMessage(reloadError)}`, "warning");
   }
@@ -2951,7 +2951,7 @@ async function deleteSelectedAccountRecords() {
   let failedBatches = 0;
   try {
     while (pendingSnapshots.length) {
-      await loadEditorState();
+      await loadAccountEditorRows();
       pendingSnapshots = pendingSnapshots.filter((snap) => findAccountEditorRowByStableKey(snap.key));
       if (!pendingSnapshots.length) break;
 
@@ -6879,8 +6879,7 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       );
     } finally {
       try {
-        await loadEditorState();
-        await loadBackupArchiveRecords();
+        await refreshAccountEditorLight({ refreshArchive: true });
       } catch (_) {
         /* ignore */
       }
@@ -6955,8 +6954,7 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     );
   } finally {
     try {
-      await loadEditorState();
-      await loadBackupArchiveRecords();
+      await refreshAccountEditorLight({ refreshArchive: true });
     } catch (_) {
       /* ignore */
     }
@@ -8608,19 +8606,63 @@ async function syncAssignableAliasOptionsIfNeeded() {
 }
 
 async function loadAccountEditorRows() {
-  const accountsResp = await request(ACCOUNT_ROWS_API);
+  const [accountsResp, supportResp] = await Promise.all([
+    request(ACCOUNT_ROWS_API),
+    request("/api/admin/editor/account_rows/support").catch(() => ({ items: [] })),
+  ]);
   accountEditorRows = Array.isArray(accountsResp.items)
     ? accountsResp.items.map((item) => getAccountRowTemplate(item))
     : [];
-  syncAccountAliasFromDeviceRows();
-  enrichAccountStatsFromDeviceRows();
+  const supportItems = Array.isArray(supportResp?.items) ? supportResp.items : [];
+  if (supportItems.length) {
+    const aliasByUser = new Map();
+    const supportByUser = new Map();
+    supportItems.forEach((item) => {
+      const key = String(item?.username || "").trim().toLowerCase();
+      if (!key) return;
+      const alias = normalizeAliasValue(item?.assigned_alias || item?.device_alias);
+      if (alias && !aliasByUser.has(key)) aliasByUser.set(key, alias);
+      const existing = supportByUser.get(key);
+      const updatedAt = String(item?.updated_at || "");
+      if (!existing || updatedAt > String(existing?.updated_at || "")) {
+        supportByUser.set(key, item);
+      }
+    });
+    backupAliasByUsername = aliasByUser;
+    (accountEditorRows || []).forEach((row) => {
+      const key = String(row?.username || "").trim().toLowerCase();
+      if (!key) return;
+      if (!normalizeAliasValue(row?.assigned_alias) && aliasByUser.has(key)) {
+        row.assigned_alias = aliasByUser.get(key) || "";
+      }
+      const support = supportByUser.get(key);
+      if (!support) return;
+      for (const field of ["video_count", "follower_count", "follower_growth"]) {
+        if (String(row?.[field] ?? "").trim()) continue;
+        const nextValue = String(support?.[field] ?? "").trim();
+        if (nextValue) row[field] = nextValue;
+      }
+    });
+  } else {
+    rebuildBackupAliasByUsername();
+    syncAccountAliasFromDeviceRows();
+    enrichAccountStatsFromDeviceRows();
+  }
+}
+
+async function refreshAccountEditorLight({ refreshArchive = false } = {}) {
+  await loadAccountEditorRows();
+  renderAccountEditorRows();
+  renderDeviceRegionPresetOptions();
+  if (refreshArchive && document.getElementById("backup-section")?.classList.contains("active")) {
+    await loadBackupArchiveRecords();
+  }
 }
 
 async function loadEditorState() {
-  const [accountsResp, devicesResp, backupResp] = await Promise.all([
+  const [accountsResp, devicesResp] = await Promise.all([
     request(ACCOUNT_ROWS_API),
     request("/api/admin/device_editor_rows/export_backup"),
-    request("/api/admin/tiktok_backup/search?limit=100"),
     loadBoundDeviceAliases().catch(() => []),
   ]);
   accountEditorRows = Array.isArray(accountsResp.items)
@@ -8629,7 +8671,7 @@ async function loadEditorState() {
   deviceEditorRows = Array.isArray(devicesResp.items)
     ? devicesResp.items.map((item) => getDeviceRowTemplate(item))
     : [];
-  backupArchiveRows = Array.isArray(backupResp.items) ? backupResp.items : [];
+  backupArchiveRows = [];
   rebuildBackupAliasByUsername();
   syncAccountAliasFromDeviceRows();
   enrichAccountStatsFromDeviceRows();
@@ -9158,7 +9200,6 @@ async function commitAccountBatchImportFromPreview() {
       throw new Error("没有可导入的账号：所选记录均已存在或重复");
     }
     const newRowIndexes = allocateAccountRowIndexes(rowsToImport.length);
-    const startIndex = accountEditorRows.length;
     const overwriteSummaries = rowsToUpdate
       .map(({ index, row }) => {
         const existing = accountEditorRows[index];
@@ -9177,16 +9218,15 @@ async function commitAccountBatchImportFromPreview() {
         return;
       }
     }
-    rowsToImport.forEach((row, offset) => {
-      row.row_index = newRowIndexes[offset];
-      accountEditorRows.push(row);
-    });
-    rowsToUpdate.forEach(({ index, row }) => {
-      accountEditorRows[index] = row;
-    });
-    const saveIndexes = [
-      ...rowsToUpdate.map(({ index }) => index),
-      ...rowsToImport.map((_, offset) => startIndex + offset),
+    const batchItems = [
+      ...rowsToUpdate.map(({ index, row }) => ({
+        row_index: resolveAccountRowIndex(accountEditorRows[index], index),
+        ...row,
+      })),
+      ...rowsToImport.map((row, offset) => ({
+        row_index: newRowIndexes[offset],
+        ...row,
+      })),
     ];
     const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
     const statusParts = [];
@@ -9197,21 +9237,20 @@ async function commitAccountBatchImportFromPreview() {
     if (bulkAliasApplied > 0) statusParts.push(`已自动分配别名 ${bulkAliasApplied} 条`);
     const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
     const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
-    try {
-      await Promise.all(saveIndexes.map((index) => saveAccountRow(index, { skipReload: true, skipBackupEnsure: true })));
-    } catch (error) {
-      await loadEditorState();
-      renderAccountEditorRows();
-      renderDeviceEditorRows();
-      throw error;
-    }
+    await request(`${ACCOUNT_ROWS_API}/batch_upsert`, {
+      method: "POST",
+      body: JSON.stringify({ items: batchItems }),
+    });
     closeAccountBatchPreviewModal();
     if (accountBatchInputEl) accountBatchInputEl.value = "";
     setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
     try {
-      await loadEditorState();
+      await loadAccountEditorRows();
       renderAccountEditorRows();
-      renderDeviceEditorRows();
+      renderDeviceRegionPresetOptions();
+      if (document.getElementById("backup-section")?.classList.contains("active")) {
+        await loadBackupArchiveRecords();
+      }
     } catch (reloadError) {
       const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError || "刷新失败");
       setStatus(`批量导入已写入，但刷新列表失败：${reloadMsg}`, "warning");
@@ -11516,8 +11555,7 @@ if (deviceAliasGroupsEl) {
         }),
       });
       releaseAccountAliasBindingLocally(username, assignedAlias);
-      await loadEditorState();
-      await loadBackupArchiveRecords();
+      await refreshAccountEditorLight({ refreshArchive: true });
       renderAccountEditorRows();
       renderDeviceEditorRows();
       const updatedAccounts = Number(resp?.updated_accounts ?? 0);
@@ -11636,7 +11674,7 @@ if (apiBaseInput) {
     void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
     void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
     void loadAutoSwitchConfig({ refreshArchive: true });
-    loadEditorState().then(() => {
+    refreshAccountEditorLight().then(() => {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
       void loadBackupStatsFullQueryConfig();
