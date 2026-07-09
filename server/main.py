@@ -1260,6 +1260,12 @@ _overview_dirty_owners: set[str] = set()
 _overview_queue_stats_dirty = False
 _overview_snapshot_wake = Event()
 _OVERVIEW_SNAPSHOT_WORKER_INTERVAL_SEC = 0.4
+_OVERVIEW_QUEUE_STATS_CACHE_TTL_SEC = 1.0
+_overview_queue_stats_cache_lock = Lock()
+_overview_queue_stats_cache: dict[str, Any] = {
+    "payload": None,
+    "expires_at": 0.0,
+}
 
 
 def _ensure_overview_snapshot_tables() -> None:
@@ -18340,7 +18346,9 @@ def _load_overview_queue_stats_from_db(*, preview_limit: int = 200) -> dict[str,
 
 def _invalidate_overview_queue_stats_cache() -> None:
     with _overview_queue_stats_cache_lock:
+        _overview_queue_stats_cache["payload"] = None
         _overview_queue_stats_cache["expires_at"] = 0.0
+    _mark_queue_stats_dirty()
 
 
 def _overview_queue_stats_cached(*, preview_limit: int = 200) -> dict[str, Any]:
