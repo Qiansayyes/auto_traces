@@ -12119,7 +12119,7 @@ def _account_editor_batch_upsert_one_in_conn(
             video_count = COALESCE(excluded.video_count, ''),
             follower_count = COALESCE(excluded.follower_count, ''),
             follower_growth = COALESCE(excluded.follower_growth, ''),
-            basic_profile_modified = COALESCE(excluded.basic_profile_modified, '鍚?),
+            basic_profile_modified = COALESCE(excluded.basic_profile_modified, '否'),
             updated_at = excluded.updated_at
         """,
         (
