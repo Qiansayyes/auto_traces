@@ -99,11 +99,11 @@ def test_fetch_tiktok_email_code_via_mail_module_extracts_code():
             assert value == "123456"
 
 
-def test_main_tiktok_email_code_prefers_mail_module():
+def test_main_tiktok_email_code_uses_mail_module_when_api_fails():
     import main as app_main
 
     with patch.object(app_main, "_try_fetch_tiktok_email_code_via_mail_module", return_value=(0, "ok", "654321")), patch.object(
-        app_main, "_fetch_tiktok_email_code_from_api", side_effect=AssertionError("should not call legacy api")
+        app_main, "_fetch_tiktok_email_code_from_api", return_value=(1, "api unavailable", None)
     ):
         resp = app_main._tiktok_email_code_response(
             "dev_1",
@@ -156,7 +156,7 @@ if __name__ == "__main__":
     test_mail_account_lookup_and_token_check()
     test_mail_account_lookup_legacy_empty_owner()
     test_fetch_tiktok_email_code_via_mail_module_extracts_code()
-    test_main_tiktok_email_code_prefers_mail_module()
+    test_main_tiktok_email_code_uses_mail_module_when_api_fails()
     test_main_tiktok_email_code_falls_back_to_api()
     test_main_tiktok_email_code_surfaces_mail_module_error_when_api_empty()
     print("mail module email code tests passed")

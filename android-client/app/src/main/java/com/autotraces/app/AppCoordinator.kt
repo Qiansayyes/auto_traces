@@ -4031,7 +4031,9 @@ object AppCoordinator {
                 }
                 return AccountLoginRetryOutcome.LoggedIn
             }
-            nextForceRelogin = false
+            if (!forceRelogin) {
+                nextForceRelogin = false
+            }
             nextResumeFromEntry = false
             if (TikTokEmailCodeFetcher.consumeLastFetchUnrecoverableConfig()) {
                 autoLoginUnrecoverableCodeFetchAttempts++
@@ -8294,25 +8296,31 @@ object AppCoordinator {
                         "终止 $username 并从登录入口续接自动登录",
                 )
                 pendingUsernames.add(0, username)
-                ensureGrowthAccountLoggedInWithRetry(
+                val recovered = ensureGrowthAccountLoggedInWithRetry(
                     alias = alias,
                     deviceId = deviceId,
                     reason = "掉登录后",
                     forceRelogin = true,
                     resumeFromLoginEntryScreen = true,
                 )
+                if (!recovered) {
+                    pauseGrowthAfterLoginFailure(alias, deviceId, "掉登录后自动登录未恢复，已保留 $username 等待重登")
+                }
                 return
             }
             if (errThrowable is AccountStatusLoggedOutException) {
                 LogCenter.op(alias, "涨粉：掉登录，终止 $username：${errThrowable.message}")
                 pendingUsernames.add(0, username)
                 executor.setAccountStatusReloginInProgress(true)
-                ensureGrowthAccountLoggedInWithRetry(
+                val recovered = ensureGrowthAccountLoggedInWithRetry(
                     alias = alias,
                     deviceId = deviceId,
                     reason = "掉登录后",
                     forceRelogin = true,
                 )
+                if (!recovered) {
+                    pauseGrowthAfterLoginFailure(alias, deviceId, "Account status 掉登录后自动登录未恢复，已保留 $username 等待重登")
+                }
                 return
             }
             if (errThrowable != null && isPullLoopJobCancellation(errThrowable)) {

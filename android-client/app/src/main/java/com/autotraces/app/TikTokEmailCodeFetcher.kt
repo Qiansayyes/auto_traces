@@ -52,23 +52,23 @@ object TikTokEmailCodeFetcher {
             if (!url.startsWith("http://") && !url.startsWith("https://")) {
                 return finishFetch(Result.failure(IllegalStateException("API 链接无效")))
             }
+        }
+
+        if (deviceId.isNotBlank() && alias.isNotBlank()) {
+            val server = fetchCodeFromServerWithRetry(deviceId, alias, url, accountEmail)
+            if (server.isSuccess || url.isBlank()) return finishFetch(server)
             val local = withContext(Dispatchers.IO) { fetchFromApiUrl(url) }
             if (local.isSuccess) return finishFetch(local)
-            val localErr = local.exceptionOrNull()!!
-            if (deviceId.isBlank() || alias.isBlank()) {
-                return finishFetch(
-                    Result.failure(
-                        IllegalStateException(
-                            "设备端获取失败：${localErr.message ?: localErr.javaClass.simpleName}；设备未绑定，无法云端代取",
-                        ),
-                    ),
-                )
-            }
-        } else if (deviceId.isBlank() || alias.isBlank()) {
+            val serverErr = server.exceptionOrNull()?.message ?: "云端代取失败"
+            val localErr = local.exceptionOrNull()?.message ?: "设备端 API 获取失败"
+            return finishFetch(Result.failure(IllegalStateException("云端代取失败：$serverErr；设备端 API 获取失败：$localErr")))
+        }
+
+        if (url.isBlank()) {
             return finishFetch(Result.failure(IllegalStateException("API 为空且设备未绑定，无法云端代取")))
         }
 
-        return finishFetch(fetchCodeFromServerWithRetry(deviceId, alias, url, accountEmail))
+        return finishFetch(withContext(Dispatchers.IO) { fetchFromApiUrl(url) })
     }
 
     private suspend fun fetchCodeFromServerWithRetry(

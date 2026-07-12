@@ -17,6 +17,7 @@ import sys
 import locale
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10144,29 +10145,69 @@ def _tiktok_email_code_response(
 ) -> dict:
     owner = str(owner_username or "").strip()
     email = str(account_email or "").strip()
-    mail_msg = ""
-
-    if owner and email:
-        mail_code, mail_msg, mail_email_code = _try_fetch_tiktok_email_code_via_mail_module(owner, email)
-        if mail_code == 0 and mail_email_code:
-            print(
-                f"[{now_text()}] device_tiktok.email_code | ok_mail_module | device={device_id} "
-                f"alias={alias} email={email} | code={mail_email_code}"
-            )
-            return {"code": 0, "msg": "ok", "email_code": mail_email_code, "source": "mail_module"}
-        print(
-            f"[{now_text()}] device_tiktok.email_code | mail_module_fallback | device={device_id} "
-            f"alias={alias} email={email} | {mail_msg}"
-        )
-
     legacy_url = (api_url or "").strip()
+    fetch_jobs: dict[str, Any] = {}
+    if owner and email:
+        fetch_jobs["mail_module"] = lambda: _try_fetch_tiktok_email_code_via_mail_module(owner, email)
+    if legacy_url:
+        fetch_jobs["api"] = lambda: _fetch_tiktok_email_code_from_api(legacy_url)
+
+    if fetch_jobs:
+        results: dict[str, tuple[int, str, str | None]] = {}
+        executor = ThreadPoolExecutor(max_workers=len(fetch_jobs), thread_name_prefix="tiktok_email_code")
+        try:
+            future_sources = {executor.submit(job): source for source, job in fetch_jobs.items()}
+            for future in as_completed(future_sources):
+                source = future_sources[future]
+                try:
+                    code, msg, email_code = future.result()
+                except Exception as exc:
+                    code, msg, email_code = 1, str(exc), None
+                results[source] = (code, msg, email_code)
+                if code != 0 or not email_code:
+                    continue
+                for pending in future_sources:
+                    if pending is not future:
+                        pending.cancel()
+                source_label = "mail_module" if source == "mail_module" else "api"
+                detail = f" email={email}" if source == "mail_module" and email else ""
+                print(
+                    f"[{now_text()}] device_tiktok.email_code | ok_{source_label} | device={device_id} "
+                    f"alias={alias}{detail} | code={email_code}"
+                )
+                return {"code": 0, "msg": "ok", "email_code": email_code, "source": source}
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        mail_msg = str((results.get("mail_module") or (1, "", None))[1] or "").strip()
+        api_msg = str((results.get("api") or (1, "", None))[1] or "").strip()
+        if "mail_module" in fetch_jobs and "api" in fetch_jobs:
+            msg_parts = []
+            if mail_msg:
+                msg_parts.append(f"邮箱管理模块：{mail_msg}")
+            if api_msg:
+                msg_parts.append(f"API：{api_msg}")
+            fail_msg = "；".join(msg_parts) or "邮箱管理模块与 API 均未获取到验证码"
+            print(
+                f"[{now_text()}] device_tiktok.email_code | failed_parallel | device={device_id} "
+                f"alias={alias} | {fail_msg}"
+            )
+            return {"code": 1, "msg": fail_msg, "email_code": None}
+        if "mail_module" in fetch_jobs:
+            fail_msg = f"邮箱管理模块：{mail_msg}" if mail_msg else "邮箱管理模块不可用且 API 为空，无法获取验证码"
+            return {"code": 1, "msg": fail_msg, "email_code": None}
+        api_code, api_msg, _ = results.get("api") or (1, "无法获取验证码", None)
+        print(
+            f"[{now_text()}] device_tiktok.email_code | failed | device={device_id} "
+            f"alias={alias} | {api_msg}"
+        )
+        return {"code": api_code, "msg": api_msg, "email_code": None}
+
     if not legacy_url:
         if not owner:
             fail_msg = "设备未关联管理账号，无法通过邮箱管理模块获取验证码"
         elif not email:
             fail_msg = "邮箱为空且 API 为空，无法获取验证码"
-        elif mail_msg:
-            fail_msg = f"邮箱管理模块：{mail_msg}（且 API 为空）"
         else:
             fail_msg = "邮箱管理模块不可用且 API 为空，无法获取验证码"
         return {
@@ -10174,19 +10215,6 @@ def _tiktok_email_code_response(
             "msg": fail_msg,
             "email_code": None,
         }
-
-    code, msg, email_code = _fetch_tiktok_email_code_from_api(legacy_url)
-    if code != 0 or not email_code:
-        print(
-            f"[{now_text()}] device_tiktok.email_code | failed | device={device_id} "
-            f"alias={alias} | {msg}"
-        )
-        return {"code": code, "msg": msg, "email_code": None}
-    print(
-        f"[{now_text()}] device_tiktok.email_code | ok_api | device={device_id} "
-        f"alias={alias} | code={email_code}"
-    )
-    return {"code": 0, "msg": "ok", "email_code": email_code, "source": "api"}
 
 
 def _effective_device_editor_alias(row: dict[str, Any]) -> str:
