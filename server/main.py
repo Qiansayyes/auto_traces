@@ -11223,7 +11223,7 @@ def admin_device_pc_service_batch_set(
     payload: DevicePcServiceUrlBatchSetRequest,
     authorization: str | None = Header(default=None),
 ):
-    """批量下发 PC 投屏/伴侣服务地址；设备轮询 device_ops 后自动保存并重新注册。"""
+    """批量下发 PC 投屏/伴侣服务地址；不校验 online/offline，写库并入队后由设备轮询 device_ops 生效。"""
     err, _session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err

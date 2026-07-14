@@ -243,13 +243,13 @@
       <section id="pc-service" class="panel">
         <header>
           <h2>PC投屏地址</h2>
-          <p>批量下发 PC 伴侣服务地址（如 <code>http://192.168.1.6:5088</code>）；设备轮询云端任务后会自动保存并重新注册。</p>
+          <p>批量下发 PC 伴侣服务地址（如 <code>http://192.168.1.6:5088</code>）。<strong>offline 设备也可勾选下发</strong>：先写库并入队，设备重新上线轮询后自动保存并重新注册。</p>
         </header>
         <div class="panel-card">
           <div class="field" style="max-width:520px;">
             <label for="pcServiceUrlInput">PC 服务地址</label>
             <input id="pcServiceUrlInput" type="text" class="ui-input" placeholder="http://192.168.1.6:5088" autocomplete="off" />
-            <div class="hint" style="margin-top:6px;">须以 <code>http://</code> 或 <code>https://</code> 开头；下发后写入数据库并排队 <code>set_pc_service_url</code> 设备任务。</div>
+            <div class="hint" style="margin-top:6px;">须以 <code>http://</code> 或 <code>https://</code> 开头；不校验在线状态，下发后写入数据库并排队 <code>set_pc_service_url</code> 设备任务。</div>
           </div>
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px;">
             <button id="pcServiceApplyBtn" type="button" class="primary">下发到所选设备</button>

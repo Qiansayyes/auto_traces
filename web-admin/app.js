@@ -3502,9 +3502,9 @@ function renderPcServiceTable(devices = pcServiceDevices) {
     const status = String(info?.status || "offline");
     const statusClass = escapeHtml(status);
     const currentUrl = String(info?.pc_service_url || "").trim() || "—";
-    const rowStyle = status === "offline" ? ' style="opacity:.55;"' : "";
+    // offline 也可勾选下发：不灰置整行，避免误以为不可操作
     return `
-      <tr${rowStyle}>
+      <tr>
         <td><input type="checkbox" class="pc-service-check" data-device="${escapeHtml(deviceId)}" /></td>
         <td>${escapeHtml(deviceId)}</td>
         <td>${escapeHtml(alias)}</td>
