@@ -100,6 +100,8 @@ BASE_DEFAULT_CONFIG = {
     "profile_edit_bio_texts": ["Just vibing", "Thanks for visiting"],
     # 发作品前本机 tasks/request 拉取素材条数（清理图库之后）；0=不拉取
     "publish_post_material_fetch_count": 3,
+    # 自动切号：每号每时段上班后先消化的主播访问条数（从 live_customer 预取进 bundle）；0=关闭
+    "live_visit_count_per_slot": 0,
     # 引流 Videos 列表轮次（与完整互点共用）；粉丝列表 Follow 单次会话点击上限
     "mutual_videos_scroll_rounds": 5,
     "mutual_follow_tap_session_limit": 20,
@@ -1689,6 +1691,9 @@ _overview_fallback_snapshot: Dict[str, Any] = {
 _MOBILE_PENDING_EXPORT_JOB_MAX_AGE_SEC = int(2 * 60 * 60)
 _mobile_pending_export_jobs: Dict[str, Dict[str, Any]] = {}
 _mobile_pending_export_job_lock = Lock()
+# 自动切号 bundle 主播访问预取幂等缓存：key=device_id|revision|schedule_date
+_live_visit_prefetch_cache: Dict[str, Dict[str, List[str]]] = {}
+_live_visit_prefetch_cache_lock = Lock()
 
 
 def _purge_old_mobile_pending_export_jobs_unlocked() -> None:
@@ -4106,6 +4111,9 @@ class UpdateConfigRequest(BaseModel):
     mutual_traffic_follow_only: bool | None = None
     mutual_left_swipe_follow: bool | None = None  # 已废弃，保存时忽略；读模板时迁移为三项开关
     growth_pull_batches_before_auto_mutual: int | None = None
+    publish_post_material_fetch_count: int | None = None
+    # 自动切号：每号每时段上班后先消化的主播访问条数（0=关闭）
+    live_visit_count_per_slot: int | None = None
 
     @field_validator(
         "like_prob",
@@ -4209,6 +4217,24 @@ class UpdateConfigRequest(BaseModel):
             return value
         if value < -1 or value > 10_000:
             raise ValueError("growth_pull_batches_before_auto_mutual 必须在 -1~10000 之间（已废弃，设备端忽略）")
+        return value
+
+    @field_validator("publish_post_material_fetch_count")
+    @classmethod
+    def validate_publish_post_material_fetch_count(cls, value: int | None):
+        if value is None:
+            return value
+        if value < 0 or value > 20:
+            raise ValueError("publish_post_material_fetch_count 必须在 0~20 之间")
+        return value
+
+    @field_validator("live_visit_count_per_slot")
+    @classmethod
+    def validate_live_visit_count_per_slot(cls, value: int | None):
+        if value is None:
+            return value
+        if value < 0 or value > 50:
+            raise ValueError("live_visit_count_per_slot 必须在 0~50 之间")
         return value
 
     @field_validator("direct_post_action_delay_ms")
@@ -16238,11 +16264,89 @@ def _build_auto_switch_account_configs(
     return configs_by_username, smart_template_debug, active_template, eff_config
 
 
+def _prefetch_live_visit_usernames_for_bundle(
+    conn: sqlite3.Connection,
+    configs_by_username: dict[str, dict[str, Any]],
+    *,
+    consume: bool = True,
+    cache_key: str = "",
+) -> None:
+    """按账号模板 live_visit_count_per_slot 从 live_customer 预取，写入 live_visit_usernames。
+
+    consume=True：bump usage_count，并按 cache_key 幂等（同 device|revision|date 不重复消耗）。
+    consume=False：仅填充预览名单，不写库、不入缓存。
+    """
+    ck = str(cache_key or "").strip()
+    if consume and ck:
+        with _live_visit_prefetch_cache_lock:
+            cached = _live_visit_prefetch_cache.get(ck)
+            if isinstance(cached, dict):
+                for account_key, entry in configs_by_username.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    entry["live_visit_usernames"] = list(cached.get(str(account_key)) or [])
+                return
+
+    reserved: set[str] = set()
+    by_account: dict[str, list[str]] = {}
+    for account_key, entry in configs_by_username.items():
+        if not isinstance(entry, dict):
+            continue
+        cfg = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+        try:
+            n = int(cfg.get("live_visit_count_per_slot") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        n = max(0, min(n, 50))
+        if n <= 0:
+            entry["live_visit_usernames"] = []
+            by_account[str(account_key)] = []
+            continue
+        # 多账号时加宽取样窗口，避免 reserved 过多导致静默取不足
+        rows = conn.execute(
+            "SELECT username FROM live_customer ORDER BY usage_count ASC, created_at ASC LIMIT ?",
+            (max(n * 4, n + len(reserved) + 32),),
+        ).fetchall()
+        selected: list[str] = []
+        for row in rows:
+            username = str(row[0] or "").strip().lstrip("@")
+            if not username:
+                continue
+            key = username.lower()
+            if key in reserved:
+                continue
+            reserved.add(key)
+            selected.append(username)
+            if len(selected) >= n:
+                break
+        entry["live_visit_usernames"] = selected
+        by_account[str(account_key)] = list(selected)
+        if not selected or not consume:
+            continue
+        current_time = now_text()
+        for username in selected:
+            conn.execute(
+                "UPDATE live_customer SET usage_count = usage_count + 1, last_visit_at = ? WHERE username = ?",
+                (current_time, username),
+            )
+    if consume and any(by_account.values()):
+        conn.commit()
+    if consume and ck:
+        with _live_visit_prefetch_cache_lock:
+            _live_visit_prefetch_cache[ck] = by_account
+            # 防止无限增长：只保留最近 256 个 revision 缓存键
+            if len(_live_visit_prefetch_cache) > 256:
+                for old_key in list(_live_visit_prefetch_cache.keys())[:64]:
+                    _live_visit_prefetch_cache.pop(old_key, None)
+
+
 def _build_auto_switch_bundle_for_device(
     device_id: str,
     alias: str,
     session_id: str = "",
     revision: int = 0,
+    *,
+    prefetch_consume: bool = True,
 ) -> dict[str, Any]:
     error, device = auth_or_error(device_id, alias)
     if error:
@@ -16291,21 +16395,37 @@ def _build_auto_switch_bundle_for_device(
                     **acct_fields,
                 }
             )
+        configs_by_username, smart_template_debug, active_template, eff_config = _build_auto_switch_account_configs(
+            owner,
+            runtime,
+            mode,
+            alias_key,
+            accounts,
+            session_id=str(session_id or "").strip(),
+        )
+        prefetch_cache_key = ""
+        if prefetch_consume:
+            prefetch_cache_key = (
+                f"{str(device_id or '').strip()}|{int(revision or 0)}|{schedule_date}|{alias_key}"
+            )
+        _prefetch_live_visit_usernames_for_bundle(
+            conn,
+            configs_by_username,
+            consume=bool(prefetch_consume),
+            cache_key=prefetch_cache_key,
+        )
     finally:
         conn.close()
-    configs_by_username, smart_template_debug, active_template, eff_config = _build_auto_switch_account_configs(
-        owner,
-        runtime,
-        mode,
-        alias_key,
-        accounts,
-        session_id=str(session_id or "").strip(),
-    )
     mat_fetch = eff_config.get("publish_post_material_fetch_count", 3)
     try:
         mat_fetch_n = int(mat_fetch)
     except (TypeError, ValueError):
         mat_fetch_n = 3
+    try:
+        live_visit_n = int(eff_config.get("live_visit_count_per_slot") or 0)
+    except (TypeError, ValueError):
+        live_visit_n = 0
+    live_visit_n = max(0, min(live_visit_n, 50))
     pc_service_url = _load_device_pc_service_url(str(device_id or "").strip())
     return {
         "session_id": str(session_id or "").strip(),
@@ -16323,6 +16443,7 @@ def _build_auto_switch_bundle_for_device(
             "run_mode": mode,
             "active_template": str(active_template or ""),
             "publish_post_material_fetch_count": mat_fetch_n,
+            "live_visit_count_per_slot": live_visit_n,
             "package_name": TIKTOK_PACKAGE_NAME,
         },
         "configs_by_username": configs_by_username,
@@ -16683,7 +16804,9 @@ def admin_auto_switch_bundle_preview(
         return {"code": 1, "msg": "无权预览该设备"}
     preview_session = str(session_id or "").strip() or f"preview-{uuid.uuid4().hex[:12]}"
     try:
-        bundle = _build_auto_switch_bundle_for_device(did, alias_key, preview_session, revision=0)
+        bundle = _build_auto_switch_bundle_for_device(
+            did, alias_key, preview_session, revision=0, prefetch_consume=False,
+        )
     except ValueError as exc:
         return {"code": 1, "msg": str(exc)}
     except Exception as exc:

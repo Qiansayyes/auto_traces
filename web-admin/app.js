@@ -3645,6 +3645,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     pull_batches_before_rest: 5,
     no_rest: false,
     publish_post_material_fetch_count: 3,
+    live_visit_count_per_slot: 0,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -3690,6 +3691,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     pull_batches_before_rest: 5,
     no_rest: false,
     publish_post_material_fetch_count: 3,
+    live_visit_count_per_slot: 0,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -3734,6 +3736,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     pull_batches_before_rest: 5,
     no_rest: false,
     publish_post_material_fetch_count: 3,
+    live_visit_count_per_slot: 0,
     process_queue_batch_size: 100,
     comment_texts: ["hi", "moring", "so cute"],
     mutual_comment_texts: ["hi", "moring", "so cute"],
@@ -5170,9 +5173,19 @@ function aliasGroupHasSelectedExportRows(detailsEl) {
   ).some((el) => el instanceof HTMLInputElement && el.checked);
 }
 
+function countVisibleAutoSwitchSelectedGroups() {
+  if (!deviceAliasGroupsEl) return 0;
+  let count = 0;
+  deviceAliasGroupsEl.querySelectorAll("details.panel-card[data-archive-alias]").forEach((details) => {
+    if (!(details instanceof HTMLElement)) return;
+    if (aliasGroupHasSelectedExportRows(details)) count += 1;
+  });
+  return count;
+}
+
 /** 收集待开启/关闭自动切号的 device_id（勾选记录 / 本组全选 / 程序化全选）。 */
 function collectAutoSwitchTargetDeviceIds() {
-  const ids = new Set(autoSwitchPickDeviceIds);
+  const ids = new Set();
   if (backupArchiveSelectedRowIndices.size && Array.isArray(backupArchivePageItems)) {
     backupArchivePageItems.forEach((row) => {
       const idx = resolveBackupArchiveExportRowIndex(row);
@@ -5246,8 +5259,7 @@ function applyAutoSwitchManualOpsUi() {
   }
   if (autoSwitchEnableSelectedBtn) {
     const pickCount = collectAutoSwitchTargetDeviceIds().length;
-    const rawCount = autoSwitchPickDeviceIds.size
-      + (backupArchiveSelectedRowIndices.size > 0 ? backupArchiveSelectedRowIndices.size : 0);
+    const rawCount = countVisibleAutoSwitchSelectedGroups();
     autoSwitchEnableSelectedBtn.disabled = autoSwitchSaveInFlight || pickCount === 0;
     autoSwitchEnableSelectedBtn.title =
       pickCount > 0
@@ -5511,7 +5523,7 @@ async function saveAutoSwitchConfig(options = {}) {
   );
   if (!deviceIds.length) {
     setStatus(
-      backupArchiveSelectedRowIndices.size > 0 || autoSwitchPickDeviceIds.size > 0
+      countVisibleAutoSwitchSelectedGroups() > 0
         ? "所选别名未绑定有效 device_id，请先在设备总览确认客户端已绑定后再开启自动切号"
         : "请先选择设备：勾选别名组左侧复选框，或点「全选本页」",
       "warning",
@@ -10821,6 +10833,24 @@ function syncBackupArchiveSearchFromInput() {
   backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
 }
 
+/** 备份档案分组「其它 N 条」折叠态；列表重渲（时段高亮/日计划刷新）时需保留，否则会看起来像自动收起。 */
+function collectOpenBackupArchiveGroupFolds() {
+  const open = new Set();
+  if (!deviceAliasGroupsEl) return open;
+  deviceAliasGroupsEl.querySelectorAll("details.panel-card[data-archive-alias]").forEach((group) => {
+    if (!(group instanceof HTMLElement)) return;
+    const fold = group.querySelector("details.backup-archive-group-fold");
+    if (fold instanceof HTMLDetailsElement && fold.open) {
+      open.add(String(group.getAttribute("data-archive-alias") || ""));
+    }
+  });
+  return open;
+}
+
+function backupArchiveGroupFoldKey(alias) {
+  return alias === "__EMPTY_ALIAS__" ? "" : String(alias || "");
+}
+
 function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
@@ -10830,6 +10860,7 @@ function renderBackupGroups(items = []) {
     deviceAliasGroupsEl.innerHTML = `<div class="hint">${emptyHint}</div>`;
     return;
   }
+  const openGroupFolds = collectOpenBackupArchiveGroupFolds();
   const groups = new Map();
   items.forEach((item) => {
     const alias = resolveBackupArchiveDisplayAlias(item) || "__EMPTY_ALIAS__";
@@ -10841,12 +10872,14 @@ function renderBackupGroups(items = []) {
     : "";
   deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
     const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
+    const aliasKey = backupArchiveGroupFoldKey(alias);
     const deviceId = resolveDeviceIdForArchiveAlias(alias, rows[0]?.device_id);
     const autoSwitchOn = isAutoSwitchEnabledForDeviceId(deviceId);
     const { primary, secondary } = partitionBackupArchiveGroupRows(rows, alias);
     const primaryHtml = primary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, idx, alias)).join("");
+    const foldOpenAttr = openGroupFolds.has(aliasKey) ? " open" : "";
     const secondaryHtml = secondary.length
-      ? `<details class="backup-archive-group-fold">
+      ? `<details class="backup-archive-group-fold"${foldOpenAttr}>
           <summary class="backup-archive-group-fold__summary">其它 ${secondary.length} 条记录（点击展开）</summary>
           <div class="backup-archive-group-fold__body">${secondary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, primary.length + idx, alias)).join("")}</div>
         </details>`
@@ -10856,7 +10889,7 @@ function renderBackupGroups(items = []) {
       .map((row) => resolveBackupArchiveExportRowIndex(row))
       .filter((n) => n != null);
     const groupAllSelected = groupRowIndices.length > 0 && groupRowIndices.every((n) => backupArchiveSelectedRowIndices.has(n));
-    return `<details class="panel-card" style="margin-bottom:12px;" open data-archive-alias="${escapeHtml(alias === "__EMPTY_ALIAS__" ? "" : alias)}" data-archive-device-id="${escapeHtml(deviceId)}">
+    return `<details class="panel-card" style="margin-bottom:12px;" open data-archive-alias="${escapeHtml(aliasKey)}" data-archive-device-id="${escapeHtml(deviceId)}">
       <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;align-items:center;">
         <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
           ${groupRowIndices.length ? `<label class="backup-archive-group-select" title="勾选本组：导出 xlsx / 开启或关闭自动切号" onclick="event.stopPropagation()"><input type="checkbox" class="backup-archive-group-select-all"${groupAllSelected ? " checked" : ""} data-group-row-indices="${escapeHtml(groupRowIndices.join(","))}" /></label>` : ""}

@@ -127,6 +127,13 @@ data class ProfileEditChainResult(
     val profileEditResumeFrom: String = "",
 )
 
+data class ProfileEditEntryPreparationResult(
+    val success: Boolean,
+    val entryMode: String = "",
+    val failureStep: String = "",
+    val profileTapPx: Pair<Int, Int>? = null,
+)
+
 interface TraceExecutor {
     suspend fun executeForUsername(username: String, config: AppConfig): String
     suspend fun restartTikTokForRecovery(skipDontAllowOcr: Boolean = false): Boolean = false
@@ -143,6 +150,12 @@ interface TraceExecutor {
         forceStopBeforeLaunch: Boolean,
         timingConfig: AppConfig? = null,
     ): Boolean
+
+    suspend fun prepareProfileEditEntryPreferHome(
+        ctx: Context,
+        alias: String,
+        reason: String,
+    ): ProfileEditEntryPreparationResult
 
     /**
      * 假定 TikTok 已在前台且刚完成「资料入口」比例点点击：OCR 严格找「Edit」坐标→点击「Edit」→
@@ -325,6 +338,137 @@ class RealTraceExecutor(
             left -= chunk
         }
         return true
+    }
+
+    private suspend fun detectVideoMotionByFrameDiffFromBeforeTapFullScreenFallback(
+        service: Context,
+        beforeTapReference: File?,
+        afterTapDelayMs: Long = 1000L,
+        tag: String = "甯у樊",
+        exportGrowthFrameDiffFailureToGallery: Boolean = false,
+    ): Boolean {
+        if (beforeTapReference == null || !beforeTapReference.exists()) {
+            return detectVideoMotionByFrameDiffFullScreenFallback(
+                service = service,
+                debugTag = "fb_${sanitizeFrameDiffTagForFilename(tag)}",
+                motionTagForFailureExport = tag,
+                exportGrowthFrameDiffFailureToGallery = exportGrowthFrameDiffFailureToGallery,
+            )
+        }
+        val afterTap = File(service.cacheDir, "frame_diff_fullscreen_after_tap.png")
+        try {
+            val waitMs = afterTapDelayMs.coerceAtLeast(0L)
+            if (waitMs > 0L) delay(waitMs)
+            if (!runSuCommand("screencap -p ${afterTap.absolutePath}")) return false
+
+            val bmp1Full = decodeScreenshotRgb565(beforeTapReference.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(afterTap.absolutePath) ?: run {
+                bmp1Full.recycle()
+                return false
+            }
+            try {
+                val w = bmp1Full.width.coerceAtMost(bmp2Full.width)
+                val h = bmp1Full.height.coerceAtMost(bmp2Full.height)
+                if (w <= 0 || h <= 0) return false
+                val bmp1Crop = Bitmap.createBitmap(bmp1Full, 0, 0, w, h)
+                val bmp2Crop = Bitmap.createBitmap(bmp2Full, 0, 0, w, h)
+                try {
+                    val targetW = 160
+                    val targetH = (targetW * (bmp1Crop.height.toFloat() / bmp1Crop.width.toFloat())).toInt()
+                        .coerceAtLeast(90)
+                    val b1 = Bitmap.createScaledBitmap(bmp1Crop, targetW, targetH, true)
+                    val b2 = Bitmap.createScaledBitmap(bmp2Crop, targetW, targetH, true)
+                    try {
+                        val diff = computeMeanAbsPixelDiff(b1, b2)
+                        val diffText = String.format(Locale.US, "%.4f", diff)
+                        val thrText = String.format(Locale.US, "%.4f", FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD)
+                        val alias = PrefsStore.getAlias() ?: "unknown"
+                        devOp(alias, "${sanitizeFrameDiffTagForFilename(tag)}（全屏fallback）：帧差计算完成 diff=$diffText")
+                        devOp(alias, "${sanitizeFrameDiffTagForFilename(tag)}（全屏fallback）：帧差阈值=$thrText，结果=${if (diff >= FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD) "通过" else "未通过"}")
+                        val passed = diff >= FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD
+                        if (!passed && exportGrowthFrameDiffFailureToGallery) {
+                            saveGrowthFrameDiffFailureScreensToGallery(service, bmp1Full, bmp2Full, "${tag}_fullscreen_fallback")
+                        }
+                        return passed
+                    } finally {
+                        b1.recycle()
+                        b2.recycle()
+                    }
+                } finally {
+                    bmp1Crop.recycle()
+                    bmp2Crop.recycle()
+                }
+            } finally {
+                bmp1Full.recycle()
+                bmp2Full.recycle()
+            }
+        } catch (_: Exception) {
+            return false
+        } finally {
+            afterTap.delete()
+        }
+    }
+
+    private suspend fun detectVideoMotionByFrameDiffFullScreenFallback(
+        service: Context,
+        debugTag: String = "no_before_ref",
+        motionTagForFailureExport: String = debugTag,
+        exportGrowthFrameDiffFailureToGallery: Boolean = false,
+    ): Boolean {
+        val screenshot1 = File(service.cacheDir, "frame_diff_fullscreen_1.png")
+        val screenshot2 = File(service.cacheDir, "frame_diff_fullscreen_2.png")
+        try {
+            if (!runSuCommand("screencap -p ${screenshot1.absolutePath}")) return false
+            delay(500)
+            if (!runSuCommand("screencap -p ${screenshot2.absolutePath}")) return false
+
+            val bmp1Full = decodeScreenshotRgb565(screenshot1.absolutePath) ?: return false
+            val bmp2Full = decodeScreenshotRgb565(screenshot2.absolutePath) ?: run {
+                bmp1Full.recycle()
+                return false
+            }
+            try {
+                val w = bmp1Full.width.coerceAtMost(bmp2Full.width)
+                val h = bmp1Full.height.coerceAtMost(bmp2Full.height)
+                if (w <= 0 || h <= 0) return false
+                val bmp1Crop = Bitmap.createBitmap(bmp1Full, 0, 0, w, h)
+                val bmp2Crop = Bitmap.createBitmap(bmp2Full, 0, 0, w, h)
+                try {
+                    val targetW = 160
+                    val targetH = (targetW * (bmp1Crop.height.toFloat() / bmp1Crop.width.toFloat())).toInt()
+                        .coerceAtLeast(90)
+                    val b1 = Bitmap.createScaledBitmap(bmp1Crop, targetW, targetH, true)
+                    val b2 = Bitmap.createScaledBitmap(bmp2Crop, targetW, targetH, true)
+                    try {
+                        val diff = computeMeanAbsPixelDiff(b1, b2)
+                        val diffText = String.format(Locale.US, "%.4f", diff)
+                        val thrText = String.format(Locale.US, "%.4f", FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD)
+                        val alias = PrefsStore.getAlias() ?: "unknown"
+                        devOp(alias, "${sanitizeFrameDiffTagForFilename(debugTag)}（全屏fallback）：帧差计算完成 diff=$diffText")
+                        devOp(alias, "${sanitizeFrameDiffTagForFilename(debugTag)}（全屏fallback）：帧差阈值=$thrText，结果=${if (diff >= FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD) "通过" else "未通过"}")
+                        val passed = diff >= FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD
+                        if (!passed && exportGrowthFrameDiffFailureToGallery) {
+                            saveGrowthFrameDiffFailureScreensToGallery(service, bmp1Full, bmp2Full, "${motionTagForFailureExport}_fullscreen_fallback")
+                        }
+                        return passed
+                    } finally {
+                        b1.recycle()
+                        b2.recycle()
+                    }
+                } finally {
+                    bmp1Crop.recycle()
+                    bmp2Crop.recycle()
+                }
+            } finally {
+                bmp1Full.recycle()
+                bmp2Full.recycle()
+            }
+        } catch (_: Exception) {
+            return false
+        } finally {
+            screenshot1.delete()
+            screenshot2.delete()
+        }
     }
 
     /**
@@ -572,12 +716,16 @@ class RealTraceExecutor(
         vision: Text,
         fileTag: String?,
     ): Boolean {
+        // Account status 须优先于 Log in 探测：弹窗正文含 “please log in again”，会误判为登录入口且永不点 OK。
+        if (accountStatusRecoveryInProgress) return false
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        if (isLogoutProbeContextActive() || accountStatusReloginInProgress) {
+            val handled = probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
+            if (handled) return true
+        }
         probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
         probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
-        if (accountStatusRecoveryInProgress) return false
-        if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return false
-        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
-        return probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
+        return false
     }
 
     /** 裁切 OCR 前对整屏截图顺手处理弹窗/验证，并在涨粉等场景下观察掉登录信号。 */
@@ -615,10 +763,12 @@ class RealTraceExecutor(
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
             }
+            // Account status 须优先于 Log in（弹窗文案 “please log in again” 不能先当登录入口）。
+            if (isLogoutProbeContextActive() || accountStatusReloginInProgress) {
+                probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
+            }
             probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
-            if (!isLogoutProbeContextActive() && !accountStatusReloginInProgress) return
-            probeAndHandleLogoutSignalsFromVision(ctx, alias, vision, fileTag)
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -711,8 +861,11 @@ class RealTraceExecutor(
 
     companion object {
         private const val FRAME_DIFF_PASS_THRESHOLD = 0.25f
+        private const val FRAME_DIFF_FULLSCREEN_FALLBACK_THRESHOLD = 0.18f
         /** 帧差重试间隔（毫秒），临时固定 5s */
         private const val FRAME_DIFF_RETRY_DELAY_MS = 5000L
+        private const val GROWTH_POST_CHECK_AFTER_TAP_DELAY_FLOOR_MS = 1500L
+        private const val GROWTH_POST_SECOND_CHECK_DELAY_FLOOR_MS = 900L
         /** Videos 区连续帧差失败时，teamwork 全量恢复的最大轮数（避免死循环） */
         private const val MUTUAL_VIDEOS_FRAME_DIFF_MAX_RECOVERY_CYCLES = 8
         /** 互点入口：force-stop 后重新搜索并进入 Videos 标签的最大尝试次数 */
@@ -1683,7 +1836,44 @@ class RealTraceExecutor(
                 logAlias,
                 "「修改基本资料」Bio：不一致（剪贴板=$fromClip ≠ 分配=$assignedNorm），上报云端更新 username",
             )
+            val deviceId = PrefsStore.getDeviceId()?.trim()?.takeIf { it.isNotEmpty() }
+            val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
             if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                fun recordLedgerFallback(reason: String) {
+                    AutoSwitchLedger.recordUsernameUpdate(assignedUsername, syncedUsername)
+                    AutoSwitchBundleHolder.notifyUsernameChanged(assignedUsername, syncedUsername)
+                    devOp(logAlias, "profile edit bio: autonomous username change queued to ledger, reason=$reason")
+                }
+                if (deviceId != null && alias != null) {
+                    try {
+                        val resp = withContext(Dispatchers.IO) {
+                            ApiService.updateDeviceAssignedAccountUsername(deviceId, alias, syncedUsername)
+                        }
+                        devOp(
+                            logAlias,
+                            "profile edit bio: autonomous cloud username update code=${resp.code} msg=${resp.msg} updated=${resp.updated} username=${resp.username}",
+                        )
+                        if (resp.code == 0) {
+                            val cloudUser = resp.username?.trim()?.takeIf { it.isNotEmpty() } ?: syncedUsername
+                            AutoSwitchBundleHolder.notifyUsernameChanged(assignedUsername, cloudUser)
+                            profileEditClearFocusedNameField(logAlias)
+                            delay(Random.nextLong(320, 520))
+                            return cloudUser
+                        }
+                        recordLedgerFallback("cloud_code_${resp.code}")
+                    } catch (ex: Exception) {
+                        devOp(logAlias, "profile edit bio: autonomous cloud username update exception ${ex.message}")
+                        recordLedgerFallback("cloud_exception")
+                    }
+                } else {
+                    devOp(logAlias, "profile edit bio: autonomous mode missing deviceId/alias, fallback to ledger")
+                    recordLedgerFallback("missing_device_identity")
+                }
+                profileEditClearFocusedNameField(logAlias)
+                delay(Random.nextLong(320, 520))
+                return syncedUsername
+            }
+            if (false) {
                 AutoSwitchLedger.recordUsernameUpdate(assignedUsername, syncedUsername)
                 devOp(logAlias, "「修改基本资料」Bio：用户名变更已记入 ledger（对账写回）")
             } else {
@@ -2023,8 +2213,9 @@ class RealTraceExecutor(
             maxOf(r1.bottom, r2.bottom, r3.bottom),
         )
 
-    /** 资料页头像入口文案：部分账号显示 Change photo，另一些为 Edit photo 或 Avatar。 */
-    private val PROFILE_EDIT_CHANGE_PHOTO_LABELS = listOf("Change photo", "Edit photo", "Avatar")
+    /** 资料页头像入口文案：部分账号显示 Change photo/Edit photo/Avatar，也有账号直接显示 Upload photo / Select from Gallery。 */
+    private val PROFILE_EDIT_CHANGE_PHOTO_LABELS =
+        listOf("Change photo", "Edit photo", "Avatar", "Upload photo", "Select from Gallery")
 
     private fun findProfileEditChangePhotoMarkerHit(result: Text): Pair<StrictLabelHit, String>? {
         for (label in PROFILE_EDIT_CHANGE_PHOTO_LABELS) {
@@ -2135,7 +2326,11 @@ class RealTraceExecutor(
 
     private fun visionShowsAccountStatusLogoutDialog(vision: Text): Boolean {
         val text = vision.text.lowercase(Locale.US)
-        return text.contains("account status")
+        if (text.contains("account status")) return true
+        // 标题漏识时：风控正文 + OK（涨粉期常见，勿误判为普通登录入口）
+        if (text.contains("may be at risk") && text.contains("log in again")) return true
+        if (text.contains("please log in again") && findAccountStatusOkButtonHit(vision) != null) return true
+        return false
     }
 
     private fun findAccountStatusOkButtonHit(vision: Text): StrictLabelHit? =
@@ -3384,6 +3579,149 @@ class RealTraceExecutor(
             if (!profileEditDelay(logAlias, settleMs, "For You下滑${pass + 1}后")) return false
         }
         return true
+    }
+
+    /*
+    override suspend fun prepareProfileEditEntryPreferHome(
+        ctx: Context,
+        alias: String,
+        reason: String,
+    ): ProfileEditEntryPreparationResult {
+        if (hardStopOrNull(alias, "$reason-鍏ュ彛棰勬")) {
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "hard_stop")
+        }
+        if (!ensureTikTokInForeground(ctx, alias, "$reason路鍏ュ彛棰勬", allowForceRestart = false)) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€鏃舵湭鑳界‘璁?TikTok 鍓嶅彴锛屼氦鍥炲杞?warmup")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_foreground_unavailable")
+        }
+        if (!profileEditDelay(alias, 700L, "$reason路鍏ュ彛棰勬")) {
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "hard_stop")
+        }
+
+        val metrics = ctx.resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_entry_precheck")
+        if (vision == null) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€ OCR 澶辫触锛?errTag")
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = if (isMlKitHardStopError(errTag)) "hard_stop" else "entry_precheck_ocr_failed",
+            )
+        }
+
+        val preview = buildProfileEditOcrPreview(vision).take(320)
+        if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, screenH)) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€宸茶 Profile+Edit锛岀洿鎺ヨ繘鍏ユ敼璧勬枡锛汷CR=$preview")
+            return ProfileEditEntryPreparationResult(success = true, entryMode = "already_on_profile")
+        }
+
+        if (!autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€鏈涓婚〉搴曟爮 Home+Profile锛屼氦鍥炲杞?warmup锛汷CR=$preview")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_precheck_not_home")
+        }
+
+        val profileHit = findAutoLoginProfileTabHit(vision, screenH)
+            ?: findBottomBandLabelContaining(vision, screenH, "profile", bottomFractionStart = 0.72f)
+        if (profileHit == null) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€宸茶 Home+Profile锛屼絾鏈畾浣嶅埌搴曟爮 Profile锛屼氦鍥炲杞?warmup锛汷CR=$preview")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_precheck_profile_miss")
+        }
+
+        val tap = coerceTapToScreen(profileHit.point, screenW, screenH)
+        devOp(alias, "$reason锛氬叆鍙ｉ妫€鍒ゅ畾褰撳墠鍦ㄩ椤碉紝鐩存帴鐐瑰簳鏍?Profile (${tap.x},${tap.y}) 杩涘叆鏀硅祫鏂?)
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+            devOp(alias, "$reason锛氬叆鍙ｉ妫€鐐瑰嚮搴曟爮 Profile 澶辫触锛坰u锛夛紝浜ゅ洖澶栬疆 warmup")
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = "entry_precheck_profile_tap_failed",
+                profileTapPx = tap.x to tap.y,
+            )
+        }
+        if (!profileEditDelay(alias, 900L, "$reason路鐐?Profile 鍚?)) {
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = "hard_stop",
+                profileTapPx = tap.x to tap.y,
+            )
+        }
+        return ProfileEditEntryPreparationResult(
+            success = true,
+            entryMode = "home_profile_tapped",
+            profileTapPx = tap.x to tap.y,
+        )
+    }
+
+    */
+
+    override suspend fun prepareProfileEditEntryPreferHome(
+        ctx: Context,
+        alias: String,
+        reason: String,
+    ): ProfileEditEntryPreparationResult {
+        if (hardStopOrNull(alias, "$reason-entry-precheck")) {
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "hard_stop")
+        }
+        if (!ensureTikTokInForeground(ctx, alias, "$reason.entry_precheck", allowForceRestart = false)) {
+            devOp(alias, "$reason: entry precheck could not confirm TikTok foreground; fallback to warmup")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_foreground_unavailable")
+        }
+        if (!profileEditDelay(alias, 700L, "$reason.entry_precheck")) {
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "hard_stop")
+        }
+
+        val metrics = ctx.resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        val (vision, errTag) = mlKitRecognizeFullScreen(ctx, "profile_edit_entry_precheck")
+        if (vision == null) {
+            devOp(alias, "$reason: entry precheck OCR failed: $errTag")
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = if (isMlKitHardStopError(errTag)) "hard_stop" else "entry_precheck_ocr_failed",
+            )
+        }
+
+        val preview = buildProfileEditOcrPreview(vision).take(320)
+        if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, screenH)) {
+            devOp(alias, "$reason: entry precheck already sees Profile+Edit; go directly to OCR chain; OCR=$preview")
+            return ProfileEditEntryPreparationResult(success = true, entryMode = "already_on_profile")
+        }
+
+        if (!autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+            devOp(alias, "$reason: entry precheck did not see Home+Profile on main feed; fallback to warmup; OCR=$preview")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_precheck_not_home")
+        }
+
+        val profileHit = findAutoLoginProfileTabHit(vision, screenH)
+            ?: findBottomBandLabelContaining(vision, screenH, "profile", bottomFractionStart = 0.72f)
+        if (profileHit == null) {
+            devOp(alias, "$reason: entry precheck saw Home+Profile but could not locate Profile tab; fallback to warmup; OCR=$preview")
+            return ProfileEditEntryPreparationResult(success = false, failureStep = "entry_precheck_profile_miss")
+        }
+
+        val tap = coerceTapToScreen(profileHit.point, screenW, screenH)
+        devOp(alias, "$reason: entry precheck determined we are on home; tap bottom Profile (${tap.x},${tap.y})")
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+            devOp(alias, "$reason: entry precheck Profile tap failed; fallback to warmup")
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = "entry_precheck_profile_tap_failed",
+                profileTapPx = tap.x to tap.y,
+            )
+        }
+        if (!profileEditDelay(alias, 900L, "$reason.after_profile_tap")) {
+            return ProfileEditEntryPreparationResult(
+                success = false,
+                failureStep = "hard_stop",
+                profileTapPx = tap.x to tap.y,
+            )
+        }
+        return ProfileEditEntryPreparationResult(
+            success = true,
+            entryMode = "home_profile_tapped",
+            profileTapPx = tap.x to tap.y,
+        )
     }
 
     private fun ocrVisionHasSwipeUpPrompt(result: Text): Boolean =
@@ -4866,6 +5204,7 @@ class RealTraceExecutor(
         val uploadPreviews = mutableListOf<String>()
         var uploadTapPx: Pair<Int, Int>? = null
         var uploadTapOk = false
+        var uploadStageAlreadyInGallery = false
         var uploadAttempts = 0
         val allowPreviews = mutableListOf<String>()
         var allowTapPx: Pair<Int, Int>? = null
@@ -5067,8 +5406,9 @@ class RealTraceExecutor(
         uploadPreviews.clear()
         uploadTapPx = null
         uploadTapOk = false
+        uploadStageAlreadyInGallery = false
         uploadAttempts = 0
-        while (uploadAttempts < 3 && !uploadTapOk) {
+        while (uploadAttempts < 3 && !uploadTapOk && !uploadStageAlreadyInGallery) {
             uploadAttempts++
             delay(600)
             devOp(logAlias, "「修改基本资料」严格「Upload photo」/「Select from Gallery」OCR 第 $uploadAttempts/3 次…")
@@ -5082,6 +5422,40 @@ class RealTraceExecutor(
             uploadPreviews.add(upPrev)
             val hitPair = findProfileEditUploadPhotoHit(vision)
             if (hitPair == null) {
+                val recentsHit = findStrictExactLabelHit(vision, "Recents")
+                if (recentsHit != null) {
+                    profileEditLogStrictHit(logAlias, "Recents", "Recents", recentsHit, w, h)
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：未见选图文案，但已直接进入相册（Recents 可见），跳过该步点击",
+                    )
+                    uploadStageAlreadyInGallery = true
+                    uploadTapOk = true
+                    break
+                }
+                val avatarEntryPair = findProfileEditChangePhotoMarkerHit(vision)
+                if (avatarEntryPair != null) {
+                    val (avatarEntryHit, avatarEntryLabel) = avatarEntryPair
+                    profileEditLogStrictHit(
+                        logAlias,
+                        "Upload photo/Select from Gallery 兼容回退",
+                        avatarEntryLabel,
+                        avatarEntryHit,
+                        w,
+                        h,
+                    )
+                    val tap = coerceTapToScreen(avatarEntryHit.point, w, h)
+                    uploadTapPx = tap.x to tap.y
+                    devOp(
+                        logAlias,
+                        "「修改基本资料」Upload photo/Select from Gallery 第 $uploadAttempts/3 次：未见选图文案，但仍见 $avatarEntryLabel；复点头像入口 (${tap.x},${tap.y}) 后继续 OCR",
+                    )
+                    if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                        devOp(logAlias, "「修改基本资料」失败：Upload photo/Select from Gallery 兼容回退复点 $avatarEntryLabel 的 input tap 未成功（su）")
+                        throw AvatarAttemptFail("upload_photo_fallback_avatar_tap_su_failed")
+                    }
+                    continue
+                }
                 logOcrReadTextOnMiss(
                     logAlias,
                     "「修改基本资料」Upload photo/Select from Gallery",
@@ -5103,16 +5477,24 @@ class RealTraceExecutor(
                 throw AvatarAttemptFail("upload_photo_tap_su_failed")
             }
         }
-        if (!uploadTapOk) {
+        if (!uploadTapOk && !uploadStageAlreadyInGallery) {
             devOp(logAlias, "「修改基本资料」失败：严格「Upload photo」/「Select from Gallery」经 3 次 OCR 仍未完成有效点击")
             throw AvatarAttemptFail("upload_photo_ocr_3x_miss")
         }
         delay(600)
-        devOp(
-            logAlias,
-            "「修改基本资料」选图入口 tap 已完成；短延迟后 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；" +
-                "未见 Allow all 但已见 Recents 则跳过 Allow；之后 OCR「Recents」确认界面稳定）",
-        )
+        if (uploadStageAlreadyInGallery) {
+            devOp(
+                logAlias,
+                "「修改基本资料」已直接进入相册；短延迟后 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；" +
+                    "未见 Allow all 但已见 Recents 则跳过 Allow；之后 OCR「Recents」确认界面稳定）",
+            )
+        } else {
+            devOp(
+                logAlias,
+                "「修改基本资料」选图入口 tap 已完成；短延迟后 OCR「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；" +
+                    "未见 Allow all 但已见 Recents 则跳过 Allow；之后 OCR「Recents」确认界面稳定）",
+            )
+        }
 
         allowPreviews.clear()
         allowTapPx = null
@@ -6119,7 +6501,7 @@ class RealTraceExecutor(
             if (logoutProbeEnabled) {
                 "For You 预滑开始：总时长=${totalMs}ms"
             } else {
-                "For You 预滑开始：总时长=${totalMs}ms（低于5分钟，跳过掉登录检测）"
+                "For You 预滑开始：总时长=${totalMs}ms（低于5分钟，预滑开始前做 1 次掉登录检测）"
             },
         )
         val logoutProbeAtMs = if (logoutProbeEnabled) {
@@ -6127,7 +6509,8 @@ class RealTraceExecutor(
                 (totalMs * phase / FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES).coerceIn(0L, totalMs)
             }
         } else {
-            null
+            // 短预滑也会在风控弹窗下卡住：至少预滑开始前探测一次 Account status / Log in
+            longArrayOf(0L)
         }
         var logoutProbesDone = 0
         var swipeCount = 0
@@ -6136,13 +6519,21 @@ class RealTraceExecutor(
             if (mutualClickOrNull(alias, "For You 预滑")) return
             val elapsedBeforeSegment = System.currentTimeMillis() - startedAt
             val probeSchedule = logoutProbeAtMs
-            if (probeSchedule != null) {
-                while (logoutProbesDone < FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES &&
-                    elapsedBeforeSegment >= probeSchedule[logoutProbesDone]
-                ) {
-                    probeForYouWarmupLogoutSignalsAtPhaseStart(service, alias, logoutProbesDone + 1)
-                    logoutProbesDone++
-                }
+            val probePhaseTotal = if (logoutProbeEnabled) {
+                FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES
+            } else {
+                probeSchedule.size
+            }
+            while (logoutProbesDone < probePhaseTotal &&
+                elapsedBeforeSegment >= probeSchedule[logoutProbesDone]
+            ) {
+                probeForYouWarmupLogoutSignalsAtPhaseStart(
+                    service,
+                    alias,
+                    logoutProbesDone + 1,
+                    phaseTotal = probePhaseTotal,
+                )
+                logoutProbesDone++
             }
             val planWatchMs =
                 if (watchMaxMs > watchMinMs) Random.nextLong(watchMinMs, watchMaxMs + 1) else watchMinMs
@@ -6472,6 +6863,16 @@ class RealTraceExecutor(
         if (vision == null) {
             devOp(alias, "点击放大镜前：Don't allow OCR 失败：$err（忽略，继续）")
             return
+        }
+        // 涨粉等 withAccountStatusOcrWatch 上下文：顺带探测掉登录（Account status 优先，避免 please log in again 误判）
+        try {
+            observeAccountStatusOnOcrText(service, vision, "magnifier_before_dont_allow")
+        } catch (ex: AccountStatusLoggedOutException) {
+            throw ex
+        } catch (ex: LoginSafeguardRequiresAutoLoginException) {
+            throw ex
+        } catch (_: Exception) {
+            // 掉登录探测失败不阻断 Don't allow 尝试
         }
         val handled = runCatching {
             tapDontAllowFromVisionIfPresent(
@@ -8317,21 +8718,22 @@ class RealTraceExecutor(
 
     /**
      * For You 预滑：每段开始前整屏 OCR，探测 Account status / Log in / Sign up / Add another account 并走既有掉登录分支。
-     * 仅当 [FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS] ≤ 配置总时长时由 [runForYouWarmupIfNeeded] 调用。
+     * 长预滑（≥5 分钟）分 [FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES] 段；短预滑至少在开始前探测 1 次。
      */
     private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
         ctx: Context,
         alias: String,
         phase: Int,
+        phaseTotal: Int = FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES,
     ) {
         devOp(
             alias,
-            "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 时间段开始前掉登录检测（Account status / Log in / Sign up / Add another account）",
+            "For You 预滑：第 $phase/$phaseTotal 时间段开始前掉登录检测（Account status / Log in / Sign up / Add another account）",
         )
         val tag = "for_you_warmup_logout_probe_$phase"
         val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)
         if (vision == null) {
-            devOp(alias, "For You 预滑：第 $phase/$FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES 段掉登录检测 OCR 失败：$err")
+            devOp(alias, "For You 预滑：第 $phase/$phaseTotal 段掉登录检测 OCR 失败：$err")
         }
     }
 
@@ -11525,8 +11927,14 @@ class RealTraceExecutor(
         config: AppConfig,
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        val afterTapDelayMs = config.growth_post_check_after_tap_delay_ms.coerceIn(100L, 5000L)
-        val secondCheckDelayMs = config.growth_post_second_check_delay_ms.coerceIn(0L, 5000L)
+        val afterTapDelayMs = maxOf(
+            config.growth_post_check_after_tap_delay_ms,
+            GROWTH_POST_CHECK_AFTER_TAP_DELAY_FLOOR_MS,
+        ).coerceAtMost(5000L)
+        val secondCheckDelayMs = maxOf(
+            config.growth_post_second_check_delay_ms,
+            GROWTH_POST_SECOND_CHECK_DELAY_FLOOR_MS,
+        ).coerceAtMost(5000L)
 
         val beforeTapForVerify = File(service.cacheDir, "post_enter_before_tap.png")
         if (beforeTapForVerify.exists()) beforeTapForVerify.delete()
@@ -11540,6 +11948,7 @@ class RealTraceExecutor(
             afterTapDelayMs = afterTapDelayMs,
             motionTag = "前后帧差-首次",
             allowOcrFallback = false,
+            allowFullscreenFrameDiffFallback = true,
             exportGrowthFrameDiffFailureToGallery = false,
         )
 
@@ -11559,6 +11968,7 @@ class RealTraceExecutor(
             afterTapDelayMs = afterTapDelayMs,
             motionTag = "前后帧差-二次(左侧重试)",
             allowOcrFallback = false,
+            allowFullscreenFrameDiffFallback = true,
             exportGrowthFrameDiffFailureToGallery = false,
         )
 
@@ -11587,6 +11997,7 @@ class RealTraceExecutor(
         afterTapDelayMs: Long = 0L,
         motionTag: String = "帧差",
         allowOcrFallback: Boolean = true,
+        allowFullscreenFrameDiffFallback: Boolean = false,
         exportGrowthFrameDiffFailureToGallery: Boolean = false,
     ): Boolean {
         val motion = if (beforeTapReference != null) {
@@ -11607,6 +12018,30 @@ class RealTraceExecutor(
         }
         if (motion) {
             return true
+        }
+        if (allowFullscreenFrameDiffFallback) {
+            val alias = PrefsStore.getAlias() ?: "unknown"
+            devOp(alias, "${sanitizeFrameDiffTagForFilename(motionTag)}：条带帧差未通过，尝试全屏帧差 fallback")
+            val fullscreenMotion = if (beforeTapReference != null) {
+                detectVideoMotionByFrameDiffFromBeforeTapFullScreenFallback(
+                    service = service,
+                    beforeTapReference = beforeTapReference,
+                    afterTapDelayMs = afterTapDelayMs,
+                    tag = motionTag,
+                    exportGrowthFrameDiffFailureToGallery = exportGrowthFrameDiffFailureToGallery,
+                )
+            } else {
+                detectVideoMotionByFrameDiffFullScreenFallback(
+                    service = service,
+                    debugTag = sanitizeFrameDiffTagForFilename(motionTag),
+                    motionTagForFailureExport = motionTag,
+                    exportGrowthFrameDiffFailureToGallery = exportGrowthFrameDiffFailureToGallery,
+                )
+            }
+            if (fullscreenMotion) {
+                devOp(alias, "${sanitizeFrameDiffTagForFilename(motionTag)}：全屏帧差 fallback 通过")
+                return true
+            }
         }
         if (!allowOcrFallback) {
             return false
@@ -13101,7 +13536,12 @@ class RealTraceExecutor(
             performMutualCommentTextDirectFixedCoordinate(service, config)
             return
         }
-        if (mode == ServerRunMode.GROWTH || mode == ServerRunMode.DIRECT) {
+        // growth / live / direct：统一走涨粉固定坐标发评（不再 OCR「Add comment...」）
+        if (
+            mode == ServerRunMode.GROWTH ||
+            mode == ServerRunMode.DIRECT ||
+            mode == ServerRunMode.LIVE
+        ) {
             performCommentTextDirectFixed(service, config)
             return
         }
@@ -13717,11 +14157,15 @@ class RealTraceExecutor(
         return commentPanelClosed
     }
 
-    private suspend fun closeMutualCommentPanelAfterFollowOnly(service: Context) {
+    private suspend fun closeMutualCommentPanelToPost(service: Context, phaseLog: String) {
         val alias = PrefsStore.getAlias() ?: "unknown"
-        devOp(alias, "互点仅关注：关闭评论区返回作品播放页")
+        devOp(alias, "$phaseLog：关闭评论区返回作品播放页")
         runSuCommand("input keyevent 4")
         delay(Random.nextLong(500, 801))
+    }
+
+    private suspend fun closeMutualCommentPanelAfterFollowOnly(service: Context) {
+        closeMutualCommentPanelToPost(service, "互点仅关注")
     }
 
     /**
@@ -13774,6 +14218,7 @@ class RealTraceExecutor(
         val typed = tryInputCommentText(alias, text)
         if (!typed) {
             devOp(alias, "评论文本 root 输入失败，已跳过发送")
+            closeMutualCommentPanelToPost(service, "互点发评输入失败后")
             return false
         }
         delay(Random.nextLong(2000, 2501))
@@ -13785,6 +14230,7 @@ class RealTraceExecutor(
         if (!sendTapped) {
             runSuCommand("input keyevent 66")
         }
+        closeMutualCommentPanelToPost(service, "互点发评发送后")
         devOp(alias, "评论发送流程结束", System.currentTimeMillis() - t0)
         return true
     }
@@ -14599,25 +15045,39 @@ class RealTraceExecutor(
         findLabelHitContainingIgnoreCase(vision, "add another account")
             ?: findLabelHitContainingIgnoreCase(vision, "another account")
 
-    /** Profile 未登录入口：Log in 按钮/文案（全屏 OCR，含 Welcome back 中央按钮；排除 log in to）。 */
+    /**
+     * Profile 未登录入口：Log in 按钮/文案（全屏 OCR，含 Welcome back 中央按钮；
+     * 排除 log in to；排除 Account status 弹窗正文 please log in again）。
+     */
     private fun findLogInEntryTapHit(vision: Text): StrictLabelHit? {
+        // Account status 弹窗标题 + “please log in again” 同屏时，不把正文当登录按钮。
+        if (visionShowsAccountStatusLogoutDialog(vision)) return null
         findStrictExactLabelHit(vision, "Log in")?.let { return it }
         findStrictExactLabelHit(vision, "log in")?.let { return it }
         for (block in vision.textBlocks) {
             for (line in block.lines) {
                 for (el in line.elements) {
                     val low = el.text.lowercase(Locale.US)
-                    if (low.contains("log in") && !low.contains("log in to")) {
+                    if (isLogInEntryPhrase(low)) {
                         el.boundingBox?.let { return StrictLabelHit(Point(it.centerX(), it.centerY()), it) }
                     }
                 }
                 val lowLine = line.text.lowercase(Locale.US)
-                if (lowLine.contains("log in") && !lowLine.contains("log in to")) {
+                if (isLogInEntryPhrase(lowLine)) {
                     line.boundingBox?.let { return StrictLabelHit(Point(it.centerX(), it.centerY()), it) }
                 }
             }
         }
         return null
+    }
+
+    /** 真登录入口短语；排除 “log in to …” / “please log in again”（Account status 风控弹窗）。 */
+    private fun isLogInEntryPhrase(low: String): Boolean {
+        if (!low.contains("log in")) return false
+        if (low.contains("log in to")) return false
+        if (low.contains("log in again")) return false
+        if (low.contains("please log in")) return false
+        return true
     }
 
     /** Profile 未登录入口：Sign up 文案（全屏 OCR，含底栏与页内链接）。 */
@@ -14636,13 +15096,20 @@ class RealTraceExecutor(
 
     /**
      * Sign up / Log in 登录入口文案；同屏为广告流（Sponsored/Replay/Shop）时忽略（Add another account 除外）。
+     * Account status 弹窗（含 please log in again）不算登录入口。
      */
     private fun visionShowsSignUpLogInLogoutMarkers(vision: Text, screenH: Int): Boolean {
         if (findAddAnotherAccountTapHit(vision) != null) return true
+        if (visionShowsAccountStatusLogoutDialog(vision)) return false
         if (visionShowsFeedAdPageMarkers(vision)) return false
         if (findLogInEntryTapHit(vision) != null) return true
         if (findSignUpEntryTapHit(vision) != null) return true
-        if (findBottomBandLabelContaining(vision, screenH, "log in") != null) return true
+        val fullLow = vision.text.lowercase(Locale.US)
+        val accountStatusBody =
+            fullLow.contains("log in again") || fullLow.contains("please log in")
+        if (!accountStatusBody && findBottomBandLabelContaining(vision, screenH, "log in") != null) {
+            return true
+        }
         if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
         return false
     }
@@ -15212,6 +15679,8 @@ class RealTraceExecutor(
 
     /** 登录状态保障：除 Edit 外，识别未登录/登录中途界面；Add another account 由 [probeAddAnotherAccountLogoutFromOcrVision] 统一处理。 */
     private fun safeguardVisionNeedsAutoLogin(vision: Text, screenH: Int): Boolean {
+        // Account status 由 probeAndHandleLogoutSignalsFromVision 单独处理，勿用正文 “log in again” 误判入口。
+        if (visionShowsAccountStatusLogoutDialog(vision)) return false
         if (visionShowsSignUpLogInLogoutMarkers(vision, screenH)) return true
         if (findAutoLoginUsernameTapHit(vision) != null) return true
         if (ocrVisionHasVerifyEmailMarker(vision)) return true

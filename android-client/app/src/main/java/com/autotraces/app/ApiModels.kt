@@ -87,9 +87,9 @@ data class AppConfig(
     // 各模式通用：进入用户主页后，按一定概率不点击作品，直接按“无作品/私密”同样的跳过方案处理
     val skip_post_click_prob: Double = 0.0,
     // growth 模式：点击作品后，前后帧差检测前等待多久（毫秒）
-    val growth_post_check_after_tap_delay_ms: Long = 1000L,
+    val growth_post_check_after_tap_delay_ms: Long = 1500L,
     // growth 模式：第一次失败后，二次判定前等待多久（毫秒）
-    val growth_post_second_check_delay_ms: Long = 650L,
+    val growth_post_second_check_delay_ms: Long = 900L,
     /** 单次拉取用户名数量，与模板键 pull_batch_size 一致，由云端运行配置下发 */
     val pull_batch_size: Int = 5,
     val break_min: Int = 10,
@@ -143,6 +143,11 @@ data class AppConfig(
     val profile_edit_bio_texts: List<String>? = null,
     /** 发作品前经本机 `POST /api/v1/tasks/request` 向 PC 拉取素材数量；0=不拉取。默认 3。 */
     val publish_post_material_fetch_count: Int = 3,
+    /**
+     * 自动切号：每号每时段上班后先消化的主播访问条数（bundle 预取自 live_customer）；0=关闭。
+     * 消化过程设备本地执行，不向云端 pull 主播名单。
+     */
+    val live_visit_count_per_slot: Int = 0,
 )
 
 data class ConfigResponse(
@@ -237,6 +242,8 @@ data class DeviceOpPayload(
     val auto_switch_slot_key: String? = null,
     /** 自动切号发作品：本时段目标账号 username。 */
     val account_username: String? = null,
+    /** 自动切号主播访问：本时段预取的主播用户名列表（设备本地消化）。 */
+    val live_visit_usernames: List<String>? = null,
     /** 批量带流：会话 ID */
     val session_id: String? = null,
     /** 批量带流：单账号活跃时长（小时） */
@@ -544,6 +551,8 @@ data class AutoSwitchBundle(
 data class AutoSwitchBundledAccountConfig(
     val active_template: String? = null,
     val config: AppConfig? = null,
+    /** 本账号本时段预取的主播访问用户名（自治期本地消化，不再 pull）。 */
+    val live_visit_usernames: List<String>? = null,
 )
 
 data class AutoSwitchSmartTemplateDebug(
@@ -588,6 +597,7 @@ data class AutoSwitchRunConfig(
     val run_mode: String? = null,
     val active_template: String? = null,
     val publish_post_material_fetch_count: Int? = null,
+    val live_visit_count_per_slot: Int? = null,
     val package_name: String? = null,
 )
 

@@ -76,6 +76,15 @@ object AutoSwitchBundleHolder {
         refreshFromPlan()
     }
 
+    fun notifyUsernameChanged(oldUsername: String, newUsername: String) {
+        val oldUser = oldUsername.trim()
+        val newUser = newUsername.trim()
+        if (oldUser.isEmpty() || newUser.isEmpty()) return
+        if (oldUser.equals(newUser, ignoreCase = true)) return
+        AutoSwitchLocalPlanStore.notifyUsernameChanged(oldUser, newUser)
+        refreshFromPlan()
+    }
+
     private fun refreshFromPlan() {
         val current = bundle ?: return
         bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(current)
@@ -335,6 +344,13 @@ fun AutoSwitchBundle.isMutualTrafficConfiguredFor(username: String): Boolean {
         cfg.mutual_traffic_author_follow ||
         cfg.mutual_traffic_followers_follow
 }
+
+/** 本账号在 bundle 中预取的主播访问用户名（已归一去 @）。 */
+fun AutoSwitchBundle.liveVisitUsernamesFor(username: String): List<String> =
+    resolveBundledConfigForUsername(username)?.live_visit_usernames.orEmpty()
+        .map { it.trim().removePrefix("@") }
+        .filter { it.isNotEmpty() }
+        .distinctBy { it.lowercase() }
 
 /** 引流互点设备 OP 类型：仅关注 vs 完整引流（评论/作者区/Followers 按配置组合）。 */
 fun AutoSwitchBundle.mutualTrafficOpTypeFor(username: String): String? {

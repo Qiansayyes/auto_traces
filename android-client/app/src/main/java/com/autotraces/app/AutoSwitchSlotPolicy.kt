@@ -6,7 +6,7 @@ import kotlin.random.Random
 
 /**
  * 自动切号时段策略：账号分配窗口 [start_min, end_min) 内，默认运行涨粉基线；
- * 发作品/引流互点等「插入操作」在窗口内到点触发，暂停涨粉 → 独占 TikTok → 结束后恢复涨粉；
+ * 主播访问 / 发作品 / 引流互点等「插入操作」在窗口内触发，暂停涨粉 → 独占 TikTok → 结束后恢复涨粉；
  * 距时段结束前 [AutoSwitchLocalScheduler.SWITCH_SAFE_BUFFER_MIN] 分钟进入切号安全缓冲，不再启动新高优插入。
  *
  * 扩展新插入：实现 [AutoSwitchSlotInsertion]，注册到 [AutoSwitchLocalScheduler] 的 insertions 列表。
@@ -342,6 +342,74 @@ class MutualTrafficSlotInsertion : AutoSwitchSlotInsertion {
         LogCenter.op(
             ctx.alias,
             "【自动切号】已入队引流互点（$modeLabel）slot=$slotKey 计划=${AutoSwitchSlotWindow.formatMinute(mutualMinute)} account=$targetUser",
+        )
+        return true
+    }
+
+    companion object {
+        private fun newLocalOpId(prefix: String): String =
+            "local-as-$prefix-${System.currentTimeMillis()}-${Random.nextInt(1000)}"
+    }
+}
+
+/**
+ * 主播访问：切号完成后、上班窗口内立刻消化 bundle 预取的 live_visit_usernames，
+ * 全部跑完（或跳过）后再让涨粉基线恢复；不调用 pull_username。
+ */
+class LiveVisitSlotInsertion : AutoSwitchSlotInsertion {
+    override val kind: String = "live_visit"
+
+    override suspend fun trySchedule(
+        ctx: AutoSwitchSlotTickContext,
+        host: AutoSwitchSlotInsertionHost,
+    ): Boolean {
+        val slotKey = ctx.slotKey
+        val targetUser = ctx.account.username?.trim().orEmpty()
+        if (targetUser.isBlank()) return false
+        val names = ctx.bundle.liveVisitUsernamesFor(targetUser)
+        if (names.isEmpty()) {
+            AutoSwitchLocalPlanStore.markInsertionState(slotKey, kind, PlanStepState.SKIPPED)
+            return false
+        }
+        // 其它独占占用时不入队、不改状态：保持 PENDING，让后续 insertion（发作品/互点）仍可调度
+        if (AutoSwitchLocalPlanStore.isPublishContextOccupying() ||
+            AutoSwitchLocalPlanStore.isMutualContextOccupying()
+        ) {
+            return false
+        }
+        if (host.isWithinSwitchSafeBuffer(ctx.minuteOfDay, ctx.slot)) return false
+        if (!AutoSwitchSlotWindow.isWithinSlot(ctx.minuteOfDay, ctx.slot)) return false
+        when (
+            host.insertionState(kind, slotKey)
+                ?: AutoSwitchLocalPlanStore.slot(slotKey)?.live_visit?.state
+        ) {
+            PlanStepState.DONE, PlanStepState.SKIPPED, PlanStepState.FAILED, PlanStepState.RUNNING -> return false
+            else -> Unit
+        }
+        if (host.isInsertionInflight(kind, slotKey)) return false
+        val targetRi = ctx.account.row_index ?: -1
+        if (!host.isSlotReady(slotKey, targetRi)) return false
+        if (!host.verifyInsertionAccountLoggedIn(ctx, kind)) return false
+        val pkg = ctx.bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
+        val aliasClean = ctx.bundle.device_alias?.trim().orEmpty().ifBlank { ctx.alias }
+        val opId = newLocalOpId("live-visit")
+        val op = DeviceOp(
+            op_id = opId,
+            op_type = "live_visit_start",
+            payload = DeviceOpPayload(
+                device_id = ctx.deviceId,
+                alias = aliasClean,
+                package_name = pkg,
+                source = "auto_switch",
+                auto_switch_slot_key = slotKey,
+                account_username = targetUser,
+                live_visit_usernames = names,
+            ),
+        )
+        host.enqueueInsertion(op, slotKey, kind)
+        LogCenter.op(
+            ctx.alias,
+            "【自动切号】已入队主播访问 slot=$slotKey count=${names.size} account=$targetUser",
         )
         return true
     }

@@ -1353,6 +1353,11 @@
             <div class="hint">设备执行发作品时，在<strong>清理图库之后</strong>调用本机 <code>POST /api/v1/tasks/request</code>（内部再调 PC <code>tasks/create</code>）拉取指定条数素材到 <code>Pictures</code>；填 <strong>0</strong> 则跳过拉取。续发断点（已成功部分条）<strong>仅在同一云端发作品指令内</strong>生效，不重复清理/拉取；用户硬停或再次下发新指令时会清除断点。</div>
           </div>
           <div class="field">
+            <label>每号每时段主播访问条数（配置键 live_visit_count_per_slot）</label>
+            <input name="live_visit_count_per_slot" type="number" min="0" max="50" step="1" value="0" />
+            <div class="hint">自动切号自治：每个账号在本时段<strong>上班后先消化</strong>这么多条主播访问（从 <code>live_customer</code> 预取进 bundle），完成后再跑涨粉基线。填 <strong>0</strong> 关闭。消化过程设备本地执行，不再向云端拉取主播名单。</div>
+          </div>
+          <div class="field">
             <label>休息前拉取批次数（配置键 pull_batches_before_rest）</label>
             <input name="pull_batches_before_rest" type="number" min="1" max="100" step="1" value="5" />
             <div class="hint">设备 App 连续完成本值的整批拉取并执行完毕后，<strong>下一次</strong>拉取请求将触发休息（默认 <strong>5 批</strong>）。与单次拉取用户名数量无关。</div>

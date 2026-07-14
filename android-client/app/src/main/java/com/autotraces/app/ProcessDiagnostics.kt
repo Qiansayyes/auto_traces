@@ -17,10 +17,13 @@ import java.util.Locale
 
 /**
  * 进程存活与卡点诊断：周期性心跳、OCR 挂起观测、崩溃/OOM 前快照落盘。
- * 进程被杀后下次冷启会打出「上次崩溃」便于对照日志断档；心跳快照仅落盘不打日志。
+ * 进程被杀后下次冷启会打出「上次崩溃」便于对照日志断档。
+ * 详细心跳快照仍只落盘；每隔 [STATUS_LOG_INTERVAL_MS] 向 UI/设备日志打一行 `[状态]`，避免涨粉时段看起来像停摆。
  */
 object ProcessDiagnostics {
     private const val HEARTBEAT_INTERVAL_MS = 30_000L
+    /** 状态行打点间隔（1–2 分钟量级）。 */
+    private const val STATUS_LOG_INTERVAL_MS = 90_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val formatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
@@ -38,13 +41,24 @@ object ProcessDiagnostics {
     private var snapshotProvider: (() -> String)? = null
 
     @Volatile
+    private var statusLineProvider: (() -> String)? = null
+
+    @Volatile
     private var heartbeatJob: Job? = null
+
+    @Volatile
+    private var lastStatusLogElapsedMs: Long = 0L
 
     @Volatile
     private var defaultUncaughtHandler: Thread.UncaughtExceptionHandler? = null
 
     fun registerSnapshotProvider(provider: () -> String) {
         snapshotProvider = provider
+    }
+
+    /** 注册周期性 `[状态]` 行内容（阶段/slot/涨粉/独占等）。 */
+    fun registerStatusLineProvider(provider: () -> String) {
+        statusLineProvider = provider
     }
 
     fun setPhase(phase: String) {
@@ -102,6 +116,19 @@ object ProcessDiagnostics {
     fun emitHeartbeat(trigger: String = "周期") {
         val line = buildSnapshotLine(trigger = trigger)
         PrefsStore.saveLastProcessHeartbeatLine(line)
+        maybeEmitStatusLog()
+    }
+
+    private fun maybeEmitStatusLog() {
+        val now = SystemClock.elapsedRealtime()
+        if (lastStatusLogElapsedMs > 0L && now - lastStatusLogElapsedMs < STATUS_LOG_INTERVAL_MS) {
+            return
+        }
+        lastStatusLogElapsedMs = now
+        val status = runCatching { statusLineProvider?.invoke() }.getOrNull()?.trim().orEmpty()
+        if (status.isBlank()) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        LogCenter.op(alias, status)
     }
 
     private fun buildSnapshotLine(

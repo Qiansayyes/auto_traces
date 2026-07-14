@@ -97,6 +97,8 @@ data class SlotPlanEntry(
     val publish: TimedInsertionPlan = TimedInsertionPlan(),
     /** 引流互点（teamwork Videos 引流会话），触发时间见 [auto_mutual_minute]。 */
     val mutual_traffic: TimedInsertionPlan = TimedInsertionPlan(),
+    /** 主播访问：上班后立刻消化 bundle 预取名单，再进入涨粉基线。 */
+    val live_visit: TimedInsertionPlan = TimedInsertionPlan(),
 )
 
 /**
@@ -141,6 +143,16 @@ data class ActiveMutualPlan(
     val pending: Boolean = false,
 )
 
+/** 自治期进行中的主播访问上下文（剩余用户名本地消化），持久化在 plan 文件。 */
+data class ActiveLiveVisitPlan(
+    val slot_key: String = "",
+    val op_id: String = "",
+    val account_username: String = "",
+    val remaining_usernames: List<String> = emptyList(),
+    val requested: Boolean = false,
+    val pending: Boolean = false,
+)
+
 /**
  * 设备端自治执行计划（唯一调度真源）。
  * 由云端 bundle 展开；切号三步、发作品/互点状态与账号运行时字段持久化，支持断点续跑。
@@ -152,6 +164,7 @@ data class AutoSwitchLocalPlan(
     val accounts: List<LocalPlanAccount> = emptyList(),
     val active_publish: ActivePublishPlan? = null,
     val active_mutual: ActiveMutualPlan? = null,
+    val active_live_visit: ActiveLiveVisitPlan? = null,
     /** 切号链成功后 TikTok 应对齐的账号（plan 级「当前活跃」标记，备份归属与切号源解析真源）。 */
     val device_active_row_index: Int? = null,
     val device_active_username: String? = null,
@@ -213,6 +226,14 @@ object AutoSwitchLocalPlanStore {
             if (am.pending || am.requested) return true
         }
         plan.slots.any { it.mutual_traffic.state == PlanStepState.RUNNING }
+    }
+
+    fun isLiveVisitContextOccupying(): Boolean = synchronized(writeLock) {
+        val plan = getInternal() ?: return false
+        plan.active_live_visit?.let { alv ->
+            if (alv.pending || alv.requested || alv.remaining_usernames.isNotEmpty()) return true
+        }
+        plan.slots.any { it.live_visit.state == PlanStepState.RUNNING }
     }
 
     fun isPublishOccupying(isExecutionActive: Boolean): Boolean =
@@ -489,6 +510,7 @@ object AutoSwitchLocalPlanStore {
             val ri = acc.row_index ?: return@map acc
             val local = byRow[ri] ?: return@map acc
             acc.copy(
+                username = local.username.ifBlank { acc.username },
                 backup_path = local.backup_path?.takeIf { it.isNotEmpty() } ?: acc.backup_path,
                 backup_name = local.backup_name?.takeIf { it.isNotEmpty() } ?: acc.backup_name,
                 is_login = local.is_login || acc.is_login == true,
@@ -509,6 +531,65 @@ object AutoSwitchLocalPlanStore {
     fun notifyBasicProfileModified(username: String) {
         mutateAccountByUsername(username) { acc ->
             acc.copy(basic_profile_modified = "是")
+        }
+    }
+
+    fun notifyUsernameChanged(oldUsername: String, newUsername: String) {
+        val oldUser = oldUsername.trim().removePrefix("@")
+        val newUser = newUsername.trim().removePrefix("@")
+        if (oldUser.isEmpty() || newUser.isEmpty()) return
+        if (oldUser.equals(newUser, ignoreCase = true)) return
+        mutatePlan { current ->
+            var changed = false
+            val updatedAccounts = current.accounts.map { acc ->
+                if (acc.username.equals(oldUser, ignoreCase = true)) {
+                    changed = true
+                    acc.copy(username = newUser)
+                } else {
+                    acc
+                }
+            }
+            val updatedSlots = current.slots.map { slot ->
+                var slotChanged = false
+                val updatedTargetUsername =
+                    if (slot.target_username.equals(oldUser, ignoreCase = true)) {
+                        slotChanged = true
+                        newUser
+                    } else {
+                        slot.target_username
+                    }
+                val currentSourceUsername = slot.cut_switch.source_username?.trim()?.removePrefix("@").orEmpty()
+                val updatedCutSwitch =
+                    if (currentSourceUsername.equals(oldUser, ignoreCase = true)) {
+                        slotChanged = true
+                        slot.cut_switch.copy(source_username = newUser)
+                    } else {
+                        slot.cut_switch
+                    }
+                if (slotChanged) {
+                    changed = true
+                    slot.copy(
+                        target_username = updatedTargetUsername,
+                        cut_switch = updatedCutSwitch,
+                    )
+                } else {
+                    slot
+                }
+            }
+            val activeUsername = current.device_active_username?.trim()?.removePrefix("@").orEmpty()
+            val updatedActiveUsername =
+                if (activeUsername.equals(oldUser, ignoreCase = true)) {
+                    changed = true
+                    newUser
+                } else {
+                    current.device_active_username
+                }
+            if (!changed) return@mutatePlan current
+            current.copy(
+                accounts = updatedAccounts,
+                slots = updatedSlots,
+                device_active_username = updatedActiveUsername,
+            )
         }
     }
 
@@ -558,6 +639,7 @@ object AutoSwitchLocalPlanStore {
                 cut_switch = mergeCutSwitch(old.cut_switch, fresh.cut_switch),
                 publish = mergeInsertion(old.publish, fresh.publish),
                 mutual_traffic = mergeInsertion(old.mutual_traffic, fresh.mutual_traffic),
+                live_visit = mergeInsertion(old.live_visit, fresh.live_visit),
             )
         }
         val mergedAccounts = mergeAccounts(expanded.accounts, previous.accounts)
@@ -567,6 +649,7 @@ object AutoSwitchLocalPlanStore {
                 accounts = mergedAccounts,
                 active_publish = previous.active_publish,
                 active_mutual = previous.active_mutual,
+                active_live_visit = previous.active_live_visit,
                 device_active_row_index = previous.device_active_row_index,
                 device_active_username = previous.device_active_username,
                 last_completed_slot_key = previous.last_completed_slot_key,
@@ -581,6 +664,7 @@ object AutoSwitchLocalPlanStore {
         plan.copy(
             active_publish = null,
             active_mutual = null,
+            active_live_visit = null,
             device_active_row_index = null,
             device_active_username = null,
             last_completed_slot_key = null,
@@ -588,6 +672,7 @@ object AutoSwitchLocalPlanStore {
                 slot.copy(
                     publish = abortRunningInsertion(slot.publish),
                     mutual_traffic = abortRunningInsertion(slot.mutual_traffic),
+                    live_visit = abortRunningInsertion(slot.live_visit),
                 )
             },
         )
@@ -609,6 +694,13 @@ object AutoSwitchLocalPlanStore {
         return target.equals(amUser, ignoreCase = true)
     }
 
+    private fun isActiveLiveVisitConsistent(plan: AutoSwitchLocalPlan, alv: ActiveLiveVisitPlan): Boolean {
+        val slot = plan.slots.firstOrNull { it.slot_key == alv.slot_key.trim() } ?: return false
+        val target = slot.target_username.trim().removePrefix("@")
+        val alvUser = alv.account_username.trim().removePrefix("@")
+        return target.equals(alvUser, ignoreCase = true)
+    }
+
     fun sanitizeActiveContexts(plan: AutoSwitchLocalPlan): AutoSwitchLocalPlan {
         var p = plan
         p.active_publish?.let { ap ->
@@ -616,6 +708,9 @@ object AutoSwitchLocalPlanStore {
         }
         p.active_mutual?.let { am ->
             if (!isActiveMutualConsistent(p, am)) p = p.copy(active_mutual = null)
+        }
+        p.active_live_visit?.let { alv ->
+            if (!isActiveLiveVisitConsistent(p, alv)) p = p.copy(active_live_visit = null)
         }
         return p
     }
@@ -628,11 +723,13 @@ object AutoSwitchLocalPlanStore {
             plan.copy(
                 active_publish = null,
                 active_mutual = null,
+                active_live_visit = null,
                 slots = plan.slots.map { slot ->
                     if (slot.schedule_date != prev) return@map slot
                     slot.copy(
                         publish = abortRunningInsertion(slot.publish),
                         mutual_traffic = abortRunningInsertion(slot.mutual_traffic),
+                        live_visit = abortRunningInsertion(slot.live_visit),
                     )
                 },
             )
@@ -669,6 +766,21 @@ object AutoSwitchLocalPlanStore {
                         slots = p.slots.map { slot ->
                             if (slot.slot_key == sk && slot.mutual_traffic.state == PlanStepState.RUNNING) {
                                 slot.copy(mutual_traffic = slot.mutual_traffic.copy(state = PlanStepState.FAILED))
+                            } else {
+                                slot
+                            }
+                        },
+                    )
+                }
+            }
+            p.active_live_visit?.let { alv ->
+                if (alv.slot_key.trim() != cur) {
+                    val sk = alv.slot_key.trim()
+                    p = p.copy(
+                        active_live_visit = null,
+                        slots = p.slots.map { slot ->
+                            if (slot.slot_key == sk && slot.live_visit.state == PlanStepState.RUNNING) {
+                                slot.copy(live_visit = slot.live_visit.copy(state = PlanStepState.FAILED))
                             } else {
                                 slot
                             }
@@ -817,6 +929,64 @@ object AutoSwitchLocalPlanStore {
 
     fun setActiveMutualPendingFlags(requested: Boolean, pending: Boolean) {
         mutateActiveMutual { it.copy(requested = requested, pending = pending) }
+    }
+
+    fun getActiveLiveVisit(): ActiveLiveVisitPlan? =
+        get()?.active_live_visit?.takeIf { it.slot_key.isNotBlank() && it.op_id.isNotBlank() }
+
+    fun activeLiveVisitSlotKey(): String? =
+        getActiveLiveVisit()?.slot_key?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun isAutoSwitchLiveVisitActive(): Boolean = getActiveLiveVisit() != null
+
+    fun beginActiveLiveVisit(
+        slotKey: String,
+        opId: String,
+        accountUsername: String,
+        remainingUsernames: List<String>,
+    ) {
+        val sk = slotKey.trim()
+        val oid = opId.trim()
+        if (sk.isEmpty() || oid.isEmpty()) return
+        mutatePlan { current ->
+            current.copy(
+                active_live_visit = ActiveLiveVisitPlan(
+                    slot_key = sk,
+                    op_id = oid,
+                    account_username = accountUsername.trim(),
+                    remaining_usernames = remainingUsernames
+                        .map { it.trim().removePrefix("@") }
+                        .filter { it.isNotEmpty() },
+                    requested = true,
+                    pending = true,
+                ),
+            )
+        }
+    }
+
+    fun clearActiveLiveVisit() {
+        mutatePlan { it.copy(active_live_visit = null) }
+    }
+
+    fun mutateActiveLiveVisit(block: (ActiveLiveVisitPlan) -> ActiveLiveVisitPlan) {
+        mutatePlan { current ->
+            val alv = current.active_live_visit ?: return@mutatePlan current
+            current.copy(active_live_visit = block(alv))
+        }
+    }
+
+    fun setActiveLiveVisitRemaining(usernames: List<String>) {
+        mutateActiveLiveVisit {
+            it.copy(
+                remaining_usernames = usernames
+                    .map { u -> u.trim().removePrefix("@") }
+                    .filter { u -> u.isNotEmpty() },
+            )
+        }
+    }
+
+    fun setActiveLiveVisitPendingFlags(requested: Boolean, pending: Boolean) {
+        mutateActiveLiveVisit { it.copy(requested = requested, pending = pending) }
     }
 
     /**
@@ -1154,6 +1324,7 @@ object AutoSwitchLocalPlanStore {
                         ),
                         publish = slot.publish.copy(state = resetRunning(slot.publish.state)),
                         mutual_traffic = slot.mutual_traffic.copy(state = resetRunning(slot.mutual_traffic.state)),
+                        live_visit = slot.live_visit.copy(state = resetRunning(slot.live_visit.state)),
                     )
                 },
             )
@@ -1205,6 +1376,7 @@ object AutoSwitchLocalPlanStore {
             when (kind) {
                 "publish" -> slot.copy(publish = slot.publish.copy(state = state))
                 "mutual_traffic" -> slot.copy(mutual_traffic = slot.mutual_traffic.copy(state = state))
+                "live_visit" -> slot.copy(live_visit = slot.live_visit.copy(state = state))
                 else -> slot
             }
         }
@@ -1215,6 +1387,7 @@ object AutoSwitchLocalPlanStore {
         return when (kind.trim()) {
             "publish" -> slot.publish.state
             "mutual_traffic" -> slot.mutual_traffic.state
+            "live_visit" -> slot.live_visit.state
             else -> null
         }
     }
@@ -1430,6 +1603,14 @@ object AutoSwitchLocalPlanStore {
                             slot.auto_mutual_minute == null -> PlanStepState.SKIPPED
                             !bundle.isMutualTrafficConfiguredFor(username) -> PlanStepState.SKIPPED
                             else -> PlanStepState.PENDING
+                        },
+                    ),
+                    live_visit = TimedInsertionPlan(
+                        trigger_at_min = start,
+                        state = if (bundle.liveVisitUsernamesFor(username).isEmpty()) {
+                            PlanStepState.SKIPPED
+                        } else {
+                            PlanStepState.PENDING
                         },
                     ),
                 ),

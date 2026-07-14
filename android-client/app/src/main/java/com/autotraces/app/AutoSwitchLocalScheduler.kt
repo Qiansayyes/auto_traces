@@ -18,7 +18,7 @@ import kotlinx.coroutines.sync.withLock
 /**
  * 自动切号自治调度器：读本地 [AutoSwitchLocalPlan] 计划文件，按时间执行下一 pending 任务。
  *
- * 每个 slot：切号（backup → clear → restore/自动登录）→ 涨粉 → 到点发作品 / 引流互点。
+ * 每个 slot：切号（backup → clear → restore/自动登录）→ 主播访问（可选）→ 涨粉 → 到点发作品 / 引流互点。
  * 切号三步与插入任务状态持久化在计划文件中，支持断点续跑。
  */
 class AutoSwitchLocalScheduler(
@@ -31,6 +31,7 @@ class AutoSwitchLocalScheduler(
     private val onRefreshWeeklyBundle: suspend () -> Boolean = { false },
     private val isPublishExecutionActive: () -> Boolean = { false },
     private val isMutualExecutionActive: () -> Boolean = { false },
+    private val isLiveVisitExecutionActive: () -> Boolean = { false },
     private val onStalePublishInflight: (slotKey: String) -> Unit = {},
     /** PLAN 切号待执行：清空当前账号发作品/互点等运行时占用，让位切号链。 */
     private val onPreemptForCutSwitch: (slotKey: String, reason: String) -> Unit = { _, _ -> },
@@ -119,6 +120,31 @@ class AutoSwitchLocalScheduler(
         maybeResumePendingCutSwitch()
     }
 
+    fun notifyLiveVisitOutcome(slotKey: String, completed: Boolean) {
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        clearInsertionInflightIfKind("live_visit", sk)
+        AutoSwitchLocalPlanStore.markInsertionState(
+            sk,
+            "live_visit",
+            if (completed) PlanStepState.DONE else PlanStepState.FAILED,
+        )
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        maybeResumePendingCutSwitch()
+    }
+
+    /** 暂缓执行时回退 RUNNING→PENDING，允许下轮 tick 重新入队，避免永久堵涨粉。 */
+    fun requeueLiveVisitInsertion(slotKey: String) {
+        val sk = slotKey.trim()
+        if (sk.isBlank()) return
+        clearInsertionInflightIfKind("live_visit", sk)
+        AutoSwitchLocalPlanStore.markInsertionState(sk, "live_visit", PlanStepState.PENDING)
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】主播访问回退 PENDING 待重入队 slot=$sk")
+        }
+    }
+
     /** 互点收尾：从 plan / prefs / in-flight / RUNNING 槽位多路解析 slot，避免 early clear 导致状态泄漏。 */
     fun resolveMutualOutcomeSlotKey(): String {
         AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
@@ -143,6 +169,29 @@ class AutoSwitchLocalScheduler(
             .filter { it.mutual_traffic.state == PlanStepState.RUNNING }
             .forEach { notifyMutualOutcome(it.slot_key, completed) }
         insertionInflight?.takeIf { it.second == "mutual_traffic" }?.let { insertionInflight = null }
+    }
+
+    fun finalizeLiveVisitOutcome(completed: Boolean) {
+        val sk = AutoSwitchLocalPlanStore.activeLiveVisitSlotKey()?.trim().orEmpty()
+            .ifBlank {
+                insertionInflight
+                    ?.takeIf { it.second == "live_visit" }
+                    ?.first?.trim().orEmpty()
+            }
+            .ifBlank {
+                AutoSwitchLocalPlanStore.get()?.slots
+                    ?.firstOrNull { it.live_visit.state == PlanStepState.RUNNING }
+                    ?.slot_key?.trim().orEmpty()
+            }
+        if (sk.isNotBlank()) {
+            notifyLiveVisitOutcome(sk, completed)
+            return
+        }
+        AutoSwitchLocalPlanStore.get()?.slots.orEmpty()
+            .filter { it.live_visit.state == PlanStepState.RUNNING }
+            .forEach { notifyLiveVisitOutcome(it.slot_key, completed) }
+        insertionInflight?.takeIf { it.second == "live_visit" }?.let { insertionInflight = null }
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
     }
 
     private fun mutualSwitchResultCompleted(switchResult: String): Boolean {
@@ -231,6 +280,12 @@ class AutoSwitchLocalScheduler(
             return AutoSwitchLocalPlanStore.formatCutSwitchProgressLine(entry.slot_key)
                 ?: "切号未完成 slot=${entry.slot_key}"
         }
+        // 主播访问：上班后先消化完再涨粉（PENDING/RUNNING 均拦截）
+        when (entry.live_visit.state) {
+            PlanStepState.PENDING, PlanStepState.RUNNING, PlanStepState.WAITING ->
+                return "本时段主播访问未完成 slot=${entry.slot_key}"
+            else -> Unit
+        }
         return growthPullBlockReason()
     }
 
@@ -243,6 +298,7 @@ class AutoSwitchLocalScheduler(
         if (PrefsStore.getAutoSwitchMode() == "exiting") return "自治退出中"
         if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return "发作品占用中"
         if (AutoSwitchLocalPlanStore.isMutualContextOccupying()) return "互点占用中"
+        if (AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()) return "主播访问占用中"
         if (busy.get()) return "独占 OP 执行中"
         if (opQueue.isNotEmpty()) return "独占 OP 队列非空（${opQueue.size}）"
         if (pendingCutSwitchSlotKey != null) return "切号等待高优插入 slot=$pendingCutSwitchSlotKey"
@@ -866,8 +922,10 @@ class AutoSwitchLocalScheduler(
             hasActiveHighPriorityInsertion() ||
             AutoSwitchLocalPlanStore.isPublishContextOccupying() ||
             AutoSwitchLocalPlanStore.isMutualContextOccupying() ||
+            AutoSwitchLocalPlanStore.isLiveVisitContextOccupying() ||
             isPublishExecutionActive() ||
-            isMutualExecutionActive()
+            isMutualExecutionActive() ||
+            isLiveVisitExecutionActive()
         if (!occupied) return
         onPreemptForCutSwitch(sk, reason)
         insertionInflight = null
@@ -881,6 +939,7 @@ class AutoSwitchLocalScheduler(
     private fun isInsertionKindStillActive(kind: String): Boolean = when (kind) {
         "publish" -> isPublishInsertionStillActive()
         "mutual_traffic" -> isMutualInsertionStillActive()
+        "live_visit" -> isLiveVisitInsertionStillActive()
         else -> insertionInflight?.second == kind
     }
 
@@ -899,6 +958,15 @@ class AutoSwitchLocalScheduler(
         val sk = insertionInflight?.first?.trim().orEmpty()
         if (sk.isBlank()) return false
         val state = AutoSwitchLocalPlanStore.insertionState(sk, "mutual_traffic")
+        return state == PlanStepState.RUNNING
+    }
+
+    private fun isLiveVisitInsertionStillActive(): Boolean {
+        if (isLiveVisitExecutionActive()) return true
+        if (AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()) return true
+        val sk = insertionInflight?.first?.trim().orEmpty()
+        if (sk.isBlank()) return false
+        val state = AutoSwitchLocalPlanStore.insertionState(sk, "live_visit")
         return state == PlanStepState.RUNNING
     }
 
@@ -1037,7 +1105,11 @@ class AutoSwitchLocalScheduler(
     }
 
     private fun deviceBusyReasonForInsertionScheduling(): String? {
-        if (ExecutionScope.isActive()) return "涨粉任务执行中"
+        // ExecutionScope 也用于切号/改资料等独占链，勿一律说成「涨粉」
+        if (ExecutionScope.isActive()) {
+            val phase = ProcessDiagnostics.currentPhase().ifBlank { "idle" }
+            return "自动化执行中 depth=${ExecutionScope.depth()} 阶段=$phase"
+        }
         if (PrefsStore.isAutoSwitchExclusivePreempt()) return "独占抢占中"
         if (busy.get()) return "本地 OP 执行中"
         if (opQueue.isNotEmpty()) return "本地 OP 队列非空（${opQueue.size}）"
@@ -1333,6 +1405,7 @@ class AutoSwitchLocalScheduler(
         private const val TICK_SKIP_LOG_COOLDOWN_MS = 5 * 60 * 1000L
         const val SWITCH_SAFE_BUFFER_MIN = 5
         private val DEFAULT_INSERTIONS: List<AutoSwitchSlotInsertion> = listOf(
+            LiveVisitSlotInsertion(),
             PublishPostSlotInsertion(),
             MutualTrafficSlotInsertion(),
         )

@@ -59,6 +59,7 @@ object ConfigDisplay {
         appendSection("拉取与休息") {
             appendLine("单次拉取用户名数量 pull_batch_size：${config.pull_batch_size}")
             appendLine("发作品前拉取素材 publish_post_material_fetch_count：${config.publish_post_material_fetch_count}（0=不拉取）")
+            appendLine("每号每时段主播访问 live_visit_count_per_slot：${config.live_visit_count_per_slot}（0=关闭）")
             if (config.no_rest) {
                 appendLine("休息策略 no_rest：不休息（模板强制关闭，永不进入批次休息）")
             } else {

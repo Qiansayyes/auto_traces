@@ -119,6 +119,7 @@ object AppCoordinator {
         onRefreshWeeklyBundle = { refreshAutoSwitchWeeklyBundleFromCloud() },
         isPublishExecutionActive = { isPublishPostSwitchActive() },
         isMutualExecutionActive = { isMutualSwitchActive() },
+        isLiveVisitExecutionActive = { isLiveVisitSwitchActive() },
         onStalePublishInflight = { slotKey ->
             if (!tryResumeStaleAutoSwitchPublish(slotKey)) {
                 val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -169,6 +170,7 @@ object AppCoordinator {
     private var lastBundleNetworkFetchSessionId: String = ""
     private var deviceOpsJob: Job? = null
     private var mutualSwitchJob: Job? = null
+    private var liveVisitSwitchJob: Job? = null
     private var publishPostSwitchJob: Job? = null
     private var batchStreamJob: Job? = null
     @Volatile
@@ -180,6 +182,13 @@ object AppCoordinator {
 
     @Volatile
     private var basicProfileEditRunning: Boolean = false
+
+    /**
+     * 切号完成后的衔接协程尚未跑完：禁止 drain 队列时抢先恢复涨粉，
+     * 避免插队导致改资料 / 主播访问饿死、调度空转。
+     */
+    @Volatile
+    private var postCutSwitchKickPending: Boolean = false
 
     /** 最近一次 [ensureAccountLoggedIn] 是否实际跑完自动登录链（含 Profile→Edit 终检）。 */
     private var lastEnsureLoginPerformedFreshAutoLogin: Boolean = false
@@ -239,6 +248,8 @@ object AppCoordinator {
 
     private fun isMutualSwitchActive(): Boolean = mutualSwitchJob?.isActive == true
 
+    private fun isLiveVisitSwitchActive(): Boolean = liveVisitSwitchJob?.isActive == true
+
     private fun isBatchStreamActive(): Boolean = batchStreamJob?.isActive == true
 
     private fun isAutoLoginActive(): Boolean = autoLoginActive
@@ -255,10 +266,12 @@ object AppCoordinator {
             !basicProfileEditRunning &&
             !PublishPostGrowthGate.isBlockingGrowth() &&
             !isMutualSwitchActive() &&
+            !isLiveVisitSwitchActive() &&
             !isBatchStreamActive() &&
             !(PrefsStore.isAutoSwitchAutonomousMode() &&
                 (isAutoSwitchPublishLocallyActive() ||
-                    AutoSwitchLocalPlanStore.isPublishContextOccupying()))
+                    AutoSwitchLocalPlanStore.isPublishContextOccupying() ||
+                    AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()))
     }
 
     /** 自治切号/发作品入队前：抢占 TikTok 通道，暂停涨粉拉取并协作中止在跑任务。 */
@@ -440,6 +453,9 @@ object AppCoordinator {
     private fun maybeStartGrowthInAutoSwitchIdle(reason: String = "自治空档") {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         if (PrefsStore.getAutoSwitchMode() == "exiting") return
+        if (postCutSwitchKickPending && !reason.contains("切号完成") && !reason.contains("切号后")) {
+            return
+        }
         if (PublishPostGrowthGate.isBlockingGrowth()) return
         if (PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
             val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -468,15 +484,31 @@ object AppCoordinator {
         if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
             val alias = PrefsStore.getAlias()?.trim().orEmpty()
             if (alias.isNotBlank()) {
-                autoSwitchLocalScheduler.growthBaselineBlockReason()?.let { reason ->
-                    LogCenter.op(alias, "【自动切号】$reason，暂不恢复涨粉拉取")
+                autoSwitchLocalScheduler.growthBaselineBlockReason()?.let { block ->
+                    LogCenter.op(alias, "【自动切号】$block，暂不恢复涨粉拉取")
                 }
             }
             return
         }
         if (pullLoopJob?.isActive == true) return
-        if (ExecutionScope.isActive()) return
-        if (!canStartPullLoopNow()) return
+        if (ExecutionScope.isActive()) {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (alias.isNotBlank()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】$reason：执行标记未释放 depth=${ExecutionScope.depth()} " +
+                        "阶段=${ProcessDiagnostics.currentPhase()}，暂不恢复涨粉拉取",
+                )
+            }
+            return
+        }
+        if (!canStartPullLoopNow()) {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】$reason：尚有独占任务占用，暂不恢复涨粉拉取")
+            }
+            return
+        }
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (alias.isNotBlank()) {
             LogCenter.op(alias, "【自动切号】$reason，恢复涨粉拉取")
@@ -495,6 +527,7 @@ object AppCoordinator {
             autoSwitchLocalScheduler.isExclusiveWorkActive() ||
             isPublishPostSwitchActive() ||
             isMutualSwitchActive() ||
+            isLiveVisitSwitchActive() ||
             isBatchStreamActive() ||
             PublishPostGrowthGate.isBlockingGrowth()
 
@@ -1028,6 +1061,9 @@ object AppCoordinator {
                 append(" hardStop=${PrefsStore.isHardStopRequested()}")
             }
         }
+        ProcessDiagnostics.registerStatusLineProvider {
+            buildAutoSwitchStatusLogLine()
+        }
         updateRuntime(
             serviceRunning = WorkerServiceTracker.isRunning,
             localStatus = PrefsStore.getLocalStatus(),
@@ -1041,6 +1077,34 @@ object AppCoordinator {
             tryUploadPendingAutoSwitchSummary()
             startIfNeeded()
         }
+    }
+
+    /** 周期性状态行：涨粉空窗时也能从日志看出卡在哪。 */
+    private fun buildAutoSwitchStatusLogLine(): String {
+        val phase = ProcessDiagnostics.currentPhase().ifBlank { "idle" }
+        val slot = PrefsStore.getAutoSwitchLastSlotKey()?.trim()?.takeIf { it.isNotEmpty() } ?: "-"
+        val pullOn = pullLoopJob?.isActive == true
+        val execOn = ExecutionScope.isActive()
+        val pull = when {
+            pullOn && execOn -> "开(执行中)"
+            pullOn -> "开"
+            execOn -> "关(exec占用)"
+            else -> "关"
+        }
+        val exclusive = when {
+            autoSwitchLocalScheduler.isExclusiveWorkActive() -> "忙"
+            PrefsStore.isAutoSwitchExclusivePreempt() -> "抢占中"
+            else -> "闲"
+        }
+        val profilePart = if (basicProfileEditRunning) "改资料中" else "否"
+        val mutualPart = when {
+            isMutualSwitchActive() || AutoSwitchLocalPlanStore.isMutualContextOccupying() -> "互点中"
+            isPublishPostSwitchActive() || AutoSwitchLocalPlanStore.isPublishContextOccupying() -> "发作品中"
+            isLiveVisitSwitchActive() || AutoSwitchLocalPlanStore.isLiveVisitContextOccupying() -> "主播访问中"
+            autoLoginActive -> "自动登录中"
+            else -> "否"
+        }
+        return "[状态] 阶段=$phase slot=$slot 涨粉pull=$pull 独占OP=$exclusive 改资料/互点占用=$profilePart/$mutualPart"
     }
 
     private fun ensureDeviceOpsLoopIfBound() {
@@ -2290,15 +2354,27 @@ object AppCoordinator {
         if (sk.isEmpty()) return
         val oldPublishSlot = AutoSwitchLocalPlanStore.activePublishSlotKey()?.trim().orEmpty()
         val oldMutualSlot = AutoSwitchLocalPlanStore.activeMutualSlotKey()?.trim().orEmpty()
+        val oldLiveVisitSlot = AutoSwitchLocalPlanStore.activeLiveVisitSlotKey()?.trim().orEmpty()
+            .ifBlank {
+                AutoSwitchLocalPlanStore.get()?.slots
+                    ?.firstOrNull { it.live_visit.state == PlanStepState.RUNNING }
+                    ?.slot_key?.trim().orEmpty()
+            }
+        // 先落主播访问终态，再 cancel job，避免 RUNNING 泄漏永久堵涨粉
+        if (oldLiveVisitSlot.isNotBlank()) {
+            autoSwitchLocalScheduler.notifyLiveVisitOutcome(oldLiveVisitSlot, completed = false)
+        }
         clearAutoSwitchPerAccountDirtyState(
             reason = reason,
             prevSlotKey = oldPublishSlot.takeIf { it.isNotBlank() && it != sk }
-                ?: oldMutualSlot.takeIf { it.isNotBlank() && it != sk },
+                ?: oldMutualSlot.takeIf { it.isNotBlank() && it != sk }
+                ?: oldLiveVisitSlot.takeIf { it.isNotBlank() && it != sk },
             newSlotKey = sk,
         )
         AutoSwitchLocalPlanStore.clearActivePublish()
         AutoSwitchLocalPlanStore.clearActiveMutual()
-        listOf(oldPublishSlot, oldMutualSlot).distinct().filter { it.isNotBlank() && it != sk }.forEach { prevSk ->
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        listOf(oldPublishSlot, oldMutualSlot, oldLiveVisitSlot).distinct().filter { it.isNotBlank() && it != sk }.forEach { prevSk ->
             autoSwitchLocalScheduler.clearPublishInsertionInflight(prevSk)
             AutoSwitchLocalPlanStore.resetStalePublishInflight(prevSk)
         }
@@ -2358,6 +2434,10 @@ object AppCoordinator {
         if (isMutualSwitchActive()) {
             mutualSwitchJob?.cancel()
             mutualSwitchJob = null
+        }
+        if (isLiveVisitSwitchActive()) {
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
         }
         pullLoopJob?.cancel()
         pullLoopJob = null
@@ -2507,6 +2587,7 @@ object AppCoordinator {
         val loaded: Boolean,
         val msg: String = "",
         val cloudDisabled: Boolean = false,
+        val usernameUnchanged: Boolean = false,
     )
 
     private fun cancelAutoSwitchBundleRetry() {
@@ -2534,7 +2615,7 @@ object AppCoordinator {
         val outcome = fetchAutoSwitchBundleFromCloud(alias, deviceId, "enter 加载 bundle", forceNetwork = true)
         return when {
             outcome.loaded && outcome.bundle != null -> {
-                applyAutoSwitchBundle(alias, deviceId, outcome.bundle, bundleRevision)
+                val usernameUnchanged = applyAutoSwitchBundle(alias, deviceId, outcome.bundle, bundleRevision)
                 val weekStart = outcome.bundle.week_start_date?.trim().orEmpty()
                 val weekEnd = outcome.bundle.week_end_date?.trim().orEmpty()
                 val dayCount = outcome.bundle.weekly_plan?.day_plans?.size ?: 0
@@ -2543,7 +2624,7 @@ object AppCoordinator {
                     "【自动切号】bundle 已加载 session=$sessionId revision=$bundleRevision " +
                         "week=$weekStart~$weekEnd days=$dayCount",
                 )
-                AutoSwitchBundleFetchOutcome(loaded = true)
+                AutoSwitchBundleFetchOutcome(loaded = true, usernameUnchanged = usernameUnchanged)
             }
             outcome.cloudDisabled ->
                 AutoSwitchBundleFetchOutcome(loaded = false, msg = outcome.msg, cloudDisabled = true)
@@ -2557,6 +2638,7 @@ object AppCoordinator {
         deviceId: String,
         eventId: Int,
         sessionId: String,
+        requestImmediateTick: Boolean = true,
     ) {
         noteCloudAutoSwitchEnabled(true)
         cancelAutoSwitchBundleRetry()
@@ -2568,9 +2650,14 @@ object AppCoordinator {
         }.onFailure { err ->
             LogCenter.op(alias, "自治模式 ACK(bundle_loaded) 失败：${err.message}")
         }
-        delay(1_500)
-        autoSwitchLocalScheduler.requestImmediateTick()
-        maybeStartGrowthInAutoSwitchIdle("自治启动")
+        if (requestImmediateTick) {
+            delay(1_500)
+            autoSwitchLocalScheduler.requestImmediateTick()
+            maybeStartGrowthInAutoSwitchIdle("自治启动")
+        } else {
+            LogCenter.op(alias, "【自动切号】资料重同步：当前账号未变，跳过立即调度")
+            maybeStartGrowthInAutoSwitchIdle("资料重同步")
+        }
     }
 
     private fun scheduleAutoSwitchBundleEnterRetry(
@@ -2580,6 +2667,7 @@ object AppCoordinator {
         sessionId: String,
         bundleRevision: Int,
         firstFailureMsg: String,
+        suppressTickWhenUsernameUnchanged: Boolean = false,
     ) {
         if (isAutoSwitchBundlePermanentFailure(firstFailureMsg)) {
             LogCenter.op(alias, "【自动切号】bundle 失败不可自动重试：$firstFailureMsg")
@@ -2604,7 +2692,13 @@ object AppCoordinator {
                 attempt++
                 val outcome = tryLoadAutoSwitchBundleForEnter(alias, deviceId, sessionId, bundleRevision)
                 if (outcome.loaded) {
-                    finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
+                    finalizeAutoSwitchEnterAfterBundleLoaded(
+                        alias,
+                        deviceId,
+                        eventId,
+                        sessionId,
+                        requestImmediateTick = !(suppressTickWhenUsernameUnchanged && outcome.usernameUnchanged),
+                    )
                     return@launch
                 }
                 if (outcome.cloudDisabled) {
@@ -2704,7 +2798,13 @@ object AppCoordinator {
                 )
                 when {
                     bundleOutcome.loaded ->
-                        finalizeAutoSwitchEnterAfterBundleLoaded(alias, deviceId, eventId, sessionId)
+                        finalizeAutoSwitchEnterAfterBundleLoaded(
+                            alias,
+                            deviceId,
+                            eventId,
+                            sessionId,
+                            requestImmediateTick = !bundleOutcome.usernameUnchanged,
+                        )
                     bundleOutcome.cloudDisabled -> {
                         LogCenter.op(
                             alias,
@@ -2717,6 +2817,7 @@ object AppCoordinator {
                             sessionId,
                             bundleRevision,
                             bundleOutcome.msg.ifBlank { "该设备未开启自动切号" },
+                            suppressTickWhenUsernameUnchanged = true,
                         )
                     }
                     else -> scheduleAutoSwitchBundleEnterRetry(
@@ -2726,6 +2827,7 @@ object AppCoordinator {
                         sessionId,
                         bundleRevision,
                         bundleOutcome.msg,
+                        suppressTickWhenUsernameUnchanged = true,
                     )
                 }
             }
@@ -3043,17 +3145,91 @@ object AppCoordinator {
         deviceId: String,
         parentOpId: String,
     ) {
+        // 必须等当前切号 OP 出队并释放 ExecutionScope，再跑改资料/插入/涨粉；
+        // 旧逻辑在 OP 未结束时尝试恢复涨粉会静默失败，随后每分钟被误判「涨粉执行中」空转。
+        postCutSwitchKickPending = true
         scope.launch {
-            val ran = maybeRunPendingBasicProfileEditAfterLoginVerified(
-                alias = alias,
-                deviceId = deviceId,
-                parentOpId = "${parentOpId}_profile_after_cut",
-                trigger = "cut_switch_after_login",
-                skipOuterWarmup = true,
-                loginVerified = true,
+            try {
+                kickPostCutSwitchPipeline(alias, deviceId, parentOpId)
+            } finally {
+                postCutSwitchKickPending = false
+            }
+        }
+    }
+
+    /**
+     * 切号完成后的强制衔接：等独占收尾 → 改资料（若需要）→ 即时 tick（主播访问/发作品/互点）→ 恢复涨粉。
+     * 对 ExecutionScope 卡住带超时强制清除，避免空窗假死。
+     */
+    private suspend fun kickPostCutSwitchPipeline(
+        alias: String,
+        deviceId: String,
+        parentOpId: String,
+    ) {
+        LogCenter.op(alias, "【自动切号】切号后衔接：等待独占 OP / 执行标记收尾…")
+        awaitAutoSwitchExclusiveDrain(alias, maxMs = 60_000L)
+        if (ExecutionScope.isActive() && !autoSwitchLocalScheduler.isExclusiveWorkActive()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】切号后衔接：执行标记仍占用 depth=${ExecutionScope.depth()} " +
+                    "阶段=${ProcessDiagnostics.currentPhase()}，强制清除以免插入任务饿死",
             )
-            if (!ran) {
-                maybeStartGrowthInAutoSwitchIdle("切号完成（无需改资料）")
+            ExecutionScope.forceClearIfStuck("切号后衔接")
+        }
+        recoverStaleAutoSwitchExclusiveState("切号后衔接")
+        if (!manuallyPaused && !shouldHonorUserHardStop() && PrefsStore.getAutoSwitchMode() != "exiting") {
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "自动切号自治：切号后衔接")
+        }
+        // 独占已空：放开 drain 抢跑限制；改资料期间由 basicProfileEditRunning / preempt 护栏负责
+        postCutSwitchKickPending = false
+
+        val ran = maybeRunPendingBasicProfileEditAfterLoginVerified(
+            alias = alias,
+            deviceId = deviceId,
+            parentOpId = "${parentOpId}_profile_after_cut",
+            trigger = "cut_switch_after_login",
+            skipOuterWarmup = true,
+            loginVerified = true,
+        )
+        // 先 tick：让主播访问等插入任务有机会入队，再决定是否恢复涨粉基线
+        autoSwitchLocalScheduler.requestImmediateTick()
+        delay(400)
+        if (!ran) {
+            maybeStartGrowthInAutoSwitchIdle("切号完成（无需改资料）")
+            retryMaybeStartGrowthIfStillIdle(alias, "切号完成（无需改资料）")
+        }
+    }
+
+    /** 切号后常见竞态：首次恢复撞上收尾窗口，短间隔重试几次。 */
+    private fun retryMaybeStartGrowthIfStillIdle(alias: String, reason: String) {
+        if (pullLoopJob?.isActive == true) return
+        scope.launch {
+            for (attempt in 1..6) {
+                delay(2_000L)
+                if (pullLoopJob?.isActive == true) return@launch
+                if (manuallyPaused || shouldHonorUserHardStop()) return@launch
+                if (PrefsStore.getAutoSwitchMode() == "exiting") return@launch
+                if (autoSwitchLocalScheduler.isExclusiveWorkActive()) continue
+                if (ExecutionScope.isActive() && !autoSwitchLocalScheduler.isExclusiveWorkActive()) {
+                    ExecutionScope.forceClearIfStuck("切号后恢复涨粉重试#$attempt")
+                }
+                if (!autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
+                    // 主播访问等插入待执行：只补 tick，不抢涨粉
+                    autoSwitchLocalScheduler.requestImmediateTick()
+                    continue
+                }
+                LogCenter.op(alias, "【自动切号】$reason：第 $attempt 次重试恢复涨粉")
+                maybeStartGrowthInAutoSwitchIdle("$reason(重试$attempt)")
+                if (pullLoopJob?.isActive == true) return@launch
+            }
+            if (pullLoopJob?.isActive != true && autoSwitchLocalScheduler.shouldAllowGrowthBaseline()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】$reason：多次重试后涨粉仍未启动 " +
+                        "exec=${ExecutionScope.depth()} preempt=${PrefsStore.isAutoSwitchExclusivePreempt()} " +
+                        "status=${PrefsStore.getLocalStatus()} 阶段=${ProcessDiagnostics.currentPhase()}",
+                )
             }
         }
     }
@@ -3085,7 +3261,7 @@ object AppCoordinator {
                 accountSnapshot.basic_profile_modified,
             )
         }
-        if (isPublishPostSwitchActive() || isMutualSwitchActive() || isBatchStreamActive()) {
+        if (isPublishPostSwitchActive() || isMutualSwitchActive() || isLiveVisitSwitchActive() || isBatchStreamActive()) {
             LogCenter.op(alias, "[OP][$parentOpId] 独占任务进行中，暂缓改资料（trigger=$trigger）")
             return false
         }
@@ -3168,6 +3344,31 @@ object AppCoordinator {
         autoSwitchLocalScheduler.awaitExclusiveIdle(maxMs)
     }
 
+    private suspend fun waitForBasicProfileEditIdle(
+        alias: String,
+        reason: String,
+        maxMs: Long = 300_000L,
+    ): Boolean {
+        if (!basicProfileEditRunning) return true
+        LogCenter.op(alias, "【自动切号】$reason：修改基本资料仍在执行，等待其结束后再继续")
+        var waited = 0L
+        while (basicProfileEditRunning) {
+            if (shouldHonorUserHardStop() || manuallyPaused || PrefsStore.getAutoSwitchMode() == "exiting") {
+                LogCenter.op(alias, "【自动切号】$reason：等待修改基本资料结束时中止")
+                return false
+            }
+            if (waited >= maxMs) {
+                LogCenter.op(alias, "【自动切号】$reason：等待修改基本资料结束超时（${maxMs / 1000}s），本轮不继续")
+                return false
+            }
+            val delayMs = minOf(500L, maxMs - waited)
+            delay(delayMs)
+            waited += delayMs
+        }
+        LogCenter.op(alias, "【自动切号】$reason：修改基本资料已结束，继续执行")
+        return true
+    }
+
     private suspend fun finishAutoSwitchCutSwitchAfterSuccess(
         alias: String,
         opId: String,
@@ -3232,10 +3433,7 @@ object AppCoordinator {
             alias,
             "【自动切号】切号完成 row=$targetRowIndex，继续自治调度（涨粉在改资料结束或无需改资料后恢复）",
         )
-        scope.launch {
-            delay(500)
-            autoSwitchLocalScheduler.requestImmediateTick()
-        }
+        // 即时 tick 改由 kickPostCutSwitchPipeline 在独占收尾后触发，避免 OP 未出栈时误判「涨粉执行中」
     }
 
     /**
@@ -3473,6 +3671,9 @@ object AppCoordinator {
         val user = targetUsername.trim()
         if (user.isBlank()) {
             LogCenter.op(alias, "【自动切号】切号后登录校验失败（$phase）：缺少目标 username")
+            return false
+        }
+        if (!waitForBasicProfileEditIdle(alias, "切号后登录校验($phase)")) {
             return false
         }
         val launched = executor.launchTikTokWithForegroundVerification(
@@ -4804,20 +5005,20 @@ object AppCoordinator {
             LogCenter.op(alias, "【自动切号】周计划 bundle 拉取失败：${outcome.msg}")
             return false
         }
-        val equivalent = applyAutoSwitchBundle(
+        val usernameUnchanged = applyAutoSwitchBundle(
             alias,
             deviceId,
             outcome.bundle,
             revision,
             startSchedulerIfStopped = false,
         )
-        if (!equivalent || !autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()) {
+        if (!usernameUnchanged) {
             autoSwitchLocalScheduler.requestImmediateTick()
             maybeStartGrowthInAutoSwitchIdle("周计划刷新")
         } else {
             LogCenter.op(
                 alias,
-                "【自动切号】周计划幂等刷新（账号未变且本时段已对齐），不打断自治涨粉",
+                "【自动切号】周计划幂等刷新（当前账号未变），不打断自治涨粉",
             )
         }
         return true
@@ -4872,8 +5073,8 @@ object AppCoordinator {
         if (revision != PrefsStore.getAutoSwitchLastConfigFetchRevision()) {
             PrefsStore.setAutoSwitchLastConfigFetchRevision(-1)
         }
-        val skipDisruptiveConfigApply =
-            accountsEquivalent && autoSwitchLocalScheduler.isCurrentSlotEnvironmentCommitted()
+        val usernameUnchanged = isBundleTargetUsernameSameAsDevice(bundle)
+        val skipDisruptiveConfigApply = usernameUnchanged
         if (!skipDisruptiveConfigApply) {
             val logUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
             val slotTargetUser = bundle.resolveCurrentSlotTargetAccount(
@@ -4892,10 +5093,9 @@ object AppCoordinator {
         } else if (alias.isNotBlank()) {
             LogCenter.op(
                 alias,
-                "【自动切号】bundle 幂等刷新：账号未变且本时段已对齐，跳过配置重载以免打断涨粉",
+                "【自动切号】bundle 幂等刷新：当前账号未变，跳过配置重载",
             )
         }
-        val usernameUnchanged = isBundleTargetUsernameSameAsDevice(bundle)
         if (!usernameUnchanged) {
             scheduleBackupDirectoryReconcile(
                 alias = alias,
@@ -4916,7 +5116,7 @@ object AppCoordinator {
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
         }
         maybeSyncPcServiceUrlFromBundle(alias, bundle)
-        return accountsEquivalent
+        return usernameUnchanged
     }
 
     /** bundle 携带云端 PC 地址时：仅在与本机不一致时保存并注册，相同则完全跳过。 */
@@ -5082,6 +5282,7 @@ object AppCoordinator {
     private fun isAutoSwitchDailyReconcileBlocked(): Boolean =
         isPublishPostSwitchActive() ||
             isMutualSwitchActive() ||
+            isLiveVisitSwitchActive() ||
             isAutoLoginActive() ||
             basicProfileEditRunning ||
             (PrefsStore.isAutoSwitchAutonomousMode() && !autoSwitchLocalScheduler.shouldAllowGrowthBaseline())
@@ -5393,6 +5594,45 @@ object AppCoordinator {
             return
         }
         val packageName = payload?.package_name?.trim().orEmpty()
+        if (op.op_type == "live_visit_start") {
+            val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
+            val accountUser = payload?.account_username?.trim().orEmpty()
+            val names = payload?.live_visit_usernames.orEmpty()
+                .map { it.trim().removePrefix("@") }
+                .filter { it.isNotEmpty() }
+                .distinctBy { it.lowercase() }
+            if (accountUser.isNotBlank()) {
+                applyBundledConfigFromAutoSwitch(accountUser, logToUser = false)
+            }
+            val liveLogLine =
+                "[OP][$opId] 收到主播访问指令，本地消化 ${names.size} 条（不拉云端名单）"
+            LogCenter.op(alias, liveLogLine)
+            if (slotKey.isNotBlank()) {
+                AutoSwitchLocalPlanStore.beginActiveLiveVisit(
+                    slotKey = slotKey,
+                    opId = opId,
+                    accountUsername = accountUser,
+                    remainingUsernames = names,
+                )
+            } else {
+                AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+            }
+            triggerLiveVisitNow(alias)
+            reportDeviceOpToCloud(
+                deviceId = deviceId,
+                alias = alias,
+                opId = opId,
+                status = "success",
+                message = "已收到主播访问请求",
+                data = mapOf(
+                    "op_type" to op.op_type,
+                    "device_id" to deviceId,
+                    "live_visit_count" to names.size,
+                    "operation_logs" to listOf(liveLogLine),
+                ),
+            )
+            return
+        }
         if (
             op.op_type == "mutual_click_start" ||
             op.op_type == "mutual_click_comment_only_start" ||
@@ -5996,6 +6236,8 @@ object AppCoordinator {
                 var avatarSucceededEver = false
                 var successOverall = false
                 var stopAfterProfileEditOk = false
+                var lastEntryMode = ""
+                var lastEntryFailureStep = ""
 
                 for (outer in 1..maxOuter) {
                     if (PrefsStore.isHardStopRequested()) {
@@ -6005,7 +6247,43 @@ object AppCoordinator {
                         break
                     }
                     opLog("修改基本资料：第 $outer/$maxOuter 轮")
-                    lastStopOk = runSu("am force-stop $packageName")
+                    lastStopOk = false
+                    lastLaunchOk = false
+                    lastRatioTapOk = false
+                    val directEntryThisRound =
+                        if (outer == 1) {
+                            opLog("profile edit: outer $outer/$maxOuter entry precheck before warmup")
+                            /*
+                            opLog("淇敼鍩烘湰璧勬枡锛氱 $outer/$maxOuter 杞厛鍋?OCR 鍒ゅ畾鏄惁鍦ㄩ椤碉紝鑻ュ湪棣栭〉鍒欑洿鎺ョ偣 Profile")
+                            */
+                            val prep = executor.prepareProfileEditEntryPreferHome(
+                                ctx = appContext,
+                                alias = alias,
+                                reason = "profile_edit_outer_$outer",
+                            )
+                            lastEntryMode = prep.entryMode
+                            lastEntryFailureStep = prep.failureStep
+                            if (prep.success) {
+                                val dm = appContext.resources.displayMetrics
+                                lastW = dm.widthPixels
+                                lastH = dm.heightPixels
+                                prep.profileTapPx?.let { lastRatioTapPx = it }
+                                lastLaunchOk = true
+                                lastRatioTapOk = prep.profileTapPx != null
+                                opLog("profile edit: outer $outer/$maxOuter entry precheck succeeded (${prep.entryMode}); continue with OCR chain")
+                                /*
+                                opLog("淇敼鍩烘湰璧勬枡锛氱 $outer/$maxOuter 杞洿杈惧叆鍙ｆ垚鍔燂紙${prep.entryMode}锛夛紝鐩存帴杩涘叆 OCR 閾?)
+                                */
+                                true
+                            } else {
+                                opLog("profile edit: outer $outer/$maxOuter entry precheck failed; fallback to warmup")
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    if (!directEntryThisRound) {
+                        lastStopOk = runSu("am force-stop $packageName")
                     if (!delayUnlessHardStop(1200)) {
                         opLog("修改基本资料：硬停中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
@@ -6060,6 +6338,8 @@ object AppCoordinator {
                             editOcrPreviews = listOf("stop=$lastStopOk launch=$lastLaunchOk ratioTap=$lastRatioTapOk"),
                         )
                         continue
+                    }
+
                     }
 
                     if (profileUsernameAtStart.isNotBlank()) {
@@ -6138,6 +6418,8 @@ object AppCoordinator {
                         "stop_ok" to lastStopOk,
                         "launch_ok" to lastLaunchOk,
                         "ratio_tap_ok" to lastRatioTapOk,
+                        "profile_edit_entry_mode" to lastEntryMode,
+                        "profile_edit_entry_failure_step" to lastEntryFailureStep,
                         "profile_edit_outer_max" to maxOuter,
                         "profile_edit_success" to successOverall,
                         "profile_edit_avatar_step_ok" to avatarSucceededEver,
@@ -7040,6 +7322,172 @@ object AppCoordinator {
         }
     }
 
+    private fun triggerLiveVisitNow(alias: String) {
+        if (liveVisitSwitchJob?.isActive == true) {
+            LogCenter.op(alias, "主播访问任务已在执行中，忽略重复触发")
+            return
+        }
+        if (isPublishPostSwitchActive() || isMutualSwitchActive()) {
+            LogCenter.op(alias, "主播访问暂缓：发作品/互点仍在执行，回退 PENDING 待下轮入队")
+            requeueDeferredLiveVisit()
+            return
+        }
+        liveVisitSwitchJob = scope.launch {
+            ExecutionScope.enter()
+            var completed = false
+            // complete=成功收尾；fail=失败收尾；requeue=回退 PENDING；none=抢占已收尾
+            var finishMode = "fail"
+            try {
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                delay(120)
+                val deviceId = PrefsStore.getDeviceId().orEmpty()
+                val active = AutoSwitchLocalPlanStore.getActiveLiveVisit()
+                val accountUser = active?.account_username?.trim().orEmpty()
+                if (accountUser.isNotBlank()) {
+                    applyBundledConfigFromAutoSwitch(accountUser, logToUser = false)
+                }
+                if (deviceId.isNotBlank() &&
+                    !ensureLoggedInBeforeExclusiveTask(alias, deviceId, "主播访问")
+                ) {
+                    LogCenter.op(alias, "主播访问：登录未就绪，回退 PENDING 待重试")
+                    finishMode = "requeue"
+                    return@launch
+                }
+                val remaining = AutoSwitchLocalPlanStore.getActiveLiveVisit()
+                    ?.remaining_usernames
+                    .orEmpty()
+                    .toMutableList()
+                if (remaining.isEmpty()) {
+                    LogCenter.op(alias, "主播访问：本地名单为空，标记完成并恢复涨粉")
+                    completed = true
+                    finishMode = "complete"
+                    return@launch
+                }
+                val liveConfig = _config.value.copy(run_mode = ServerRunMode.LIVE)
+                var successCount = 0
+                while (remaining.isNotEmpty()) {
+                    if (shouldHonorUserHardStop() || PrefsStore.isHardStopRequested()) {
+                        LogCenter.op(alias, "主播访问：硬停中断，剩余 ${remaining.size} 条")
+                        finishMode = "fail"
+                        break
+                    }
+                    if (PrefsStore.isAutoSwitchAutonomousMode() &&
+                        AutoSwitchLocalPlanStore.getActiveLiveVisit() == null
+                    ) {
+                        LogCenter.op(alias, "主播访问：已被切号抢占，中止本批")
+                        finishMode = "none"
+                        return@launch
+                    }
+                    val username = remaining.removeAt(0)
+                    AutoSwitchLocalPlanStore.setActiveLiveVisitRemaining(remaining)
+                    LogCenter.op(alias, "主播访问：开始 @$username（剩余 ${remaining.size}）")
+                    val result = runCatching {
+                        executor.executeForUsername(username, liveConfig)
+                    }.getOrElse { err ->
+                        when (err) {
+                            is LoginSafeguardRequiresAutoLoginException -> {
+                                if (deviceId.isNotBlank()) {
+                                    val loginReady = ensureAccountLoggedInWithRetry(
+                                        alias = alias,
+                                        deviceId = deviceId,
+                                        reason = "主播访问保障",
+                                        forceRelogin = true,
+                                        resumeFromLoginEntryScreen = true,
+                                    ) == AccountLoginRetryOutcome.LoggedIn
+                                    if (loginReady) {
+                                        runCatching {
+                                            executor.executeForUsername(username, liveConfig)
+                                        }.getOrElse { e2 ->
+                                            "失败：登录保障后仍异常 ${e2.message ?: "unknown"}"
+                                        }
+                                    } else {
+                                        "失败：登录保障后仍未登录"
+                                    }
+                                } else {
+                                    "失败：需要自动登录"
+                                }
+                            }
+                            is AccountStatusLoggedOutException -> {
+                                if (deviceId.isNotBlank()) {
+                                    recoverFromAccountStatusLogout(alias, deviceId, "主播访问")
+                                }
+                                "失败：掉登录 ${err.message ?: "account_status"}"
+                            }
+                            else -> "失败：${err.message ?: "unknown"}"
+                        }
+                    }
+                    val failed = result.startsWith("失败：") ||
+                        result.contains("执行失败") ||
+                        result.contains("异常")
+                    if (failed) {
+                        LogCenter.op(alias, "主播访问失败：@$username — $result")
+                    } else {
+                        successCount += 1
+                        LogCenter.op(alias, "主播访问完成：@$username — $result")
+                    }
+                }
+                completed = remaining.isEmpty()
+                finishMode = if (completed) "complete" else "fail"
+                LogCenter.op(
+                    alias,
+                    "主播访问结束：成功 $successCount 条，剩余 ${remaining.size}，completed=$completed",
+                )
+                updateRuntime(lastMessage = "主播访问结束：成功 $successCount")
+            } finally {
+                when {
+                    !PrefsStore.isAutoSwitchAutonomousMode() -> {
+                        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+                    }
+                    finishMode == "none" -> {
+                        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+                    }
+                    finishMode == "requeue" -> {
+                        requeueDeferredLiveVisit()
+                    }
+                    else -> {
+                        val sk = AutoSwitchLocalPlanStore.activeLiveVisitSlotKey()?.trim().orEmpty()
+                            .ifBlank {
+                                AutoSwitchLocalPlanStore.get()?.slots
+                                    ?.firstOrNull { it.live_visit.state == PlanStepState.RUNNING }
+                                    ?.slot_key?.trim().orEmpty()
+                            }
+                        if (sk.isNotBlank() &&
+                            AutoSwitchLocalPlanStore.insertionState(sk, "live_visit") == PlanStepState.RUNNING
+                        ) {
+                            autoSwitchLocalScheduler.finalizeLiveVisitOutcome(finishMode == "complete")
+                        } else {
+                            AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+                        }
+                    }
+                }
+                if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                    releaseInsertionPrepExclusiveIfIdle("主播访问结束")
+                }
+                ExecutionScope.exit()
+                liveVisitSwitchJob = null
+                if (PrefsStore.isAutoSwitchAutonomousMode() && finishMode != "requeue") {
+                    maybeStartGrowthInAutoSwitchIdle("主播访问结束")
+                }
+            }
+        }
+    }
+
+    /** 因其它独占任务暂缓主播访问：回退 PENDING，避免 RUNNING 永久堵涨粉。 */
+    private fun requeueDeferredLiveVisit() {
+        val sk = AutoSwitchLocalPlanStore.activeLiveVisitSlotKey()?.trim().orEmpty()
+            .ifBlank {
+                AutoSwitchLocalPlanStore.get()?.slots
+                    ?.firstOrNull { it.live_visit.state == PlanStepState.RUNNING }
+                    ?.slot_key?.trim().orEmpty()
+            }
+        if (sk.isBlank()) {
+            AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+            return
+        }
+        autoSwitchLocalScheduler.requeueLiveVisitInsertion(sk)
+    }
+
     private fun triggerMutualSwitchNow(alias: String) {
         if (mutualSwitchJob?.isActive == true) {
             LogCenter.op(alias, "互点切换任务已在执行中，忽略重复触发")
@@ -7781,6 +8229,8 @@ object AppCoordinator {
             var lastLaunchOk = false
             var lastRatioTapOk = false
             val maxOuter = 3
+            var lastEntryMode = ""
+            var lastEntryFailureStep = ""
 
             suspend fun runProfileEditChainOnce(): ProfileEditChainResult =
                 try {
@@ -7809,7 +8259,36 @@ object AppCoordinator {
                     runSu("am force-stop $packageName")
                     break
                 }
-                val skipWarmupThisRound = skipOuterWarmup && outer == 1
+                lastStopOk = false
+                lastLaunchOk = false
+                lastRatioTapOk = false
+                val directEntryThisRound =
+                    if (outer == 1) {
+                        opLog("profile edit after cut switch: outer $outer/$maxOuter entry precheck before warmup")
+                        val prep = executor.prepareProfileEditEntryPreferHome(
+                            ctx = appContext,
+                            alias = alias,
+                            reason = "profile_edit_after_cut_switch_outer_$outer",
+                        )
+                        lastEntryMode = prep.entryMode
+                        lastEntryFailureStep = prep.failureStep
+                        if (prep.success) {
+                            val metrics = appContext.resources.displayMetrics
+                            lastW = metrics.widthPixels
+                            lastH = metrics.heightPixels
+                            prep.profileTapPx?.let { lastRatioTapPx = it }
+                            lastLaunchOk = true
+                            lastRatioTapOk = prep.profileTapPx != null
+                            opLog("profile edit after cut switch: outer $outer/$maxOuter entry precheck succeeded (${prep.entryMode})")
+                            true
+                        } else {
+                            opLog("profile edit after cut switch: outer $outer/$maxOuter entry precheck failed")
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                val skipWarmupThisRound = directEntryThisRound
                 if (skipWarmupThisRound) {
                     opLog("修改基本资料：第 $outer/$maxOuter 轮（跳过外轮 warmup，直接 OCR 链）")
                 } else {
@@ -7930,6 +8409,8 @@ object AppCoordinator {
                     "stop_ok" to lastStopOk,
                     "launch_ok" to lastLaunchOk,
                     "ratio_tap_ok" to lastRatioTapOk,
+                    "profile_edit_entry_mode" to lastEntryMode,
+                    "profile_edit_entry_failure_step" to lastEntryFailureStep,
                     "profile_edit_success" to successOverall,
                     "profile_edit_avatar_step_ok" to avatarSucceededEver,
                     "profile_edit_bio_after_part1_ok" to chain.bioAfterPart1Ok,
