@@ -3958,6 +3958,8 @@ class DeviceIdAliasRequest(BaseModel):
 class DeviceOpPollRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
+    # 非空时仅弹出匹配类型的任务（自治模式只拉 set_pc_service_url，其它任务留队）。
+    allowed_op_types: List[str] = Field(default_factory=list)
 
 
 class DeviceModeAckRequest(BaseModel):
@@ -10409,6 +10411,92 @@ def device_gallery_library_random(device_id: str, alias: str):
     return {"code": 0, "msg": "ok", "item": item}
 
 
+def _fetch_device_assigned_accounts_list(
+    conn: sqlite3.Connection, owner_username: str, alias: str
+) -> list[dict[str, Any]]:
+    """当前设备别名桶内全部账号（含凭据 / 登录态 / 备份字段），供手动切号下拉。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return []
+    dev_rows = conn.execute(
+        """
+        SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
+               backup_path, backup_name, backup_time, backup_status, env_status
+        FROM device_editor_rows
+        WHERE owner_username = ? AND TRIM(username) <> ''
+        ORDER BY row_index ASC
+        """,
+        (owner,),
+    ).fetchall()
+    matched = [
+        dict(r)
+        for r in dev_rows
+        if _normalize_alias_key(_effective_device_editor_alias(dict(r))) == alias_key
+    ]
+    if not matched:
+        return []
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pick in matched:
+        username = str(pick.get("username") or "").strip()
+        if not username:
+            continue
+        uname_key = username.lower()
+        if uname_key in seen:
+            continue
+        alias_err = _validate_username_device_effective_alias(conn, owner, username, alias_key)
+        if alias_err:
+            continue
+        seen.add(uname_key)
+        fields = _account_bundle_fields_for_username(conn, owner, username)
+        items.append(
+            {
+                "row_index": int(pick.get("row_index") or 0),
+                "account_row_index": int(fields.get("account_row_index") or 0),
+                "username": username,
+                "email": str(fields.get("email") or "").strip(),
+                "password": str(fields.get("password") or "").strip(),
+                "email_password": str(fields.get("email_password") or "").strip(),
+                "api": str(fields.get("api") or "").strip(),
+                "is_login": bool(fields.get("is_login")),
+                "login_time": str(fields.get("login_time") or "").strip(),
+                "basic_profile_modified": str(fields.get("basic_profile_modified") or "否"),
+                "mail_module_code_available": bool(fields.get("mail_module_code_available")),
+                "backup_path": str(pick.get("backup_path") or "").strip(),
+                "backup_name": str(pick.get("backup_name") or "").strip(),
+                "backup_time": str(pick.get("backup_time") or "").strip(),
+                "backup_status": str(pick.get("backup_status") or "").strip(),
+                "switch_highlight": _normalize_switch_highlight(pick.get("switch_highlight")),
+                "env_status": str(pick.get("env_status") or "").strip(),
+            }
+        )
+    return items
+
+
+@app.get("/api/device/assigned_accounts")
+def device_assigned_accounts(device_id: str, alias: str):
+    """设备端：拉取当前别名桶下全部已分配账号（手动切号下拉 / 刷新账号信息）。"""
+    error, device = auth_or_error(device_id, alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    conn = _get_db()
+    try:
+        items = _fetch_device_assigned_accounts_list(conn, owner, alias)
+        if not items:
+            return {
+                "code": 1,
+                "msg": "未找到该别名下的分配账号（请确认设备表有绑定账号且分配别名一致）",
+                "items": [],
+            }
+        return {"code": 0, "msg": "ok", "items": items, "count": len(items)}
+    finally:
+        conn.close()
+
+
 @app.get("/api/device/assigned_account")
 def device_assigned_account(device_id: str, alias: str):
     """设备端：拉取当前别名桶下分配账号及登录状态（切号后自动登录用）。"""
@@ -16150,8 +16238,10 @@ def _cancel_pending_auto_switch_device_ops_for_device(device_id: str) -> int:
         else:
             store.pending_device_ops.pop(did, None)
         if removed_op_ids:
+            owner_key = str(owner or "").strip()
+            alias_key = _normalize_alias_key(dev.alias if dev else "")
             for bucket_key, inflight in list(store.auto_switch_publish_inflight_keys.items()):
-                if not bucket_key.endswith(f"|{_normalize_alias_key(dev.alias if dev else '')}"):
+                if bucket_key != _auto_switch_bucket_key(owner_key, alias_key):
                     continue
                 _slot, op_id = _parse_auto_switch_publish_inflight(str(inflight))
                 if op_id in removed_op_ids:

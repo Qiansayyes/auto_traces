@@ -230,11 +230,31 @@ class AutoSwitchLocalScheduler(
     }
 
     fun clearSlotPublishAborted(slotKey: String) {
+        reviveLoginAbortedInsertions(slotKey, reviveMutual = false)
+    }
+
+    /**
+     * 登录保障恢复成功后：把因登录失败钉死的发作品/互点 FAILED 回退 PENDING，允许同 slot 重新入队。
+     * 账号切换导致的终态不走此路径（会先 invalidateSlotAlignment）。
+     */
+    fun reviveLoginAbortedInsertions(slotKey: String, reviveMutual: Boolean = true) {
         val sk = slotKey.trim()
         if (sk.isBlank()) return
         val slot = AutoSwitchLocalPlanStore.slot(sk) ?: return
+        val revivedKinds = mutableListOf<String>()
         if (slot.publish.state == PlanStepState.FAILED) {
             AutoSwitchLocalPlanStore.markInsertionState(sk, "publish", PlanStepState.PENDING)
+            revivedKinds.add("publish")
+        }
+        if (reviveMutual && slot.mutual_traffic.state == PlanStepState.FAILED) {
+            AutoSwitchLocalPlanStore.markInsertionState(sk, "mutual_traffic", PlanStepState.PENDING)
+            revivedKinds.add("mutual_traffic")
+        }
+        if (revivedKinds.isNotEmpty() && alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】登录恢复后重开插入任务 slot=$sk kinds=${revivedKinds.joinToString(",")}",
+            )
         }
     }
 
@@ -705,8 +725,35 @@ class AutoSwitchLocalScheduler(
         pendingCutSwitchSlotKey = null
 
         deviceBusyReasonForInsertionScheduling()?.let { reason ->
-            logTickSkipThrottled("插入任务暂缓：$reason")
-            return
+            val dueLabel = dueTimedInsertionKindNeedingPreempt(
+                bundle = currentBundle,
+                planSlot = planSlot,
+                minuteOfDay = minuteOfDay,
+                slotKey = slotKey,
+                targetRowIndex = slotEntry.target_row_index,
+                busyReason = reason,
+            )
+            if (dueLabel == null) {
+                logTickSkipThrottled("插入任务暂缓：$reason")
+                return
+            }
+            // 到点发作品/互点：对齐切号，设独占抢占让涨粉协作退出，再入队（不等窗口滑过）。
+            preemptGrowthForDueTimedInsertion(slotKey, dueLabel, reason)
+            awaitTikTokExclusiveIdle(maxMs = 20_000L, forceEnqueueLabel = "到点$dueLabel")
+            onForceStopTikTokForExclusive("到点${dueLabel}入队前（涨粉收尾后）")
+            // 对齐切号：协作退出超时仍继续入队。仅登录保障 / 本地 OP 队列等硬忙因才放弃本 tick。
+            val hardBusy = deviceBusyReasonForInsertionScheduling()
+                ?.takeUnless { it == "独占抢占中" || it.startsWith("自动化执行中") }
+            if (hardBusy != null) {
+                logTickSkipThrottled("插入任务暂缓（到点${dueLabel}抢占后硬忙）：$hardBusy")
+                return
+            }
+            if (ExecutionScope.isActive() && alias.isNotBlank()) {
+                LogCenter.op(
+                    alias,
+                    "【自动切号】到点${dueLabel}抢占后涨粉未退尽，仍继续入队 slot=$slotKey",
+                )
+            }
         }
 
         val targetRow = currentBundle.accounts.orEmpty()
@@ -765,6 +812,45 @@ class AutoSwitchLocalScheduler(
 
         val planSlot = AutoSwitchLocalPlanStore.slot(slotKey) ?: entry
         val cs = planSlot.cut_switch
+        // 源=目标：仅当 plan 活跃标记/源字段已证明设备就在目标号上时才跳过。
+        // 禁止用 accounts.size==1 推断同源——那会把「首次 bootstrap 清库登录」误短路掉。
+        if (!cs.isDone()) {
+            if (
+                canShortCircuitSameAccountCutSwitch(cs) &&
+                isDeviceAlreadyOnCutSwitchTarget(entry, previousSlotKey)
+            ) {
+                val targetUser = entry.target_username.trim().removePrefix("@")
+                val active = AutoSwitchLocalPlanStore.getDeviceActiveIdentity()
+                if (alias.isNotBlank()) {
+                    LogCenter.op(
+                        alias,
+                        "【自动切号】源=目标 @$targetUser（活跃标记已对齐），跳过备份→清理→还原，直接标记切号完成 slot=$slotKey",
+                    )
+                }
+                AutoSwitchLedger.syncSessionContextFromPrefs()
+                val ok = AutoSwitchLocalPlanStore.commitCutSwitchAlreadyOnTarget(
+                    slotKey = slotKey,
+                    username = targetUser,
+                    sourceRowIndex = active?.first,
+                    sourceUsername = active?.second,
+                )
+                if (ok) {
+                    cancelDuplicatePendingCutSwitchOps(slotKey)
+                    cutSwitchInflightSlotKey = null
+                    pendingCutSwitchSlotKey = null
+                    if (shouldAllowGrowthBaseline()) {
+                        onTryResumeGrowth()
+                    }
+                    return
+                }
+                if (alias.isNotBlank()) {
+                    LogCenter.op(
+                        alias,
+                        "【自动切号】源=目标短路失败（可能清理已执行，将续跑还原/登录）slot=$slotKey",
+                    )
+                }
+            }
+        }
         // 切号是否完成只看 plan 文件 cut_switch 进度；未 DONE 则 strictly 按 nextPendingStep 续跑，
         // 不因 device_active / logContext 等推断「已对齐」（避免涨粉误刷活跃标记后假完成切号）。
         val needsLoginFinish = !cs.isDone() &&
@@ -845,6 +931,49 @@ class AutoSwitchLocalScheduler(
         } else if (alias.isNotBlank()) {
             LogCenter.op(alias, "【自动切号】切号入队失败 slot=$slotKey step=$nextStep target=@${entry.target_username}")
         }
+    }
+
+    /**
+     * 是否已有 plan 证据表明设备当前就在目标账号上（可安全跳过切号链）。
+     * 只信 device_active / 已持久化 source / 上一完成时段；不信 accounts.size==1。
+     */
+    private fun isDeviceAlreadyOnCutSwitchTarget(
+        entry: SlotPlanEntry,
+        previousSlotKey: String?,
+    ): Boolean {
+        val tgtRi = entry.target_row_index
+        val tgtUser = entry.target_username.trim().removePrefix("@")
+
+        AutoSwitchLocalPlanStore.getDeviceActiveIdentity()?.let { (ri, uname) ->
+            if (ri >= 0 && ri == tgtRi) return true
+            if (tgtUser.isNotEmpty() && uname.equals(tgtUser, ignoreCase = true)) return true
+        }
+
+        val cs = AutoSwitchLocalPlanStore.slot(entry.slot_key)?.cut_switch ?: entry.cut_switch
+        cs.source_row_index?.takeIf { it >= 0 }?.let { if (it == tgtRi) return true }
+        cs.source_username?.trim()?.removePrefix("@")?.takeIf { it.isNotEmpty() }?.let { src ->
+            if (tgtUser.isNotEmpty() && src.equals(tgtUser, ignoreCase = true)) return true
+        }
+
+        val prevSk = previousSlotKey?.trim()?.takeIf { it.isNotEmpty() && it != entry.slot_key }
+        if (prevSk != null && AutoSwitchLocalPlanStore.isCutSwitchDone(prevSk)) {
+            AutoSwitchLocalPlanStore.slot(prevSk)?.let { prev ->
+                if (prev.target_row_index == tgtRi) return true
+                val prevUser = prev.target_username.trim().removePrefix("@")
+                if (tgtUser.isNotEmpty() && prevUser.equals(tgtUser, ignoreCase = true)) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 同账号短路仅在「尚未清理 TikTok」时安全。
+     * 清理已 DONE/RUNNING 后数据目录可能已空，必须续跑还原/登录。
+     */
+    private fun canShortCircuitSameAccountCutSwitch(cs: CutSwitchPlanSteps): Boolean {
+        if (cs.clear == PlanStepState.DONE || cs.clear == PlanStepState.RUNNING) return false
+        if (cs.restore_or_login == PlanStepState.RUNNING) return false
+        return true
     }
 
     /** 切号源账号：只读 plan 文件（source、device_active、上一已完成时段），不用 TikTok 前台推断。 */
@@ -1105,6 +1234,10 @@ class AutoSwitchLocalScheduler(
     }
 
     private fun deviceBusyReasonForInsertionScheduling(): String? {
+        if (PrefsStore.isAutoSwitchLoginRecoveryActive() || PrefsStore.isAutoSwitchTikTokLoginHoldActive()) {
+            return PrefsStore.autoSwitchTikTokLoginHoldReason()?.let { "登录保障恢复中：$it" }
+                ?: "登录保障恢复中（暂停涨粉/发作品/引流调度）"
+        }
         // ExecutionScope 也用于切号/改资料等独占链，勿一律说成「涨粉」
         if (ExecutionScope.isActive()) {
             val phase = ProcessDiagnostics.currentPhase().ifBlank { "idle" }
@@ -1117,6 +1250,81 @@ class AutoSwitchLocalScheduler(
             if (isInsertionKindStillActive(kind)) return "插入 in-flight：$kind slot=$sk"
         }
         return null
+    }
+
+    /**
+     * 发作品/引流互点已到点，但调度被「自动化执行中」（多为涨粉）挡住：
+     * 返回可读标签以触发独占抢占；其它忙因（登录保障/OP 队列等）不抢占。
+     */
+    private fun dueTimedInsertionKindNeedingPreempt(
+        bundle: AutoSwitchBundle,
+        planSlot: AutoSwitchPlanSlot,
+        minuteOfDay: Int,
+        slotKey: String,
+        targetRowIndex: Int?,
+        busyReason: String,
+    ): String? {
+        if (!busyReason.startsWith("自动化执行中")) return null
+        if (PublishPostGrowthGate.isBlockingGrowth()) return null
+        if (AutoSwitchSlotWindow.isWithinSwitchSafeBuffer(minuteOfDay, planSlot, SWITCH_SAFE_BUFFER_MIN)) {
+            return null
+        }
+        val sk = slotKey.trim()
+        if (sk.isEmpty()) return null
+
+        val pubMinute = planSlot.auto_publish_minute
+        if (
+            pubMinute != null &&
+            AutoSwitchSlotWindow.isWithinInsertionTrigger(minuteOfDay, planSlot, pubMinute) &&
+            isTimedInsertionSchedulable(sk, "publish")
+        ) {
+            return "发作品"
+        }
+
+        val mutualMinute = planSlot.auto_mutual_minute
+        if (
+            mutualMinute != null &&
+            AutoSwitchSlotWindow.isWithinInsertionTrigger(minuteOfDay, planSlot, mutualMinute) &&
+            isTimedInsertionSchedulable(sk, "mutual_traffic")
+        ) {
+            val targetUser = bundle.accounts.orEmpty()
+                .firstOrNull { (it.row_index ?: -1) == (targetRowIndex ?: -1) }
+                ?.username?.trim().orEmpty()
+            if (targetUser.isNotBlank() && bundle.isMutualTrafficConfiguredFor(targetUser)) {
+                return "引流互点"
+            }
+        }
+        return null
+    }
+
+    private fun isTimedInsertionSchedulable(slotKey: String, kind: String): Boolean {
+        val state = AutoSwitchLocalPlanStore.insertionState(slotKey, kind)
+            ?: when (kind) {
+                "publish" -> AutoSwitchLocalPlanStore.slot(slotKey)?.publish?.state
+                "mutual_traffic" -> AutoSwitchLocalPlanStore.slot(slotKey)?.mutual_traffic?.state
+                else -> null
+            }
+        when (state) {
+            PlanStepState.DONE, PlanStepState.SKIPPED, PlanStepState.FAILED, PlanStepState.RUNNING ->
+                return false
+            else -> Unit
+        }
+        return !isInsertionInflight(kind, slotKey)
+    }
+
+    private suspend fun preemptGrowthForDueTimedInsertion(
+        slotKey: String,
+        kindLabel: String,
+        busyReason: String,
+    ) {
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】到点$kindLabel 抢占涨粉 slot=$slotKey：原暂缓=$busyReason",
+            )
+        }
+        onPauseGrowth()
+        onForceStopTikTokForExclusive("到点${kindLabel}入队前")
     }
 
     private fun enqueueExclusiveOp(op: DeviceOp) {

@@ -558,6 +558,17 @@ object PrefsStore {
             .apply()
     }
 
+    private fun clearAllPublishPostResumeProgress() {
+        val keys = prefs.all.keys.filter { key ->
+            key.startsWith(KEY_PUBLISH_POST_RESUME_NEXT_INDEX_PREFIX) ||
+                key.startsWith(KEY_PUBLISH_POST_RESUME_OP_ID_PREFIX)
+        }
+        if (keys.isEmpty()) return
+        val editor = prefs.edit()
+        keys.forEach { editor.remove(it) }
+        editor.apply()
+    }
+
     private fun publishPostEntryLayoutPrefsKey(): String? {
         val id = getDeviceId()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         return KEY_PUBLISH_POST_ENTRY_LAYOUT_PREFIX + id
@@ -675,8 +686,24 @@ object PrefsStore {
         prefs.edit()
             .putBoolean(KEY_MUTUAL_CLICK_REQUESTED, false)
             .putBoolean(KEY_MUTUAL_CLICK_PENDING, false)
+            .putBoolean(KEY_MUTUAL_COMMENT_ONLY_SESSION, false)
+            .putBoolean(KEY_MUTUAL_FOLLOW_ONLY_SESSION, false)
             .remove(KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY)
             .apply()
+    }
+
+    /**
+     * 清发作品/互点插入任务相关 prefs（不含 plan 文件 slot 步骤态）。
+     * 用于自治退出、会话轮换、切号跨账号清理。
+     */
+    fun clearAutoSwitchInsertionDirtyPrefs() {
+        clearAutoSwitchTikTokLoginHold()
+        clearPublishPostState()
+        clearAllPublishPostResumeProgress()
+        clearMutualClickState()
+        setGrowthContinueFromPublishHome(false)
+        setAutoSwitchExclusivePreempt(false)
+        prefs.edit().remove(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT).apply()
     }
 
     fun getAuthToken(): String? = prefs.getString(KEY_AUTH_TOKEN, null)?.trim()?.takeIf { it.isNotEmpty() }
@@ -1023,6 +1050,7 @@ object PrefsStore {
     private fun nowLocalText(): String = nowBeijingText()
 
     fun clearAutoSwitchSessionContext() {
+        clearAutoSwitchInsertionDirtyPrefs()
         prefs.edit()
             .putString(KEY_AUTO_SWITCH_MODE, "off")
             .remove(KEY_AUTO_SWITCH_SESSION_ID)

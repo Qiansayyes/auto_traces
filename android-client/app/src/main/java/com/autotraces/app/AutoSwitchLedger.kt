@@ -122,6 +122,16 @@ object AutoSwitchLedger {
         val rev = if (bundleRevision >= 0) bundleRevision else PrefsStore.getAutoSwitchBundleRevision()
         val prefSid = PrefsStore.getAutoSwitchSessionId().orEmpty()
         val sameSession = sid.isNotEmpty() && sid == this.sessionId.ifBlank { prefSid }
+        // 资料重同步会换 sessionId，但计划文件里已完成的切号仍有效；
+        // 清空 ledger 时保留 cut_switch_chain_completed，避免 revalidate 把 DONE 当孤儿重置。
+        val willClear = (prefSid.isNotBlank() && sid.isNotBlank() && sid != prefSid) || !sameSession
+        val preservedCutSwitchCompletions = if (willClear) {
+            entries.filter {
+                it.op_type == "cut_switch_chain_completed" && it.phase == "success"
+            }
+        } else {
+            emptyList()
+        }
         if (prefSid.isNotBlank() && sid.isNotBlank() && sid != prefSid) {
             entries.clear()
             entryIndexByOpId.clear()
@@ -133,6 +143,13 @@ object AutoSwitchLedger {
             entries.clear()
             entryIndexByOpId.clear()
             AutoSwitchAccountActivityTracker.reset()
+        }
+        if (preservedCutSwitchCompletions.isNotEmpty()) {
+            for (entry in preservedCutSwitchCompletions) {
+                if (entryIndexByOpId.containsKey(entry.op_id)) continue
+                entries.add(entry)
+                entryIndexByOpId[entry.op_id] = entries.lastIndex
+            }
         }
         startedAt = PrefsStore.getAutoSwitchSessionStartedAt().orEmpty().ifBlank { nowBeijingText() }
         persist()

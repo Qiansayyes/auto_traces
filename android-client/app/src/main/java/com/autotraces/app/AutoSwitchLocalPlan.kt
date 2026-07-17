@@ -217,7 +217,7 @@ object AutoSwitchLocalPlanStore {
                 return true
             }
         }
-        plan.slots.any { it.publish.state == PlanStepState.RUNNING }
+        plan.slots.any { it.publish?.state == PlanStepState.RUNNING }
     }
 
     fun isMutualContextOccupying(): Boolean = synchronized(writeLock) {
@@ -225,7 +225,7 @@ object AutoSwitchLocalPlanStore {
         plan.active_mutual?.let { am ->
             if (am.pending || am.requested) return true
         }
-        plan.slots.any { it.mutual_traffic.state == PlanStepState.RUNNING }
+        plan.slots.any { it.mutual_traffic?.state == PlanStepState.RUNNING }
     }
 
     fun isLiveVisitContextOccupying(): Boolean = synchronized(writeLock) {
@@ -233,7 +233,7 @@ object AutoSwitchLocalPlanStore {
         plan.active_live_visit?.let { alv ->
             if (alv.pending || alv.requested || alv.remaining_usernames.isNotEmpty()) return true
         }
-        plan.slots.any { it.live_visit.state == PlanStepState.RUNNING }
+        plan.slots.any { it.live_visit?.state == PlanStepState.RUNNING }
     }
 
     fun isPublishOccupying(isExecutionActive: Boolean): Boolean =
@@ -243,9 +243,36 @@ object AutoSwitchLocalPlanStore {
 
     private fun saveInternal(plan: AutoSwitchLocalPlan) {
         val file = planFile ?: return
-        val stamped = plan.copy(updated_at_ms = System.currentTimeMillis())
+        val stamped = sanitizePlanNullables(plan).copy(updated_at_ms = System.currentTimeMillis())
         cached = stamped
         file.writeText(gson.toJson(stamped))
+    }
+
+    /**
+     * Gson 反序列化旧计划 JSON 时，新增字段（如 live_visit）可能为 null，绕过 Kotlin 默认值。
+     * 启动恢复若直接 .state 会 NPE 直接把进程打崩。
+     */
+    private fun sanitizePlanNullables(plan: AutoSwitchLocalPlan): AutoSwitchLocalPlan {
+        var dirty = false
+        val slots = plan.slots.map { slot ->
+            val cut = slot.cut_switch
+            val pub = slot.publish
+            val mutual = slot.mutual_traffic
+            val live = slot.live_visit
+            @Suppress("SENSELESS_COMPARISON")
+            val need =
+                cut == null || pub == null || mutual == null || live == null
+            if (!need) return@map slot
+            dirty = true
+            @Suppress("SENSELESS_COMPARISON")
+            slot.copy(
+                cut_switch = cut ?: CutSwitchPlanSteps(),
+                publish = pub ?: TimedInsertionPlan(),
+                mutual_traffic = mutual ?: TimedInsertionPlan(),
+                live_visit = live ?: TimedInsertionPlan(),
+            )
+        }
+        return if (dirty) plan.copy(slots = slots) else plan
     }
 
     private inline fun mutatePlan(block: (AutoSwitchLocalPlan) -> AutoSwitchLocalPlan) {
@@ -1146,19 +1173,112 @@ object AutoSwitchLocalPlanStore {
     }
 
     /**
-     * 计划文件若标「切号完成」但 ledger 无 [cut_switch_chain_completed]，视为无效状态，整段切号重置重跑。
+     * 计划文件若标「切号完成」但 ledger 无 [cut_switch_chain_completed]：
+     * 补记 ledger，**禁止**整段重置重跑。
+     * session 重同步会清空内存 ledger，若因 ledger 缺失而 reset，会把已对齐时段打成待执行，
+     * 进而触发「源=目标」无意义自切号。
      */
     fun revalidateCutSwitchCompletionsAgainstLedger(
         hasChainCompleted: (slotKey: String) -> Boolean,
     ) {
         val plan = get() ?: return
         for (slot in plan.slots) {
-            if (!slot.cut_switch.isDone()) continue
+            if (!isCutSwitchDone(slot.slot_key)) continue
             if (hasChainCompleted(slot.slot_key)) continue
-            resetCutSwitch(
+            val user = slot.target_username.trim().removePrefix("@")
+            if (user.isBlank()) {
+                LogCenter.op(
+                    PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" },
+                    "【自动切号·计划文件】切号完成 ledger 缺失且目标 username 为空，保留 plan DONE（不重置）slot=${slot.slot_key}",
+                )
+                continue
+            }
+            val healed = AutoSwitchLedger.tryRecordCutSwitchChainCompleted(
                 slot.slot_key,
-                "计划文件标切号完成但 ledger 无本时段切号链完成记录，将重跑切号",
+                user,
+                "plan_done_ledger_heal",
             )
+            if (healed) {
+                logPlanCutSwitchProgress(
+                    slot.slot_key,
+                    "ledger 补记切号完成（计划已完成，禁止因 session/重同步重置）",
+                )
+            } else {
+                LogCenter.op(
+                    PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" },
+                    "【自动切号·计划文件】切号完成 ledger 缺失且补记失败，保留 plan DONE（不重置重跑）slot=${slot.slot_key}",
+                )
+            }
+        }
+    }
+
+    /**
+     * 源账号与目标账号相同：设备已在目标号上，跳过备份→清理→还原，直接标切号完成并补记 ledger。
+     * 禁止同账号自切（对自己 tar 备份再清理再还原）。
+     *
+     * 注意：若清理步已 DONE/RUNNING，TikTok 数据目录可能已被清，不得短路，须续跑还原/登录。
+     */
+    fun commitCutSwitchAlreadyOnTarget(
+        slotKey: String,
+        username: String,
+        sourceRowIndex: Int? = null,
+        sourceUsername: String? = null,
+    ): Boolean {
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) return false
+        val sk = slotKey.trim()
+        val user = username.trim().removePrefix("@")
+        if (sk.isEmpty() || user.isBlank()) return false
+
+        synchronized(writeLock) {
+            val before = getInternal() ?: return false
+            val slot = before.slots.firstOrNull { it.slot_key == sk } ?: return false
+            val cs = slot.cut_switch
+            if (cs.clear == PlanStepState.DONE || cs.clear == PlanStepState.RUNNING) {
+                return false
+            }
+            if (isCutSwitchDone(sk)) {
+                if (!AutoSwitchLedger.hasCutSwitchChainCompleted(sk)) {
+                    AutoSwitchLedger.tryRecordCutSwitchChainCompleted(sk, user, "already_on_target_heal")
+                }
+                return true
+            }
+
+            val after = updateDeviceActiveAfterCutSwitch(
+                before.copy(
+                    slots = before.slots.map { entry ->
+                        if (entry.slot_key != sk) entry
+                        else entry.copy(
+                            cut_switch = cs.copy(
+                                backup = PlanStepState.SKIPPED,
+                                clear = PlanStepState.SKIPPED,
+                                restore_or_login = PlanStepState.DONE,
+                                mode = "switch",
+                                source_row_index = sourceRowIndex ?: cs.source_row_index ?: entry.target_row_index,
+                                source_username = (sourceUsername ?: cs.source_username ?: user)
+                                    .trim()
+                                    .removePrefix("@"),
+                            ),
+                        )
+                    },
+                ),
+                sk,
+            )
+            saveInternal(after)
+            val ledgerOk = AutoSwitchLedger.tryRecordCutSwitchChainCompleted(
+                sk,
+                user,
+                "already_on_target",
+            )
+            logPlanCutSwitchProgress(
+                sk,
+                if (ledgerOk) {
+                    "源=目标跳过切号链（plan+ledger）"
+                } else {
+                    "源=目标跳过切号链（plan 已完成，ledger 待补记）"
+                },
+            )
+            logDeviceActiveCommittedAfterCutSwitch(sk, user)
+            return true
         }
     }
 
@@ -1313,18 +1433,23 @@ object AutoSwitchLocalPlanStore {
         mutatePlan { plan ->
             fun resetRunning(state: PlanStepState): PlanStepState =
                 if (state == PlanStepState.RUNNING) PlanStepState.PENDING else state
+            fun TimedInsertionPlan?.resetOrDefault(): TimedInsertionPlan {
+                val base = this ?: TimedInsertionPlan()
+                return base.copy(state = resetRunning(base.state))
+            }
             plan.copy(
                 slots = plan.slots.map { slot ->
-                    val cs = slot.cut_switch
+                    @Suppress("SENSELESS_COMPARISON")
+                    val cs = slot.cut_switch ?: CutSwitchPlanSteps()
                     slot.copy(
                         cut_switch = cs.copy(
                             backup = resetRunning(cs.backup),
                             clear = resetRunning(cs.clear),
                             restore_or_login = resetRunning(cs.restore_or_login),
                         ),
-                        publish = slot.publish.copy(state = resetRunning(slot.publish.state)),
-                        mutual_traffic = slot.mutual_traffic.copy(state = resetRunning(slot.mutual_traffic.state)),
-                        live_visit = slot.live_visit.copy(state = resetRunning(slot.live_visit.state)),
+                        publish = slot.publish.resetOrDefault(),
+                        mutual_traffic = slot.mutual_traffic.resetOrDefault(),
+                        live_visit = slot.live_visit.resetOrDefault(),
                     )
                 },
             )
@@ -1517,7 +1642,13 @@ object AutoSwitchLocalPlanStore {
         val file = planFile ?: return null
         if (!file.isFile) return null
         return runCatching {
-            gson.fromJson(file.readText(), AutoSwitchLocalPlan::class.java)
+            val raw = gson.fromJson(file.readText(), AutoSwitchLocalPlan::class.java) ?: return@runCatching null
+            val sanitized = sanitizePlanNullables(raw)
+            // 旧 JSON 缺字段时写回，避免下次启动再踩 NPE
+            if (sanitized !== raw) {
+                file.writeText(gson.toJson(sanitized.copy(updated_at_ms = System.currentTimeMillis())))
+            }
+            sanitized
         }.getOrNull()
     }
 

@@ -320,8 +320,14 @@ class MutualTrafficSlotInsertion : AutoSwitchSlotInsertion {
             else -> Unit
         }
         if (host.isInsertionInflight(kind, slotKey)) return false
+        if (PrefsStore.isAutoSwitchLoginRecoveryActive() ||
+            PrefsStore.isAutoSwitchTikTokLoginHoldActive(slotKey)
+        ) {
+            return false
+        }
         val targetRi = ctx.account.row_index ?: -1
         if (!host.isSlotReady(slotKey, targetRi)) return false
+        if (!host.verifyInsertionAccountLoggedIn(ctx, kind)) return false
         val pkg = ctx.bundle.run_config?.package_name?.trim().orEmpty().ifBlank { Config.TIKTOK_PACKAGE_NAME }
         val aliasClean = ctx.bundle.device_alias?.trim().orEmpty().ifBlank { ctx.alias }
         val opId = newLocalOpId("mutual-traffic")

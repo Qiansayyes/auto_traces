@@ -29,6 +29,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
@@ -44,6 +45,12 @@ const val SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE = "__SAFEGUARD_REQUIRES_AUTO_LOG
 
 /** TikTok「Account status / 已登出」弹窗：已在设备端点 OK、强停并冷启，需中止当前步骤并重新自动登录。 */
 class AccountStatusLoggedOutException(message: String) : RuntimeException(message)
+
+/**
+ * 系统 ANR「TikTok isn't responding」：已点 Close app、强停并冷启，需中止当前步骤由调度重试。
+ * 不触发自动登录（与 [AccountStatusLoggedOutException] 区分）。
+ */
+class TikTokAnrRecoveredException(message: String) : RuntimeException(message)
 
 /** 登录状态保障判定需自动登录，由协调器从当前 Profile 登录入口续接（勿再冷启 TikTok）。 */
 class LoginSafeguardRequiresAutoLoginException : RuntimeException(SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE)
@@ -558,6 +565,11 @@ class RealTraceExecutor(
 
     private var cachedSuCommand: SuCommand? = null
     private var lastConfigSnapshot: AppConfig = AppConfig()
+    /**
+     * 回首页恢复 / Users 重搜互斥：同时只允许一路操作 TikTok 导航与强关。
+     * 后来者 [tryLock] 失败则直接失败（不等待），避免日志里两路 1/10 与 8/10 互抢。
+     */
+    private val recoverHomeMutex = Mutex()
     // 只要当前用户名流程中发生过重启 TikTok，下一轮就必须从头启动，禁止复用 Users。
     private var didRestartTikTokInCurrentRun: Boolean = false
     // 仅 growth：上一名 Users 恢复失败后，下一名从“点击放大镜”重新搜索（不复用 Users，不额外强关 TikTok）。
@@ -580,6 +592,7 @@ class RealTraceExecutor(
     private var lastSaveLoginForNextTimePopupDismissAtMs: Long = 0L
     private var lastContinueEditingPostPopupDismissAtMs: Long = 0L
     private var lastSecurityCheckupPopupDismissAtMs: Long = 0L
+    private var lastVerifyToContinuePopupDismissAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
     @Volatile
     private var inlineIdentityVerificationInProgress: Boolean = false
@@ -588,6 +601,10 @@ class RealTraceExecutor(
     private var lastInlineIdentityResendTapAtMs: Long = 0L
     @Volatile
     private var accountStatusRecoveryInProgress: Boolean = false
+
+    /** 系统 ANR 弹窗恢复中：点 Close app → 强停冷启，避免重入。 */
+    @Volatile
+    private var tiktokAnrRecoveryInProgress: Boolean = false
 
     /**
      * Account status 首遇（强停冷启）后的重登期：自动登录链内任意 OCR 见弹窗则顺手点 OK，不中断登录。
@@ -612,11 +629,12 @@ class RealTraceExecutor(
     private fun isLogoutProbeContextActive(): Boolean =
         isAccountStatusOcrWatchActive() || loginSafeguardLogoutProbeActive
 
-    /** 任务执行中掉登录类异常须上浮至 [AppCoordinator]，勿在局部 OCR catch 吞掉。 */
+    /** 任务执行中掉登录 / ANR 恢复类异常须上浮至 [AppCoordinator]，勿在局部 OCR catch 吞掉。 */
     private fun rethrowTaskLogoutIfNeeded(ex: Throwable) {
         when (ex) {
             is AccountStatusLoggedOutException,
             is LoginSafeguardRequiresAutoLoginException,
+            is TikTokAnrRecoveredException,
             -> throw ex
         }
     }
@@ -739,6 +757,8 @@ class RealTraceExecutor(
         val image = InputImage.fromBitmap(bitmap, 0)
         try {
             val result = MlKitOcrGate.recognize(image)
+            // ANR 系统层遮罩优先于其它顺手处理
+            probeAndHandleTikTokAnrFromVision(ctx, result, "截图OCR顺手")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "截图OCR顺手")
             } else {
@@ -772,6 +792,8 @@ class RealTraceExecutor(
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
+            throw ex
+        } catch (ex: TikTokAnrRecoveredException) {
             throw ex
         } catch (_: Exception) {
             // OCR 失败时不因掉登录探测阻断主流程
@@ -1011,6 +1033,14 @@ class RealTraceExecutor(
         private const val INLINE_SECURITY_CHECKUP_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** Security checkup 弹窗：点击 Y = 屏高 × 本比例（屏顶 20% 处，点遮罩关闭）。 */
         private const val SECURITY_CHECKUP_POPUP_DISMISS_TOP_Y_FRACTION = 0.20f
+        /** 「Verify to continue」滑块验证：OCR 命中后点关闭钮的冷却。 */
+        private const val INLINE_VERIFY_TO_CONTINUE_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 「Verify to continue」关闭钮：X = 屏宽 × 本比例（距左 85%，靠右）。 */
+        private const val VERIFY_TO_CONTINUE_DISMISS_X_FRACTION = 0.85f
+        /** 「Verify to continue」关闭钮：Y = 屏高 × 本比例（距顶 32%）。 */
+        private const val VERIFY_TO_CONTINUE_DISMISS_Y_FRACTION = 0.32f
+        /** 系统 ANR「isn't responding」：点 Close app 后等待再强停的缓冲。 */
+        private const val TIKTOK_ANR_CLOSE_APP_SETTLE_MS = 600L
         /** 通用 OCR 顺手消 Swipe up 提示：单次最多上滑次数。 */
         private const val INLINE_SWIPE_UP_DISMISS_MAX_PASSES = 8
         /** 涨粉/引流互点：more result for 顺手点击冷却。 */
@@ -1383,8 +1413,9 @@ class RealTraceExecutor(
      * 优先 [navBack] 回首页（底栏 Home+Profile 同见视为已回首页，不强关）；
      * 导航返回过程中 OCR 已见底栏 Home+Profile 时，再执行最后一次返回（搜索/内页也可能误命中底栏）；
      * 首次 OCR 已见底栏 Home+Profile 则判定可能仍在搜索/内页，未按返回键，改为强关重启；
-     * 连续返回 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS] 次后若 dumpsys 判定 TikTok 非前台，
-     * 视为返回键已退出应用，优先重新打开 TikTok（不强停）；重开失败再 fallback 强关重启。
+     * 每次按返回前若 dumpsys 判定 TikTok 非前台，不再空按返回，优先重新打开 TikTok（不强停）；
+     * 连续返回 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS] 次后再次校验（返回可能已退出应用）；
+     * 重开失败再 fallback 强关重启。
      * 超过 [RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS] 次仍未回首页则 fallback 强关重启。
      *
      * [allowInitialDoubleBack] 为 false 时（如 Users 标签恢复）不使用前 N 轮双返。
@@ -1397,7 +1428,42 @@ class RealTraceExecutor(
         devOp(alias, "回首页恢复成功，下一名涨粉将跳过 For You 预滑")
     }
 
+    /** 抢占回首页/重搜互斥；失败时已打日志。 */
+    private fun tryAcquireRecoverHomeExclusive(alias: String, reason: String): Boolean {
+        if (recoverHomeMutex.tryLock()) return true
+        devOp(alias, "$reason：已有回首页/搜索恢复在进行，本路直接失败（避免流程互抢）")
+        return false
+    }
+
+    private fun releaseRecoverHomeExclusive() {
+        recoverHomeMutex.unlock()
+    }
+
+    /**
+     * 优先 navBack 回首页；失败则强关重启。
+     * 与 [reopenSearchAndEnterUsersTab] 共用 [recoverHomeMutex]：后来者直接失败。
+     */
     private suspend fun recoverToHomeViaBackOrRestart(
+        service: Context,
+        reason: String,
+        skipDontAllowOcr: Boolean = false,
+        allowInitialDoubleBack: Boolean = true,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        if (!tryAcquireRecoverHomeExclusive(alias, reason)) return false
+        try {
+            return recoverToHomeViaBackOrRestartUnlocked(
+                service,
+                reason,
+                skipDontAllowOcr,
+                allowInitialDoubleBack,
+            )
+        } finally {
+            releaseRecoverHomeExclusive()
+        }
+    }
+
+    private suspend fun recoverToHomeViaBackOrRestartUnlocked(
         service: Context,
         reason: String,
         skipDontAllowOcr: Boolean = false,
@@ -1441,22 +1507,29 @@ class RealTraceExecutor(
         }
 
         /**
-         * 连续返回达到阈值后校验 TikTok 前台；非前台则尝试重新打开（不强停）。
+         * TikTok 非前台时不再按返回（对桌面/其它 App 按返回无意义），改为重新打开（不强停）。
+         * @param requireMinBacks 为 true 时：须已连续返回达到 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS]
+         *   才校验（避免首轮 dumpsys 抖动误判）；为 false 时：每次返回前强制校验。
          * @return null 仍在前台或已重开但未命中首页，可继续返回；非 null 为结束本恢复流程的结果。
          */
-        suspend fun reopenTikTokIfBackClosedDuringRecover(
+        suspend fun reopenTikTokIfNotForegroundDuringRecover(
             passLabel: String,
             backsCompleted: Int,
+            requireMinBacks: Boolean,
         ): Boolean? {
-            if (backsCompleted < RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS) return null
+            if (requireMinBacks && backsCompleted < RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS) {
+                return null
+            }
             invalidateForegroundProbeCache()
             if (isPackageVisible(pkg)) return null
 
-            devOp(
-                alias,
-                "$reason：$passLabel 已连续返回 $backsCompleted 次且 TikTok 非前台（返回可能已退出应用），" +
-                    "尝试重新打开 TikTok",
-            )
+            val why =
+                if (backsCompleted > 0) {
+                    "已连续返回 $backsCompleted 次且 TikTok 非前台（返回可能已退出应用）"
+                } else {
+                    "TikTok 非前台（再按返回无意义）"
+                }
+            devOp(alias, "$reason：$passLabel $why，跳过返回，尝试重新打开 TikTok")
             val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
             if (
                 launchTikTokOnceWithCheck(
@@ -1515,6 +1588,12 @@ class RealTraceExecutor(
         var backsCompleted = 0
         for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
             if (hardStopOrNull(alias, reason)) return false
+            // 每次按返回前先确认仍在 TikTok：已退出则重开，避免对桌面空按返回
+            reopenTikTokIfNotForegroundDuringRecover(
+                "第 $pass 次返回前",
+                backsCompleted,
+                requireMinBacks = false,
+            )?.let { return it }
             val backsThisPass =
                 navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
                     service,
@@ -1525,7 +1604,11 @@ class RealTraceExecutor(
                     allowInitialDoubleBack,
                 ) ?: return false
             backsCompleted += backsThisPass
-            reopenTikTokIfBackClosedDuringRecover("第 $pass 次返回后", backsCompleted)?.let { return it }
+            reopenTikTokIfNotForegroundDuringRecover(
+                "第 $pass 次返回后",
+                backsCompleted,
+                requireMinBacks = true,
+            )?.let { return it }
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
                     devOp(
@@ -1538,7 +1621,11 @@ class RealTraceExecutor(
                     if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·最后一次返回后")) {
                         return false
                     }
-                    reopenTikTokIfBackClosedDuringRecover("最后一次返回后", backsCompleted)?.let { return it }
+                    reopenTikTokIfNotForegroundDuringRecover(
+                        "最后一次返回后",
+                        backsCompleted,
+                        requireMinBacks = true,
+                    )?.let { return it }
                     when (evaluateRecoverHomeOcr("final_back_$pass", "最后一次返回")) {
                         RecoverHomeOcrOutcome.HardStop -> return false
                         RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -2333,6 +2420,90 @@ class RealTraceExecutor(
         return false
     }
 
+    /**
+     * 系统 ANR 弹窗：标题含 isn't responding（OCR 漏撇号/弯引号时归一为 isnt responding），
+     * 或同屏同时见 Close app + Wait。
+     */
+    private fun visionShowsTikTokAnrDialog(vision: Text): Boolean {
+        // 归一撇号变体：' ’ ʻ ʼ ʻ 等，避免 OCR 弯引号漏检
+        val text = vision.text.lowercase(Locale.US)
+            .replace(Regex("[\\u2018\\u2019\\u02BB\\u02BC\\u0060\\u00B4]"), "'")
+        val normalized = text.replace("'", "")
+        if (text.contains("isn't responding") || normalized.contains("isnt responding")) return true
+        val hasCloseApp = findTikTokAnrCloseAppHit(vision) != null
+        val hasWait = findStrictExactLabelHit(vision, "Wait") != null
+            || findStrictExactLabelHit(vision, "WAIT") != null
+        return hasCloseApp && hasWait
+    }
+
+    private fun findTikTokAnrCloseAppHit(vision: Text): StrictLabelHit? =
+        findLabelHitContainingIgnoreCase(vision, "close app")
+            ?: findStrictExactLabelHit(vision, "Close app")
+            ?: findStrictExactLabelHit(vision, "Close App")
+
+    private fun tapTikTokAnrCloseApp(alias: String, vision: Text, w: Int, h: Int): Boolean {
+        val hit = findTikTokAnrCloseAppHit(vision)
+        if (hit != null) {
+            val tap = coerceTapToScreen(hit.point, w, h)
+            devOp(alias, "ANR：点 Close app (${tap.x},${tap.y})")
+            return runSuCommand("input tap ${tap.x} ${tap.y}")
+        }
+        // 常见系统 ANR：左侧 Close app / 右侧 Wait
+        val fx = (w * 0.32f).toInt().coerceIn(1, w - 1)
+        val fy = (h * 0.58f).toInt().coerceIn(1, h - 1)
+        devOp(alias, "ANR：未 OCR 到 Close app，比例点 (${fx},${fy})")
+        return runSuCommand("input tap $fx $fy")
+    }
+
+    /**
+     * OCR 见系统 ANR 时：点 Close app → 强停 TikTok → 冷启，抛出 [TikTokAnrRecoveredException] 中止当前步骤。
+     */
+    private suspend fun probeAndHandleTikTokAnrFromVision(
+        ctx: Context,
+        vision: Text,
+        phaseLog: String,
+    ) {
+        if (tiktokAnrRecoveryInProgress || accountStatusRecoveryInProgress) return
+        if (!visionShowsTikTokAnrDialog(vision)) return
+        performTikTokAnrRecovery(ctx, vision, phaseLog)
+    }
+
+    private suspend fun performTikTokAnrRecovery(
+        ctx: Context,
+        vision: Text,
+        phaseLog: String,
+    ): Nothing {
+        if (tiktokAnrRecoveryInProgress) {
+            throw TikTokAnrRecoveredException("ANR 恢复重入")
+        }
+        tiktokAnrRecoveryInProgress = true
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        try {
+            if (hardStopOrNull(alias, "ANR恢复")) {
+                throw TikTokAnrRecoveredException("硬停")
+            }
+            devOp(alias, "$phaseLog：检测到 TikTok ANR（isn't responding / Close app+Wait），立即终止当前步骤")
+            val dm = ctx.resources.displayMetrics
+            val w = dm.widthPixels.coerceAtLeast(1)
+            val h = dm.heightPixels.coerceAtLeast(1)
+            tapTikTokAnrCloseApp(alias, vision, w, h)
+            delay(TIKTOK_ANR_CLOSE_APP_SETTLE_MS)
+            val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+            val launched = launchTikTokOnceWithCheck(
+                ctx = ctx,
+                alias = alias,
+                tag = "ANR恢复",
+                launchWaitMs = launchWaitMs,
+                forceStopBeforeLaunch = true,
+                skipDontAllowOcr = true,
+            )
+            devOp(alias, "ANR：强停冷启 TikTok ${if (launched) "成功" else "失败"}，中止当前步骤待调度重试")
+        } finally {
+            tiktokAnrRecoveryInProgress = false
+        }
+        throw TikTokAnrRecoveredException("TikTok ANR 已点 Close app 并冷启，需中止当前步骤")
+    }
+
     private fun findAccountStatusOkButtonHit(vision: Text): StrictLabelHit? =
         findBottommostStrictExactLabelHit(vision, "OK")
             ?: findBottommostStrictExactLabelHit(vision, "Ok")
@@ -2487,6 +2658,8 @@ class RealTraceExecutor(
         return try {
             val (result, err) = mlKitRecognizeFullScreenCore(ctx, fileTag)
             if (result == null) return null to err
+            // ANR 系统层遮罩优先于 Don't allow / 各类 TikTok 弹窗
+            probeAndHandleTikTokAnrFromVision(ctx, result, "OCR顺手处理")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "OCR顺手处理")
             } else {
@@ -2527,7 +2700,7 @@ class RealTraceExecutor(
                     )
                 }
             }
-            // 任意整屏 OCR：顺手关 Viewer history / Save login / Continue editing this post / Security checkup 弹窗，并令调用方重试 OCR。
+            // 任意整屏 OCR：顺手关 Viewer history / Save login / Continue editing this post / Security checkup / Verify to continue 弹窗，并令调用方重试 OCR。
             // auto_login_* / login_safeguard_* 由 [autoLoginTryDismissInlineOverlaysFromVision] 处理。
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag)?.let { interruptTag ->
@@ -2538,6 +2711,8 @@ class RealTraceExecutor(
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
+            throw ex
+        } catch (ex: TikTokAnrRecoveredException) {
             throw ex
         }
     }
@@ -2692,7 +2867,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 任意 OCR vision 上顺手处理弹窗/验证（Save login、Viewer history、Continue editing this post、Security checkup、Before you continue 身份验证等）。
+     * 任意 OCR vision 上顺手处理弹窗/验证（Save login、Viewer history、Continue editing this post、Security checkup、Verify to continue、Before you continue 身份验证等）。
      * @return 非 null 表示已处理中断，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun handleOcrVisionInlineInterruptions(
@@ -2701,6 +2876,8 @@ class RealTraceExecutor(
         fileTag: String?,
         phaseLog: String = "OCR顺手",
     ): String? {
+        // ANR 不受 auto_login / login_safeguard 跳过限制（系统层遮罩）
+        probeAndHandleTikTokAnrFromVision(ctx, vision, phaseLog)
         if (fileTag != null &&
             (fileTag.startsWith("auto_login_") || fileTag.startsWith("login_safeguard_"))
         ) {
@@ -2720,7 +2897,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 后顺手关弹窗（Viewer history / Save login for next time / Continue editing this post / Security checkup 等）。
+     * 整屏 OCR 后顺手关弹窗（Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue 等）。
      * @return 非 null 表示已点击关弹窗，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun dismissFullScreenInlinePopupsIfPresent(
@@ -2777,6 +2954,16 @@ class RealTraceExecutor(
             )
         }.getOrDefault(false)
         if (securityCheckupDismissed) return "security_checkup_popup_dismissed"
+        val verifyToContinueDismissed = runCatching {
+            tryDismissVerifyToContinuePopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (verifyToContinueDismissed) return "verify_to_continue_popup_dismissed"
         return null
     }
 
@@ -2818,6 +3005,52 @@ class RealTraceExecutor(
         }
         if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
         lastSecurityCheckupPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(350L)
+        return true
+    }
+
+    private fun visionHasVerifyToContinuePopup(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "verify to continue") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "verify to continu") != null) return true
+        return false
+    }
+
+    /**
+     * 「Verify to continue」滑块验证弹窗：OCR 命中后点固定关钮
+     *（X=屏宽×0.85、Y=屏高×0.32，对应右上角关闭）。
+     */
+    private suspend fun tryDismissVerifyToContinuePopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasVerifyToContinuePopup(vision)) return false
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastVerifyToContinuePopupDismissAtMs < INLINE_VERIFY_TO_CONTINUE_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val px = (w * VERIFY_TO_CONTINUE_DISMISS_X_FRACTION).toInt().coerceIn(1, w - 1)
+        val py = (h * VERIFY_TO_CONTINUE_DISMISS_Y_FRACTION).toInt().coerceIn(1, h - 1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(Point(px, py), w, h)
+        } else {
+            coerceTapToScreen(Point(px, py), w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(
+                safeAlias,
+                "$phaseLog：Verify to continue 弹窗，点关闭 (${tap.x},${tap.y})" +
+                    "（距左${(VERIFY_TO_CONTINUE_DISMISS_X_FRACTION * 100).toInt()}%" +
+                    "/距顶${(VERIFY_TO_CONTINUE_DISMISS_Y_FRACTION * 100).toInt()}%）",
+            )
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastVerifyToContinuePopupDismissAtMs = SystemClock.elapsedRealtime()
         delay(350L)
         return true
     }
@@ -6763,7 +6996,12 @@ class RealTraceExecutor(
         val ocrPoint = findUserInListByOcr(service, username, isLiveModeForUsersCheck)
         if (ocrPoint == null) {
             devOp(alias, "Users 列表 OCR 未找到目标：$username")
-            // 仍在搜索/Users 页且已清空搜索框，下一名应复用界面，避免误走 For You 预滑。
+            if (restartFromMagnifierForGrowth) {
+                // 回首页/重搜失败：界面可能已不在 Users，下一名从放大镜重搜，禁止复用 Users。
+                lastEndedAtUsersSelection = false
+                return "失败：Users 列表 OCR 未找到目标用户 $username（回首页重搜失败，下一名从放大镜）"
+            }
+            // 仍在搜索/Users 页：清框后下一名复用界面，避免误走 For You 预滑。
             lastEndedAtUsersSelection = true
             focusSearchInput(service)
             clearSearchInputText()
@@ -6864,12 +7102,16 @@ class RealTraceExecutor(
             devOp(alias, "点击放大镜前：Don't allow OCR 失败：$err（忽略，继续）")
             return
         }
+        // 系统 ANR 优先（本路径走无副作用 OCR，不会进 mlKitRecognizeFullScreen 顺手处理）
+        probeAndHandleTikTokAnrFromVision(service, vision, "点击放大镜前")
         // 涨粉等 withAccountStatusOcrWatch 上下文：顺带探测掉登录（Account status 优先，避免 please log in again 误判）
         try {
             observeAccountStatusOnOcrText(service, vision, "magnifier_before_dont_allow")
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
+            throw ex
+        } catch (ex: TikTokAnrRecoveredException) {
             throw ex
         } catch (_: Exception) {
             // 掉登录探测失败不阻断 Don't allow 尝试
@@ -7874,7 +8116,6 @@ class RealTraceExecutor(
         val limit = config.mutual_follow_tap_session_limit.coerceAtLeast(1)
         var reachedEnd = false
         var rounds = 0
-        var singleDigitTotal: Int? = null
         while (!reachedEnd && rounds < 7) {
             if (mutualClickOrNull(alias, "互点粉丝列表 Follow+下滑")) return
             if (mutualFollowLimitReached) return
@@ -7892,9 +8133,6 @@ class RealTraceExecutor(
                 devOp(alias, "互点：粉丝列表（涨粉同款 OCR）无可用 Follow 行，结束列表滑动")
                 return
             }
-            if (singleDigitTotal == null) {
-                singleDigitTotal = inferSingleDigitFollowersTotal(service, followers.size)
-            }
             devOp(alias, "互点：粉丝列表 OCR 命中 ${followers.size} 条 Follow（中心点击）")
             for (entry in followers) {
                 if (mutualClickOrNull(alias, "互点粉丝列表单条 Follow")) return
@@ -7905,11 +8143,6 @@ class RealTraceExecutor(
                     return
                 }
                 delay(Random.nextLong(1000, 1501))
-            }
-            if (singleDigitTotal != null) {
-                devOp(alias, "互点：粉丝列表个位数($singleDigitTotal)，首轮处理完毕，跳过下滑")
-                reachedEnd = true
-                break
             }
             val avgRow = followers.map { it.rowHeight }.average().toFloat().coerceAtLeast(1f)
             val scrollDistance = (avgRow * 7f).coerceAtLeast(240f)
@@ -10440,15 +10673,26 @@ class RealTraceExecutor(
         }
 
         devOp(alias, "Users 标签 OCR 未命中，尝试返回首页或强关后重新进入搜索")
-        if (!recoverToHomeViaBackOrRestart(service, "Users 标签恢复", allowInitialDoubleBack = false)) {
-            devOp(alias, "Users 标签恢复：返回首页失败（导航返回与强关均未成功）")
-            return false
+        // 回首页 + 重搜同一把锁：避免一路强关冷启时另一路仍在按返回/搜上一名。
+        if (!tryAcquireRecoverHomeExclusive(alias, "Users 标签恢复")) return false
+        try {
+            if (!recoverToHomeViaBackOrRestartUnlocked(
+                    service,
+                    "Users 标签恢复",
+                    allowInitialDoubleBack = false,
+                )
+            ) {
+                devOp(alias, "Users 标签恢复：返回首页失败（导航返回与强关均未成功）")
+                return false
+            }
+            if (!reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)) {
+                devOp(alias, "Users 标签恢复：已回首页但重新搜索或进入 Users 失败")
+                return false
+            }
+            return true
+        } finally {
+            releaseRecoverHomeExclusive()
         }
-        if (!reopenSearchAndEnterUsersTab(service, username, isLiveModeForUsersCheck)) {
-            devOp(alias, "Users 标签恢复：已回首页但重新搜索或进入 Users 失败")
-            return false
-        }
-        return true
     }
 
     private suspend fun ensureUsersTabReadyForLiveMode(service: Context) {
@@ -12508,42 +12752,6 @@ class RealTraceExecutor(
         }
     }
 
-    private suspend fun detectSingleDigitFollowersTotal(service: Context): Int? {
-        val alias = PrefsStore.getAlias() ?: "unknown"
-        val snapshot = captureFollowersListOcrSnapshot(
-            service,
-            "followers_single_digit_check.png",
-            "growth_followers_single_digit_check",
-        ) ?: return null
-        val total = resolveSingleDigitFollowersTotal(snapshot)
-        if (total != null) {
-            LogCenter.append(
-                alias,
-                "粉丝列表个位数判定：总数=$total tab=${snapshot.tabFollowersCount} follow=${snapshot.followButtonCount}",
-            )
-        }
-        return total
-    }
-
-    /** 结合 Tab 数字、整屏 Follow 计数与当前可见行数，推断个位数粉丝总量。 */
-    private suspend fun inferSingleDigitFollowersTotal(
-        service: Context,
-        visibleFollowRows: Int,
-    ): Int? {
-        if (visibleFollowRows !in 1..9) return null
-        val snapshot = captureFollowersListOcrSnapshot(
-            service,
-            "followers_single_digit_infer.png",
-            "growth_followers_single_digit_infer",
-        ) ?: return null
-        resolveSingleDigitFollowersTotal(snapshot)?.let { return it }
-        return when {
-            snapshot.tabFollowersCount == visibleFollowRows -> visibleFollowRows
-            snapshot.followButtonCount == visibleFollowRows -> visibleFollowRows
-            else -> null
-        }
-    }
-
     private suspend fun detectVideoMotionByFrameDiffFromBeforeTap(
         service: Context,
         beforeTapReference: File?,
@@ -13119,8 +13327,7 @@ class RealTraceExecutor(
         if (growthYieldOrNull(alias, "处理粉丝列表")) return
         var reachedEnd = false
         var rounds = 0
-        var singleDigitTotal: Int? = null
-        // 主循环：固定最多 7 轮；若中途判定到底则提前结束
+        // 主循环：固定最多 7 轮；若中途判定到底则提前结束（恢复旧设计：不再因「个位数」短路跳过下滑）
         while (!reachedEnd && rounds < 7) {
             if (growthYieldOrNull(alias, "处理粉丝列表循环")) return
             if (mutualClickOrNull(alias, "处理粉丝列表循环")) {
@@ -13128,17 +13335,9 @@ class RealTraceExecutor(
             }
             val followers = findFollowersEntriesByOcr(service)
             if (followers.isEmpty()) {
-                // 已进入 Followers 流程后，整屏 OCR 却 0 条可点行：视为页面错乱/非列表态，不应当作正常结束回 Users。
-                LogCenter.append(alias, "粉丝列表 OCR 未命中任何用户，判定页面异常，优先导航返回回首页")
-                val restarted = recoverToHomeViaBackOrRestart(service, "粉丝列表 OCR 异常")
-                devOp(alias, "TikTok 恢复结果：${if (restarted) "success" else "failed"}")
-                if (restarted) {
-                    delay(3000)
-                }
-                throw GrowthFlowRestartRequired("粉丝列表 OCR 未命中条目，页面异常，已执行重启 TikTok")
-            }
-            if (singleDigitTotal == null) {
-                singleDigitTotal = inferSingleDigitFollowersTotal(service, followers.size)
+                // 本屏无可用 Follow/可点行：按本轮粉丝列表处理完毕收尾回 Users，不升级为重启异常
+                LogCenter.append(alias, "粉丝列表 OCR 未命中可点用户，按处理完毕结束并返回 Users")
+                break
             }
             for (entry in followers) {
                 if (growthYieldOrNull(alias, "处理粉丝列表单条")) return
@@ -13171,12 +13370,7 @@ class RealTraceExecutor(
                 // 若作品内动作被取消，依旧给一点缓冲，避免紧接着操作下一条导致 UI 抢占
                 delay(Random.nextLong(450, 750))
             }
-            if (singleDigitTotal != null) {
-                LogCenter.append(alias, "粉丝列表个位数($singleDigitTotal)，首轮处理完毕，跳过下滑")
-                reachedEnd = true
-                break
-            }
-            // 测试用：只滑动 1 轮，便于观察每轮边界与回调链路
+            // 每轮处理完可见行后下滑，靠到底判定或满 7 轮结束
             val avgRow = followers.map { it.rowHeight }.average().toFloat().coerceAtLeast(1f)
             val scrollDistance = (avgRow * 7f).coerceAtLeast(240f)
             val metrics = service.resources.displayMetrics
@@ -13235,7 +13429,6 @@ class RealTraceExecutor(
                     followButtonCount = countStrictFollowButtonsFromOcrResult(result, bitmap.height),
                 )
                 val followCount = snapshot.followButtonCount
-                val singleDigitTotal = resolveSingleDigitFollowersTotal(snapshot)
                 val endMarkers = listOf(
                     "no more results",
                     "you've reached the end",
@@ -13243,13 +13436,12 @@ class RealTraceExecutor(
                     "end of list",
                 )
                 val hitEndMarker = normalized.any { line -> endMarkers.any { marker -> line.contains(marker) } }
-                val singleDigitComplete = singleDigitTotal != null &&
-                    (followCount > 0 || snapshot.tabFollowersCount != null)
-                val reachedEnd = hitEndMarker || followCount == 0 || singleDigitComplete
+                // 恢复旧设计：仅文案到底或本屏 Follow=0；不再用「个位数」误判直接判定到底
+                val reachedEnd = hitEndMarker || followCount == 0
                 LogCenter.append(
                     alias,
                     "粉丝列表到底判定: followCount=$followCount tab=${snapshot.tabFollowersCount} " +
-                        "singleDigit=$singleDigitTotal marker=$hitEndMarker result=$reachedEnd",
+                        "marker=$hitEndMarker result=$reachedEnd",
                 )
                 return reachedEnd
             } catch (ex: Exception) {
@@ -14169,8 +14361,9 @@ class RealTraceExecutor(
     }
 
     /**
-     * 互点：右侧评论按钮打开评论区后，再点涨粉同款底部输入框并发评；
+     * 互点：作品页直接点底部评论输入框并发评（与涨粉同款固定坐标，不先开右侧评论区）；
      * 文案仅 [pickMutualCommentPhrase]（仅 mutual_comment_texts）。
+     * 发评后仍停在作品播放页，由外层互动完成再 navBack 回 Videos 列表（避免多一次返回）。
      */
     private suspend fun performMutualCommentTextDirectFixedCoordinate(
         service: Context,
@@ -14179,8 +14372,7 @@ class RealTraceExecutor(
         val alias = PrefsStore.getAlias() ?: "unknown"
         val metrics = service.resources.displayMetrics
         val t0 = System.currentTimeMillis()
-        tapMutualTrafficCommentEntryFixedPoint(service, "互点发评打开评论区", settleMs = 900L)
-        tapGrowthCommentInputFixedPoint(service, "互点发评聚焦输入框")
+        tapGrowthCommentInputFixedPoint(service, "互点发评")
 
         // 剪贴板在 Android 14 后台常不可读：先把剪贴板粘贴进评论框，再用 uiautomator dump 读 EditText.text。
         // 已达粉丝列表 Follow 上限后的「仅互点评论」阶段未再复制主页用户名，禁止粘贴与 /api/report_mutual_copied_username 回传。
@@ -14218,7 +14410,6 @@ class RealTraceExecutor(
         val typed = tryInputCommentText(alias, text)
         if (!typed) {
             devOp(alias, "评论文本 root 输入失败，已跳过发送")
-            closeMutualCommentPanelToPost(service, "互点发评输入失败后")
             return false
         }
         delay(Random.nextLong(2000, 2501))
@@ -14230,7 +14421,6 @@ class RealTraceExecutor(
         if (!sendTapped) {
             runSuCommand("input keyevent 66")
         }
-        closeMutualCommentPanelToPost(service, "互点发评发送后")
         devOp(alias, "评论发送流程结束", System.currentTimeMillis() - t0)
         return true
     }
@@ -14483,8 +14673,23 @@ class RealTraceExecutor(
 
     /**
      * Users 标签 OCR 恢复：回首页成功后，与主流程一致地重新打开搜索并切到 Users 标签。
+     * 与 [recoverToHomeViaBackOrRestart] 共用 [recoverHomeMutex]：后来者直接失败。
      */
     private suspend fun reopenSearchAndEnterUsersTab(
+        service: Context,
+        username: String,
+        isLiveModeForUsersCheck: Boolean,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        if (!tryAcquireRecoverHomeExclusive(alias, "Users 标签恢复重搜")) return false
+        try {
+            return reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)
+        } finally {
+            releaseRecoverHomeExclusive()
+        }
+    }
+
+    private suspend fun reopenSearchAndEnterUsersTabUnlocked(
         service: Context,
         username: String,
         isLiveModeForUsersCheck: Boolean,
@@ -14529,8 +14734,11 @@ class RealTraceExecutor(
 
     /**
      * 在 Users 列表区域用 OCR 查找包含目标用户名的行，返回该行点击点（屏幕坐标，偏左）。
-     * 每一段（首次进入列表，或重启 TikTok 并重新打开搜索后）最多 **3 次** OCR。
-     * 连续 3 次未匹配：先 OCR 重找 Users 标签并点击，再额外做 2 次列表匹配；仍失败则关闭并重启 TikTok、重新进入搜索与 Users 列表，再开启**新的一段**（仍最多 3 次 OCR）；整段流程最多执行 **1 次**此类重启，避免死循环。
+     * 每一段（首次进入列表，或「回首页后重新打开搜索」后）最多 **3 次** OCR。
+     * 连续 3 次未匹配：先 OCR 重找 Users 标签并点击，再额外做 2 次列表匹配；
+     * **第一段**仍失败则导航返回回首页（一次双返→OCR；未见再单返→OCR；退 App 则重开不强关），
+     * 再重新进入搜索与 Users 列表，开启**第二段**（仍先 Users 重试，再列表 OCR）；
+     * **第二段** Users 重试后仍失败则结束。最多 **1 次**回首页重搜。不再强关重启 TikTok。
      */
     private suspend fun findUserInListByOcr(
         service: Context,
@@ -14554,17 +14762,13 @@ class RealTraceExecutor(
         var consecutiveFailures = 0
         var needLongSettleBeforeOcr = true
         var ocrInSegment = 0
-        var didRestartAfterTripleMiss = false
-        var didUsersTabOcrRetryBeforeRestart = false
+        var didRecoverHomeAfterTripleMiss = false
+        var didUsersTabOcrRetryBeforeRecover = false
 
         while (true) {
             if (consecutiveFailures >= 3) {
-                if (didRestartAfterTripleMiss) {
-                    devOp(alias, "Users 列表 OCR：已连续 3 次未匹配且已执行过一次重启，结束匹配")
-                    break
-                }
-                if (!didUsersTabOcrRetryBeforeRestart) {
-                    didUsersTabOcrRetryBeforeRestart = true
+                if (!didUsersTabOcrRetryBeforeRecover) {
+                    didUsersTabOcrRetryBeforeRecover = true
                     devOp(alias, "Users 列表 OCR 连续 3 次未匹配，OCR 重新定位 Users 标签并点击后再试 2 次列表匹配")
                     if (ensureUsersTabClicked(service)) {
                         delay(betweenRetryMs)
@@ -14577,18 +14781,29 @@ class RealTraceExecutor(
                             }
                         }
                     } else {
-                        devOp(alias, "Users 列表 OCR：重找 Users 标签失败，跳过补试，改为强关重启")
+                        val nextAction =
+                            if (didRecoverHomeAfterTripleMiss) "结束匹配" else "改为导航返回回首页"
+                        devOp(alias, "Users 列表 OCR：重找 Users 标签失败，跳过补试，$nextAction")
                     }
                 }
-                devOp(alias, "Users 列表 OCR 连续 3 次未匹配，强关重启 TikTok 后重新进入搜索与 Users 列表")
-                restartTikTokForRecovery()
-                if (!reopenSearchAndEnterUsersTab(service, username, isLiveModeForUsersCheck)) {
+                if (didRecoverHomeAfterTripleMiss) {
+                    // 第二段：已做过回首页重搜，且本段 Users 重试也用完，结束匹配
+                    devOp(alias, "Users 列表 OCR：第二段连续未匹配且 Users 重试已用尽，结束匹配")
+                    break
+                }
+                // 第一段：回首页后重搜，再开新一段（仍最多 3 次 OCR）
+                devOp(alias, "Users 列表 OCR 连续 3 次未匹配，导航返回回首页后重新进入搜索与 Users 列表")
+                if (!recoverUsersListMissToHomeThenReopenSearch(service, username, isLiveModeForUsersCheck)) {
+                    // 人可能已不在 Users（主 Feed / 半途 / 甚至退 App）：禁止下一名「复用 Users」
+                    lastEndedAtUsersSelection = false
+                    restartFromMagnifierForGrowth = true
+                    devOp(alias, "Users 列表 OCR：回首页重搜失败，已标记下一名从放大镜重新搜索（不复用 Users）")
                     return null
                 }
-                didRestartAfterTripleMiss = true
+                didRecoverHomeAfterTripleMiss = true
                 consecutiveFailures = 0
                 ocrInSegment = 0
-                didUsersTabOcrRetryBeforeRestart = false
+                didUsersTabOcrRetryBeforeRecover = false
                 needLongSettleBeforeOcr = true
                 continue
             }
@@ -14617,6 +14832,141 @@ class RealTraceExecutor(
             if (!lastHadText) "Users 列表多次 OCR 仍无文字，匹配失败" else "Users 列表有文字但未匹配到用户名",
         )
         return null
+    }
+
+    /**
+     * Users 列表未匹配恢复：不杀 TikTok。
+     * 一次双返 → OCR；未见主 Feed 再单返 → OCR（命中后不再额外返回）；
+     * 仍未见则续单返+OCR。返回可能退 App 时仅重开 TikTok（不强关），成功后重新搜索并进 Users。
+     */
+    private suspend fun recoverUsersListMissToHomeThenReopenSearch(
+        service: Context,
+        username: String,
+        isLiveModeForUsersCheck: Boolean,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val reason = "Users列表未匹配回首页"
+        if (!tryAcquireRecoverHomeExclusive(alias, reason)) return false
+        try {
+            if (!recoverUsersListMissToHomeUnlocked(service, reason)) return false
+            return reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)
+        } finally {
+            releaseRecoverHomeExclusive()
+        }
+    }
+
+    /**
+     * 一次双返后立刻 OCR；未见主 Feed 再接单返+OCR；续轮仅单返。
+     * 命中主 Feed 即成功（不再额外返回）。不占用外层互斥锁。
+     */
+    private suspend fun recoverUsersListMissToHomeUnlocked(service: Context, reason: String): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val ctx = service.applicationContext
+        val pkg = Config.TIKTOK_PACKAGE_NAME
+        if (hardStopOrNull(alias, reason)) return false
+        if (!ensureTikTokInForeground(ctx, alias, "$reason·回首页", allowForceRestart = false)) {
+            devOp(alias, "$reason：TikTok 非前台，无法导航返回回首页（不进行强关重启）")
+            return false
+        }
+        val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        var backsCompleted = 0
+
+        suspend fun ocrOnMainFeed(tag: String): Boolean? {
+            val (vision, err) = mlKitRecognizeFullScreen(service, "users_miss_recover_$tag")
+            if (vision == null) {
+                devOp(alias, "$reason：回首页 OCR 失败：$err")
+                return if (isMlKitHardStopError(err)) null else false
+            }
+            if (autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                devOp(alias, "$reason：OCR 已见主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}）")
+                return true
+            }
+            return false
+        }
+
+        /** @return null 可继续；非 null 为本恢复流程结束结果。 */
+        suspend fun reopenIfBackClosedApp(passLabel: String): Boolean? {
+            if (backsCompleted < RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS) return null
+            invalidateForegroundProbeCache()
+            if (isPackageVisible(pkg)) return null
+            devOp(
+                alias,
+                "$reason：$passLabel 已连续返回 $backsCompleted 次且 TikTok 非前台，尝试重新打开（不强关）",
+            )
+            val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+            if (
+                !launchTikTokOnceWithCheck(
+                    ctx,
+                    alias,
+                    "$reason·重新打开",
+                    launchWaitMs,
+                    forceStopBeforeLaunch = false,
+                )
+            ) {
+                devOp(alias, "$reason：重新打开 TikTok 失败（不进行强关重启）")
+                return false
+            }
+            when (val hit = ocrOnMainFeed("reopen_$backsCompleted")) {
+                null -> return false
+                true -> {
+                    markSkipForYouWarmupAfterRecoverHome(alias)
+                    return true
+                }
+                false -> {
+                    devOp(alias, "$reason：重新打开后仍未见主 Feed，继续导航返回")
+                    return null
+                }
+            }
+        }
+
+        // 一次返回两次（双返），然后立刻 OCR —— 不要固定再无条件单返以免过冲退 App
+        devOp(alias, "$reason：一次双返（连按两次）")
+        navBack(alias, "$reason·双返 1/2")
+        if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return false
+        navBack(alias, "$reason·双返 2/2")
+        if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返后")) return false
+        backsCompleted += 2
+        reopenIfBackClosedApp("双返后")?.let { return it }
+        when (val afterDouble = ocrOnMainFeed("after_double")) {
+            null -> return false
+            true -> {
+                markSkipForYouWarmupAfterRecoverHome(alias)
+                return true
+            }
+            false -> Unit
+        }
+
+        // 双返未见主 Feed：后续接上返回一次，再 OCR
+        navBack(alias, "$reason·单返")
+        if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·单返后")) return false
+        backsCompleted += 1
+        reopenIfBackClosedApp("单返后")?.let { return it }
+        when (val afterSingle = ocrOnMainFeed("after_double_single")) {
+            null -> return false
+            true -> {
+                markSkipForYouWarmupAfterRecoverHome(alias)
+                return true
+            }
+            false -> Unit
+        }
+
+        for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, reason)) return false
+            navBack(alias, "$reason·续单返（$pass/$RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS）")
+            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·续单返后")) return false
+            backsCompleted += 1
+            reopenIfBackClosedApp("续单返 $pass 后")?.let { return it }
+            when (val hit = ocrOnMainFeed("cont_$pass")) {
+                null -> return false
+                true -> {
+                    markSkipForYouWarmupAfterRecoverHome(alias)
+                    return true
+                }
+                false -> Unit
+            }
+        }
+        devOp(alias, "$reason：导航返回仍未回首页（不进行强关重启）")
+        return false
     }
 
     private fun clickUsersTab(service: Context): Boolean {
@@ -14837,6 +15187,7 @@ class RealTraceExecutor(
         maxPasses: Int,
         phase: String,
         vision: Text,
+        screenH: Int = 0,
     ) {
         val pwStrict = findAllPasswordLabelHits(vision).size
         val nextHit = findStrictExactLabelHit(vision, "Next")
@@ -14844,10 +15195,13 @@ class RealTraceExecutor(
             ?: findLabelHitContainingIgnoreCase(vision, "next")
         val pwContains = countLabelContainingIgnoreCase(vision, "password")
         val layoutAReady = findSinglePasswordAndNextHits(vision) != null
+        val accessThese = findLabelHitContainingIgnoreCase(vision, "access these") != null
+        val layoutCReady = screenH > 0 && findSinglePasswordWithAccessThese(vision, screenH) != null
         devOp(
             alias,
             "自动登录 布局判定[$phase] 第${pass}/${maxPasses}次: " +
-                "严格password=$pwStrict, 含password计数=$pwContains, next=${nextHit != null}, 布局A命中=$layoutAReady",
+                "严格password=$pwStrict, 含password计数=$pwContains, next=${nextHit != null}, " +
+                "access these=$accessThese, 布局A命中=$layoutAReady, 布局C命中=$layoutCReady",
         )
     }
 
@@ -14901,6 +15255,17 @@ class RealTraceExecutor(
         return pw[0] to next
     }
 
+    /**
+     * 布局 C：同屏仅 1 个 password，且底部有 access these。
+     * 表示仍在设密码页（Next 常被键盘遮住，需收起键盘或下滑后才可见）。
+     */
+    private fun findSinglePasswordWithAccessThese(result: Text, screenH: Int): StrictLabelHit? {
+        val pw = findAllPasswordLabelHits(result)
+        if (pw.size != 1) return null
+        if (!hasBottomBandContaining(result, screenH, "access these")) return null
+        return pw[0]
+    }
+
     /** 统计 OCR 中包含指定短语的命中数（有 element 时只计 element，避免与 line 重复）。 */
     private fun countLabelContainingIgnoreCase(result: Text, needle: String): Int {
         val lowNeedle = needle.trim().lowercase(Locale.US)
@@ -14932,9 +15297,18 @@ class RealTraceExecutor(
         }
         if (vision != null) {
             // 顺带处理：每次 autoLogin OCR 后，尝试 agree and / Don't allow / Swipe 引导 / 各类弹窗。
-            val overlayDismissed = runCatching {
+            // 不可用 runCatching：会吞掉 ANR / 掉登录等须上浮的控制流异常。
+            val overlayDismissed = try {
                 autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
-            }.getOrDefault(false)
+            } catch (ex: TikTokAnrRecoveredException) {
+                throw ex
+            } catch (ex: AccountStatusLoggedOutException) {
+                throw ex
+            } catch (ex: LoginSafeguardRequiresAutoLoginException) {
+                throw ex
+            } catch (_: Exception) {
+                false
+            }
             if (overlayDismissed && !tag.endsWith("_overlay_redo")) {
                 return autoLoginOcrOnce(ctx, alias, "${tag}_overlay_redo")
             }
@@ -14949,6 +15323,8 @@ class RealTraceExecutor(
         vision: Text,
     ): Boolean {
         if (hardStopOrNull(alias, "自动登录-OCR顺带处理")) return false
+        // ANR 优先：点 Close app → 强停冷启 → 抛出异常中止（外层自动登录可重试）
+        probeAndHandleTikTokAnrFromVision(ctx, vision, "自动登录(顺带) ANR")
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
@@ -15036,6 +15412,20 @@ class RealTraceExecutor(
             )
         ) {
             autoLoginDelay(alias, 450L, "Security checkup 弹窗后")
+            return true
+        }
+
+        // 8) 「Verify to continue」滑块验证：点右上关闭（距左 85% / 距顶 32%）
+        if (
+            tryDismissVerifyToContinuePopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Verify to continue 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Verify to continue 弹窗后")
             return true
         }
         return false
@@ -15725,12 +16115,32 @@ class RealTraceExecutor(
     }
 
     override suspend fun runLoginSafeguardMeasure(ctx: Context, sourceTag: String): LoginSafeguardOutcome {
-        loginSafeguardLogoutProbeActive = true
-        try {
-            return runLoginSafeguardMeasureCore(ctx, sourceTag)
-        } finally {
-            loginSafeguardLogoutProbeActive = false
+        return LoginSafeguardGate.withExclusive("ocr:$sourceTag") {
+            loginSafeguardLogoutProbeActive = true
+            try {
+                runLoginSafeguardMeasureCore(ctx, sourceTag)
+            } finally {
+                loginSafeguardLogoutProbeActive = false
+            }
         }
+    }
+
+    /**
+     * 点 Profile 失败时先导航返回/强关重启回首页，再重试一次；
+     * 避免卡在子页/叠层时无限重复 OCR 点 Profile。
+     */
+    private suspend fun loginSafeguardTapProfileWithRecovery(
+        ctx: Context,
+        alias: String,
+    ): ProfileLoginEntryTapOutcome {
+        val first = autoLoginTapProfileForLoginEntry(ctx, alias)
+        if (first != ProfileLoginEntryTapOutcome.Failed) return first
+        devOp(alias, "登录状态保障：未能点击底栏 Profile，尝试返回/重启回首页后重试")
+        recoverToHomeViaBackOrRestart(ctx, "登录状态保障·Profile", skipDontAllowOcr = true)
+        if (!autoLoginDelay(alias, 900L, "登录状态保障恢复后")) {
+            return ProfileLoginEntryTapOutcome.Failed
+        }
+        return autoLoginTapProfileForLoginEntry(ctx, alias)
     }
 
     private suspend fun runLoginSafeguardMeasureCore(ctx: Context, sourceTag: String): LoginSafeguardOutcome {
@@ -15743,7 +16153,7 @@ class RealTraceExecutor(
 
         devOp(alias, "登录状态保障：开始（来源=$sourceTag）")
 
-        when (autoLoginTapProfileForLoginEntry(ctx, alias)) {
+        when (loginSafeguardTapProfileWithRecovery(ctx, alias)) {
             ProfileLoginEntryTapOutcome.OnLoginEntryScreen -> {
                 devOp(alias, "登录状态保障：定位 Profile 时见登录入口，判定未登录，接入自动登录")
                 return LoginSafeguardOutcome.RequiresAutoLogin
@@ -15870,6 +16280,8 @@ class RealTraceExecutor(
             SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
         } catch (logout: AccountStatusLoggedOutException) {
             throw logout
+        } catch (anr: TikTokAnrRecoveredException) {
+            throw anr
         }
     }
 
@@ -16001,6 +16413,72 @@ class RealTraceExecutor(
             .filter { it != "skip" }
             .count { key -> findLabelHitContainingIgnoreCase(result, key) != null }
         return hasSkip && interestHits >= 2
+    }
+
+    /** 仅按一次返回收起键盘，再尝试定位 Next（暂不滑动）。 */
+    private suspend fun autoLoginBackOnceToRevealNext(alias: String): Boolean {
+        devOp(alias, "自动登录：收起键盘（仅一次返回）")
+        runSuCommand("input keyevent 4")
+        return autoLoginDelay(alias, 500L, "收起键盘后")
+    }
+
+    /**
+     * 布局 C：1 个 password + 底部 access these → 输密码 → 一次返回 → 点 Next。
+     */
+    private suspend fun autoLoginEnterPasswordLayoutAccessThese(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        password: String,
+        tagPrefix: String,
+    ): Boolean {
+        var readyVision: Text? = null
+        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_detect_$pass") ?: continue
+            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局C探测", vision, h)
+            if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                readyVision = vision
+                break
+            }
+            if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
+                autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "布局C定位")
+            }
+        }
+        val vision = readyVision
+        if (vision == null) {
+            devOp(alias, "自动登录：布局C（password+access these）未命中")
+            return false
+        }
+        val field = findMiddlePasswordFieldHit(vision)
+        if (field == null) {
+            devOp(alias, "自动登录：布局C 密码输入区未定位")
+            return false
+        }
+        val pwTap = autoLoginTapWithJitter(field.point, w, h)
+        devOp(alias, "自动登录：布局C 点 password 输入区 (${pwTap.x},${pwTap.y})")
+        runSuCommand("input tap ${pwTap.x} ${pwTap.y}")
+        if (!autoLoginDelay(alias, 400L, "布局C-点password后")) return false
+        if (!autoLoginInputText(alias, password)) return false
+        if (!autoLoginDelay(alias, 500L, "布局C-输密码后")) return false
+
+        // 先看 Next 是否已可见；否则仅一次返回后再找。
+        val alreadyVisible = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_next_probe")
+            ?.let { findAutoLoginContinueOrNextHit(it) != null } == true
+        if (!alreadyVisible) {
+            if (!autoLoginBackOnceToRevealNext(alias)) return false
+        }
+        val nextOutcome = autoLoginOcrTapContinueOrNext(
+            ctx, alias, w, h,
+            "${tagPrefix}_next",
+            "Next(布局C-access these)",
+            maxPasses = AUTO_LOGIN_OCR_MAX_PASSES,
+        )
+        if (nextOutcome != AutoLoginStepOutcome.Ok) {
+            devOp(alias, "自动登录：布局C 未点到 Next")
+            return false
+        }
+        return true
     }
 
     /**
@@ -16241,6 +16719,11 @@ class RealTraceExecutor(
                 return AutoLoginStepOutcome.Ok
             }
 
+            if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                devOp(alias, "自动登录：验证码页已通过（布局C命中 password+access these，第 $ocrPass 次 OCR）")
+                return AutoLoginStepOutcome.Ok
+            }
+
             val pwLabels = findAllPasswordLabelHits(vision)
             if (pwLabels.size >= 2) {
                 devOp(alias, "自动登录：验证码页已通过（严格 password>=2，第 $ocrPass 次 OCR）")
@@ -16319,6 +16802,7 @@ class RealTraceExecutor(
             return AutoLoginCutSwitchPostEmailBranch.CheckYourInbox
         }
         if (findSinglePasswordAndNextHits(vision) != null ||
+            findSinglePasswordWithAccessThese(vision, screenH) != null ||
             findAllPasswordLabelHits(vision).isNotEmpty()
         ) {
             return AutoLoginCutSwitchPostEmailBranch.DirectPassword
@@ -16434,7 +16918,7 @@ class RealTraceExecutor(
         return null
     }
 
-    /** 切号流：布局 A→B 输密码并点 Continue/Next（不点 trust this device）。 */
+    /** 切号流：布局 A→C→B 输密码并点 Continue/Next（不点 trust this device）。 */
     private suspend fun autoLoginCutSwitchEnterPasswordLayoutAB(
         ctx: Context,
         alias: String,
@@ -16446,9 +16930,13 @@ class RealTraceExecutor(
         var enteredPasswordViaEnterPasswordLayout = false
         for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_layout_a_$pass") ?: continue
-            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "切号-布局A探测", vision)
+            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "切号-布局A探测", vision, h)
             val hits = findSinglePasswordAndNextHits(vision)
             if (hits == null) {
+                if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                    devOp(alias, "自动登录(切号)：布局A探测中命中布局C（password+access these），转布局C")
+                    break
+                }
                 if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
                     autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "切号-Password+Next")
                 }
@@ -16488,10 +16976,15 @@ class RealTraceExecutor(
                 maxPasses = 3,
             ) == AutoLoginStepOutcome.Ok
         }
-        devOp(alias, "自动登录(切号)：布局 A 未命中，转布局 B")
+        if (autoLoginEnterPasswordLayoutAccessThese(ctx, alias, w, h, password, "${tagPrefix}_layout_c")) {
+            devOp(alias, "自动登录(切号)：布局C（password+access these）已输密码并点 Next")
+            return true
+        }
+        devOp(alias, "自动登录(切号)：布局 A/C 未命中，转布局 B")
         var passwordFieldReady = false
         for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_layout_b_$pass") ?: continue
+            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "切号-布局B定位", vision, h)
             val field = findMiddlePasswordFieldHit(vision)
             if (field != null) {
                 val tap = autoLoginTapWithJitter(field.point, w, h)
@@ -16850,9 +17343,13 @@ class RealTraceExecutor(
 
             for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
                 val vision = autoLoginOcrOnce(ctx, alias, "auto_login_password_next_layout_$pass") ?: continue
-                autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局A探测", vision)
+                autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局A探测", vision, h)
                 val hits = findSinglePasswordAndNextHits(vision)
                 if (hits == null) {
+                    if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                        devOp(alias, "自动登录：布局A探测中命中布局C（password+access these），转布局C")
+                        break
+                    }
                     if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
                         autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "Password+Next 布局定位")
                     }
@@ -16873,7 +17370,7 @@ class RealTraceExecutor(
                 for (verifyPass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
                     val verifyVision = autoLoginOcrOnce(ctx, alias, "auto_login_password_next_verify_$verifyPass") ?: continue
                     autoLoginLogPasswordLayoutProbe(
-                        alias, verifyPass, AUTO_LOGIN_OCR_MAX_PASSES, "布局A校验(点Next后)", verifyVision,
+                        alias, verifyPass, AUTO_LOGIN_OCR_MAX_PASSES, "布局A校验(点Next后)", verifyVision, h,
                     )
                     val passwordCount = countLabelContainingIgnoreCase(verifyVision, "password")
                     if (passwordCount >= 3) {
@@ -16903,12 +17400,19 @@ class RealTraceExecutor(
                     return AutoLoginCutSwitchStepOutcome.Failed
                 }
                 passwordContinueDone = true
+            } else if (
+                autoLoginEnterPasswordLayoutAccessThese(
+                    ctx, alias, w, h, password, "auto_login_pwd_layout_c",
+                )
+            ) {
+                devOp(alias, "自动登录：布局C（password+access these）已输密码并点 Next")
+                passwordContinueDone = true
             } else {
-                devOp(alias, "自动登录：布局A ${AUTO_LOGIN_OCR_MAX_PASSES} 次均未满足，转布局B")
+                devOp(alias, "自动登录：布局A/C 均未满足，转布局B")
                 var passwordFieldReady = false
                 for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
                     val vision = autoLoginOcrOnce(ctx, alias, "auto_login_password_$pass") ?: continue
-                    autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局B定位", vision)
+                    autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局B定位", vision, h)
                     val field = findMiddlePasswordFieldHit(vision)
                     if (field != null) {
                         val tap = autoLoginTapWithJitter(field.point, w, h)
@@ -17121,6 +17625,7 @@ class RealTraceExecutor(
                     markerGone = { v ->
                         !autoLoginVisionHasContinueMarker(v) &&
                             findSinglePasswordAndNextHits(v) == null &&
+                            findSinglePasswordWithAccessThese(v, h) == null &&
                             findAllPasswordLabelHits(v).isEmpty()
                     },
                     allowVerifySuccess = true,
@@ -17336,6 +17841,13 @@ class RealTraceExecutor(
                 devOp(alias, "自动登录：${logout.message ?: "掉登录"}，整链重来")
                 if (chain >= AUTO_LOGIN_MAX_CHAIN_RESTARTS) {
                     devOp(alias, "自动登录：掉登录后已达整链重试上限")
+                    return false
+                }
+                continue
+            } catch (anr: TikTokAnrRecoveredException) {
+                devOp(alias, "自动登录：${anr.message ?: "ANR 已恢复"}，整链重来")
+                if (chain >= AUTO_LOGIN_MAX_CHAIN_RESTARTS) {
+                    devOp(alias, "自动登录：ANR 恢复后已达整链重试上限")
                     return false
                 }
                 continue

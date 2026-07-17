@@ -145,15 +145,22 @@ object AppCoordinator {
             )?.let { it.fileName to it.absolutePath }
         },
         verifyInsertionLogin = { ctx, kind ->
-            if (kind == "publish") {
-                verifyPublishInsertionLoginBeforeEnqueue(
+            val sk = ctx.slotKey.trim()
+            when {
+                PrefsStore.isAutoSwitchTikTokLoginHoldActive(sk.ifBlank { null }) -> {
+                    LogCenter.op(
+                        ctx.alias,
+                        "【自动切号】跳过$kind：登录保障恢复中 slot=${sk.ifBlank { "-" }}",
+                    )
+                    false
+                }
+                kind == "publish" -> verifyPublishInsertionLoginBeforeEnqueue(
                     alias = ctx.alias,
                     deviceId = ctx.deviceId,
                     targetUsername = ctx.account.username.orEmpty(),
                     slotKey = ctx.slotKey,
                 )
-            } else {
-                true
+                else -> true
             }
         },
     )
@@ -208,6 +215,10 @@ object AppCoordinator {
 
     /** 涨粉登录状态保障：外层重试间隔（毫秒）。 */
     private val loginSafeguardRetryDelayMs = 3_000L
+
+    /**
+     * 登录状态保障全局单飞已迁至 [LoginSafeguardGate]（覆盖 OCR + 续接自动登录，含互点/发作品冷启）。
+     */
 
     /** 验证码配置缺失时，自动登录最多重试次数（超过后本地暂停）。 */
     private val autoLoginUnrecoverableCodeFetchMaxAttempts = 3
@@ -2303,7 +2314,7 @@ object AppCoordinator {
                     alias = alias,
                     deviceId = deviceId,
                     tag = "登录保障恢复",
-                    forceStopBeforeLaunch = false,
+                    forceStopBeforeLaunch = true,
                     safeguardSource = "登录保障恢复",
                     strict = true,
                 )
@@ -2311,6 +2322,13 @@ object AppCoordinator {
                     PrefsStore.clearAutoSwitchTikTokLoginHold()
                     growthModeLoginSafeguardPending = false
                     autoSwitchLoginRecoveryJob = null
+                    val reviveSlot = slotKey.ifBlank {
+                        PrefsStore.getAutoSwitchLastSlotKey().orEmpty()
+                    }
+                    if (reviveSlot.isNotBlank()) {
+                        autoSwitchLocalScheduler.reviveLoginAbortedInsertions(reviveSlot)
+                        autoSwitchLocalScheduler.requestImmediateTick(recoveryTick = true)
+                    }
                     if (!manuallyPaused && !shouldHonorUserHardStop()) {
                         PrefsStore.saveLocalStatus("running")
                         updateRuntime(localStatus = "running", lastMessage = "登录保障恢复成功")
@@ -4546,6 +4564,7 @@ object AppCoordinator {
     /**
      * 登录状态保障：TikTok 已在前台时 OCR 点 Profile 判定界面登录态；需登录则走自动登录链。
      * 与云端 `is_login` 字段无关，仅依据 TikTok 界面 OCR。
+     * 整段（OCR + 必要自动登录）占用 [LoginSafeguardGate]，与互点/发作品冷启共用单飞。
      * @param strict true：自动登录失败等返回 false；false：切号后尽力登录，凭证不齐等仍可返回 true。
      */
     private suspend fun ensureLoginSafeguardMeasure(
@@ -4554,6 +4573,22 @@ object AppCoordinator {
         source: String,
         strict: Boolean = true,
         deferBasicProfileEdit: Boolean = false,
+    ): Boolean = LoginSafeguardGate.withExclusive(source) {
+        ensureLoginSafeguardMeasureUnderGate(
+            alias = alias,
+            deviceId = deviceId,
+            source = source,
+            strict = strict,
+            deferBasicProfileEdit = deferBasicProfileEdit,
+        )
+    }
+
+    private suspend fun ensureLoginSafeguardMeasureUnderGate(
+        alias: String,
+        deviceId: String,
+        source: String,
+        strict: Boolean,
+        deferBasicProfileEdit: Boolean,
     ): Boolean {
         fetchConfig(logToUser = false)
         return try {
@@ -4641,7 +4676,7 @@ object AppCoordinator {
         return ensureLoginSafeguardMeasure(alias, deviceId, safeguardSource, strict)
     }
 
-    /** 整段登录状态保障（拉起 → 前台校验 → OCR）外层重试；仅全部失败后才由调用方 pause。 */
+    /** 整段登录状态保障（拉起 → 前台校验 → OCR → 必要时自动登录）外层重试；仅全部失败后才由调用方 pause。 */
     private suspend fun launchTikTokWithLoginSafeguardWithRetry(
         alias: String,
         deviceId: String,
@@ -4656,30 +4691,46 @@ object AppCoordinator {
             LogCenter.op(alias, "登录状态保障暂缓：发作品独占发布中（$safeguardSource）")
             return false
         }
-        for (attempt in 1..maxAttempts) {
-            if (shouldHonorUserHardStop() || manuallyPaused) return false
-            if (attempt > 1) {
-                LogCenter.op(
-                    alias,
-                    "登录状态保障：第 $attempt/$maxAttempts 次重试（$safeguardSource）",
-                )
-                if (!delayUnlessHardStop(delayBetweenMs)) return false
-            }
+        return LoginSafeguardGate.withExclusive(safeguardSource) {
+            // 排队等待后：若其它入口已转入登录恢复（除恢复任务、切号校验），不再叠跑
             if (
-                launchTikTokWithLoginSafeguard(
-                    alias = alias,
-                    deviceId = deviceId,
-                    tag = tag,
-                    forceStopBeforeLaunch = forceStopBeforeLaunch,
-                    safeguardSource = safeguardSource,
-                    strict = strict,
-                )
+                PrefsStore.isAutoSwitchLoginRecoveryActive() &&
+                safeguardSource != "登录保障恢复" &&
+                !LoginSafeguardGate.isCutSwitchOwner(safeguardSource)
             ) {
-                return true
+                LogCenter.op(alias, "登录状态保障跳过：登录保障恢复中（$safeguardSource）")
+                return@withExclusive false
             }
+            if (PublishPostGrowthGate.shouldBlockExternalLoginSafeguard()) {
+                LogCenter.op(alias, "登录状态保障暂缓：发作品独占发布中（$safeguardSource）")
+                return@withExclusive false
+            }
+            for (attempt in 1..maxAttempts) {
+                if (shouldHonorUserHardStop() || manuallyPaused) return@withExclusive false
+                if (attempt > 1) {
+                    LogCenter.op(
+                        alias,
+                        "登录状态保障：第 $attempt/$maxAttempts 次重试（$safeguardSource）",
+                    )
+                    if (!delayUnlessHardStop(delayBetweenMs)) return@withExclusive false
+                }
+                val forceStopThisAttempt = forceStopBeforeLaunch || attempt > 1
+                if (
+                    launchTikTokWithLoginSafeguard(
+                        alias = alias,
+                        deviceId = deviceId,
+                        tag = tag,
+                        forceStopBeforeLaunch = forceStopThisAttempt,
+                        safeguardSource = safeguardSource,
+                        strict = strict,
+                    )
+                ) {
+                    return@withExclusive true
+                }
+            }
+            LogCenter.op(alias, "登录状态保障：$maxAttempts 次尝试均失败（$safeguardSource）")
+            false
         }
-        LogCenter.op(alias, "登录状态保障：$maxAttempts 次尝试均失败（$safeguardSource）")
-        return false
     }
 
     private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
@@ -7544,21 +7595,24 @@ object AppCoordinator {
                     }
                 }
                 if (switchResultLocal == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForMutual.isNotBlank()) {
-                    val loginReady = ensureAccountLoggedInWithRetry(
-                        alias = alias,
-                        deviceId = deviceIdForMutual,
-                        reason = "互点保障",
-                        forceRelogin = true,
-                        resumeFromLoginEntryScreen = true,
-                    ) == AccountLoginRetryOutcome.LoggedIn
-                    if (loginReady) {
-                        switchResultLocal = runCatching {
-                            executor.executeForUsername("__mutual_switch__", _config.value)
-                        }.getOrElse { err ->
-                            "互点流程切换异常：${err.message ?: "unknown"}"
+                    // OCR 已释放单飞；自动登录 + 重试互点必须再占单飞，避免与涨粉保障抢界面
+                    switchResultLocal = LoginSafeguardGate.withExclusive("互点保障") {
+                        val loginReady = ensureAccountLoggedInWithRetry(
+                            alias = alias,
+                            deviceId = deviceIdForMutual,
+                            reason = "互点保障",
+                            forceRelogin = true,
+                            resumeFromLoginEntryScreen = true,
+                        ) == AccountLoginRetryOutcome.LoggedIn
+                        if (loginReady) {
+                            runCatching {
+                                executor.executeForUsername("__mutual_switch__", _config.value)
+                            }.getOrElse { err ->
+                                "互点流程切换异常：${err.message ?: "unknown"}"
+                            }
+                        } else {
+                            "互点：登录保障后仍未登录"
                         }
-                    } else {
-                        switchResultLocal = "互点：登录保障后仍未登录"
                     }
                 }
                 switchResult = switchResultLocal
@@ -7783,32 +7837,38 @@ object AppCoordinator {
             }
             if (switchResult == SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE && deviceIdForPublish.isNotBlank()) {
                 val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
-                val loginReady = ensureAccountLoggedInWithRetry(
-                    alias = alias,
-                    deviceId = deviceIdForPublish,
-                    reason = "发作品保障",
-                    expectedUsername = expectedUser,
-                    forceRelogin = true,
-                    resumeFromLoginEntryScreen = true,
-                ) == AccountLoginRetryOutcome.LoggedIn
-                if (loginReady) {
-                    PrefsStore.setPublishPostSkipNextColdLaunchSafeguard(true)
-                    switchResult = runCatching {
-                        executor.executeForUsername("__publish_post__", _config.value)
-                    }.getOrElse { err ->
-                        when (err) {
-                            is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
-                            is AccountStatusLoggedOutException -> {
-                                if (deviceIdForPublish.isNotBlank()) {
-                                    recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
+                // OCR 已释放单飞；自动登录 + 重试发作品必须再占单飞，避免与涨粉保障抢界面
+                var publishLoginReady = false
+                switchResult = LoginSafeguardGate.withExclusive("发作品保障") {
+                    publishLoginReady = ensureAccountLoggedInWithRetry(
+                        alias = alias,
+                        deviceId = deviceIdForPublish,
+                        reason = "发作品保障",
+                        expectedUsername = expectedUser,
+                        forceRelogin = true,
+                        resumeFromLoginEntryScreen = true,
+                    ) == AccountLoginRetryOutcome.LoggedIn
+                    if (publishLoginReady) {
+                        PrefsStore.setPublishPostSkipNextColdLaunchSafeguard(true)
+                        runCatching {
+                            executor.executeForUsername("__publish_post__", _config.value)
+                        }.getOrElse { err ->
+                            when (err) {
+                                is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                                is AccountStatusLoggedOutException -> {
+                                    if (deviceIdForPublish.isNotBlank()) {
+                                        recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
+                                    }
+                                    "发作品掉登录：${err.message ?: "account_status"}"
                                 }
-                                "发作品掉登录：${err.message ?: "account_status"}"
+                                else -> "发作品入口流程异常：${err.message ?: "unknown"}"
                             }
-                            else -> "发作品入口流程异常：${err.message ?: "unknown"}"
                         }
+                    } else {
+                        "发作品：登录保障后仍未登录"
                     }
-                } else {
-                    switchResult = "发作品：登录保障后仍未登录"
+                }
+                if (!publishLoginReady) {
                     activateAutoSwitchTikTokLoginHold(
                         publishSlotKeyAtStart,
                         "发作品保障自动登录失败",

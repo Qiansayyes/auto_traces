@@ -50,6 +50,6 @@ object PublishPostGrowthGate {
         return true
     }
 
-    /** 发作品独占发布中：禁止外部 [launchTikTokWithLoginSafeguardWithRetry]（发作品冷启走 TraceExecutor 直连 OCR）。 */
+    /** 发作品独占发布中：禁止外部登录状态保障（发作品冷启 OCR 仍走 TraceExecutor，但与 [LoginSafeguardGate] 单飞共用）。 */
     fun shouldBlockExternalLoginSafeguard(): Boolean = exclusiveActive
 }

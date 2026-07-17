@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Android 11+ 必须声明要查询的包，否则 getLaunchIntentForPackage 会返回 null -->
+    <queries>
+        <package android:name="com.zhiliaoapp.musically" />
+        <package android:name="com.tiktok.android" />
+    </queries>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 14+：targetSdk 34 时后台读他应用写入的剪贴板需显式声明（与 ClipboardManager.getPrimaryClip 一致） -->
+    <uses-permission android:name="android.permission.READ_CLIPBOARD" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <permission
+        android:name="com.autotraces.app.videoded.permission.BRIDGE_READ"
+        android:protectionLevel="signature" />
+
+    <application
+        android:name=".AutoTracesApp"
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AutoTraces"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name=".BindActivity"
+            android:exported="false" />
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ConfigParamsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name=".WorkerService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <receiver
+            android:name=".WorkerServiceWatchdogReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- video_ded 独立入口：WiFi 素材传输 + PC 投屏（与涨粉主流程隔离） -->
+        <activity
+            android:name=".videoded.VideoDedMainActivity"
+            android:exported="false"
+            android:label="@string/video_ded_app_name" />
+        <activity
+            android:name=".videoded.TaskHistoryActivity"
+            android:exported="false" />
+        <activity
+            android:name=".videoded.TaskDetailActivity"
+            android:exported="false" />
+        <activity
+            android:name=".videoded.StatusLogActivity"
+            android:exported="false" />
+        <service
+            android:name=".videoded.VideoDedDeviceService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <provider
+            android:name=".videoded.CompanionBridgeProvider"
+            android:authorities="com.autotraces.app.videoded.bridge"
+            android:exported="true"
+            android:readPermission="com.autotraces.app.videoded.permission.BRIDGE_READ" />
+
+    </application>
+
+</manifest>
