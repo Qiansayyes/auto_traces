@@ -165,6 +165,17 @@ object AppCoordinator {
         },
     )
     private var pullLoopJob: Job? = null
+    private var forYouSwipeJob: Job? = null
+    private var manualSwitchJob: Job? = null
+    private val _manualSwitchBusy = MutableStateFlow(false)
+    /** 手动下拉切号进行中：UI 应禁用任务按钮，直至切号完成。 */
+    val manualSwitchBusy = _manualSwitchBusy.asStateFlow()
+    /** 手动账号就绪态变化：UI 刷新按钮（切号/自动登录/登录状态检测通过后递增）。 */
+    private val _manualAccountUiEpoch = MutableStateFlow(0)
+    val manualAccountUiEpoch = _manualAccountUiEpoch.asStateFlow()
+    /** 最近一次 [handleDeviceOp] 关键步骤是否成功（供手动切号判断还原/清理结果）。 */
+    @Volatile
+    private var lastDeviceOpOk: Boolean = false
     private val autoSwitchRecoverMutex = Mutex()
     private val autoSwitchBundleFetchMutex = Mutex()
     @Volatile
@@ -355,6 +366,8 @@ object AppCoordinator {
         deviceId: String,
         cloudEnabled: Boolean?,
     ) {
+        // simple 本机自治：开关由 APP 控制，不对账云端 auto_switch_enabled。
+        if (ManualDeviceControl.ENABLED) return
         noteCloudAutoSwitchEnabled(cloudEnabled)
         if (cloudEnabled != false) return
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
@@ -648,6 +661,36 @@ object AppCoordinator {
     }
 
     private suspend fun recoverAutoSwitchAutonomousWork(reason: String) {
+        if (ManualDeviceControl.ENABLED && !PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            // exiting 由 performAutoSwitchExitShutdown 收尾，避免与硬停关闭路径并发清状态。
+            if (PrefsStore.getAutoSwitchMode() == "exiting") return
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                clearOrphanedAutoSwitchAfterManualDisable(reason)
+            }
+            return
+        }
+        if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            autoSwitchRecoverMutex.withLock {
+                val now = SystemClock.elapsedRealtime()
+                if (
+                    PrefsStore.getAutoSwitchMode() == "on" &&
+                    now - lastAutoSwitchRecoverAtMs < AUTO_SWITCH_RECOVER_DEBOUNCE_MS
+                ) {
+                    val skipAlias = PrefsStore.getAlias()?.trim().orEmpty()
+                    if (skipAlias.isNotBlank()) {
+                        LogCenter.op(
+                            skipAlias,
+                            "【自动切号】$reason：恢复去重跳过完整重载（${now - lastAutoSwitchRecoverAtMs}ms 内已恢复），轻量续跑",
+                        )
+                    }
+                    resumeAutoSwitchGrowthLightweight(reason)
+                    return@withLock
+                }
+                lastAutoSwitchRecoverAtMs = now
+                recoverManualLocalAutoSwitchWork(reason)
+            }
+            return
+        }
         if (PrefsStore.getAutoSwitchMode() != "on") return
         autoSwitchRecoverMutex.withLock {
             val now = SystemClock.elapsedRealtime()
@@ -664,6 +707,90 @@ object AppCoordinator {
             }
             lastAutoSwitchRecoverAtMs = now
             recoverAutoSwitchAutonomousWorkInner(reason)
+        }
+    }
+
+    /** 手动模式未开本机自治时：清掉历史遗留 mode=on，避免硬停无效且不停自愈。 */
+    private suspend fun clearOrphanedAutoSwitchAfterManualDisable(reason: String) {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】$reason：本机未开启自动切号，清理遗留自治状态")
+        }
+        cancelAutoSwitchBundleRetry()
+        autoSwitchLocalScheduler.stop(clearState = true)
+        AutoSwitchLedger.clear()
+        AutoSwitchAccountActivityTracker.reset()
+        PrefsStore.clearAutoSwitchSessionContext()
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setManualLocalAutoSwitchEnabled(false)
+        PrefsStore.setAutoSwitchPendingSummaryUpload(false)
+        updateRuntime(lastMessage = "自动切号已关闭（本机开关）")
+    }
+
+    /** simple 本机自治恢复：只用本地计划/缓存，不拉云端周计划。 */
+    private suspend fun recoverManualLocalAutoSwitchWork(reason: String) {
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return
+        if (PrefsStore.getAutoSwitchMode() == "exiting") return
+        if (shouldHonorUserHardStop()) {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "【自动切号】$reason：硬停中，跳过本机自治恢复")
+            }
+            return
+        }
+        manuallyPaused = false
+        recoverStaleAutoSwitchExclusiveState(reason)
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(localStatus = "running", lastMessage = "本机自动切号：$reason")
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) return
+        // 硬停暂停后 mode 可能仍为 on；若曾被清成 off，按计划文件恢复会话再续跑。
+        ensureManualLocalAutoSwitchModeFromPlan(alias)
+        if (autoSwitchLocalScheduler.isRunning()) {
+            autoSwitchLocalScheduler.stop(clearState = false)
+        }
+        var resumed = resumeAutoSwitchFromLocalPlan(reason)
+        if (!resumed) {
+            resumed = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
+                reason = "$reason-重建计划",
+            )
+        }
+        if (resumed && !shouldHonorUserHardStop() && PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            maybeStartGrowthInAutoSwitchIdle(reason)
+        }
+    }
+
+    /**
+     * APP 开关仍开、但硬停/异常把 mode 清掉时：用计划文件里的 session/revision 把 mode 拉回 on，
+     * 以便 [resumeAutoSwitchFromLocalPlan] 能按持久化计划续跑。
+     */
+    private fun ensureManualLocalAutoSwitchModeFromPlan(alias: String) {
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return
+        if (PrefsStore.getAutoSwitchMode() != "off") return
+        val plan = AutoSwitchLocalPlanStore.get() ?: return
+        val sessionId = plan.session_id.trim().ifBlank {
+            PrefsStore.getAutoSwitchSessionId().orEmpty().trim()
+        }
+        val revision = plan.revision.coerceAtLeast(1)
+            .coerceAtLeast(PrefsStore.getAutoSwitchBundleRevision())
+        if (sessionId.isBlank()) return
+        if (PrefsStore.getAutoSwitchSessionId().isNullOrBlank()) {
+            PrefsStore.saveAutoSwitchSessionContext(sessionId, revision)
+        } else {
+            PrefsStore.setAutoSwitchMode("on")
+            if (PrefsStore.getAutoSwitchBundleRevision() < revision) {
+                PrefsStore.saveAutoSwitchSessionContext(sessionId, revision)
+            }
+        }
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】已按计划文件恢复会话 mode=on session=$sessionId revision=$revision",
+            )
         }
     }
 
@@ -810,7 +937,16 @@ object AppCoordinator {
 
     private fun isCutSwitchMissingBackupFailure(reason: String): Boolean {
         val r = reason.trim()
-        return r.contains("备份文件不存在或不可读") || r.contains("本机无 @")
+        return r.contains("备份文件不存在或不可读") ||
+            r.contains("本机无 @") ||
+            isCutSwitchCorruptBackupFailure(r)
+    }
+
+    private fun isCutSwitchCorruptBackupFailure(reason: String): Boolean {
+        val r = reason.trim()
+        return r.contains("备份包损坏") ||
+            r.contains("备份包已损坏") ||
+            r.contains("gzip/tar 完整性校验失败")
     }
 
     private fun cutSwitchMissingBackupUserMessage(username: String): String {
@@ -822,10 +958,23 @@ object AppCoordinator {
         }
     }
 
+    private fun cutSwitchCorruptBackupUserMessage(username: String): String {
+        val user = username.trim().removePrefix("@")
+        return if (user.isNotBlank()) {
+            "目标账号 @$user 备份包已损坏并删除，改走自动登录"
+        } else {
+            "目标账号备份包已损坏并删除，改走自动登录"
+        }
+    }
+
     /** 实时日志用：去掉完整路径、备份包名、内网地址等敏感信息。 */
     private fun cutSwitchUserLogMessage(reason: String): String {
         val r = reason.trim()
         if (r.isEmpty()) return "切号步骤失败"
+        if (isCutSwitchCorruptBackupFailure(r)) {
+            val user = Regex("@([\\w.]+)").find(r)?.groupValues?.getOrNull(1)
+            return cutSwitchCorruptBackupUserMessage(user.orEmpty())
+        }
         if (isCutSwitchMissingBackupFailure(r)) {
             val user = Regex("本机无 @([\\w.]+)").find(r)?.groupValues?.getOrNull(1)
                 ?: Regex("@([\\w.]+)").find(r)?.groupValues?.getOrNull(1)
@@ -844,9 +993,10 @@ object AppCoordinator {
             .ifBlank { "切号步骤失败" }
     }
 
-    /** 备份包缺失、username 无效等错误重试无意义，应立即中止。 */
+    /** 备份包缺失/损坏、username 无效等错误重试无意义，应立即中止。 */
     private fun isCutSwitchFailureRetryable(reason: String): Boolean {
         if (isCutSwitchMissingBackupFailure(reason)) return false
+        if (isCutSwitchCorruptBackupFailure(reason)) return false
         val r = reason.trim()
         if (r.isEmpty()) return true
         val nonRetryableMarkers = listOf(
@@ -860,6 +1010,73 @@ object AppCoordinator {
             "跳过打包备份",
         )
         return nonRetryableMarkers.none { r.contains(it) }
+    }
+
+    /** root 下校验备份包 gzip/tar 完整性；损坏返回 false。 */
+    private fun probeBackupArchiveIntegrity(
+        runSu: (String) -> Boolean,
+        absolutePath: String,
+    ): Boolean {
+        val path = absolutePath.trim()
+        if (path.isEmpty()) return false
+        val q = DeviceBackupShell.shellQuote(path)
+        return runSu(DeviceBackupShell.backupArchiveIntegrityTestCommand(q))
+    }
+
+    /**
+     * 删除损坏备份包；若同账号还有其它包则返回 true 让上层继续解析，
+     * 否则走缺备份兜底（不还原，改自动登录）并返回 false。
+     * @param onFailure 由 [handleDeviceOp] 内局部 `recordCutSwitchFailure` 传入，用于写入切号失败原因。
+     * @return null 表示已走兜底并应 `return@handleDeviceOp`；true 继续重试解析；false 记录失败后 break。
+     */
+    private suspend fun discardCorruptRestoreBackupAndMaybeFallback(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        payload: DeviceOpPayload?,
+        skipPmClear: Boolean,
+        restoreUsername: String,
+        backupName: String,
+        backupPath: String,
+        cloudBackupName: String,
+        runSu: (String) -> Boolean,
+        phase: String,
+        onFailure: (String) -> Unit,
+    ): Boolean? {
+        val q = DeviceBackupShell.shellQuote(backupPath)
+        runSu("rm -f $q")
+        runCatching { File(backupPath).delete() }
+        val detail =
+            "备份包损坏已删除（gzip/tar 完整性校验失败）：$backupName；路径：$backupPath"
+        val userMsg = cutSwitchCorruptBackupUserMessage(restoreUsername)
+        LogCenter.op(alias, "【切号】$userMsg（$backupName）")
+        val stillHasSibling = restoreUsername.isNotBlank() &&
+            UnifiedBackupPaths.listUsernameBackupArchives(
+                appContext,
+                restoreUsername,
+                alias,
+                deviceId,
+            ).any { it.length() >= UnifiedBackupPaths.MIN_VALID_BACKUP_FILE_BYTES }
+        if (stillHasSibling) {
+            onFailure(detail)
+            return true
+        }
+        if (isAutoSwitchCutSwitchRestore(payload, skipPmClear) && restoreUsername.isNotBlank()) {
+            handleCutSwitchMissingBackupFallback(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                payload = payload,
+                restoreUsername = restoreUsername,
+                cloudBackupName = cloudBackupName.ifBlank { backupName },
+                phase = phase,
+                internalDetail = detail,
+                userMessageOverride = userMsg,
+            )
+            return null
+        }
+        onFailure(detail)
+        return false
     }
 
     /** @return false 表示不可重试，调用方应 break 重试循环 */
@@ -1213,6 +1430,24 @@ object AppCoordinator {
                 }
                 fetchConfig()
                 enqueuePendingReports()
+                if (PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                    PrefsStore.saveLocalStatus("running")
+                    updateRuntime(
+                        localStatus = "running",
+                        hardStopRequested = false,
+                        lastMessage = "本机自动切号：$reason",
+                    )
+                    if (!WorkerServiceTracker.isRunning) {
+                        runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "force_start_running_now") }
+                    }
+                    startCheckLoop()
+                    ensureDeviceOpsLoopIfBound()
+                    recoverAutoSwitchAutonomousWork("显式启动")
+                    if (!alias.isNullOrBlank()) {
+                        LogCenter.op(alias, "本机自动切号：已按持久化计划恢复调度（$reason）")
+                    }
+                    return@launch
+                }
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(
                     localStatus = "online",
@@ -1304,16 +1539,50 @@ object AppCoordinator {
                     error(resp.msg?.trim().orEmpty().ifBlank { "拉取账号列表失败" })
                 }
                 val options = resp.items.orEmpty().mapNotNull { ManualDeviceControl.fromAssignedItem(it) }
-                if (options.isEmpty()) error("云端未返回可用账号")
+                if (options.isEmpty()) error("云端未返回可用账号（可能均已设为不参加自动切号）")
+                val oldUsers = ManualDeviceControl.getCachedAccounts()
+                    .map { it.username.trim().removePrefix("@").lowercase() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
                 ManualDeviceControl.updateCachedAccounts(options)
-                val selected = PrefsStore.getManualSelectedUsername()?.trim().orEmpty()
-                    .ifBlank { PrefsStore.getLogContextUsername().orEmpty() }
+                val activeKey = PrefsStore.getManualActiveUsername()?.trim()?.removePrefix("@").orEmpty()
+                val selectedKey = PrefsStore.getManualSelectedUsername()?.trim()?.removePrefix("@").orEmpty()
+                    .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
                 val keep = options.firstOrNull {
-                    it.username.equals(selected.removePrefix("@"), ignoreCase = true)
+                    it.username.equals(activeKey, ignoreCase = true)
+                } ?: options.firstOrNull {
+                    it.username.equals(selectedKey, ignoreCase = true)
                 } ?: options.first()
                 PrefsStore.setManualSelectedUsername(keep.username)
                 PrefsStore.setLogContextUsername(keep.username)
-                LogCenter.op(alias, "手动模式：已刷新云端账号 ${options.size} 个，当前选中 @${keep.username}")
+                val activeDropped = activeKey.isNotBlank() &&
+                    options.none { it.username.equals(activeKey, ignoreCase = true) }
+                if (activeDropped) {
+                    LogCenter.op(
+                        alias,
+                        "手动模式：本机当前 @$activeKey 已在云端设为不参与，已从列表移除；请切到其他账号对齐",
+                    )
+                }
+                val newUsers = options.map { it.username.trim().removePrefix("@").lowercase() }.toSet()
+                val rosterChanged = oldUsers != newUsers
+                // 账号集合变化时重建本机计划，避免继续调度已排除账号
+                if (rosterChanged && PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                    val minutes = PrefsStore.getManualAutoSwitchSlotMinutes()
+                    val rebuilt = rebuildAndStartManualLocalAutoSwitch(
+                        alias = alias,
+                        deviceId = deviceId,
+                        slotMinutes = minutes,
+                        reason = "刷新账号后同步本机计划",
+                    )
+                    if (!rebuilt) {
+                        LogCenter.op(alias, "手动模式：账号列表已更新，但本机计划重建失败，请手动点「重建计划」")
+                    }
+                }
+                LogCenter.op(
+                    alias,
+                    "手动模式：已刷新云端账号 ${options.size} 个，当前选中 @${keep.username}" +
+                        if (activeDropped) "（本机当前仍为 @$activeKey，待切号）" else "",
+                )
                 options
             }
         }
@@ -1326,11 +1595,56 @@ object AppCoordinator {
         PrefsStore.setManualSelectedUsername(u)
     }
 
-    fun manualSetFirstLoginDone(username: String, done: Boolean) {
+    /** 下拉选中账号与本机当前是否已对齐（切号完成后为 true）。 */
+    fun isManualAccountAligned(): Boolean {
+        val selected = ManualDeviceControl.selectedManualUsername()
+        val active = ManualDeviceControl.activeManualUsername()
+        if (selected.isBlank()) return false
+        return active.isNotBlank() && active.equals(selected, ignoreCase = true)
+    }
+
+    /** 仅看 busy 标记，避免 finally 中 job 尚未置空时 UI 误判仍在切号。 */
+    fun isManualSwitchBusy(): Boolean = _manualSwitchBusy.value
+
+    private fun notifyManualAccountUi() {
+        _manualAccountUiEpoch.value = _manualAccountUiEpoch.value + 1
+    }
+
+    /** 手动切号成功：还原完成 / 自动登录完成 / 登录状态检测通过 → 就绪并刷新 UI。 */
+    private fun markManualAccountReady(username: String, via: String) {
         val u = username.trim().removePrefix("@")
         if (u.isBlank()) return
-        PrefsStore.setManualFirstLoginDone(u, done)
+        PrefsStore.setManualFirstLoginDone(u, true)
+        PrefsStore.setManualActiveUsername(u)
         PrefsStore.setManualSelectedUsername(u)
+        PrefsStore.setLogContextUsername(u)
+        notifyManualAccountUi()
+        LogCenter.op(PrefsStore.getAlias(), "手动账号已就绪：@$u（$via）")
+    }
+
+    /**
+     * 手动下拉切号入口：与 [manualSwitchAccount] 相同，默认先备份本机当前号。
+     * 若目标与本机当前已相同且已就绪则直接对齐；同号未就绪则继续走还原/自动登录补齐。
+     */
+    fun manualSwitchAccountFromSpinner(targetUsername: String) {
+        val target = targetUsername.trim().removePrefix("@")
+        if (target.isBlank()) return
+        val active = ManualDeviceControl.activeManualUsername()
+        if (active.isNotBlank() && active.equals(target, ignoreCase = true)) {
+            PrefsStore.setManualSelectedUsername(target)
+            PrefsStore.setManualActiveUsername(target)
+            PrefsStore.setLogContextUsername(target)
+            if (PrefsStore.isManualFirstLoginDone(target)) {
+                updateRuntime(lastMessage = "本机已是 @$target，无需切号")
+                notifyManualAccountUi()
+                return
+            }
+            // 同号未就绪：不再早退，走还原/自动登录把就绪门闩补上
+            LogCenter.op(PrefsStore.getAlias(), "手动切号：本机已是 @$target 但未就绪，补跑还原/自动登录")
+            manualSwitchAccount(target, backupCurrentFirst = false)
+            return
+        }
+        manualSwitchAccount(target, backupCurrentFirst = true)
     }
 
     fun manualQuerySwitchStatus(username: String): ManualDeviceControl.SwitchAccountStatus {
@@ -1339,14 +1653,16 @@ object AppCoordinator {
         val deviceId = PrefsStore.getDeviceId().orEmpty()
         val cached = ManualDeviceControl.findCachedAccount(u)
         val backups = if (u.isNotBlank() && alias.isNotBlank() && deviceId.isNotBlank() && ::appContext.isInitialized) {
-            UnifiedBackupPaths.listUsernameBackupArchives(appContext, u, alias, deviceId)
+            val strict = UnifiedBackupPaths.listUsernameBackupArchives(appContext, u, alias, deviceId)
+            if (strict.isNotEmpty()) strict
+            else UnifiedBackupPaths.listLegacyBackupsForAccount(appContext, u, alias)
         } else {
             emptyList()
         }
         val firstDone = u.isNotBlank() && PrefsStore.isManualFirstLoginDone(u)
         val active = ManualDeviceControl.activeManualUsername()
         val msg = buildString {
-            append(if (firstDone) "已完成初次登录" else "未完成初次登录")
+            append(if (firstDone) "已就绪（还原/登录/状态检测完成）" else "未就绪（请先切号）")
             append(" · ")
             if (backups.isNotEmpty()) {
                 append("本机备份：${backups.first().name}")
@@ -1355,9 +1671,6 @@ object AppCoordinator {
             }
             if (active.isNotBlank()) {
                 append(" · 本机当前：@$active")
-            }
-            cached?.cloudIsLogin?.let {
-                append(if (it) " · 云端 is_login=是" else " · 云端 is_login=否")
             }
         }
         return ManualDeviceControl.SwitchAccountStatus(
@@ -1378,7 +1691,7 @@ object AppCoordinator {
             return
         }
         if (!PrefsStore.isManualFirstLoginDone(user)) {
-            LogCenter.op(PrefsStore.getAlias(), "手动涨粉：请先勾选「已完成初次登录」或点击「自动登录」")
+            LogCenter.op(PrefsStore.getAlias(), "手动涨粉：请先切号完成（有备份还原 / 无备份自动登录）")
             return
         }
         scope.launch {
@@ -1401,9 +1714,72 @@ object AppCoordinator {
         scope.launch {
             pullLoopJob?.cancel()
             pullLoopJob = null
+            forYouSwipeJob?.cancel()
+            forYouSwipeJob = null
             PrefsStore.saveLocalStatus("online")
             updateRuntime(localStatus = "online", lastMessage = reason)
             LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason")
+        }
+    }
+
+    /** 手动 For You 预滑：按指定秒数刷视频，点赞/收藏/转发与涨粉共用概率与额度。 */
+    fun manualStartForYouSwipe(totalSec: Int) {
+        if (!ManualDeviceControl.ENABLED) return
+        val user = ManualDeviceControl.selectedManualUsername()
+        if (user.isBlank()) {
+            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：请先选择账号")
+            return
+        }
+        if (!PrefsStore.isManualFirstLoginDone(user)) {
+            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：请先切号完成（有备份还原 / 无备份自动登录）")
+            return
+        }
+        if (forYouSwipeJob?.isActive == true) {
+            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：已在进行中，忽略重复点击")
+            return
+        }
+        if (isPublishPostSwitchActive() || isMutualSwitchActive() || isLiveVisitSwitchActive()) {
+            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：其它独占任务进行中，请稍后再试")
+            return
+        }
+        val sec = totalSec.coerceIn(
+            PrefsStore.MIN_MANUAL_FOR_YOU_SWIPE_SEC,
+            PrefsStore.MAX_MANUAL_FOR_YOU_SWIPE_SEC,
+        )
+        PrefsStore.setManualForYouSwipeSec(sec)
+        forYouSwipeJob = scope.launch {
+            // 与涨粉并发会互抢 TikTok：先停拉取循环
+            if (pullLoopJob?.isActive == true) {
+                LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：先暂停涨粉拉取")
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+            }
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            if (!started.get()) started.set(true)
+            PrefsStore.setLogContextUsername(user)
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = "手动 For You 预滑 ${sec}s")
+            fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+            ExecutionScope.enter()
+            val result = try {
+                LogCenter.op(PrefsStore.getAlias(), "手动模式：开始 For You 预滑（@$user · ${sec}s）")
+                executor.runForYouSwipe(sec, _config.value)
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    "For You 预滑已取消"
+                } else {
+                    LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑异常：${t.message}")
+                    "For You 预滑失败：${t.message}"
+                }
+            } finally {
+                ExecutionScope.exit()
+                forYouSwipeJob = null
+            }
+            PrefsStore.saveLocalStatus("online")
+            updateRuntime(localStatus = "online", lastMessage = result)
+            LogCenter.op(PrefsStore.getAlias(), "手动模式：$result")
         }
     }
 
@@ -1427,9 +1803,15 @@ object AppCoordinator {
         }
     }
 
-    fun manualStartPublishPost() {
+    fun manualStartPublishPost(publishCount: Int = PrefsStore.getManualPublishCount()) {
+        val count = publishCount.coerceIn(
+            PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+            PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+        )
+        PrefsStore.setManualPublishCount(count)
         enqueueManualTaskOp("publish_post_start") { alias, deviceId, pkg ->
             PrefsStore.setPublishPostPackageName(pkg)
+            PrefsStore.setPublishPostTargetCount(count)
             PrefsStore.setPublishPostRequested(true)
             PrefsStore.setPublishPostPending(true)
             DeviceOp(
@@ -1441,6 +1823,7 @@ object AppCoordinator {
                     package_name = pkg,
                     account_username = ManualDeviceControl.selectedManualUsername(),
                     source = "manual",
+                    publish_count = count,
                 ),
             )
         }
@@ -1496,21 +1879,223 @@ object AppCoordinator {
                 forceRelogin = true,
             )
             if (outcome == AccountLoginRetryOutcome.LoggedIn) {
-                PrefsStore.setManualFirstLoginDone(user, true)
-                PrefsStore.setManualActiveUsername(user)
-                PrefsStore.setManualSelectedUsername(user)
-                PrefsStore.setLogContextUsername(user)
+                markManualAccountReady(user, "手动自动登录")
+                PrefsStore.saveLocalStatus("online")
+                updateRuntime(localStatus = "online", lastMessage = "切号完成（自动登录）：@$user 已就绪")
                 LogCenter.op(alias, "手动自动登录成功：@$user")
                 maybeManualAutoGrowthAfterTask("初次自动登录完成")
             } else {
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(localStatus = "online", lastMessage = "自动登录未完成")
                 LogCenter.op(alias, "手动自动登录未完成：@$user outcome=$outcome")
+                notifyManualAccountUi()
             }
         }
     }
 
-    fun manualSwitchAccount(targetUsername: String) {
+    /**
+     * 手动「备份」：按切号同款规则打包本机当前 TikTok 数据（强停 → 目录大小检测 → tar → 校验），
+     * 不 pm clear、不还原。归属账号优先本机 active，其次下拉选中。
+     */
+    fun manualBackupCurrentAccount(usernameHint: String = "") {
+        if (!ManualDeviceControl.ENABLED) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        if (alias.isBlank() || deviceId.isBlank()) {
+            LogCenter.op(alias.ifBlank { null }, "手动备份：设备未绑定")
+            return
+        }
+        val user = usernameHint.trim().removePrefix("@")
+            .ifBlank { ManualDeviceControl.activeManualUsername() }
+            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+        if (user.isBlank()) {
+            LogCenter.op(alias, "手动备份：请先选择账号")
+            return
+        }
+        scope.launch {
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            if (!started.get()) started.set(true)
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "手动备份 @$user")
+            PrefsStore.setManualSelectedUsername(user)
+            PrefsStore.setManualActiveUsername(user)
+            PrefsStore.setLogContextUsername(user)
+            val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+            LogCenter.op(alias, "手动备份：按规则备份 @$user（仅打包，不清理）")
+            handleDeviceOp(
+                alias,
+                deviceId,
+                DeviceOp(
+                    op_id = ManualDeviceControl.newLocalManualOpId("backup"),
+                    op_type = "tiktok_backup_and_clear",
+                    payload = DeviceOpPayload(
+                        device_id = deviceId,
+                        alias = alias,
+                        package_name = pkg,
+                        username = user,
+                        source = "manual",
+                        skip_pm_clear = true,
+                    ),
+                ),
+            )
+            PrefsStore.saveLocalStatus("online")
+            val status = manualQuerySwitchStatus(user)
+            updateRuntime(localStatus = "online", lastMessage = "备份完成：${status.message}")
+            LogCenter.op(alias, "手动备份结束：@$user · ${status.message}")
+        }
+    }
+
+    /**
+     * 手动「清理」：强停后对 TikTok 执行 pm clear（不备份、不还原）。
+     */
+    fun manualClearTikTok(usernameHint: String = "") {
+        if (!ManualDeviceControl.ENABLED) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        if (alias.isBlank() || deviceId.isBlank()) {
+            LogCenter.op(alias.ifBlank { null }, "手动清理：设备未绑定")
+            return
+        }
+        val user = usernameHint.trim().removePrefix("@")
+            .ifBlank { ManualDeviceControl.activeManualUsername() }
+            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+        if (user.isBlank()) {
+            LogCenter.op(alias, "手动清理：请先选择账号")
+            return
+        }
+        scope.launch {
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            if (!started.get()) started.set(true)
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "手动清理 TikTok @$user")
+            PrefsStore.setManualSelectedUsername(user)
+            PrefsStore.setLogContextUsername(user)
+            val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+            LogCenter.op(alias, "手动清理：强停 + pm clear TikTok（@$user）")
+            handleDeviceOp(
+                alias,
+                deviceId,
+                DeviceOp(
+                    op_id = ManualDeviceControl.newLocalManualOpId("clear"),
+                    op_type = "tiktok_clear",
+                    payload = DeviceOpPayload(
+                        device_id = deviceId,
+                        alias = alias,
+                        package_name = pkg,
+                        username = user,
+                        source = "manual",
+                    ),
+                ),
+            )
+            PrefsStore.saveLocalStatus("online")
+            val status = manualQuerySwitchStatus(user)
+            updateRuntime(localStatus = "online", lastMessage = "清理完成：${status.message}")
+            LogCenter.op(
+                alias,
+                "手动清理结束：@$user · ${status.message}。清理后需重新登录，可点「自动登录」。",
+            )
+        }
+    }
+
+    /**
+     * 手动「清理并还原」：对选中账号执行 pm clear 后从本机备份包还原（不备份当前号）。
+     * 仅当该账号本机存在有效备份包时有意义。
+     */
+    fun manualClearAndRestore(usernameHint: String = "") {
+        if (!ManualDeviceControl.ENABLED) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        if (alias.isBlank() || deviceId.isBlank()) {
+            LogCenter.op(alias.ifBlank { null }, "手动清理并还原：设备未绑定")
+            return
+        }
+        val user = usernameHint.trim().removePrefix("@")
+            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+        if (user.isBlank()) {
+            LogCenter.op(alias, "手动清理并还原：请先选择账号")
+            return
+        }
+        scope.launch {
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            if (!started.get()) started.set(true)
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(localStatus = "running", lastMessage = "手动清理并还原 @$user")
+            PrefsStore.setManualSelectedUsername(user)
+            PrefsStore.setLogContextUsername(user)
+            val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+            val localBackups = UnifiedBackupPaths.listUsernameBackupArchives(appContext, user, alias, deviceId)
+            val targetBackup = localBackups.firstOrNull()
+            if (targetBackup == null) {
+                LogCenter.op(alias, "手动清理并还原：@$user 本机无备份包，已取消")
+                PrefsStore.saveLocalStatus("online")
+                updateRuntime(localStatus = "online", lastMessage = "清理并还原取消：@$user 无本机备份")
+                return@launch
+            }
+            LogCenter.op(alias, "手动清理并还原：清理后还原 @$user ← ${targetBackup.name}")
+            handleDeviceOp(
+                alias,
+                deviceId,
+                DeviceOp(
+                    op_id = ManualDeviceControl.newLocalManualOpId("clear"),
+                    op_type = "tiktok_clear",
+                    payload = DeviceOpPayload(
+                        device_id = deviceId,
+                        alias = alias,
+                        package_name = pkg,
+                        username = user,
+                        source = "manual",
+                    ),
+                ),
+            )
+            handleDeviceOp(
+                alias,
+                deviceId,
+                DeviceOp(
+                    op_id = ManualDeviceControl.newLocalManualOpId("restore"),
+                    op_type = "tiktok_restore",
+                    payload = DeviceOpPayload(
+                        device_id = deviceId,
+                        alias = alias,
+                        package_name = pkg,
+                        username = user,
+                        backup_name = targetBackup.name,
+                        backup_path = targetBackup.absolutePath,
+                        source = "manual",
+                        skip_pm_clear = true,
+                    ),
+                ),
+            )
+            PrefsStore.setManualSelectedUsername(user)
+            PrefsStore.setManualActiveUsername(user)
+            PrefsStore.setLogContextUsername(user)
+            PrefsStore.saveLocalStatus("online")
+            val status = manualQuerySwitchStatus(user)
+            updateRuntime(localStatus = "online", lastMessage = "清理并还原完成：${status.message}")
+            LogCenter.op(
+                alias,
+                "手动清理并还原结束：@$user · ${status.message}。还原后若未登录请点「自动登录」。",
+            )
+        }
+    }
+
+    /**
+     * 手动切号：可选先备份本机当前账号；
+     * 目标有备份 → 清理+还原；无备份（或还原失败）→ 清理+自动登录。
+     * @param backupCurrentFirst 默认 true：完整切号先备份当前号。
+     */
+    fun manualSwitchAccount(targetUsername: String, backupCurrentFirst: Boolean = true) {
         if (!ManualDeviceControl.ENABLED) return
         val target = targetUsername.trim().removePrefix("@")
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -1523,89 +2108,279 @@ object AppCoordinator {
             LogCenter.op(alias, "手动切号：请先选择目标账号")
             return
         }
-        scope.launch {
-            PrefsStore.setTransientPausedForDestructiveOp(false)
-            PrefsStore.setHardStopRequested(false)
-            manuallyPaused = false
-            if (!started.get()) started.set(true)
-            pullLoopJob?.cancel()
-            pullLoopJob = null
-            PrefsStore.saveLocalStatus("running")
-            updateRuntime(localStatus = "running", lastMessage = "手动切号 → @$target")
-            val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
-            // 关键：备份源必须是本机当前 active，不能用下拉选中目标（选中会在点切号前就改掉）
-            val source = ManualDeviceControl.activeManualUsername()
-            val localBackups = UnifiedBackupPaths.listUsernameBackupArchives(appContext, target, alias, deviceId)
-            val targetBackup = localBackups.firstOrNull()
-            val sameAccount = source.isNotBlank() && source.equals(target, ignoreCase = true)
-            if (sameAccount && targetBackup != null) {
-                LogCenter.op(alias, "手动切号：目标与本机当前同为 @$target 且已有备份，跳过无意义还原")
-            } else if (source.isNotBlank() && !sameAccount) {
-                LogCenter.op(alias, "手动切号：备份并清理当前账号 @$source → 目标 @$target")
-                handleDeviceOp(
-                    alias,
-                    deviceId,
-                    DeviceOp(
-                        op_id = ManualDeviceControl.newLocalManualOpId("backup"),
-                        op_type = "tiktok_backup_and_clear",
-                        payload = DeviceOpPayload(
-                            device_id = deviceId,
-                            alias = alias,
-                            package_name = pkg,
-                            username = source,
-                            source = "manual",
+        if (manualSwitchJob?.isActive == true || _manualSwitchBusy.value) {
+            LogCenter.op(alias, "手动切号：已有切号进行中，忽略重复请求 → @$target")
+            return
+        }
+        val previousActive = ManualDeviceControl.activeManualUsername()
+            .ifBlank { PrefsStore.getLogContextUsername().orEmpty().trim().removePrefix("@") }
+        PrefsStore.setManualSelectedUsername(target)
+        manualSwitchJob = scope.launch {
+            _manualSwitchBusy.value = true
+            var restoredFromBackup = false
+            /** 已对 TikTok 执行 clear/restore 后，失败不应再回滚选中到旧号。 */
+            var tikTokSwitched = false
+            try {
+                PrefsStore.setTransientPausedForDestructiveOp(false)
+                PrefsStore.setHardStopRequested(false)
+                manuallyPaused = false
+                if (!started.get()) started.set(true)
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                forYouSwipeJob?.cancel()
+                forYouSwipeJob = null
+                PrefsStore.saveLocalStatus("running")
+                updateRuntime(localStatus = "running", lastMessage = "手动切号 → @$target")
+                val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+                val source = previousActive
+                val sameAccount = source.isNotBlank() && source.equals(target, ignoreCase = true)
+                val strictBackups = UnifiedBackupPaths.listUsernameBackupArchives(appContext, target, alias, deviceId)
+                val legacyBackups = if (strictBackups.isEmpty()) {
+                    UnifiedBackupPaths.listLegacyBackupsForAccount(appContext, target, alias)
+                } else {
+                    emptyList()
+                }
+                val targetBackup = (strictBackups.ifEmpty { legacyBackups }).firstOrNull()
+
+                if (sameAccount) {
+                    if (PrefsStore.isManualFirstLoginDone(target)) {
+                        LogCenter.op(alias, "手动切号：本机已是 @$target，无需切号")
+                        PrefsStore.setManualSelectedUsername(target)
+                        PrefsStore.setManualActiveUsername(target)
+                        PrefsStore.setLogContextUsername(target)
+                        PrefsStore.saveLocalStatus("online")
+                        updateRuntime(localStatus = "online", lastMessage = "本机已是 @$target")
+                        notifyManualAccountUi()
+                        return@launch
+                    }
+                    LogCenter.op(alias, "手动切号：本机已是 @$target 但未就绪，补齐还原/自动登录")
+                }
+
+                if (backupCurrentFirst && source.isNotBlank() && !sameAccount) {
+                    LogCenter.op(alias, "手动切号：先备份当前账号 @$source")
+                    handleDeviceOp(
+                        alias,
+                        deviceId,
+                        DeviceOp(
+                            op_id = ManualDeviceControl.newLocalManualOpId("backup"),
+                            op_type = "tiktok_backup_and_clear",
+                            payload = DeviceOpPayload(
+                                device_id = deviceId,
+                                alias = alias,
+                                package_name = pkg,
+                                username = source,
+                                source = "manual_switch_pre_backup",
+                                skip_pm_clear = true,
+                            ),
                         ),
-                    ),
-                )
-            } else if (targetBackup == null) {
-                LogCenter.op(alias, "手动切号：目标无本机备份，清理 TikTok 数据后等待登录")
-                handleDeviceOp(
-                    alias,
-                    deviceId,
-                    DeviceOp(
-                        op_id = ManualDeviceControl.newLocalManualOpId("clear"),
-                        op_type = "tiktok_clear",
-                        payload = DeviceOpPayload(
-                            device_id = deviceId,
-                            alias = alias,
-                            package_name = pkg,
-                            username = target,
-                            source = "manual",
+                    )
+                    if (!lastDeviceOpOk) {
+                        error("备份当前账号 @$source 失败，已中止切号以免丢号")
+                    }
+                }
+
+                PrefsStore.setManualSelectedUsername(target)
+                PrefsStore.setLogContextUsername(target)
+
+                if (targetBackup != null) {
+                    // 有备份 → 清理 + 还原；还原失败则回退自动登录
+                    LogCenter.op(
+                        alias,
+                        buildString {
+                            append("手动切号：@$target 有备份 ${targetBackup.name}")
+                            if (strictBackups.isEmpty()) append("（旧包名兼容）")
+                            append(" → 清理后还原")
+                        },
+                    )
+                    handleDeviceOp(
+                        alias,
+                        deviceId,
+                        DeviceOp(
+                            op_id = ManualDeviceControl.newLocalManualOpId("clear"),
+                            op_type = "tiktok_clear",
+                            payload = DeviceOpPayload(
+                                device_id = deviceId,
+                                alias = alias,
+                                package_name = pkg,
+                                username = source.ifBlank { target },
+                                source = "manual",
+                            ),
                         ),
-                    ),
+                    )
+                    if (!lastDeviceOpOk) {
+                        error("清理 TikTok 失败，切号中止")
+                    }
+                    tikTokSwitched = true
+                    PrefsStore.setManualActiveUsername(target)
+                    handleDeviceOp(
+                        alias,
+                        deviceId,
+                        DeviceOp(
+                            op_id = ManualDeviceControl.newLocalManualOpId("restore"),
+                            op_type = "tiktok_restore",
+                            payload = DeviceOpPayload(
+                                device_id = deviceId,
+                                alias = alias,
+                                package_name = pkg,
+                                username = target,
+                                backup_name = targetBackup.name,
+                                backup_path = targetBackup.absolutePath,
+                                source = "manual",
+                                skip_pm_clear = true,
+                            ),
+                        ),
+                    )
+                    if (lastDeviceOpOk) {
+                        restoredFromBackup = true
+                        // 还原完成：再跑登录状态检测；通过即切号成功；需登录则保障链内自动登录
+                        updateRuntime(
+                            localStatus = "running",
+                            lastMessage = "手动切号：@$target 还原完成，登录状态检测中",
+                        )
+                        LogCenter.op(alias, "手动切号：@$target 还原成功，开始登录状态检测")
+                        val safeguardOk = launchTikTokWithLoginSafeguardWithRetry(
+                            alias = alias,
+                            deviceId = deviceId,
+                            tag = "手动切号还原后",
+                            forceStopBeforeLaunch = false,
+                            safeguardSource = "手动切号还原后",
+                            strict = true,
+                        )
+                        if (safeguardOk) {
+                            markManualAccountReady(target, "还原+登录状态检测")
+                        } else {
+                            LogCenter.op(alias, "手动切号：@$target 还原后登录状态未通过，回退自动登录")
+                            PrefsStore.setManualFirstLoginDone(target, false)
+                            updateRuntime(
+                                localStatus = "running",
+                                lastMessage = "手动切号：@$target 还原后→自动登录",
+                            )
+                            val loginOutcome = ensureAccountLoggedInWithRetry(
+                                alias = alias,
+                                deviceId = deviceId,
+                                reason = "手动切号还原后→自动登录",
+                                expectedUsername = target,
+                                resumeRunningOnSuccess = false,
+                                forceRelogin = true,
+                            )
+                            if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
+                                error("还原后登录状态未通过且自动登录 @$target 未完成（$loginOutcome）")
+                            }
+                            markManualAccountReady(target, "还原后自动登录")
+                        }
+                    } else {
+                        LogCenter.op(alias, "手动切号：@$target 还原失败，回退自动登录")
+                        PrefsStore.setManualFirstLoginDone(target, false)
+                        updateRuntime(localStatus = "running", lastMessage = "手动切号：@$target 还原失败→自动登录")
+                        val loginOutcome = ensureAccountLoggedInWithRetry(
+                            alias = alias,
+                            deviceId = deviceId,
+                            reason = "手动切号还原失败→自动登录",
+                            expectedUsername = target,
+                            resumeRunningOnSuccess = false,
+                            forceRelogin = true,
+                        )
+                        if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
+                            error("还原失败且自动登录 @$target 未完成（$loginOutcome）")
+                        }
+                        markManualAccountReady(target, "还原失败后自动登录")
+                    }
+                } else {
+                    // 无备份 → 清理 + 自动登录
+                    LogCenter.op(
+                        alias,
+                        "手动切号：@$target 无本机备份 → 清理后自动登录",
+                    )
+                    handleDeviceOp(
+                        alias,
+                        deviceId,
+                        DeviceOp(
+                            op_id = ManualDeviceControl.newLocalManualOpId("clear"),
+                            op_type = "tiktok_clear",
+                            payload = DeviceOpPayload(
+                                device_id = deviceId,
+                                alias = alias,
+                                package_name = pkg,
+                                username = target,
+                                source = "manual",
+                            ),
+                        ),
+                    )
+                    if (!lastDeviceOpOk) {
+                        error("清理 TikTok 失败，切号中止")
+                    }
+                    tikTokSwitched = true
+                    PrefsStore.setManualActiveUsername(target)
+                    PrefsStore.setManualFirstLoginDone(target, false)
+                    updateRuntime(localStatus = "running", lastMessage = "手动切号：@$target 自动登录中")
+                    val loginOutcome = ensureAccountLoggedInWithRetry(
+                        alias = alias,
+                        deviceId = deviceId,
+                        reason = "手动切号无备份→自动登录",
+                        expectedUsername = target,
+                        resumeRunningOnSuccess = false,
+                        forceRelogin = true,
+                    )
+                    if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
+                        error("自动登录 @$target 未完成（$loginOutcome）")
+                    }
+                    markManualAccountReady(target, "无备份自动登录")
+                }
+
+                PrefsStore.setManualSelectedUsername(target)
+                PrefsStore.setManualActiveUsername(target)
+                PrefsStore.setLogContextUsername(target)
+                PrefsStore.saveLocalStatus("online")
+                val status = manualQuerySwitchStatus(target)
+                updateRuntime(
+                    localStatus = "online",
+                    lastMessage = if (restoredFromBackup) {
+                        "切号完成（还原）：${status.message}"
+                    } else {
+                        "切号完成（自动登录）：${status.message}"
+                    },
                 )
+                notifyManualAccountUi()
+                LogCenter.op(
+                    alias,
+                    buildString {
+                        append("手动切号完成：@$target")
+                        append(if (restoredFromBackup) "（还原）" else "（自动登录）")
+                        append(" · ${status.message}")
+                    },
+                )
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    if (!tikTokSwitched && previousActive.isNotBlank()) {
+                        PrefsStore.setManualSelectedUsername(previousActive)
+                    } else {
+                        // 已清/还目标环境：保持选中目标，便于继续点「自动登录」
+                        PrefsStore.setManualSelectedUsername(target)
+                        PrefsStore.setManualActiveUsername(target)
+                        PrefsStore.setLogContextUsername(target)
+                    }
+                    updateRuntime(localStatus = "online", lastMessage = "手动切号已取消")
+                    LogCenter.op(alias, "手动切号已取消 → @$target")
+                    throw t
+                }
+                if (!tikTokSwitched && previousActive.isNotBlank()) {
+                    // 尚未动 TikTok（如备份失败）：回滚选中
+                    PrefsStore.setManualSelectedUsername(previousActive)
+                } else {
+                    // 已清号：保持目标选中/active，方便用户点自动登录重试
+                    PrefsStore.setManualSelectedUsername(target)
+                    PrefsStore.setManualActiveUsername(target)
+                    PrefsStore.setLogContextUsername(target)
+                }
+                PrefsStore.saveLocalStatus("online")
+                updateRuntime(localStatus = "online", lastMessage = "手动切号失败：${t.message}")
+                LogCenter.op(alias, "手动切号失败 → @$target：${t.message}")
+            } finally {
+                // 先置空 job，再清 busy，避免 UI 刷新时 job.isActive 仍为 true 导致按钮一直灰
+                manualSwitchJob = null
+                _manualSwitchBusy.value = false
+                notifyManualAccountUi()
             }
-            if (targetBackup != null && !sameAccount) {
-                LogCenter.op(alias, "手动切号：还原本机备份 ${targetBackup.name}")
-                handleDeviceOp(
-                    alias,
-                    deviceId,
-                    DeviceOp(
-                        op_id = ManualDeviceControl.newLocalManualOpId("restore"),
-                        op_type = "tiktok_restore",
-                        payload = DeviceOpPayload(
-                            device_id = deviceId,
-                            alias = alias,
-                            package_name = pkg,
-                            username = target,
-                            backup_name = targetBackup.name,
-                            backup_path = targetBackup.absolutePath,
-                            source = "manual",
-                        ),
-                    ),
-                )
-            }
-            PrefsStore.setManualSelectedUsername(target)
-            PrefsStore.setManualActiveUsername(target)
-            PrefsStore.setLogContextUsername(target)
-            PrefsStore.saveLocalStatus("online")
-            val status = manualQuerySwitchStatus(target)
-            updateRuntime(localStatus = "online", lastMessage = "切号完成：${status.message}")
-            LogCenter.op(
-                alias,
-                "手动切号完成：@$target（首次登录=${status.firstLoginDone}，本机备份=${status.localBackupExists}）。" +
-                    "已登录请勾选「已完成初次登录」；未登录请点「自动登录」。不会自动登录。",
-            )
         }
     }
 
@@ -1626,7 +2401,7 @@ object AppCoordinator {
             return
         }
         if (!PrefsStore.isManualFirstLoginDone(user)) {
-            LogCenter.op(alias, "手动$label：请先勾选「已完成初次登录」或完成「自动登录」")
+            LogCenter.op(alias, "手动$label：请先切号完成（有备份还原 / 无备份自动登录）")
             return
         }
         scope.launch {
@@ -1659,6 +2434,177 @@ object AppCoordinator {
         }
         LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason → 自动进入涨粉")
         manualStartGrowth("$reason → 自动涨粉")
+    }
+
+    /** 开启本机自动切号自治：按当前账号列表生成计划并启动调度。 */
+    fun manualEnableLocalAutoSwitch(slotMinutes: Int = PrefsStore.getManualAutoSwitchSlotMinutes()) {
+        if (!ManualDeviceControl.ENABLED) return
+        val minutes = ManualAutoSwitchPlanBuilder.normalizeSlotMinutes(slotMinutes)
+        PrefsStore.setManualAutoSwitchSlotMinutes(minutes)
+        scope.launch {
+            val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (deviceId.isBlank() || alias.isBlank()) {
+                LogCenter.op(alias.ifBlank { null }, "本机自动切号：请先绑定设备")
+                PrefsStore.setManualLocalAutoSwitchEnabled(false)
+                return@launch
+            }
+            if (shouldHonorUserHardStop()) {
+                LogCenter.op(alias, "本机自动切号：当前硬停中，已取消开启")
+                PrefsStore.setManualLocalAutoSwitchEnabled(false)
+                return@launch
+            }
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            PrefsStore.setManualLocalAutoSwitchEnabled(true)
+            val ok = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = minutes,
+                reason = "APP 开启本机自动切号",
+            )
+            if (!ok || shouldHonorUserHardStop() || !PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                PrefsStore.setManualLocalAutoSwitchEnabled(false)
+                if (ok && shouldHonorUserHardStop()) {
+                    autoSwitchLocalScheduler.stop(clearState = true)
+                    PrefsStore.clearAutoSwitchSessionContext()
+                    LogCenter.op(alias, "本机自动切号：开启过程中遇到硬停，已回滚")
+                }
+                updateRuntime(lastMessage = "本机自动切号启动失败或已取消")
+                return@launch
+            }
+            if (!WorkerServiceTracker.isRunning) {
+                runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "manual_local_auto_switch") }
+            }
+            PrefsStore.saveLocalStatus("running")
+            updateRuntime(
+                localStatus = "running",
+                hardStopRequested = false,
+                lastMessage = "本机自动切号已开启（每号 ${minutes} 分钟）",
+            )
+            LogCenter.op(alias, "本机自动切号已开启：每号 ${minutes} 分钟，按账号列表轮转")
+            maybeStartGrowthInAutoSwitchIdle("本机自动切号开启")
+        }
+    }
+
+    /** 关闭本机自动切号自治；可同时进入硬停。 */
+    fun manualDisableLocalAutoSwitch(alsoHardStop: Boolean = false) {
+        if (!ManualDeviceControl.ENABLED) return
+        scope.launch {
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+            val wasLocalSession =
+                ManualAutoSwitchPlanBuilder.isLocalSessionId(PrefsStore.getAutoSwitchSessionId())
+            PrefsStore.setManualLocalAutoSwitchEnabled(false)
+            when {
+                wasLocalSession &&
+                    deviceId.isNotBlank() &&
+                    alias.isNotBlank() &&
+                    PrefsStore.isAutoSwitchAutonomousMode() ->
+                    performAutoSwitchExitShutdown(alias, deviceId, eventId = 0, exitSessionId = "")
+                PrefsStore.isAutoSwitchAutonomousMode() || PrefsStore.getAutoSwitchMode() == "exiting" ->
+                    clearOrphanedAutoSwitchAfterManualDisable("APP 关闭遗留自治")
+                else ->
+                    clearOrphanedAutoSwitchAfterManualDisable("APP 关闭")
+            }
+            if (alsoHardStop) {
+                // 退出收尾可能改写 lastMessage / localStatus，硬停标志再盖一次。
+                applyUserGracefulHardStopFlags(alias.ifBlank { null })
+            } else if (!shouldHonorUserHardStop()) {
+                LogCenter.op(alias.ifBlank { null }, "本机自动切号已关闭")
+                updateRuntime(lastMessage = "本机自动切号已关闭")
+            }
+        }
+    }
+
+    /** 按当前账号列表与时段分钟数重建本机计划（保持开启状态）。 */
+    fun manualRebuildLocalAutoSwitchPlan(slotMinutes: Int = PrefsStore.getManualAutoSwitchSlotMinutes()) {
+        if (!ManualDeviceControl.ENABLED) return
+        val minutes = ManualAutoSwitchPlanBuilder.normalizeSlotMinutes(slotMinutes)
+        PrefsStore.setManualAutoSwitchSlotMinutes(minutes)
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            manualEnableLocalAutoSwitch(minutes)
+            return
+        }
+        scope.launch {
+            val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+            val alias = PrefsStore.getAlias()?.trim().orEmpty()
+            if (deviceId.isBlank() || alias.isBlank()) {
+                LogCenter.op(alias.ifBlank { null }, "重建本机计划：请先绑定设备")
+                return@launch
+            }
+            if (shouldHonorUserHardStop()) {
+                LogCenter.op(alias, "重建本机计划：硬停中，已跳过")
+                return@launch
+            }
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            val ok = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = minutes,
+                reason = "APP 重建本机计划",
+            )
+            if (ok && !shouldHonorUserHardStop() && PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                updateRuntime(lastMessage = "本机计划已重建（每号 ${minutes} 分钟）")
+                maybeStartGrowthInAutoSwitchIdle("本机计划重建")
+            }
+        }
+    }
+
+    private suspend fun rebuildAndStartManualLocalAutoSwitch(
+        alias: String,
+        deviceId: String,
+        slotMinutes: Int,
+        reason: String,
+    ): Boolean {
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return false
+        if (shouldHonorUserHardStop()) return false
+        val accounts = ManualDeviceControl.getCachedAccounts()
+        if (accounts.isEmpty()) {
+            LogCenter.op(alias, "本机自动切号失败：请先拉取云端账号列表")
+            return false
+        }
+        val bundle = runCatching {
+            ManualAutoSwitchPlanBuilder.buildBundle(
+                context = appContext,
+                accounts = accounts,
+                slotMinutes = slotMinutes,
+                alias = alias,
+                deviceId = deviceId,
+                previousSessionId = PrefsStore.getAutoSwitchSessionId(),
+                previousRevision = PrefsStore.getAutoSwitchBundleRevision(),
+            )
+        }.onFailure { err ->
+            LogCenter.op(alias, "本机计划生成失败：${err.message}")
+        }.getOrNull() ?: return false
+
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled() || shouldHonorUserHardStop()) return false
+
+        val sessionId = bundle.session_id?.trim().orEmpty()
+        val revision = bundle.revision ?: 1
+        PrefsStore.saveAutoSwitchSessionContext(sessionId, revision)
+        AutoSwitchLedger.restoreFromPrefs()
+        AutoSwitchLedger.startSession(sessionId, bundleRevision = revision)
+        PrefsStore.setAutoSwitchPendingSummaryUpload(false)
+        if (autoSwitchLocalScheduler.isRunning()) {
+            autoSwitchLocalScheduler.stop(clearState = false)
+        }
+        applyAutoSwitchBundle(alias, deviceId, bundle, revision)
+        if (!PrefsStore.isManualLocalAutoSwitchEnabled() || shouldHonorUserHardStop()) {
+            autoSwitchLocalScheduler.stop(clearState = true)
+            PrefsStore.clearAutoSwitchSessionContext()
+            LogCenter.op(alias, "【自动切号】$reason：启动后检测到关闭/硬停，已回滚")
+            return false
+        }
+        LogCenter.op(
+            alias,
+            "【自动切号】$reason：本机计划已生效 accounts=${accounts.size} " +
+                "slotMin=$slotMinutes revision=$revision slots=${AutoSwitchLocalPlanStore.get()?.slots?.size ?: 0}",
+        )
+        autoSwitchLocalScheduler.requestImmediateTick()
+        return true
     }
 
     // endregion
@@ -2399,12 +3345,12 @@ object AppCoordinator {
                     continue
                 }
 
-                // 手动模式：未勾选「已完成初次登录」时不自动登录，等用户点「自动登录」或中途 OCR 触发。
+                // 手动模式：未就绪时不自动登录；须先切号（有备份还原 / 无备份自动登录）或点「自动登录」重试。
                 if (ManualDeviceControl.ENABLED) {
                     val currentUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
                         .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
                     if (currentUser.isBlank() || !PrefsStore.isManualFirstLoginDone(currentUser)) {
-                        updateRuntime(lastMessage = "手动模式：请先勾选已完成初次登录，或点击「自动登录」")
+                        updateRuntime(lastMessage = "手动模式：请先切号完成（有备份还原 / 无备份自动登录）")
                         delay(2_000)
                         continue
                     }
@@ -3686,6 +4632,7 @@ object AppCoordinator {
 
     /**
      * 登录已就绪（自动登录成功 / 云端 is_login=是 / 登录状态保障通过）且云端「基本资料已修改」=否 时衔接改资料。
+     * 手动模式（android-simple）禁止一切自动触发：仅人点「修改基本资料」经 [manualStartEditBasicProfile] 下发 local-manual OP。
      * @param loginVerified 调用方已确认登录就绪时设为 true（避免 mark is_login 上报尚未落库导致误判）。
      */
     private suspend fun maybeRunPendingBasicProfileEditAfterLoginVerified(
@@ -3696,6 +4643,10 @@ object AppCoordinator {
         skipOuterWarmup: Boolean = false,
         loginVerified: Boolean = false,
     ): Boolean {
+        if (ManualDeviceControl.ENABLED) {
+            // 登录保障 / 涨粉 / 切号后会频繁路过；静默跳过，避免刷屏
+            return false
+        }
         if (basicProfileEditRunning) {
             LogCenter.op(alias, "[OP][$parentOpId] 改资料已在执行中，跳过（trigger=$trigger）")
             return false
@@ -4067,7 +5018,7 @@ object AppCoordinator {
         }
     }
 
-    /** 切号还原阶段备份包缺失：记入 ledger 并改走 exclusive 自动登录。 */
+    /** 切号还原阶段备份包缺失/损坏：记入 ledger 并改走 exclusive 自动登录。 */
     private suspend fun handleCutSwitchMissingBackupFallback(
         alias: String,
         deviceId: String,
@@ -4077,9 +5028,12 @@ object AppCoordinator {
         cloudBackupName: String,
         phase: String,
         internalDetail: String = "",
+        userMessageOverride: String = "",
     ) {
         val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
-        val userMessage = cutSwitchMissingBackupUserMessage(restoreUsername)
+        val userMessage = userMessageOverride.trim().ifBlank {
+            cutSwitchMissingBackupUserMessage(restoreUsername)
+        }
         AutoSwitchLedger.recordCutSwitchMissingBackup(
             username = restoreUsername,
             slotKey = slotKey,
@@ -4091,7 +5045,7 @@ object AppCoordinator {
             opId = opId,
             opType = "tiktok_restore",
             status = "failed",
-            message = "备份包本机不存在，已改走自动登录",
+            message = userMessage,
             slotKey = slotKey,
             username = restoreUsername,
             reportData = buildMap {
@@ -4099,6 +5053,9 @@ object AppCoordinator {
                 put("username", restoreUsername)
                 put("backup_name", cloudBackupName)
                 put("cut_switch_missing_backup_fallback", true)
+                if (phase.contains("corrupt")) {
+                    put("cut_switch_corrupt_backup_fallback", true)
+                }
                 put("internal_detail", internalDetail.take(500))
                 payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let {
                     put("auto_switch_slot_key", it)
@@ -4887,10 +5844,10 @@ object AppCoordinator {
         if (ManualDeviceControl.ENABLED) {
             val user = ManualDeviceControl.selectedManualUsername()
             if (user.isBlank() || !PrefsStore.isManualFirstLoginDone(user)) {
-                LogCenter.op(alias, "$taskLabel：手动模式未完成初次登录，请先点「自动登录」或勾选已完成")
+                LogCenter.op(alias, "$taskLabel：手动模式未就绪，请先切号（有备份还原 / 无备份自动登录）")
                 return false
             }
-            // 已完成初次登录：不在入口主动跑自动登录；任务中途 OCR 掉登录再触发。
+            // 已就绪：不在入口主动跑自动登录；任务中途 OCR 掉登录再触发。
             return true
         }
         val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
@@ -4940,10 +5897,10 @@ object AppCoordinator {
             val user = expectedUser?.trim().orEmpty()
                 .ifBlank { ManualDeviceControl.selectedManualUsername() }
             if (user.isBlank() || !PrefsStore.isManualFirstLoginDone(user)) {
-                LogCenter.op(alias, "发作品：手动模式未完成初次登录，中止发布独占阶段")
+                LogCenter.op(alias, "发作品：手动模式未就绪，请先切号（有备份还原 / 无备份自动登录）")
                 return false
             }
-            // 初次登录已完成：不在入口主动跑自动登录；OCR 掉登录由后续保障触发。
+            // 已就绪：不在入口主动跑自动登录；OCR 掉登录由后续保障触发。
         } else if (!isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = expectedUser)) {
             when (
                 ensureAccountLoggedInWithRetry(
@@ -5069,6 +6026,13 @@ object AppCoordinator {
             when (executor.runLoginSafeguardMeasure(appContext, source)) {
                 LoginSafeguardOutcome.Ready -> {
                     LogCenter.op(alias, "登录状态保障($source)：界面可继续，已回 Home")
+                    if (ManualDeviceControl.ENABLED) {
+                        val u = ManualDeviceControl.activeManualUsername()
+                            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                        if (u.isNotBlank()) {
+                            markManualAccountReady(u, "登录状态检测通过($source)")
+                        }
+                    }
                     if (!deferBasicProfileEdit) {
                         maybeRunPendingBasicProfileEditAfterLoginVerified(
                             alias = alias,
@@ -5084,7 +6048,7 @@ object AppCoordinator {
                 LoginSafeguardOutcome.RequiresAutoLogin -> {
                     LogCenter.op(alias, "登录状态保障($source)：界面需登录，启动自动登录")
                     val opId = "safeguard_${System.currentTimeMillis()}"
-                    ensureAccountLoggedIn(
+                    val ok = ensureAccountLoggedIn(
                         alias = alias,
                         deviceId = deviceId,
                         opId = opId,
@@ -5094,6 +6058,14 @@ object AppCoordinator {
                         resumeFromLoginEntryScreen = true,
                         deferBasicProfileEdit = deferBasicProfileEdit,
                     )
+                    if (ok && ManualDeviceControl.ENABLED) {
+                        val u = ManualDeviceControl.activeManualUsername()
+                            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                        if (u.isNotBlank()) {
+                            markManualAccountReady(u, "登录状态保障自动登录($source)")
+                        }
+                    }
+                    ok
                 }
                 LoginSafeguardOutcome.Failed -> {
                     LogCenter.op(alias, "登录状态保障($source)：执行失败")
@@ -5102,7 +6074,7 @@ object AppCoordinator {
             }
         } catch (logout: LoginSafeguardRequiresAutoLoginException) {
             LogCenter.op(alias, "登录状态保障($source)：OCR 见 Add another account，从登录入口续接自动登录")
-            ensureAccountLoggedIn(
+            val ok = ensureAccountLoggedIn(
                 alias = alias,
                 deviceId = deviceId,
                 opId = "safeguard_add_account_${System.currentTimeMillis()}",
@@ -5112,10 +6084,16 @@ object AppCoordinator {
                 resumeFromLoginEntryScreen = true,
                 deferBasicProfileEdit = deferBasicProfileEdit,
             )
+            if (ok && ManualDeviceControl.ENABLED) {
+                val u = ManualDeviceControl.activeManualUsername()
+                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+            }
+            ok
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
             executor.setAccountStatusReloginInProgress(true)
-            ensureAccountLoggedIn(
+            val ok = ensureAccountLoggedIn(
                 alias = alias,
                 deviceId = deviceId,
                 opId = "safeguard_acct_status_${System.currentTimeMillis()}",
@@ -5124,6 +6102,12 @@ object AppCoordinator {
                 forceRelogin = true,
                 deferBasicProfileEdit = deferBasicProfileEdit,
             )
+            if (ok && ManualDeviceControl.ENABLED) {
+                val u = ManualDeviceControl.activeManualUsername()
+                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+            }
+            ok
         }
     }
 
@@ -5526,6 +6510,18 @@ object AppCoordinator {
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (deviceId.isBlank() || alias.isBlank()) return false
+        if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            val ok = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
+                reason = "本机周计划滚动刷新",
+            )
+            if (ok) {
+                maybeStartGrowthInAutoSwitchIdle("本机周计划刷新")
+            }
+            return ok
+        }
         val revision = PrefsStore.getAutoSwitchBundleRevision()
         val outcome = fetchAutoSwitchBundleFromCloud(alias, deviceId, "周计划刷新")
         if (!outcome.loaded || outcome.bundle == null) {
@@ -5905,6 +6901,15 @@ object AppCoordinator {
         if (kind == "daily") {
             AutoSwitchAccountActivityTracker.reopenAfterReconcileIfNeeded()
         }
+        // simple 本机会话：不依赖云端会话总结，本地收尾即可。
+        if (
+            ManualDeviceControl.ENABLED &&
+            ManualAutoSwitchPlanBuilder.isLocalSessionId(PrefsStore.getAutoSwitchSessionId())
+        ) {
+            LogCenter.op(alias, AutoSwitchLedger.buildOneLineSummary(alias, kind, reconcile))
+            LogCenter.op(alias, "【自动切号】本机会话总结已本地收尾（不上报云端）")
+            return true
+        }
         val summary = AutoSwitchLedger.toSummaryRequest(
             alias = alias,
             deviceId = deviceId,
@@ -5959,6 +6964,7 @@ object AppCoordinator {
     }
 
     private suspend fun handleDeviceOp(alias: String, deviceId: String, op: DeviceOp) {
+        lastDeviceOpOk = false
         val opId = op.op_id
         val payloadEarly = op.payload
         if (ManualDeviceControl.shouldIgnoreCloudTaskOp(op.op_type, opId)) {
@@ -5975,6 +6981,7 @@ object AppCoordinator {
                     "manual_mode_ignored" to true,
                 ),
             )
+            lastDeviceOpOk = true
             return
         }
         if (
@@ -6639,6 +7646,23 @@ object AppCoordinator {
             }
 
             "tiktok_edit_basic_profile" -> {
+                if (ManualDeviceControl.ENABLED && !ManualDeviceControl.isLocalManualOpId(opId)) {
+                    opLog("手动模式：改资料仅允许本机「修改基本资料」按钮触发，已忽略")
+                    reportDeviceOpToCloud(
+                        deviceId = deviceId,
+                        alias = alias,
+                        opId = opId,
+                        status = "success",
+                        message = "设备手动模式：改资料仅允许本机按钮触发",
+                        data = mapOf(
+                            "op_type" to "tiktok_edit_basic_profile",
+                            "device_id" to deviceId,
+                            "manual_mode_button_only" to true,
+                        ),
+                    )
+                    lastDeviceOpOk = true
+                    return@handleDeviceOp
+                }
                 opStep("修改基本资料：拉取配置")
                 val cfgOk = fetchConfig()
                 if (!cfgOk) opLog("配置拉取失败，沿用上一版")
@@ -6871,7 +7895,7 @@ object AppCoordinator {
                             break
                         }
                     }
-                    lastRatioTapOk = runSu("input tap $rtx $rty")
+                    lastRatioTapOk = executor.navBackThenTapProfile(alias, "修改基本资料外轮资料入口", rtx, rty)
 
                     if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
                         opLog("外轮$outer：准备阶段未就绪，重试")
@@ -7077,6 +8101,7 @@ object AppCoordinator {
                     },
                     data = clearReport,
                 )
+                lastDeviceOpOk = clearOk
                 if (!clearOk && isCutSwitch && retryUntilSuccess) {
                     notifyAutoSwitchCutSwitchStepFailed(payload)
                 }
@@ -7175,12 +8200,14 @@ object AppCoordinator {
                     if (retryUntilSuccess && attempt > 1) {
                         opStep(cutStepLabel("切号重试 第${attempt}轮"))
                     } else {
-                        opStep(cutStepLabel(if (isCutSwitch) "切号：开始备份当前账号" else "开始备份并清理"))
+                        opStep(cutStepLabel(if (isCutSwitch) "切号：开始备份当前账号" else if (payload?.skip_pm_clear == true) "开始备份" else "开始备份并清理"))
                         if (isCutSwitch) {
                             opStep(cutStepLabel("备份账号：@$reportUsername"))
                             if (suppressLocalAutoSwitchUiLog) {
                                 LogCenter.op(alias, "【切号】备份 @$reportUsername")
                             }
+                        } else if (payload?.skip_pm_clear == true) {
+                            opStep(cutStepLabel("备份账号：@$reportUsername（仅打包）"))
                         }
                     }
 
@@ -7211,6 +8238,7 @@ object AppCoordinator {
                     backupSkipped = stopOk &&
                         (dataDirKb == null || dataDirKb < DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP)
 
+                    val backupOnly = payload?.skip_pm_clear == true
                     val backupOk = if (!stopOk) {
                         false
                     } else if (backupSkipped) {
@@ -7238,6 +8266,25 @@ object AppCoordinator {
                                 )
                             }
                             true
+                        } else if (backupOnly && payload?.source == "manual_switch_pre_backup") {
+                            // 手动下拉切号前备份：空号/未登录数据过小，跳过打包并继续切号（无可丢数据）
+                            opStep(
+                                cutStepLabel(
+                                    "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，跳过打包备份（切号前无可保数据）",
+                                ),
+                            )
+                            LogCenter.op(
+                                alias,
+                                "手动切号：@${reportUsername.ifBlank { "?" }} TikTok 数据过小（${dataDirKb ?: 0}KB），跳过备份继续切号",
+                            )
+                            true
+                        } else if (backupOnly) {
+                            opStep(
+                                cutStepLabel(
+                                    "数据目录 ${dataDirKb ?: 0}KB < ${DeviceBackupShell.MIN_DATA_DIR_KB_FOR_BACKUP}KB，仅备份失败（未生成包）",
+                                ),
+                            )
+                            false
                         } else {
                             opStep(
                                 cutStepLabel(
@@ -7317,6 +8364,10 @@ object AppCoordinator {
 
                     val clearOk = if (backupOk) {
                         when {
+                            payload?.skip_pm_clear == true -> {
+                                opStep(cutStepLabel("仅备份：跳过 pm clear"))
+                                true
+                            }
                             isCutSwitch && !backupSkipped -> {
                                 val (verified, verifyMsg) = UnifiedBackupPaths.verifyLocalBackupArchive(
                                     context = appContext,
@@ -7427,14 +8478,31 @@ object AppCoordinator {
                     when {
                         !ok -> if (isCutSwitch) {
                             lastCutSwitchFailureReason.ifBlank { "切号步骤失败" }
+                        } else if (payload?.skip_pm_clear == true) {
+                            "备份失败"
                         } else {
                             "备份或清理失败"
                         }
-                        backupSkipped -> "数据过小已跳过备份，清理完成"
+                        backupSkipped -> if (payload?.skip_pm_clear == true) {
+                            if (payload.source == "manual_switch_pre_backup") {
+                                "数据过小已跳过备份"
+                            } else {
+                                "备份失败（数据过小）"
+                            }
+                        } else {
+                            "数据过小已跳过备份，清理完成"
+                        }
                         isCutSwitch -> "切号步骤完成"
+                        payload?.skip_pm_clear == true -> "备份完成"
                         else -> "备份并清理完成"
                     },
-                    if (isCutSwitch) "切号步骤失败" else "备份或清理失败",
+                    if (isCutSwitch) {
+                        "切号步骤失败"
+                    } else if (payload?.skip_pm_clear == true) {
+                        "备份失败"
+                    } else {
+                        "备份或清理失败"
+                    },
                 )
 
                 val reportBackupRecordId = payload?.backup_record_id
@@ -7480,6 +8548,7 @@ object AppCoordinator {
                     },
                     data = reportData,
                 )
+                lastDeviceOpOk = ok
                 if (ok && isCutSwitch) {
                     payload?.auto_switch_slot_key?.trim()?.takeIf { it.isNotEmpty() }?.let { sk ->
                         AutoSwitchLocalPlanStore.markCutSwitchBackupClearDone(sk, backupSkipped = backupSkipped)
@@ -7524,6 +8593,7 @@ object AppCoordinator {
                 }
                 var restoreOk = false
                 var attempt = 0
+                var corruptDiscardCount = 0
                 var resolvedBackupName = backupNameHint
                 var resolvedBackupPath = backupPathHint.ifBlank {
                     if (backupNameHint.isNotBlank()) {
@@ -7650,10 +8720,108 @@ object AppCoordinator {
                         runSu("test -f $qBackupPath")
                     }
 
+                    val integrityLabel =
+                        if (skipPmClear) restoreStepLabel("第2.5步：校验备份包完整性") else "第3.5步：校验备份包完整性"
+                    val integrityOk = backupExists && runRestoreShellStep(::opStep, integrityLabel) {
+                        probeBackupArchiveIntegrity(runSu, backupPath)
+                    }
+                    if (backupExists && !integrityOk) {
+                        if (corruptDiscardCount >= 5) {
+                            recordCutSwitchFailure(
+                                "备份包损坏已删除次数过多（@$restoreUsername），停止还原",
+                            )
+                            if (isAutoSwitchCutSwitchRestore(payload, skipPmClear) &&
+                                restoreUsername.isNotBlank()
+                            ) {
+                                handleCutSwitchMissingBackupFallback(
+                                    alias = alias,
+                                    deviceId = deviceId,
+                                    opId = opId,
+                                    payload = payload,
+                                    restoreUsername = restoreUsername,
+                                    cloudBackupName = backupNameHint.ifBlank { backupName },
+                                    phase = "restore_corrupt_limit",
+                                    internalDetail = "corrupt discard limit: $backupPath",
+                                    userMessageOverride = cutSwitchCorruptBackupUserMessage(restoreUsername),
+                                )
+                                return@handleDeviceOp
+                            }
+                            break
+                        }
+                        corruptDiscardCount++
+                        when (
+                            discardCorruptRestoreBackupAndMaybeFallback(
+                                alias = alias,
+                                deviceId = deviceId,
+                                opId = opId,
+                                payload = payload,
+                                skipPmClear = skipPmClear,
+                                restoreUsername = restoreUsername,
+                                backupName = backupName,
+                                backupPath = backupPath,
+                                cloudBackupName = backupNameHint.ifBlank { backupName },
+                                runSu = runSu,
+                                phase = "restore_corrupt_precheck",
+                                onFailure = ::recordCutSwitchFailure,
+                            )
+                        ) {
+                            null -> return@handleDeviceOp
+                            true -> continue
+                            false -> break
+                        }
+                    }
+
                     val restoreDataLabel =
                         if (skipPmClear) restoreStepLabel("第3步：恢复账号数据") else "第4步：恢复账号数据"
-                    val restoreDataOk = backupExists && runRestoreShellStep(::opStep, restoreDataLabel) {
+                    val restoreDataOk = integrityOk && runRestoreShellStep(::opStep, restoreDataLabel) {
                         runSu("tar -xzf $qBackupPath -C /data/data")
+                    }
+                    if (integrityOk && !restoreDataOk &&
+                        !probeBackupArchiveIntegrity(runSu, backupPath)
+                    ) {
+                        if (corruptDiscardCount >= 5) {
+                            recordCutSwitchFailure(
+                                "备份包损坏已删除次数过多（@$restoreUsername），停止还原",
+                            )
+                            if (isAutoSwitchCutSwitchRestore(payload, skipPmClear) &&
+                                restoreUsername.isNotBlank()
+                            ) {
+                                handleCutSwitchMissingBackupFallback(
+                                    alias = alias,
+                                    deviceId = deviceId,
+                                    opId = opId,
+                                    payload = payload,
+                                    restoreUsername = restoreUsername,
+                                    cloudBackupName = backupNameHint.ifBlank { backupName },
+                                    phase = "restore_corrupt_limit",
+                                    internalDetail = "corrupt after tar: $backupPath",
+                                    userMessageOverride = cutSwitchCorruptBackupUserMessage(restoreUsername),
+                                )
+                                return@handleDeviceOp
+                            }
+                            break
+                        }
+                        corruptDiscardCount++
+                        when (
+                            discardCorruptRestoreBackupAndMaybeFallback(
+                                alias = alias,
+                                deviceId = deviceId,
+                                opId = opId,
+                                payload = payload,
+                                skipPmClear = skipPmClear,
+                                restoreUsername = restoreUsername,
+                                backupName = backupName,
+                                backupPath = backupPath,
+                                cloudBackupName = backupNameHint.ifBlank { backupName },
+                                runSu = runSu,
+                                phase = "restore_corrupt_after_tar",
+                                onFailure = ::recordCutSwitchFailure,
+                            )
+                        ) {
+                            null -> return@handleDeviceOp
+                            true -> continue
+                            false -> break
+                        }
                     }
 
                     val permissionLabel =
@@ -7739,6 +8907,8 @@ object AppCoordinator {
                                 alias = alias,
                                 deviceId = deviceId,
                             )
+                        !integrityOk ->
+                            "备份包损坏（gzip/tar 完整性校验失败）：$backupName"
                         !restoreDataOk ->
                             "第3步 tar 解压失败：$backupPath → /data/data（包可能损坏或 root 权限不足）"
                         !permissionOk ->
@@ -7760,6 +8930,11 @@ object AppCoordinator {
                             cloudBackupName = backupNameHint.ifBlank { backupName },
                             phase = "restore_retry_guard",
                             internalDetail = failReason,
+                            userMessageOverride = if (isCutSwitchCorruptBackupFailure(failReason)) {
+                                cutSwitchCorruptBackupUserMessage(restoreUsername)
+                            } else {
+                                ""
+                            },
                         )
                         return@handleDeviceOp
                     }
@@ -7812,8 +8987,26 @@ object AppCoordinator {
                     },
                     data = restoreReport,
                 )
+                lastDeviceOpOk = restoreOk
                 if (skipPmClear) {
-                    if (restoreOk) {
+                    val isLocalManualRestore =
+                        ManualDeviceControl.isLocalManualOpId(opId) ||
+                            payload?.source?.trim().orEmpty().startsWith("manual")
+                    if (isLocalManualRestore) {
+                        // 手动切号还原：只负责清/还，成功与否由调用方（manualSwitchAccount）收尾。
+                        // 绝不可走 finishCutSwitchAfterSuccess（会因云端 is_login=否再跑自动登录，看起来像「没还原却登录」）。
+                        if (restoreOk) {
+                            LogCenter.op(
+                                alias,
+                                "手动还原完成：@${restoreUsername.ifBlank { "?" }} ← $resolvedBackupName（不触发切号后自动登录）",
+                            )
+                        } else {
+                            LogCenter.op(
+                                alias,
+                                "手动还原失败：@${restoreUsername.ifBlank { "?" }} ← $resolvedBackupName（${lastCutSwitchFailureReason.ifBlank { "见 OP 日志" }}）",
+                            )
+                        }
+                    } else if (restoreOk) {
                         finishCutSwitchAfterSuccess(
                             alias,
                             deviceId,
@@ -8627,6 +9820,14 @@ object AppCoordinator {
         profileEditTrigger: String,
         skipAccountDbUpdate: Boolean = false,
     ) {
+        // android-simple：改资料只允许人点「修改基本资料」按钮（local-manual OP），禁止一切自动衔接。
+        if (ManualDeviceControl.ENABLED) {
+            LogCenter.op(
+                alias,
+                "[OP][$parentOpId] 手动模式：跳过自动改资料（trigger=$profileEditTrigger），仅按钮可触发",
+            )
+            return
+        }
         val profileOpId = "${parentOpId}_profile_${System.currentTimeMillis()}"
         val profileAccount = resolveAssignedAccount(alias, deviceId)
         val profileUsernameAtStart = profileAccount?.username?.trim().orEmpty()
@@ -8894,7 +10095,7 @@ object AppCoordinator {
                             break
                         }
                     }
-                    lastRatioTapOk = runSu("input tap $rtx $rty")
+                    lastRatioTapOk = executor.navBackThenTapProfile(alias, "切号后改资料外轮资料入口", rtx, rty)
 
                     if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
                         opLog("外轮$outer：准备阶段未就绪，重试")
@@ -9556,8 +10757,28 @@ object AppCoordinator {
     /**
      * 用户从主界面请求「硬停」：不在协程安全点外杀进程；通过 [TraceExecutor] 内硬停检查在合适位置结束；
      * 暂停用户名拉取；保留 [startCheckLoop] 与设备指令轮询；并向云端同步 paused + 关闭本机「自动开启程序」。
+     * simple 本机自治开启时：硬停**暂停**调度并清运行时脏数据，保留计划文件与 APP 开关；
+     * 「启动后台服务」再按持久化计划续跑。
      */
     fun requestUserGracefulHardStop() {
+        if (ManualDeviceControl.ENABLED) {
+            val alias = PrefsStore.getAlias()
+            when {
+                PrefsStore.isManualLocalAutoSwitchEnabled() -> {
+                    LogCenter.op(alias, "硬停：暂停本机自动切号自治并清理运行时脏数据（保留计划文件）")
+                    pauseManualLocalAutoSwitchForHardStop()
+                }
+                PrefsStore.isAutoSwitchAutonomousMode() -> {
+                    // APP 开关已关但仍遗留 mode=on/exiting：彻底清掉，避免硬停后自愈打架。
+                    LogCenter.op(alias, "硬停：清理遗留自动切号自治状态")
+                    scope.launch {
+                        clearOrphanedAutoSwitchAfterManualDisable("硬停清理遗留")
+                    }
+                }
+            }
+            applyUserGracefulHardStopFlags(alias)
+            return
+        }
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
             val alias = PrefsStore.getAlias()
             if (alias != null) {
@@ -9566,8 +10787,53 @@ object AppCoordinator {
             updateRuntime(lastMessage = "自动切号自治中：硬停不可用")
             return
         }
+        applyUserGracefulHardStopFlags(PrefsStore.getAlias())
+    }
+
+    /**
+     * 硬停暂停本机自动切号：停调度、取消在途插入/登录恢复、清运行时脏 prefs；
+     * **不**清计划文件 / session / APP 开关，便于点击开始按本地计划续跑。
+     */
+    private fun pauseManualLocalAutoSwitchForHardStop() {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        cancelAutoSwitchBundleRetry()
+        autoSwitchLoginRecoveryJob?.cancel()
+        autoSwitchLoginRecoveryJob = null
+        growthModeLoginSafeguardPending = false
+        if (isPublishPostSwitchActive()) {
+            publishPostSwitchJob?.cancel()
+            publishPostSwitchJob = null
+        }
+        if (isMutualSwitchActive()) {
+            mutualSwitchJob?.cancel()
+            mutualSwitchJob = null
+        }
+        if (isLiveVisitSwitchActive()) {
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
+        }
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        autoSwitchLocalScheduler.stop(clearState = false)
+        PrefsStore.clearAutoSwitchInsertionDirtyPrefs()
+        AutoSwitchLocalPlanStore.clearActivePublish()
+        AutoSwitchLocalPlanStore.clearActiveMutual()
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PublishPostGrowthGate.exitExclusivePublishPhase()
+        executor.clearAccountStatusReloginState()
+        ExecutionScope.forceClearIfStuck("硬停暂停本机自动切号")
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】硬停已暂停本机自治：已清登录/发作品/互点运行时脏数据，计划文件保留；点击开始可按计划续跑",
+            )
+        }
+        updateRuntime(lastMessage = "硬停：本机自动切号已暂停（计划保留）")
+    }
+
+    private fun applyUserGracefulHardStopFlags(alias: String?) {
         val deviceId = PrefsStore.getDeviceId()
-        val alias = PrefsStore.getAlias()
         PrefsStore.setHardStopRequested(true)
         val publishAccountKey =
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias?.trim().orEmpty()

@@ -79,9 +79,9 @@ data class AppConfig(
     // For You 预滑阶段，每条视频执行点赞（双击屏幕）的概率
     val for_you_like_prob: Double = 0.0,
     // For You 预滑阶段，每条视频观看时长最小值（秒）
-    val for_you_watch_min_sec: Double = 2.0,
+    val for_you_watch_min_sec: Double = 3.0,
     // For You 预滑阶段，每条视频观看时长最大值（秒）
-    val for_you_watch_max_sec: Double = 5.0,
+    val for_you_watch_max_sec: Double = 12.0,
     // direct 模式：点击左侧首条作品后，等待多久开始互动（毫秒）
     val direct_post_action_delay_ms: Long = 1500L,
     // 各模式通用：进入用户主页后，按一定概率不点击作品，直接按“无作品/私密”同样的跳过方案处理

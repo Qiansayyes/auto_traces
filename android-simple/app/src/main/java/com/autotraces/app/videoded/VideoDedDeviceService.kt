@@ -172,10 +172,16 @@ class VideoDedDeviceService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
+        // 必须打开「视频传输/投屏」页，不能走 LAUNCHER（MainActivity），否则用户会回到主流程「初始化」态。
+        val openIntent = Intent(this, VideoDedMainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
         val open = PendingIntent.getActivity(
             this,
             0,
-            packageManager.getLaunchIntentForPackage(packageName),
+            openIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)

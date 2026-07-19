@@ -165,6 +165,15 @@ interface TraceExecutor {
     ): ProfileEditEntryPreparationResult
 
     /**
+     * 凡要点击底栏 Profile / 资料入口时的统一动作：先导航返回一次，间隔约 1s 后再点坐标。
+     *
+     * 目的：TikTok 偶发「正在加载」类弹窗会挡住底栏点击，导致点 Profile 无效；
+     * 返回一次可关掉该弹窗。若当前没有这类弹窗，首页上返回一次页面不变，可安全执行。
+     * 返回→点 Profile 间隔约 1s，给弹窗关闭留出稳定时间。
+     */
+    suspend fun navBackThenTapProfile(alias: String, reason: String, tapX: Int, tapY: Int): Boolean
+
+    /**
      * 假定 TikTok 已在前台且刚完成「资料入口」比例点点击：OCR 严格找「Edit」坐标→点击「Edit」→
      * OCR 在同一屏分别找「Change photo」「Name」「Bio」三词坐标并写日志（不点击）→
      * 同屏再严格找「Change photo」并首击（若无则整屏专段 OCR）→
@@ -304,7 +313,8 @@ class RealTraceExecutor(
             val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
             val (vision, err) = mlKitRecognizeFullScreen(service, "$reason-precheck")
             if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
-                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前已是主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}），直接继续发作品")
+                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前已是主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}），连点 Home 确认后继续发作品")
+                confirmCleanForYouByTappingHome(service, alias, reason, vision)
                 return PublishPostEntryRecoveryResult.AlreadyReady
             }
             if (vision == null) {
@@ -318,8 +328,30 @@ class RealTraceExecutor(
             devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：回首页成功，紧接着继续发作品")
             return PublishPostEntryRecoveryResult.RecoveredByBack
         }
-        devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：导航返回回首页未成功，改按原方案强关重启")
+        // 外层兜底前再验一次：已见底栏 = 已回 For You，只连点 Home，禁止「回首页失败 → 再强关」叠重启
+        if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
+            val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+            val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-fallback-precheck")
+            if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                devOp(
+                    alias,
+                    "${publishPostRecoveryScopeLabel(reason)}：回首页返回 false 但已见底栏 Home+Profile，" +
+                        "连点 Home 确认后继续（外层不再强关）",
+                )
+                confirmCleanForYouByTappingHome(service, alias, reason, vision)
+                return PublishPostEntryRecoveryResult.AlreadyReady
+            }
+        }
+        devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：导航返回回首页未成功且未见底栏，改按原方案强关重启")
         return if (restartTikTokForRecovery(skipDontAllowOcr = true)) {
+            // 冷启成功后再验：已见底栏只连点 Home，绝不再叠一次强关
+            if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
+                val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+                val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-after-restart")
+                if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                    confirmCleanForYouByTappingHome(service, alias, reason, vision)
+                }
+            }
             devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：重启兜底成功，紧接着继续发作品")
             PublishPostEntryRecoveryResult.RecoveredByRestart
         } else {
@@ -926,12 +958,33 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS = 2_000L
         /** 进入创作流后 OCR「Continue」最多次数；均未命中则跳过，不判失败。 */
         private const val PUBLISH_POST_CONTINUE_OCR_MAX_PASSES = 3
+        /**
+         * 单次比例点点击后，OCR「CREATE/POST」的最多次数。
+         * 目的：确认创作页是否已出现；连续未命中 = 创作页未就绪（未跳转成功，或被加载弹窗挡住）。
+         */
+        private const val PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES = 3
+        /**
+         * 下方中间资料比例点的点击次数上限（含首次与复点）。
+         * 目的：
+         * 1) 第 1 次点后 OCR 仍无 CREATE/POST → 导航返回消「正在加载」弹窗（无弹窗时返回通常不改页）→ 再点第 2 次；
+         * 2) 第 2 次仍无 → 本函数内立刻强关重启 TikTok，供上层重新开始当前作品。
+         */
+        private const val PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS = 2
         /** 点击相册（Recents→Pictures）前：可能连续出现的权限弹窗轮数（每轮尝试 OCR 点 Don't allow）。 */
         private const val PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_POPUP_ROUNDS = 2
         /** 每轮 Don't allow OCR 最多次数；均未命中跳过，不判失败。 */
         private const val PUBLISH_POST_PRE_GALLERY_DONT_ALLOW_OCR_PASSES = 3
-        /** 右下固定点后探测「Recents」最多次数（仅识别不点击）。 */
-        private const val PUBLISH_POST_RECENTS_OCR_MAX_PASSES = 3
+        /**
+         * Recents / Pictures 相册选择：整段（找 Recents→点开→选 Pictures→验跳转）外层最多次数。
+         * 相册列表动画偏慢，5×1s 比原先 3×0.7s 更稳。
+         */
+        private const val PUBLISH_POST_RECENTS_OCR_MAX_PASSES = 5
+        private const val PUBLISH_POST_RECENTS_OCR_RETRY_DELAY_MS = 1000L
+        /** 点 Pictures 后：校验「原 Recents 位已变为 Pictures」/ 补点 Pictures / 补点 Recents 的轮数。 */
+        private const val PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES = 5
+        private const val PUBLISH_POST_PICTURES_JUMP_VERIFY_DELAY_MS = 800L
+        /** 判定「原 Recents 位置已是 Pictures」时，中心点允许的最大像素距离（约 8% 屏高另算）。 */
+        private const val PUBLISH_POST_PICTURES_NEAR_RECENTS_MAX_DIST_PX = 120
         /** 未见 Recents 时备用入口 X = 屏宽 / 12。 */
         private const val PUBLISH_POST_LAYOUT_B_FALLBACK_X_DIVISOR = 12
         /** 布局 A/B 试探点击后 OCR「Allow all」最多次数（未命中不点击；不判失败）。 */
@@ -940,11 +993,19 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_ALLOW_ALL_MAX_CLICKS = 2
         /** 图库点选素材后等待界面稳定，再 OCR「Next」。 */
         private const val PUBLISH_POST_AFTER_GALLERY_DELAY_MS = 1000L
-        /** 第一次定位 Next：全屏 OCR 最多次数（均未命中则本条失败）。 */
+        /**
+         * 选图后首次定位 Next：全屏 OCR 最多次数（均未命中则本条失败）。
+         * 素材缩略图/转码偶发慢，5×1s；命中后坐标复用，不再反复重定位。
+         */
         private const val PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES = 5
-        /** 第一次 Next OCR 相邻两次间隔（毫秒，含随机）。 */
-        private const val PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MIN_MS = 500L
-        private const val PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MAX_MS = 1000L
+        private const val PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MS = 1000L
+        /** 每次点击 Next 后等待再 OCR（判断是否仍有 Next / 是否已见 add description）。 */
+        private const val PUBLISH_POST_NEXT_CHAIN_AFTER_TAP_DELAY_MS = 3000L
+        /** 选图→文案屏：复用同一 Next 坐标连续点击的上限（含首次）。 */
+        private const val PUBLISH_POST_NEXT_CHAIN_MAX_TAPS = 6
+        /** 文案屏 OCR「(add) description」定位最多次数。 */
+        private const val PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES = 5
+        private const val PUBLISH_POST_ADD_DESCRIPTION_OCR_RETRY_DELAY_MS = 800L
         /** 文案屏顶部 Post：bbox 中心 Y ≤ 屏高×本比例视为「屏幕上方」（用于与中部工具栏 Post 区分）。 */
         private const val PUBLISH_POST_CAPTION_TOP_POST_MAX_CENTER_Y_FRACTION = 0.28f
         /** For You 预滑：每累计滑动该次数后做一次底栏 OCR（Home / Profile）。 */
@@ -963,6 +1024,17 @@ class RealTraceExecutor(
         private const val RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS = 2
         /** 导航返回后等待 UI 稳定再 OCR（毫秒）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_DELAY_MS = 520L
+        /**
+         * [navBackThenTapProfile]：返回关掉「正在加载」弹窗后，到点 Profile 的间隔。
+         * 无弹窗时返回本身不改页面。
+         */
+        private const val PROFILE_TAP_AFTER_BACK_DELAY_MS = 1000L
+        /**
+         * 已见底栏 Home+Profile 时：连续点 Home 次数以确认干净 For You。
+         * 严禁因此路径强关重启 TikTok。
+         */
+        private const val RECOVER_HOME_CONFIRM_HOME_TAP_COUNT = 3
+        private const val RECOVER_HOME_CONFIRM_HOME_TAP_DELAY_MS = 450L
         /** 发作品全部完成后的收尾：OCR 点底栏 Home（顺手处理 Don't allow）。 */
         private const val PUBLISH_POST_FINAL_HOME_TAP_MAX_PASSES = 8
         private const val PUBLISH_POST_FINAL_HOME_TAP_RETRY_DELAY_MS = 500L
@@ -1410,9 +1482,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 优先 [navBack] 回首页（底栏 Home+Profile 同见视为已回首页，不强关）；
-     * 导航返回过程中 OCR 已见底栏 Home+Profile 时，再执行最后一次返回（搜索/内页也可能误命中底栏）；
-     * 首次 OCR 已见底栏 Home+Profile 则判定可能仍在搜索/内页，未按返回键，改为强关重启；
+     * 优先 [navBack] 回首页；底栏 Home+Profile 同见 = 已回首页：只连续点 Home 确认干净 For You，**绝不因此强关**。
      * 每次按返回前若 dumpsys 判定 TikTok 非前台，不再空按返回，优先重新打开 TikTok（不强停）；
      * 连续返回 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS] 次后再次校验（返回可能已退出应用）；
      * 重开失败再 fallback 强关重启。
@@ -1426,6 +1496,68 @@ class RealTraceExecutor(
     private fun markSkipForYouWarmupAfterRecoverHome(alias: String) {
         skipForYouWarmupOnNextUsername = true
         devOp(alias, "回首页恢复成功，下一名涨粉将跳过 For You 预滑")
+    }
+
+    /**
+     * 已见底栏 Home+Profile 时：连续点 Home 若干次，确认落在干净 For You。
+     * 本函数不得触发强关重启；点不到也不升格为重启。
+     * @return 是否至少成功点到一次 Home（供日志；调用方在已确认主 Feed 时仍应视为恢复成功）
+     */
+    private suspend fun confirmCleanForYouByTappingHome(
+        service: Context,
+        alias: String,
+        reason: String,
+        initialVision: Text? = null,
+    ): Boolean {
+        val dm = service.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        var vision = initialVision
+        var tapped = 0
+        for (i in 1..RECOVER_HOME_CONFIRM_HOME_TAP_COUNT) {
+            if (hardStopOrNull(alias, "$reason·连点Home")) return tapped > 0
+            if (i > 1) {
+                if (!growthDelay(alias, RECOVER_HOME_CONFIRM_HOME_TAP_DELAY_MS, "$reason·连点Home间隔")) {
+                    return tapped > 0
+                }
+                vision = null
+            }
+            if (vision == null) {
+                val (next, err) = mlKitRecognizeFullScreen(service, "recover_home_tap_$i")
+                if (next == null) {
+                    devOp(alias, "$reason：连点 Home 第 $i/$RECOVER_HOME_CONFIRM_HOME_TAP_COUNT 次 OCR 失败：$err")
+                    if (isMlKitHardStopError(err)) return tapped > 0
+                    continue
+                }
+                vision = next
+            }
+            val hit =
+                findBottomBandHomeTabHit(vision, h)
+                    ?: findBottomBandExactLabelHit(vision, h, "Home")
+                    ?: findBottomBandLabelContaining(vision, h, "home")
+            if (hit == null) {
+                devOp(alias, "$reason：连点 Home 第 $i/$RECOVER_HOME_CONFIRM_HOME_TAP_COUNT 次未命中底栏 Home")
+                vision = null
+                continue
+            }
+            val tap = coerceTapToScreen(hit.point, w, h)
+            if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                tapped++
+                devOp(
+                    alias,
+                    "$reason：连点 Home 第 $i/$RECOVER_HOME_CONFIRM_HOME_TAP_COUNT 次已点 (${tap.x},${tap.y})",
+                )
+            } else {
+                devOp(alias, "$reason：连点 Home 第 $i/$RECOVER_HOME_CONFIRM_HOME_TAP_COUNT 次点击失败")
+            }
+            vision = null
+        }
+        if (tapped > 0) {
+            devOp(alias, "$reason：已连点 Home ${tapped} 次确认 For You（不强制重启）")
+        } else {
+            devOp(alias, "$reason：主 Feed 已确认但未能点到 Home，仍视为已回首页（不强制重启）")
+        }
+        return tapped > 0
     }
 
     /** 抢占回首页/重搜互斥；失败时已打日志。 */
@@ -1475,14 +1607,13 @@ class RealTraceExecutor(
         val ctx = service.applicationContext
         val blockForceRestart = PrefsStore.peekGrowthContinueFromPublishHome()
         if (!ensureTikTokInForeground(ctx, alias, "$reason·回首页", allowForceRestart = !blockForceRestart)) {
-            devOp(alias, "$reason：TikTok 非前台，未按返回键，改为强关重启")
+            // ensure 在允许强关时内部已尝试过 restartTikTokForRecovery；此处禁止再叠一次强关
             if (blockForceRestart) {
                 devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
-                return false
+            } else {
+                devOp(alias, "$reason：TikTok 前台未确认（ensure 已尽力含强关），放弃回首页（不再二次强关）")
             }
-            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
-            }
+            return false
         }
 
         val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
@@ -1544,6 +1675,7 @@ class RealTraceExecutor(
                 devOp(alias, "$reason：TikTok 已重新打开，校验是否已在主 Feed")
                 when (evaluateRecoverHomeOcr("reopen", passLabel)) {
                     RecoverHomeOcrOutcome.OnMainFeed -> {
+                        confirmCleanForYouByTappingHome(service, alias, reason)
                         markSkipForYouWarmupAfterRecoverHome(alias)
                         return true
                     }
@@ -1561,22 +1693,21 @@ class RealTraceExecutor(
                 devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启")
                 return false
             }
-            return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-                if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+            val restarted = restartTikTokForRecovery(skipDontAllowOcr)
+            if (restarted) {
+                confirmCleanForYouByTappingHome(service, alias, reason)
+                markSkipForYouWarmupAfterRecoverHome(alias)
             }
+            return restarted
         }
 
         when (val precheck = evaluateRecoverHomeOcr("precheck", "首次 OCR 前")) {
             RecoverHomeOcrOutcome.OnMainFeed -> {
-                devOp(
-                    alias,
-                    "$reason：OCR 已见底栏 Home+Profile（搜索/内页也可能命中），未按返回键，" +
-                        if (blockForceRestart) "发作品刚完成后跳过硬关重启" else "改为强关重启",
-                )
-                if (blockForceRestart) return false
-                return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-                    if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
-                }
+                // 已见底栏 = 干净 For You：只连点 Home，严禁再强关（曾误判搜索/内页导致重启完又重启）
+                devOp(alias, "$reason：OCR 已见底栏 Home+Profile，连点 Home 确认 For You（不强关重启）")
+                confirmCleanForYouByTappingHome(service, alias, reason)
+                markSkipForYouWarmupAfterRecoverHome(alias)
+                return true
             }
             RecoverHomeOcrOutcome.HardStop -> return false
             RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -1611,32 +1742,10 @@ class RealTraceExecutor(
             )?.let { return it }
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
-                    devOp(
-                        alias,
-                        "$reason：第 $pass 次导航返回后 OCR 已见回首页信息，再执行最后一次返回",
-                    )
-                    if (hardStopOrNull(alias, reason)) return false
-                    navBack(alias, "$reason 回首页·最后一次返回（第 $pass 次已命中）")
-                    backsCompleted += 1
-                    if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·最后一次返回后")) {
-                        return false
-                    }
-                    reopenTikTokIfNotForegroundDuringRecover(
-                        "最后一次返回后",
-                        backsCompleted,
-                        requireMinBacks = true,
-                    )?.let { return it }
-                    when (evaluateRecoverHomeOcr("final_back_$pass", "最后一次返回")) {
-                        RecoverHomeOcrOutcome.HardStop -> return false
-                        RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
-                        RecoverHomeOcrOutcome.OnMainFeed,
-                        RecoverHomeOcrOutcome.NotOnMainFeed,
-                        -> {
-                            devOp(alias, "$reason：最后一次返回完成，导航返回回首页恢复成功（未强关 TikTok）")
-                            markSkipForYouWarmupAfterRecoverHome(alias)
-                            return true
-                        }
-                    }
+                    devOp(alias, "$reason：第 $pass 次导航返回后 OCR 已见底栏 Home+Profile，连点 Home 确认（不强关）")
+                    confirmCleanForYouByTappingHome(service, alias, reason)
+                    markSkipForYouWarmupAfterRecoverHome(alias)
+                    return true
                 }
                 RecoverHomeOcrOutcome.HardStop -> return false
                 RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -1650,9 +1759,13 @@ class RealTraceExecutor(
                 if (blockForceRestart) "发作品刚完成后跳过硬关重启" else "改为强关重启",
         )
         if (blockForceRestart) return false
-        return restartTikTokForRecovery(skipDontAllowOcr).also { ok ->
-            if (ok) markSkipForYouWarmupAfterRecoverHome(alias)
+        val restarted = restartTikTokForRecovery(skipDontAllowOcr)
+        if (restarted) {
+            // 冷启后若已见底栏：只连点 Home，禁止「重启成功 → 再见底栏 → 再强关」
+            confirmCleanForYouByTappingHome(service, alias, reason)
+            markSkipForYouWarmupAfterRecoverHome(alias)
         }
+        return restarted
     }
 
     private data class StrictLabelHit(val point: Point, val rect: Rect)
@@ -3186,25 +3299,103 @@ class RealTraceExecutor(
         findStrictExactAcrossAdjacentLines(vision, "Verify identity") != null
             || findLabelHitContainingIgnoreCase(vision, "verify identity") != null
 
-    private fun visionHasIdentityMethodSelectionPage(vision: Text): Boolean {
-        if (!visionHasBeforeYouContinueText(vision)) return false
-        return visionHasVerifyIdentityTitle(vision)
-            || findLabelHitContainingIgnoreCase(vision, "verify it's really you") != null
+    /** 「Verify it's really you」标题（OCR 可能丢撇号 / 折行）。 */
+    private fun visionHasVerifyItsReallyYouTitle(vision: Text): Boolean =
+        findLabelHitContainingIgnoreCase(vision, "verify it's really you") != null
             || findLabelHitContainingIgnoreCase(vision, "verify its really you") != null
+            || findLabelHitContainingIgnoreCaseRelaxed(vision, "verify it's really you") != null
+            || findLabelHitContainingIgnoreCaseRelaxed(vision, "verify its really you") != null
+            || findStrictExactAcrossAdjacentLines(vision, "Verify it's really you") != null
+            || findStrictExactAcrossAdjacentLines(vision, "Verify its really you") != null
+            || (
+                findLabelHitContainingIgnoreCaseRelaxed(vision, "really you") != null &&
+                    findLabelHitContainingIgnoreCase(vision, "verify") != null
+                )
+
+    /**
+     * 身份验证方式选择页（Verify it's really you）：
+     * - Email + access these → 点 Email 接码
+     * - Password + access these → 点 Password，跳转后输密码
+     * - 旧版：Before you continue + Verify identity
+     * 切勿仅因标题含 Verify 当成验证码页去等 Resend。
+     */
+    private fun visionHasIdentityMethodSelectionPage(vision: Text): Boolean {
+        // 已是验证码输入页
+        if (findLabelHitContainingIgnoreCase(vision, "resend code") != null ||
+            findLabelHitContainingIgnoreCase(vision, "enter 6-digit") != null ||
+            findLabelHitContainingIgnoreCase(vision, "6-digit code") != null
+        ) {
+            return false
+        }
+        val hasAccessThese = findLabelHitContainingIgnoreCase(vision, "access these") != null
+        val hasEmail = findIdentityMethodEmailHit(vision) != null
+        val hasPassword = findAllPasswordLabelHits(vision).isNotEmpty()
+        val hasChooseMethod = findLabelHitContainingIgnoreCase(vision, "choose a method") != null
+        if (visionHasBeforeYouContinueText(vision)) {
+            return visionHasVerifyIdentityTitle(vision) || visionHasVerifyItsReallyYouTitle(vision)
+        }
+        // Password + Can't access these? → 点 Password
+        if (hasPassword && hasAccessThese) return true
+        // Email + Can't access these? → 点 Email
+        if (hasEmail && hasAccessThese) return true
+        if (visionHasVerifyItsReallyYouTitle(vision)) {
+            return hasEmail || hasAccessThese || hasChooseMethod || hasPassword
+        }
+        return hasChooseMethod && (hasEmail || hasPassword)
     }
 
-    private fun visionHasIdentityCodeEntryPage(vision: Text): Boolean =
-        visionHasVerifyIdentityTitle(vision) &&
-            (
-                findLabelHitContainingIgnoreCase(vision, "enter 6-digit code") != null
-                    || findLabelHitContainingIgnoreCase(vision, "6-digit code") != null
-                    || findLabelHitContainingIgnoreCase(vision, "digit code") != null
-                    || findLabelHitContainingIgnoreCase(vision, "send code") != null
-                    || findLabelHitContainingIgnoreCase(vision, "resend code") != null
-                )
+    /** 方式页：Password 选项卡片（与布局 C「输入框」区分：先点卡片再跳转输密）。 */
+    private fun findIdentityMethodPasswordHit(vision: Text): StrictLabelHit? =
+        findStrictExactLabelHit(vision, "Password")
+            ?: findStrictExactLabelHit(vision, "password")
+            ?: findAllPasswordLabelHits(vision).firstOrNull()
+
+    private fun visionHasPasswordAccessTheseMethod(vision: Text): Boolean =
+        findAllPasswordLabelHits(vision).isNotEmpty() &&
+            findLabelHitContainingIgnoreCase(vision, "access these") != null
+
+    private fun visionHasEmailAccessTheseMethod(vision: Text): Boolean =
+        findIdentityMethodEmailHit(vision) != null &&
+            findLabelHitContainingIgnoreCase(vision, "access these") != null
+
+    /** 输密/接码成功后：上滑屏幕上半部分。 */
+    private suspend fun autoLoginSwipeUpperHalfAfterAuth(
+        alias: String,
+        w: Int,
+        h: Int,
+        label: String,
+    ): Boolean {
+        val x = (w * 0.5f).toInt().coerceIn(1, (w - 1).coerceAtLeast(1))
+        val startY = (h * 0.42f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        val endY = (h * 0.12f).toInt().coerceIn(1, (h - 1).coerceAtLeast(1))
+        if (hardStopOrNull(alias, "自动登录-$label 上滑")) return false
+        devOp(alias, "自动登录：$label 后上滑上半屏（swipe $x,$startY → $x,$endY）")
+        runSuCommand("input swipe $x $startY $x $endY 480")
+        return autoLoginDelay(alias, 500L, "$label 上滑后")
+    }
+
+    private fun visionHasIdentityCodeEntryPage(vision: Text): Boolean {
+        val hasCodeCue =
+            findLabelHitContainingIgnoreCase(vision, "enter 6-digit code") != null
+                || findLabelHitContainingIgnoreCase(vision, "6-digit code") != null
+                || findLabelHitContainingIgnoreCase(vision, "digit code") != null
+                || findLabelHitContainingIgnoreCase(vision, "send code") != null
+                || findLabelHitContainingIgnoreCase(vision, "resend code") != null
+        if (!hasCodeCue) return false
+        return visionHasVerifyIdentityTitle(vision)
+            || visionHasVerifyItsReallyYouTitle(vision)
+            || findLabelHitContainingIgnoreCase(vision, "verify") != null
+    }
 
     private fun visionIdentityVerificationBlocking(vision: Text): Boolean =
         visionHasIdentityMethodSelectionPage(vision) || visionHasIdentityCodeEntryPage(vision)
+
+    /** 验证方式页：Email 卡片 / Outlook 邮箱行。 */
+    private fun findIdentityMethodEmailHit(vision: Text): StrictLabelHit? =
+        findTopmostOutlookEmailHit(vision)
+            ?: findStrictExactLabelHit(vision, "Email")
+            ?: findStrictExactLabelHit(vision, "email")
+            ?: findLabelHitContainingIgnoreCase(vision, "outlook.com")
 
     /** 验证方式页：取最靠上的 Outlook 邮箱行。 */
     private fun findTopmostOutlookEmailHit(vision: Text): StrictLabelHit? {
@@ -3279,6 +3470,30 @@ class RealTraceExecutor(
         return email to apiUrl
     }
 
+    /** 身份验证 / 方式页点 Password 时取 TikTok 密码。 */
+    private suspend fun resolveInlineVerificationPassword(alias: String): String? {
+        val deviceId = PrefsStore.getDeviceId()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val devAlias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val resp: DeviceAssignedAccountResponse? = if (PrefsStore.isAutoSwitchAutonomousMode()) {
+            AutoSwitchBundleHolder.resolveAssignedAccount(
+                logContextUsername = PrefsStore.getLogContextUsername(),
+            )
+        } else {
+            try {
+                withContext(Dispatchers.IO) {
+                    ApiService.getDeviceAssignedAccount(deviceId, devAlias)
+                }.takeIf { it.code == 0 }
+            } catch (_: Exception) {
+                null
+            }
+        }
+        return resp?.password?.trim()?.takeIf { it.isNotEmpty() }.also {
+            if (it == null) {
+                devOp(alias, "身份验证：未获取到 TikTok password（Password 方式页无法输密）")
+            }
+        }
+    }
+
     private suspend fun identityVerifyTapOutlookAndNext(
         ctx: Context,
         alias: String,
@@ -3287,19 +3502,36 @@ class RealTraceExecutor(
         vision: Text,
         tagPrefix: String,
     ): Boolean {
-        val outlookHit = findTopmostOutlookEmailHit(vision) ?: run {
-            devOp(alias, "身份验证：未 OCR 到 Outlook 邮箱行")
+        val emailHit = findIdentityMethodEmailHit(vision) ?: run {
+            val preview = buildProfileEditOcrPreview(vision, maxLines = 40).take(600)
+            val hasPassword = findIdentityMethodPasswordHit(vision) != null
+            devOp(
+                alias,
+                "身份验证：未 OCR 到 Email/Outlook 选项（hasPassword=$hasPassword）；OCR=$preview",
+            )
             return false
         }
-        var tap = coerceTapToScreen(outlookHit.point, w, h)
-        devOp(alias, "身份验证：点 Outlook (${tap.x},${tap.y})")
+        var tap = coerceTapToScreen(emailHit.point, w, h)
+        devOp(alias, "身份验证：点 Email/Outlook (${tap.x},${tap.y})")
         if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
-        if (!identityVerifyDelay(alias, 500L, "Outlook 后")) return false
+        if (!identityVerifyDelay(alias, 500L, "Email/Outlook 后")) return false
+
+        // 「Verify it's really you」卡片点击后通常直接进入验证码页，无需再点 Next。
+        if (!visionHasBeforeYouContinueText(vision)) {
+            return true
+        }
+
         for (pass in 1..4) {
             if (pass > 1 && !identityVerifyDelay(alias, INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS, "定位 Next")) {
                 return false
             }
             val nextVision = identityVerifyOcrOnce(ctx, alias, "${tagPrefix}_next_$pass") ?: continue
+            if (visionHasIdentityCodeEntryPage(nextVision) ||
+                findLabelHitContainingIgnoreCase(nextVision, "resend code") != null
+            ) {
+                devOp(alias, "身份验证：点 Email 后已进入验证码页，跳过 Next")
+                return true
+            }
             val nextHit = findStrictExactLabelHit(nextVision, "Next")
                 ?: findStrictExactLabelHit(nextVision, "next")
                 ?: findBottommostStrictExactLabelHit(nextVision, "Next")
@@ -3322,28 +3554,40 @@ class RealTraceExecutor(
     ): Boolean {
         for (redo in 0..INLINE_IDENTITY_VERIFY_OUTLOOK_NEXT_REDO_MAX) {
             for (poll in 1..INLINE_IDENTITY_VERIFY_WAIT_GONE_MAX_POLLS) {
-                if (poll > 1 && !identityVerifyDelay(alias, INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS, "等 Before you continue 消失")) {
+                if (poll > 1 && !identityVerifyDelay(alias, INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS, "等验证方式页消失")) {
                     return false
                 }
                 val vision = identityVerifyOcrOnce(ctx, alias, "${tagPrefix}_gone_${redo}_$poll") ?: continue
-                val beforeGone = !visionHasBeforeYouContinueText(vision)
+                val methodGone = !visionHasIdentityMethodSelectionPage(vision)
                 val codePage = visionHasIdentityCodeEntryPage(vision)
-                if (beforeGone && codePage) {
-                    devOp(alias, "身份验证：Before you continue 已消失，已进入验证码页")
+                    || findLabelHitContainingIgnoreCase(vision, "resend code") != null
+                    || findLabelHitContainingIgnoreCase(vision, "send code") != null
+                if (methodGone && codePage) {
+                    devOp(alias, "身份验证：验证方式页已消失，已进入验证码页")
                     return true
                 }
             }
             if (redo >= INLINE_IDENTITY_VERIFY_OUTLOOK_NEXT_REDO_MAX) break
-            devOp(alias, "身份验证：Before you continue 仍在，第 ${redo + 1} 次重试 Outlook+Next")
             val vision = identityVerifyOcrOnce(ctx, alias, "${tagPrefix}_redo_vision_$redo") ?: continue
+            if (visionHasPasswordAccessTheseMethod(vision) ||
+                (
+                    findIdentityMethodPasswordHit(vision) != null &&
+                        findIdentityMethodEmailHit(vision) == null
+                    )
+            ) {
+                devOp(alias, "身份验证：方式页仍在且见 Password，第 ${redo + 1} 次改点 Password")
+                // 交给上层；此处返回 false 让 Core 重新分流更清晰——直接返回 true 表示「可转 Password」
+                return false
+            }
+            devOp(alias, "身份验证：验证方式页仍在，第 ${redo + 1} 次重试 Email/Outlook")
             if (!identityVerifyTapOutlookAndNext(ctx, alias, w, h, vision, "${tagPrefix}_redo_$redo")) {
                 continue
             }
-            if (!identityVerifyDelay(alias, INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS, "重试 Outlook+Next 后")) {
+            if (!identityVerifyDelay(alias, INLINE_IDENTITY_VERIFY_OCR_INTERVAL_MS, "重试 Email/Outlook 后")) {
                 return false
             }
         }
-        devOp(alias, "身份验证：等待 Before you continue 消失超时")
+        devOp(alias, "身份验证：等待验证方式页消失超时")
         return false
     }
 
@@ -3411,7 +3655,8 @@ class RealTraceExecutor(
             autoLoginTapVerificationCodeField(ctx, alias, w, h, focusVision)
             autoLoginClearFocusedInput(alias)
             if (!autoLoginInputText(alias, code)) return false
-            return identityVerifyDelay(alias, 400L, "验证码输入后")
+            if (!identityVerifyDelay(alias, 400L, "验证码输入后")) return false
+            return autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "身份验证码")
         }
 
         val firstCode = fetchCodeOrNull()
@@ -3432,6 +3677,7 @@ class RealTraceExecutor(
                 return false
             }
             val vision = identityVerifyOcrOnce(ctx, alias, "${tagPrefix}_after_code_$ocrPass") ?: continue
+            autoLoginLogPostCodePageOcr(alias, "身份验证-验证码后", ocrPass, vision, h)
             if (!visionIdentityVerificationBlocking(vision)) {
                 devOp(alias, "$phaseLog：验证页已消失，身份验证完成")
                 return true
@@ -3479,6 +3725,91 @@ class RealTraceExecutor(
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
+        val safeTag = fileTag
+            ?.filter { it.isLetterOrDigit() || it == '_' }
+            ?.take(48)
+            ?.ifEmpty { "inline" }
+            ?: "inline"
+
+        var vision = identityVerifyOcrOnce(ctx, alias, "identity_verify_${safeTag}_entry") ?: triggerVision
+
+        // Password + access these：点 Password 输密（即使同页没有 Email，也绝不能只找 Email）
+        if (visionHasPasswordAccessTheseMethod(vision) ||
+            (
+                visionHasIdentityMethodSelectionPage(vision) &&
+                    findIdentityMethodPasswordHit(vision) != null &&
+                    findIdentityMethodEmailHit(vision) == null
+                )
+        ) {
+            val password = resolveInlineVerificationPassword(alias)
+            if (password.isNullOrBlank()) {
+                devOp(alias, "$phaseLog：见 Password 方式页，但 password 为空")
+                return false
+            }
+            devOp(alias, "$phaseLog：见验证方式页 Password（含 access these 或无 Email），点 Password 输密")
+            return autoLoginEnterPasswordLayoutAccessThese(
+                ctx, alias, w, h, password, "identity_${safeTag}_pwd",
+                readyVisionHint = vision,
+            )
+        }
+
+        // Email + access these / 其它方式页：点 Email 接码；找不到 Email 但有 Password 则改点 Password
+        if (visionHasIdentityMethodSelectionPage(vision) || visionHasEmailAccessTheseMethod(vision)) {
+            val kind = if (visionHasBeforeYouContinueText(vision)) {
+                "Before you continue"
+            } else {
+                "Verify it's really you / Email+access these"
+            }
+            val hasEmail = findIdentityMethodEmailHit(vision) != null
+            val hasPassword = findIdentityMethodPasswordHit(vision) != null
+            if (!hasEmail && hasPassword) {
+                val password = resolveInlineVerificationPassword(alias)
+                if (password.isNullOrBlank()) {
+                    devOp(alias, "$phaseLog：方式页无 Email 有 Password，但 password 为空")
+                    return false
+                }
+                devOp(alias, "$phaseLog：见验证方式页无 Email 有 Password，点 Password 输密")
+                return autoLoginEnterPasswordLayoutAccessThese(
+                    ctx, alias, w, h, password, "identity_${safeTag}_pwd_only",
+                    readyVisionHint = vision,
+                )
+            }
+            devOp(alias, "$phaseLog：见验证方式页（$kind），点 Email/Outlook")
+            if (!identityVerifyTapOutlookAndNext(ctx, alias, w, h, vision, "identity_${safeTag}")) {
+                if (hasPassword) {
+                    val password = resolveInlineVerificationPassword(alias)
+                    if (!password.isNullOrBlank()) {
+                        devOp(alias, "$phaseLog：未点到 Email，回退点 Password 输密")
+                        return autoLoginEnterPasswordLayoutAccessThese(
+                            ctx, alias, w, h, password, "identity_${safeTag}_pwd_fb",
+                            readyVisionHint = vision,
+                        )
+                    }
+                }
+                return false
+            }
+            if (!identityVerifyWaitMethodPageTransition(ctx, alias, w, h, "identity_${safeTag}")) {
+                // 等待失败时若仍是 Password 方式页，转 Password
+                val again = identityVerifyOcrOnce(ctx, alias, "identity_${safeTag}_after_wait") ?: vision
+                if (visionHasPasswordAccessTheseMethod(again) ||
+                    (
+                        findIdentityMethodPasswordHit(again) != null &&
+                            findIdentityMethodEmailHit(again) == null
+                        )
+                ) {
+                    val password = resolveInlineVerificationPassword(alias)
+                    if (!password.isNullOrBlank()) {
+                        devOp(alias, "$phaseLog：等 Email 跳转失败，改点 Password 输密")
+                        return autoLoginEnterPasswordLayoutAccessThese(
+                            ctx, alias, w, h, password, "identity_${safeTag}_pwd_after_wait",
+                            readyVisionHint = again,
+                        )
+                    }
+                }
+                return false
+            }
+        }
+
         val creds = resolveInlineVerificationEmailCredentials(alias)
         if (creds == null) {
             devOp(alias, "$phaseLog：身份验证需要邮箱凭据但未获取到")
@@ -3490,27 +3821,27 @@ class RealTraceExecutor(
             devOp(alias, "$phaseLog：deviceId 为空，无法拉取验证码")
             return false
         }
-        val safeTag = fileTag
-            ?.filter { it.isLetterOrDigit() || it == '_' }
-            ?.take(48)
-            ?.ifEmpty { "inline" }
-            ?: "inline"
-
-        var vision = identityVerifyOcrOnce(ctx, alias, "identity_verify_${safeTag}_entry") ?: triggerVision
-
-        if (visionHasIdentityMethodSelectionPage(vision)) {
-            devOp(alias, "$phaseLog：见 Before you continue，点 Outlook + Next")
-            if (!identityVerifyTapOutlookAndNext(ctx, alias, w, h, vision, "identity_${safeTag}")) {
-                return false
-            }
-            if (!identityVerifyWaitMethodPageTransition(ctx, alias, w, h, "identity_${safeTag}")) {
-                return false
-            }
-        }
 
         vision = identityVerifyOcrOnce(ctx, alias, "identity_verify_${safeTag}_code_page") ?: return false
-        if (!visionHasIdentityCodeEntryPage(vision) && !visionHasVerifyIdentityTitle(vision)) {
-            devOp(alias, "$phaseLog：未进入 Verify identity 验证码页")
+        if (!visionHasIdentityCodeEntryPage(vision) &&
+            findLabelHitContainingIgnoreCase(vision, "resend code") == null &&
+            findLabelHitContainingIgnoreCase(vision, "send code") == null &&
+            !visionHasVerifyIdentityTitle(vision)
+        ) {
+            // 点 Email 后偶发落到 Password 方式页：转 Password
+            if (visionHasPasswordAccessTheseMethod(vision)) {
+                val password = resolveInlineVerificationPassword(alias)
+                if (password.isNullOrBlank()) {
+                    devOp(alias, "$phaseLog：验证码页未到，见 Password+access these，但 password 为空")
+                    return false
+                }
+                devOp(alias, "$phaseLog：验证码页未到，转 Password+access these 输密")
+                return autoLoginEnterPasswordLayoutAccessThese(
+                    ctx, alias, w, h, password, "identity_${safeTag}_pwd_fallback",
+                    readyVisionHint = vision,
+                )
+            }
+            devOp(alias, "$phaseLog：未进入验证码页")
             return false
         }
         return identityVerifyEnterCodeAndComplete(
@@ -3935,7 +4266,7 @@ class RealTraceExecutor(
 
         val tap = coerceTapToScreen(profileHit.point, screenW, screenH)
         devOp(alias, "$reason: entry precheck determined we are on home; tap bottom Profile (${tap.x},${tap.y})")
-        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+        if (!navBackThenTapProfile(alias, "$reason·入口Profile", tap.x, tap.y)) {
             devOp(alias, "$reason: entry precheck Profile tap failed; fallback to warmup")
             return ProfileEditEntryPreparationResult(
                 success = false,
@@ -4285,7 +4616,7 @@ class RealTraceExecutor(
             logAlias,
             "「修改基本资料」Bio后② 重试 warmup：资料入口比例点 (0.97×宽,0.95×高)→($profileEntryX,$profileEntryY) 屏${rw}x${rh}",
         )
-        val ratioTapOk = runSuCommand("input tap $profileEntryX $profileEntryY")
+        val ratioTapOk = navBackThenTapProfile(logAlias, "修改基本资料②重试资料入口", profileEntryX, profileEntryY)
         if (!ratioTapOk) {
             devOp(logAlias, "「修改基本资料」Bio后② 重试 warmup：资料比例点 tap 失败")
             return false
@@ -6497,6 +6828,32 @@ class RealTraceExecutor(
         runSuCommand("input keyevent 4")
     }
 
+    /**
+     * 点底栏 Profile / 资料入口前必先返回一次，再间隔约 1s 点击。
+     *
+     * 目的：消掉可能挡住底栏的「正在加载」弹窗，再点 Profile；无弹窗时返回不改变页面。
+     * 返回与点击之间不做 OCR（仅等 [PROFILE_TAP_AFTER_BACK_DELAY_MS]）。
+     */
+    override suspend fun navBackThenTapProfile(
+        alias: String,
+        reason: String,
+        tapX: Int,
+        tapY: Int,
+    ): Boolean {
+        if (hardStopOrNull(alias, "$reason-点Profile前返回")) return false
+        navBack(alias, "$reason·点 Profile 前")
+        var left = PROFILE_TAP_AFTER_BACK_DELAY_MS
+        while (left > 0) {
+            if (hardStopOrNull(alias, "$reason-点Profile前等待")) return false
+            val chunk = minOf(left, 100L)
+            delay(chunk)
+            left -= chunk
+        }
+        if (hardStopOrNull(alias, "$reason-点Profile")) return false
+        devOp(alias, "$reason：返回后间隔(${PROFILE_TAP_AFTER_BACK_DELAY_MS}ms)点 Profile ($tapX,$tapY)")
+        return runSuCommand("input tap $tapX $tapY")
+    }
+
     /** 创作相机底栏同时出现 POST + CREATE 时，单次返回无法退出，须连按两次。 */
     private fun ocrSeesPublishPostCameraBottomNav(vision: Text): Boolean {
         fun hasNavLabel(vararg labels: String): Boolean =
@@ -6703,6 +7060,12 @@ class RealTraceExecutor(
         return false
     }
 
+    /**
+     * For You 预滑主循环。
+     * 点赞/收藏/转发与涨粉共用 like_prob/favorite_prob/share_prob 及对应每日额度；不做评论。
+     * 每条视频在互动前按 skip_post_click_prob 独立判定：命中则跳过本条赞/藏/转，仅观看后翻页
+     *（与涨粉「进入主页后跳过作品点击」同一配置、同一语义）。
+     */
     private suspend fun runForYouWarmupIfNeeded(service: Context, alias: String, config: AppConfig) {
         val totalMs = (config.for_you_swipe_total_sec * 1000.0).toLong().coerceAtLeast(0L)
         if (totalMs < 500L) {
@@ -6716,7 +7079,6 @@ class RealTraceExecutor(
         if (growthYieldOrNull(alias, "For You 预滑")) return
         if (!ensureTikTokInForeground(service, alias, "For You 预滑")) return
 
-        val likeProb = config.for_you_like_prob.coerceIn(0.0, 1.0)
         val rawMinMs = (config.for_you_watch_min_sec * 1000.0).toLong().coerceAtLeast(500L)
         val rawMaxMs = (config.for_you_watch_max_sec * 1000.0).toLong().coerceAtLeast(500L)
         val watchMinMs = minOf(rawMinMs, rawMaxMs)
@@ -6724,17 +7086,24 @@ class RealTraceExecutor(
         val metrics = service.resources.displayMetrics
         val width = metrics.widthPixels
         val height = metrics.heightPixels
-        val likeX = (width * 0.5f).toInt()
-        val likeY = (height * 0.55f).toInt()
         val startedAt = System.currentTimeMillis()
 
         val logoutProbeEnabled = totalMs >= FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS
         devOp(
             alias,
-            if (logoutProbeEnabled) {
-                "For You 预滑开始：总时长=${totalMs}ms"
-            } else {
-                "For You 预滑开始：总时长=${totalMs}ms（低于5分钟，预滑开始前做 1 次掉登录检测）"
+            buildString {
+                append("For You 预滑开始：总时长=${totalMs}ms")
+                append(" · 互动=赞/藏/转（与涨粉共用概率与额度，无评论）")
+                append(
+                    " · 概率 like=${config.like_prob}/fav=${config.favorite_prob}/share=${config.share_prob}",
+                )
+                append(" · 跳过互动 skip_post_click_prob=${config.skip_post_click_prob}")
+                append(
+                    " · 上限 ${config.like_daily_limit}/${config.favorite_daily_limit}/${config.share_daily_limit}",
+                )
+                if (!logoutProbeEnabled) {
+                    append("（低于5分钟，预滑开始前做 1 次掉登录检测）")
+                }
             },
         )
         val logoutProbeAtMs = if (logoutProbeEnabled) {
@@ -6775,39 +7144,17 @@ class RealTraceExecutor(
             val watchMs = minOf(planWatchMs, remain)
             if (watchMs <= 0L) break
 
-            val segmentT0 = System.currentTimeMillis()
-            val doLike = Random.nextDouble() < likeProb
-            // 双击点赞约占用 ~250ms，留出随机落点区间 [preDelay, watchMs - budget)
-            val likeTapBudgetMs = 280L
-            if (doLike && watchMs >= likeTapBudgetMs + 80L) {
-                val hiExclusive = watchMs - likeTapBudgetMs
-                val preDelay = Random.nextLong(40L, hiExclusive + 1)
-                if (!growthDelay(alias, preDelay, "For You 预滑-点赞前")) return
-                val jitterX = Random.nextInt(-18, 19)
-                val jitterY = Random.nextInt(-18, 19)
-                val tapX = (likeX + jitterX).coerceIn(1, width - 1)
-                val tapY = (likeY + jitterY).coerceIn(1, height - 1)
-                runSuCommand("input tap $tapX $tapY")
-                delay(90)
-                runSuCommand("input tap $tapX $tapY")
-                devOp(alias, "For You 点赞：观看中随机时刻双击")
-            } else if (doLike && watchMs >= 120L) {
-                // 本段观看较短：在中间附近点一次赞，避免总在段首
-                val preDelay = Random.nextLong(0L, (watchMs / 2).coerceAtLeast(1L))
-                if (!growthDelay(alias, preDelay, "For You 预滑-短段点赞前")) return
-                val jitterX = Random.nextInt(-18, 19)
-                val jitterY = Random.nextInt(-18, 19)
-                val tapX = (likeX + jitterX).coerceIn(1, width - 1)
-                val tapY = (likeY + jitterY).coerceIn(1, height - 1)
-                runSuCommand("input tap $tapX $tapY")
-                delay(90)
-                runSuCommand("input tap $tapX $tapY")
-                devOp(alias, "For You 点赞：短观看段内双击")
+            if (!growthDelay(alias, watchMs, "For You 预滑-观看")) return
+            if (growthYieldOrNull(alias, "For You 预滑-互动前")) return
+            if (mutualClickOrNull(alias, "For You 预滑-互动前")) return
+            // 与涨粉「进入主页后跳过作品点击」共用 skip_post_click_prob：命中则本条不赞/藏/转
+            if (config.skip_post_click_prob > 0.0 &&
+                Random.nextDouble() < config.skip_post_click_prob
+            ) {
+                devOp(alias, "For You 预滑：命中跳过作品概率，本条仅观看翻页（不互动）")
+            } else {
+                runForYouFeedInteractions(service, config)
             }
-
-            val spentInSegment = System.currentTimeMillis() - segmentT0
-            val rest = (watchMs - spentInSegment).coerceAtLeast(0L)
-            if (rest > 0L && !growthDelay(alias, rest, "For You 预滑-观看")) return
             if (System.currentTimeMillis() - startedAt >= totalMs) break
 
             if (Random.nextDouble() < 0.12) {
@@ -6822,6 +7169,88 @@ class RealTraceExecutor(
             }
         }
         devOp(alias, "For You 预滑结束：已达到配置时长")
+    }
+
+    /**
+     * For You Feed 上的互动：与涨粉同款概率/额度挑选，仅点赞/收藏/转发（无评论、无返回）。
+     */
+    private suspend fun runForYouFeedInteractions(service: Context, config: AppConfig) {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        data class Action(
+            val name: String,
+            val weight: Double,
+            val dailyLimit: Int,
+            val run: suspend () -> Unit,
+        )
+
+        fun canRun(action: Action): Boolean {
+            if (action.weight <= 0) return false
+            if (action.dailyLimit <= 0) return false
+            val used = PrefsStore.getDailyActionCount(action.name)
+            return used < action.dailyLimit
+        }
+
+        fun pickOne(available: List<Action>): Action? {
+            val total = available.sumOf { it.weight.coerceAtLeast(0.0) }
+            if (total <= 0.0) return null
+            var r = Random.nextDouble(0.0, total)
+            for (a in available) {
+                r -= a.weight.coerceAtLeast(0.0)
+                if (r <= 0) return a
+            }
+            return available.lastOrNull()
+        }
+
+        val allActions = listOf(
+            Action(
+                name = "like",
+                weight = config.like_prob,
+                dailyLimit = config.like_daily_limit,
+                run = { performLike(service) },
+            ),
+            Action(
+                name = "favorite",
+                weight = config.favorite_prob,
+                dailyLimit = config.favorite_daily_limit,
+                run = { performFavorite(service, useOcrAnchor = false) },
+            ),
+            Action(
+                name = "share",
+                weight = config.share_prob,
+                dailyLimit = config.share_daily_limit,
+                run = { performShare(service, useOcrRepost = false) },
+            ),
+        )
+
+        val actionsToRun: List<Action> = if (config.action_single) {
+            val picked = pickOne(allActions.filter { canRun(it) })
+            if (picked == null) emptyList() else listOf(picked)
+        } else {
+            allActions.filter { canRun(it) }
+        }
+
+        if (actionsToRun.isEmpty()) {
+            val likeUsed = PrefsStore.getDailyActionCount("like")
+            val favUsed = PrefsStore.getDailyActionCount("favorite")
+            val shareUsed = PrefsStore.getDailyActionCount("share")
+            devOp(
+                alias,
+                "For You 预滑：本条无可执行互动（额度或概率为0）" +
+                    " like=$likeUsed/${config.like_daily_limit}" +
+                    " fav=$favUsed/${config.favorite_daily_limit}" +
+                    " share=$shareUsed/${config.share_daily_limit}",
+            )
+            return
+        }
+
+        for (action in actionsToRun) {
+            if (growthYieldOrNull(alias, "For You 预滑-互动")) return
+            if (mutualClickOrNull(alias, "For You 预滑-互动")) return
+            devOp(alias, "For You 预滑互动：${action.name}")
+            action.run()
+            PrefsStore.incrementDailyActionCount(action.name)
+            delay(700)
+        }
     }
 
     override suspend fun executeForUsername(username: String, config: AppConfig): String {
@@ -6924,6 +7353,9 @@ class RealTraceExecutor(
             devOp(alias, "涨粉：上一名 Users 恢复失败，本用户从放大镜重新搜索（未强关 TikTok，不复用 Users）")
             restartFromMagnifierForGrowth = false
             delay(500)
+            if (!ensureMainFeedBeforeRestartFromMagnifier(service, alias)) {
+                return "未能确认主 Feed / 回首页，无法从放大镜重新搜索 $username"
+            }
             if (!clickMagnifier(service)) {
                 return "TikTok 恢复拉起失败，无法点击放大镜，无法执行 $username"
             }
@@ -6989,6 +7421,7 @@ class RealTraceExecutor(
         if (!ensureUsersTabWithForceRestartRecovery(service, username, isLiveModeForUsersCheck)) {
             restartFromMagnifierForGrowth = true
             lastEndedAtUsersSelection = false
+            recoverToHomeViaBackOrRestart(service, "Users标签恢复失败交接前确认主Feed")
             return "失败：Users 标签 OCR 未命中，恢复后仍无法进入 Users 列表，已跳过 $username"
         }
 
@@ -7089,6 +7522,31 @@ class RealTraceExecutor(
             delay(Random.nextLong(800, 1200))
             true
         } == true
+    }
+
+    /**
+     * 上一名 Users 恢复失败后、下一名点放大镜前：先确认已在主 Feed。
+     * 未确认则强制走回首页，避免仍停在搜索页/底部弹窗时误点右上角坐标。
+     */
+    private suspend fun ensureMainFeedBeforeRestartFromMagnifier(service: Context, alias: String): Boolean {
+        if (hardStopOrNull(alias, "从放大镜重搜前确认主Feed")) return false
+        if (growthYieldOrNull(alias, "从放大镜重搜前确认主Feed")) return false
+        val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        val (vision, err) = mlKitRecognizeFullScreenCore(service, "magnifier_restart_main_feed_check")
+        if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+            devOp(alias, "从放大镜重搜前：OCR 已确认主 Feed，直接点放大镜")
+            return true
+        }
+        if (vision == null) {
+            devOp(alias, "从放大镜重搜前：主 Feed OCR 失败：$err，改为强制回首页")
+        } else {
+            devOp(alias, "从放大镜重搜前：未确认主 Feed，强制导航回首页")
+        }
+        val ok = recoverToHomeViaBackOrRestart(service, "从放大镜重搜前确认主Feed")
+        if (!ok) {
+            devOp(alias, "从放大镜重搜前：强制回首页失败")
+        }
+        return ok
     }
 
     /**
@@ -8542,20 +9000,95 @@ class RealTraceExecutor(
      * 第 1 张基准 X≈16%*W、Y≈30%*H；第 2 张屏宽水平中点、Y 同第 1；第 3 张与第 1 关于竖直中线对称；
      * 第 4 张 X 同第 1、Y≈49%*H；第 5 张屏宽水平中点、Y 同第 4。
      */
-    /** 发作品文案屏 description 固定坐标：与图库首条作品 [publishPostGalleryMediaTap] 点击坐标一致。 */
-    private fun publishPostDescriptionTapPoint(w: Int, h: Int): Point =
-        publishPostGalleryMediaTap(w, h, 0)
+    /**
+     * 文案输入区：OCR 含「description」即可（带 add / (add) 也算）。
+     * 点击输入用；Next 链结束另见 [publishPostCaptionPageEndReason]（description 或 drafts）。
+     */
+    private fun findDescriptionLabelHit(result: Text): StrictLabelHit? {
+        findLabelHitContainingIgnoreCaseRelaxed(result, "description")?.let { return it }
+        return null
+    }
 
-    /** 发作品文案屏：固定坐标点击 description 输入区，不做 OCR。 */
+    /** 文案屏辅助指纹：含「drafts」（如 Drafts）。 */
+    private fun findDraftsLabelHit(result: Text): StrictLabelHit? {
+        findLabelHitContainingIgnoreCaseRelaxed(result, "drafts")?.let { return it }
+        findStrictExactLabelHit(result, "Drafts")?.let { return it }
+        return null
+    }
+
+    /**
+     * 统一 Next 页结束：同屏见到 description 和/或 drafts（任一带文案屏特征即停，避免误多点 Next）。
+     * 进入后仍须 OCR 点 description 再输入。
+     */
+    private fun publishPostCaptionPageEndReason(result: Text): String? {
+        val hasDescription = findDescriptionLabelHit(result) != null
+        val hasDrafts = findDraftsLabelHit(result) != null
+        if (!hasDescription && !hasDrafts) return null
+        return buildString {
+            if (hasDescription) append("description")
+            if (hasDrafts) {
+                if (isNotEmpty()) append('+')
+                append("drafts")
+            }
+        }
+    }
+
+    /** 发作品文案屏：OCR 定位含 description 的文案并点击；均未命中则失败（由上层决定是否重启）。 */
     private suspend fun publishPostTapDescriptionField(
+        service: Context,
         alias: String,
         videoIndex: Int,
         w: Int,
         h: Int,
     ): Boolean {
-        val tap = publishPostDescriptionTapPoint(w, h)
-        devOp(alias, "发作品 第${videoIndex + 1} 条：固定坐标点击 description (${tap.x},${tap.y})（同图库首条 X≈16%*W Y≈30%*H）")
-        return runSuCommand("input tap ${tap.x} ${tap.y}")
+        for (pass in 1..PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES) {
+            if (hardStopOrNull(alias, "发作品 description OCR")) return false
+            if (pass > 1) delay(PUBLISH_POST_ADD_DESCRIPTION_OCR_RETRY_DELAY_MS)
+            val (vision, err) =
+                mlKitRecognizeFullScreen(service, "publish_post_description_${videoIndex}_$pass")
+            if (vision == null) {
+                devOp(
+                    alias,
+                    "发作品：description OCR 第 $pass/${PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES} 次失败：$err",
+                )
+                if (isMlKitHardStopError(err)) return false
+                continue
+            }
+            val endReason = publishPostCaptionPageEndReason(vision)
+            devOp(
+                alias,
+                "发作品：description OCR 第 $pass/${PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES} 次 " +
+                    "文案屏指纹=${endReason ?: "无"} 摘要=" +
+                    buildProfileEditOcrPreview(vision).take(420),
+            )
+            val hit = findDescriptionLabelHit(vision)
+            if (hit == null) {
+                // 仅见 drafts、未见 description：不点 Next，继续等 description 出现
+                if (endReason != null) {
+                    devOp(
+                        alias,
+                        "发作品：已见文案屏指纹($endReason)但未定位到 description，等待后重试（不点 Next）",
+                    )
+                } else {
+                    devOp(
+                        alias,
+                        "发作品：description OCR 第 $pass/${PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES} 次未命中",
+                    )
+                }
+                continue
+            }
+            val tap = coerceTapToScreen(hit.point, w, h)
+            devOp(
+                alias,
+                "发作品 第${videoIndex + 1} 条：OCR 点击 description (${tap.x},${tap.y})",
+            )
+            return runSuCommand("input tap ${tap.x} ${tap.y}")
+        }
+        devOp(
+            alias,
+            "发作品：description 连续 ${PUBLISH_POST_ADD_DESCRIPTION_OCR_MAX_PASSES} 次未命中",
+        )
+        return false
     }
 
     private fun publishPostGalleryMediaTap(w: Int, h: Int, videoIndex: Int): Point {
@@ -9467,7 +10000,7 @@ class RealTraceExecutor(
         }
         for (pass in 1..PUBLISH_POST_RECENTS_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, hardStopLabel)) return false
-            if (pass > 1) delay(700)
+            if (pass > 1) delay(PUBLISH_POST_RECENTS_OCR_RETRY_DELAY_MS)
             val ok = publishPostProbeRecentsOnScreen(
                 service = service,
                 alias = alias,
@@ -9557,6 +10090,46 @@ class RealTraceExecutor(
         return if (hits.isEmpty()) "-" else hits.joinToString(" ; ")
     }
 
+    /**
+     * 判定 OCR 命中是否落在「原 Recents 位置」附近：
+     * 中心距离 ≤ max(固定像素, 屏高 8%)，或 bbox 与原 Recents rect 相交。
+     */
+    private fun publishPostHitNearRecentsSlot(
+        hit: StrictLabelHit,
+        recentsRect: Rect,
+        screenH: Int,
+    ): Boolean {
+        val maxDist = maxOf(
+            PUBLISH_POST_PICTURES_NEAR_RECENTS_MAX_DIST_PX,
+            (screenH * 0.08f).toInt(),
+        )
+        val dx = hit.point.x - recentsRect.centerX()
+        val dy = hit.point.y - recentsRect.centerY()
+        if (dx * dx + dy * dy <= maxDist * maxDist) return true
+        return Rect.intersects(hit.rect, recentsRect)
+    }
+
+    /**
+     * S06 跳转成功：原 Recents 槽位文案已变为 Pictures（相册标题切换完成）。
+     * 下拉列表打开时 Pictures 在列表中、Recents 仍占原位 → 不会误判成功。
+     */
+    private fun publishPostPicturesOccupiesRecentsSlot(
+        result: Text,
+        recentsRect: Rect,
+        screenH: Int,
+    ): Boolean {
+        val picturesHit = findStrictExactLabelHit(result, "Pictures") ?: return false
+        return publishPostHitNearRecentsSlot(picturesHit, recentsRect, screenH)
+    }
+
+    /**
+     * 仍在 Recents/Pictures 相册选择页：同屏同时见 Recents 与 Pictures。
+     * 仅此时允许补点 Pictures；否则视为选择页被误触关掉，应补点 Recents 重新打开。
+     */
+    private fun publishPostIsAlbumPickerPage(result: Text): Boolean =
+        findStrictExactLabelHit(result, "Recents") != null &&
+            findStrictExactLabelHit(result, "Pictures") != null
+
     private suspend fun publishPostProbeRecentsOnScreen(
         service: Context,
         alias: String,
@@ -9564,6 +10137,9 @@ class RealTraceExecutor(
         clickRecents: Boolean = false,
         clickPictures: Boolean = false,
     ): Boolean {
+        val dm = service.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
         val (vision, errTag) = mlKitRecognizeFullScreen(service, ocrTag)
         if (vision == null) {
             devOp(alias, "发作品：Recents 探测 OCR 失败：$errTag [$ocrTag]")
@@ -9576,50 +10152,138 @@ class RealTraceExecutor(
             "发作品：Recents 探测 OCR 文案=$recentsPreview [$ocrTag]",
         )
         val recentsHit = findStrictExactLabelHit(vision, "Recents")
-        if (recentsHit != null) {
-            if (!clickRecents) {
-                devOp(alias, "发作品：已探测到 Recents（仅记录，不点击） [$ocrTag]")
-                return true
+        if (recentsHit == null) {
+            // 已在 Pictures 槽：原 Recents 位已是 Pictures（上轮已跳转成功，或续跑）
+            if (clickPictures) {
+                val anyPictures = findStrictExactLabelHit(vision, "Pictures")
+                if (anyPictures != null && !publishPostIsAlbumPickerPage(vision)) {
+                    devOp(
+                        alias,
+                        "发作品：未见 Recents 但已见 Pictures 且非选择页，视为相册已切到 Pictures [$ocrTag]",
+                    )
+                    return true
+                }
             }
-            val tap = coerceTapToScreen(recentsHit.point, service.resources.displayMetrics.widthPixels, service.resources.displayMetrics.heightPixels)
-            devOp(alias, "发作品：已探测到 Recents，执行点击 (${tap.x},${tap.y}) [$ocrTag]")
-            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                devOp(alias, "发作品：Recents 点击失败 [$ocrTag]")
-                return false
-            }
-            delay(700)
-            if (!clickPictures) return true
-            val (vision2, errTag2) = mlKitRecognizeFullScreen(service, "${ocrTag}_pictures")
-            if (vision2 == null) {
-                devOp(alias, "发作品：Pictures 探测 OCR 失败：$errTag2 [$ocrTag]")
-                return false
-            }
-            val picturesPreview = buildProfileEditOcrPreview(vision2)
-            val picturesCandidates = buildPublishPostGalleryOcrCandidates(vision2)
             devOp(
                 alias,
-                "发作品：Pictures 探测 OCR 文案=$picturesPreview 相关候选=$picturesCandidates [$ocrTag]",
+                "发作品：Recents 探测未命中（需严格等于 Recents）OCR文案=$recentsPreview 相关候选=${buildPublishPostGalleryOcrCandidates(vision)} [$ocrTag]",
             )
-            val picturesHit = findStrictExactLabelHit(vision2, "Pictures")
-            if (picturesHit == null) {
-                devOp(
-                    alias,
-                    "发作品：Pictures 探测未命中（需严格等于 Pictures）OCR文案=$picturesPreview 相关候选=$picturesCandidates [$ocrTag]",
-                )
-                return false
-            }
-            val pictureTap = coerceTapToScreen(picturesHit.point, service.resources.displayMetrics.widthPixels, service.resources.displayMetrics.heightPixels)
-            devOp(alias, "发作品：已探测到 Pictures，执行点击 (${pictureTap.x},${pictureTap.y}) [$ocrTag]")
-            if (!runSuCommand("input tap ${pictureTap.x} ${pictureTap.y}")) {
-                devOp(alias, "发作品：Pictures 点击失败 [$ocrTag]")
-                return false
-            }
+            return false
+        }
+        if (!clickRecents) {
+            devOp(alias, "发作品：已探测到 Recents（仅记录，不点击） [$ocrTag]")
+            return true
+        }
+        val recentsRect = Rect(recentsHit.rect)
+        val tap = coerceTapToScreen(recentsHit.point, w, h)
+        devOp(alias, "发作品：已探测到 Recents，执行点击 (${tap.x},${tap.y}) [$ocrTag]")
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+            devOp(alias, "发作品：Recents 点击失败 [$ocrTag]")
+            return false
+        }
+        if (!clickPictures) {
             delay(700)
             return true
         }
+        delay(PUBLISH_POST_PICTURES_JUMP_VERIFY_DELAY_MS)
+        return publishPostSelectPicturesUntilRecentsSlotSwitched(
+            service = service,
+            alias = alias,
+            ocrTag = ocrTag,
+            w = w,
+            h = h,
+            recentsRect = recentsRect,
+            initialRecentsTap = tap,
+        )
+    }
+
+    /**
+     * 点开 Recents 后选 Pictures，并按 OCR 判定跳转：
+     * - 成功：原 Recents 位置文案变为 Pictures；
+     * - 未跳转且同屏仍有 Recents+Pictures → 补点 Pictures；
+     * - 否则视为选择页消失 → 补点 Recents 重新打开选择页。
+     */
+    private suspend fun publishPostSelectPicturesUntilRecentsSlotSwitched(
+        service: Context,
+        alias: String,
+        ocrTag: String,
+        w: Int,
+        h: Int,
+        recentsRect: Rect,
+        initialRecentsTap: Point,
+    ): Boolean {
+        var lastRecentsTap = initialRecentsTap
+        for (pass in 1..PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES) {
+            if (hardStopOrNull(alias, "发作品 Pictures 跳转校验")) return false
+            if (pass > 1) delay(PUBLISH_POST_PICTURES_JUMP_VERIFY_DELAY_MS)
+            val (vision, errTag) = mlKitRecognizeFullScreen(service, "${ocrTag}_pic_verify_$pass")
+            if (vision == null) {
+                devOp(
+                    alias,
+                    "发作品：Pictures 跳转校验 OCR 第 $pass/${PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES} 次失败：$errTag",
+                )
+                if (isMlKitHardStopError(errTag)) return false
+                continue
+            }
+            val preview = buildProfileEditOcrPreview(vision).take(420)
+            val candidates = buildPublishPostGalleryOcrCandidates(vision)
+            val pickerOpen = publishPostIsAlbumPickerPage(vision)
+            val slotSwitched = publishPostPicturesOccupiesRecentsSlot(vision, recentsRect, h)
+            devOp(
+                alias,
+                "发作品：Pictures 跳转校验 第 $pass/${PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES} 次 " +
+                    "选择页=${if (pickerOpen) "是" else "否"} 原位已是Pictures=${if (slotSwitched) "是" else "否"} " +
+                    "摘要=$preview 相关候选=$candidates",
+            )
+            if (slotSwitched && !pickerOpen) {
+                // 必须选择页已关闭：下拉仍开时列表里的 Pictures 可能贴近标题，会误判「原位已切换」
+                devOp(alias, "发作品：原 Recents 位已变为 Pictures 且选择页已关闭，相册跳转成功")
+                return true
+            }
+            if (slotSwitched && pickerOpen) {
+                devOp(
+                    alias,
+                    "发作品：原位附近见 Pictures 但选择页仍开，不视为跳转成功，继续补点 Pictures",
+                )
+            }
+            if (pickerOpen) {
+                val picturesHit = findStrictExactLabelHit(vision, "Pictures")
+                if (picturesHit == null) {
+                    devOp(alias, "发作品：选择页判定有 Pictures 文案但严格命中失败，跳过本轮")
+                    continue
+                }
+                val pictureTap = coerceTapToScreen(picturesHit.point, w, h)
+                devOp(
+                    alias,
+                    "发作品：仍在 Recents/Pictures 选择页，补点 Pictures (${pictureTap.x},${pictureTap.y})",
+                )
+                if (!runSuCommand("input tap ${pictureTap.x} ${pictureTap.y}")) {
+                    devOp(alias, "发作品：Pictures 补点失败")
+                    return false
+                }
+                continue
+            }
+            // 选择页消失且原位未切到 Pictures → 误触，补点 Recents 重新打开
+            val recentsHit = findStrictExactLabelHit(vision, "Recents")
+            val reopenTap =
+                if (recentsHit != null) {
+                    lastRecentsTap = coerceTapToScreen(recentsHit.point, w, h)
+                    lastRecentsTap
+                } else {
+                    lastRecentsTap
+                }
+            devOp(
+                alias,
+                "发作品：未见 Recents+Pictures 选择页且原位未切到 Pictures，判定误触；补点 Recents (${reopenTap.x},${reopenTap.y})",
+            )
+            if (!runSuCommand("input tap ${reopenTap.x} ${reopenTap.y}")) {
+                devOp(alias, "发作品：补点 Recents 失败")
+                return false
+            }
+        }
         devOp(
             alias,
-            "发作品：Recents 探测未命中（需严格等于 Recents）OCR文案=$recentsPreview 相关候选=${buildPublishPostGalleryOcrCandidates(vision)} [$ocrTag]",
+            "发作品：Pictures 跳转校验 ${PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES} 次仍未成功（原 Recents 位未变为 Pictures）",
         )
         return false
     }
@@ -9692,6 +10356,17 @@ class RealTraceExecutor(
         return true
     }
 
+    /**
+     * 发作品入口：点屏幕下方中间资料比例点，再确认已进入创作页，然后走图库入口（布局 A/B / Recents）。
+     *
+     * **CREATE/POST 跳转门禁（目的）**
+     * - 点下方中间比例点后，用 OCR 找「CREATE/POST」判断创作页是否已就绪（页面是否跳转成功）。
+     * - 单次点击后最多 OCR [PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES] 次；仍无则视为创作页未就绪。
+     * - 第 1 次失败：先导航返回再复点比例点。返回是为了关掉可能卡住的「正在加载」弹窗；
+     *   若当时没有加载弹窗，返回通常不会改变当前页，可安全再点一次。
+     * - 第 2 次仍找不到：本函数内立刻 [publishPostFail] 强关重启 TikTok（`tryRestart=true`），
+     *   返回 false，由上层重新开始当前作品；禁止只打「需重启」日志却不重启。
+     */
     private suspend fun publishPostTapProfileRatioWhileUsingAndLeftBottom(
         service: Context,
         alias: String,
@@ -9720,7 +10395,7 @@ class RealTraceExecutor(
             alias,
             "发作品：资料比例点 (${tapX},${tapY}) 屏${w}x${h}（Y=${ratioTapY}×高）",
         )
-        if (!runSuCommand("input tap $tapX $tapY")) {
+        if (!navBackThenTapProfile(alias, "发作品资料入口", tapX, tapY)) {
             devOp(alias, "发作品：比例位 tap 失败")
             return false
         }
@@ -9747,34 +10422,84 @@ class RealTraceExecutor(
         }
         if (!publishPostTryDismissDontAllowBeforeGallery(service, alias, "资料入口后")) return false
 
-        val createPostMaxPasses = 4
+        // ---------- CREATE/POST 跳转门禁 ----------
+        // 目的：点下方中间比例点后，必须见到 CREATE/POST 才算创作页就绪，再继续图库入口。
+        // 流程：
+        //   ① OCR 最多 PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES 次；
+        //   ② 仍无 → 导航返回（消「正在加载」弹窗；无弹窗则页面通常不变）→ 再点比例点 → 再 OCR；
+        //   ③ 第 2 次比例点仍无 → publishPostFail(tryRestart=true) 立刻强关重启，返回 false 重开当前作品。
         var createPostSeen = false
         var createPostTap: Point? = null
-        for (pass in 1..createPostMaxPasses) {
-            if (hardStopOrNull(alias, "发作品 CREATE/POST OCR")) return false
-            if (pass > 1) delay(700)
-            val (vision, errTag) = mlKitRecognizeFullScreen(service, "publish_post_create_post_$pass")
-            if (vision == null) {
-                devOp(alias, "发作品：CREATE/POST OCR 第 $pass/$createPostMaxPasses 次失败：$errTag")
-                if (isMlKitHardStopError(errTag)) return false
-                continue
+        for (ratioAttempt in 1..PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS) {
+            if (hardStopOrNull(alias, "发作品 CREATE/POST 比例点第 $ratioAttempt 次")) return false
+            for (pass in 1..PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES) {
+                if (hardStopOrNull(alias, "发作品 CREATE/POST OCR")) return false
+                if (pass > 1) delay(700)
+                val (vision, errTag) =
+                    mlKitRecognizeFullScreen(
+                        service,
+                        "publish_post_create_post_r${ratioAttempt}_$pass",
+                    )
+                if (vision == null) {
+                    devOp(
+                        alias,
+                        "发作品：CREATE/POST OCR（比例点第 $ratioAttempt/${PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS} 次）" +
+                            " 第 $pass/${PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES} 次失败：$errTag",
+                    )
+                    if (isMlKitHardStopError(errTag)) return false
+                    continue
+                }
+                val preview = buildProfileEditOcrPreview(vision).take(480)
+                devOp(
+                    alias,
+                    "发作品：CREATE/POST OCR（比例点第 $ratioAttempt/${PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS} 次）" +
+                        " 第 $pass/${PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES} 次摘要=$preview",
+                )
+                val hit = findCreatePostLabelHit(vision)
+                if (hit == null) {
+                    devOp(
+                        alias,
+                        "发作品：CREATE/POST OCR（比例点第 $ratioAttempt/${PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS} 次）" +
+                            " 第 $pass/${PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES} 次未命中",
+                    )
+                    continue
+                }
+                val tap = coerceTapToScreen(hit.point, w, h)
+                createPostTap = tap
+                // 目的：命中即确认创作页已就绪，记下坐标供后续布局 B 备用点使用。
+                devOp(
+                    alias,
+                    "发作品：CREATE/POST 比例点第 $ratioAttempt 次已命中，记录坐标 (${tap.x},${tap.y})，等待后续固定点",
+                )
+                createPostSeen = true
+                break
             }
-            val preview = buildProfileEditOcrPreview(vision).take(480)
-            devOp(alias, "发作品：CREATE/POST OCR 第 $pass/$createPostMaxPasses 次摘要=$preview")
-            val hit = findCreatePostLabelHit(vision)
-            if (hit == null) {
-                devOp(alias, "发作品：CREATE/POST OCR 第 $pass/$createPostMaxPasses 次未命中")
-                continue
+            if (createPostSeen) break
+            if (ratioAttempt >= PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS) {
+                // 目的：两次比例点均未进入创作页 → 立刻强关重启，避免只写「需重启」却拖到外层才冷启。
+                devOp(
+                    alias,
+                    "发作品：第 $ratioAttempt 次点击下方中间比例点后 " +
+                        "CREATE/POST 连续 ${PUBLISH_POST_CREATE_POST_OCR_MAX_PASSES} 次仍未命中，立刻重启 TikTok 重新开始当前作品",
+                )
+                return publishPostFail(alias, "发作品 CREATE/POST 两次未命中", tryRestart = true)
             }
-            val tap = coerceTapToScreen(hit.point, w, h)
-            createPostTap = tap
-            devOp(alias, "发作品：CREATE/POST OCR 第 $pass/$createPostMaxPasses 次命中，记录坐标 (${tap.x},${tap.y})，等待后续固定点")
-            createPostSeen = true
-            break
-        }
-        if (!createPostSeen) {
-            devOp(alias, "发作品：CREATE/POST 连续 $createPostMaxPasses 次未命中，需重启 TikTok 重新开始当前作品")
-            return false
+            // 目的：创作页未就绪时先返回——有「正在加载」弹窗则关掉；无弹窗则返回通常不改页，再复点比例点。
+            devOp(
+                alias,
+                "发作品：比例点第 $ratioAttempt 次后未见 CREATE/POST，判定创作页未就绪；" +
+                    "导航返回（消加载弹窗）后重新点击下方中间比例点",
+            )
+            if (hardStopOrNull(alias, "发作品 CREATE/POST 未跳转后复点比例点")) return false
+            devOp(
+                alias,
+                "发作品：复点资料比例点 (${tapX},${tapY})（第 ${ratioAttempt + 1}/${PUBLISH_POST_CREATE_POST_RATIO_TAP_MAX_ATTEMPTS} 次）",
+            )
+            if (!navBackThenTapProfile(alias, "发作品资料入口复点", tapX, tapY)) {
+                devOp(alias, "发作品：复点比例位 tap 失败")
+                return false
+            }
+            delay(650)
         }
         val postTap = createPostTap
         if (postTap == null) {
@@ -9817,22 +10542,16 @@ class RealTraceExecutor(
      * 「发布作品」单条素材的核心选择流程。
      *
      * 阶段顺序：
-     * 1) 底部入口（上一段：资料比例点 →（仅本任务第 1 条）Continue → 点击相册前 Don't allow → …；首条试探 A/B 并缓存；布局确认后每条仍执行 Recents→Pictures OCR 点击）
-     * 2) 图库选素材：第 1 张 X≈16%*W、Y≈30%*H，第 2～3 相对第 1；第 4 张 X 同第 1、Y≈49%*H，第 5 屏宽中点且 Y 同第 4（最多 5 条）
-     * 3) 图库点选后等待 [PUBLISH_POST_AFTER_GALLERY_DELAY_MS]，再 OCR 定位 Next（最多 [PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES] 次，间隔 500~1000ms）；同一轮命中时记录 Recents / Videos 分界 Y 等
-     * 4) 通过 OCR 反复校验 Your Story 是否出现，最多 7 次，间隔 1s；若失败则整条任务失败重来
-     * 5) 点击第一次 Next
-     * 6) [已禁用] Your Story 命中后，说明素材加载成功，点击音频位置
-     * 7) [已禁用] OCR 定位并点击 Sound
-     * 8) [已禁用] 再次点击音频位置
-     * 9) 沿用第一次 Next 的坐标再次点击 Next
-     * 10) 固定坐标点击 description（同图库首条 X≈16%*W Y≈30%*H），各条一致、不做 OCR
-     * 11) 使用运行配置中的 [AppConfig.comment_texts] 随机文案输入
-     * 12) OCR 定位 Done（偏下）或屏幕上方含 post 的 Post（优先 Done）并点击；点 Done 后再点一次第一次 Next；点顶部 Post 则等价 Done+Next+确认 Post，跳过后续 Next
-     * 13)（仅 Done 路径）再次点击第一次 Next 的坐标，进入后续确认页
-     * 14) 两种布局末次点击后 OCR 判定发布完成：Done 布局点完 Next 后不再 OCR 到 Next；Post 布局点完顶部 Post 后不再 OCR 到该 Post；
-     *     正面信号（底栏≥2 等）仍可作为提前完成路径
-     * 15) 仅当日首条且已确认发布成功：按序尝试可选权限弹窗（Post Now / Only this time×2 / Don't allow / 底部 Cancel），未命中不判失败
+     * 1) 底部入口（上一段：资料比例点 →（仅本任务第 1 条）Continue → Don't allow → …
+     *    Recents→Pictures：跳转成功=原 Recents 位变为 Pictures；选择页仍开则补点 Pictures；选择页没了则补点 Recents）
+     * 2) 图库选素材：第 1～5 张固定坐标
+     * 3) 选图后统一为「点 Next」页：首次 OCR 定位 Next 坐标；每次点击前先 OCR——
+     *    已见 description/drafts 则不再点 Next；点后等 3s 再判，仍见 Next 才补点，
+     *    直到出现 description 或 drafts 视为 Next 页结束
+     * 4) OCR 点含 description 的输入区 → 输入 comment_texts 随机文案
+     * 5) OCR 定位 Done（偏下）或屏幕上方含 post 的 Post（优先 Done）并点击；点 Done 后再点一次 Next 坐标；点顶部 Post 则跳过后续 Next
+     * 6) 两种布局末次点击后 OCR 判定发布完成；正面信号可提前完成
+     * 7) 仅当日首条且已确认发布成功：可选权限弹窗（Post Now / Only this time×2 / Don't allow / 底部 Cancel）
      */
     private suspend fun runPublishPostPickSoundCaptionAndMaybeDialogs(
         service: Context,
@@ -9862,120 +10581,214 @@ class RealTraceExecutor(
         devOp(alias, "发作品：图库点选后等待 ${PUBLISH_POST_AFTER_GALLERY_DELAY_MS}ms 再 OCR Next")
         delay(PUBLISH_POST_AFTER_GALLERY_DELAY_MS)
 
+        // ---------- 首次定位 Next（坐标复用）----------
         var nextHit: StrictLabelHit? = null
+        var sawCaptionBeforeNextLocate = false
         for (nextPass in 1..PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, "发作品 Next OCR")) return false
             if (nextPass > 1) {
-                val retryDelayMs = Random.nextLong(
-                    PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MIN_MS,
-                    PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MAX_MS + 1,
+                devOp(
+                    alias,
+                    "发作品：Next 首次定位 OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次，" +
+                        "间隔 ${PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MS}ms",
                 )
-                devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次，间隔 ${retryDelayMs}ms")
-                delay(retryDelayMs)
+                delay(PUBLISH_POST_FIRST_NEXT_OCR_RETRY_DELAY_MS)
             } else {
-                devOp(alias, "发作品：Next OCR 第 1/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次")
+                devOp(alias, "发作品：Next 首次定位 OCR 第 1/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次")
             }
             val (vision, err) = mlKitRecognizeFullScreen(
                 service,
                 "publish_post_first_next_${videoIndex}_$nextPass",
             )
             if (vision == null) {
-                devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次识别失败 $err")
+                devOp(
+                    alias,
+                    "发作品：Next 首次定位 OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次识别失败 $err",
+                )
                 if (isMlKitHardStopError(err)) return false
                 continue
             }
+            // 已提前到文案屏：见 description / drafts 即跳过 Next 链，禁止再点 Next
+            val earlyCaption = publishPostCaptionPageEndReason(vision)
+            if (earlyCaption != null) {
+                sawCaptionBeforeNextLocate = true
+                devOp(alias, "发作品：选图后已见文案屏指纹($earlyCaption)，跳过 Next 链（防误多点）")
+                break
+            }
             devOp(
                 alias,
-                "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次摘要=" +
+                "发作品：Next 首次定位 OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次摘要=" +
                     buildProfileEditOcrPreview(vision).take(420),
             )
             val hit = findStrictExactLabelHit(vision, "Next")
             if (hit != null) {
                 nextHit = hit
-                devOp(alias, "发作品：Next 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次已命中")
+                devOp(alias, "发作品：Next 首次定位第 $nextPass 次已命中，后续复用坐标")
                 break
             }
-            devOp(alias, "发作品：Next OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次未命中")
+            devOp(alias, "发作品：Next 首次定位 OCR 第 $nextPass/${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次未命中")
         }
-        val resolvedNext = nextHit ?: run {
+
+        val tapNext0: Point?
+        if (nextHit != null) {
+            val resolvedNext = nextHit
+            val tap = coerceTapToScreen(resolvedNext.point, w, h)
+            tapNext0 = tap
             devOp(
                 alias,
-                "发作品：Next 连续 ${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次 OCR 均未命中，本条失败",
+                "发作品：Next 坐标记位 (${tap.x},${tap.y})，开始 Next 链" +
+                    "（点前先验文案屏；点后等 ${PUBLISH_POST_NEXT_CHAIN_AFTER_TAP_DELAY_MS}ms）",
+            )
+
+            var reachedCaption = false
+            var tapIdx = 0
+            while (tapIdx < PUBLISH_POST_NEXT_CHAIN_MAX_TAPS && !reachedCaption) {
+                if (hardStopOrNull(alias, "发作品 Next 链第 ${tapIdx + 1} 次")) return false
+
+                // 点前先 OCR：已进文案屏则绝不再点 Next（防 description 未定位到却误多点）
+                val (vBefore, errBefore) =
+                    mlKitRecognizeFullScreen(service, "publish_post_next_pre_${videoIndex}_${tapIdx + 1}")
+                if (vBefore == null) {
+                    if (isMlKitHardStopError(errBefore)) return false
+                    // OCR 失败时不盲点：短等再检一轮，仍失败则本条失败（避免误多点 Next）
+                    delay(PUBLISH_POST_ADD_DESCRIPTION_OCR_RETRY_DELAY_MS)
+                    val (vBefore2, errBefore2) =
+                        mlKitRecognizeFullScreen(
+                            service,
+                            "publish_post_next_pre_retry_${videoIndex}_${tapIdx + 1}",
+                        )
+                    if (vBefore2 == null) {
+                        if (isMlKitHardStopError(errBefore2)) return false
+                        devOp(alias, "发作品：Next 点前 OCR 连续失败，停止点击防误触")
+                        break
+                    }
+                    val preEnd2 = publishPostCaptionPageEndReason(vBefore2)
+                    if (preEnd2 != null) {
+                        reachedCaption = true
+                        devOp(alias, "发作品：点前重试已见文案屏指纹($preEnd2)，停止 Next 链")
+                        break
+                    }
+                    if (findStrictExactLabelHit(vBefore2, "Next") == null) {
+                        devOp(alias, "发作品：点前重试未见 Next 也未见 description/drafts，停止盲点")
+                        break
+                    }
+                    // 重试见到 Next，允许本次点击
+                } else {
+                    val preEnd = publishPostCaptionPageEndReason(vBefore)
+                    if (preEnd != null) {
+                        reachedCaption = true
+                        devOp(alias, "发作品：点 Next 前已见文案屏指纹($preEnd)，停止 Next 链（防误多点）")
+                        break
+                    }
+                    val stillNextBefore = findStrictExactLabelHit(vBefore, "Next") != null
+                    if (!stillNextBefore) {
+                        // 无 Next 也无文案指纹：短等补检，仍无则失败，不盲点
+                        delay(PUBLISH_POST_ADD_DESCRIPTION_OCR_RETRY_DELAY_MS)
+                        val (vPreWait, errPreWait) =
+                            mlKitRecognizeFullScreen(
+                                service,
+                                "publish_post_next_pre_wait_${videoIndex}_${tapIdx + 1}",
+                            )
+                        if (vPreWait == null) {
+                            if (isMlKitHardStopError(errPreWait)) return false
+                            devOp(alias, "发作品：点前补检 OCR 失败，停止盲点")
+                            break
+                        }
+                        val waitEnd = publishPostCaptionPageEndReason(vPreWait)
+                        if (waitEnd != null) {
+                            reachedCaption = true
+                            devOp(alias, "发作品：点前补检已见文案屏指纹($waitEnd)，停止 Next 链")
+                            break
+                        }
+                        if (findStrictExactLabelHit(vPreWait, "Next") == null) {
+                            devOp(alias, "发作品：点前未见 Next 也未见 description/drafts，停止盲点")
+                            break
+                        }
+                        // 补检又见 Next，落入下方点击
+                    }
+                }
+
+                tapIdx++
+                devOp(alias, "发作品：Next 链第 $tapIdx/${PUBLISH_POST_NEXT_CHAIN_MAX_TAPS} 次点击 (${tap.x},${tap.y})")
+                if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+                delay(PUBLISH_POST_NEXT_CHAIN_AFTER_TAP_DELAY_MS)
+                val (vAfter, errAfter) =
+                    mlKitRecognizeFullScreen(service, "publish_post_next_chain_${videoIndex}_$tapIdx")
+                if (vAfter == null) {
+                    devOp(alias, "发作品：Next 链第 $tapIdx 次点击后 OCR 失败 $errAfter")
+                    if (isMlKitHardStopError(errAfter)) return false
+                    // 不立刻再点：下一轮 while 会先做点前 OCR；若已是文案屏则停，若仍见 Next 再补点
+                    continue
+                }
+                val afterPreview = buildProfileEditOcrPreview(vAfter).take(420)
+                val endReason = publishPostCaptionPageEndReason(vAfter)
+                val stillNext = findStrictExactLabelHit(vAfter, "Next") != null
+                devOp(
+                    alias,
+                    "发作品：Next 链第 $tapIdx 次后 OCR 文案屏=${endReason ?: "无"} 仍见Next=$stillNext 摘要=$afterPreview",
+                )
+                if (endReason != null) {
+                    reachedCaption = true
+                    devOp(alias, "发作品：已见文案屏指纹($endReason)，Next 页结束")
+                    break
+                }
+                if (stillNext) {
+                    devOp(alias, "发作品：仍见 Next，未跳转到文案屏，继续补点 Next")
+                    continue
+                }
+                // Next 已消失但未见 description/drafts：短等补检，不再盲点
+                delay(PUBLISH_POST_ADD_DESCRIPTION_OCR_RETRY_DELAY_MS)
+                val (vWait, errWait) =
+                    mlKitRecognizeFullScreen(service, "publish_post_next_chain_wait_${videoIndex}_$tapIdx")
+                if (vWait != null) {
+                    val waitEnd = publishPostCaptionPageEndReason(vWait)
+                    if (waitEnd != null) {
+                        reachedCaption = true
+                        devOp(alias, "发作品：Next 消失后补检已见文案屏指纹($waitEnd)，Next 页结束")
+                        break
+                    }
+                    if (findStrictExactLabelHit(vWait, "Next") != null) {
+                        devOp(alias, "发作品：补检仍见 Next，继续补点")
+                        continue
+                    }
+                }
+                if (vWait == null && isMlKitHardStopError(errWait)) return false
+                devOp(
+                    alias,
+                    "发作品：Next 已消失且未见 description/drafts，停止盲点（本条失败）",
+                )
+                break
+            }
+            if (!reachedCaption) {
+                devOp(
+                    alias,
+                    "发作品：Next 链结束后仍未见 description/drafts，本条失败",
+                )
+                return false
+            }
+        } else if (sawCaptionBeforeNextLocate) {
+            tapNext0 = null
+            devOp(alias, "发作品：确认已在文案屏（description/drafts），无 Next 坐标")
+        } else {
+            tapNext0 = null
+            devOp(
+                alias,
+                "发作品：Next 连续 ${PUBLISH_POST_FIRST_NEXT_OCR_MAX_PASSES} 次未命中且未见 description/drafts，本条失败",
             )
             return false
         }
-        val tapNext0 = coerceTapToScreen(resolvedNext.point, w, h)
-        devOp(alias, "发作品：第一次 Next 坐标记位 (${tapNext0.x},${tapNext0.y})")
-        if (!runSuCommand("input tap ${tapNext0.x} ${tapNext0.y}")) return false
 
-        var yourStorySeen = false
-        var yourStoryAttempts = 0
-        while (yourStoryAttempts < 7 && !yourStorySeen) {
-            if (hardStopOrNull(alias, "发作品 Your Story OCR")) return false
-            yourStoryAttempts++
-            if (yourStoryAttempts > 1) delay(1000)
-            val (vStory, errStory) = mlKitRecognizeFullScreen(service, "publish_post_your_story_${videoIndex}_$yourStoryAttempts")
-            if (vStory == null) {
-                devOp(alias, "发作品：Your Story OCR 第 $yourStoryAttempts/7 次失败 $errStory")
-                if (isMlKitHardStopError(errStory)) return false
-                continue
-            }
-            devOp(alias, "发作品：Your Story OCR 第 $yourStoryAttempts/7 次摘要=${buildProfileEditOcrPreview(vStory).take(420)}")
-            if (findStrictExactLabelHit(vStory, "Your Story") != null) {
-                yourStorySeen = true
-                devOp(alias, "发作品：已定位 Your Story，确认素材加载成功")
-            } else {
-                devOp(alias, "发作品：Your Story OCR 第 $yourStoryAttempts/7 次未命中")
-            }
-        }
-        if (!yourStorySeen) {
-            devOp(alias, "发作品：Your Story 7 次均未命中，判定任务失败，整条流程重来")
-            return false
-        }
-
-        // 步骤 6～8 已禁用：固定音频位置 ×2 + OCR 点 Sound
-        devOp(alias, "发作品：已跳过固定音频点与 Sound OCR（步骤 6～8 已注释）")
-        /*
-        val audioTap = fixedAudioTapPoint(service)
-        devOp(alias, "发作品：第一次点击固定音频位置 (${audioTap.x},${audioTap.y})（屏幕正中 X，顶部 1/10 处 Y）")
-        if (!runSuCommand("input tap ${audioTap.x} ${audioTap.y}")) return false
-        delay(550)
-
-        devOp(alias, "发作品：准备点击 Sound")
-        if (!publishPostOcrTapByFinder(
-                service,
-                alias,
-                "publish_post_sound_${videoIndex}",
-                "Sound",
-                6,
-            ) { findBottommostStrictExactLabelHit(it, "Sound") }
-        ) {
-            devOp(alias, "发作品：Sound OCR 失败")
-            return false
-        }
-
-        devOp(alias, "发作品：Sound 已点，准备第二次点击固定音频位置 (${audioTap.x},${audioTap.y})")
-        if (!runSuCommand("input tap ${audioTap.x} ${audioTap.y}")) return false
-        delay(550)
-        */
-
-        delay(1000)
-        devOp(alias, "发作品：准备复用第一次 Next 坐标 (${tapNext0.x},${tapNext0.y}) 再点一次 Next")
-        if (!runSuCommand("input tap ${tapNext0.x} ${tapNext0.y}")) return false
-        delay(600)
-
-        val (vCap, errCap) = mlKitRecognizeFullScreen(service, "publish_post_caption_screen_${videoIndex}")
-        if (vCap == null) {
-            devOp(alias, "发作品：文案屏 OCR 失败 $errCap，准备重启 TikTok 后重新发布")
-            return publishPostFail(alias, "发作品文案屏 OCR", tryRestart = !isMlKitHardStopError(errCap))
-        }
-        devOp(alias, "发作品：文案屏 OCR 摘要=${buildProfileEditOcrPreview(vCap).take(420)}")
         val captionPool = config.comment_texts.map { it.trim() }.filter { it.isNotBlank() }
         val phrase = captionPool.randomOrNull() ?: "Nice"
-        devOp(alias, "发作品：准备输入文案，来源=config.comment_texts，候选数=${captionPool.size}，选中文案 len=${phrase.length} preview=${phrase.take(40)}")
-        devOp(alias, "发作品：输入文案前固定坐标点击 description（同图库首条）")
-        if (!publishPostTapDescriptionField(alias, videoIndex, w, h)) {
-            return false
+        devOp(
+            alias,
+            "发作品：准备输入文案，来源=config.comment_texts，候选数=${captionPool.size}，" +
+                "选中文案 len=${phrase.length} preview=${phrase.take(40)}",
+        )
+        devOp(alias, "发作品：输入文案前 OCR 定位并点击 description（文案屏可含 drafts）")
+        if (!publishPostTapDescriptionField(service, alias, videoIndex, w, h)) {
+            devOp(alias, "发作品：description OCR/点击失败，准备重启 TikTok 后重新发布")
+            return publishPostFail(alias, "发作品 description OCR", tryRestart = true)
         }
         devOp(alias, "发作品：description 已点击，等待页面/键盘稳定")
         delay(1000)
@@ -9984,6 +10797,7 @@ class RealTraceExecutor(
             devOp(alias, "发作品：文案 input 失败，准备重启 TikTok 后重新发布")
             return publishPostFail(alias, "发作品文案 input", tryRestart = true)
         }
+        devOp(alias, "发作品：文案 input 已执行（phrase len=${phrase.length}），开始 OCR Done/Post")
         delay(350)
         val captionConfirmRetryLimit = 4
         var captionConfirmOcrSummary = ""
@@ -10041,12 +10855,30 @@ class RealTraceExecutor(
             PublishCaptionConfirmKind.DONE -> {
                 delay(500)
                 val tapNextAgain = tapNext0
-                devOp(
-                    alias,
-                    "发作品：Done 已点击，准备复用第一次 Next 坐标 (${tapNextAgain.x},${tapNextAgain.y}) 再点一次 Next",
-                )
-                if (!runSuCommand("input tap ${tapNextAgain.x} ${tapNextAgain.y}")) return false
-                delay(800)
+                if (tapNextAgain != null) {
+                    devOp(
+                        alias,
+                        "发作品：Done 已点击，准备复用 Next 坐标 (${tapNextAgain.x},${tapNextAgain.y}) 再点一次 Next",
+                    )
+                    if (!runSuCommand("input tap ${tapNextAgain.x} ${tapNextAgain.y}")) return false
+                    delay(800)
+                } else {
+                    // 无记位：OCR 找 Next 再点
+                    devOp(alias, "发作品：Done 已点击，无 Next 记位，OCR 定位 Next")
+                    if (
+                        !publishPostOcrTapByFinder(
+                            service,
+                            alias,
+                            "publish_post_after_done_next_$videoIndex",
+                            "Done后Next",
+                            4,
+                        ) { findStrictExactLabelHit(it, "Next") }
+                    ) {
+                        devOp(alias, "发作品：Done 后 Next OCR 未命中，继续发布完成校验")
+                    } else {
+                        delay(800)
+                    }
+                }
             }
             PublishCaptionConfirmKind.POST -> {
                 devOp(
@@ -10063,11 +10895,23 @@ class RealTraceExecutor(
             if (confirmAttempt > 0) {
                 when (layoutKind) {
                     PublishCaptionConfirmKind.DONE -> {
-                        devOp(
-                            alias,
-                            "发作品：Done 路径第 $confirmAttempt 次补点 Next（${tapNext0.x},${tapNext0.y}）",
-                        )
-                        if (!runSuCommand("input tap ${tapNext0.x} ${tapNext0.y}")) return false
+                        val retryNext = tapNext0
+                        if (retryNext != null) {
+                            devOp(
+                                alias,
+                                "发作品：Done 路径第 $confirmAttempt 次补点 Next（${retryNext.x},${retryNext.y}）",
+                            )
+                            if (!runSuCommand("input tap ${retryNext.x} ${retryNext.y}")) return false
+                        } else {
+                            publishPostOcrTapByFinder(
+                                service,
+                                alias,
+                                "publish_post_done_retry_next_${videoIndex}_$confirmAttempt",
+                                "Done补点Next",
+                                2,
+                            ) { findStrictExactLabelHit(it, "Next") }
+                        }
+                        delay(800)
                     }
                     PublishCaptionConfirmKind.POST -> {
                         devOp(
@@ -10075,9 +10919,9 @@ class RealTraceExecutor(
                             "发作品：Post 路径第 $confirmAttempt 次补点顶部 Post（${tapConfirm.x},${tapConfirm.y}）",
                         )
                         if (!runSuCommand("input tap ${tapConfirm.x} ${tapConfirm.y}")) return false
+                        delay(800)
                     }
                 }
-                delay(800)
             }
             if (
                 verifyPublishPostLayoutConfirmTapSucceeded(
@@ -10153,6 +10997,7 @@ class RealTraceExecutor(
      * 图库统计为 0 时不执行发布并返回 false。
      * 新任务（无续发断点）时：先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；**全部成功后不删图库**（素材保留至下次新任务开始前清理）。
      * 素材准备阶段不暂停涨粉；图库确认有可用素材后才进入发布独占阶段（暂停涨粉并执行 TikTok 发布）。
+     * 进入发布独占前、以及同条重试前都会复检图库数量；不足则补拉（避免并发清库把素材删掉后仍按「已就绪」空跑）。
      * 中途失败时 [PrefsStore] 记录已成功条数，**仅在同一次云端 publish_post_start 指令内**从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
      * 用户硬停或收到新的发作品指令时清除断点；断点不可跨指令复用。
      * 断点条数大于本次计划条数且图库仍有素材时，视为断点与图库不一致，清断点从第 1 条重发（不删图）。
@@ -10165,15 +11010,36 @@ class RealTraceExecutor(
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
         val resumeStartIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
         val targetPublishCount = PrefsStore.getPublishPostTargetCount()
+        val configuredFetchCount =
+            (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
         if (resumeStartIdx <= 0) {
             if (PrefsStore.isPublishPostMaterialReady()) {
-                devOp(alias, "发作品：检测到素材已就绪（进程恢复），跳过图库清理与素材拉取")
+                val readyStats = publishPostResolveGalleryMaterialStats()
+                if (readyStats.resolvedCount > 0) {
+                    devOp(
+                        alias,
+                        "发作品：检测到素材已就绪且复检通过（图片=${readyStats.picturesRootImageCount} " +
+                            "视频=${readyStats.picturesRootVideoCount} 合计=${readyStats.resolvedCount}），跳过图库清理与素材拉取",
+                    )
+                } else {
+                    PrefsStore.setPublishPostMaterialReady(false)
+                    devOp(alias, "发作品：素材就绪标记存在但复检图库为空，重新清理并拉取")
+                    deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
+                    if (configuredFetchCount > 0) {
+                        if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
+                            lastPublishPostEntryFailureReason =
+                                lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
+                            return false
+                        }
+                    } else {
+                        devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
+                    }
+                }
             } else {
                 devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
                 deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
-                val fetchCount = (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
-                if (fetchCount > 0) {
-                    if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
+                if (configuredFetchCount > 0) {
+                    if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
                         lastPublishPostEntryFailureReason =
                             lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
                         return false
@@ -10188,19 +11054,21 @@ class RealTraceExecutor(
                 "发作品：续发断点已成功 $resumeStartIdx 条（指令=${PrefsStore.getPublishPostTaskOpId()}），跳过图库清理与素材拉取",
             )
         }
-        val galleryStats = publishPostResolveGalleryMaterialStats()
-        val galleryMaterialCount = galleryStats.resolvedCount
-        if (galleryMaterialCount <= 0) {
-            lastPublishPostEntryFailureReason = "图库无可用素材"
-            devOp(
-                alias,
-                "发作品：图库无可用素材，已中止本次任务。明细：Pictures（不含 AutoTraces）图片=${galleryStats.picturesRootImageCount}，" +
-                    "视频=${galleryStats.picturesRootVideoCount}（合计=${galleryStats.resolvedCount}）。" +
-                    "请确认 PC 去重服务可用、运行配置 publish_post_material_fetch_count>0，且素材可写入 ${PUBLISH_POST_PICTURES_PATH}（非 AutoTraces 子目录；扩展名 jpg/jpeg/png/webp/gif/mp4/mkv/3gp/webm）。",
-            )
+        val plannedMax = targetPublishCount ?: PUBLISH_POST_MAX_ITEMS_PER_TASK
+        val needBeforeExclusive = (plannedMax.coerceAtLeast(1) - resumeStartIdx.coerceAtLeast(0)).coerceAtLeast(1)
+        val galleryStats = publishPostEnsureGalleryMaterials(
+            service = service,
+            alias = alias,
+            needCount = needBeforeExclusive,
+            phaseLabel = "进入发布前",
+            configFetchCount = configuredFetchCount.coerceAtLeast(needBeforeExclusive),
+        ) ?: run {
+            if (lastPublishPostEntryFailureReason.isNullOrBlank()) {
+                lastPublishPostEntryFailureReason = "图库无可用素材"
+            }
             return false
         }
-        val plannedMax = targetPublishCount ?: PUBLISH_POST_MAX_ITEMS_PER_TASK
+        val galleryMaterialCount = galleryStats.resolvedCount
         val publishRounds = minOf(galleryMaterialCount, plannedMax.coerceAtLeast(1))
         val needsPerm = PrefsStore.shouldRunPublishPostFirstDailyPermissionOcr(accountKey)
         var startIdx = resumeStartIdx
@@ -10302,6 +11170,18 @@ class RealTraceExecutor(
                             "等待 ${PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS}ms 后重试",
                     )
                     delay(PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS)
+                    if (
+                        !publishPostRefillMaterialsOnRetryIfMissing(
+                            service = service,
+                            alias = alias,
+                            needCount = (publishRounds - videoIndex).coerceAtLeast(1),
+                            configFetchCount = configuredFetchCount.coerceAtLeast(1),
+                            phaseLabel = "同任务续发前",
+                            itemLabel = "第 ${videoIndex + 1}/$publishRounds 条",
+                        )
+                    ) {
+                        return false
+                    }
                     when (val recovery = recoverPublishPostEntry(service, "发作品同条续作")) {
                         PublishPostEntryRecoveryResult.AlreadyReady,
                         PublishPostEntryRecoveryResult.RecoveredByBack,
@@ -10321,6 +11201,18 @@ class RealTraceExecutor(
                     lastPublishAttempts = publishAttempts
                     if (publishAttempts > 1) {
                         devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：第 $publishAttempts 次重试，重新拉起 TikTok 后继续同一条作品")
+                        if (
+                            !publishPostRefillMaterialsOnRetryIfMissing(
+                                service = service,
+                                alias = alias,
+                                needCount = (publishRounds - videoIndex).coerceAtLeast(1),
+                                configFetchCount = configuredFetchCount.coerceAtLeast(1),
+                                phaseLabel = "同条重试前",
+                                itemLabel = "第 ${videoIndex + 1}/$publishRounds 条",
+                            )
+                        ) {
+                            return false
+                        }
                         when (val recovery = recoverPublishPostEntry(service, "发作品同条重试")) {
                             PublishPostEntryRecoveryResult.AlreadyReady,
                             PublishPostEntryRecoveryResult.RecoveredByBack,
@@ -10355,7 +11247,32 @@ class RealTraceExecutor(
                                 )
                             }
                         }
-                        devOp(alias, "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败（CREATE/POST 或 Recents/布局B），准备同一条重试")
+                        val emptyAfterEntry = publishPostResolveGalleryMaterialStats().resolvedCount <= 0
+                        if (emptyAfterEntry) {
+                            lastPublishPostEntryFailureReason = "图库无可用素材（入口失败后复检）"
+                            devOp(
+                                alias,
+                                "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败，复检判定为无视频/无素材导致，准备补拉后重试",
+                            )
+                            if (
+                                !publishPostRefillMaterialsOnRetryIfMissing(
+                                    service = service,
+                                    alias = alias,
+                                    needCount = (publishRounds - videoIndex).coerceAtLeast(1),
+                                    configFetchCount = configuredFetchCount.coerceAtLeast(1),
+                                    phaseLabel = "入口失败后补拉",
+                                    itemLabel = "第 ${videoIndex + 1}/$publishRounds 条",
+                                )
+                            ) {
+                                return false
+                            }
+                        } else {
+                            devOp(
+                                alias,
+                                "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败（CREATE/POST 或 Recents/布局B），" +
+                                    "复检图库仍有素材，非无视频问题，准备同一条重试",
+                            )
+                        }
                         if (isHardStopActive()) return false
                         continue
                     }
@@ -10647,7 +11564,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 搜索结果页进入 Users 标签；首次 OCR 未命中则优先导航返回回首页（或 OCR 已见底栏时强关），再重新搜索；仍失败则中止。
+     * 搜索结果页进入 Users 标签；首次 OCR 未命中则优先导航返回回首页（已见底栏则连点 Home，不强关），再重新搜索；仍失败则中止。
      */
     private suspend fun ensureUsersTabWithForceRestartRecovery(
         service: Context,
@@ -11431,6 +12348,103 @@ class RealTraceExecutor(
                     "磁盘文件 清理前=$beforeFs 清理后剩余=$afterFs（已清 $fsRemoved 个）",
             )
         }
+    }
+
+    /**
+     * 发作品前/重试前复检图库：若 Pictures 可用素材 < [needCount]，则按差额从 PC 补拉。
+     * 图库为空时先清一次再拉，避免 MediaStore 脏状态。
+     * @return 复检后的图库统计；补拉失败返回 null（已写 [lastPublishPostEntryFailureReason]）
+     */
+    private suspend fun publishPostEnsureGalleryMaterials(
+        service: Context,
+        alias: String,
+        needCount: Int,
+        phaseLabel: String,
+        configFetchCount: Int,
+    ): PublishPostGalleryMaterialStats? {
+        val need = needCount.coerceAtLeast(1)
+        var stats = publishPostResolveGalleryMaterialStats()
+        if (stats.resolvedCount >= need) {
+            if (stats.resolvedCount > 0) {
+                PrefsStore.setPublishPostMaterialReady(true)
+            }
+            devOp(
+                alias,
+                "发作品：$phaseLabel 复检素材充足 need=$need have=${stats.resolvedCount}" +
+                    "（图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount}）",
+            )
+            return stats
+        }
+        PrefsStore.setPublishPostMaterialReady(false)
+        val shortage = (need - stats.resolvedCount).coerceAtLeast(1)
+        val fetchCount = maxOf(shortage, configFetchCount.coerceIn(0, 20)).coerceIn(1, 20)
+        if (stats.resolvedCount <= 0) {
+            devOp(
+                alias,
+                "发作品：$phaseLabel 复检图库无可用素材（图片=${stats.picturesRootImageCount} " +
+                    "视频=${stats.picturesRootVideoCount}），清理后补拉 $fetchCount 条",
+            )
+            deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
+        } else {
+            devOp(
+                alias,
+                "发作品：$phaseLabel 复检素材不足 need=$need have=${stats.resolvedCount}" +
+                    "（图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount}），补拉 $fetchCount 条",
+            )
+        }
+        if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
+            lastPublishPostEntryFailureReason =
+                lastPublishPostEntryFailureReason ?: "PC 素材拉取失败（$phaseLabel）"
+            return null
+        }
+        stats = publishPostResolveGalleryMaterialStats()
+        if (stats.resolvedCount < need) {
+            lastPublishPostEntryFailureReason =
+                "图库无可用素材（$phaseLabel 补拉后仍不足 need=$need have=${stats.resolvedCount}）"
+            devOp(
+                alias,
+                "发作品：$phaseLabel 补拉后仍不足 need=$need have=${stats.resolvedCount}" +
+                    "（图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount}）。" +
+                    "请确认 PC 去重服务可用、运行配置 publish_post_material_fetch_count>0，且素材可写入 ${PUBLISH_POST_PICTURES_PATH}",
+            )
+            return null
+        }
+        return stats
+    }
+
+    /**
+     * 同条重试前：若图库已无素材，判定为「无视频」失败并补拉；已有素材则直接放行。
+     * @return false 表示补拉失败应中止本轮发作品
+     */
+    private suspend fun publishPostRefillMaterialsOnRetryIfMissing(
+        service: Context,
+        alias: String,
+        needCount: Int,
+        configFetchCount: Int,
+        phaseLabel: String,
+        itemLabel: String,
+    ): Boolean {
+        val stats = publishPostResolveGalleryMaterialStats()
+        if (stats.resolvedCount > 0) {
+            devOp(
+                alias,
+                "发作品 $itemLabel：$phaseLabel 复检图库仍有素材 " +
+                    "图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} 合计=${stats.resolvedCount}，无需补拉",
+            )
+            return true
+        }
+        lastPublishPostEntryFailureReason = "图库无可用素材（$phaseLabel）"
+        devOp(
+            alias,
+            "发作品 $itemLabel：$phaseLabel 复检判定为无视频/无素材导致的失败，开始补拉",
+        )
+        return publishPostEnsureGalleryMaterials(
+            service = service,
+            alias = alias,
+            needCount = needCount.coerceAtLeast(1),
+            phaseLabel = phaseLabel,
+            configFetchCount = configFetchCount.coerceAtLeast(1),
+        ) != null
     }
 
     /**
@@ -14797,6 +15811,8 @@ class RealTraceExecutor(
                     // 人可能已不在 Users（主 Feed / 半途 / 甚至退 App）：禁止下一名「复用 Users」
                     lastEndedAtUsersSelection = false
                     restartFromMagnifierForGrowth = true
+                    // 标记前再尽量回到主 Feed；下一名点放大镜前还会再确认一次。
+                    recoverToHomeViaBackOrRestart(service, "列表恢复失败交接前确认主Feed")
                     devOp(alias, "Users 列表 OCR：回首页重搜失败，已标记下一名从放大镜重新搜索（不复用 Users）")
                     return null
                 }
@@ -15197,11 +16213,42 @@ class RealTraceExecutor(
         val layoutAReady = findSinglePasswordAndNextHits(vision) != null
         val accessThese = findLabelHitContainingIgnoreCase(vision, "access these") != null
         val layoutCReady = screenH > 0 && findSinglePasswordWithAccessThese(vision, screenH) != null
+        val preview = buildProfileEditOcrPreview(vision, maxLines = 80).take(1200)
         devOp(
             alias,
             "自动登录 布局判定[$phase] 第${pass}/${maxPasses}次: " +
                 "严格password=$pwStrict, 含password计数=$pwContains, next=${nextHit != null}, " +
-                "access these=$accessThese, 布局A命中=$layoutAReady, 布局C命中=$layoutCReady",
+                "access these=$accessThese, 布局A命中=$layoutAReady, 布局C命中=$layoutCReady；OCR全文=$preview",
+        )
+    }
+
+    /**
+     * 验证码输入后诊断：明确打印本屏 OCR 全文 + 布局A/C/方式页判定，便于对照真机确认是否更新/是否识别到文案。
+     */
+    private fun autoLoginLogPostCodePageOcr(
+        alias: String,
+        phase: String,
+        pass: Int,
+        vision: Text,
+        screenH: Int = 0,
+    ) {
+        val preview = buildProfileEditOcrPreview(vision, maxLines = 80).take(1200)
+        val pwStrict = findAllPasswordLabelHits(vision).size
+        val accessThese = findLabelHitContainingIgnoreCase(vision, "access these") != null
+        val layoutA = findSinglePasswordAndNextHits(vision) != null
+        val layoutC = screenH > 0 && findSinglePasswordWithAccessThese(vision, screenH) != null
+        val methodPage = visionHasIdentityMethodSelectionPage(vision)
+        val pwdMethod = visionHasPasswordAccessTheseMethod(vision)
+        val emailMethod = visionHasEmailAccessTheseMethod(vision)
+        val resend = findLabelHitContainingIgnoreCase(vision, "resend code") != null
+        val verifyMarker = autoLoginDetectVerificationPageMarker(vision)
+        devOp(
+            alias,
+            "自动登录[验证码后OCR][$phase] 第${pass}次: " +
+                "布局A=$layoutA, 布局C=$layoutC, 方式页=$methodPage, " +
+                "Password方式=$pwdMethod, Email方式=$emailMethod, " +
+                "严格password=$pwStrict, accessThese=$accessThese, " +
+                "resend=$resend, verifyMarker=$verifyMarker；OCR全文=$preview",
         )
     }
 
@@ -15256,13 +16303,16 @@ class RealTraceExecutor(
     }
 
     /**
-     * 布局 C：同屏仅 1 个 password，且底部有 access these。
-     * 表示仍在设密码页（Next 常被键盘遮住，需收起键盘或下滑后才可见）。
+     * 布局 C：同屏仅 1 个 password，且有 access these（底部优先；键盘顶起时也可能不在底带）。
+     * 与「Verify it's really you」方式页区分：方式页无 password。
      */
     private fun findSinglePasswordWithAccessThese(result: Text, screenH: Int): StrictLabelHit? {
         val pw = findAllPasswordLabelHits(result)
         if (pw.size != 1) return null
-        if (!hasBottomBandContaining(result, screenH, "access these")) return null
+        val hasAccess =
+            (screenH > 0 && hasBottomBandContaining(result, screenH, "access these")) ||
+                findLabelHitContainingIgnoreCase(result, "access these") != null
+        if (!hasAccess) return null
         return pw[0]
     }
 
@@ -15689,35 +16739,137 @@ class RealTraceExecutor(
         return AutoLoginStepOutcome.Failed
     }
 
-    /** 邮箱/验证码验证页：含 verify 子串即认定（不要求完整 Verify email）。 */
-    private fun ocrVisionHasVerifyEmailMarker(result: Text): Boolean =
-        findLabelHitContainingIgnoreCase(result, "verify") != null
+    /**
+     * 邮箱/验证码验证页：含 verify 子串即认定（不要求完整 Verify email）。
+     * 「Verify it's really you」方式选择页也含 verify，须先排除。
+     */
+    private fun ocrVisionHasVerifyEmailMarker(result: Text): Boolean {
+        if (visionHasIdentityMethodSelectionPage(result)) return false
+        if (visionHasPasswordAccessTheseMethod(result)) return false
+        if (visionHasEmailAccessTheseMethod(result)) return false
+        if (visionHasVerifyItsReallyYouTitle(result)) return false
+        return findLabelHitContainingIgnoreCase(result, "verify") != null
+    }
 
-    /** 验证码页门禁：Verify 文案 / Resend code 命中其一即可。 */
-    private fun autoLoginDetectVerificationPageMarker(vision: Text): String? = when {
-        findLabelHitContainingIgnoreCase(vision, "resend code") != null -> "Resend code"
-        ocrVisionHasVerifyEmailMarker(vision) -> "Verify"
-        else -> null
+    /** 验证码页门禁：Verify 文案 / Resend code 命中其一即可（不含方式选择页 / Password|Email+access these）。 */
+    private fun autoLoginDetectVerificationPageMarker(vision: Text): String? {
+        if (visionHasIdentityMethodSelectionPage(vision)) return null
+        if (visionHasPasswordAccessTheseMethod(vision)) return null
+        if (visionHasEmailAccessTheseMethod(vision)) return null
+        if (visionHasVerifyItsReallyYouTitle(vision)) return null
+        return when {
+            findLabelHitContainingIgnoreCase(vision, "resend code") != null -> "Resend code"
+            ocrVisionHasVerifyEmailMarker(vision) -> "Verify"
+            else -> null
+        }
     }
 
     /**
      * 确认已进入验证码页（Verify 文案或 Resend code 任一），并持续 OCR 直至定位 Resend code。
+     * 若先见到 Verify it's really you / 验证方式页，先点 Email 再等 Resend code。
      * 拉取验证码须在 Resend code 命中之后，故本函数返回 true 时 Resend code 已就绪。
+     */
+    private enum class AutoLoginVerifyGateResult {
+        /** 已定位 Resend code，可拉验证码。 */
+        ResendReady,
+        /** 已按 Password+access these 点 Password 并输密。 */
+        PasswordDone,
+        Failed,
+    }
+
+    /**
+     * 确认验证方式/验证码页：
+     * - Password + access these → 点 Password 输密
+     * - Email + access these → 点 Email，等到 Resend code
+     * - 普通 Verify/Resend → 等到 Resend code
      */
     private suspend fun autoLoginOcrConfirmVerificationPageAndWaitResendCode(
         ctx: Context,
         alias: String,
         w: Int,
         h: Int,
-    ): Boolean {
+        password: String = "",
+    ): AutoLoginVerifyGateResult {
         val passes = AUTO_LOGIN_OCR_MAX_PASSES
         var pageConfirmed = false
         var confirmedMarker: String? = null
 
         for (pass in 1..passes) {
-            if (hardStopOrNull(alias, "自动登录-验证码页确认")) return false
-            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "验证码页确认")) return false
+            if (hardStopOrNull(alias, "自动登录-验证码页确认")) return AutoLoginVerifyGateResult.Failed
+            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "验证码页确认")) {
+                return AutoLoginVerifyGateResult.Failed
+            }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_verify_page_$pass") ?: continue
+            autoLoginLogPostCodePageOcr(alias, "验证码页确认", pass, vision, h)
+            if (visionHasPasswordAccessTheseMethod(vision) ||
+                (
+                    visionHasIdentityMethodSelectionPage(vision) &&
+                        findIdentityMethodPasswordHit(vision) != null &&
+                        findIdentityMethodEmailHit(vision) == null
+                    )
+            ) {
+                if (password.isBlank()) {
+                    devOp(alias, "自动登录：见 Password 方式页，但 password 为空（第 $pass 次）")
+                    return AutoLoginVerifyGateResult.Failed
+                }
+                devOp(alias, "自动登录：见 Password 方式页（含 access these 或无 Email），点 Password 输密（第 $pass 次）")
+                return if (
+                    autoLoginEnterPasswordLayoutAccessThese(
+                        ctx, alias, w, h, password, "auto_login_verify_to_pwd_$pass",
+                        readyVisionHint = vision,
+                    )
+                ) {
+                    AutoLoginVerifyGateResult.PasswordDone
+                } else {
+                    AutoLoginVerifyGateResult.Failed
+                }
+            }
+            if (visionHasIdentityMethodSelectionPage(vision) || visionHasEmailAccessTheseMethod(vision)) {
+                val kind = if (visionHasBeforeYouContinueText(vision)) {
+                    "Before you continue"
+                } else {
+                    "Verify it's really you / Email+access these"
+                }
+                val hasEmail = findIdentityMethodEmailHit(vision) != null
+                val hasPassword = findIdentityMethodPasswordHit(vision) != null
+                if (!hasEmail && hasPassword) {
+                    if (password.isBlank()) {
+                        devOp(alias, "自动登录：方式页无 Email 有 Password，但 password 为空（第 $pass 次）")
+                        return AutoLoginVerifyGateResult.Failed
+                    }
+                    devOp(alias, "自动登录：方式页无 Email 有 Password，点 Password 输密（第 $pass 次）")
+                    return if (
+                        autoLoginEnterPasswordLayoutAccessThese(
+                            ctx, alias, w, h, password, "auto_login_verify_pwd_only_$pass",
+                            readyVisionHint = vision,
+                        )
+                    ) {
+                        AutoLoginVerifyGateResult.PasswordDone
+                    } else {
+                        AutoLoginVerifyGateResult.Failed
+                    }
+                }
+                devOp(alias, "自动登录：验证码确认见验证方式页（$kind），先点 Email/Outlook（第 $pass 次）")
+                if (!autoLoginTapIdentityMethodEmail(ctx, alias, w, h, vision, "auto_login_verify_method_$pass")) {
+                    if (hasPassword && password.isNotBlank()) {
+                        devOp(alias, "自动登录：未点到 Email，回退点 Password 输密（第 $pass 次）")
+                        return if (
+                            autoLoginEnterPasswordLayoutAccessThese(
+                                ctx, alias, w, h, password, "auto_login_verify_pwd_fb_$pass",
+                                readyVisionHint = vision,
+                            )
+                        ) {
+                            AutoLoginVerifyGateResult.PasswordDone
+                        } else {
+                            AutoLoginVerifyGateResult.Failed
+                        }
+                    }
+                    continue
+                }
+                pageConfirmed = true
+                confirmedMarker = kind
+                continue
+            }
             val marker = autoLoginDetectVerificationPageMarker(vision)
             if (marker == null) {
                 devOp(alias, "自动登录：验证码页确认第 $pass/$passes 次：Verify / Resend code 均未命中")
@@ -15730,12 +16882,12 @@ class RealTraceExecutor(
             }
             if (marker == "Resend code") {
                 devOp(alias, "自动登录：已定位 Resend code，可拉取验证码（第 $pass 次 OCR）")
-                return true
+                return AutoLoginVerifyGateResult.ResendReady
             }
         }
         if (!pageConfirmed) {
             devOp(alias, "自动登录：验证码页确认失败（${passes} 次均未命中 Verify / Resend code）")
-            return false
+            return AutoLoginVerifyGateResult.Failed
         }
 
         devOp(
@@ -15743,17 +16895,115 @@ class RealTraceExecutor(
             "自动登录：已见 $confirmedMarker，继续等待 Resend code（最多 ${passes} 次 OCR）",
         )
         for (pass in 1..passes) {
-            if (hardStopOrNull(alias, "自动登录-等待 Resend code")) return false
-            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "等待 Resend code")) return false
+            if (hardStopOrNull(alias, "自动登录-等待 Resend code")) return AutoLoginVerifyGateResult.Failed
+            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "等待 Resend code")) {
+                return AutoLoginVerifyGateResult.Failed
+            }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_resend_$pass") ?: continue
+            autoLoginLogPostCodePageOcr(alias, "等待Resend code", pass, vision, h)
+            if (visionHasPasswordAccessTheseMethod(vision) ||
+                (
+                    visionHasIdentityMethodSelectionPage(vision) &&
+                        findIdentityMethodPasswordHit(vision) != null &&
+                        findIdentityMethodEmailHit(vision) == null
+                    )
+            ) {
+                if (password.isBlank()) {
+                    devOp(alias, "自动登录：等待 Resend 时见 Password 方式页，但 password 为空")
+                    return AutoLoginVerifyGateResult.Failed
+                }
+                devOp(alias, "自动登录：等待 Resend 时见 Password 方式页，转点 Password 输密")
+                return if (
+                    autoLoginEnterPasswordLayoutAccessThese(
+                        ctx, alias, w, h, password, "auto_login_resend_to_pwd_$pass",
+                        readyVisionHint = vision,
+                    )
+                ) {
+                    AutoLoginVerifyGateResult.PasswordDone
+                } else {
+                    AutoLoginVerifyGateResult.Failed
+                }
+            }
+            if (visionHasIdentityMethodSelectionPage(vision) || visionHasEmailAccessTheseMethod(vision)) {
+                val hasEmail = findIdentityMethodEmailHit(vision) != null
+                val hasPassword = findIdentityMethodPasswordHit(vision) != null
+                if (!hasEmail && hasPassword && password.isNotBlank()) {
+                    devOp(alias, "自动登录：等待 Resend 时无 Email 有 Password，点 Password 输密")
+                    return if (
+                        autoLoginEnterPasswordLayoutAccessThese(
+                            ctx, alias, w, h, password, "auto_login_resend_pwd_only_$pass",
+                            readyVisionHint = vision,
+                        )
+                    ) {
+                        AutoLoginVerifyGateResult.PasswordDone
+                    } else {
+                        AutoLoginVerifyGateResult.Failed
+                    }
+                }
+                devOp(alias, "自动登录：等待 Resend 时仍见验证方式页，再点 Email（等待第 $pass 次）")
+                if (!autoLoginTapIdentityMethodEmail(ctx, alias, w, h, vision, "auto_login_resend_method_$pass")) {
+                    if (hasPassword && password.isNotBlank()) {
+                        devOp(alias, "自动登录：等待 Resend 未点到 Email，回退点 Password")
+                        return if (
+                            autoLoginEnterPasswordLayoutAccessThese(
+                                ctx, alias, w, h, password, "auto_login_resend_pwd_fb_$pass",
+                                readyVisionHint = vision,
+                            )
+                        ) {
+                            AutoLoginVerifyGateResult.PasswordDone
+                        } else {
+                            AutoLoginVerifyGateResult.Failed
+                        }
+                    }
+                }
+                continue
+            }
             if (findLabelHitContainingIgnoreCase(vision, "resend code") != null) {
                 devOp(alias, "自动登录：已定位 Resend code，可拉取验证码（等待阶段第 $pass 次 OCR）")
-                return true
+                return AutoLoginVerifyGateResult.ResendReady
             }
             devOp(alias, "自动登录：等待 Resend code 第 $pass/$passes 次：仍未命中")
         }
         devOp(alias, "自动登录：已进入验证码页（$confirmedMarker）但 ${passes} 次内未定位 Resend code")
-        return false
+        return AutoLoginVerifyGateResult.Failed
+    }
+
+    /** 自动登录：验证方式页点 Email/Outlook；Before you continue 变体再尝试点 Next。 */
+    private suspend fun autoLoginTapIdentityMethodEmail(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        vision: Text,
+        tagPrefix: String,
+    ): Boolean {
+        val emailHit = findIdentityMethodEmailHit(vision) ?: run {
+            devOp(alias, "自动登录：验证方式页未找到 Email/Outlook")
+            return false
+        }
+        val tap = autoLoginTapWithJitter(emailHit.point, w, h)
+        devOp(alias, "自动登录：验证方式页点 Email/Outlook (${tap.x},${tap.y})")
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        if (!autoLoginDelay(alias, 500L, "验证方式-Email后")) return false
+        if (!visionHasBeforeYouContinueText(vision)) return true
+        for (pass in 1..3) {
+            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "验证方式-Next")) return false
+            val nextVision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_next_$pass") ?: continue
+            if (visionHasIdentityCodeEntryPage(nextVision) ||
+                findLabelHitContainingIgnoreCase(nextVision, "resend code") != null
+            ) {
+                return true
+            }
+            val nextHit = findStrictExactLabelHit(nextVision, "Next")
+                ?: findStrictExactLabelHit(nextVision, "next")
+                ?: findBottommostStrictExactLabelHit(nextVision, "Next")
+            if (nextHit != null) {
+                val nextTap = autoLoginTapWithJitter(nextHit.point, w, h)
+                devOp(alias, "自动登录：验证方式页点 Next (${nextTap.x},${nextTap.y})")
+                return runSuCommand("input tap ${nextTap.x} ${nextTap.y}")
+            }
+        }
+        return true
     }
 
     /** Email 输入框页：须可见 address 或 username 相关文案。 */
@@ -15925,7 +17175,7 @@ class RealTraceExecutor(
             if (hit == null) continue
             val tap = autoLoginTapWithJitter(hit.point, w, h)
             devOp(alias, "自动登录：预处理点 Profile 进登录入口 (${tap.x},${tap.y})")
-            if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+            if (navBackThenTapProfile(alias, "自动登录入口Profile", tap.x, tap.y)) {
                 autoLoginDelay(alias, 450L, "入口Profile 后")
                 return ProfileLoginEntryTapOutcome.ProfileTapped
             }
@@ -15995,7 +17245,7 @@ class RealTraceExecutor(
             }
             val tap = autoLoginTapWithJitter(profileHit.point, w, h)
             devOp(alias, "自动登录成功校验：点底栏 Profile (${tap.x},${tap.y}) [pass=$pass]")
-            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) continue
+            if (!navBackThenTapProfile(alias, "自动登录成功校验Profile", tap.x, tap.y)) continue
             if (!autoLoginDelay(alias, 900L, "成功校验 Profile 点击后")) return false
 
             for (editPass in 1..maxPasses) {
@@ -16352,6 +17602,18 @@ class RealTraceExecutor(
                 continue
             }
 
+            // Password/Email + access these 方式页：切勿等成「命中 Verify」空等 Resend
+            if (visionHasPasswordAccessTheseMethod(vision) ||
+                visionHasEmailAccessTheseMethod(vision) ||
+                visionHasIdentityMethodSelectionPage(vision)
+            ) {
+                devOp(
+                    alias,
+                    "自动登录：已识别 Verify 方式页（Password/Email+access these），认为 Email→Continue 跳转成功（第 $pass 次 OCR）",
+                )
+                return AutoLoginEmailAfterContinueOutcome.VerifyReady
+            }
+
             val sawVerifyEmail = ocrVisionHasVerifyEmailMarker(vision)
             if (sawVerifyEmail) {
                 devOp(alias, "自动登录：已识别 Verify 文案，认为 Email→Continue 跳转成功（第 $pass 次 OCR）")
@@ -16423,7 +17685,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 布局 C：1 个 password + 底部 access these → 输密码 → 一次返回 → 点 Next。
+     * 布局 C：1 个 password + access these → 输密码 → 一次返回 → 点 Next。
+     * @param readyVisionHint 上游已 OCR 命中布局 C 时传入，避免二次探测失败掉进布局 B。
      */
     private suspend fun autoLoginEnterPasswordLayoutAccessThese(
         ctx: Context,
@@ -16432,37 +17695,75 @@ class RealTraceExecutor(
         h: Int,
         password: String,
         tagPrefix: String,
+        readyVisionHint: Text? = null,
     ): Boolean {
-        var readyVision: Text? = null
-        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
-            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_detect_$pass") ?: continue
-            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局C探测", vision, h)
-            if (findSinglePasswordWithAccessThese(vision, h) != null) {
-                readyVision = vision
-                break
+        var readyVision: Text? =
+            readyVisionHint?.takeIf { findSinglePasswordWithAccessThese(it, h) != null }
+        if (readyVision == null) {
+            for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+                val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_detect_$pass") ?: continue
+                autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局C探测", vision, h)
+                if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                    readyVision = vision
+                    break
+                }
+                if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
+                    autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "布局C定位")
+                }
             }
-            if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
-                autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "布局C定位")
-            }
+        } else {
+            devOp(alias, "自动登录：布局C 复用上游 OCR，跳过二次探测")
         }
         val vision = readyVision
         if (vision == null) {
             devOp(alias, "自动登录：布局C（password+access these）未命中")
             return false
         }
-        val field = findMiddlePasswordFieldHit(vision)
-        if (field == null) {
-            devOp(alias, "自动登录：布局C 密码输入区未定位")
+
+        // 方式页：点 Password 卡片（不是点卡片下方假装输入框）
+        val methodPw = findIdentityMethodPasswordHit(vision) ?: findAllPasswordLabelHits(vision).firstOrNull()
+        if (methodPw == null) {
+            devOp(alias, "自动登录：布局C 未找到 Password 文案")
             return false
         }
-        val pwTap = autoLoginTapWithJitter(field.point, w, h)
-        devOp(alias, "自动登录：布局C 点 password 输入区 (${pwTap.x},${pwTap.y})")
-        runSuCommand("input tap ${pwTap.x} ${pwTap.y}")
-        if (!autoLoginDelay(alias, 400L, "布局C-点password后")) return false
-        if (!autoLoginInputText(alias, password)) return false
-        if (!autoLoginDelay(alias, 500L, "布局C-输密码后")) return false
+        val cardTap = autoLoginTapWithJitter(methodPw.point, w, h)
+        devOp(alias, "自动登录：布局C/方式页 点 Password (${cardTap.x},${cardTap.y})")
+        runSuCommand("input tap ${cardTap.x} ${cardTap.y}")
+        if (!autoLoginDelay(alias, 800L, "布局C-点Password后")) return false
 
-        // 先看 Next 是否已可见；否则仅一次返回后再找。
+        var typed = false
+        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+            if (hardStopOrNull(alias, "自动登录-布局C输密")) return false
+            if (pass > 1 && !autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "布局C输密等待")) return false
+            val after = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_after_tap_$pass") ?: continue
+            autoLoginLogPostCodePageOcr(alias, "布局C-点Password后", pass, after, h)
+            // 仍停在方式页：再点一次 Password
+            if (visionHasPasswordAccessTheseMethod(after) &&
+                (
+                    visionHasVerifyItsReallyYouTitle(after) ||
+                        findLabelHitContainingIgnoreCase(after, "choose a method") != null
+                    )
+            ) {
+                val again = findIdentityMethodPasswordHit(after) ?: continue
+                val t = autoLoginTapWithJitter(again.point, w, h)
+                devOp(alias, "自动登录：布局C 仍见方式页，再点 Password (${t.x},${t.y})")
+                runSuCommand("input tap ${t.x} ${t.y}")
+                if (!autoLoginDelay(alias, 800L, "布局C-再点Password后")) return false
+                continue
+            }
+            // 点 Password 后输入框通常已聚焦，直接输密（勿再点输入区）
+            devOp(alias, "自动登录：布局C 点 Password 后已聚焦，直接输密码")
+            if (!autoLoginInputText(alias, password)) return false
+            typed = true
+            break
+        }
+        if (!typed) {
+            devOp(alias, "自动登录：布局C 点 Password 后未能输密")
+            return false
+        }
+        if (!autoLoginDelay(alias, 500L, "布局C-输密码后")) return false
+        if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "布局C输密")) return false
+
         val alreadyVisible = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_next_probe")
             ?.let { findAutoLoginContinueOrNextHit(it) != null } == true
         if (!alreadyVisible) {
@@ -16475,8 +17776,8 @@ class RealTraceExecutor(
             maxPasses = AUTO_LOGIN_OCR_MAX_PASSES,
         )
         if (nextOutcome != AutoLoginStepOutcome.Ok) {
-            devOp(alias, "自动登录：布局C 未点到 Next")
-            return false
+            // 部分机型输密+上滑后已自动提交，Next 可不出现
+            devOp(alias, "自动登录：布局C 未点到 Next（可能已自动提交），继续")
         }
         return true
     }
@@ -16612,6 +17913,7 @@ class RealTraceExecutor(
             autoLoginClearFocusedInput(alias)
             if (!autoLoginInputText(alias, fetched)) return AutoLoginStepOutcome.Failed
             if (!autoLoginDelay(alias, 400L, "验证码输入后")) return AutoLoginStepOutcome.Failed
+            if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "验证码")) return AutoLoginStepOutcome.Failed
             return AutoLoginStepOutcome.Ok
         }
 
@@ -16687,6 +17989,7 @@ class RealTraceExecutor(
                 return AutoLoginStepOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_after_code_$ocrPass") ?: continue
+            autoLoginLogPostCodePageOcr(alias, "旧流-验证码后轮询", ocrPass, vision, h)
 
             if (findLabelHitContainingIgnoreCase(vision, "expired") != null) {
                 if (!recoverFromExpiredVerificationCode()) {
@@ -16743,6 +18046,8 @@ class RealTraceExecutor(
         ReachedInterest,
         ReachedHome,
         ReachedVerify,
+        /** Inbox/直接密码后出现设密码页（布局 A/B/C）。 */
+        ReachedPasswordLayout,
         Timeout,
         Failed,
     }
@@ -16781,7 +18086,8 @@ class RealTraceExecutor(
             findLabelHitContainingIgnoreCase(vision, "continue") != null
 
     private fun autoLoginVisionOnVerificationPage(vision: Text): Boolean =
-        autoLoginDetectVerificationPageMarker(vision) != null ||
+        visionHasIdentityMethodSelectionPage(vision) ||
+            autoLoginDetectVerificationPageMarker(vision) != null ||
             findLabelHitContainingIgnoreCase(vision, "resend code") != null
 
     /** 仅「Check your inbox」文案触发 Inbox 密码路径；「Need help logging in」验证码页也有，不能作分流依据。 */
@@ -16794,7 +18100,7 @@ class RealTraceExecutor(
             AutoLoginRouteScreenKind.MainFeed -> return AutoLoginCutSwitchPostEmailBranch.ShortPathHome
             AutoLoginRouteScreenKind.Unknown -> Unit
         }
-        // Verify 页与 Check your inbox 页都可能含 verify 子串；先排除验证码页再判 Inbox。
+        // 方式选择页 / 验证码页优先；勿把「Verify it's really you」误判进 Inbox。
         if (autoLoginVisionOnVerificationPage(vision)) {
             return AutoLoginCutSwitchPostEmailBranch.VerifyPage
         }
@@ -16816,8 +18122,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 切号流：点击 Continue 后等待旧页特征消失，再等待兴趣页/底栏 Home/verify 出现（80s）。
-     * 兴趣页与 Home 可在任意时刻命中；verify 须在 [markerGone] 为 true 后命中。
+     * 切号流：点击 Continue 后等待旧页特征消失，再等待兴趣页/底栏 Home/verify/密码布局出现（80s）。
+     * 兴趣页与 Home 可在任意时刻命中；verify / 密码布局须在 [markerGone] 为 true 后命中。
      */
     private suspend fun autoLoginWaitPageTransitionCutSwitch(
         ctx: Context,
@@ -16828,6 +18134,7 @@ class RealTraceExecutor(
         markerGone: (Text) -> Boolean,
         allowVerifySuccess: Boolean,
         ocrIntervalMs: Long = AUTO_LOGIN_OCR_RETRY_DELAY_MS,
+        allowPasswordLayoutSuccess: Boolean = false,
     ): AutoLoginCutSwitchTransitionOutcome {
         val startedAt = System.currentTimeMillis()
         var pass = 0
@@ -16842,6 +18149,9 @@ class RealTraceExecutor(
                 return AutoLoginCutSwitchTransitionOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass") ?: continue
+            if (phaseLog.contains("验证码") || allowPasswordLayoutSuccess) {
+                autoLoginLogPostCodePageOcr(alias, "切号-$phaseLog", pass, vision, h)
+            }
             when (autoLoginClassifyRouteScreen(vision, h)) {
                 AutoLoginRouteScreenKind.Interest -> {
                     devOp(alias, "自动登录(切号)：$phaseLog 命中兴趣页（第 $pass 次 OCR）")
@@ -16857,9 +18167,32 @@ class RealTraceExecutor(
                 goneObserved = true
                 devOp(alias, "自动登录(切号)：$phaseLog 旧页特征已消失（第 $pass 次 OCR）")
             }
-            if (allowVerifySuccess && goneObserved && ocrVisionHasVerifyEmailMarker(vision)) {
-                devOp(alias, "自动登录(切号)：$phaseLog 旧页消失且已见 verify（第 $pass 次 OCR）")
-                return AutoLoginCutSwitchTransitionOutcome.ReachedVerify
+            if (allowPasswordLayoutSuccess && goneObserved) {
+                val layoutC = findSinglePasswordWithAccessThese(vision, h) != null
+                val layoutA = findSinglePasswordAndNextHits(vision) != null
+                val layoutB = findAllPasswordLabelHits(vision).size >= 2
+                if (layoutC || layoutA || layoutB) {
+                    val kind = when {
+                        layoutC -> "布局C(password+access these)"
+                        layoutA -> "布局A(password+next)"
+                        else -> "布局B(password>=2)"
+                    }
+                    devOp(alias, "自动登录(切号)：$phaseLog 旧页消失且已见设密码页 $kind（第 $pass 次 OCR）")
+                    return AutoLoginCutSwitchTransitionOutcome.ReachedPasswordLayout
+                }
+            }
+            if (allowVerifySuccess && goneObserved) {
+                if (visionHasIdentityMethodSelectionPage(vision)) {
+                    devOp(
+                        alias,
+                        "自动登录(切号)：$phaseLog 旧页消失且已见 Verify it's really you 验证方式页（第 $pass 次 OCR）",
+                    )
+                    return AutoLoginCutSwitchTransitionOutcome.ReachedVerify
+                }
+                if (ocrVisionHasVerifyEmailMarker(vision)) {
+                    devOp(alias, "自动登录(切号)：$phaseLog 旧页消失且已见 verify（第 $pass 次 OCR）")
+                    return AutoLoginCutSwitchTransitionOutcome.ReachedVerify
+                }
             }
         }
         devOp(
@@ -16892,6 +18225,7 @@ class RealTraceExecutor(
             if (branch != AutoLoginCutSwitchPostEmailBranch.StillOnEmail &&
                 branch != AutoLoginCutSwitchPostEmailBranch.Unknown
             ) {
+                autoLoginLogPostCodePageOcr(alias, "Email后分流=$branch", pass, vision, h)
                 devOp(alias, "自动登录(切号)：Email 后分流=$branch（第 $pass 次 OCR）")
                 return AutoLoginCutSwitchPostEmailDetectResult(branch, vision)
             }
@@ -16928,12 +18262,14 @@ class RealTraceExecutor(
         tagPrefix: String,
     ): Boolean {
         var enteredPasswordViaEnterPasswordLayout = false
+        var layoutCReadyVision: Text? = null
         for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_layout_a_$pass") ?: continue
             autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "切号-布局A探测", vision, h)
             val hits = findSinglePasswordAndNextHits(vision)
             if (hits == null) {
                 if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                    layoutCReadyVision = vision
                     devOp(alias, "自动登录(切号)：布局A探测中命中布局C（password+access these），转布局C")
                     break
                 }
@@ -16976,7 +18312,12 @@ class RealTraceExecutor(
                 maxPasses = 3,
             ) == AutoLoginStepOutcome.Ok
         }
-        if (autoLoginEnterPasswordLayoutAccessThese(ctx, alias, w, h, password, "${tagPrefix}_layout_c")) {
+        if (
+            autoLoginEnterPasswordLayoutAccessThese(
+                ctx, alias, w, h, password, "${tagPrefix}_layout_c",
+                readyVisionHint = layoutCReadyVision,
+            )
+        ) {
             devOp(alias, "自动登录(切号)：布局C（password+access these）已输密码并点 Next")
             return true
         }
@@ -17057,6 +18398,7 @@ class RealTraceExecutor(
         reachedInterest: BooleanArray,
         reachedHome: BooleanArray,
         needVerify: BooleanArray,
+        needPasswordLayout: BooleanArray? = null,
     ): AutoLoginCutSwitchStepOutcome {
         return when (outcome) {
             AutoLoginCutSwitchTransitionOutcome.ReachedInterest -> {
@@ -17070,6 +18412,15 @@ class RealTraceExecutor(
             AutoLoginCutSwitchTransitionOutcome.ReachedVerify -> {
                 needVerify[0] = true
                 AutoLoginCutSwitchStepOutcome.Ok
+            }
+            AutoLoginCutSwitchTransitionOutcome.ReachedPasswordLayout -> {
+                if (needPasswordLayout != null) {
+                    needPasswordLayout[0] = true
+                    AutoLoginCutSwitchStepOutcome.Ok
+                } else {
+                    devOp(alias, "自动登录(切号)：$phaseLog 出现设密码页但本阶段未启用处理")
+                    AutoLoginCutSwitchStepOutcome.Failed
+                }
             }
             AutoLoginCutSwitchTransitionOutcome.Timeout,
             AutoLoginCutSwitchTransitionOutcome.Failed,
@@ -17086,7 +18437,7 @@ class RealTraceExecutor(
         val reachedHome: Boolean = false,
     )
 
-    /** 切号流：验证码输入（自动提交；过期清码+Resend，不返回）。 */
+    /** 切号流：验证码输入（自动提交；过期清码+Resend，不返回）。验证码后可接布局 A/C/B。 */
     private suspend fun autoLoginEnterVerificationCodeCutSwitch(
         ctx: Context,
         alias: String,
@@ -17095,6 +18446,7 @@ class RealTraceExecutor(
         deviceId: String,
         apiUrl: String,
         email: String,
+        password: String,
     ): AutoLoginCutSwitchVerifyResult {
         suspend fun fetchCodeOrNull(): String? {
             val codeResult = TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl, email)
@@ -17118,6 +18470,48 @@ class RealTraceExecutor(
             return false
         }
 
+        suspend fun waitInterestOrHomeAfterPassword(tagPrefix: String): AutoLoginCutSwitchVerifyResult {
+            val afterPwd = autoLoginWaitPageTransitionCutSwitch(
+                ctx = ctx,
+                alias = alias,
+                h = h,
+                phaseLog = "验证码后设密码",
+                tagPrefix = tagPrefix,
+                markerGone = { v ->
+                    findSinglePasswordAndNextHits(v) == null &&
+                        findSinglePasswordWithAccessThese(v, h) == null &&
+                        findAllPasswordLabelHits(v).isEmpty()
+                },
+                allowVerifySuccess = false,
+                ocrIntervalMs = AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS,
+                allowPasswordLayoutSuccess = false,
+            )
+            return when (afterPwd) {
+                AutoLoginCutSwitchTransitionOutcome.ReachedInterest ->
+                    AutoLoginCutSwitchVerifyResult(
+                        AutoLoginCutSwitchStepOutcome.Ok,
+                        reachedInterest = true,
+                    )
+                AutoLoginCutSwitchTransitionOutcome.ReachedHome ->
+                    AutoLoginCutSwitchVerifyResult(
+                        AutoLoginCutSwitchStepOutcome.Ok,
+                        reachedHome = true,
+                    )
+                else -> AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
+            }
+        }
+
+        suspend fun enterPasswordLayoutIfNeeded(tagPrefix: String): AutoLoginCutSwitchVerifyResult {
+            if (password.isBlank()) {
+                devOp(alias, "自动登录(切号)：验证码后见设密码页但 password 为空")
+                return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
+            }
+            if (!autoLoginCutSwitchEnterPasswordLayoutAB(ctx, alias, w, h, password, tagPrefix)) {
+                return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
+            }
+            return waitInterestOrHomeAfterPassword("${tagPrefix}_after_pwd")
+        }
+
         suspend fun inputCodeAndWaitRoute(code: String, tagPrefix: String): AutoLoginCutSwitchVerifyResult {
             val focusVision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_focus")
             autoLoginTapVerificationCodeField(ctx, alias, w, h, focusVision)
@@ -17126,6 +18520,9 @@ class RealTraceExecutor(
                 return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
             }
             if (!autoLoginDelay(alias, 400L, "验证码输入后")) {
+                return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
+            }
+            if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "验证码")) {
                 return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
             }
             val transition = autoLoginWaitPageTransitionCutSwitch(
@@ -17137,6 +18534,7 @@ class RealTraceExecutor(
                 markerGone = { v -> !autoLoginVisionOnVerificationPage(v) },
                 allowVerifySuccess = false,
                 ocrIntervalMs = AUTO_LOGIN_CODE_AFTER_OCR_INTERVAL_MS,
+                allowPasswordLayoutSuccess = password.isNotBlank(),
             )
             return when (transition) {
                 AutoLoginCutSwitchTransitionOutcome.ReachedInterest ->
@@ -17149,6 +18547,10 @@ class RealTraceExecutor(
                         AutoLoginCutSwitchStepOutcome.Ok,
                         reachedHome = true,
                     )
+                AutoLoginCutSwitchTransitionOutcome.ReachedPasswordLayout -> {
+                    devOp(alias, "自动登录(切号)：验证码后命中设密码页，走布局 A/C/B")
+                    enterPasswordLayoutIfNeeded("${tagPrefix}_pwd")
+                }
                 else -> AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.Failed)
             }
         }
@@ -17240,8 +18642,17 @@ class RealTraceExecutor(
                     )
                 AutoLoginRouteScreenKind.Unknown -> Unit
             }
+            if (password.isNotBlank()) {
+                val layoutC = findSinglePasswordWithAccessThese(vision, h) != null
+                val layoutA = findSinglePasswordAndNextHits(vision) != null
+                val layoutB = findAllPasswordLabelHits(vision).size >= 2
+                if (layoutC || layoutA || layoutB) {
+                    devOp(alias, "自动登录(切号)：验证码轮询中命中设密码页，走布局 A/C/B")
+                    return enterPasswordLayoutIfNeeded("cut_switch_code_poll_pwd")
+                }
+            }
         }
-        devOp(alias, "自动登录(切号)：验证码提交后未进入兴趣页/Home")
+        devOp(alias, "自动登录(切号)：验证码提交后未进入兴趣页/Home/设密码页")
         return AutoLoginCutSwitchVerifyResult(AutoLoginCutSwitchStepOutcome.ChainRestart)
     }
 
@@ -17313,10 +18724,31 @@ class RealTraceExecutor(
         }
 
         if (!autoLoginDelay(alias, 800L, "验证码分支探测")) return AutoLoginCutSwitchStepOutcome.Failed
-        val verificationPageReady = autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)
-        if (!verificationPageReady) {
-            devOp(alias, "自动登录：验证码页未确认或未定位 Resend code，整链重来")
-            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        when (val gate = autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h, password)) {
+            AutoLoginVerifyGateResult.Failed -> {
+                devOp(alias, "自动登录：验证方式/验证码页未确认（Password/Email+access these 或 Resend），整链重来")
+                return AutoLoginCutSwitchStepOutcome.ChainRestart
+            }
+            AutoLoginVerifyGateResult.PasswordDone -> {
+                devOp(alias, "自动登录：Password+access these 已点 Password 并输密，跳过验证码")
+                var reachedInterestAfterPwd = false
+                var reachedHomeAfterPwd = false
+                when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                    AutoLoginStepOutcome.ReachedInterest -> reachedInterestAfterPwd = true
+                    AutoLoginStepOutcome.ReachedHome -> reachedHomeAfterPwd = true
+                    else -> Unit
+                }
+                return if (
+                    autoLoginCutSwitchFinishLoginTail(
+                        ctx, alias, w, h, reachedInterestAfterPwd, reachedHomeAfterPwd, dontAllowHandledEarly,
+                    )
+                ) {
+                    AutoLoginCutSwitchStepOutcome.Ok
+                } else {
+                    AutoLoginCutSwitchStepOutcome.Failed
+                }
+            }
+            AutoLoginVerifyGateResult.ResendReady -> Unit
         }
 
         if (apiUrl.isBlank() && email.isBlank()) {
@@ -17336,10 +18768,12 @@ class RealTraceExecutor(
             AutoLoginStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
         }
 
+
         if (!reachedInterestAfterCode && !reachedHomeAfterCode) {
             if (!autoLoginDelay(alias, 600L, "Password 页")) return AutoLoginCutSwitchStepOutcome.Failed
             var enteredPasswordViaEnterPasswordLayout = false
             var passwordContinueDone = false
+            var layoutCReadyVision: Text? = null
 
             for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
                 val vision = autoLoginOcrOnce(ctx, alias, "auto_login_password_next_layout_$pass") ?: continue
@@ -17347,6 +18781,7 @@ class RealTraceExecutor(
                 val hits = findSinglePasswordAndNextHits(vision)
                 if (hits == null) {
                     if (findSinglePasswordWithAccessThese(vision, h) != null) {
+                        layoutCReadyVision = vision
                         devOp(alias, "自动登录：布局A探测中命中布局C（password+access these），转布局C")
                         break
                     }
@@ -17403,6 +18838,7 @@ class RealTraceExecutor(
             } else if (
                 autoLoginEnterPasswordLayoutAccessThese(
                     ctx, alias, w, h, password, "auto_login_pwd_layout_c",
+                    readyVisionHint = layoutCReadyVision,
                 )
             ) {
                 devOp(alias, "自动登录：布局C（password+access these）已输密码并点 Next")
@@ -17509,6 +18945,7 @@ class RealTraceExecutor(
             val reachedInterest = booleanArrayOf(false)
             val reachedHome = booleanArrayOf(false)
             val needVerify = booleanArrayOf(false)
+            val needPasswordLayout = booleanArrayOf(false)
 
             if (!autoLoginCutSwitchInboxPasswordPath(ctx, alias, w, h, password, inboxPageVision)) {
                 return AutoLoginCutSwitchStepOutcome.Failed
@@ -17521,34 +18958,81 @@ class RealTraceExecutor(
                 tagPrefix = "cut_switch_inbox_pwd_transition",
                 markerGone = { v -> !autoLoginVisionHasContinueMarker(v) },
                 allowVerifySuccess = true,
+                allowPasswordLayoutSuccess = true,
             )
             when (
                 autoLoginCutSwitchApplyTransitionOutcome(
-                    alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify,
+                    alias, transition, "Inbox密码后", reachedInterest, reachedHome, needVerify, needPasswordLayout,
                 )
             ) {
                 AutoLoginCutSwitchStepOutcome.Ok -> Unit
                 else -> return AutoLoginCutSwitchStepOutcome.Failed
             }
 
-            if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
-                if (!autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)) {
-                    return AutoLoginCutSwitchStepOutcome.ChainRestart
-                }
-                if (apiUrl.isBlank() && email.isBlank()) {
-                    devOp(alias, "自动登录(Email后 Inbox)：需要验证码但 API 与邮箱均为空")
+            // Check your inbox 输密后可能直接进入设密码页（布局 A/B/C，含 password+access these）
+            if (!reachedInterest[0] && !reachedHome[0] && needPasswordLayout[0]) {
+                devOp(alias, "自动登录(Email后 Inbox)：密码后命中设密码页，走布局 A/C/B")
+                if (!autoLoginCutSwitchEnterPasswordLayoutAB(
+                        ctx, alias, w, h, password, "cut_switch_inbox_pwd_layout",
+                    )
+                ) {
                     return AutoLoginCutSwitchStepOutcome.Failed
                 }
-                val verifyResult = autoLoginEnterVerificationCodeCutSwitch(ctx, alias, w, h, deviceId, apiUrl, email)
-                when (verifyResult.step) {
-                    AutoLoginCutSwitchStepOutcome.Ok -> {
-                        reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
-                        reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
-                    }
-                    AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
-                    AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+                val afterPwd = autoLoginWaitPageTransitionCutSwitch(
+                    ctx = ctx,
+                    alias = alias,
+                    h = h,
+                    phaseLog = "Inbox设密码后",
+                    tagPrefix = "cut_switch_inbox_set_pwd_transition",
+                    markerGone = { v ->
+                        findSinglePasswordAndNextHits(v) == null &&
+                            findSinglePasswordWithAccessThese(v, h) == null &&
+                            findAllPasswordLabelHits(v).isEmpty()
+                    },
+                    allowVerifySuccess = true,
+                    allowPasswordLayoutSuccess = false,
+                )
+                when (
+                    autoLoginCutSwitchApplyTransitionOutcome(
+                        alias, afterPwd, "Inbox设密码后", reachedInterest, reachedHome, needVerify,
+                    )
+                ) {
+                    AutoLoginCutSwitchStepOutcome.Ok -> Unit
+                    else -> return AutoLoginCutSwitchStepOutcome.Failed
                 }
             }
+
+            if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
+                when (val gate = autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h, password)) {
+                    AutoLoginVerifyGateResult.Failed -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                    AutoLoginVerifyGateResult.PasswordDone -> {
+                        devOp(alias, "自动登录(Email后 Inbox)：Password+access these 已输密，跳过验证码")
+                        when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                            AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
+                            AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
+                            else -> Unit
+                        }
+                    }
+                    AutoLoginVerifyGateResult.ResendReady -> {
+                        if (apiUrl.isBlank() && email.isBlank()) {
+                            devOp(alias, "自动登录(Email后 Inbox)：需要验证码但 API 与邮箱均为空")
+                            return AutoLoginCutSwitchStepOutcome.Failed
+                        }
+                        val verifyResult = autoLoginEnterVerificationCodeCutSwitch(
+                            ctx, alias, w, h, deviceId, apiUrl, email, password,
+                        )
+                        when (verifyResult.step) {
+                            AutoLoginCutSwitchStepOutcome.Ok -> {
+                                reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
+                                reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
+                            }
+                            AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                            AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+                        }
+                    }
+                }
+            }
+
 
             if (!reachedInterest[0] && !reachedHome[0]) {
                 devOp(alias, "自动登录(Email后 Inbox)：未完成登录短路径（兴趣页/Home）")
@@ -17664,23 +19148,36 @@ class RealTraceExecutor(
         }
 
         if (!reachedInterest[0] && !reachedHome[0] && needVerify[0]) {
-            if (!autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h)) {
-                return AutoLoginCutSwitchStepOutcome.ChainRestart
-            }
-            if (apiUrl.isBlank() && email.isBlank()) {
-                devOp(alias, "自动登录(切号)：需要验证码但 API 与邮箱均为空")
-                return AutoLoginCutSwitchStepOutcome.Failed
-            }
-            val verifyResult = autoLoginEnterVerificationCodeCutSwitch(ctx, alias, w, h, deviceId, apiUrl, email)
-            when (verifyResult.step) {
-                AutoLoginCutSwitchStepOutcome.Ok -> {
-                    reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
-                    reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
+            when (val gate = autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h, password)) {
+                AutoLoginVerifyGateResult.Failed -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                AutoLoginVerifyGateResult.PasswordDone -> {
+                    devOp(alias, "自动登录(切号)：Password+access these 已输密，跳过验证码")
+                    when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                        AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
+                        AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
+                        else -> Unit
+                    }
                 }
-                AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
-                AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+                AutoLoginVerifyGateResult.ResendReady -> {
+                    if (apiUrl.isBlank() && email.isBlank()) {
+                        devOp(alias, "自动登录(切号)：需要验证码但 API 与邮箱均为空")
+                        return AutoLoginCutSwitchStepOutcome.Failed
+                    }
+                    val verifyResult = autoLoginEnterVerificationCodeCutSwitch(
+                        ctx, alias, w, h, deviceId, apiUrl, email, password,
+                    )
+                    when (verifyResult.step) {
+                        AutoLoginCutSwitchStepOutcome.Ok -> {
+                            reachedInterest[0] = reachedInterest[0] || verifyResult.reachedInterest
+                            reachedHome[0] = reachedHome[0] || verifyResult.reachedHome
+                        }
+                        AutoLoginCutSwitchStepOutcome.ChainRestart -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+                        AutoLoginCutSwitchStepOutcome.Failed -> return AutoLoginCutSwitchStepOutcome.Failed
+                    }
+                }
             }
         }
+
 
         if (!reachedInterest[0] && !reachedHome[0]) {
             devOp(alias, "自动登录(切号)：未完成登录短路径（兴趣页/Home）")

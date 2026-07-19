@@ -6,7 +6,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * android-simple 手动操控模式：任务仅由设备端按钮触发，
- * 云端涨粉 / 引流互点 / 发作品 / 改资料 / 切号 / 自动切号一律忽略。
+ * 云端涨粉 / 引流互点 / 发作品 / 改资料 / 切号 / 云端自动切号事件一律忽略。
+ * 本机自动切号自治由 APP 开关 + [ManualAutoSwitchPlanBuilder] 本地计划驱动。
  */
 object ManualDeviceControl {
     /** 本工程恒为手动模式。 */

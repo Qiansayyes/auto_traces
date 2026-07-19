@@ -28,10 +28,15 @@ object AdbWirelessSetup {
         var keyAlready = false
 
         if (su) {
-            val err = RootWifiAdbHelper.enableAdbTcpip(port)
-            tcpEnabled = err == null
-            if (err != null) {
-                Log.w(TAG, "enableAdbTcpip failed: $err")
+            // 端口已在监听时禁止 stop/start adbd，否则会打断 PC 已建立的无线连接/投屏。
+            if (AdbRuntimeProbe.isAdbTcpPortOpen(context, port)) {
+                Log.d(TAG, "adb tcp $port already open, skip stop/start adbd")
+            } else {
+                val err = RootWifiAdbHelper.enableAdbTcpip(port)
+                tcpEnabled = err == null
+                if (err != null) {
+                    Log.w(TAG, "enableAdbTcpip failed: $err")
+                }
             }
         }
 

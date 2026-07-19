@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
                 logStickToBottom = true
                 if (WorkerServiceTracker.isRunning) {
                     AppCoordinator.forceStartRunningNow("设备端点击启动后台服务")
-                    LogCenter.op(alias, "后台服务已启动，已按本地计划请求恢复自动任务")
+                    LogCenter.op(alias, "后台服务已启动，已按持久化计划请求恢复自动切号/自动任务")
                 } else {
                     LogCenter.op(alias, "后台服务未能启动")
                 }
@@ -85,7 +85,7 @@ class MainActivity : AppCompatActivity() {
                 AppCoordinator.requestUserGracefulHardStop()
                 LogCenter.op(
                     alias,
-                    "已请求硬停：当前步骤结束后停下自动任务；后台继续轮询 check_start / 设备指令；已请求云端关闭本机自动开启",
+                    "已请求硬停：当前步骤结束后停下自动任务；若自动切号自治已开启会暂停并清脏数据（计划文件保留）；点击「启动后台服务」可按计划续跑；后台继续轮询 check_start / 设备指令；已请求云端关闭本机自动开启",
                 )
                 runCatching { WorkerService.start(this@MainActivity) }
                     .onFailure { err ->

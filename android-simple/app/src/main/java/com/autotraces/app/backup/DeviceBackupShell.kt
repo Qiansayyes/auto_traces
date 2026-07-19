@@ -21,6 +21,13 @@ object DeviceBackupShell {
 
     fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
+    /**
+     * 校验 .tar.gz 完整性（读完整流）。失败常见于截断/损坏包。
+     * Android toybox：优先 `gzip -t`，再兜底 `tar -tzf`。
+     */
+    fun backupArchiveIntegrityTestCommand(quotedAbsolutePath: String): String =
+        "gzip -t $quotedAbsolutePath 2>/dev/null || tar -tzf $quotedAbsolutePath >/dev/null 2>&1"
+
     fun forceStopCommand(dataPackageName: String): String =
         "am force-stop ${shellQuote(dataPackageName.trim())}"
 

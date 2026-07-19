@@ -89,6 +89,9 @@ class VideoDedMainActivity : ComponentActivity() {
             Log.d(TAG, "auto fill mirrorIpOverrideInput=$wifiIp")
             mirrorIpOverrideInput.setText(wifiIp)
             lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
+        } else if (::statusView.isInitialized && statusView.text?.contains("初始化") == true) {
+            // 从通知/后台回到本页时，若仍停在初始化文案则补一次注册刷新
+            lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
         }
         if (::mirrorAddrView.isInitialized) {
             refreshMirrorAddrLine()

@@ -97,6 +97,26 @@ object UnifiedBackupPaths {
         return base.startsWith(prefix.lowercase(Locale.US))
     }
 
+    /**
+     * 备份新旧排序键：优先包名内 `yyyyMMdd_HHmmss`，其次文件 mtime。
+     * 用于还原/整理时「必须选最新」。
+     */
+    fun archiveRecencyKey(file: File): Long {
+        val fromName = parseBackupTimestampFromArchiveName(file.name)
+        if (fromName != null) return fromName
+        return file.lastModified()
+    }
+
+    /** 从包名解析 `yyyyMMdd_HHmmss` → 可比较的 Long（yyyyMMddHHmmss）。 */
+    fun parseBackupTimestampFromArchiveName(archiveName: String): Long? {
+        val base = File(archiveName.trim()).name
+            .removeSuffix(".tar.gz")
+            .removeSuffix(".TAR.GZ")
+        val m = Regex("""(\d{8})_(\d{6})$""").find(base) ?: return null
+        val digits = m.groupValues[1] + m.groupValues[2]
+        return digits.toLongOrNull()
+    }
+
     /** 统一 backups 目录下该 username（同 alias+device）的已有 .tar.gz（不含 keepAbsolutePath）。 */
     fun listUsernameBackupArchives(
         context: Context,
@@ -115,7 +135,8 @@ object UnifiedBackupPaths {
                 file.name.endsWith(".tar.gz", ignoreCase = true) &&
                 backupArchiveMatchesUsername(file.name, username, alias, deviceId) &&
                 runCatching { file.canonicalFile.absolutePath }.getOrNull() != keepCanon
-        }?.sortedByDescending { it.lastModified() }.orEmpty()
+        }?.sortedWith(compareByDescending<File> { archiveRecencyKey(it) }.thenByDescending { it.name })
+            .orEmpty()
     }
 
     fun hasExistingUsernameBackup(context: Context, username: String, alias: String, deviceId: String): Boolean =
@@ -195,7 +216,8 @@ object UnifiedBackupPaths {
     )
 
     /**
-     * 还原前解析本机可用备份：云端指定名 / payload 路径 → 同账号最新本地包 → legacy 包。
+     * 还原前解析本机可用备份：**同账号一律取最新包**（包名时间戳优先）。
+     * 云端 backup_name / path 仅作「本机无同账号包」时的回退提示，不得覆盖更新的本地包。
      */
     fun resolveRestoreBackupArchive(
         context: Context,
@@ -205,6 +227,15 @@ object UnifiedBackupPaths {
         alias: String,
         deviceId: String,
     ): ResolvedBackupArchive? {
+        val user = username.trim().removePrefix("@")
+        if (user.isNotEmpty()) {
+            val latest = listUsernameBackupArchives(context, user, alias, deviceId).firstOrNull()
+                ?: listLegacyBackupsForAccount(context, user, alias).firstOrNull()
+            if (latest != null && latest.length() >= MIN_VALID_BACKUP_FILE_BYTES) {
+                return ResolvedBackupArchive(latest.name, latest.absolutePath)
+            }
+        }
+        // 无 username 或本机无同账号包：才回退显式路径（兼容远控单包指定）
         val explicitPaths = buildList {
             backupPathHint.trim().takeIf { it.isNotEmpty() }?.let { add(it) }
             val name = backupName.trim()
@@ -215,15 +246,11 @@ object UnifiedBackupPaths {
         }.distinct()
         for (path in explicitPaths) {
             val file = File(path)
-            if (file.isFile && file.canRead()) {
+            if (file.isFile && file.canRead() && file.length() >= MIN_VALID_BACKUP_FILE_BYTES) {
                 return ResolvedBackupArchive(file.name, file.absolutePath)
             }
         }
-        val user = username.trim().removePrefix("@")
-        if (user.isEmpty()) return null
-        val local = listUsernameBackupArchives(context, user, alias, deviceId).firstOrNull()
-            ?: listLegacyBackupsForAccount(context, user, alias).firstOrNull()
-        return local?.let { ResolvedBackupArchive(it.name, it.absolutePath) }
+        return null
     }
 
     /**
@@ -248,7 +275,8 @@ object UnifiedBackupPaths {
                 file.name.endsWith(".tar.gz", ignoreCase = true) &&
                 file.name.lowercase(Locale.US).startsWith(prefix) &&
                 runCatching { file.canonicalFile.absolutePath }.getOrNull() != keepCanon
-        }?.sortedByDescending { it.lastModified() }.orEmpty()
+        }?.sortedWith(compareByDescending<File> { archiveRecencyKey(it) }.thenByDescending { it.name })
+            .orEmpty()
     }
 
     data class PurgeLegacyBackupsResult(

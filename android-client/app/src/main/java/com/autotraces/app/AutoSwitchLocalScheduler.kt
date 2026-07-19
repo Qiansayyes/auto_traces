@@ -734,7 +734,16 @@ class AutoSwitchLocalScheduler(
                 busyReason = reason,
             )
             if (dueLabel == null) {
-                logTickSkipThrottled("插入任务暂缓：$reason")
+                logTickSkipThrottled(
+                    describeBusySkipWithoutDueInsertion(
+                        bundle = currentBundle,
+                        planSlot = planSlot,
+                        minuteOfDay = minuteOfDay,
+                        slotKey = slotKey,
+                        targetRowIndex = slotEntry.target_row_index,
+                        busyReason = reason,
+                    ),
+                )
                 return
             }
             // 到点发作品/互点：对齐切号，设独占抢占让涨粉协作退出，再入队（不等窗口滑过）。
@@ -1250,6 +1259,61 @@ class AutoSwitchLocalScheduler(
             if (isInsertionKindStillActive(kind)) return "插入 in-flight：$kind slot=$sk"
         }
         return null
+    }
+
+    /**
+     * 设备忙且本 tick 没有「到点可抢占」的发作品/互点时，写清原因，避免误读成「插入被永久挡住」。
+     */
+    private fun describeBusySkipWithoutDueInsertion(
+        bundle: AutoSwitchBundle,
+        planSlot: AutoSwitchPlanSlot,
+        minuteOfDay: Int,
+        slotKey: String,
+        targetRowIndex: Int?,
+        busyReason: String,
+    ): String {
+        if (!busyReason.startsWith("自动化执行中")) {
+            return "插入任务暂缓：$busyReason"
+        }
+        if (PublishPostGrowthGate.isBlockingGrowth()) {
+            return "发作品闸门占用中，涨粉继续"
+        }
+        if (AutoSwitchSlotWindow.isWithinSwitchSafeBuffer(minuteOfDay, planSlot, SWITCH_SAFE_BUFFER_MIN)) {
+            return "切号安全缓冲内，发作品/互点不插入，涨粉继续"
+        }
+        val pubMinute = planSlot.auto_publish_minute
+        val mutualMinute = planSlot.auto_mutual_minute
+        if (pubMinute == null && mutualMinute == null) {
+            return "本时段无发作品/引流互点计划，涨粉继续"
+        }
+        val nowLabel = formatMinuteOfDay(minuteOfDay)
+        val parts = mutableListOf<String>()
+        if (pubMinute != null) {
+            when {
+                !AutoSwitchSlotWindow.isWithinInsertionTrigger(minuteOfDay, planSlot, pubMinute) ->
+                    parts.add("发作品时间未到(计划${formatMinuteOfDay(pubMinute)}/现$nowLabel)")
+                !isTimedInsertionSchedulable(slotKey.trim(), "publish") ->
+                    parts.add("发作品已处理或进行中")
+            }
+        }
+        if (mutualMinute != null) {
+            val targetUser = bundle.accounts.orEmpty()
+                .firstOrNull { (it.row_index ?: -1) == (targetRowIndex ?: -1) }
+                ?.username?.trim().orEmpty()
+            when {
+                !AutoSwitchSlotWindow.isWithinInsertionTrigger(minuteOfDay, planSlot, mutualMinute) ->
+                    parts.add("引流互点时间未到(计划${formatMinuteOfDay(mutualMinute)}/现$nowLabel)")
+                targetUser.isBlank() || !bundle.isMutualTrafficConfiguredFor(targetUser) ->
+                    parts.add("引流互点未配置")
+                !isTimedInsertionSchedulable(slotKey.trim(), "mutual_traffic") ->
+                    parts.add("引流互点已处理或进行中")
+            }
+        }
+        return if (parts.isEmpty()) {
+            "发作品/引流互点暂不可调度，涨粉继续"
+        } else {
+            parts.joinToString("；") + "，涨粉继续"
+        }
     }
 
     /**

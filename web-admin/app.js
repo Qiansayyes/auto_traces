@@ -150,6 +150,14 @@ const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrol
 const autoSwitchSelectAllEnableBtn = document.getElementById("autoSwitchSelectAllEnableBtn");
 const autoSwitchEnableSelectedBtn = document.getElementById("autoSwitchEnableSelectedBtn");
 const autoSwitchDisableSelectedBtn = document.getElementById("autoSwitchDisableSelectedBtn");
+const autoSwitchExcludedBatchBtn = document.getElementById("autoSwitchExcludedBatchBtn");
+const autoSwitchExcludedBatchModalEl = document.getElementById("autoSwitchExcludedBatchModal");
+const autoSwitchExcludedBatchTextarea = document.getElementById("autoSwitchExcludedBatchTextarea");
+const autoSwitchExcludedBatchMessageEl = document.getElementById("autoSwitchExcludedBatchMessage");
+const closeAutoSwitchExcludedBatchBtn = document.getElementById("closeAutoSwitchExcludedBatchBtn");
+const cancelAutoSwitchExcludedBatchBtn = document.getElementById("cancelAutoSwitchExcludedBatchBtn");
+const autoSwitchExcludedBatchExcludeBtn = document.getElementById("autoSwitchExcludedBatchExcludeBtn");
+const autoSwitchExcludedBatchJoinBtn = document.getElementById("autoSwitchExcludedBatchJoinBtn");
 const autoSwitchEnabledCountHint = document.getElementById("autoSwitchEnabledCountHint");
 const autoSwitchSessionSummariesEl = document.getElementById("autoSwitchSessionSummariesEl");
 const autoSwitchSessionSummariesHint = document.getElementById("autoSwitchSessionSummariesHint");
@@ -3632,8 +3640,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
     for_you_like_prob: 0,
-    for_you_watch_min_sec: 2,
-    for_you_watch_max_sec: 5,
+    for_you_watch_min_sec: 3,
+    for_you_watch_max_sec: 12,
     like_daily_limit: 800,
     comment_daily_limit: 800,
     mutual_traffic_comment_daily_limit: 800,
@@ -3679,8 +3687,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
     for_you_like_prob: 0,
-    for_you_watch_min_sec: 2,
-    for_you_watch_max_sec: 5,
+    for_you_watch_min_sec: 3,
+    for_you_watch_max_sec: 12,
     like_daily_limit: 800,
     comment_daily_limit: 800,
     favorite_daily_limit: 800,
@@ -3724,8 +3732,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
     for_you_like_prob: 0,
-    for_you_watch_min_sec: 2,
-    for_you_watch_max_sec: 5,
+    for_you_watch_min_sec: 3,
+    for_you_watch_max_sec: 12,
     like_daily_limit: 800,
     comment_daily_limit: 800,
     favorite_daily_limit: 800,
@@ -5282,6 +5290,99 @@ function guardAutoSwitchManualOps(actionLabel = "该操作", deviceId = "", alia
   if (!isAutoSwitchEnabledForDeviceId(did)) return true;
   setStatus(`${actionLabel}不可用：${AUTO_SWITCH_MANUAL_BLOCK_HINT}`, "warning");
   return false;
+}
+
+function setAutoSwitchExcludedBatchMessage(text, type = "") {
+  if (!autoSwitchExcludedBatchMessageEl) return;
+  autoSwitchExcludedBatchMessageEl.textContent = text || "";
+  autoSwitchExcludedBatchMessageEl.dataset.type = type || "";
+}
+
+function parseAutoSwitchExcludedBatchUsernames(rawText) {
+  const lines = String(rawText || "").split(/\r?\n/);
+  const result = [];
+  const seen = new Set();
+  for (const line of lines) {
+    let name = String(line || "").trim();
+    if (!name) continue;
+    // 兼容粘贴带 @ 前缀的 TikTok username
+    if (name.startsWith("@")) name = name.slice(1).trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(name);
+  }
+  return result;
+}
+
+function openAutoSwitchExcludedBatchModal() {
+  if (!autoSwitchExcludedBatchModalEl) return;
+  setAutoSwitchExcludedBatchMessage("");
+  if (autoSwitchExcludedBatchTextarea) {
+    autoSwitchExcludedBatchTextarea.value = "";
+  }
+  autoSwitchExcludedBatchModalEl.classList.remove("hidden");
+  autoSwitchExcludedBatchModalEl.setAttribute("aria-hidden", "false");
+  // 先展示弹窗再聚焦，避免 hidden 状态下 focus 无效
+  autoSwitchExcludedBatchTextarea?.focus();
+}
+
+function closeAutoSwitchExcludedBatchModal() {
+  if (!autoSwitchExcludedBatchModalEl) return;
+  autoSwitchExcludedBatchModalEl.classList.add("hidden");
+  autoSwitchExcludedBatchModalEl.setAttribute("aria-hidden", "true");
+}
+
+async function submitAutoSwitchExcludedBatch(excluded) {
+  const usernames = parseAutoSwitchExcludedBatchUsernames(autoSwitchExcludedBatchTextarea?.value || "");
+  if (!usernames.length) {
+    setAutoSwitchExcludedBatchMessage("请至少填写一个 username（一行一个）", "warning");
+    return;
+  }
+  const actionText = excluded ? "不参加自动切号" : "参加自动切号";
+  const detail = excluded
+    ? "开启后，这些账号将从自动切号计划和 bundle 中排除。"
+    : "关闭后，这些账号会重新参与自动切号计划。";
+  if (!window.confirm(`确认将 ${usernames.length} 个账号批量设置为“${actionText}”？\n${detail}`)) {
+    return;
+  }
+  if (autoSwitchExcludedBatchExcludeBtn) autoSwitchExcludedBatchExcludeBtn.disabled = true;
+  if (autoSwitchExcludedBatchJoinBtn) autoSwitchExcludedBatchJoinBtn.disabled = true;
+  setAutoSwitchExcludedBatchMessage(`正在批量设置为“${actionText}”…`, "info");
+  try {
+    const resp = await request("/api/admin/editor/device_rows/auto_switch_excluded_batch", {
+      method: "POST",
+      body: JSON.stringify({ usernames, excluded: !!excluded }),
+      timeoutMs: 120000,
+    });
+    await loadAutoSwitchConfig({ refreshArchive: false });
+    await loadBackupArchiveRecords();
+    await refreshAutoSwitchDailyPlansInBackground();
+    const updatedRows = Number(resp?.updated_rows || 0);
+    const unchangedRows = Number(resp?.unchanged_rows || 0);
+    const notFound = Array.isArray(resp?.not_found) ? resp.not_found : [];
+    const disabledDevices = Number(resp?.devices_disabled || 0);
+    const notifiedDevices = Number(resp?.devices_notified || 0);
+    const parts = [`已批量设置为“${actionText}”：更新 ${updatedRows} 条`];
+    if (unchangedRows > 0) parts.push(`已是该状态 ${unchangedRows} 条`);
+    if (notFound.length > 0) parts.push(`未找到 ${notFound.length} 个`);
+    if (disabledDevices > 0) parts.push(`已自动关闭 ${disabledDevices} 台设备自动切号`);
+    else if (notifiedDevices > 0) parts.push(`已重同步 ${notifiedDevices} 台设备`);
+    const msg = parts.join("，");
+    const level = notFound.length > 0 || disabledDevices > 0 ? "warning" : "success";
+    setAutoSwitchExcludedBatchMessage(
+      notFound.length > 0 ? `${msg}。未找到：${notFound.slice(0, 20).join(", ")}${notFound.length > 20 ? "…" : ""}` : msg,
+      level,
+    );
+    setStatus(msg, level);
+    if (updatedRows > 0 && notFound.length === 0) {
+      closeAutoSwitchExcludedBatchModal();
+    }
+  } finally {
+    if (autoSwitchExcludedBatchExcludeBtn) autoSwitchExcludedBatchExcludeBtn.disabled = false;
+    if (autoSwitchExcludedBatchJoinBtn) autoSwitchExcludedBatchJoinBtn.disabled = false;
+  }
 }
 
 async function loadAutoSwitchConfig(options = {}) {
@@ -8172,6 +8273,36 @@ if (autoSwitchDisableSelectedBtn) {
     saveAutoSwitchConfig({ enabled: false }).catch((e) =>
       setStatus(e.message || "关闭失败", "error"),
     );
+  });
+}
+if (autoSwitchExcludedBatchBtn) {
+  autoSwitchExcludedBatchBtn.addEventListener("click", () => openAutoSwitchExcludedBatchModal());
+}
+if (closeAutoSwitchExcludedBatchBtn) {
+  closeAutoSwitchExcludedBatchBtn.addEventListener("click", () => closeAutoSwitchExcludedBatchModal());
+}
+if (cancelAutoSwitchExcludedBatchBtn) {
+  cancelAutoSwitchExcludedBatchBtn.addEventListener("click", () => closeAutoSwitchExcludedBatchModal());
+}
+if (autoSwitchExcludedBatchExcludeBtn) {
+  autoSwitchExcludedBatchExcludeBtn.addEventListener("click", () => {
+    submitAutoSwitchExcludedBatch(true).catch((e) => {
+      setAutoSwitchExcludedBatchMessage(e.message || "批量设置失败", "error");
+      setStatus(e.message || "批量设置失败", "error");
+    });
+  });
+}
+if (autoSwitchExcludedBatchJoinBtn) {
+  autoSwitchExcludedBatchJoinBtn.addEventListener("click", () => {
+    submitAutoSwitchExcludedBatch(false).catch((e) => {
+      setAutoSwitchExcludedBatchMessage(e.message || "批量退出失败", "error");
+      setStatus(e.message || "批量退出失败", "error");
+    });
+  });
+}
+if (autoSwitchExcludedBatchModalEl) {
+  autoSwitchExcludedBatchModalEl.addEventListener("click", (event) => {
+    if (event.target === autoSwitchExcludedBatchModalEl) closeAutoSwitchExcludedBatchModal();
   });
 }
 if (startSchedulersBtn) {

@@ -124,8 +124,8 @@ BASE_DEFAULT_CONFIG = {
     # For You 预滑阶段点赞概率（双击屏幕）
     "for_you_like_prob": 0.0,
     # For You 预滑阶段每条视频观看时长区间（秒）
-    "for_you_watch_min_sec": 2.0,
-    "for_you_watch_max_sec": 5.0,
+    "for_you_watch_min_sec": 3.0,
+    "for_you_watch_max_sec": 12.0,
 }
 
 MODE_DEFAULT_CONFIGS = {
@@ -3931,6 +3931,14 @@ class DeviceEditorSwitchHighlightRequest(BaseModel):
 
 class DeviceEditorAutoSwitchExcludedRequest(BaseModel):
     row_index: int = Field(..., ge=0)
+    excluded: bool = False
+
+
+DEVICE_EDITOR_AUTO_SWITCH_EXCLUDED_BATCH_MAX = 200
+
+
+class DeviceEditorAutoSwitchExcludedBatchRequest(BaseModel):
+    usernames: list[str] = Field(default_factory=list)
     excluded: bool = False
 
 
@@ -10414,7 +10422,10 @@ def device_gallery_library_random(device_id: str, alias: str):
 def _fetch_device_assigned_accounts_list(
     conn: sqlite3.Connection, owner_username: str, alias: str
 ) -> list[dict[str, Any]]:
-    """当前设备别名桶内全部账号（含凭据 / 登录态 / 备份字段），供手动切号下拉。"""
+    """当前设备别名桶内全部账号（含凭据 / 登录态 / 备份字段），供手动切号下拉。
+
+    排除云端「不参加自动切号」(auto_switch_excluded=1) 的账号，与自动切号桶一致。
+    """
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     if not owner or not alias_key:
@@ -10424,7 +10435,9 @@ def _fetch_device_assigned_accounts_list(
         SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
                backup_path, backup_name, backup_time, backup_status, env_status
         FROM device_editor_rows
-        WHERE owner_username = ? AND TRIM(username) <> ''
+        WHERE owner_username = ?
+          AND TRIM(username) <> ''
+          AND COALESCE(auto_switch_excluded, 0) = 0
         ORDER BY row_index ASC
         """,
         (owner,),
@@ -13630,6 +13643,140 @@ def set_device_editor_auto_switch_excluded(
         "devices_disabled": int(sync_info.get("disabled") or 0),
         "session_id": str(sync_info.get("session_id") or ""),
         "bundle_revision": int(sync_info.get("bundle_revision") or 0),
+    }
+
+
+@app.post("/api/admin/editor/device_rows/auto_switch_excluded_batch")
+def set_device_editor_auto_switch_excluded_batch(
+    payload: DeviceEditorAutoSwitchExcludedBatchRequest, authorization: str | None = Header(default=None)
+):
+    """按 username 批量设置/取消「不参加自动切号」。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session.get("username") or "").strip()
+    if not owner:
+        return {"code": 401, "msg": "请先登录"}
+
+    raw_usernames = payload.usernames if isinstance(payload.usernames, list) else []
+    normalized: list[str] = []
+    seen_keys: set[str] = set()
+    for raw in raw_usernames:
+        name = str(raw or "").strip()
+        if name.startswith("@"):
+            name = name[1:].strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized.append(name)
+    if not normalized:
+        return {"code": 1, "msg": "请至少填写一个 username"}
+    if len(normalized) > DEVICE_EDITOR_AUTO_SWITCH_EXCLUDED_BATCH_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多处理 {DEVICE_EDITOR_AUTO_SWITCH_EXCLUDED_BATCH_MAX} 个 username，请分批操作",
+        }
+
+    excluded_i = 1 if bool(payload.excluded) else 0
+    now = now_text()
+    matched_usernames: set[str] = set()
+    updated_rows = 0
+    unchanged_rows = 0
+    updated_usernames: list[str] = []
+    affected_aliases: set[str] = set()
+
+    conn = _get_db()
+    try:
+        placeholders = ",".join("?" for _ in normalized)
+        rows = conn.execute(
+            f"""
+            SELECT row_index, username, assigned_alias, device_alias, auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ?
+              AND LOWER(TRIM(username)) IN ({placeholders})
+            ORDER BY row_index ASC
+            """,
+            (owner, *[n.lower() for n in normalized]),
+        ).fetchall()
+        for row in rows or []:
+            username = str(row["username"] or "").strip()
+            if not username:
+                continue
+            matched_usernames.add(username.lower())
+            alias_key = _device_editor_effective_alias(
+                {
+                    "assigned_alias": str(row["assigned_alias"] or "").strip(),
+                    "device_alias": str(row["device_alias"] or "").strip(),
+                }
+            )
+            current_excluded = int(row["auto_switch_excluded"] or 0)
+            if current_excluded == excluded_i:
+                unchanged_rows += 1
+                continue
+            cur = conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET auto_switch_excluded = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (excluded_i, now, owner, int(row["row_index"] or 0)),
+            )
+            if int(cur.rowcount or 0) > 0:
+                updated_rows += 1
+                updated_usernames.append(username)
+                if alias_key:
+                    affected_aliases.add(alias_key)
+        if updated_rows > 0:
+            conn.commit()
+    finally:
+        conn.close()
+
+    not_found = [name for name in normalized if name.lower() not in matched_usernames]
+    plan_regenerated = 0
+    devices_notified = 0
+    devices_disabled = 0
+    alias_results: list[dict[str, Any]] = []
+    for alias_key in sorted(affected_aliases):
+        plan_info = _refresh_auto_switch_plans_for_alias(owner, alias_key)
+        sync_info = _resync_auto_switch_devices_for_alias(
+            owner, alias_key, int(plan_info.get("bucket_size") or 0)
+        )
+        if plan_info.get("plan_regenerated"):
+            plan_regenerated += 1
+        devices_notified += int(sync_info.get("notified") or 0)
+        devices_disabled += int(sync_info.get("disabled") or 0)
+        alias_results.append(
+            {
+                "alias": alias_key,
+                "bucket_size": int(plan_info.get("bucket_size") or 0),
+                "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+                "devices_notified": int(sync_info.get("notified") or 0),
+                "devices_disabled": int(sync_info.get("disabled") or 0),
+            }
+        )
+
+    if updated_rows > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+
+    action_text = "不参加自动切号" if excluded_i else "参加自动切号"
+    return {
+        "code": 0,
+        "msg": f"批量设置为“{action_text}”完成",
+        "excluded": bool(excluded_i),
+        "requested": len(normalized),
+        "matched": len(matched_usernames),
+        "updated_rows": updated_rows,
+        "unchanged_rows": unchanged_rows,
+        "updated_usernames": updated_usernames,
+        "not_found": not_found,
+        "aliases_touched": len(affected_aliases),
+        "plan_regenerated": plan_regenerated,
+        "devices_notified": devices_notified,
+        "devices_disabled": devices_disabled,
+        "alias_results": alias_results,
     }
 
 

@@ -34,8 +34,22 @@ object PrefsStore {
     private const val KEY_MANUAL_ACTIVE_USERNAME = "manual_active_username"
     /** 手动模式：最近一次拉取的分配账号列表 JSON（进程重启后凭据不丢）。 */
     private const val KEY_MANUAL_ACCOUNTS_CACHE_JSON = "manual_accounts_cache_json"
-    /** 手动模式：账号是否已完成初次登录（按 username 存）。 */
+    /** 手动模式：账号是否已就绪（切号还原或自动登录成功后置位，按 username 存）。 */
     private const val KEY_MANUAL_FIRST_LOGIN_DONE_PREFIX = "manual_first_login_done_"
+    /** 手动模式：本机开启自动切号自治（不依赖管理台开关）。 */
+    private const val KEY_MANUAL_LOCAL_AUTO_SWITCH = "manual_local_auto_switch_enabled"
+    /** 手动模式：本机自动切号每号时段分钟数。 */
+    private const val KEY_MANUAL_AUTO_SWITCH_SLOT_MINUTES = "manual_auto_switch_slot_minutes"
+    /** 手动模式：For You 预滑时长（秒）。 */
+    private const val KEY_MANUAL_FOR_YOU_SWIPE_SEC = "manual_for_you_swipe_sec"
+    const val DEFAULT_MANUAL_FOR_YOU_SWIPE_SEC: Int = 60
+    const val MIN_MANUAL_FOR_YOU_SWIPE_SEC: Int = 10
+    const val MAX_MANUAL_FOR_YOU_SWIPE_SEC: Int = 3600
+    /** 手动模式：发作品目标条数（1–5）。 */
+    private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
+    const val DEFAULT_MANUAL_PUBLISH_COUNT: Int = 1
+    const val MIN_MANUAL_PUBLISH_COUNT: Int = 1
+    const val MAX_MANUAL_PUBLISH_COUNT: Int = 5
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
     /** 最近一次请求硬停的时间；用于忽略 opt_out 同步前的 check_start 竞态。 */
     private const val KEY_HARD_STOP_AT_MS = "hard_stop_at_ms"
@@ -1130,6 +1144,55 @@ object PrefsStore {
 
     fun setAutoGrowthAfterTasksEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_GROWTH_AFTER_TASKS, enabled).apply()
+    }
+
+    /** simple 本机自动切号自治开关；未开时不得按遗留 prefs 恢复云端自治。 */
+    fun isManualLocalAutoSwitchEnabled(): Boolean =
+        prefs.getBoolean(KEY_MANUAL_LOCAL_AUTO_SWITCH, false)
+
+    fun setManualLocalAutoSwitchEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_MANUAL_LOCAL_AUTO_SWITCH, enabled).apply()
+    }
+
+    fun getManualAutoSwitchSlotMinutes(): Int =
+        prefs.getInt(
+            KEY_MANUAL_AUTO_SWITCH_SLOT_MINUTES,
+            ManualAutoSwitchPlanBuilder.DEFAULT_SLOT_MINUTES,
+        ).let { ManualAutoSwitchPlanBuilder.normalizeSlotMinutes(it) }
+
+    fun setManualAutoSwitchSlotMinutes(minutes: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_MANUAL_AUTO_SWITCH_SLOT_MINUTES,
+                ManualAutoSwitchPlanBuilder.normalizeSlotMinutes(minutes),
+            )
+            .apply()
+    }
+
+    fun getManualForYouSwipeSec(): Int =
+        prefs.getInt(KEY_MANUAL_FOR_YOU_SWIPE_SEC, DEFAULT_MANUAL_FOR_YOU_SWIPE_SEC)
+            .coerceIn(MIN_MANUAL_FOR_YOU_SWIPE_SEC, MAX_MANUAL_FOR_YOU_SWIPE_SEC)
+
+    fun setManualForYouSwipeSec(sec: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_MANUAL_FOR_YOU_SWIPE_SEC,
+                sec.coerceIn(MIN_MANUAL_FOR_YOU_SWIPE_SEC, MAX_MANUAL_FOR_YOU_SWIPE_SEC),
+            )
+            .apply()
+    }
+
+    fun getManualPublishCount(): Int =
+        prefs.getInt(KEY_MANUAL_PUBLISH_COUNT, DEFAULT_MANUAL_PUBLISH_COUNT)
+            .coerceIn(MIN_MANUAL_PUBLISH_COUNT, MAX_MANUAL_PUBLISH_COUNT)
+
+    fun setManualPublishCount(count: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_MANUAL_PUBLISH_COUNT,
+                count.coerceIn(MIN_MANUAL_PUBLISH_COUNT, MAX_MANUAL_PUBLISH_COUNT),
+            )
+            .apply()
     }
 
     fun getManualSelectedUsername(): String? =

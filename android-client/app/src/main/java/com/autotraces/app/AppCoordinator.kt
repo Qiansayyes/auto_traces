@@ -563,6 +563,35 @@ object AppCoordinator {
         restartAutoSwitchLoginRecoveryIfNeeded(reason)
     }
 
+    /**
+     * 显式恢复（硬停后点开始）：mode=off 但计划文件仍在时，用 plan session 拉回 on。
+     * 不处理 exiting（退出收尾中禁止复活调度）。
+     */
+    private fun ensureAutoSwitchModeFromPlan(alias: String) {
+        if (PrefsStore.getAutoSwitchMode() != "off") return
+        val plan = AutoSwitchLocalPlanStore.get() ?: return
+        val sessionId = plan.session_id.trim().ifBlank {
+            PrefsStore.getAutoSwitchSessionId().orEmpty().trim()
+        }
+        val revision = plan.revision.coerceAtLeast(1)
+            .coerceAtLeast(PrefsStore.getAutoSwitchBundleRevision())
+        if (sessionId.isBlank()) return
+        if (PrefsStore.getAutoSwitchSessionId().isNullOrBlank()) {
+            PrefsStore.saveAutoSwitchSessionContext(sessionId, revision)
+        } else {
+            PrefsStore.setAutoSwitchMode("on")
+            if (PrefsStore.getAutoSwitchBundleRevision() < revision) {
+                PrefsStore.saveAutoSwitchSessionContext(sessionId, revision)
+            }
+        }
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】已按计划文件恢复会话 mode=on session=$sessionId revision=$revision",
+            )
+        }
+    }
+
     /** 云端 bundle 拉取失败时，用磁盘 plan + bundle 缓存恢复调度器。 */
     private suspend fun resumeAutoSwitchFromLocalPlan(reason: String): Boolean {
         if (PrefsStore.getAutoSwitchMode() != "on") return false
@@ -648,6 +677,7 @@ object AppCoordinator {
     }
 
     private suspend fun recoverAutoSwitchAutonomousWork(reason: String) {
+        if (PrefsStore.getAutoSwitchMode() == "exiting") return
         if (PrefsStore.getAutoSwitchMode() != "on") return
         autoSwitchRecoverMutex.withLock {
             val now = SystemClock.elapsedRealtime()
@@ -1252,10 +1282,21 @@ object AppCoordinator {
             startCheckLoop()
             ensureLoopsRunning()
             runCatching { syncRunningToCloud() }
-            if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                recoverAutoSwitchAutonomousWork("显式启动")
-            } else {
-                startPullLoop()
+            when (PrefsStore.getAutoSwitchMode()) {
+                "on" -> recoverAutoSwitchAutonomousWork("显式启动")
+                "off" -> {
+                    val resumeAlias = alias?.trim().orEmpty()
+                    ensureAutoSwitchModeFromPlan(resumeAlias)
+                    if (PrefsStore.getAutoSwitchMode() == "on") {
+                        recoverAutoSwitchAutonomousWork("显式启动")
+                    } else {
+                        startPullLoop()
+                    }
+                }
+                else -> { /* exiting：退出收尾中，不复活调度 */ }
+            }
+            if (PrefsStore.getAutoSwitchMode() == "on" && !alias.isNullOrBlank()) {
+                LogCenter.op(alias, "自动切号自治：已按持久化计划恢复调度（$reason）")
             }
         }
     }
@@ -6379,7 +6420,7 @@ object AppCoordinator {
                             break
                         }
                     }
-                    lastRatioTapOk = runSu("input tap $rtx $rty")
+                    lastRatioTapOk = executor.navBackThenTapProfile(alias, "修改基本资料外轮资料入口", rtx, rty)
 
                     if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
                         opLog("外轮$outer：准备阶段未就绪，重试")
@@ -8398,7 +8439,7 @@ object AppCoordinator {
                             break
                         }
                     }
-                    lastRatioTapOk = runSu("input tap $rtx $rty")
+                    lastRatioTapOk = executor.navBackThenTapProfile(alias, "切号后改资料外轮资料入口", rtx, rty)
 
                     if (!lastStopOk || !lastLaunchOk || !lastRatioTapOk) {
                         opLog("外轮$outer：准备阶段未就绪，重试")
@@ -9060,18 +9101,15 @@ object AppCoordinator {
     /**
      * 用户从主界面请求「硬停」：不在协程安全点外杀进程；通过 [TraceExecutor] 内硬停检查在合适位置结束；
      * 暂停用户名拉取；保留 [startCheckLoop] 与设备指令轮询；并向云端同步 paused + 关闭本机「自动开启程序」。
+     * 自动切号自治开启时：硬停暂停调度并清运行时脏数据，保留计划文件与会话；点击开始按持久化计划续跑。
      */
     fun requestUserGracefulHardStop() {
-        if (PrefsStore.isAutoSwitchAutonomousMode()) {
-            val alias = PrefsStore.getAlias()
-            if (alias != null) {
-                LogCenter.op(alias, "自动切号自治模式中不可硬停，请先在管理台关闭自动切号")
-            }
-            updateRuntime(lastMessage = "自动切号自治中：硬停不可用")
-            return
-        }
         val deviceId = PrefsStore.getDeviceId()
         val alias = PrefsStore.getAlias()
+        if (PrefsStore.isAutoSwitchAutonomousMode()) {
+            LogCenter.op(alias, "硬停：暂停自动切号自治并清理运行时脏数据（保留计划文件）")
+            pauseAutoSwitchAutonomousForHardStop()
+        }
         PrefsStore.setHardStopRequested(true)
         val publishAccountKey =
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias?.trim().orEmpty()
@@ -9109,6 +9147,47 @@ object AppCoordinator {
             }.onSuccess {
                 LogCenter.op(alias, "硬停：已向云端上报关闭本设备自动开启程序（opt_out=true）")
             }
+        }
+    }
+
+    /**
+     * 硬停暂停自动切号自治：停调度、取消在途插入/登录恢复、清运行时脏 prefs；
+     * **不**清计划文件 / session / ledger，便于点击开始按本地计划续跑。
+     */
+    private fun pauseAutoSwitchAutonomousForHardStop() {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        cancelAutoSwitchBundleRetry()
+        autoSwitchLoginRecoveryJob?.cancel()
+        autoSwitchLoginRecoveryJob = null
+        growthModeLoginSafeguardPending = false
+        if (isPublishPostSwitchActive()) {
+            publishPostSwitchJob?.cancel()
+            publishPostSwitchJob = null
+        }
+        if (isMutualSwitchActive()) {
+            mutualSwitchJob?.cancel()
+            mutualSwitchJob = null
+        }
+        if (isLiveVisitSwitchActive()) {
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
+        }
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        autoSwitchLocalScheduler.stop(clearState = false)
+        PrefsStore.clearAutoSwitchInsertionDirtyPrefs()
+        AutoSwitchLocalPlanStore.clearActivePublish()
+        AutoSwitchLocalPlanStore.clearActiveMutual()
+        AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PublishPostGrowthGate.exitExclusivePublishPhase()
+        executor.clearAccountStatusReloginState()
+        ExecutionScope.forceClearIfStuck("硬停暂停自动切号自治")
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【自动切号】硬停已暂停自治：已清登录/发作品/互点运行时脏数据，计划文件保留；点击开始可按计划续跑",
+            )
         }
     }
 

@@ -7,7 +7,8 @@ import java.util.Locale
 
 /**
  * 按云端 bundle 账号档案 + 备份包命名规则整理 [UnifiedBackupPaths] 目录：
- * - 每个已分配 username 仅保留 1 个包（优先云端 [backup_name] 且本机存在，否则保留最新）
+ * - 每个已分配 username 仅保留 1 个包（本机最新；包名时间戳优先）
+ * - 云端 [backup_name] 仅用于缺失告警，不得覆盖保留更新的本地包
  * - 删除同 username 重复包、别名下未分配 username 的包、不符合命名规则的 .tar.gz
  * - 云端 [backup_name] 解析出的 username 与档案 username 不一致时删除该备份包
  * - 云端有 [backup_name] 但本机不存在时记入 [ReconcileResult.missingCloud]（需重新登录备份）
@@ -128,7 +129,11 @@ object BackupDirectoryReconciler {
             val invalidFiles = userFiles.filter { file -> file !in validFiles.toSet() }
             invalidFiles.forEach { toDelete.add(it.canonicalOrAbsolute()) }
 
-            val keepFile = validFiles.maxByOrNull { it.lastModified() }
+            // 必须保留最新：包名时间戳优先，避免 mtime 相同或 extraKeep 护住旧包
+            val keepFile = validFiles.maxWithOrNull(
+                compareByDescending<File> { UnifiedBackupPaths.archiveRecencyKey(it) }
+                    .thenByDescending { it.name },
+            )
             val cloudNameForMatch = cloudName
             if (cloudNameForMatch.isNotEmpty()) {
                 val cloudMatchesLocal = validFiles.any { file ->
@@ -152,14 +157,19 @@ object BackupDirectoryReconciler {
             }
             validFiles.forEach { file ->
                 val path = file.canonicalOrAbsolute()
-                if (path != keepPath && path !in extraKeepCanon) {
+                // 非最新一律删；extraKeep 不得保留更旧的同账号包
+                if (path != keepPath) {
                     toDelete.add(path)
                 }
             }
         }
 
-        // 2) 强制保留本轮新备份
-        extraKeepCanon.forEach { kept.add(it) }
+        // 2) 本轮新备份：仅当它不是「已判定删除的旧包」时才强制保留
+        extraKeepCanon.forEach { path ->
+            if (path !in toDelete) {
+                kept.add(path)
+            }
+        }
 
         // 3) 未分配 username / 非本别名 / 无法识别：删除
         for (file in allArchives) {

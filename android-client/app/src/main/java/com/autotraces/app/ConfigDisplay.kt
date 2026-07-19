@@ -80,8 +80,10 @@ object ConfigDisplay {
 
         appendSection("For You 预滑") {
             appendLine("预滑总时长 for_you_swipe_total_sec：${config.for_you_swipe_total_sec} 秒（0=关闭）")
-            appendLine("点赞概率 for_you_like_prob：${formatProb(config.for_you_like_prob)}")
             appendLine("单条观看 for_you_watch：${formatRangeSec(config.for_you_watch_min_sec, config.for_you_watch_max_sec)}")
+            appendLine("互动：点赞/收藏/转发与涨粉共用 like_prob/favorite_prob/share_prob 及每日额度（无评论）")
+            appendLine("跳过互动：与涨粉共用 skip_post_click_prob（命中则本条仅观看翻页）")
+            appendLine("（兼容字段 for_you_like_prob=${formatProb(config.for_you_like_prob)}，预滑已不再单独使用）")
         }
 
         appendSection("互动概率（随机权重）") {
@@ -89,7 +91,7 @@ object ConfigDisplay {
             appendLine("评论 comment_prob：${formatProb(config.comment_prob)}")
             appendLine("收藏 favorite_prob：${formatProb(config.favorite_prob)}")
             appendLine("转发 share_prob：${formatProb(config.share_prob)}")
-            appendLine("跳过作品点击 skip_post_click_prob：${formatProb(config.skip_post_click_prob)}")
+            appendLine("跳过作品点击 skip_post_click_prob：${formatProb(config.skip_post_click_prob)}（涨粉进主页跳过点作品；For You 预滑跳过本条互动）")
             appendLine("评论用文字 comment_text_prob：${formatProb(config.comment_text_prob)}")
             appendLine("仅执行一个动作 action_single：${if (config.action_single) "是" else "否"}")
         }

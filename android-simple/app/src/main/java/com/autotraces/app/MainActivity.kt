@@ -43,6 +43,7 @@ class MainActivity : AppCompatActivity() {
     private var assignedAccount: DeviceAssignedAccountResponse? = null
     private var manualAccounts: List<ManualDeviceControl.AccountOption> = emptyList()
     private var suppressingManualSpinnerCallback = false
+    private var suppressingManualAutoSwitchCheck = false
     /** 硬停后关闭自动滚底，便于用户翻看历史日志；重新启动后台服务后恢复。 */
     private var logStickToBottom = true
 
@@ -76,7 +77,7 @@ class MainActivity : AppCompatActivity() {
                 logStickToBottom = true
                 if (WorkerServiceTracker.isRunning) {
                     AppCoordinator.forceStartRunningNow("设备端点击启动后台服务")
-                    LogCenter.op(alias, "后台服务已启动，已按本地计划请求恢复自动任务")
+                    LogCenter.op(alias, "后台服务已启动，已按持久化计划请求恢复本机自动切号/自动任务")
                 } else {
                     LogCenter.op(alias, "后台服务未能启动")
                 }
@@ -91,7 +92,7 @@ class MainActivity : AppCompatActivity() {
                 AppCoordinator.requestUserGracefulHardStop()
                 LogCenter.op(
                     alias,
-                    "已请求硬停：当前步骤结束后停下自动任务；后台继续轮询 check_start / 设备指令；已请求云端关闭本机自动开启",
+                    "已请求硬停：当前步骤结束后停下自动任务；若已开本机自动切号会暂停并清脏数据（计划文件保留）；点击「启动后台服务」可按计划续跑；后台继续轮询 check_start / 设备指令",
                 )
                 runCatching { WorkerService.start(this@MainActivity) }
                     .onFailure { err ->
@@ -397,6 +398,7 @@ class MainActivity : AppCompatActivity() {
             refreshAssignedAccountFields()
             refreshManualAccountStatus()
         }
+        refreshManualAutoSwitchStatus()
     }
 
     private fun setupManualTaskSection() {
@@ -407,25 +409,93 @@ class MainActivity : AppCompatActivity() {
                 if (checked) "已开启：任务完成后自动涨粉" else "已关闭：任务完成后不自动涨粉"
         }
 
+        binding.manualAutoSwitchSlotMinutesInput.setText(
+            PrefsStore.getManualAutoSwitchSlotMinutes().toString(),
+        )
+        suppressingManualAutoSwitchCheck = true
+        binding.manualAutoSwitchEnableCheck.isChecked = PrefsStore.isManualLocalAutoSwitchEnabled()
+        suppressingManualAutoSwitchCheck = false
+        binding.manualAutoSwitchEnableCheck.setOnCheckedChangeListener { _, checked ->
+            if (suppressingManualAutoSwitchCheck) return@setOnCheckedChangeListener
+            if (!ensureCloudLoginAndBoundForStart()) {
+                suppressingManualAutoSwitchCheck = true
+                binding.manualAutoSwitchEnableCheck.isChecked = PrefsStore.isManualLocalAutoSwitchEnabled()
+                suppressingManualAutoSwitchCheck = false
+                return@setOnCheckedChangeListener
+            }
+            val minutes = binding.manualAutoSwitchSlotMinutesInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualAutoSwitchSlotMinutes()
+            if (checked) {
+                if (ManualDeviceControl.getCachedAccounts().isEmpty()) {
+                    Toast.makeText(this, "请先拉取云端账号列表", Toast.LENGTH_SHORT).show()
+                    suppressingManualAutoSwitchCheck = true
+                    binding.manualAutoSwitchEnableCheck.isChecked = false
+                    suppressingManualAutoSwitchCheck = false
+                    return@setOnCheckedChangeListener
+                }
+                binding.manualTaskStatusText.text = "正在开启本机自动切号…"
+                AppCoordinator.manualEnableLocalAutoSwitch(minutes)
+            } else {
+                binding.manualTaskStatusText.text = "正在关闭本机自动切号…"
+                AppCoordinator.manualDisableLocalAutoSwitch()
+            }
+            lifecycleScope.launch {
+                delay(800)
+                refreshManualAutoSwitchStatus()
+                // 开启失败时回滚勾选状态
+                if (checked && !PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                    binding.manualTaskStatusText.text = "本机自动切号开启失败或已取消"
+                }
+            }
+        }
+        binding.manualAutoSwitchRebuildButton.setOnClickListener {
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            if (ManualDeviceControl.getCachedAccounts().isEmpty()) {
+                Toast.makeText(this, "请先拉取云端账号列表", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val minutes = binding.manualAutoSwitchSlotMinutesInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualAutoSwitchSlotMinutes()
+            binding.manualTaskStatusText.text = "正在重建本机切号计划…"
+            AppCoordinator.manualRebuildLocalAutoSwitchPlan(minutes)
+            suppressingManualAutoSwitchCheck = true
+            binding.manualAutoSwitchEnableCheck.isChecked = true
+            suppressingManualAutoSwitchCheck = false
+            lifecycleScope.launch {
+                delay(600)
+                refreshManualAutoSwitchStatus()
+            }
+        }
+        refreshManualAutoSwitchStatus()
+
         binding.manualAccountSelect.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 if (suppressingManualSpinnerCallback) return
                 val opt = manualAccounts.getOrNull(position) ?: return
                 AppCoordinator.manualSelectAccount(opt.username)
                 applyManualAccountFields(opt)
-                refreshManualAccountStatus()
+                val active = ManualDeviceControl.activeManualUsername()
+                if (active.isNotBlank() && active.equals(opt.username, ignoreCase = true)) {
+                    refreshManualAccountStatus()
+                    return
+                }
+                if (!ensureCloudLoginAndBoundForStart()) {
+                    // 未绑定：回滚到本机当前账号，避免假选中
+                    revertManualSpinnerToActive()
+                    refreshManualAccountStatus()
+                    return
+                }
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    Toast.makeText(this@MainActivity, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                    revertManualSpinnerToActive()
+                    return
+                }
+                binding.manualTaskStatusText.text = "正在切号 → @${opt.username} …"
+                setManualTaskButtonsEnabled(false)
+                AppCoordinator.manualSwitchAccountFromSpinner(opt.username)
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
-
-        binding.manualFirstLoginDoneCheck.setOnCheckedChangeListener { _, checked ->
-            val user = selectedManualUsername()
-            if (user.isBlank()) return@setOnCheckedChangeListener
-            AppCoordinator.manualSetFirstLoginDone(user, checked)
-            refreshManualAccountStatus()
-            binding.manualTaskStatusText.text =
-                if (checked) "已标记 @$user 完成初次登录（不会自动登录）" else "已取消 @$user 初次登录标记"
         }
 
         binding.manualRefreshAccountsButton.setOnClickListener {
@@ -436,7 +506,15 @@ class MainActivity : AppCompatActivity() {
                 binding.manualRefreshAccountsButton.isEnabled = true
                 result.onSuccess { list ->
                     bindManualAccountSpinner(list)
-                    binding.manualTaskStatusText.text = "已拉取 ${list.size} 个账号"
+                    val active = ManualDeviceControl.activeManualUsername()
+                    val activeStillListed = active.isNotBlank() &&
+                        list.any { it.username.equals(active, ignoreCase = true) }
+                    binding.manualTaskStatusText.text = when {
+                        active.isNotBlank() && !activeStillListed ->
+                            "已拉取 ${list.size} 个账号；本机当前 @$active 已不参与，请切到其他账号"
+                        else -> "已拉取 ${list.size} 个账号"
+                    }
+                    refreshManualAutoSwitchStatus()
                     // 不要再调 refreshAssignedAccountFields：它会用云端「高亮」单账号覆盖下拉选中凭据
                 }.onFailure { err ->
                     binding.manualTaskStatusText.text = "拉取失败：${err.message}"
@@ -444,25 +522,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        binding.manualSwitchAccountButton.setOnClickListener {
-            val user = selectedManualUsername()
-            if (user.isBlank()) {
-                Toast.makeText(this, "请先拉取并选择账号", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
-            binding.manualTaskStatusText.text = "正在切号 → @$user …"
-            AppCoordinator.manualSwitchAccount(user)
-            lifecycleScope.launch {
-                delay(800)
-                refreshManualAccountStatus()
-            }
-        }
+        // 备份/清理已移除：切号由账号下拉触发完整备份→清理→还原链
 
         binding.manualAutoLoginButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             val user = selectedManualUsername()
             if (user.isBlank()) {
                 Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!AppCoordinator.isManualAccountAligned()) {
+                Toast.makeText(this, "请先等待切号完成（本机当前需与下拉一致）", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
@@ -471,7 +544,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.manualStartGrowthButton.setOnClickListener {
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            if (!guardManualTaskReady("涨粉")) return@setOnClickListener
             binding.manualTaskStatusText.text = "已请求开始涨粉"
             AppCoordinator.manualStartGrowth()
         }
@@ -481,22 +554,83 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.manualStopGrowth()
         }
 
+        binding.manualForYouSwipeSecInput.setText(
+            PrefsStore.getManualForYouSwipeSec().toString(),
+        )
+        binding.manualForYouSwipeButton.setOnClickListener {
+            if (!guardManualTaskReady("For You 预滑")) return@setOnClickListener
+            val raw = binding.manualForYouSwipeSecInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualForYouSwipeSec()
+            val sec = raw.coerceIn(
+                PrefsStore.MIN_MANUAL_FOR_YOU_SWIPE_SEC,
+                PrefsStore.MAX_MANUAL_FOR_YOU_SWIPE_SEC,
+            )
+            PrefsStore.setManualForYouSwipeSec(sec)
+            binding.manualForYouSwipeSecInput.setText(sec.toString())
+            binding.manualTaskStatusText.text = "已请求 For You 预滑（${sec}s）"
+            AppCoordinator.manualStartForYouSwipe(sec)
+        }
+
         binding.manualMutualButton.setOnClickListener {
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            if (!guardManualTaskReady("引流互点")) return@setOnClickListener
             binding.manualTaskStatusText.text = "已请求引流互点"
             AppCoordinator.manualStartMutualClick()
         }
 
+        binding.manualPublishCountInput.setText(
+            PrefsStore.getManualPublishCount().toString(),
+        )
         binding.manualPublishButton.setOnClickListener {
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
-            binding.manualTaskStatusText.text = "已请求发作品"
-            AppCoordinator.manualStartPublishPost()
+            if (!guardManualTaskReady("发作品")) return@setOnClickListener
+            val raw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualPublishCount()
+            val count = raw.coerceIn(
+                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+            )
+            PrefsStore.setManualPublishCount(count)
+            binding.manualPublishCountInput.setText(count.toString())
+            binding.manualTaskStatusText.text = "已请求发作品（${count}条）"
+            AppCoordinator.manualStartPublishPost(count)
         }
 
         binding.manualProfileEditButton.setOnClickListener {
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            if (!guardManualTaskReady("修改基本资料")) return@setOnClickListener
             binding.manualTaskStatusText.text = "已请求修改基本资料"
             AppCoordinator.manualStartEditBasicProfile()
+        }
+
+        lifecycleScope.launch {
+            var seenBusy = false
+            AppCoordinator.manualSwitchBusy.collectLatest { busy ->
+                refreshManualAccountStatus()
+                if (busy) {
+                    seenBusy = true
+                    binding.manualTaskStatusText.text = "正在切号…"
+                    revertManualSpinnerToSelected()
+                } else if (seenBusy) {
+                    val active = ManualDeviceControl.activeManualUsername()
+                    val msg = AppCoordinator.runtimeState.value.lastMessage
+                    if (msg.startsWith("切号完成") || msg.startsWith("手动切号完成")) {
+                        binding.manualTaskStatusText.text =
+                            if (active.isNotBlank()) "切号完成，本机当前：@$active" else msg
+                        revertManualSpinnerToActive()
+                    } else if (msg.startsWith("手动切号失败") || msg.startsWith("手动切号已取消")) {
+                        binding.manualTaskStatusText.text = msg
+                        revertManualSpinnerToActive()
+                    } else {
+                        revertManualSpinnerToActive()
+                    }
+                    refreshManualAccountSpinnerLabels()
+                    refreshManualAccountStatus()
+                }
+            }
+        }
+        lifecycleScope.launch {
+            AppCoordinator.manualAccountUiEpoch.collectLatest {
+                refreshManualAccountSpinnerLabels()
+                refreshManualAccountStatus()
+            }
         }
 
         val cached = ManualDeviceControl.getCachedAccounts()
@@ -504,6 +638,63 @@ class MainActivity : AppCompatActivity() {
             bindManualAccountSpinner(cached)
         }
         refreshManualAccountStatus()
+    }
+
+    /** 任务按钮：切号完成且本机当前与下拉一致后才可点。 */
+    private fun guardManualTaskReady(label: String): Boolean {
+        if (AppCoordinator.isManualSwitchBusy()) {
+            Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        if (!AppCoordinator.isManualAccountAligned()) {
+            Toast.makeText(this, "请先切号完成（本机当前需与下拉账号一致）后再$label", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        return ensureCloudLoginAndBoundForStart()
+    }
+
+    private fun revertManualSpinnerToActive() {
+        val active = ManualDeviceControl.activeManualUsername()
+            .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
+        if (active.isBlank() || manualAccounts.isEmpty()) return
+        val idx = manualAccounts.indexOfFirst { it.username.equals(active, ignoreCase = true) }
+        if (idx < 0) return
+        suppressingManualSpinnerCallback = true
+        binding.manualAccountSelect.setSelection(idx)
+        applyManualAccountFields(manualAccounts[idx])
+        AppCoordinator.manualSelectAccount(manualAccounts[idx].username)
+        suppressingManualSpinnerCallback = false
+    }
+
+    /** 切号进行中：下拉保持显示目标选中账号（prefs selected）。 */
+    private fun revertManualSpinnerToSelected() {
+        val selected = PrefsStore.getManualSelectedUsername().orEmpty()
+        if (selected.isBlank() || manualAccounts.isEmpty()) return
+        val idx = manualAccounts.indexOfFirst { it.username.equals(selected, ignoreCase = true) }
+        if (idx < 0) return
+        if (binding.manualAccountSelect.selectedItemPosition == idx) return
+        suppressingManualSpinnerCallback = true
+        binding.manualAccountSelect.setSelection(idx)
+        applyManualAccountFields(manualAccounts[idx])
+        suppressingManualSpinnerCallback = false
+    }
+
+    private fun setManualTaskButtonsEnabled(enabled: Boolean) {
+        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !AppCoordinator.isManualSwitchBusy()
+        binding.manualAccountSelect.isEnabled = !AppCoordinator.isManualSwitchBusy()
+        binding.manualRefreshAccountsButton.isEnabled = !AppCoordinator.isManualSwitchBusy()
+        binding.manualAutoGrowthAfterTasksCheck.isEnabled = aligned
+        binding.manualStartGrowthButton.isEnabled = aligned
+        binding.manualStopGrowthButton.isEnabled = true
+        binding.manualForYouSwipeButton.isEnabled = aligned
+        binding.manualForYouSwipeSecInput.isEnabled = aligned
+        binding.manualMutualButton.isEnabled = aligned
+        binding.manualPublishButton.isEnabled = aligned
+        binding.manualProfileEditButton.isEnabled = aligned
+        // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
+        val statusUser = selectedManualUsername()
+        val firstDone = statusUser.isNotBlank() && PrefsStore.isManualFirstLoginDone(statusUser)
+        binding.manualAutoLoginButton.isEnabled = aligned && !firstDone
     }
 
     private fun selectedManualUsername(): String {
@@ -514,25 +705,47 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindManualAccountSpinner(list: List<ManualDeviceControl.AccountOption>) {
         manualAccounts = list
-        val labels = list.map { opt ->
-            buildString {
-                append("@${opt.username}")
-                if (opt.switchHighlight.equals("是", ignoreCase = true)) append(" ·高亮")
-                if (opt.cloudIsLogin == true) append(" ·云端已登录")
-            }
-        }
+        val active = ManualDeviceControl.activeManualUsername()
+        val labels = list.map { opt -> formatManualAccountSpinnerLabel(opt.username, active) }
         suppressingManualSpinnerCallback = true
         binding.manualAccountSelect.adapter =
             ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-        val selected = PrefsStore.getManualSelectedUsername().orEmpty()
-        val idx = list.indexOfFirst { it.username.equals(selected, ignoreCase = true) }
+        // 优先展示本机当前账号，否则用上次选中
+        val preferred = ManualDeviceControl.activeManualUsername()
+            .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
+        val idx = list.indexOfFirst { it.username.equals(preferred, ignoreCase = true) }
             .takeIf { it >= 0 } ?: 0
         if (list.isNotEmpty()) {
             binding.manualAccountSelect.setSelection(idx)
             applyManualAccountFields(list[idx])
+            AppCoordinator.manualSelectAccount(list[idx].username)
         }
         suppressingManualSpinnerCallback = false
         refreshManualAccountStatus()
+    }
+
+    /** 下拉项文案：只标注本机切号后的当前活跃账号，不展示云端高亮/is_login（易误导）。 */
+    private fun formatManualAccountSpinnerLabel(username: String, activeUsername: String = ManualDeviceControl.activeManualUsername()): String {
+        return buildString {
+            append("@$username")
+            if (activeUsername.isNotBlank() && username.equals(activeUsername, ignoreCase = true)) {
+                append(" ·本机当前")
+            }
+        }
+    }
+
+    /** 切号完成后刷新「本机当前」标记，保持下拉选中位置不变。 */
+    private fun refreshManualAccountSpinnerLabels() {
+        if (manualAccounts.isEmpty()) return
+        val active = ManualDeviceControl.activeManualUsername()
+        val labels = manualAccounts.map { formatManualAccountSpinnerLabel(it.username, active) }
+        val rawPos = binding.manualAccountSelect.selectedItemPosition
+        val selectedPos = if (rawPos in manualAccounts.indices) rawPos else 0
+        suppressingManualSpinnerCallback = true
+        binding.manualAccountSelect.adapter =
+            ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
+        binding.manualAccountSelect.setSelection(selectedPos)
+        suppressingManualSpinnerCallback = false
     }
 
     private fun applyManualAccountFields(opt: ManualDeviceControl.AccountOption) {
@@ -556,27 +769,51 @@ class MainActivity : AppCompatActivity() {
         val user = selectedManualUsername()
         if (user.isBlank()) {
             binding.manualAccountStatusText.text = "账号状态：未选择"
-            binding.manualFirstLoginDoneCheck.setOnCheckedChangeListener(null)
-            binding.manualFirstLoginDoneCheck.isChecked = false
-            binding.manualFirstLoginDoneCheck.setOnCheckedChangeListener { _, checked ->
-                val u = selectedManualUsername()
-                if (u.isBlank()) return@setOnCheckedChangeListener
-                AppCoordinator.manualSetFirstLoginDone(u, checked)
-                refreshManualAccountStatus()
-            }
+            binding.manualClearAndRestoreButton.visibility = View.GONE
+            setManualTaskButtonsEnabled(false)
             return
         }
         val status = AppCoordinator.manualQuerySwitchStatus(user)
-        binding.manualAccountStatusText.text = "账号状态：${status.message}"
-        binding.manualFirstLoginDoneCheck.setOnCheckedChangeListener(null)
-        binding.manualFirstLoginDoneCheck.isChecked = status.firstLoginDone
-        binding.manualFirstLoginDoneCheck.setOnCheckedChangeListener { _, checked ->
-            AppCoordinator.manualSetFirstLoginDone(user, checked)
-            refreshManualAccountStatus()
-            binding.manualTaskStatusText.text =
-                if (checked) "已标记 @$user 完成初次登录（不会自动登录）" else "已取消 @$user 初次登录标记"
+        val busy = AppCoordinator.isManualSwitchBusy()
+        val aligned = AppCoordinator.isManualAccountAligned()
+        binding.manualAccountStatusText.text = buildString {
+            append("账号状态：${status.message}")
+            when {
+                busy -> append(" · 切号中…")
+                !aligned -> append(" · 待切号对齐")
+            }
         }
-        binding.manualAutoLoginButton.isEnabled = !status.firstLoginDone
+        binding.manualClearAndRestoreButton.visibility = View.GONE
+        setManualTaskButtonsEnabled(!busy && aligned)
+    }
+
+    private fun refreshManualAutoSwitchStatus() {
+        val enabled = PrefsStore.isManualLocalAutoSwitchEnabled()
+        val mode = PrefsStore.getAutoSwitchMode()
+        val minutes = PrefsStore.getManualAutoSwitchSlotMinutes()
+        val accounts = ManualDeviceControl.getCachedAccounts().size
+        val planSlots = AutoSwitchLocalPlanStore.get()?.slots?.size ?: 0
+        val weekStart = PrefsStore.getAutoSwitchWeekStart().orEmpty()
+        val weekEnd = PrefsStore.getAutoSwitchWeekEnd().orEmpty()
+        val week = when {
+            weekStart.isNotBlank() && weekEnd.isNotBlank() -> "$weekStart~$weekEnd"
+            else -> PrefsStore.getAutoSwitchScheduleDate().orEmpty().ifBlank { "—" }
+        }
+        suppressingManualAutoSwitchCheck = true
+        binding.manualAutoSwitchEnableCheck.isChecked = enabled
+        suppressingManualAutoSwitchCheck = false
+        if (binding.manualAutoSwitchSlotMinutesInput.text?.toString().isNullOrBlank()) {
+            binding.manualAutoSwitchSlotMinutesInput.setText(minutes.toString())
+        }
+        binding.manualAutoSwitchStatusText.text = buildString {
+            append("自治状态：")
+            append(if (enabled) "开" else "关")
+            append(" · mode=$mode")
+            append(" · 每号 ${minutes} 分钟")
+            append(" · 账号 $accounts")
+            append(" · 计划槽 $planSlots")
+            if (week.isNotBlank() && week != "—") append(" · $week")
+        }
     }
 
     private fun openConfigParamsScreen() {
@@ -685,9 +922,13 @@ class MainActivity : AppCompatActivity() {
                     }
                     appendLine("云端自动起号: $cloudAutoStartLabel")
                     val autoSwitchMode = PrefsStore.getAutoSwitchMode()
-                    if (autoSwitchMode != "off") {
-                        appendLine("自动切号自治（本机）: $autoSwitchMode")
+                    if (autoSwitchMode != "off" || PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                        appendLine(
+                            "自动切号自治（本机）: $autoSwitchMode" +
+                                if (PrefsStore.isManualLocalAutoSwitchEnabled()) " · APP开关=开" else "",
+                        )
                     }
+                    refreshManualAutoSwitchStatus()
                     appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
                     append("最近状态: ${state.lastMessage}")
                 }

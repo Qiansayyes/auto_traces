@@ -10,6 +10,10 @@ import org.json.JSONObject
  */
 object VideoDedSettingsRegistrar {
     private const val TAG = "VideoDedSettingsRegistrar"
+    /** 无线流水线最短间隔，避免 15s 轮询反复 adb connect / prepare 打断投屏。 */
+    private const val WIRELESS_PIPELINE_MIN_INTERVAL_MS = 120_000L
+    @Volatile
+    private var lastWirelessPipelineAtMs: Long = 0L
 
     data class SaveInput(
         val windowsUrl: String? = null,
@@ -60,6 +64,8 @@ object VideoDedSettingsRegistrar {
     fun shouldTriggerWirelessPipeline(context: Context, reg: JSONObject?): Boolean {
         if (reg != null && reg.optString("pcAdbState", "").trim() == "device") return false
         if (MirrorStateProbe.currentMirrorStatus(context) == "ready") return false
+        val now = System.currentTimeMillis()
+        if (now - lastWirelessPipelineAtMs < WIRELESS_PIPELINE_MIN_INTERVAL_MS) return false
         return true
     }
 
@@ -135,7 +141,6 @@ object VideoDedSettingsRegistrar {
         if (logRegistration) {
             mirrorHint?.let { StatusLogBuffer.append("投屏说明：${mirrorHintForStatusLog(it)}") }
         }
-        if (!shouldTriggerWirelessPipeline(context, reg)) return
 
         if (retryRootAdbIfNeeded && !tcpOpen &&
             ApiSettings.isRootAdbTcpipEnabled(context) && RootWifiAdbHelper.hasSu()
@@ -143,8 +148,9 @@ object VideoDedSettingsRegistrar {
             if (logRegistration) StatusLogBuffer.append("正在重试开启无线 ADB…")
             VideoDedDeviceService.enqueueTryRootAdbTcpip(context)
         }
-        if (triggerWirelessIfNeeded) {
+        if (triggerWirelessIfNeeded && shouldTriggerWirelessPipeline(context, reg)) {
             if (logRegistration) StatusLogBuffer.append("正在请求 PC 无线授权流水线…")
+            lastWirelessPipelineAtMs = System.currentTimeMillis()
             runCatching {
                 CompanionApi.requestPcWirelessPipeline(context, launchMirror = false)
             }.onSuccess {

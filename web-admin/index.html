@@ -82,6 +82,26 @@
     </div>
   </div>
 
+  <div id="autoSwitchExcludedBatchModal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>批量设置不参加自动切号</h3>
+        <button id="closeAutoSwitchExcludedBatchBtn" type="button" class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-hint">按 username 批量操作，一行一个；匹配设备备份档案中的账号（忽略大小写）。</p>
+      <div class="field" style="margin:0;">
+        <label for="autoSwitchExcludedBatchTextarea">username 列表</label>
+        <textarea id="autoSwitchExcludedBatchTextarea" rows="12" placeholder="一行一个 username&#10;例如：&#10;user_a&#10;user_b&#10;user_c" style="width:100%;min-height:220px;resize:vertical;"></textarea>
+      </div>
+      <div id="autoSwitchExcludedBatchMessage" class="hint" style="margin-top:8px;"></div>
+      <div class="modal-actions">
+        <button id="cancelAutoSwitchExcludedBatchBtn" type="button" class="ghost">取消</button>
+        <button id="autoSwitchExcludedBatchJoinBtn" type="button" class="ghost" title="将列表中的账号恢复为参加自动切号">批量退出不参加</button>
+        <button id="autoSwitchExcludedBatchExcludeBtn" type="button" class="primary" title="将列表中的账号设为不参加自动切号">批量设为不参加</button>
+      </div>
+    </div>
+  </div>
+
   <div class="app hidden" id="appShell">
     <aside class="sidebar">
       <div class="brand">
@@ -820,6 +840,7 @@
               <button id="autoSwitchSelectAllEnableBtn" type="button" class="ghost" title="为当前账号下全部设备开启自动切号（无需逐个勾选）">全选并开启</button>
               <button id="autoSwitchEnableSelectedBtn" type="button" class="ghost" title="为勾选的别名组/备份记录对应设备开启自动切号（本机自治调度）">开启选中设备自动切号</button>
               <button id="autoSwitchDisableSelectedBtn" type="button" class="ghost" title="关闭勾选别名组/记录对应设备的自动切号">关闭选中设备自动切号</button>
+              <button id="autoSwitchExcludedBatchBtn" type="button" class="ghost" title="按 username 批量设置/取消不参加自动切号">批量不参加自动切号</button>
               <span id="autoSwitchEnabledCountHint" class="hint"></span>
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>
               <button id="backupArchiveSelectAllPageBtn" type="button" class="ghost" title="勾选当前页全部备份记录">全选本页</button>
@@ -1218,7 +1239,7 @@
 
           <h4>4.7 延时与「用户资料主页」停留（Android <code>TraceExecutor.kt</code>，以当前代码为准）</h4>
           <p style="margin:0.5em 0;">下列为<strong>硬编码或可配置 delay</strong> 与 OCR 耗时叠加后的行为说明；OCR/截屏耗时随设备性能变化，文档不量化。</p>
-          <p style="margin:0.5em 0;"><strong>For You 预滑</strong>（<code>runForYouWarmupIfNeeded</code>）：仅当 <code>for_you_swipe_total_sec × 1000 ≥ 500</code> 时执行。总时长内循环：每段随机观看 <code>for_you_watch_min_sec</code>～<code>for_you_watch_max_sec</code>（换算为毫秒且各自下限钳制为 500ms），每段不超过剩余总时长；若命中 <code>for_you_like_prob</code>，点赞双击发生在<strong>该观看段内的随机时刻</strong>（段足够长时 <code>preDelay ∈ [40, watchMs−280)</code> 毫秒；较短段另有分支）；段末执行上滑 <code>swipe</code> 后 <code>delay(450)</code>。</p>
+          <p style="margin:0.5em 0;"><strong>For You 预滑</strong>（<code>runForYouWarmupIfNeeded</code>）：仅当 <code>for_you_swipe_total_sec × 1000 ≥ 500</code> 时执行。总时长内循环：每段随机观看 <code>for_you_watch_min_sec</code>～<code>for_you_watch_max_sec</code>（换算为毫秒且各自下限钳制为 500ms），每段不超过剩余总时长；观看后按 <code>skip_post_click_prob</code> 独立判定是否跳过本条赞/藏/转（命中则仅翻页；未命中则按 <code>like_prob</code>/<code>favorite_prob</code>/<code>share_prob</code> 与每日额度执行互动）；段末执行上滑 <code>swipe</code>。</p>
           <p style="margin:0.5em 0;"><strong>从 Users 列表进入「当前任务用户名」对应主页</strong>（根用户，三种模式共用一段）：列表行点击后 <code>delay(400)</code>（失败会再点一次）；随后 <code>delay(Random.nextLong(1200, 1800))</code>；再执行一次 <code>checkNoVideosAndGoBack</code>（无作品/私密则 <code>back</code> 并结束本任务）。此处<strong>没有</strong>调用 <code>checkNoVideosAndGoBackWithRetry</code>。</p>
           <ul>
             <li><strong>growth</strong>：通过后立即进入 <code>clickFollowersAndVerify</code>，不在主页额外插入随机停留。该函数每次点击 Followers 后：第 1 次 OCR 轮询前 <code>delay(2500)</code>，第 2～4 次轮询间隔 <code>Random.nextLong(500, 850)</code>；最多 4 次轮询、最多 3 轮点击尝试。通过后进入粉丝列表，再 <code>delay(Random.nextLong(1000, 2000))</code> 后执行 <code>processFollowersList</code>。</li>
@@ -1466,12 +1487,12 @@
             <div class="range-pair" role="group" aria-label="For You 每条视频观看秒数">
               <div class="range-half">
                 <label class="range-sublabel" for="cfg-fy-watch-min">最短</label>
-                <input id="cfg-fy-watch-min" name="for_you_watch_min_sec" type="number" min="0.5" max="120" step="0.1" value="2" />
+                <input id="cfg-fy-watch-min" name="for_you_watch_min_sec" type="number" min="0.5" max="120" step="0.1" value="3" />
               </div>
               <span class="range-sep" aria-hidden="true">~</span>
               <div class="range-half">
                 <label class="range-sublabel" for="cfg-fy-watch-max">最长</label>
-                <input id="cfg-fy-watch-max" name="for_you_watch_max_sec" type="number" min="0.5" max="120" step="0.1" value="5" />
+                <input id="cfg-fy-watch-max" name="for_you_watch_max_sec" type="number" min="0.5" max="120" step="0.1" value="12" />
               </div>
             </div>
             <div class="hint">For You 预滑阶段：每次滑动前先随机观看一段时间，时长在本区间内。</div>
@@ -1495,7 +1516,7 @@
           <div class="field">
             <label>跳过作品点击概率</label>
             <input name="skip_post_click_prob" type="number" step="0.01" min="0" max="1" value="0" />
-            <div class="hint">三套模式（growth/live/direct）都会<strong>各自</strong>在“进入用户主页后”做一次独立判定：按该概率决定本次是否<strong>跳过作品点击</strong>，直接走“无作品/私密账号”同样的跳过流程。它是互斥分支（命中则不点作品，未命中才会进入点作品流程），并非三套模式同时叠加执行。比如 0.1 表示约 10% 概率跳过作品点击。</div>
+            <div class="hint">三套模式（growth/live/direct）都会<strong>各自</strong>在“进入用户主页后”做一次独立判定：按该概率决定本次是否<strong>跳过作品点击</strong>，直接走“无作品/私密账号”同样的跳过流程。For You 预滑对每条视频也会按同一概率独立判定：命中则<strong>跳过本条赞/藏/转</strong>，仅观看后翻页。它是互斥分支（命中则不互动/不点作品，未命中才会进入互动流程），并非多处叠加执行。比如 0.1 表示约 10% 概率跳过。</div>
           </div>
           <div class="field">
             <label>仅执行一个动作</label>

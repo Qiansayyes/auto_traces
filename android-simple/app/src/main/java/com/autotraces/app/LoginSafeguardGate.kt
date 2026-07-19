@@ -41,6 +41,7 @@ object LoginSafeguardGate {
         if (s.isEmpty()) return false
         return s == "切号完成" ||
             s.startsWith("切号后") ||
+            s.contains("手动切号") ||
             s.contains("restore_chain") ||
             s.contains("切号后校验") ||
             s.contains("切号后登录")
