@@ -320,10 +320,11 @@ class RealTraceExecutor(
             val (vision, err) = mlKitRecognizeFullScreen(service, "$reason-precheck")
             if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
                 devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前已是主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}），连点 Home 确认后继续发作品")
-                confirmCleanForYouByTappingHome(service, alias, reason, vision)
-                return PublishPostEntryRecoveryResult.AlreadyReady
-            }
-            if (vision == null) {
+                if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
+                    return PublishPostEntryRecoveryResult.AlreadyReady
+                }
+                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：已是主 Feed 但未能点到 Home，改走回首页恢复")
+            } else if (vision == null) {
                 devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：主 Feed 预检 OCR 失败：$err，先尝试导航返回恢复")
             } else {
                 devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前前台但未确认主 Feed，先尝试导航返回恢复")
@@ -339,27 +340,35 @@ class RealTraceExecutor(
             val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
             val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-fallback-precheck")
             if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
+                    devOp(
+                        alias,
+                        "${publishPostRecoveryScopeLabel(reason)}：回首页返回 false 但已见底栏 Home+Profile，" +
+                            "连点 Home 确认后继续（外层不再强关）",
+                    )
+                    return PublishPostEntryRecoveryResult.AlreadyReady
+                }
                 devOp(
                     alias,
-                    "${publishPostRecoveryScopeLabel(reason)}：回首页返回 false 但已见底栏 Home+Profile，" +
-                        "连点 Home 确认后继续（外层不再强关）",
+                    "${publishPostRecoveryScopeLabel(reason)}：已见底栏但未能点到 Home，继续走强关重启兜底",
                 )
-                confirmCleanForYouByTappingHome(service, alias, reason, vision)
-                return PublishPostEntryRecoveryResult.AlreadyReady
             }
         }
         devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：导航返回回首页未成功且未见底栏，改按原方案强关重启")
         return if (restartTikTokForRecovery(skipDontAllowOcr = true)) {
-            // 冷启成功后再验：已见底栏只连点 Home，绝不再叠一次强关
+            // 冷启成功后再验：必须点到 Home，否则不视为恢复成功（避免桌面空转假成功）
             if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
                 val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
                 val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-after-restart")
                 if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
-                    confirmCleanForYouByTappingHome(service, alias, reason, vision)
+                    if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
+                        devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：重启兜底成功，紧接着继续发作品")
+                        return PublishPostEntryRecoveryResult.RecoveredByRestart
+                    }
                 }
             }
-            devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：重启兜底成功，紧接着继续发作品")
-            PublishPostEntryRecoveryResult.RecoveredByRestart
+            devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：强关冷启后未能确认主 Feed/Home，恢复失败")
+            PublishPostEntryRecoveryResult.Failed
         } else {
             PublishPostEntryRecoveryResult.Failed
         }
@@ -1259,9 +1268,11 @@ class RealTraceExecutor(
         forceStopBeforeLaunch: Boolean = true,
         skipDontAllowOcr: Boolean = false,
         quietSuccessLog: Boolean = false,
+        /** 强关冷启后必须禁止「已在前台跳过拉起」，否则 dumpsys 残留会假成功停在桌面。 */
+        allowSkipIfAlreadyForeground: Boolean = true,
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        if (!forceStopBeforeLaunch && isTikTokForeground()) {
+        if (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()) {
             devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
             logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
             if (!skipDontAllowOcr) {
@@ -1283,7 +1294,8 @@ class RealTraceExecutor(
         }
 
         val hostWasForeground = isHostAppInForeground()
-        val tiktokAlreadyForeground = !forceStopBeforeLaunch && isTikTokForeground()
+        val tiktokAlreadyForeground =
+            allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()
         if (!hostWasForeground && !tiktokAlreadyForeground) {
             devOp(alias, "$tag：当前不在本应用界面，先切回 AutoTraces 再拉起 TikTok")
             bringHostAppToForeground(ctx)
@@ -1444,41 +1456,61 @@ class RealTraceExecutor(
         val t0 = System.currentTimeMillis()
         devOp(alias, "强关重启：正在关闭 TikTok")
 
-        suspend fun launchOnce(tag: String): Boolean =
-            launchTikTokOnceWithCheck(
-                ctx,
+        /**
+         * 强关后必须真实冷启 + 严格前台复检；禁止「已在前台跳过」与「短等后 dumpsys 残留」假成功。
+         */
+        suspend fun launchOnceStrict(tag: String): Boolean {
+            invalidateForegroundProbeCache()
+            val launched =
+                launchTikTokOnceWithCheck(
+                    ctx,
+                    alias,
+                    tag,
+                    launchWaitMs,
+                    forceStopBeforeLaunch = false,
+                    skipDontAllowOcr = skipDontAllowOcr,
+                    quietSuccessLog = true,
+                    allowSkipIfAlreadyForeground = false,
+                )
+            if (!launched) return false
+            invalidateForegroundProbeCache()
+            delay(250)
+            if (!isPackageVisible(pkg)) {
+                logForegroundProbeFailure(alias, tag, pkg)
+                devOp(alias, "$tag：拉起回报成功但严格前台复检未通过，不视为冷启成功")
+                return false
+            }
+            val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
+            logTikTokForegroundCheck(
                 alias,
                 tag,
-                launchWaitMs,
-                forceStopBeforeLaunch = false,
-                skipDontAllowOcr = skipDontAllowOcr,
-                quietSuccessLog = true,
+                passed = true,
+                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"}",
             )
+            return true
+        }
 
         runSuCommand("am force-stop $pkg")
         delay(forceStopWaitMs)
+        invalidateForegroundProbeCache()
+        if (isTikTokForeground()) {
+            delay(450)
+            invalidateForegroundProbeCache()
+            if (isTikTokForeground()) {
+                devOp(alias, "强关后 dumpsys 仍报 TikTok 前台，忽略残留并强制冷启拉起")
+            }
+        }
 
-        val firstOk = launchOnce("首次启动")
+        val firstOk = launchOnceStrict("首次启动")
         if (firstOk) {
             devOp(alias, "强关重启 TikTok 成功（首次冷启）", System.currentTimeMillis() - t0)
             return true
         }
 
-        delay(350)
-        invalidateForegroundProbeCache()
-        if (isPackageVisible(pkg)) {
-            val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
-            devOp(
-                alias,
-                "强关重启 TikTok 成功（短等后前台=${fgPkg ?: "未知"}）",
-                System.currentTimeMillis() - t0,
-            )
-            return true
-        }
-
         runSuCommand("am force-stop $pkg")
         delay(forceStopWaitMs)
-        val secondOk = launchOnce("二次启动")
+        invalidateForegroundProbeCache()
+        val secondOk = launchOnceStrict("二次启动")
         devOp(
             alias,
             "强关重启 TikTok ${if (secondOk) "成功（二次冷启）" else "失败（二次冷启）"}",
@@ -1507,7 +1539,7 @@ class RealTraceExecutor(
     /**
      * 已见底栏 Home+Profile 时：连续点 Home 若干次，确认落在干净 For You。
      * 本函数不得触发强关重启；点不到也不升格为重启。
-     * @return 是否至少成功点到一次 Home（供日志；调用方在已确认主 Feed 时仍应视为恢复成功）
+     * @return 是否至少成功点到一次 Home；点不到时调用方不得假装回首页成功。
      */
     private suspend fun confirmCleanForYouByTappingHome(
         service: Context,
@@ -1561,9 +1593,23 @@ class RealTraceExecutor(
         if (tapped > 0) {
             devOp(alias, "$reason：已连点 Home ${tapped} 次确认 For You（不强制重启）")
         } else {
-            devOp(alias, "$reason：主 Feed 已确认但未能点到 Home，仍视为已回首页（不强制重启）")
+            devOp(alias, "$reason：未能点到底栏 Home，不视为回首页成功")
         }
         return tapped > 0
+    }
+
+    /** 回首页收尾：必须点到 Home；成功则标记跳过 For You 预滑。 */
+    private suspend fun confirmRecoverHomeByTappingHomeOrFail(
+        service: Context,
+        alias: String,
+        reason: String,
+        initialVision: Text? = null,
+    ): Boolean {
+        if (!confirmCleanForYouByTappingHome(service, alias, reason, initialVision)) {
+            return false
+        }
+        markSkipForYouWarmupAfterRecoverHome(alias)
+        return true
     }
 
     /** 抢占回首页/重搜互斥；失败时已打日志。 */
@@ -1681,9 +1727,7 @@ class RealTraceExecutor(
                 devOp(alias, "$reason：TikTok 已重新打开，校验是否已在主 Feed")
                 when (evaluateRecoverHomeOcr("reopen", passLabel)) {
                     RecoverHomeOcrOutcome.OnMainFeed -> {
-                        confirmCleanForYouByTappingHome(service, alias, reason)
-                        markSkipForYouWarmupAfterRecoverHome(alias)
-                        return true
+                        return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
                     }
                     RecoverHomeOcrOutcome.HardStop -> return false
                     RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -1700,20 +1744,15 @@ class RealTraceExecutor(
                 return false
             }
             val restarted = restartTikTokForRecovery(skipDontAllowOcr)
-            if (restarted) {
-                confirmCleanForYouByTappingHome(service, alias, reason)
-                markSkipForYouWarmupAfterRecoverHome(alias)
-            }
-            return restarted
+            if (!restarted) return false
+            return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
         }
 
         when (val precheck = evaluateRecoverHomeOcr("precheck", "首次 OCR 前")) {
             RecoverHomeOcrOutcome.OnMainFeed -> {
-                // 已见底栏 = 干净 For You：只连点 Home，严禁再强关（曾误判搜索/内页导致重启完又重启）
+                // 已见底栏 = 干净 For You：只连点 Home，严禁再强关；点不到 Home 不算回首页成功
                 devOp(alias, "$reason：OCR 已见底栏 Home+Profile，连点 Home 确认 For You（不强关重启）")
-                confirmCleanForYouByTappingHome(service, alias, reason)
-                markSkipForYouWarmupAfterRecoverHome(alias)
-                return true
+                return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
             }
             RecoverHomeOcrOutcome.HardStop -> return false
             RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -1749,9 +1788,7 @@ class RealTraceExecutor(
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
                     devOp(alias, "$reason：第 $pass 次导航返回后 OCR 已见底栏 Home+Profile，连点 Home 确认（不强关）")
-                    confirmCleanForYouByTappingHome(service, alias, reason)
-                    markSkipForYouWarmupAfterRecoverHome(alias)
-                    return true
+                    return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
                 }
                 RecoverHomeOcrOutcome.HardStop -> return false
                 RecoverHomeOcrOutcome.ForegroundUnavailable -> return false
@@ -1766,12 +1803,9 @@ class RealTraceExecutor(
         )
         if (blockForceRestart) return false
         val restarted = restartTikTokForRecovery(skipDontAllowOcr)
-        if (restarted) {
-            // 冷启后若已见底栏：只连点 Home，禁止「重启成功 → 再见底栏 → 再强关」
-            confirmCleanForYouByTappingHome(service, alias, reason)
-            markSkipForYouWarmupAfterRecoverHome(alias)
-        }
-        return restarted
+        if (!restarted) return false
+        // 冷启后必须点到 Home；禁止「重启成功 → 假装回首页」在桌面空转
+        return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
     }
 
     private data class StrictLabelHit(val point: Point, val rect: Rect)
@@ -11028,7 +11062,9 @@ class RealTraceExecutor(
      * 仅该账号当日首条在确认发布成功后按序尝试 Post Now / Only this time（点后二次 OCR 再点可选）/ Don't allow / 底部 Cancel（可选，未命中不判失败）。
      * 单条是否发布成功：Done 布局点完 Next / Post 布局点完顶部 Post 后，OCR 不再命中对应控件（或出现正面信号）。
      * 图库统计为 0 时不执行发布并返回 false。
-     * 新任务（无续发断点）时：先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；**全部成功后不删图库**（素材保留至下次新任务开始前清理）。
+     * 新任务（无续发断点）时：**必须**先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；
+     * **全部成功后不删图库**（素材保留至下次新任务开始前清理）。
+     * 禁止用 `materialReady` 跳过清库：进程被杀/硬停后标记仍可能为 true，旧视频会污染下一次发作品。
      * 素材准备阶段不暂停涨粉；图库确认有可用素材后才进入发布独占阶段（暂停涨粉并执行 TikTok 发布）。
      * 进入发布独占前、以及同条重试前都会复检图库数量；不足则补拉（避免并发清库把素材删掉后仍按「已就绪」空跑）。
      * 中途失败时 [PrefsStore] 记录已成功条数，**仅在同一次云端 publish_post_start 指令内**从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
@@ -11046,40 +11082,21 @@ class RealTraceExecutor(
         val configuredFetchCount =
             (targetPublishCount ?: config.publish_post_material_fetch_count).coerceIn(0, 20)
         if (resumeStartIdx <= 0) {
+            // 新任务头：无论 materialReady 是否残留，都必须清库再拉，避免复用上轮旧视频。
             if (PrefsStore.isPublishPostMaterialReady()) {
-                val readyStats = publishPostResolveGalleryMaterialStats()
-                if (readyStats.resolvedCount > 0) {
-                    devOp(
-                        alias,
-                        "发作品：检测到素材已就绪且复检通过（图片=${readyStats.picturesRootImageCount} " +
-                            "视频=${readyStats.picturesRootVideoCount} 合计=${readyStats.resolvedCount}），跳过图库清理与素材拉取",
-                    )
-                } else {
-                    PrefsStore.setPublishPostMaterialReady(false)
-                    devOp(alias, "发作品：素材就绪标记存在但复检图库为空，重新清理并拉取")
-                    deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
-                    if (configuredFetchCount > 0) {
-                        if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
-                            lastPublishPostEntryFailureReason =
-                                lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
-                            return false
-                        }
-                    } else {
-                        devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
-                    }
+                PrefsStore.setPublishPostMaterialReady(false)
+                devOp(alias, "发作品：忽略残留素材就绪标记，强制清理图库后重新拉取")
+            }
+            devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
+            deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
+            if (configuredFetchCount > 0) {
+                if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
+                    lastPublishPostEntryFailureReason =
+                        lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
+                    return false
                 }
             } else {
-                devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
-                deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
-                if (configuredFetchCount > 0) {
-                    if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
-                        lastPublishPostEntryFailureReason =
-                            lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
-                        return false
-                    }
-                } else {
-                    devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
-                }
+                devOp(alias, "发作品：运行配置 publish_post_material_fetch_count=0，跳过本机素材拉取")
             }
         } else {
             devOp(

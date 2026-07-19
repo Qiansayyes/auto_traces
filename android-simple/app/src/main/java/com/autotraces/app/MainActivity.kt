@@ -104,7 +104,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        binding.openSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         binding.openConfigParamsButton.setOnClickListener { openConfigParamsScreen() }
         binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
         binding.showVideoDedButton.setOnClickListener {
@@ -491,6 +490,8 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
                 binding.manualTaskStatusText.text = "正在切号 → @${opt.username} …"
+                // 先同步禁用（含「手动切号完毕」），再启动切号；busy 也会在 coordinator 内同步置位
+                binding.manualConfirmSwitchDoneButton.isEnabled = false
                 setManualTaskButtonsEnabled(false)
                 AppCoordinator.manualSwitchAccountFromSpinner(opt.username)
             }
@@ -523,6 +524,25 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 备份/清理已移除：切号由账号下拉触发完整备份→清理→还原链
+
+        binding.manualConfirmSwitchDoneButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val user = selectedManualUsername()
+            if (user.isBlank()) {
+                Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            AppCoordinator.manualSelectAccount(user)
+            AppCoordinator.manualConfirmSwitchDone()
+            binding.manualTaskStatusText.text = "已确认手动切号完毕：@$user"
+            refreshManualAccountStatus()
+            refreshManualAccountSpinnerLabels()
+            Toast.makeText(this, "已标记 @$user 切号完毕", Toast.LENGTH_SHORT).show()
+        }
 
         binding.manualAutoLoginButton.setOnClickListener {
             if (AppCoordinator.isManualSwitchBusy()) {
@@ -680,9 +700,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setManualTaskButtonsEnabled(enabled: Boolean) {
-        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !AppCoordinator.isManualSwitchBusy()
-        binding.manualAccountSelect.isEnabled = !AppCoordinator.isManualSwitchBusy()
-        binding.manualRefreshAccountsButton.isEnabled = !AppCoordinator.isManualSwitchBusy()
+        val busy = AppCoordinator.isManualSwitchBusy()
+        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !busy
+        binding.manualAccountSelect.isEnabled = !busy
+        binding.manualRefreshAccountsButton.isEnabled = !busy
+        // 手动切号完毕：未在自动切号中即可点（用户已在设备上切好号后告知程序）
+        binding.manualConfirmSwitchDoneButton.isEnabled = !busy && selectedManualUsername().isNotBlank()
         binding.manualAutoGrowthAfterTasksCheck.isEnabled = aligned
         binding.manualStartGrowthButton.isEnabled = aligned
         binding.manualStopGrowthButton.isEnabled = true

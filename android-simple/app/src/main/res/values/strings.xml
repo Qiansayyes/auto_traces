@@ -17,7 +17,6 @@
     <string name="action_sync_online">上报在线</string>
     <string name="action_start_service">启动后台服务</string>
     <string name="action_stop_service">停止后台服务</string>
-    <string name="action_open_settings">打开设置</string>
     <string name="action_clear_logs">清空日志</string>
     <string name="action_request_overlay">开启悬浮日志权限</string>
     <string name="overlay_log_hint">实时日志会以透明悬浮窗显示在屏幕顶部</string>

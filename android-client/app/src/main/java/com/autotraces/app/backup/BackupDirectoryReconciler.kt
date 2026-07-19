@@ -9,9 +9,12 @@ import java.util.Locale
  * 按云端 bundle 账号档案 + 备份包命名规则整理 [UnifiedBackupPaths] 目录：
  * - 每个已分配 username 仅保留 1 个包（本机最新；包名时间戳优先）
  * - 云端 [backup_name] 仅用于缺失告警，不得覆盖保留更新的本地包
- * - 删除同 username 重复包、别名下未分配 username 的包、不符合命名规则的 .tar.gz
+ * - 删除同 username 重复包、不符合命名规则的 .tar.gz
+ * - 仅在 [deleteUnlistedUsernameArchives]=true 且花名册完整时，才删除「别名下未列入花名册」的包
  * - 云端 [backup_name] 解析出的 username 与档案 username 不一致时删除该备份包
  * - 云端有 [backup_name] 但本机不存在时记入 [ReconcileResult.missingCloud]（需重新登录备份）
+ *
+ * 铁律：切号预备份时若只传入「刚备份的那一个号」，绝不可把其它本机号的合法包当垃圾删掉。
  */
 object BackupDirectoryReconciler {
 
@@ -53,6 +56,8 @@ object BackupDirectoryReconciler {
 
     /**
      * @param extraKeepAbsolutePaths 本轮刚生成、尚未写入云端的备份路径，整理时强制保留
+     * @param deleteUnlistedUsernameArchives 是否删除「本别名下、但不在 policies 花名册里」的合法用户包。
+     *   花名册不完整（例如备份后只塞了当前 1 个号）时必须为 false，否则会误删即将还原的其它号备份。
      */
     fun reconcile(
         context: Context,
@@ -60,6 +65,7 @@ object BackupDirectoryReconciler {
         deviceId: String,
         policies: List<AccountBackupPolicy>,
         extraKeepAbsolutePaths: Set<String> = emptySet(),
+        deleteUnlistedUsernameArchives: Boolean = true,
         deleteFile: (absolutePath: String) -> Boolean,
     ): ReconcileResult {
         val root = UnifiedBackupPaths.ensureBackupsDir(context)
@@ -171,7 +177,8 @@ object BackupDirectoryReconciler {
             }
         }
 
-        // 3) 未分配 username / 非本别名 / 无法识别：删除
+        // 3) 非本别名 / 非法命名：删除。
+        // 未列入花名册的「本别名合法用户包」仅在 deleteUnlistedUsernameArchives=true 时删除。
         for (file in allArchives) {
             val path = file.canonicalOrAbsolute()
             if (path in kept || path in toDelete) continue
@@ -182,11 +189,17 @@ object BackupDirectoryReconciler {
             }
             val matchedUser = matchAssignedUsername(lowerName, aliasToken, assignedTokens, policyByUser.keys)
             if (matchedUser == null) {
-                toDelete.add(path)
+                if (deleteUnlistedUsernameArchives) {
+                    toDelete.add(path)
+                } else {
+                    // 花名册不完整：其它 username 的合法包一律保留，绝不误删
+                    kept.add(path)
+                }
                 continue
             }
             if (!matchesNamingRule(file.name, alias, matchedUser)) {
                 toDelete.add(path)
+                continue
             }
             // 已分配但不在步骤 1 出现（policy 重复/username 规范化遗漏）— 仅保留最新
             if (path !in kept) {

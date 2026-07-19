@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 import random
 import re
 import sqlite3
@@ -261,6 +262,19 @@ DEVICE_EDITOR_UNASSIGNED_ALIAS_BUCKET = "__UNASSIGNED__"
 _DEVICE_OPS_POLL_MIN_INTERVAL_SEC = 10.0
 _device_ops_poll_last_at: dict[str, float] = {}
 
+# mode_wait 长轮询并发上限：防止几十台设备同时占满连接导致管理台/health 都连不上。
+# 默认 36 ≈ 30 台设备 + 余量；可用环境变量 MODE_WAIT_MAX_INFLIGHT 调整。
+_MODE_WAIT_MAX_INFLIGHT = max(8, int(os.getenv("MODE_WAIT_MAX_INFLIGHT", "36")))
+# 全站 HTTP 软上限：超过后只拒新的 mode_wait，管理台/探活/登录仍放行。
+_HTTP_INFLIGHT_SHED_MODE_WAIT = max(
+    _MODE_WAIT_MAX_INFLIGHT + 16,
+    int(os.getenv("HTTP_INFLIGHT_SHED_MODE_WAIT", "96")),
+)
+_mode_wait_inflight = 0
+_mode_wait_inflight_lock = Lock()
+_http_inflight = 0
+_http_inflight_lock = Lock()
+
 
 def _device_ops_poll_try_acquire(device_id: str) -> bool:
     """同一 device_id 冷却期内跳过 poll，避免设备密集轮询拖垮管理台接口。"""
@@ -273,6 +287,37 @@ def _device_ops_poll_try_acquire(device_id: str) -> bool:
         return False
     _device_ops_poll_last_at[did] = now
     return True
+
+
+def _mode_wait_busy_response() -> dict:
+    """HTTP 200 + code=0：旧客户端不会当鉴权失败；msg=busy 供新客户端短退避。"""
+    with _mode_wait_inflight_lock:
+        inflight = _mode_wait_inflight
+    return {
+        "code": 0,
+        "event": None,
+        "msg": "busy",
+        "retry_after_sec": 5,
+        "auto_switch_enabled": None,
+        "inflight": inflight,
+        "max_inflight": _MODE_WAIT_MAX_INFLIGHT,
+    }
+
+
+def _try_acquire_mode_wait_slot() -> bool:
+    """同步计数器抢名额，避免 asyncio.Semaphore 懒创建竞态与 wait_for 误判。"""
+    global _mode_wait_inflight
+    with _mode_wait_inflight_lock:
+        if _mode_wait_inflight >= _MODE_WAIT_MAX_INFLIGHT:
+            return False
+        _mode_wait_inflight += 1
+        return True
+
+
+def _release_mode_wait_slot() -> None:
+    global _mode_wait_inflight
+    with _mode_wait_inflight_lock:
+        _mode_wait_inflight = max(0, _mode_wait_inflight - 1)
 
 
 def _is_db_lock_error(exc: BaseException) -> bool:
@@ -3460,11 +3505,31 @@ if __name__ == "__main__":
 
 @app.middleware("http")
 async def log_request_timing(request: Request, call_next):
+    global _http_inflight
     if _app_shutting_down:
         return JSONResponse(status_code=503, content={"code": 1, "msg": "服务正在关闭"})
     started = time.perf_counter()
     path = request.url.path
     quiet_poll = path in ("/api/device/mode_wait", "/api/device/mode_ack", "/api/check_start", "/api/device_ops/poll")
+    is_mode_wait = path == "/api/device/mode_wait"
+    # 管理台优先：mode_wait 名额已满，或全站连接过高时，快速拒绝新长轮询（探活/管理台仍放行）。
+    if is_mode_wait:
+        with _mode_wait_inflight_lock:
+            current_mw = _mode_wait_inflight
+        with _http_inflight_lock:
+            current_http = _http_inflight
+        if current_mw >= _MODE_WAIT_MAX_INFLIGHT or current_http >= _HTTP_INFLIGHT_SHED_MODE_WAIT:
+            print(
+                f"[{now_text()}] HTTP GET /api/device/mode_wait | shed_busy | "
+                f"mode_wait={current_mw}/{_MODE_WAIT_MAX_INFLIGHT} "
+                f"http_inflight={current_http} shed>={_HTTP_INFLIGHT_SHED_MODE_WAIT}"
+            )
+            return JSONResponse(content=_mode_wait_busy_response())
+    counted = False
+    with _http_inflight_lock:
+        _http_inflight += 1
+        counted = True
+    response: Response | None = None
     if not quiet_poll:
         print(f"[{now_text()}] HTTP {request.method} {path} | enter")
     try:
@@ -3482,7 +3547,7 @@ async def log_request_timing(request: Request, call_next):
     except asyncio.TimeoutError:
         elapsed_ms = (time.perf_counter() - started) * 1000
         print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 504 | {elapsed_ms:.1f}ms | TIMEOUT")
-        return JSONResponse(
+        response = JSONResponse(
             status_code=504,
             content={"code": 1, "msg": "服务繁忙：请求超时，请稍后重试"},
         )
@@ -3490,26 +3555,34 @@ async def log_request_timing(request: Request, call_next):
         elapsed_ms = (time.perf_counter() - started) * 1000
         if _is_db_lock_error(exc):
             print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 503 | {elapsed_ms:.1f}ms | DB_BUSY")
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=503,
                 content={"code": 1, "msg": "数据库繁忙，请稍后重试"},
             )
-        print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
-        raise
+        else:
+            print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
+            raise
     except RuntimeError as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         if str(exc).startswith("DB_BUSY:"):
             print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 503 | {elapsed_ms:.1f}ms | DB_BUSY")
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=503,
                 content={"code": 1, "msg": "数据库繁忙，请稍后重试"},
             )
-        print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
-        raise
+        else:
+            print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
+            raise
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         print(f"[{now_text()}] HTTP {request.method} {request.url.path} | 500 | {elapsed_ms:.1f}ms | EXC={exc}")
         raise
+    finally:
+        if counted:
+            with _http_inflight_lock:
+                _http_inflight = max(0, _http_inflight - 1)
+    if response is None:
+        return JSONResponse(status_code=500, content={"code": 1, "msg": "服务异常"})
     elapsed_ms = (time.perf_counter() - started) * 1000
     if elapsed_ms >= 800 or response.status_code >= 500:
         print(f"[{now_text()}] HTTP {request.method} {request.url.path} | {response.status_code} | {elapsed_ms:.1f}ms")
@@ -10035,46 +10108,57 @@ async def device_mode_wait(
     timeout_sec: int = 45,
 ):
     """长轮询：等待自动切号 ENTER/EXIT 等模式事件（自治 P0 控制面）。"""
-    error, _device = auth_or_error(device_id, alias)
-    if error:
-        return error
-    safe_timeout = max(5, min(int(timeout_sec or 45), _MODE_WAIT_SERVER_MAX_SEC))
-    deadline = time.monotonic() + float(safe_timeout)
-    while time.monotonic() < deadline:
-        pull_req = await asyncio.to_thread(_peek_device_log_pull_request, device_id)
-        if pull_req:
-            enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
-            return {
-                "code": 0,
-                "event": None,
-                "msg": "log_pull",
-                "log_pull_requested": True,
-                "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
-                # 返回时现读开关，避免长轮询期间管理台已开启但携带轮询开始时的陈旧 false。
-                "auto_switch_enabled": enabled,
-            }
-        event = await asyncio.to_thread(_fetch_pending_device_mode_event, device_id, since_event_id)
-        if event:
-            print(
-                f"[{now_text()}] device_mode.wait | hit | device_id={device_id} "
-                f"event_id={event.get('event_id')} type={event.get('type')}"
-            )
-            enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
-            return {
-                "code": 0,
-                "event": event,
-                "auto_switch_enabled": enabled,
-            }
-        if _APP_SHUTDOWN_EVENT.is_set():
-            break
-        await asyncio.sleep(1.0)
-    enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
-    return {
-        "code": 0,
-        "event": None,
-        "msg": "none",
-        "auto_switch_enabled": enabled,
-    }
+    if not _try_acquire_mode_wait_slot():
+        with _mode_wait_inflight_lock:
+            inflight = _mode_wait_inflight
+        print(
+            f"[{now_text()}] device_mode.wait | deferred_busy | device_id={device_id} "
+            f"inflight={inflight} max={_MODE_WAIT_MAX_INFLIGHT}"
+        )
+        return _mode_wait_busy_response()
+    try:
+        error, _device = auth_or_error(device_id, alias)
+        if error:
+            return error
+        safe_timeout = max(5, min(int(timeout_sec or 45), _MODE_WAIT_SERVER_MAX_SEC))
+        deadline = time.monotonic() + float(safe_timeout)
+        while time.monotonic() < deadline:
+            pull_req = await asyncio.to_thread(_peek_device_log_pull_request, device_id)
+            if pull_req:
+                enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
+                return {
+                    "code": 0,
+                    "event": None,
+                    "msg": "log_pull",
+                    "log_pull_requested": True,
+                    "log_pull_max_lines": int(pull_req.get("max_lines") or 400),
+                    # 返回时现读开关，避免长轮询期间管理台已开启但携带轮询开始时的陈旧 false。
+                    "auto_switch_enabled": enabled,
+                }
+            event = await asyncio.to_thread(_fetch_pending_device_mode_event, device_id, since_event_id)
+            if event:
+                print(
+                    f"[{now_text()}] device_mode.wait | hit | device_id={device_id} "
+                    f"event_id={event.get('event_id')} type={event.get('type')}"
+                )
+                enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
+                return {
+                    "code": 0,
+                    "event": event,
+                    "auto_switch_enabled": enabled,
+                }
+            if _APP_SHUTDOWN_EVENT.is_set():
+                break
+            await asyncio.sleep(1.0)
+        enabled = await asyncio.to_thread(_device_auto_switch_enabled_resolved, device_id)
+        return {
+            "code": 0,
+            "event": None,
+            "msg": "none",
+            "auto_switch_enabled": enabled,
+        }
+    finally:
+        _release_mode_wait_slot()
 
 
 @app.post("/api/device/mode_ack")

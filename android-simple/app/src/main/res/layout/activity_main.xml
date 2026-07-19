@@ -198,14 +198,6 @@
                 android:layout_marginTop="8dp"
                 android:text="@string/action_open_config_params" />
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/openSettingsButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="打开设置" />
-
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -217,68 +209,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="选择账号后操作；云端任务指令会被忽略"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:text="自动切号自治（本机）"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="按下方账号列表轮转生成计划；不依赖管理台开关。硬停会同时关闭自治。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
-
-            <com.google.android.material.checkbox.MaterialCheckBox
-                android:id="@+id/manualAutoSwitchEnableCheck"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="开启自动切号自治" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="每号时段(分钟)">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualAutoSwitchSlotMinutesInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualAutoSwitchRebuildButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="重建计划" />
-            </LinearLayout>
-
-            <TextView
-                android:id="@+id/manualAutoSwitchStatusText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="自治状态：关"
+                android:text="选择账号后操作；若已在设备上手动切好号，点「手动切号完毕」即可。云端任务指令会被忽略"
                 android:textColor="@android:color/darker_gray"
                 android:textSize="12sp" />
 
@@ -304,6 +235,14 @@
                 android:text="账号状态：—"
                 android:textColor="@android:color/darker_gray"
                 android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualConfirmSwitchDoneButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="手动切号完毕" />
 
             <com.google.android.material.checkbox.MaterialCheckBox
                 android:id="@+id/manualAutoGrowthAfterTasksCheck"
@@ -651,6 +590,67 @@
                     android:layout_marginTop="6dp"
                     android:textColor="@android:color/darker_gray" />
             </LinearLayout>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="自动切号自治（本机）"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="按上方账号列表轮转生成计划；不依赖管理台开关。硬停会同时关闭自治。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="12sp" />
+
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/manualAutoSwitchEnableCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="开启自动切号自治" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="每号时段(分钟)">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/manualAutoSwitchSlotMinutesInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:maxLines="1" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualAutoSwitchRebuildButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="重建计划" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/manualAutoSwitchStatusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="自治状态：关"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="12sp" />
         </LinearLayout>
     </ScrollView>
 

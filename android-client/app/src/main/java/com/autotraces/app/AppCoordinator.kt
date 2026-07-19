@@ -957,11 +957,68 @@ object AppCoordinator {
         accounts: List<AutoSwitchAccount>,
         extraKeepAbsolutePath: String? = null,
         logPrefix: String = "【备份目录整理】",
+        deleteUnlistedUsernameArchives: Boolean = true,
     ) {
         if (alias.isBlank() || deviceId.isBlank()) return
         scope.launch {
-            runBackupDirectoryReconcile(alias, deviceId, accounts, extraKeepAbsolutePath, logPrefix)
+            runBackupDirectoryReconcile(
+                alias = alias,
+                deviceId = deviceId,
+                accounts = accounts,
+                extraKeepAbsolutePath = extraKeepAbsolutePath,
+                logPrefix = logPrefix,
+                deleteUnlistedUsernameArchives = deleteUnlistedUsernameArchives,
+            )
         }
+    }
+
+    /**
+     * 备份目录整理花名册：必须覆盖本机「还可能还原」的所有号。
+     * 绝不能只塞刚备份的那一个号——否则其它号合法包会被当成无关备份删掉。
+     */
+    private fun buildAccountsForBackupDirectoryReconcile(
+        reportUsername: String,
+        backupName: String,
+        backupPath: String,
+    ): List<AutoSwitchAccount> {
+        val byUser = linkedMapOf<String, AutoSwitchAccount>()
+        fun put(acc: AutoSwitchAccount) {
+            val u = acc.username?.trim()?.removePrefix("@").orEmpty()
+            if (u.isBlank()) return
+            val key = u.lowercase(java.util.Locale.US)
+            val existing = byUser[key]
+            if (existing == null) {
+                byUser[key] = acc.copy(username = u)
+                return
+            }
+            byUser[key] = existing.copy(
+                backup_name = acc.backup_name?.trim()?.takeIf { it.isNotEmpty() && it != "-" }
+                    ?: existing.backup_name,
+                backup_path = acc.backup_path?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: existing.backup_path,
+                row_index = acc.row_index ?: existing.row_index,
+                account_row_index = acc.account_row_index ?: existing.account_row_index,
+            )
+        }
+
+        AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty().forEach(::put)
+        listOf(
+            PrefsStore.getLogContextUsername().orEmpty().trim().removePrefix("@"),
+        ).forEach { u ->
+            if (u.isNotBlank()) put(AutoSwitchAccount(username = u))
+        }
+
+        val report = reportUsername.trim().removePrefix("@")
+        if (report.isNotBlank()) {
+            put(
+                AutoSwitchAccount(
+                    username = report,
+                    backup_name = backupName.trim().takeIf { it.isNotEmpty() },
+                    backup_path = backupPath.trim().takeIf { it.isNotEmpty() },
+                ),
+            )
+        }
+        return byUser.values.toList()
     }
 
     private suspend fun runBackupDirectoryReconcile(
@@ -970,9 +1027,17 @@ object AppCoordinator {
         accounts: List<AutoSwitchAccount>,
         extraKeepAbsolutePath: String? = null,
         logPrefix: String = "【备份目录整理】",
+        deleteUnlistedUsernameArchives: Boolean = true,
     ) {
         val policies = BackupDirectoryReconciler.policiesFromAccounts(accounts)
         if (policies.isEmpty()) return
+        val safeDeleteUnlisted = deleteUnlistedUsernameArchives && policies.size >= 2
+        if (deleteUnlistedUsernameArchives && !safeDeleteUnlisted) {
+            LogCenter.op(
+                alias,
+                "$logPrefix 花名册仅 ${policies.size} 个账号，跳过删除未列入花名册的备份包（防误删）",
+            )
+        }
         val extraKeep = extraKeepAbsolutePath?.trim()?.takeIf { it.isNotEmpty() }?.let { setOf(it) } ?: emptySet()
         val result = BackupDirectoryReconciler.reconcile(
             context = appContext,
@@ -980,6 +1045,7 @@ object AppCoordinator {
             deviceId = deviceId,
             policies = policies,
             extraKeepAbsolutePaths = extraKeep,
+            deleteUnlistedUsernameArchives = safeDeleteUnlisted,
             deleteFile = { path ->
                 val q = DeviceBackupShell.shellQuote(path)
                 runExecutorSu("rm -f $q")
@@ -2601,6 +2667,11 @@ object AppCoordinator {
                     }
                     authErrorRounds = 0
                     val event = resp.event
+                    // 服务端 mode_wait 并发自保：立刻返回 msg=busy，短退避后重试，避免 30s 空窗。
+                    if (event == null && resp.msg?.equals("busy", ignoreCase = true) == true) {
+                        delay(5_000L)
+                        continue
+                    }
                     noteCloudAutoSwitchEnabled(
                         resolveCloudAutoSwitchEnabledFromModeWait(event, resp.auto_switch_enabled),
                     )
@@ -5881,9 +5952,10 @@ object AppCoordinator {
                 PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
             if (!prevTaskOpId.isNullOrBlank() && prevTaskOpId != opId && payload?.source != "auto_switch") {
                 PrefsStore.clearPublishPostResumeProgress(publishAccountKey)
+                PrefsStore.setPublishPostMaterialReady(false)
                 LogCenter.op(
                     alias,
-                    "[OP][$opId] 新发作品指令，已清除上一指令（$prevTaskOpId）的断点续发",
+                    "[OP][$opId] 新发作品指令，已清除上一指令（$prevTaskOpId）的断点续发与素材就绪标记",
                 )
             }
             if (payload?.source == "auto_switch") {
@@ -5899,6 +5971,8 @@ object AppCoordinator {
                 PrefsStore.setPublishPostTaskOpId(opId)
                 PrefsStore.setPublishPostPackageName(pubPkg)
                 PrefsStore.setPublishPostTargetCount(payload?.publish_count)
+                // 新手动发作品任务必须清库重拉；禁止沿用上轮 materialReady 残留。
+                PrefsStore.setPublishPostMaterialReady(false)
                 PrefsStore.setPublishPostRequested(true)
                 PrefsStore.setPublishPostPending(true)
             }
@@ -6944,31 +7018,19 @@ object AppCoordinator {
                         val qPrev = DeviceBackupShell.shellQuote(prevRaw)
                         runSu("rm -f $qPrev")
                     }
-                    val bundleAccounts = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
-                    val reconcileAccounts = if (bundleAccounts.isNotEmpty()) {
-                        bundleAccounts.map { acc ->
-                            val u = acc.username?.trim()?.removePrefix("@").orEmpty()
-                            if (u.equals(reportUsername, ignoreCase = true)) {
-                                acc.copy(backup_name = backupName, backup_path = backupPath)
-                            } else {
-                                acc
-                            }
-                        }
-                    } else {
-                        listOf(
-                            AutoSwitchAccount(
-                                username = reportUsername,
-                                backup_name = backupName,
-                                backup_path = backupPath,
-                            ),
-                        )
-                    }
+                    val reconcileAccounts = buildAccountsForBackupDirectoryReconcile(
+                        reportUsername = reportUsername,
+                        backupName = backupName,
+                        backupPath = backupPath,
+                    )
+                    val isManualSwitchPreBackup = payload?.source == "manual_switch_pre_backup"
                     runBackupDirectoryReconcile(
                         alias = alias,
                         deviceId = deviceId,
                         accounts = reconcileAccounts,
                         extraKeepAbsolutePath = backupPath,
                         logPrefix = if (suppressLocalAutoSwitchUiLog) "【切号·备份整理】" else "【备份目录整理】",
+                        deleteUnlistedUsernameArchives = !isManualSwitchPreBackup,
                     )
                 }
                 opDone(
