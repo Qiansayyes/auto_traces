@@ -4774,13 +4774,30 @@ object AppCoordinator {
         strict: Boolean = true,
     ): Boolean {
         lastEnsureLoginPerformedFreshAutoLogin = false
-        val launched = executor.launchTikTokWithForegroundVerification(
-            ctx = appContext,
-            alias = alias,
-            tag = tag,
-            forceStopBeforeLaunch = forceStopBeforeLaunch,
-            timingConfig = _config.value,
-        )
+        val launched = try {
+            executor.launchTikTokWithForegroundVerification(
+                ctx = appContext,
+                alias = alias,
+                tag = tag,
+                forceStopBeforeLaunch = forceStopBeforeLaunch,
+                timingConfig = _config.value,
+            )
+        } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            // 拉起后 Don't allow OCR 若仍误触 Welcome back 上的 Add another，直接从当前登录入口续接。
+            LogCenter.op(
+                alias,
+                "登录状态保障：拉起阶段见登录入口（$safeguardSource），从当前页续接自动登录",
+            )
+            return ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = "safeguard_launch_${System.currentTimeMillis()}",
+                reason = "登录状态保障($safeguardSource)-拉起见登录入口",
+                strict = strict,
+                forceRelogin = true,
+                resumeFromLoginEntryScreen = true,
+            )
+        }
         if (!launched) {
             LogCenter.op(alias, "登录状态保障：TikTok 拉起失败（$safeguardSource）")
             return false
@@ -4827,7 +4844,7 @@ object AppCoordinator {
                     if (!delayUnlessHardStop(delayBetweenMs)) return@withExclusive false
                 }
                 val forceStopThisAttempt = forceStopBeforeLaunch || attempt > 1
-                if (
+                val ok = try {
                     launchTikTokWithLoginSafeguard(
                         alias = alias,
                         deviceId = deviceId,
@@ -4836,7 +4853,23 @@ object AppCoordinator {
                         safeguardSource = safeguardSource,
                         strict = strict,
                     )
-                ) {
+                } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+                    // 兜底：拉起层若仍上抛 Welcome back/Add another，从入口续接，禁止冒成进程崩溃。
+                    LogCenter.op(
+                        alias,
+                        "登录状态保障：重试层捕获登录入口信号（$safeguardSource），从当前页续接自动登录",
+                    )
+                    ensureAccountLoggedIn(
+                        alias = alias,
+                        deviceId = deviceId,
+                        opId = "safeguard_retry_entry_${System.currentTimeMillis()}",
+                        reason = "登录状态保障($safeguardSource)-重试层见登录入口",
+                        strict = strict,
+                        forceRelogin = true,
+                        resumeFromLoginEntryScreen = true,
+                    )
+                }
+                if (ok) {
                     return@withExclusive true
                 }
             }
@@ -4976,6 +5009,43 @@ object AppCoordinator {
                 resumeFromLoginEntryScreen = resumeFromLoginEntryScreen,
                 flowKind = flowKind,
             )
+        }.recoverCatching { err ->
+            // 自动登录链内 OCR 误把 Welcome back/Add another 当掉登录上抛时：从当前登录入口续接，勿直接判失败。
+            if (err is LoginSafeguardRequiresAutoLoginException) {
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] 自动登录($reason)：链内见登录入口信号，从当前页续接（resumeFromLoginEntryScreen）",
+                )
+                var resumed = false
+                repeat(2) { attempt ->
+                    if (resumed) return@repeat
+                    resumed = runCatching {
+                        executor.runAutoLoginAfterCutSwitch(
+                            appContext,
+                            TikTokAutoLoginCredentials(
+                                username = username,
+                                email = email,
+                                password = password,
+                                apiUrl = api,
+                            ),
+                            resumeFromLoginEntryScreen = true,
+                            flowKind = flowKind,
+                        )
+                    }.getOrElse { resumeErr ->
+                        if (resumeErr is LoginSafeguardRequiresAutoLoginException) {
+                            LogCenter.op(
+                                alias,
+                                "[OP][$opId] 自动登录($reason)：入口续接第 ${attempt + 1} 次仍见登录入口信号",
+                            )
+                            false
+                        } else {
+                            throw resumeErr
+                        }
+                    }
+                }
+                return@recoverCatching resumed
+            }
+            throw err
         }.getOrElse { err ->
             LogCenter.op(alias, "[OP][$opId] 自动登录($reason)异常：${err.message}")
             false

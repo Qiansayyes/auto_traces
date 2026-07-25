@@ -5711,6 +5711,9 @@ object AppCoordinator {
         forceRelogin: Boolean = false,
         resumeFromLoginEntryScreen: Boolean = false,
     ): AccountLoginRetryOutcome {
+        if (reason.contains("掉登录")) {
+            clearMutualClickStateForInterrupt("掉登录($reason)")
+        }
         if (PublishPostGrowthGate.shouldBlockExternalAutoLogin(reason)) {
             LogCenter.op(alias, "自动登录暂缓：发作品独占发布中（$reason）")
             return AccountLoginRetryOutcome.Aborted
@@ -5768,16 +5771,21 @@ object AppCoordinator {
                     "尝试自动登录（$reason）"
             }
             LogCenter.op(alias, retryLog)
-            val loginOk = ensureAccountLoggedIn(
-                alias = alias,
-                deviceId = deviceId,
-                opId = "login_retry_${System.currentTimeMillis()}",
-                reason = reason,
-                strict = true,
-                forceRelogin = nextForceRelogin,
-                resumeFromLoginEntryScreen = nextResumeFromEntry,
-                preferredUsername = expected,
-            )
+            val loginOk = try {
+                ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = "login_retry_${System.currentTimeMillis()}",
+                    reason = reason,
+                    strict = true,
+                    forceRelogin = nextForceRelogin,
+                    resumeFromLoginEntryScreen = nextResumeFromEntry,
+                    preferredUsername = expected,
+                )
+            } catch (banned: AccountBannedException) {
+                handleAccountBanned(alias, deviceId, banned.username.ifBlank { expected.orEmpty() }, reason)
+                return AccountLoginRetryOutcome.Aborted
+            }
             if (loginOk) {
                 autoLoginUnrecoverableCodeFetchAttempts = 0
                 if (resumeRunningOnSuccess) {
@@ -6195,40 +6203,53 @@ object AppCoordinator {
             }
         } catch (logout: LoginSafeguardRequiresAutoLoginException) {
             LogCenter.op(alias, "登录状态保障($source)：OCR 见 Add another account，从登录入口续接自动登录")
-            val ok = ensureAccountLoggedIn(
-                alias = alias,
-                deviceId = deviceId,
-                opId = "safeguard_add_account_${System.currentTimeMillis()}",
-                reason = "登录状态保障($source)-Add another account",
-                strict = strict,
-                forceRelogin = true,
-                resumeFromLoginEntryScreen = true,
-                deferBasicProfileEdit = deferBasicProfileEdit,
-            )
-            if (ok && ManualDeviceControl.ENABLED) {
-                val u = ManualDeviceControl.activeManualUsername()
-                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+            return try {
+                val ok = ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = "safeguard_add_account_${System.currentTimeMillis()}",
+                    reason = "登录状态保障($source)-Add another account",
+                    strict = strict,
+                    forceRelogin = true,
+                    resumeFromLoginEntryScreen = true,
+                    deferBasicProfileEdit = deferBasicProfileEdit,
+                )
+                if (ok && ManualDeviceControl.ENABLED) {
+                    val u = ManualDeviceControl.activeManualUsername()
+                        .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                    if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+                }
+                ok
+            } catch (banned: AccountBannedException) {
+                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+                false
             }
-            ok
+        } catch (banned: AccountBannedException) {
+            handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+            false
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
             executor.setAccountStatusReloginInProgress(true)
-            val ok = ensureAccountLoggedIn(
-                alias = alias,
-                deviceId = deviceId,
-                opId = "safeguard_acct_status_${System.currentTimeMillis()}",
-                reason = "登录状态保障($source)-Account status",
-                strict = strict,
-                forceRelogin = true,
-                deferBasicProfileEdit = deferBasicProfileEdit,
-            )
-            if (ok && ManualDeviceControl.ENABLED) {
-                val u = ManualDeviceControl.activeManualUsername()
-                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+            return try {
+                val ok = ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = "safeguard_acct_status_${System.currentTimeMillis()}",
+                    reason = "登录状态保障($source)-Account status",
+                    strict = strict,
+                    forceRelogin = true,
+                    deferBasicProfileEdit = deferBasicProfileEdit,
+                )
+                if (ok && ManualDeviceControl.ENABLED) {
+                    val u = ManualDeviceControl.activeManualUsername()
+                        .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                    if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
+                }
+                ok
+            } catch (banned: AccountBannedException) {
+                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+                false
             }
-            ok
         }
     }
 
@@ -6241,13 +6262,35 @@ object AppCoordinator {
         strict: Boolean = true,
     ): Boolean {
         lastEnsureLoginPerformedFreshAutoLogin = false
-        val launched = executor.launchTikTokWithForegroundVerification(
-            ctx = appContext,
-            alias = alias,
-            tag = tag,
-            forceStopBeforeLaunch = forceStopBeforeLaunch,
-            timingConfig = _config.value,
-        )
+        val launched = try {
+            executor.launchTikTokWithForegroundVerification(
+                ctx = appContext,
+                alias = alias,
+                tag = tag,
+                forceStopBeforeLaunch = forceStopBeforeLaunch,
+                timingConfig = _config.value,
+            )
+        } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            // 拉起后 Don't allow OCR 若仍误触 Welcome back 上的 Add another，直接从当前登录入口续接。
+            LogCenter.op(
+                alias,
+                "登录状态保障：拉起阶段见登录入口（$safeguardSource），从当前页续接自动登录",
+            )
+            return try {
+                ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = "safeguard_launch_${System.currentTimeMillis()}",
+                    reason = "登录状态保障($safeguardSource)-拉起见登录入口",
+                    strict = strict,
+                    forceRelogin = true,
+                    resumeFromLoginEntryScreen = true,
+                )
+            } catch (banned: AccountBannedException) {
+                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($safeguardSource)")
+                false
+            }
+        }
         if (!launched) {
             LogCenter.op(alias, "登录状态保障：TikTok 拉起失败（$safeguardSource）")
             return false
@@ -6294,7 +6337,7 @@ object AppCoordinator {
                     if (!delayUnlessHardStop(delayBetweenMs)) return@withExclusive false
                 }
                 val forceStopThisAttempt = forceStopBeforeLaunch || attempt > 1
-                if (
+                val ok = try {
                     launchTikTokWithLoginSafeguard(
                         alias = alias,
                         deviceId = deviceId,
@@ -6303,7 +6346,28 @@ object AppCoordinator {
                         safeguardSource = safeguardSource,
                         strict = strict,
                     )
-                ) {
+                } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+                    // 兜底：拉起层若仍上抛 Welcome back/Add another，从入口续接，禁止冒成进程崩溃。
+                    LogCenter.op(
+                        alias,
+                        "登录状态保障：重试层捕获登录入口信号（$safeguardSource），从当前页续接自动登录",
+                    )
+                    try {
+                        ensureAccountLoggedIn(
+                            alias = alias,
+                            deviceId = deviceId,
+                            opId = "safeguard_retry_entry_${System.currentTimeMillis()}",
+                            reason = "登录状态保障($safeguardSource)-重试层见登录入口",
+                            strict = strict,
+                            forceRelogin = true,
+                            resumeFromLoginEntryScreen = true,
+                        )
+                    } catch (banned: AccountBannedException) {
+                        handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($safeguardSource)")
+                        false
+                    }
+                }
+                if (ok) {
                     return@withExclusive true
                 }
             }
@@ -6313,16 +6377,120 @@ object AppCoordinator {
     }
 
     private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
+        clearMutualClickStateForInterrupt("掉登录($source)")
         LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录（来源=$source）")
         executor.setAccountStatusReloginInProgress(true)
         val opId = "acct_status_${System.currentTimeMillis()}"
-        return ensureAccountLoggedIn(
-            alias = alias,
+        return try {
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                reason = "掉登录恢复($source)",
+                strict = true,
+                forceRelogin = true,
+            )
+        } catch (banned: AccountBannedException) {
+            handleAccountBanned(alias, deviceId, banned.username, "掉登录恢复($source)")
+            false
+        }
+    }
+
+    /**
+     * OCR 见「Your account has been banned」：
+     * 上报云端（email/email_password=banned + 移出自动切号计划），本机缓存剔除并重建计划，不重登。
+     */
+    private suspend fun handleAccountBanned(
+        alias: String,
+        deviceId: String,
+        bannedUsername: String,
+        source: String,
+    ) {
+        val username = bannedUsername.trim().removePrefix("@").ifBlank {
+            ManualDeviceControl.activeManualUsername()
+                .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
+        }
+        LogCenter.op(
+            alias,
+            "封禁处理：OCR 见账号封禁（来源=$source username=${username.ifBlank { "-" }}），" +
+                "移出计划并将邮箱标 banned，上报云端",
+        )
+        updateRuntime(lastMessage = "账号封禁：@$username 移出计划")
+        executor.clearAccountStatusReloginState()
+
+        var cloudOk = false
+        var cloudMsg = ""
+        if (deviceId.isNotBlank() && username.isNotBlank()) {
+            val resp = runCatching {
+                ApiService.markDeviceAssignedAccountBanned(deviceId, alias, username)
+            }.onFailure { err ->
+                cloudMsg = err.message ?: "unknown"
+                LogCenter.op(alias, "封禁处理：云端 mark_banned 异常：${err.message}")
+            }.getOrNull()
+            if (resp != null) {
+                cloudOk = resp.code == 0
+                cloudMsg = resp.msg.orEmpty().ifBlank { if (cloudOk) "ok" else "failed" }
+                LogCenter.op(
+                    alias,
+                    "封禁处理：云端 mark_banned code=${resp.code} msg=${resp.msg} " +
+                        "excluded=${resp.device_excluded_rows} notified=${resp.devices_notified}",
+                )
+            }
+        } else {
+            cloudMsg = "缺少 deviceId/username"
+            LogCenter.op(alias, "封禁处理：缺少 deviceId 或 username，跳过云端上报")
+        }
+
+        if (username.isNotBlank()) {
+            ManualDeviceControl.removeCachedAccount(username)
+            val selected = ManualDeviceControl.selectedManualUsername()
+            val active = ManualDeviceControl.activeManualUsername()
+            if (selected.equals(username, ignoreCase = true) || active.equals(username, ignoreCase = true)) {
+                val next = ManualDeviceControl.getCachedAccounts().firstOrNull()?.username.orEmpty()
+                if (next.isNotBlank()) {
+                    PrefsStore.setManualSelectedUsername(next)
+                    PrefsStore.setLogContextUsername(next)
+                } else {
+                    PrefsStore.setManualSelectedUsername("")
+                    PrefsStore.setLogContextUsername("")
+                }
+            }
+        }
+
+        if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled() && deviceId.isNotBlank()) {
+            val ok = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
+                reason = "账号封禁移出计划",
+            )
+            if (ok) {
+                autoSwitchLocalScheduler.requestImmediateTick()
+            }
+        }
+
+        val opId = "account_banned_${System.currentTimeMillis()}"
+        reportDeviceOpToCloud(
             deviceId = deviceId,
+            alias = alias,
             opId = opId,
-            reason = "掉登录恢复($source)",
-            strict = true,
-            forceRelogin = true,
+            status = if (cloudOk) "success" else "failed",
+            message = "账号封禁 @$username：移出计划，邮箱标 banned（$cloudMsg）",
+            data = mapOf(
+                "op_type" to "account_banned",
+                "username" to username,
+                "email" to "banned",
+                "email_password" to "banned",
+                "source" to source,
+                "cloud_synced" to cloudOk,
+                "cloud_msg" to cloudMsg,
+            ),
+        )
+        pauseGrowthAfterLoginFailure(
+            alias,
+            deviceId,
+            "账号 @$username 已封禁并移出计划，请切到其他账号",
         )
     }
 
@@ -6335,15 +6503,20 @@ object AppCoordinator {
             "掉登录恢复（登录状态保障路径）：终止当前步骤，从登录入口续接自动登录（来源=$source）",
         )
         val opId = "safeguard_logout_${System.currentTimeMillis()}"
-        return ensureAccountLoggedIn(
-            alias = alias,
-            deviceId = deviceId,
-            opId = opId,
-            reason = "掉登录恢复($source)",
-            strict = true,
-            forceRelogin = true,
-            resumeFromLoginEntryScreen = true,
-        )
+        return try {
+            ensureAccountLoggedIn(
+                alias = alias,
+                deviceId = deviceId,
+                opId = opId,
+                reason = "掉登录恢复($source)",
+                strict = true,
+                forceRelogin = true,
+                resumeFromLoginEntryScreen = true,
+            )
+        } catch (banned: AccountBannedException) {
+            handleAccountBanned(alias, deviceId, banned.username, "掉登录恢复($source)")
+            false
+        }
     }
 
     private suspend fun ensureAccountLoggedIn(
@@ -6443,7 +6616,47 @@ object AppCoordinator {
                 resumeFromLoginEntryScreen = resumeFromLoginEntryScreen,
                 flowKind = flowKind,
             )
+        }.recoverCatching { err ->
+            if (err is AccountBannedException) throw err
+            // 自动登录链内 OCR 误把 Welcome back/Add another 当掉登录上抛时：从当前登录入口续接，勿直接判失败。
+            if (err is LoginSafeguardRequiresAutoLoginException) {
+                LogCenter.op(
+                    alias,
+                    "[OP][$opId] 自动登录($reason)：链内见登录入口信号，从当前页续接（resumeFromLoginEntryScreen）",
+                )
+                var resumed = false
+                repeat(2) { attempt ->
+                    if (resumed) return@repeat
+                    resumed = runCatching {
+                        executor.runAutoLoginAfterCutSwitch(
+                            appContext,
+                            TikTokAutoLoginCredentials(
+                                username = username,
+                                email = email,
+                                password = password,
+                                apiUrl = api,
+                            ),
+                            resumeFromLoginEntryScreen = true,
+                            flowKind = flowKind,
+                        )
+                    }.getOrElse { resumeErr ->
+                        if (resumeErr is AccountBannedException) throw resumeErr
+                        if (resumeErr is LoginSafeguardRequiresAutoLoginException) {
+                            LogCenter.op(
+                                alias,
+                                "[OP][$opId] 自动登录($reason)：入口续接第 ${attempt + 1} 次仍见登录入口信号",
+                            )
+                            false
+                        } else {
+                            throw resumeErr
+                        }
+                    }
+                }
+                return@recoverCatching resumed
+            }
+            throw err
         }.getOrElse { err ->
+            if (err is AccountBannedException) throw err
             LogCenter.op(alias, "[OP][$opId] 自动登录($reason)异常：${err.message}")
             false
         }
@@ -7363,6 +7576,7 @@ object AppCoordinator {
             return
         }
         if (op.op_type == "publish_post_start") {
+            clearMutualClickStateForInterrupt("发作品开始")
             val pubPkg = payload?.package_name?.trim().orEmpty()
             val slotKey = payload?.auto_switch_slot_key?.trim().orEmpty()
             val isAutoSwitchPublish = payload?.source == "auto_switch"
@@ -7489,26 +7703,8 @@ object AppCoordinator {
                 if (publishCount != null && publishCount > 0) "，目标发布 $publishCount 条" else ""
             val autoSwitchHint =
                 if (payload?.source == "auto_switch") "（自动切号调度）" else ""
-            val lineQueued =
-                "[OP][$opId] 发作品指令$autoSwitchHint：互点切换任务执行中，发作品需排队在互点模式结束之后执行$countHint"
             val lineStart =
                 "[OP][$opId] 发作品指令$autoSwitchHint 已收到，准备切入发作品入口流程$countHint"
-            if (mutualSwitchJob?.isActive == true) {
-                PrefsStore.setPublishPostQueuedAfterMutual(true)
-                LogCenter.op(alias, lineQueued)
-                reportDeviceOpToCloud(
-                    deviceId = deviceId,
-                    alias = alias,
-                    opId = opId,
-                    status = "success",
-                    message = "已排队：互点会话结束后将执行发作品入口",
-                    data = publishPostStartReportData(deviceId, opId, payload, slotKey).toMutableMap().apply {
-                        put("publish_queued_after_mutual", true)
-                        put("operation_logs", listOf(lineQueued))
-                    },
-                )
-                return
-            }
             PrefsStore.setPublishPostQueuedAfterMutual(false)
             LogCenter.op(alias, lineStart)
             triggerPublishPostNow(alias)
@@ -8038,6 +8234,14 @@ object AppCoordinator {
                     }
                     val chain = try {
                         executor.profileEditRunOcrChain(appContext, _config.value)
+                    } catch (e: AccountBannedException) {
+                        opLog("修改基本资料：账号封禁 ${e.message}")
+                        handleAccountBanned(alias, deviceId, e.username, "修改基本资料")
+                        ProfileEditChainResult(
+                            success = false,
+                            failureStep = "account_banned",
+                            editOcrPreviews = listOf(e.message ?: "account_banned"),
+                        )
                     } catch (e: AccountStatusLoggedOutException) {
                         opLog("修改基本资料：掉登录 ${e.message}")
                         recoverFromAccountStatusLogout(alias, deviceId, "修改基本资料")
@@ -9257,6 +9461,12 @@ object AppCoordinator {
                                     "失败：需要自动登录"
                                 }
                             }
+                            is AccountBannedException -> {
+                                if (deviceId.isNotBlank()) {
+                                    handleAccountBanned(alias, deviceId, err.username, "主播访问")
+                                }
+                                "失败：账号封禁 ${err.message ?: "banned"}"
+                            }
                             is AccountStatusLoggedOutException -> {
                                 if (deviceId.isNotBlank()) {
                                     recoverFromAccountStatusLogout(alias, deviceId, "主播访问")
@@ -9383,6 +9593,12 @@ object AppCoordinator {
                 }.getOrElse { err ->
                     when (err) {
                         is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                        is AccountBannedException -> {
+                            if (deviceIdForMutual.isNotBlank()) {
+                                handleAccountBanned(alias, deviceIdForMutual, err.username, "互点切换")
+                            }
+                            "互点流程账号封禁：${err.message ?: "banned"}"
+                        }
                         is AccountStatusLoggedOutException -> {
                             if (deviceIdForMutual.isNotBlank()) {
                                 recoverFromAccountStatusLogout(alias, deviceIdForMutual, "互点切换")
@@ -9406,7 +9622,17 @@ object AppCoordinator {
                             runCatching {
                                 executor.executeForUsername("__mutual_switch__", _config.value)
                             }.getOrElse { err ->
-                                "互点流程切换异常：${err.message ?: "unknown"}"
+                                when (err) {
+                                    is AccountBannedException -> {
+                                        handleAccountBanned(alias, deviceIdForMutual, err.username, "互点切换")
+                                        "互点流程账号封禁：${err.message ?: "banned"}"
+                                    }
+                                    is AccountStatusLoggedOutException -> {
+                                        recoverFromAccountStatusLogout(alias, deviceIdForMutual, "互点切换")
+                                        "互点流程掉登录：${err.message ?: "account_status"}"
+                                    }
+                                    else -> "互点流程切换异常：${err.message ?: "unknown"}"
+                                }
                             }
                         } else {
                             "互点：登录保障后仍未登录"
@@ -9586,6 +9812,7 @@ object AppCoordinator {
             LogCenter.op(alias, "发作品切换任务已在执行中，忽略重复触发")
             return
         }
+        clearMutualClickStateForInterrupt("发作品入口")
         publishPostSwitchJob = scope.launch {
             if (PrefsStore.isAutoSwitchAutonomousMode()) {
                 pauseGrowthForAutoSwitchExclusiveOp()
@@ -9626,6 +9853,12 @@ object AppCoordinator {
             }.getOrElse { err ->
                 when (err) {
                     is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                    is AccountBannedException -> {
+                        if (deviceIdForPublish.isNotBlank()) {
+                            handleAccountBanned(alias, deviceIdForPublish, err.username, "发作品")
+                        }
+                        "发作品账号封禁：${err.message ?: "banned"}"
+                    }
                     is AccountStatusLoggedOutException -> {
                         if (deviceIdForPublish.isNotBlank()) {
                             recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
@@ -9655,6 +9888,12 @@ object AppCoordinator {
                         }.getOrElse { err ->
                             when (err) {
                                 is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
+                                is AccountBannedException -> {
+                                    if (deviceIdForPublish.isNotBlank()) {
+                                        handleAccountBanned(alias, deviceIdForPublish, err.username, "发作品")
+                                    }
+                                    "发作品账号封禁：${err.message ?: "banned"}"
+                                }
                                 is AccountStatusLoggedOutException -> {
                                     if (deviceIdForPublish.isNotBlank()) {
                                         recoverFromAccountStatusLogout(alias, deviceIdForPublish, "发作品")
@@ -10105,6 +10344,14 @@ object AppCoordinator {
             suspend fun runProfileEditChainOnce(): ProfileEditChainResult =
                 try {
                     executor.profileEditRunOcrChain(appContext, _config.value)
+                } catch (e: AccountBannedException) {
+                    opLog("账号封禁 ${e.message}")
+                    handleAccountBanned(alias, deviceId, e.username, "切号后修改基本资料")
+                    ProfileEditChainResult(
+                        success = false,
+                        failureStep = "account_banned",
+                        editOcrPreviews = listOf(e.message ?: "account_banned"),
+                    )
                 } catch (e: AccountStatusLoggedOutException) {
                     opLog("掉登录 ${e.message}")
                     recoverFromAccountStatusLogout(alias, deviceId, "切号后修改基本资料")
@@ -10641,6 +10888,7 @@ object AppCoordinator {
 
             val errThrowable = result.exceptionOrNull()
             if (errThrowable is LoginSafeguardRequiresAutoLoginException) {
+                clearMutualClickStateForInterrupt("掉登录(涨粉)")
                 LogCenter.op(
                     alias,
                     "涨粉：OCR 见 Log in/Sign up/Add another account 等登录入口（与登录状态保障一致），" +
@@ -10659,7 +10907,17 @@ object AppCoordinator {
                 }
                 return
             }
+            if (errThrowable is AccountBannedException) {
+                handleAccountBanned(
+                    alias,
+                    deviceId,
+                    errThrowable.username.ifBlank { username },
+                    "涨粉",
+                )
+                return
+            }
             if (errThrowable is AccountStatusLoggedOutException) {
+                clearMutualClickStateForInterrupt("掉登录(Account status)")
                 LogCenter.op(alias, "涨粉：掉登录，终止 $username：${errThrowable.message}")
                 pendingUsernames.add(0, username)
                 executor.setAccountStatusReloginInProgress(true)
@@ -10862,6 +11120,26 @@ object AppCoordinator {
 
     fun shouldSwitchToMutualClick(): Boolean = PrefsStore.isMutualClickRequested() && PrefsStore.isMutualClickPending()
 
+    /**
+     * 硬停 / 发作品 / 掉登录等打断场景：清互点待执行标记并取消在途互点协程，
+     * 避免残留 requested/pending 劫持后续涨粉。
+     */
+    private fun clearMutualClickStateForInterrupt(reason: String) {
+        val hadMutual =
+            PrefsStore.isMutualClickRequested() ||
+                PrefsStore.isMutualClickPending() ||
+                isMutualSwitchActive()
+        if (!hadMutual) return
+        if (isMutualSwitchActive()) {
+            mutualSwitchJob?.cancel()
+            mutualSwitchJob = null
+        }
+        PrefsStore.clearMutualClickState()
+        PrefsStore.getAlias()?.trim()?.takeIf { it.isNotBlank() }?.let { alias ->
+            LogCenter.op(alias, "互点状态已清除（$reason）")
+        }
+    }
+
     fun markMutualClickSwitched() {
         PrefsStore.clearMutualClickState()
         PrefsStore.setMutualCommentOnlySession(false)
@@ -10946,6 +11224,7 @@ object AppCoordinator {
     }
 
     private fun applyUserGracefulHardStopFlags(alias: String?) {
+        clearMutualClickStateForInterrupt("硬停")
         val deviceId = PrefsStore.getDeviceId()
         PrefsStore.setHardStopRequested(true)
         val publishAccountKey =
@@ -11000,6 +11279,7 @@ object AppCoordinator {
 
     fun stopAllWork(requestHardStop: Boolean = true) {
         if (requestHardStop) {
+            clearMutualClickStateForInterrupt("硬停")
             PrefsStore.setHardStopRequested(true)
         }
         val hardStopped = PrefsStore.isHardStopRequested()
