@@ -467,6 +467,26 @@ data class DeviceAssignedAccountMarkLoginRequest(
     val username: String,
 )
 
+data class DeviceAssignedAccountMarkBannedRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+)
+
+data class DeviceAssignedAccountMarkBannedResponse(
+    val code: Int,
+    val msg: String? = null,
+    val username: String? = null,
+    val password: String? = null,
+    val email: String? = null,
+    val email_password: String? = null,
+    val account_updated: Int? = null,
+    val device_excluded_rows: Int? = null,
+    val plan_regenerated_aliases: Int? = null,
+    val devices_notified: Int? = null,
+    val cloud_synced: Boolean? = null,
+)
+
 data class DeviceAssignedAccountUpdateUsernameRequest(
     val device_id: String,
     val alias: String,

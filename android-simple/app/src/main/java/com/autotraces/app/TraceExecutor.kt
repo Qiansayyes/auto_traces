@@ -692,10 +692,11 @@ class RealTraceExecutor(
     private fun isLogoutProbeContextActive(): Boolean =
         isAccountStatusOcrWatchActive() || loginSafeguardLogoutProbeActive
 
-    /** 任务执行中掉登录 / ANR 恢复类异常须上浮至 [AppCoordinator]，勿在局部 OCR catch 吞掉。 */
+    /** 任务执行中掉登录 / 封禁 / ANR 恢复类异常须上浮至 [AppCoordinator]，勿在局部 OCR catch 吞掉。 */
     private fun rethrowTaskLogoutIfNeeded(ex: Throwable) {
         when (ex) {
             is AccountStatusLoggedOutException,
+            is AccountBannedException,
             is LoginSafeguardRequiresAutoLoginException,
             is TikTokAnrRecoveredException,
             -> throw ex
@@ -807,6 +808,8 @@ class RealTraceExecutor(
         vision: Text,
         fileTag: String?,
     ): Boolean {
+        // 封禁优先于掉登录 / 登录入口：Verify email 等页也可能叠封禁弹窗。
+        probeAndHandleAccountBannedFromVision(vision, "OCR顺手(封禁)")
         // Account status 须优先于 Log in 探测：弹窗正文含 “please log in again”，会误判为登录入口且永不点 OK。
         if (accountStatusRecoveryInProgress) return false
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
@@ -832,6 +835,8 @@ class RealTraceExecutor(
             val result = MlKitOcrGate.recognize(image)
             // ANR 系统层遮罩优先于其它顺手处理
             probeAndHandleTikTokAnrFromVision(ctx, result, "截图OCR顺手")
+            // 封禁弹窗：任意截图 OCR 顺手上报并中止（含裁切路径）
+            probeAndHandleAccountBannedFromVision(result, "截图OCR顺手(封禁)")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "截图OCR顺手")
             } else {
@@ -848,6 +853,7 @@ class RealTraceExecutor(
                     val (redo, err) = mlKitRecognizeFullScreenCore(ctx, "${safeTag}_more_result_for_redo")
                     if (redo != null) {
                         vision = redo
+                        probeAndHandleAccountBannedFromVision(vision, "截图OCR顺手(封禁-重扫)")
                     } else if (err == "hard_stop") {
                         return
                     }
@@ -862,6 +868,8 @@ class RealTraceExecutor(
             }
             probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
+        } catch (ex: AccountBannedException) {
+            throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -2610,6 +2618,44 @@ class RealTraceExecutor(
     }
 
     /**
+     * TikTok 账号封禁弹窗：Your account has been banned / Appeal / Download your data。
+     * 与 Account status 掉登录区分：封禁不上抛重登，由协调器 mark_banned 并移出计划。
+     */
+    private fun visionShowsAccountBannedDialog(vision: Text): Boolean {
+        val text = vision.text.lowercase(Locale.US)
+        if (text.contains("your account has been banned")) return true
+        if (text.contains("account has been banned")) return true
+        // 标题漏识时：banned + 申诉/下载数据同屏
+        if (text.contains("has been banned") &&
+            (text.contains("appeal") || text.contains("download your data") || text.contains("submit an appeal"))
+        ) {
+            return true
+        }
+        return false
+    }
+
+    private fun resolveUsernameForAccountBannedReport(): String =
+        ManualDeviceControl.activeManualUsername()
+            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+            .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
+
+    /**
+     * OCR 顺手：见封禁弹窗则立即抛 [AccountBannedException]，由协调器上报云端并剔除本机计划。
+     * 任意 OCR 路径均应调用（含自动登录 Verify email）。
+     */
+    private fun probeAndHandleAccountBannedFromVision(vision: Text, phaseLog: String) {
+        if (!visionShowsAccountBannedDialog(vision)) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val username = resolveUsernameForAccountBannedReport()
+        devOp(
+            alias,
+            "$phaseLog：OCR 见账号封禁弹窗（Your account has been banned），" +
+                "username=${username.ifBlank { "-" }}，中止当前步骤上报云端并移出计划",
+        )
+        throw AccountBannedException(username)
+    }
+
+    /**
      * 系统 ANR 弹窗：标题含 isn't responding（OCR 漏撇号/弯引号时归一为 isnt responding），
      * 或同屏同时见 Close app + Wait。
      */
@@ -2849,6 +2895,8 @@ class RealTraceExecutor(
             if (result == null) return null to err
             // ANR 系统层遮罩优先于 Don't allow / 各类 TikTok 弹窗
             probeAndHandleTikTokAnrFromVision(ctx, result, "OCR顺手处理")
+            // 封禁弹窗：任意整屏 OCR 顺手（含自动登录 Verify email）
+            probeAndHandleAccountBannedFromVision(result, "OCR顺手(封禁)")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "OCR顺手处理")
             } else {
@@ -2897,6 +2945,8 @@ class RealTraceExecutor(
                 }
             }
             vision to "ok"
+        } catch (ex: AccountBannedException) {
+            throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -7828,9 +7878,12 @@ class RealTraceExecutor(
         }
         // 系统 ANR 优先（本路径走无副作用 OCR，不会进 mlKitRecognizeFullScreen 顺手处理）
         probeAndHandleTikTokAnrFromVision(service, vision, "点击放大镜前")
+        probeAndHandleAccountBannedFromVision(vision, "点击放大镜前(封禁)")
         // 涨粉等 withAccountStatusOcrWatch 上下文：顺带探测掉登录（Account status 优先，避免 please log in again 误判）
         try {
             observeAccountStatusOnOcrText(service, vision, "magnifier_before_dont_allow")
+        } catch (ex: AccountBannedException) {
+            throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
         } catch (ex: LoginSafeguardRequiresAutoLoginException) {
@@ -16601,6 +16654,8 @@ class RealTraceExecutor(
             // 不可用 runCatching：会吞掉 ANR / 掉登录等须上浮的控制流异常。
             val overlayDismissed = try {
                 autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
+            } catch (ex: AccountBannedException) {
+                throw ex
             } catch (ex: TikTokAnrRecoveredException) {
                 throw ex
             } catch (ex: AccountStatusLoggedOutException) {
@@ -16626,6 +16681,8 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "自动登录-OCR顺带处理")) return false
         // ANR 优先：点 Close app → 强停冷启 → 抛出异常中止（外层自动登录可重试）
         probeAndHandleTikTokAnrFromVision(ctx, vision, "自动登录(顺带) ANR")
+        // 封禁：Verify email 等页叠封禁弹窗时立即上报，不继续等验证码
+        probeAndHandleAccountBannedFromVision(vision, "自动登录(顺带)封禁")
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
@@ -20233,8 +20290,18 @@ class RealTraceExecutor(
             if (!skipColdBootstrap) {
                 // 打开 TikTok 后：首帧 OCR 由 autoLoginOcrOnce 顺带处理 agree and / Don't allow / Swipe，再点 Profile
                 if (!ensureTikTokInForeground(ctx, alias, "自动登录-Profile前")) return false
+                // 不可裸用 runCatching：封禁 / ANR / 掉登录须上浮到协调器
                 runCatching {
                     autoLoginTapProfileForLoginEntry(ctx, alias)
+                }.onFailure { ex ->
+                    when (ex) {
+                        is AccountBannedException,
+                        is AccountStatusLoggedOutException,
+                        is TikTokAnrRecoveredException,
+                        is LoginSafeguardRequiresAutoLoginException,
+                        -> throw ex
+                        else -> Unit
+                    }
                 }
                 dontAllowHandledEarly = autoLoginDontAllowHandledInThisChain
             }

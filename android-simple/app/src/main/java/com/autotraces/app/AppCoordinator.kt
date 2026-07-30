@@ -2678,8 +2678,9 @@ object AppCoordinator {
         if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return false
         if (shouldHonorUserHardStop()) return false
         val accounts = ManualDeviceControl.getCachedAccounts()
+            .filterNot { ManualDeviceControl.accountLooksBanned(it) }
         if (accounts.isEmpty()) {
-            LogCenter.op(alias, "本机自动切号失败：请先拉取云端账号列表")
+            LogCenter.op(alias, "本机自动切号失败：请先拉取云端账号列表（或列表中账号均已封禁）")
             return false
         }
         val bundle = runCatching {
@@ -6398,7 +6399,7 @@ object AppCoordinator {
 
     /**
      * OCR 见「Your account has been banned」：
-     * 上报云端（email/email_password=banned + 移出自动切号计划），本机缓存剔除并重建计划，不重登。
+     * 上报云端（password/email/email_password=banned + 移出自动切号计划），本机缓存剔除并重建计划，不重登。
      */
     private suspend fun handleAccountBanned(
         alias: String,
@@ -6414,7 +6415,7 @@ object AppCoordinator {
         LogCenter.op(
             alias,
             "封禁处理：OCR 见账号封禁（来源=$source username=${username.ifBlank { "-" }}），" +
-                "移出计划并将邮箱标 banned，上报云端",
+                "移出计划并将 password/email/email_password 标 banned，上报云端",
         )
         updateRuntime(lastMessage = "账号封禁：@$username 移出计划")
         executor.clearAccountStatusReloginState()
@@ -6447,26 +6448,18 @@ object AppCoordinator {
             val selected = ManualDeviceControl.selectedManualUsername()
             val active = ManualDeviceControl.activeManualUsername()
             if (selected.equals(username, ignoreCase = true) || active.equals(username, ignoreCase = true)) {
-                val next = ManualDeviceControl.getCachedAccounts().firstOrNull()?.username.orEmpty()
+                val next = ManualDeviceControl.getCachedAccounts()
+                    .filterNot { ManualDeviceControl.accountLooksBanned(it) }
+                    .firstOrNull()?.username.orEmpty()
                 if (next.isNotBlank()) {
                     PrefsStore.setManualSelectedUsername(next)
+                    PrefsStore.setManualActiveUsername(next)
                     PrefsStore.setLogContextUsername(next)
                 } else {
                     PrefsStore.setManualSelectedUsername("")
+                    PrefsStore.setManualActiveUsername("")
                     PrefsStore.setLogContextUsername("")
                 }
-            }
-        }
-
-        if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled() && deviceId.isNotBlank()) {
-            val ok = rebuildAndStartManualLocalAutoSwitch(
-                alias = alias,
-                deviceId = deviceId,
-                slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
-                reason = "账号封禁移出计划",
-            )
-            if (ok) {
-                autoSwitchLocalScheduler.requestImmediateTick()
             }
         }
 
@@ -6476,10 +6469,11 @@ object AppCoordinator {
             alias = alias,
             opId = opId,
             status = if (cloudOk) "success" else "failed",
-            message = "账号封禁 @$username：移出计划，邮箱标 banned（$cloudMsg）",
+            message = "账号封禁 @$username：移出计划，password/email/email_password=banned（$cloudMsg）",
             data = mapOf(
                 "op_type" to "account_banned",
                 "username" to username,
+                "password" to "banned",
                 "email" to "banned",
                 "email_password" to "banned",
                 "source" to source,
@@ -6487,11 +6481,34 @@ object AppCoordinator {
                 "cloud_msg" to cloudMsg,
             ),
         )
-        pauseGrowthAfterLoginFailure(
-            alias,
-            deviceId,
-            "账号 @$username 已封禁并移出计划，请切到其他账号",
-        )
+
+        // 本机自动切号开启时：剔除后重建计划并立刻切号，切勿走「登录失败 hold」——
+        // 否则会周期性重登已封禁账号，并挡住 requestImmediateTick。
+        if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled() && deviceId.isNotBlank()) {
+            PrefsStore.clearAutoSwitchTikTokLoginHold()
+            val ok = rebuildAndStartManualLocalAutoSwitch(
+                alias = alias,
+                deviceId = deviceId,
+                slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
+                reason = "账号封禁移出计划",
+            )
+            if (ok) {
+                autoSwitchLocalScheduler.requestImmediateTick()
+                updateRuntime(lastMessage = "账号 @$username 已封禁并移出计划，将切到其他账号")
+            } else {
+                pauseGrowthAfterLoginFailure(
+                    alias,
+                    deviceId,
+                    "账号 @$username 已封禁；本机计划重建失败，请手动切号",
+                )
+            }
+        } else {
+            pauseGrowthAfterLoginFailure(
+                alias,
+                deviceId,
+                "账号 @$username 已封禁并移出计划，请切到其他账号",
+            )
+        }
     }
 
     /**

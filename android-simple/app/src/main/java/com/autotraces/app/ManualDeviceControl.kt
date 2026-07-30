@@ -54,6 +54,19 @@ object ManualDeviceControl {
         PrefsStore.setManualAccountsCacheJson(encodeAccounts(accounts))
     }
 
+    /** 从本机缓存移除账号（封禁移出计划后立即生效，无需等下次云端拉取）。 */
+    fun removeCachedAccount(username: String): Boolean {
+        val key = username.trim().removePrefix("@").lowercase()
+        if (key.isEmpty()) return false
+        val current = getCachedAccounts()
+        val next = current.filterNot {
+            it.username.trim().removePrefix("@").lowercase() == key
+        }
+        if (next.size == current.size) return false
+        updateCachedAccounts(next)
+        return true
+    }
+
     fun getCachedAccounts(): List<AccountOption> {
         val mem = cachedAccounts.get()
         if (mem.isNotEmpty()) return mem
@@ -118,10 +131,17 @@ object ManualDeviceControl {
         val message: String,
     )
 
+    /** password / email / email_password 任一为 banned（忽略大小写）视为云端已标封禁。 */
+    fun accountLooksBanned(opt: AccountOption): Boolean =
+        isBannedMarker(opt.password) || isBannedMarker(opt.emailPassword) || isBannedMarker(opt.email)
+
+    fun isBannedMarker(value: String?): Boolean =
+        value?.trim()?.equals("banned", ignoreCase = true) == true
+
     fun fromAssignedItem(item: DeviceAssignedAccountItem): AccountOption? {
         val username = item.username?.trim()?.removePrefix("@").orEmpty()
         if (username.isEmpty()) return null
-        return AccountOption(
+        val opt = AccountOption(
             username = username,
             password = item.password?.trim().orEmpty(),
             email = item.email?.trim().orEmpty(),
@@ -135,12 +155,15 @@ object ManualDeviceControl {
             mailModuleCodeAvailable = item.mail_module_code_available == true,
             switchHighlight = item.switch_highlight?.trim().orEmpty().ifBlank { "否" },
         )
+        // 云端已标 banned 的账号不下发到本机计划 / 下拉列表
+        if (accountLooksBanned(opt)) return null
+        return opt
     }
 
     fun fromAssignedResponse(resp: DeviceAssignedAccountResponse): AccountOption? {
         val username = resp.username?.trim()?.removePrefix("@").orEmpty()
         if (username.isEmpty()) return null
-        return AccountOption(
+        val opt = AccountOption(
             username = username,
             password = resp.password?.trim().orEmpty(),
             email = resp.email?.trim().orEmpty(),
@@ -151,6 +174,8 @@ object ManualDeviceControl {
             basicProfileModified = resp.basic_profile_modified?.trim().orEmpty().ifBlank { "否" },
             mailModuleCodeAvailable = resp.mail_module_code_available == true,
         )
+        if (accountLooksBanned(opt)) return null
+        return opt
     }
 
     private fun encodeAccounts(accounts: List<AccountOption>): String {
@@ -185,25 +210,25 @@ object ManualDeviceControl {
                     val o = arr.optJSONObject(i) ?: continue
                     val username = o.optString("username").trim().removePrefix("@")
                     if (username.isEmpty()) continue
-                    add(
-                        AccountOption(
-                            username = username,
-                            password = o.optString("password"),
-                            email = o.optString("email"),
-                            emailPassword = o.optString("emailPassword"),
-                            api = o.optString("api"),
-                            backupPath = o.optString("backupPath"),
-                            backupName = o.optString("backupName"),
-                            rowIndex = o.optInt("rowIndex").takeIf { o.has("rowIndex") && !o.isNull("rowIndex") },
-                            cloudIsLogin = when {
-                                !o.has("cloudIsLogin") || o.isNull("cloudIsLogin") -> null
-                                else -> o.optBoolean("cloudIsLogin")
-                            },
-                            basicProfileModified = o.optString("basicProfileModified").ifBlank { "否" },
-                            mailModuleCodeAvailable = o.optBoolean("mailModuleCodeAvailable"),
-                            switchHighlight = o.optString("switchHighlight").ifBlank { "否" },
-                        ),
+                    val opt = AccountOption(
+                        username = username,
+                        password = o.optString("password"),
+                        email = o.optString("email"),
+                        emailPassword = o.optString("emailPassword"),
+                        api = o.optString("api"),
+                        backupPath = o.optString("backupPath"),
+                        backupName = o.optString("backupName"),
+                        rowIndex = o.optInt("rowIndex").takeIf { o.has("rowIndex") && !o.isNull("rowIndex") },
+                        cloudIsLogin = when {
+                            !o.has("cloudIsLogin") || o.isNull("cloudIsLogin") -> null
+                            else -> o.optBoolean("cloudIsLogin")
+                        },
+                        basicProfileModified = o.optString("basicProfileModified").ifBlank { "否" },
+                        mailModuleCodeAvailable = o.optBoolean("mailModuleCodeAvailable"),
+                        switchHighlight = o.optString("switchHighlight").ifBlank { "否" },
                     )
+                    if (accountLooksBanned(opt)) continue
+                    add(opt)
                 }
             }
         }.getOrDefault(emptyList())

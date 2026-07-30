@@ -4119,6 +4119,12 @@ class DeviceAssignedAccountMarkLoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
 
 
+class DeviceAssignedAccountMarkBannedRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    username: str = Field(..., min_length=1, max_length=128)
+
+
 class DeviceAssignedAccountUpdateUsernameRequest(DeviceAuthModel):
     new_username: str = Field(..., min_length=1, max_length=128)
 
@@ -5386,12 +5392,57 @@ def _auto_switch_row_dict(row: sqlite3.Row | tuple | dict) -> dict[str, Any]:
     }
 
 
+def _account_cred_is_banned_marker(value: Any) -> bool:
+    return str(value or "").strip().lower() == "banned"
+
+
+def _account_row_looks_banned(
+    password: Any = "",
+    email: Any = "",
+    email_password: Any = "",
+) -> bool:
+    """账号表 password / email / email_password 任一为 banned 即视为封禁。"""
+    return (
+        _account_cred_is_banned_marker(password)
+        or _account_cred_is_banned_marker(email_password)
+        or _account_cred_is_banned_marker(email)
+    )
+
+
+def _banned_usernames_for_owner(conn: sqlite3.Connection, owner_username: str) -> set[str]:
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return set()
+    rows = conn.execute(
+        """
+        SELECT username, password, email, email_password
+        FROM account_editor_rows
+        WHERE owner_username = ?
+        """,
+        (owner,),
+    ).fetchall()
+    out: set[str] = set()
+    for r in rows or []:
+        if _account_row_looks_banned(
+            r["password"] if hasattr(r, "keys") else r[1],
+            r["email"] if hasattr(r, "keys") else r[2],
+            r["email_password"] if hasattr(r, "keys") else r[3],
+        ):
+            uname = str(
+                (r["username"] if hasattr(r, "keys") else r[0]) or ""
+            ).strip().lower()
+            if uname:
+                out.add(uname)
+    return out
+
+
 def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str, Any]]]:
     owner = str(owner_username or "").strip()
     if not owner:
         return {}
     conn = _get_db()
     try:
+        banned = _banned_usernames_for_owner(conn, owner)
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias,
@@ -5407,6 +5458,10 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
     buckets: Dict[str, List[dict[str, Any]]] = {}
     for row in rows or []:
         item = _auto_switch_row_dict(row)
+        uname = str(item.get("username") or "").strip().lower()
+        # 密码/邮箱密码标 banned 的账号不进周计划桶（即使未勾 auto_switch_excluded）
+        if uname and uname in banned:
+            continue
         alias_key = _device_editor_effective_alias(item)
         if not alias_key:
             continue
@@ -5559,8 +5614,6 @@ def _resync_auto_switch_devices_for_alias(owner_username: str, alias: str, bucke
 def _auto_publish_count_for_video_count(video_count: int) -> int:
     """自动切号发作品：按账号 video_count 决定本次下发条数（不含 -1 新号冷却标记）。"""
     vc = max(0, int(video_count))
-    if vc < 3:
-        return 1
     if vc <= 9:
         return 2
     return 3
@@ -10508,7 +10561,8 @@ def _fetch_device_assigned_accounts_list(
 ) -> list[dict[str, Any]]:
     """当前设备别名桶内全部账号（含凭据 / 登录态 / 备份字段），供手动切号下拉。
 
-    排除云端「不参加自动切号」(auto_switch_excluded=1) 的账号，与自动切号桶一致。
+    排除云端「不参加自动切号」(auto_switch_excluded=1) 以及 password/email/email_password=banned 的账号，
+    与自动切号周计划桶一致。
     """
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
@@ -10547,6 +10601,13 @@ def _fetch_device_assigned_accounts_list(
             continue
         seen.add(uname_key)
         fields = _account_bundle_fields_for_username(conn, owner, username)
+        # password/email/email_password=banned：不下发给设备（与周计划排除一致）
+        if _account_row_looks_banned(
+            fields.get("password"),
+            fields.get("email"),
+            fields.get("email_password"),
+        ):
+            continue
         items.append(
             {
                 "row_index": int(pick.get("row_index") or 0),
@@ -10668,6 +10729,128 @@ def device_assigned_account_mark_login(payload: DeviceAssignedAccountMarkLoginRe
         return {"code": 0, "msg": "已标记登录", "login_time": now}
     finally:
         conn.close()
+
+
+@app.post("/api/device/assigned_account/mark_banned")
+def device_assigned_account_mark_banned(payload: DeviceAssignedAccountMarkBannedRequest):
+    """设备端 OCR 检测到「Your account has been banned」：
+    1) 账号表 password / email / email_password 写为 banned，is_login=0（便于用户识别被封）
+    2) 设备表对应行 auto_switch_excluded=1（移出自动切号计划）
+    3) 刷新该别名计划并重同步设备（周计划按 password=banned 与 excluded 双重排除）
+    """
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    username = str(payload.username or "").strip().lstrip("@")
+    alias_key = _normalize_alias_key(payload.alias)
+    if not owner or not username:
+        return {"code": 1, "msg": "参数无效"}
+    now = now_text()
+    banned_marker = "banned"
+    account_updated = 0
+    device_updated = 0
+    affected_aliases: set[str] = set()
+    conn = _get_db()
+    try:
+        acct_cur = conn.execute(
+            """
+            UPDATE account_editor_rows
+            SET password = ?,
+                email = ?,
+                email_password = ?,
+                is_login = 0,
+                updated_at = ?
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            """,
+            (banned_marker, banned_marker, banned_marker, now, owner, username),
+        )
+        account_updated = int(acct_cur.rowcount or 0)
+        if account_updated < 1:
+            return {"code": 1, "msg": "未找到对应账号记录"}
+
+        dev_rows = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias, auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            """,
+            (owner, username),
+        ).fetchall()
+        for dr in dev_rows or []:
+            item = {
+                "row_index": int(dr["row_index"] or 0),
+                "username": str(dr["username"] or "").strip(),
+                "assigned_alias": str(dr["assigned_alias"] or "").strip(),
+                "device_alias": str(dr["device_alias"] or "").strip(),
+            }
+            row_alias = _device_editor_effective_alias(item)
+            if row_alias:
+                affected_aliases.add(row_alias)
+            if int(dr["auto_switch_excluded"] or 0) == 1:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET auto_switch_excluded = 1, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (now, owner, int(item["row_index"])),
+            )
+            if int(cur.rowcount or 0) > 0:
+                device_updated += 1
+        # 即便设备表无行，也刷新当前别名计划，便于本机尽快拿到新资料
+        if not affected_aliases and alias_key:
+            affected_aliases.add(alias_key)
+        conn.commit()
+    finally:
+        conn.close()
+
+    plan_regenerated = 0
+    devices_notified = 0
+    devices_disabled = 0
+    alias_results: list[dict[str, Any]] = []
+    for ak in sorted(affected_aliases):
+        plan_info = _refresh_auto_switch_plans_for_alias(owner, ak)
+        sync_info = _resync_auto_switch_devices_for_alias(
+            owner, ak, int(plan_info.get("bucket_size") or 0)
+        )
+        if plan_info.get("plan_regenerated"):
+            plan_regenerated += 1
+        devices_notified += int(sync_info.get("notified") or 0)
+        devices_disabled += int(sync_info.get("disabled") or 0)
+        alias_results.append(
+            {
+                "alias": ak,
+                "bucket_size": int(plan_info.get("bucket_size") or 0),
+                "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+                "devices_notified": int(sync_info.get("notified") or 0),
+                "devices_disabled": int(sync_info.get("disabled") or 0),
+            }
+        )
+    if device_updated > 0 or account_updated > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+
+    _append_device_log(
+        payload.device_id,
+        f"[{now}] 账号封禁 | username={username} password/email/email_password=banned "
+        f"excluded_rows={device_updated} plan_regen={plan_regenerated} notified={devices_notified}",
+    )
+    return {
+        "code": 0,
+        "msg": "已标记封禁并移出计划",
+        "username": username,
+        "password": banned_marker,
+        "email": banned_marker,
+        "email_password": banned_marker,
+        "account_updated": account_updated,
+        "device_excluded_rows": device_updated,
+        "plan_regenerated_aliases": plan_regenerated,
+        "devices_notified": devices_notified,
+        "devices_disabled": devices_disabled,
+        "aliases": alias_results,
+        "cloud_synced": True,
+    }
 
 
 @app.post("/api/device/assigned_account/update_username")
