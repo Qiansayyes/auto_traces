@@ -58,6 +58,19 @@ data class TikTokEmailCodeResponse(
     val email_code: String? = null,
 )
 
+/** POST /api/device/tk_pending/acquire — 从待注册 TK 池领取并转入邮箱账户管理。 */
+data class DeviceTkPendingAcquireResponse(
+    val code: Int,
+    val msg: String? = null,
+    val available: Boolean? = null,
+    val promoted: Boolean? = null,
+    val taken: Boolean? = null,
+    val email: String? = null,
+    val password: String? = null,
+    val client_id: String? = null,
+    val refresh_token: String? = null,
+)
+
 /** 与 web-admin `switchRunMode` / 服务端 `RunModeRequest` 一致，仅使用精确字面量比较，禁止 contains 模糊匹配。 */
 object ServerRunMode {
     const val GROWTH = "growth"

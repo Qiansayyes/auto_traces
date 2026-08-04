@@ -28,10 +28,9 @@ class WorkerService : Service() {
             return
         }
         NotificationHelper.ensureChannel(this)
-        if (PrefsStore.isMutualClickRequested()) {
-            PrefsStore.setMutualClickPending(true)
-            AppCoordinator.refreshRuntimeSnapshot()
-            LogCenter.op(PrefsStore.getAlias(), "检测到互点待执行标记，等待任务进入合适的停止点")
+        if (PrefsStore.isMutualClickRequested() || PrefsStore.isMutualClickPending()) {
+            PrefsStore.clearMutualClickState()
+            LogCenter.op(PrefsStore.getAlias(), "服务重启：已清除残留互点待执行标记")
         }
         WorkerServiceTracker.isRunning = true
         AppCoordinator.onWorkerServiceChanged(true)

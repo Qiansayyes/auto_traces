@@ -209,6 +209,16 @@ object ApiService {
         clazz = BaseResponse::class.java,
     )
 
+    suspend fun markDeviceAssignedAccountBanned(
+        deviceId: String,
+        alias: String,
+        username: String,
+    ): DeviceAssignedAccountMarkBannedResponse = post(
+        path = "/api/device/assigned_account/mark_banned",
+        body = DeviceAssignedAccountMarkBannedRequest(deviceId, alias, username),
+        clazz = DeviceAssignedAccountMarkBannedResponse::class.java,
+    )
+
     suspend fun updateDeviceAssignedAccountUsername(
         deviceId: String,
         alias: String,
@@ -217,6 +227,20 @@ object ApiService {
         path = "/api/device/assigned_account/update_username",
         body = DeviceAssignedAccountUpdateUsernameRequest(deviceId, alias, newUsername),
         clazz = DeviceAssignedAccountUpdateUsernameResponse::class.java,
+    )
+
+    suspend fun acquireTkPendingEmail(
+        deviceId: String,
+        alias: String,
+        email: String = "",
+    ): DeviceTkPendingAcquireResponse = post(
+        path = "/api/device/tk_pending/acquire",
+        body = mapOf(
+            "device_id" to deviceId,
+            "alias" to alias,
+            "email" to email,
+        ),
+        clazz = DeviceTkPendingAcquireResponse::class.java,
     )
 
     suspend fun getTikTokEmailCodeFromServer(

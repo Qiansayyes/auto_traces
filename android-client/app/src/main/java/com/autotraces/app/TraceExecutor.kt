@@ -16313,7 +16313,8 @@ class RealTraceExecutor(
 
     /**
      * ViaLogIn / ViaAddAnotherAccount：与底栏 Log in 同级，先点其一，再 Username×2 → 填邮箱 …
-     * ViaWelcomeBackLogIn：同页同时见 Add another account + Log in（Welcome back），优先点 Log in，
+     * client：同页同时见 Add another account + Log in（Welcome back）→ **优先点 Add another account**。
+     * ViaWelcomeBackLogIn：仅见 Welcome back / Log in、无 Add another 时点 Log in，
      *   跳过 Username/邮箱，OCR 等新页后接验证码/密码/直达成功。
      * ViaSignUp：底栏仅见 Sign up（已在 Log in 之后、且非 Sign up 落地页），不点底栏，直接 Username×2 → 填邮箱 …
      * AlreadyLoggedIn：入口页未见 Log in/Sign up 但识别 Edit，账号已登录。
@@ -16323,7 +16324,7 @@ class RealTraceExecutor(
         None,
         ViaLogIn,
         ViaAddAnotherAccount,
-        /** Welcome back：同页 Add another account + Log in，已点 Log in。 */
+        /** Welcome back：无 Add another 时点 Log in。 */
         ViaWelcomeBackLogIn,
         ViaSignUp,
         AlreadyLoggedIn,
@@ -17031,32 +17032,39 @@ class RealTraceExecutor(
             val addAnotherHit = findAddAnotherAccountTapHit(vision)
             val onWelcomeBack = visionShowsWelcomeBackMarker(vision)
             val welcomeLogInHit = findLogInEntryTapHit(vision)
-            if (onWelcomeBack || (addAnotherHit != null && welcomeLogInHit != null)) {
-                loginEntryMissStreak = 0
-                val (rawTap, how) = resolveWelcomeBackLogInTapPoint(vision, w, h, addAnotherHit)
-                val tap = autoLoginTapWithJitter(rawTap, w, h)
-                val preview = buildProfileEditOcrPreview(vision).take(240)
-                devOp(
-                    alias,
-                    "自动登录：Welcome back 入口，点击 Log in（$how，第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})；OCR=$preview",
-                )
-                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                    autoLoginDelay(alias, 800L, "Welcome back Log in 点击后")
-                    return AutoLoginEntryPath.ViaWelcomeBackLogIn
-                }
-                continue
-            }
+            // client：同页 Add another + Log in / Welcome back → 优先点 Add another（simple 仍优先 Log in）。
             if (addAnotherHit != null) {
-                // 仅 Add another、无 Welcome back / Log in：旧方案
+                loginEntryMissStreak = 0
                 val tap = autoLoginTapWithJitter(addAnotherHit.point, w, h)
+                val samePageLogIn = onWelcomeBack || welcomeLogInHit != null
                 devOp(
                     alias,
-                    "自动登录：点 Add another account（未见 Welcome back/Log in，" +
-                        "第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})",
+                    if (samePageLogIn) {
+                        "自动登录：同页见 Add another account + Log in，优先点 Add another account" +
+                            "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})"
+                    } else {
+                        "自动登录：点 Add another account" +
+                            "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})"
+                    },
                 )
                 if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
                     autoLoginDelay(alias, 550L, "Add another account 点击后")
                     return AutoLoginEntryPath.ViaAddAnotherAccount
+                }
+                continue
+            }
+            if (onWelcomeBack) {
+                loginEntryMissStreak = 0
+                val (rawTap, how) = resolveWelcomeBackLogInTapPoint(vision, w, h, addAnotherHit = null)
+                val tap = autoLoginTapWithJitter(rawTap, w, h)
+                val preview = buildProfileEditOcrPreview(vision).take(240)
+                devOp(
+                    alias,
+                    "自动登录：Welcome back 入口（无 Add another），点击 Log in（$how，第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）tap (${tap.x},${tap.y})；OCR=$preview",
+                )
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    autoLoginDelay(alias, 800L, "Welcome back Log in 点击后")
+                    return AutoLoginEntryPath.ViaWelcomeBackLogIn
                 }
                 continue
             }
@@ -17113,14 +17121,29 @@ class RealTraceExecutor(
             val signUpHit = findSignUpEntryTapHit(vision)
                 ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
             if (signUpHit != null) {
-                // 再防一层：同屏若其实是 Welcome back，禁止 Sign up→Username 卡死
-                if (visionShowsWelcomeBackMarker(vision) || findAddAnotherAccountTapHit(vision) != null) {
+                // 再防一层：同屏若其实是 Welcome back / Add another，禁止 Sign up→Username 卡死
+                val signUpAddAnother = findAddAnotherAccountTapHit(vision)
+                if (signUpAddAnother != null) {
+                    loginEntryMissStreak = 0
+                    val tap = autoLoginTapWithJitter(signUpAddAnother.point, w, h)
+                    devOp(
+                        alias,
+                        "自动登录：见 Sign up 但同屏有 Add another account，优先点 Add another " +
+                            "tap (${tap.x},${tap.y})",
+                    )
+                    if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                        autoLoginDelay(alias, 550L, "Add another account 点击后")
+                        return AutoLoginEntryPath.ViaAddAnotherAccount
+                    }
+                    continue
+                }
+                if (visionShowsWelcomeBackMarker(vision)) {
                     loginEntryMissStreak = 0
                     val (rawTap, how) = resolveWelcomeBackLogInTapPoint(vision, w, h)
                     val tap = autoLoginTapWithJitter(rawTap, w, h)
                     devOp(
                         alias,
-                        "自动登录：见 Sign up 但同屏为 Welcome back 入口，改点 Log in（$how）" +
+                        "自动登录：见 Sign up 但同屏为 Welcome back（无 Add another），改点 Log in（$how）" +
                             " tap (${tap.x},${tap.y})",
                     )
                     if (runSuCommand("input tap ${tap.x} ${tap.y}")) {

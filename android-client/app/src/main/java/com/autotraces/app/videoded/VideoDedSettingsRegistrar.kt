@@ -60,10 +60,10 @@ object VideoDedSettingsRegistrar {
             ?: WifiUtils.getWifiIp(context).orEmpty()
     }
 
-    /** PC 已无线连接或本机 ADB 就绪时，不再触发无线流水线，避免打断现有投屏。 */
+    /** PC 已无线连接时不再触发；仅以 PC 侧 pcAdbState 为准，本机 ready 不代表 PC 已 adb connect。 */
     fun shouldTriggerWirelessPipeline(context: Context, reg: JSONObject?): Boolean {
         if (reg != null && reg.optString("pcAdbState", "").trim() == "device") return false
-        if (MirrorStateProbe.currentMirrorStatus(context) == "ready") return false
+        if (MirrorStateProbe.currentMirrorStatus(context) == "offline") return false
         val now = System.currentTimeMillis()
         if (now - lastWirelessPipelineAtMs < WIRELESS_PIPELINE_MIN_INTERVAL_MS) return false
         return true

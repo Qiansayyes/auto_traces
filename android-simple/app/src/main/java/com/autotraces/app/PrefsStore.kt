@@ -47,6 +47,9 @@ object PrefsStore {
     const val MAX_MANUAL_FOR_YOU_SWIPE_SEC: Int = 3600
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
+    /** 最近一次从「待注册TK账号」领取并转入邮箱账户管理的邮箱。 */
+    private const val KEY_ISSUED_TK_PENDING_EMAIL = "issued_tk_pending_email"
+    private const val KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD = "issued_tk_pending_email_password"
     const val DEFAULT_MANUAL_PUBLISH_COUNT: Int = 1
     const val MIN_MANUAL_PUBLISH_COUNT: Int = 1
     const val MAX_MANUAL_PUBLISH_COUNT: Int = 5
@@ -1193,6 +1196,29 @@ object PrefsStore {
                 count.coerceIn(MIN_MANUAL_PUBLISH_COUNT, MAX_MANUAL_PUBLISH_COUNT),
             )
             .apply()
+    }
+
+    fun getIssuedTkPendingEmail(): String? =
+        prefs.getString(KEY_ISSUED_TK_PENDING_EMAIL, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun getIssuedTkPendingEmailPassword(): String? =
+        prefs.getString(KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD, null)?.takeIf { it.isNotEmpty() }
+
+    fun setIssuedTkPendingEmail(email: String?, password: String? = null) {
+        val e = email?.trim()?.takeIf { it.isNotEmpty() }
+        val p = password?.takeIf { it.isNotEmpty() }
+        val editor = prefs.edit()
+        if (e == null) {
+            editor.remove(KEY_ISSUED_TK_PENDING_EMAIL).remove(KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD)
+        } else {
+            editor.putString(KEY_ISSUED_TK_PENDING_EMAIL, e)
+            if (p == null) {
+                editor.remove(KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD)
+            } else {
+                editor.putString(KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD, p)
+            }
+        }
+        editor.apply()
     }
 
     fun getManualSelectedUsername(): String? =

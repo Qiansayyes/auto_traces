@@ -58,6 +58,7 @@ class MainActivity : AppCompatActivity() {
         requestReadClipboardPermissionIfNeeded()
         setupBindingSection()
         setupAssignedAccountSection()
+        setupIssuedNewEmailSection()
         setupManualTaskSection()
         renderDeviceInfo()
         observeLogs()
@@ -335,6 +336,118 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.assignedUsernameSelect.visibility = View.GONE
+    }
+
+    private fun setupIssuedNewEmailSection() {
+        fun copy(label: String, value: String) {
+            val text = value.trim()
+            if (text.isBlank()) {
+                binding.issuedNewEmailStatusText.text = "$label 为空，未复制"
+                return
+            }
+            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText(label, text))
+            binding.issuedNewEmailStatusText.text = "$label 已复制"
+        }
+
+        fun applyIssuedEmail(email: String?, password: String?) {
+            binding.issuedNewEmailInput.setText(email.orEmpty())
+            binding.issuedNewEmailPasswordInput.setText(password.orEmpty())
+        }
+
+        applyIssuedEmail(PrefsStore.getIssuedTkPendingEmail(), PrefsStore.getIssuedTkPendingEmailPassword())
+        if (!PrefsStore.getIssuedTkPendingEmail().isNullOrBlank()) {
+            binding.issuedNewEmailStatusText.text = "已恢复上次下发邮箱：${PrefsStore.getIssuedTkPendingEmail()}"
+        }
+
+        binding.copyIssuedNewEmailButton.setOnClickListener {
+            copy("新邮箱", binding.issuedNewEmailInput.text?.toString().orEmpty())
+        }
+        binding.copyIssuedNewEmailPasswordButton.setOnClickListener {
+            copy("邮箱密码", binding.issuedNewEmailPasswordInput.text?.toString().orEmpty())
+        }
+
+        binding.acquireNewEmailButton.setOnClickListener {
+            if (!binding.acquireNewEmailButton.isEnabled) return@setOnClickListener
+            if (requireCloudLoginIfNeeded()) return@setOnClickListener
+            val deviceId = PrefsStore.getDeviceId().orEmpty()
+            val alias = PrefsStore.getAlias().orEmpty().trim()
+            if (deviceId.isBlank() || alias.isBlank()) {
+                binding.issuedNewEmailStatusText.text = "设备未绑定，无法领取新邮箱"
+                return@setOnClickListener
+            }
+
+            // 同步禁用，避免连点并发领取多封邮箱
+            binding.acquireNewEmailButton.isEnabled = false
+            binding.issuedNewEmailStatusText.text = "正在从「待注册TK账号」领取新邮箱…"
+            lifecycleScope.launch {
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { ApiService.acquireTkPendingEmail(deviceId, alias) }
+                    }
+
+                    val resp = result.getOrNull()
+                    if (resp == null) {
+                        binding.issuedNewEmailStatusText.text =
+                            "领取失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+                        return@launch
+                    }
+                    if (resp.code != 0 || resp.email.isNullOrBlank()) {
+                        binding.issuedNewEmailStatusText.text =
+                            resp.msg?.trim().orEmpty().ifBlank { "待注册池无可用邮箱" }
+                        return@launch
+                    }
+
+                    val email = resp.email.trim()
+                    val password = resp.password.orEmpty()
+                    PrefsStore.setIssuedTkPendingEmail(email, password)
+                    applyIssuedEmail(email, password)
+                    copy("新邮箱", email)
+                    binding.issuedNewEmailStatusText.text =
+                        "已下发并转入邮箱账户管理：$email（已复制）"
+                } finally {
+                    binding.acquireNewEmailButton.isEnabled = true
+                }
+            }
+        }
+
+        binding.fetchNewEmailCodeButton.setOnClickListener {
+            if (!binding.fetchNewEmailCodeButton.isEnabled) return@setOnClickListener
+            val accountEmail = binding.issuedNewEmailInput.text?.toString().orEmpty().trim()
+                .ifBlank { PrefsStore.getIssuedTkPendingEmail().orEmpty() }
+            val deviceId = PrefsStore.getDeviceId().orEmpty()
+            val alias = PrefsStore.getAlias().orEmpty().trim()
+
+            if (accountEmail.isBlank()) {
+                binding.issuedNewEmailStatusText.text = "请先点击「获取新邮箱」"
+                return@setOnClickListener
+            }
+            if (deviceId.isBlank() || alias.isBlank()) {
+                binding.issuedNewEmailStatusText.text = "设备未绑定：无法从云端取验证码"
+                return@setOnClickListener
+            }
+
+            binding.fetchNewEmailCodeButton.isEnabled = false
+            binding.issuedNewEmailStatusText.text = "正在从云端邮箱管理模块获取验证码…"
+            lifecycleScope.launch {
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        TikTokEmailCodeFetcher.fetchCode(deviceId, alias, apiUrl = "", email = accountEmail)
+                    }
+
+                    val code = result.getOrNull()
+                    if (code.isNullOrBlank()) {
+                        val msg = result.exceptionOrNull()?.message ?: "未识别到 6 位验证码"
+                        binding.issuedNewEmailStatusText.text = "获取验证码失败：$msg"
+                        return@launch
+                    }
+                    copy("TikTok Code", code)
+                    binding.issuedNewEmailStatusText.text = "验证码 $code（已自动复制）"
+                } finally {
+                    binding.fetchNewEmailCodeButton.isEnabled = true
+                }
+            }
+        }
     }
 
     private fun requireCloudLoginIfNeeded(): Boolean {

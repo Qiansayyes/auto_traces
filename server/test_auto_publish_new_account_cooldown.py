@@ -10,9 +10,10 @@ def test_parse_video_count_raw_supports_negative():
 
 
 def test_auto_publish_count_for_video_count_ignores_negative_semantics():
-    assert m._auto_publish_count_for_video_count(0) == 1
-    assert m._auto_publish_count_for_video_count(2) == 1
+    assert m._auto_publish_count_for_video_count(0) == 2
+    assert m._auto_publish_count_for_video_count(2) == 2
     assert m._auto_publish_count_for_video_count(5) == 2
+    assert m._auto_publish_count_for_video_count(9) == 2
     assert m._auto_publish_count_for_video_count(12) == 3
 
 

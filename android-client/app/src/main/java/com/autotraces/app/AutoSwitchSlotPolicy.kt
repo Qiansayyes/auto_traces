@@ -118,7 +118,6 @@ internal object AutoSwitchPublishVideoCount {
     fun autoPublishCountFor(videoCount: Int): Int {
         val vc = videoCount.coerceAtLeast(0)
         return when {
-            vc < 3 -> 1
             vc <= 9 -> 2
             else -> 3
         }
