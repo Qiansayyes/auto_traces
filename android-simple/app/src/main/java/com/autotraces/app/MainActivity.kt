@@ -16,6 +16,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -46,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     private var suppressingManualAutoSwitchCheck = false
     /** 硬停后关闭自动滚底，便于用户翻看历史日志；重新启动后台服务后恢复。 */
     private var logStickToBottom = true
+    /** 防止连点弹出多个确认框 / 并发提交更新邮箱。 */
+    private var updatingAccountEmailFromIssued = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -445,6 +448,195 @@ class MainActivity : AppCompatActivity() {
                     binding.issuedNewEmailStatusText.text = "验证码 $code（已自动复制）"
                 } finally {
                     binding.fetchNewEmailCodeButton.isEnabled = true
+                }
+            }
+        }
+
+        binding.updateAccountEmailFromIssuedButton.setOnClickListener {
+            promptUpdateAccountEmailFromIssued()
+        }
+    }
+
+    /**
+     * 用「新邮箱」区的下发邮箱/密码，更新「手动任务」下拉当前选中账号的云端邮箱字段。
+     * 先弹窗展示账号、旧值→新值，用户确认后再请求。
+     */
+    private fun promptUpdateAccountEmailFromIssued() {
+        if (updatingAccountEmailFromIssued) return
+        if (requireCloudLoginIfNeeded()) return
+        val deviceId = PrefsStore.getDeviceId().orEmpty()
+        val alias = PrefsStore.getAlias().orEmpty().trim()
+        if (deviceId.isBlank() || alias.isBlank()) {
+            binding.issuedNewEmailStatusText.text = "设备未绑定，无法更新云端邮箱"
+            return
+        }
+
+        val username = selectedManualUsername().ifBlank {
+            ManualDeviceControl.selectedManualUsername()
+        }.trim().removePrefix("@")
+        if (username.isBlank()) {
+            binding.issuedNewEmailStatusText.text = "请先在「手动任务」下拉选择要更新的账号"
+            Toast.makeText(this, "请先选择下拉账号", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val newEmail = binding.issuedNewEmailInput.text?.toString().orEmpty().trim()
+            .ifBlank { PrefsStore.getIssuedTkPendingEmail().orEmpty().trim() }
+        val newPassword = binding.issuedNewEmailPasswordInput.text?.toString().orEmpty()
+            .ifBlank { PrefsStore.getIssuedTkPendingEmailPassword().orEmpty() }
+        if (newEmail.isBlank()) {
+            binding.issuedNewEmailStatusText.text = "请先点击「获取新邮箱」再更新"
+            Toast.makeText(this, "新邮箱为空", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val opt = ManualDeviceControl.findCachedAccount(username)
+            ?: manualAccounts.firstOrNull { it.username.equals(username, ignoreCase = true) }
+        val oldEmail = opt?.email?.trim().orEmpty()
+            .ifBlank { binding.assignedEmailInput.text?.toString().orEmpty().trim() }
+        val oldPassword = opt?.emailPassword.orEmpty()
+            .ifBlank { binding.assignedEmailPasswordInput.text?.toString().orEmpty() }
+        val oldApi = opt?.api?.trim().orEmpty()
+            .ifBlank { binding.assignedApiInput.text?.toString().orEmpty().trim() }
+
+        if (oldEmail.equals(newEmail, ignoreCase = true) &&
+            oldPassword == newPassword &&
+            oldApi.isBlank()
+        ) {
+            binding.issuedNewEmailStatusText.text = "邮箱信息与当前账号一致，无需更新"
+            Toast.makeText(this, "无需更新", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val message = buildString {
+            append("将更新云端账号表中的邮箱信息：\n\n")
+            append("账号：@$username\n\n")
+            append("邮箱：\n")
+            append("  原：${oldEmail.ifBlank { "(空)" }}\n")
+            append("  新：$newEmail\n\n")
+            append("邮箱密码：\n")
+            append("  原：${oldPassword.ifBlank { "(空)" }}\n")
+            append("  新：${newPassword.ifBlank { "(空)" }}\n")
+            if (oldApi.isNotBlank()) {
+                append("\n同时会清空该账号旧的 API 链接（改走邮箱管理模块取码）。\n")
+            }
+            append("\n请确认 TikTok 上已改到该新邮箱后再点「确定更新」。")
+        }
+
+        binding.updateAccountEmailFromIssuedButton.isEnabled = false
+        AlertDialog.Builder(this)
+            .setTitle("确认更新邮箱信息")
+            .setMessage(message)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确定更新") { _, _ ->
+                performUpdateAccountEmailFromIssued(
+                    deviceId = deviceId,
+                    alias = alias,
+                    username = username,
+                    newEmail = newEmail,
+                    newPassword = newPassword,
+                )
+            }
+            .setOnDismissListener {
+                if (!updatingAccountEmailFromIssued && !isFinishing && !isDestroyed) {
+                    binding.updateAccountEmailFromIssuedButton.isEnabled = true
+                }
+            }
+            .show()
+    }
+
+    private fun performUpdateAccountEmailFromIssued(
+        deviceId: String,
+        alias: String,
+        username: String,
+        newEmail: String,
+        newPassword: String,
+    ) {
+        if (updatingAccountEmailFromIssued) return
+        if (isFinishing || isDestroyed) return
+        updatingAccountEmailFromIssued = true
+        binding.updateAccountEmailFromIssuedButton.isEnabled = false
+        binding.issuedNewEmailStatusText.text = "正在更新 @$username 的云端邮箱…"
+        lifecycleScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        ApiService.updateDeviceAssignedAccountEmail(
+                            deviceId = deviceId,
+                            alias = alias,
+                            username = username,
+                            email = newEmail,
+                            emailPassword = newPassword,
+                            clearApi = true,
+                        )
+                    }
+                }
+                if (isFinishing || isDestroyed) return@launch
+                val resp = result.getOrNull()
+                if (resp == null) {
+                    binding.issuedNewEmailStatusText.text =
+                        "更新失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+                    return@launch
+                }
+                if (resp.code != 0) {
+                    binding.issuedNewEmailStatusText.text =
+                        resp.msg?.trim().orEmpty().ifBlank { "更新失败（code=${resp.code}）" }
+                    return@launch
+                }
+
+                val email = resp.email?.trim().orEmpty().ifBlank { newEmail }
+                val emailPassword = resp.email_password ?: newPassword
+                val mailOk = resp.mail_module_code_available == true
+                val updated = resp.updated == true
+
+                if (updated) {
+                    ManualDeviceControl.updateCachedAccountEmail(
+                        username = username,
+                        email = email,
+                        emailPassword = emailPassword,
+                        clearApi = true,
+                        mailModuleCodeAvailable = mailOk,
+                    )
+                    AutoSwitchBundleHolder.notifyAccountEmailUpdated(
+                        username = username,
+                        email = email,
+                        emailPassword = emailPassword,
+                        clearApi = true,
+                        mailModuleCodeAvailable = mailOk,
+                    )
+                    val refreshed = ManualDeviceControl.getCachedAccounts()
+                    if (refreshed.isNotEmpty()) {
+                        manualAccounts = refreshed
+                        // 仅当用户仍停留在该账号时才刷新凭据区，避免切号后覆盖错误账号展示
+                        val stillSelected = selectedManualUsername()
+                            .equals(username, ignoreCase = true)
+                        if (stillSelected) {
+                            val idx = refreshed.indexOfFirst {
+                                it.username.equals(username, ignoreCase = true)
+                            }
+                            if (idx >= 0) {
+                                applyManualAccountFields(refreshed[idx])
+                            }
+                        }
+                        refreshManualAccountSpinnerLabels()
+                    }
+                }
+
+                binding.issuedNewEmailStatusText.text = if (updated) {
+                    "已更新 @$username 邮箱 → $email" +
+                        if (resp.api_cleared == true) "（已清空旧 API）" else ""
+                } else {
+                    resp.msg?.trim().orEmpty().ifBlank { "邮箱信息无变化" }
+                }
+                Toast.makeText(
+                    this@MainActivity,
+                    if (updated) "云端邮箱已更新" else "无需更新",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            } finally {
+                updatingAccountEmailFromIssued = false
+                if (!isFinishing && !isDestroyed) {
+                    binding.updateAccountEmailFromIssuedButton.isEnabled = true
                 }
             }
         }

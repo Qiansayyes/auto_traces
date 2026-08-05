@@ -514,6 +514,29 @@ data class DeviceAssignedAccountUpdateUsernameResponse(
     val updated: Boolean? = null,
 )
 
+/** POST /api/device/assigned_account/update_email */
+data class DeviceAssignedAccountUpdateEmailRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+    val email: String,
+    val email_password: String = "",
+    val clear_api: Boolean = true,
+)
+
+data class DeviceAssignedAccountUpdateEmailResponse(
+    val code: Int,
+    val msg: String? = null,
+    val username: String? = null,
+    val email: String? = null,
+    val email_password: String? = null,
+    val old_email: String? = null,
+    val old_email_password: String? = null,
+    val api_cleared: Boolean? = null,
+    val mail_module_code_available: Boolean? = null,
+    val updated: Boolean? = null,
+)
+
 data class TikTokAutoLoginCredentials(
     val username: String,
     val email: String,

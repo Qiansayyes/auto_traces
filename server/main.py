@@ -4129,6 +4129,15 @@ class DeviceAssignedAccountUpdateUsernameRequest(DeviceAuthModel):
     new_username: str = Field(..., min_length=1, max_length=128)
 
 
+class DeviceAssignedAccountUpdateEmailRequest(DeviceAuthModel):
+    """设备端：将指定账号的邮箱/邮箱密码同步到账号表（通常用于改邮后写入下发的新邮箱）。"""
+    username: str = Field(..., min_length=1, max_length=128)
+    email: str = Field(..., min_length=1, max_length=255)
+    email_password: str = Field(default="", max_length=255)
+    # 新邮箱走邮箱管理模块取码时，清空旧 API 链接，避免仍指向旧邮箱。
+    clear_api: bool = True
+
+
 class DeviceOpReportRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
@@ -10944,6 +10953,122 @@ def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdate
             "old_username": old_username,
             "updated": True,
             "device_rows_updated": dev_updated,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/device/assigned_account/update_email")
+def device_assigned_account_update_email(payload: DeviceAssignedAccountUpdateEmailRequest):
+    """设备端：将下拉选中账号的邮箱/邮箱密码更新为下发的新邮箱信息。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    username = str(payload.username or "").strip().lstrip("@")
+    new_email = str(payload.email or "").strip()
+    new_email_password = str(payload.email_password or "").strip()
+    alias_key = _normalize_alias_key(payload.alias)
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    if not username:
+        return {"code": 1, "msg": "用户名为空"}
+    if not new_email:
+        return {"code": 1, "msg": "新邮箱为空"}
+    if not alias_key:
+        return {"code": 1, "msg": "设备别名无效"}
+    conn = _get_db()
+    try:
+        alias_err = _validate_username_device_effective_alias(conn, owner, username, alias_key)
+        if alias_err:
+            return {"code": 1, "msg": alias_err}
+        # 必须属于当前别名桶（与手动切号下拉一致）
+        bucket = _fetch_device_assigned_accounts_list(conn, owner, payload.alias)
+        if not any(
+            str(it.get("username") or "").strip().lower() == username.lower() for it in bucket
+        ):
+            return {"code": 1, "msg": f"账号 @{username} 不在当前设备别名下拉列表中"}
+        row = conn.execute(
+            """
+            SELECT row_index, username, email, email_password, api
+            FROM account_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            LIMIT 1
+            """,
+            (owner, username),
+        ).fetchone()
+        if not row:
+            return {"code": 1, "msg": "未找到对应账号记录"}
+        acct = dict(row)
+        old_email = str(acct.get("email") or "").strip()
+        old_email_password = str(acct.get("email_password") or "").strip()
+        old_api = str(acct.get("api") or "").strip()
+        clear_api = bool(payload.clear_api)
+        email_same = old_email.lower() == new_email.lower()
+        pwd_same = old_email_password == new_email_password
+        api_will_clear = clear_api and old_api != ""
+        if email_same and pwd_same and not api_will_clear:
+            return {
+                "code": 0,
+                "msg": "邮箱信息无变化，无需更新",
+                "username": username,
+                "email": old_email,
+                "email_password": old_email_password,
+                "old_email": old_email,
+                "old_email_password": old_email_password,
+                "api_cleared": False,
+                "updated": False,
+            }
+        now = now_text()
+        if clear_api:
+            cur = conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET email = ?,
+                    email_password = ?,
+                    api = '',
+                    updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (new_email, new_email_password, now, owner, int(acct["row_index"])),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET email = ?,
+                    email_password = ?,
+                    updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (new_email, new_email_password, now, owner, int(acct["row_index"])),
+            )
+        if int(cur.rowcount or 0) < 1:
+            return {"code": 1, "msg": "账号表更新失败"}
+        conn.commit()
+        mail_ok = False
+        try:
+            from mail_integration import mail_module_can_fetch_code
+
+            mail_ok = bool(mail_module_can_fetch_code(owner, new_email))
+        except ImportError:
+            mail_ok = False
+        _append_device_log(
+            payload.device_id,
+            f"[{now}] 更新邮箱 | @{username} email {old_email or '(空)'} → {new_email}"
+            + (f"；已清空 api" if api_will_clear else ""),
+        )
+        return {
+            "code": 0,
+            "msg": "已更新邮箱信息",
+            "username": username,
+            "email": new_email,
+            "email_password": new_email_password,
+            "old_email": old_email,
+            "old_email_password": old_email_password,
+            "api_cleared": api_will_clear,
+            "mail_module_code_available": mail_ok,
+            "updated": True,
         }
     finally:
         conn.close()

@@ -682,6 +682,22 @@
                 android:layout_marginTop="10dp"
                 android:text="从新邮箱中取验证码" />
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/updateAccountEmailFromIssuedButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="用新邮箱更新下拉账号" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="改邮完成后：把上方下发的邮箱/密码写入「手动任务」下拉选中账号的云端记录（先弹窗确认）。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="12sp" />
+
             <TextView
                 android:id="@+id/issuedNewEmailStatusText"
                 android:layout_width="match_parent"

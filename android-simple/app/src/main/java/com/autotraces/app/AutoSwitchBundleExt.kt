@@ -85,6 +85,39 @@ object AutoSwitchBundleHolder {
         refreshFromPlan()
     }
 
+    /** 改邮后同步内存/落盘 bundle 中对应账号的邮箱凭据，避免自治回退仍用旧邮箱。 */
+    fun notifyAccountEmailUpdated(
+        username: String,
+        email: String,
+        emailPassword: String,
+        clearApi: Boolean = true,
+        mailModuleCodeAvailable: Boolean? = null,
+    ) {
+        val uname = username.trim().removePrefix("@")
+        if (uname.isEmpty()) return
+        val current = bundle ?: return
+        val accounts = current.accounts.orEmpty()
+        if (accounts.isEmpty()) return
+        var changed = false
+        val nextAccounts = accounts.map { acc ->
+            val u = acc.username?.trim()?.removePrefix("@").orEmpty()
+            if (!u.equals(uname, ignoreCase = true)) {
+                acc
+            } else {
+                changed = true
+                acc.copy(
+                    email = email.trim().takeIf { it.isNotEmpty() },
+                    email_password = emailPassword,
+                    api = if (clearApi) null else acc.api,
+                    mail_module_code_available = mailModuleCodeAvailable
+                        ?: (email.trim().isNotEmpty()),
+                )
+            }
+        }
+        if (!changed) return
+        setBundle(current.copy(accounts = nextAccounts))
+    }
+
     private fun refreshFromPlan() {
         val current = bundle ?: return
         bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(current)

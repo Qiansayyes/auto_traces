@@ -67,6 +67,37 @@ object ManualDeviceControl {
         return true
     }
 
+    /** 本机缓存同步云端邮箱字段（改邮后 update_email 成功回调）。 */
+    fun updateCachedAccountEmail(
+        username: String,
+        email: String,
+        emailPassword: String,
+        clearApi: Boolean = true,
+        mailModuleCodeAvailable: Boolean? = null,
+    ): Boolean {
+        val key = username.trim().removePrefix("@").lowercase()
+        if (key.isEmpty()) return false
+        val current = getCachedAccounts()
+        var changed = false
+        val next = current.map { opt ->
+            if (opt.username.trim().removePrefix("@").lowercase() != key) {
+                opt
+            } else {
+                changed = true
+                opt.copy(
+                    email = email.trim(),
+                    emailPassword = emailPassword,
+                    api = if (clearApi) "" else opt.api,
+                    mailModuleCodeAvailable = mailModuleCodeAvailable
+                        ?: (email.trim().isNotEmpty()),
+                )
+            }
+        }
+        if (!changed) return false
+        updateCachedAccounts(next)
+        return true
+    }
+
     fun getCachedAccounts(): List<AccountOption> {
         val mem = cachedAccounts.get()
         if (mem.isNotEmpty()) return mem
