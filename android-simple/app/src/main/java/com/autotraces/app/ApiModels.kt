@@ -464,6 +464,10 @@ data class DeviceAssignedAccountItem(
     val backup_status: String? = null,
     val switch_highlight: String? = null,
     val env_status: String? = null,
+    /** true=不参加自动切号；false/null=参加。 */
+    val auto_switch_excluded: Boolean? = null,
+    /** 云端 password/email/email_password 标 banned。 */
+    val looks_banned: Boolean? = null,
 )
 
 /** GET /api/device/assigned_accounts */
@@ -472,6 +476,54 @@ data class DeviceAssignedAccountsResponse(
     val msg: String? = null,
     val items: List<DeviceAssignedAccountItem>? = null,
     val count: Int? = null,
+)
+
+/** POST /api/device/assigned_account/set_auto_switch_excluded */
+data class DeviceAssignedAccountSetAutoSwitchExcludedRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+    val excluded: Boolean,
+)
+
+data class DeviceAssignedAccountSetAutoSwitchExcludedResponse(
+    val code: Int,
+    val msg: String? = null,
+    val username: String? = null,
+    val excluded: Boolean? = null,
+    val participating: Boolean? = null,
+    val updated_rows: Int? = null,
+    val row_index: Int? = null,
+    val alias: String? = null,
+    val bucket_size: Int? = null,
+    val plan_regenerated: Boolean? = null,
+    val devices_notified: Int? = null,
+    val devices_disabled: Int? = null,
+)
+
+/** POST /api/device/assigned_accounts/sync_auto_switch_participation */
+data class DeviceAssignedAccountsSyncParticipationRequest(
+    val device_id: String,
+    val alias: String,
+    /** null=不改账号参与标记；非 null（含空列表）=按名单全量同步。 */
+    val participate_usernames: List<String>? = null,
+    val enable_device_auto_switch: Boolean? = null,
+)
+
+data class DeviceAssignedAccountsSyncParticipationResponse(
+    val code: Int,
+    val msg: String? = null,
+    val alias: String? = null,
+    val requested_participate: List<String>? = null,
+    val updated_rows: Int? = null,
+    val unchanged_rows: Int? = null,
+    val set_participate: List<String>? = null,
+    val set_exclude: List<String>? = null,
+    val bucket_size: Int? = null,
+    val plan_regenerated: Boolean? = null,
+    val devices_notified: Int? = null,
+    val devices_disabled: Int? = null,
+    val device_auto_switch: Map<String, Any>? = null,
 )
 
 data class DeviceAssignedAccountMarkLoginRequest(

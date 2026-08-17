@@ -190,6 +190,13 @@
           </div>
         </div>
         <p id="startHint" class="hint toolbar-hint">请选择在线设备后再启动。开启「自动起号策略」后，已绑定且未暂停、且未选择退出的设备会在 App 轮询到策略时自行拉起后台（无需每次点启动）。</p>
+        <div class="panel-card" style="margin-top:10px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <h3 style="margin:0;">发作品执行汇总</h3>
+            <small style="color:#666;">点击「发布作品」后，等待各设备跑完并在此汇总成败</small>
+          </div>
+          <pre id="publishPostBatchLogs" style="white-space:pre-wrap;max-height:220px;overflow:auto;margin-top:10px;">暂无汇总</pre>
+        </div>
         <div class="cards">
           <div class="card">
             <h3>在线设备</h3>
@@ -596,7 +603,7 @@
       <section id="tiktok-stats" class="panel">
         <header>
           <h2>TikTok数据查询</h2>
-          <p>输入用户名后，从主页内嵌 Universal 解析与项目根目录 <code>autoSearch_5.28_with_debug.py</code> 中 <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。结果顶部摘要含 <code>profile_following_visibility</code>（<code>followingVisibility</code>，1=公开）与 <code>following_list_hidden_guess</code>（非 1 表示关注列表对他人隐藏）。<strong>默认仅展示该快照 JSON</strong>；需排查壳页时再勾选「附带原始 HTTP」。Cookie 默认自动读取项目根目录或 <code>server/</code> 下的 <code>tiktok_cookies.json</code>；也可用环境变量 <code>TIKTOK_COOKIES_FILE</code>；<code>TIKTOK_SKIP_COOKIE=1</code> 可强制不带 Cookie。</p>
+          <p>输入用户名后，从主页内嵌 Universal 解析与项目根目录 <code>autoSearch_5.28_with_debug.py</code> 中 <code>extract_tiktok_universal_profile_snapshot</code> 一致的字段（仅返回结果，不写数据库）。也可上传 xlsx（首列为 <code>username</code>，首行为列名），按行查询并把 <code>粉丝量</code> / <code>关注数</code> / <code>总赞</code> / <code>视频数</code> / <code>点赞量</code> 写回表格（缺列则自动创建）。批量查询时结果区不再展示快照 JSON。Cookie 默认自动读取项目根目录或 <code>server/</code> 下的 <code>tiktok_cookies.json</code>。</p>
         </header>
         <div class="split">
           <div class="panel-card">
@@ -612,6 +619,15 @@
               </label>
             </div>
             <button id="fetchTiktokStats" class="primary">查询 TikTok 数据</button>
+            <div class="field" style="margin-top:16px;">
+              <label>批量查询表格（xlsx，首列为 username）</label>
+              <input id="statsXlsxFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
+              <div id="statsXlsxHint" class="hint" style="margin-top:6px;">点击下方按钮选择表格，上传后将从第一行数据开始查询，并把五项指标写回表格</div>
+            </div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
+              <button id="fetchTiktokStatsXlsx" class="primary" type="button">上传表格并查询</button>
+              <button id="downloadTiktokStatsXlsx" class="ghost" type="button" disabled>下载写回表格</button>
+            </div>
           </div>
           <div class="panel-card">
             <h3>返回结果</h3>
@@ -1666,6 +1682,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260708-1"></script>
+  <script src="app.js?v=20260817-1"></script>
 </body>
 </html>

@@ -2,7 +2,7 @@ package com.autotraces.app
 
 /**
  * 发作品流程分两阶段：
- * 1. 素材准备（清图库 / PC 拉取）——不阻塞涨粉；
+ * 1. 素材准备（清图库 / PC 拉取）——云端自治下可不阻塞涨粉；**本机手动模式**在按钮入队时已抢占停涨粉；
  * 2. 素材就绪后的 TikTok 发布独占阶段——暂停涨粉。
  */
 object PublishPostGrowthGate {

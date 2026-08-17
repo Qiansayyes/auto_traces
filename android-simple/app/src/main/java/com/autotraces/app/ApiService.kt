@@ -191,6 +191,51 @@ object ApiService {
         clazz = DeviceAssignedAccountsResponse::class.java,
     )
 
+    /**
+     * 含「不参加自动切号」账号，供切换到云端模式前挑选参与名单。
+     * include_banned=1 时附带 banned 账号（UI 只展示、不可选）。
+     */
+    suspend fun getDeviceAssignedAccountsRoster(
+        deviceId: String,
+        alias: String,
+    ): DeviceAssignedAccountsResponse = get(
+        path = "/api/device/assigned_accounts?device_id=${encode(deviceId)}&alias=${encode(alias)}" +
+            "&include_excluded=1&include_banned=1",
+        clazz = DeviceAssignedAccountsResponse::class.java,
+    )
+
+    suspend fun setDeviceAssignedAccountAutoSwitchExcluded(
+        deviceId: String,
+        alias: String,
+        username: String,
+        excluded: Boolean,
+    ): DeviceAssignedAccountSetAutoSwitchExcludedResponse = post(
+        path = "/api/device/assigned_account/set_auto_switch_excluded",
+        body = DeviceAssignedAccountSetAutoSwitchExcludedRequest(
+            device_id = deviceId,
+            alias = alias,
+            username = username,
+            excluded = excluded,
+        ),
+        clazz = DeviceAssignedAccountSetAutoSwitchExcludedResponse::class.java,
+    )
+
+    suspend fun syncDeviceAssignedAccountsAutoSwitchParticipation(
+        deviceId: String,
+        alias: String,
+        participateUsernames: List<String>? = null,
+        enableDeviceAutoSwitch: Boolean? = null,
+    ): DeviceAssignedAccountsSyncParticipationResponse = post(
+        path = "/api/device/assigned_accounts/sync_auto_switch_participation",
+        body = DeviceAssignedAccountsSyncParticipationRequest(
+            device_id = deviceId,
+            alias = alias,
+            participate_usernames = participateUsernames,
+            enable_device_auto_switch = enableDeviceAutoSwitch,
+        ),
+        clazz = DeviceAssignedAccountsSyncParticipationResponse::class.java,
+    )
+
     suspend fun fetchRandomGalleryLibraryItem(deviceId: String, alias: String): GalleryLibraryRandomResponse =
         getWithClient(
             longTimeoutClient,

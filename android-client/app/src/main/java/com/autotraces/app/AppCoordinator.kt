@@ -6073,15 +6073,8 @@ object AppCoordinator {
             }
             PrefsStore.setPublishPostQueuedAfterMutual(false)
             LogCenter.op(alias, lineStart)
+            // 不在此处上报 success：网页端需轮询最终发作品成败；启动即 success 会挡住终态回执。
             triggerPublishPostNow(alias)
-            reportDeviceOpToCloud(
-                deviceId = deviceId,
-                alias = alias,
-                opId = opId,
-                status = "success",
-                message = "已收到并发作品入口任务",
-                data = publishPostStartReportData(deviceId, opId, payload, slotKey),
-            )
             return
         }
         if (packageName.isBlank()) {
@@ -7844,6 +7837,54 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * 云端「发布作品」下发的最终回执（非自动切号）。
+     * 网页端轮询 op_result，据此汇总各设备成败。
+     */
+    private suspend fun reportCloudPublishFinalOutcome(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        completed: Boolean,
+        loginFailed: Boolean,
+        message: String,
+        successCount: Int,
+        targetCount: Int,
+    ) {
+        if (opId.isBlank()) return
+        if (PrefsStore.isAutoSwitchAutonomousMode()) return
+        val status = if (completed) "success" else "failed"
+        val summary =
+            if (completed) {
+                "发作品最终结果：成功（$successCount/$targetCount）$message"
+            } else {
+                "发作品最终结果：失败（已成功 $successCount/$targetCount）$message"
+            }
+        runCatching {
+            withContext(Dispatchers.IO) {
+                reportDeviceOpToCloud(
+                    deviceId = deviceId.ifBlank { PrefsStore.getDeviceId().orEmpty() },
+                    alias = alias,
+                    opId = opId,
+                    status = status,
+                    message = summary,
+                    data = mapOf(
+                        "op_type" to "publish_post_start",
+                        "device_id" to deviceId,
+                        "publish_post_outcome_report" to true,
+                        "publish_post_completed" to completed,
+                        "publish_success_count" to successCount.coerceAtLeast(0),
+                        "publish_target_count" to targetCount.coerceAtLeast(0),
+                        "publish_login_failed" to loginFailed,
+                        "operation_logs" to listOf("[OP][$opId] $summary"),
+                    ),
+                )
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "发作品最终结果上报失败：${err.message}")
+        }
+    }
+
     private suspend fun reportAutoSwitchPublishOutcomeIfNeeded(
         alias: String,
         deviceId: String,
@@ -8047,15 +8088,28 @@ object AppCoordinator {
                         "发作品保障自动登录失败",
                     )
                     if (publishOpId.isNotBlank()) {
-                        reportAutoSwitchPublishOutcomeIfNeeded(
-                            alias = alias,
-                            deviceId = deviceIdForPublish,
-                            opId = publishOpId,
-                            completed = false,
-                            loginFailed = true,
-                            accountChanged = false,
-                            message = switchResult,
-                        )
+                        if (PrefsStore.isAutoSwitchPublishTask()) {
+                            reportAutoSwitchPublishOutcomeIfNeeded(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = true,
+                                accountChanged = false,
+                                message = switchResult,
+                            )
+                        } else {
+                            reportCloudPublishFinalOutcome(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = true,
+                                message = switchResult,
+                                successCount = 0,
+                                targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
+                            )
+                        }
                     }
                     LogCenter.op(alias, switchResult)
                     updateRuntime(lastMessage = switchResult)
@@ -8070,6 +8124,16 @@ object AppCoordinator {
                 )
             }
             val publishCompleted = switchResult.contains("已完成") && !publishLoginFailed
+            val accountKeyForCount =
+                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
+            val targetCount = PrefsStore.getPublishPostTargetCount() ?: 0
+            val successCount = when {
+                publishCompleted -> {
+                    val actual = PrefsStore.peekPublishPostLastActualSuccessCount()
+                    if (actual > 0) actual else targetCount
+                }
+                else -> PrefsStore.getPublishPostResumeNextIndex(accountKeyForCount).coerceAtLeast(0)
+            }
             if (autoSwitchPublishAtStart && publishOpId.isNotBlank()) {
                 reportAutoSwitchPublishOutcomeIfNeeded(
                     alias = alias,
@@ -8090,6 +8154,17 @@ object AppCoordinator {
                     loginFailed = publishLoginFailed,
                     accountChanged = false,
                     message = switchResult,
+                )
+            } else if (publishOpId.isNotBlank() && deviceIdForPublish.isNotBlank()) {
+                reportCloudPublishFinalOutcome(
+                    alias = alias,
+                    deviceId = deviceIdForPublish,
+                    opId = publishOpId,
+                    completed = publishCompleted,
+                    loginFailed = publishLoginFailed,
+                    message = switchResult,
+                    successCount = successCount,
+                    targetCount = targetCount,
                 )
             }
             LogCenter.op(alias, switchResult)

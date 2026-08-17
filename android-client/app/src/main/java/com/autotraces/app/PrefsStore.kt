@@ -624,6 +624,9 @@ object PrefsStore {
             .apply()
     }
 
+    fun peekPublishPostLastActualSuccessCount(): Int =
+        prefs.getInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, 0).coerceAtLeast(0)
+
     fun getAndClearPublishPostLastActualSuccessCount(): Int {
         val v = prefs.getInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, 0).coerceAtLeast(0)
         if (v > 0) {

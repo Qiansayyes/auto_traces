@@ -45,6 +45,10 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                 session.method == Method.POST && session.uri.startsWith("/api/v1/tasks/") && session.uri.endsWith("/retry") -> handleRetry(session)
                 session.method == Method.POST && session.uri == "/api/v1/adb/prepare" -> handleAdbPrepare(session)
                 session.method == Method.GET && session.uri == "/api/v1/system/memory" -> handleSystemMemory(session)
+                session.method == Method.GET && session.uri == "/api/v1/simple/status" ->
+                    jsonResponse(200, SimpleRemoteControl.buildStatus())
+                session.method == Method.POST && session.uri == "/api/v1/simple/action" -> handleSimpleAction(session)
+                session.method == Method.POST && session.uri == "/api/v1/worker/start" -> handleWorkerStart(session)
                 else -> jsonResponse(404, errorJson("not_found"))
             }
         } catch (t: Throwable) {
@@ -250,6 +254,23 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                 .put("tcpEnabled", result.tcpEnabled)
                 .put("detail", result.detail),
         )
+    }
+
+    private fun handleSimpleAction(session: IHTTPSession): Response {
+        val body = JSONObject(readBody(session))
+        // 业务成败看 JSON success；HTTP 恒为 200，便于 PC 经 USB forward 解析 message。
+        return jsonResponse(200, SimpleRemoteControl.handleAction(context.applicationContext, body))
+    }
+
+    /** 兼容 video_ded 批量「启动后台服务」：转发到 simple 遥控 start_service。 */
+    private fun handleWorkerStart(session: IHTTPSession): Response {
+        val body = JSONObject(readBody(session))
+        val reason = body.optString("reason", "").trim().ifEmpty { "PC 批量启动后台服务" }
+        val result = SimpleRemoteControl.handleAction(
+            context.applicationContext,
+            JSONObject().put("action", "start_service").put("reason", reason),
+        )
+        return jsonResponse(200, result)
     }
 
     private fun handleRetry(session: IHTTPSession): Response {

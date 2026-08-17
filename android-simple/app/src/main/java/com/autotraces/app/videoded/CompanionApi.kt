@@ -22,6 +22,12 @@ import java.util.concurrent.TimeUnit
 object CompanionApi {
     private const val TAG = "CompanionApi"
     private const val PREFS = "video_ded_embedded"
+    private const val USB_LOOPBACK_BASE = "http://127.0.0.1:5088"
+    private const val BASE_URL_CACHE_MS = 15_000L
+
+    private val baseUrlCacheLock = Any()
+    @Volatile private var cachedBaseUrl: String? = null
+    @Volatile private var cachedAtMs: Long = 0L
 
     /** 与外部业务（如 adb 统计相册图片）对齐的素材落盘目录。 */
     const val DEFAULT_MATERIAL_STORAGE_PATH = "/storage/emulated/0/Pictures"
@@ -167,13 +173,77 @@ object CompanionApi {
         return url
     }
 
+    /**
+     * USB 已 reverse 时优先本机 127.0.0.1:5088，否则回退 [windowsBaseUrl]。
+     * 多机各自 reverse，互不串隧道；素材隔离仍靠 deviceId / taskId。
+     */
+    fun resolveBaseUrl(context: Context): String {
+        val now = System.currentTimeMillis()
+        synchronized(baseUrlCacheLock) {
+            val cached = cachedBaseUrl
+            if (cached != null && now - cachedAtMs < BASE_URL_CACHE_MS) {
+                return cached
+            }
+        }
+        val usb = if (probeUsbLoopbackCompanion()) USB_LOOPBACK_BASE else null
+        val resolved = usb ?: windowsBaseUrl(context).trim().trimEnd('/')
+        synchronized(baseUrlCacheLock) {
+            cachedBaseUrl = resolved
+            cachedAtMs = now
+        }
+        if (usb != null) {
+            Log.i(TAG, "resolveBaseUrl using USB loopback $USB_LOOPBACK_BASE")
+        } else {
+            Log.d(TAG, "resolveBaseUrl using LAN $resolved")
+        }
+        return resolved
+    }
+
+    fun invalidateBaseUrlCache() {
+        synchronized(baseUrlCacheLock) {
+            cachedBaseUrl = null
+            cachedAtMs = 0L
+        }
+    }
+
+    private fun probeUsbLoopbackCompanion(): Boolean {
+        return try {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(800, TimeUnit.MILLISECONDS)
+                .readTimeout(1200, TimeUnit.MILLISECONDS)
+                .writeTimeout(800, TimeUnit.MILLISECONDS)
+                .callTimeout(2, TimeUnit.SECONDS)
+                .build()
+            val request = Request.Builder().url("$USB_LOOPBACK_BASE/health").get().build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return false
+                val body = response.body?.string().orEmpty()
+                body.contains("video_ded", ignoreCase = true) || body.contains("\"ok\"", ignoreCase = true)
+            }
+        } catch (t: Throwable) {
+            Log.d(TAG, "probeUsbLoopbackCompanion miss: ${t.message}")
+            false
+        }
+    }
+
     fun setWindowsBaseUrl(context: Context, value: String) {
         val normalized = value.trim().trimEnd('/')
         Log.d(TAG, "setWindowsBaseUrl=$normalized")
+        invalidateBaseUrlCache()
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString("windows_base_url", normalized)
             .apply()
+    }
+
+    /** PC 已 adb push 到 targetPath 时，校验本地文件是否与任务一致。 */
+    fun localFileMatches(expected: TaskFileInfo, file: File): Boolean {
+        return try {
+            verifyFile(file, expected)
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun deviceFolder(context: Context): File {
@@ -214,7 +284,7 @@ object CompanionApi {
             hardwareKey = hardwareKey(context),
             groupName = getBackendGroupName(context),
         )
-        val url = "${windowsBaseUrl(context)}/api/devices/register"
+        val url = "${resolveBaseUrl(context)}/api/devices/register"
         Log.d(TAG, "ensureRegistered -> $url request=$request")
         val reg = org.json.JSONObject(postJson(url, request))
         adoptCanonicalDeviceId(context, reg)
@@ -233,7 +303,7 @@ object CompanionApi {
         ensureRegistered(context)
         val resolved = resolvedTargetPath(targetPath)
         val req = CreateTaskRequest(deviceId(context), count, resolved)
-        val url = "${windowsBaseUrl(context)}/api/tasks/create"
+        val url = "${resolveBaseUrl(context)}/api/tasks/create"
         Log.d(TAG, "createTask -> $url count=$count targetPath=$resolved request=$req")
         val raw =
             try {
@@ -340,7 +410,7 @@ object CompanionApi {
         val resolvedTarget = target?.trim().orEmpty().ifEmpty {
             if (ip != null) "$ip:$port" else ""
         }
-        val url = "${windowsBaseUrl(context)}/api/mirror/start"
+        val url = "${resolveBaseUrl(context)}/api/mirror/start"
         val req = mutableMapOf<String, Any>(
             "autoConnectOnly" to true,
             "autoAuthorize" to true,
@@ -356,7 +426,7 @@ object CompanionApi {
     }
 
     suspend fun getTaskStatus(context: Context, taskId: String): TaskStatusResponse = withContext(Dispatchers.IO) {
-        val url = "${windowsBaseUrl(context)}/api/tasks/$taskId"
+        val url = "${resolveBaseUrl(context)}/api/tasks/$taskId"
         Log.d(TAG, "getTaskStatus -> $url taskId=$taskId")
         val raw = get(url)
         Log.d(TAG, "getTaskStatus <- response=$raw")
@@ -364,7 +434,7 @@ object CompanionApi {
     }
 
     suspend fun fetchTaskDetail(context: Context, taskId: String): PcTaskDetailDto? = withContext(Dispatchers.IO) {
-        val url = "${windowsBaseUrl(context)}/api/tasks/$taskId"
+        val url = "${resolveBaseUrl(context)}/api/tasks/$taskId"
         Log.d(TAG, "fetchTaskDetail -> $url")
         val raw = runCatching { get(url) }.getOrElse {
             Log.w(TAG, "fetchTaskDetail failed: ${it.message}")
@@ -378,7 +448,7 @@ object CompanionApi {
 
     suspend fun ackTask(context: Context, taskId: String, success: Boolean, message: String? = null, files: List<TaskFileAck> = emptyList()) = withContext(Dispatchers.IO) {
         val req = TaskAckRequest(success, message, files)
-        val url = "${windowsBaseUrl(context)}/api/tasks/$taskId/ack"
+        val url = "${resolveBaseUrl(context)}/api/tasks/$taskId/ack"
         Log.d(TAG, "ackTask -> $url success=$success message=$message files=${files.size}")
         postJson(url, req)
     }
@@ -418,7 +488,7 @@ object CompanionApi {
     }
 
     private suspend fun downloadFileOnce(context: Context, taskId: String, fileName: String, destination: File) = withContext(Dispatchers.IO) {
-        val url = "${windowsBaseUrl(context)}/api/tasks/$taskId/download/$fileName"
+        val url = "${resolveBaseUrl(context)}/api/tasks/$taskId/download/$fileName"
         Log.d(TAG, "downloadFileOnce -> $url destination=${destination.absolutePath}")
         val request = Request.Builder()
             .url(url)

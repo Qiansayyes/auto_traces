@@ -11362,7 +11362,7 @@ class RealTraceExecutor(
      * 新任务（无续发断点）时：**必须**先清理图库（Pictures + Camera 相册）→ 再按运行配置拉素材 → 再统计 `Pictures` 并发作品；
      * **全部成功后不删图库**（素材保留至下次新任务开始前清理）。
      * 禁止用 `materialReady` 跳过清库：进程被杀/硬停后标记仍可能为 true，旧视频会污染下一次发作品。
-     * 素材准备阶段不暂停涨粉；图库确认有可用素材后才进入发布独占阶段（暂停涨粉并执行 TikTok 发布）。
+     * 素材准备阶段：云端自治可不暂停涨粉；本机手动模式由 AppCoordinator 按钮抢占先行停涨粉。图库确认有可用素材后才进入发布独占阶段（暂停涨粉并执行 TikTok 发布）。
      * 进入发布独占前、以及同条重试前都会复检图库数量；不足则补拉（避免并发清库把素材删掉后仍按「已就绪」空跑）。
      * 中途失败时 [PrefsStore] 记录已成功条数，**仅在同一次云端 publish_post_start 指令内**从对应图库坐标序号续发（不逐个删素材文件；续发不重复清理/拉取）。
      * 用户硬停或收到新的发作品指令时清除断点；断点不可跨指令复用。
@@ -12831,7 +12831,13 @@ class RealTraceExecutor(
                     },
                 ),
             )
-            TaskDownloadWorkflow.downloadVerifyAndAck(app, task.taskId, task.files, targetPath)
+            TaskDownloadWorkflow.downloadVerifyAndAck(
+                app,
+                task.taskId,
+                task.files,
+                targetPath,
+                adbPushed = task.adbPushed == true,
+            )
             val stats = publishPostResolveGalleryMaterialStats()
             devOp(
                 alias,

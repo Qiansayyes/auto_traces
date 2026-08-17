@@ -185,6 +185,13 @@ _batch_stream_session_lock = Lock()
 _batch_stream_sessions: Dict[str, Dict[str, Any]] = {}
 _batch_stream_device_active: Dict[str, str] = {}
 
+TIKTOK_STATS_XLSX_DIR = BASE_DIR / "tiktok_stats_xlsx_sessions"
+with contextlib.suppress(Exception):
+    TIKTOK_STATS_XLSX_DIR.mkdir(parents=True, exist_ok=True)
+TIKTOK_STATS_XLSX_METRIC_HEADERS = ("粉丝量", "关注数", "总赞", "视频数", "点赞量")
+_tiktok_stats_xlsx_lock = Lock()
+_tiktok_stats_xlsx_sessions: Dict[str, Dict[str, Any]] = {}
+
 BATCH_STREAM_HEADER_ALIASES: Dict[str, tuple[str, ...]] = {
     "username": ("username", "用户名", "user"),
     "password": ("password", "密码", "tiktok_password"),
@@ -3817,6 +3824,12 @@ class TikTokProfileStatsRequest(BaseModel):
     query_total: int | None = Field(default=None, ge=1)
 
 
+class TikTokStatsXlsxQueryRowRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=80)
+    sheet_row: int = Field(..., ge=2)
+    include_raw: bool = False
+
+
 class LiveCustomerImportResponse(BaseModel):
     inserted: int
     total_rows: int
@@ -4123,6 +4136,23 @@ class DeviceAssignedAccountMarkBannedRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
     alias: str = Field(..., min_length=1, max_length=64)
     username: str = Field(..., min_length=1, max_length=128)
+
+
+class DeviceAssignedAccountAutoSwitchExcludedRequest(DeviceAuthModel):
+    """设备端：按 username 设置是否「不参加自动切号」(auto_switch_excluded)。"""
+    username: str = Field(..., min_length=1, max_length=128)
+    excluded: bool = False
+
+
+class DeviceAssignedAccountsSyncParticipationRequest(DeviceAuthModel):
+    """设备端：按挑选名单同步自动切号参与状态。
+
+    participate_usernames 非 null 时：名单内 → excluded=0，同桶其余 → excluded=1；
+    为 null 时不改账号标记（仅用于切回手动时关设备自动切号）。
+    enable_device_auto_switch 非空时同步本设备 client_devices.auto_switch_enabled。
+    """
+    participate_usernames: list[str] | None = None
+    enable_device_auto_switch: bool | None = None
 
 
 class DeviceAssignedAccountUpdateUsernameRequest(DeviceAuthModel):
@@ -10566,29 +10596,45 @@ def device_gallery_library_random(device_id: str, alias: str):
 
 
 def _fetch_device_assigned_accounts_list(
-    conn: sqlite3.Connection, owner_username: str, alias: str
+    conn: sqlite3.Connection,
+    owner_username: str,
+    alias: str,
+    *,
+    include_excluded: bool = False,
+    include_banned: bool = False,
 ) -> list[dict[str, Any]]:
     """当前设备别名桶内全部账号（含凭据 / 登录态 / 备份字段），供手动切号下拉。
 
-    排除云端「不参加自动切号」(auto_switch_excluded=1) 以及 password/email/email_password=banned 的账号，
+    默认排除云端「不参加自动切号」(auto_switch_excluded=1) 以及 password/email/email_password=banned 的账号，
     与自动切号周计划桶一致。
+    include_excluded=True 时保留 excluded 账号并返回 auto_switch_excluded 字段（供切换 client 前挑选）。
     """
     owner = str(owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     if not owner or not alias_key:
         return []
-    dev_rows = conn.execute(
+    if include_excluded:
+        sql = """
+            SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
+                   backup_path, backup_name, backup_time, backup_status, env_status,
+                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ?
+              AND TRIM(username) <> ''
+            ORDER BY row_index ASC
         """
-        SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
-               backup_path, backup_name, backup_time, backup_status, env_status
-        FROM device_editor_rows
-        WHERE owner_username = ?
-          AND TRIM(username) <> ''
-          AND COALESCE(auto_switch_excluded, 0) = 0
-        ORDER BY row_index ASC
-        """,
-        (owner,),
-    ).fetchall()
+    else:
+        sql = """
+            SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
+                   backup_path, backup_name, backup_time, backup_status, env_status,
+                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ?
+              AND TRIM(username) <> ''
+              AND COALESCE(auto_switch_excluded, 0) = 0
+            ORDER BY row_index ASC
+        """
+    dev_rows = conn.execute(sql, (owner,)).fetchall()
     matched = [
         dict(r)
         for r in dev_rows
@@ -10610,12 +10656,13 @@ def _fetch_device_assigned_accounts_list(
             continue
         seen.add(uname_key)
         fields = _account_bundle_fields_for_username(conn, owner, username)
-        # password/email/email_password=banned：不下发给设备（与周计划排除一致）
-        if _account_row_looks_banned(
+        looks_banned = _account_row_looks_banned(
             fields.get("password"),
             fields.get("email"),
             fields.get("email_password"),
-        ):
+        )
+        # password/email/email_password=banned：默认不下发（与周计划排除一致）
+        if looks_banned and not include_banned:
             continue
         items.append(
             {
@@ -10636,23 +10683,148 @@ def _fetch_device_assigned_accounts_list(
                 "backup_status": str(pick.get("backup_status") or "").strip(),
                 "switch_highlight": _normalize_switch_highlight(pick.get("switch_highlight")),
                 "env_status": str(pick.get("env_status") or "").strip(),
+                "auto_switch_excluded": bool(int(pick.get("auto_switch_excluded") or 0)),
+                "looks_banned": bool(looks_banned),
             }
         )
     return items
 
 
+def _apply_device_auto_switch_enabled_for_device(
+    device_id: str,
+    enabled: bool,
+    *,
+    force_resync_if_already_on: bool = False,
+) -> dict[str, Any]:
+    """设备端切换运行模式时同步本机 auto_switch_enabled（开/关各发一次 enter/exit）。
+
+    已是目标状态时：默认幂等返回；force_resync_if_already_on=True 且目标为开时，
+    仍投递一次 enter（供 APP 从手动切到云端时本地尚未进入自治也能拉到 bundle）。
+    """
+    did = str(device_id or "").strip()
+    if not did:
+        return {"changed": False, "notified": False, "session_id": "", "bundle_revision": 0}
+    if not store.devices.get(did):
+        _hydrate_device_from_db(did)
+    target_enabled = bool(enabled)
+    session_id = _new_auto_switch_session_id(entering=target_enabled)
+    bundle_revision = 0
+
+    turning_on = False
+    turning_off = False
+    resync_bundle = False
+    owner = ""
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return {"changed": False, "notified": False, "session_id": session_id, "bundle_revision": 0}
+        owner = str(dev.owner_username or "").strip()
+        was_enabled = bool(dev.auto_switch_enabled)
+        if was_enabled == target_enabled:
+            if target_enabled and force_resync_if_already_on:
+                resync_bundle = True
+            else:
+                return {
+                    "changed": False,
+                    "notified": False,
+                    "session_id": session_id,
+                    "bundle_revision": 0,
+                    "enabled": bool(target_enabled),
+                }
+        else:
+            dev.auto_switch_enabled = target_enabled
+            turning_on = target_enabled and not was_enabled
+            turning_off = (not target_enabled) and was_enabled
+
+    if target_enabled and (turning_on or resync_bundle):
+        with store.lock:
+            store.auto_switch_bundle_revision = int(store.auto_switch_bundle_revision or 0) + 1
+            bundle_revision = int(store.auto_switch_bundle_revision)
+        persist_runtime_state()
+        _persist_auto_switch_session_row(session_id, enabled=True, bundle_revision=bundle_revision)
+    elif turning_off:
+        _persist_auto_switch_session_row(session_id, enabled=False, bundle_revision=0)
+
+    if turning_on or turning_off:
+        _persist_client_device_to_db(did, force=True)
+    notified = False
+    if turning_on or resync_bundle:
+        closed_sessions = _close_active_auto_switch_enter_sessions_for_device(
+            did, except_session_id=session_id
+        )
+        if closed_sessions > 0:
+            _auto_switch_log(
+                f"设备端模式切换：关闭 {closed_sessions} 个陈旧 enter session device={did}"
+            )
+        superseded = _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+        if superseded > 0:
+            _auto_switch_log(
+                f"设备端模式切换：作废 {superseded} 条待投递 exit 事件 device={did}"
+            )
+        if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
+            notified = True
+            with store.lock:
+                store.auto_switch_align_on_next_tick = True
+            _append_device_log(
+                did,
+                f"[{now_text()}] 自动切号 | 设备端切换到云端模式已开启/重同步 session={session_id}",
+            )
+    elif turning_off:
+        closed_sessions = _close_active_auto_switch_enter_sessions_for_device(did)
+        if closed_sessions > 0:
+            _auto_switch_log(
+                f"设备端模式切换：关闭时结束 {closed_sessions} 个活跃 enter session device={did}"
+            )
+        superseded = _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+        if superseded > 0:
+            _auto_switch_log(
+                f"设备端模式切换：作废 {superseded} 条待投递 enter 事件 device={did}"
+            )
+        _cancel_pending_auto_switch_device_ops_for_device(did)
+        if _enqueue_device_mode_event(did, owner, "auto_switch_exit", session_id, bundle_revision=0):
+            notified = True
+            _append_device_log(
+                did,
+                f"[{now_text()}] 自动切号 | 设备端切回本机手动已关闭 session={session_id}",
+            )
+    return {
+        "changed": bool(turning_on or turning_off),
+        "notified": bool(notified),
+        "session_id": session_id,
+        "bundle_revision": int(bundle_revision or 0),
+        "enabled": bool(target_enabled),
+        "resynced": bool(resync_bundle),
+    }
+
+
 @app.get("/api/device/assigned_accounts")
-def device_assigned_accounts(device_id: str, alias: str):
-    """设备端：拉取当前别名桶下全部已分配账号（手动切号下拉 / 刷新账号信息）。"""
+def device_assigned_accounts(
+    device_id: str,
+    alias: str,
+    include_excluded: int = 0,
+    include_banned: int = 0,
+):
+    """设备端：拉取当前别名桶下全部已分配账号（手动切号下拉 / 刷新账号信息）。
+
+    include_excluded=1 时包含「不参加自动切号」账号，并返回 auto_switch_excluded。
+    """
     error, device = auth_or_error(device_id, alias)
     if error:
         return error
     owner = str(getattr(device, "owner_username", "") or "").strip()
     if not owner:
         return {"code": 1, "msg": "设备未关联管理账号"}
+    want_excluded = int(include_excluded or 0) == 1
+    want_banned = int(include_banned or 0) == 1
     conn = _get_db()
     try:
-        items = _fetch_device_assigned_accounts_list(conn, owner, alias)
+        items = _fetch_device_assigned_accounts_list(
+            conn,
+            owner,
+            alias,
+            include_excluded=want_excluded,
+            include_banned=want_banned,
+        )
         if not items:
             return {
                 "code": 1,
@@ -10662,6 +10834,214 @@ def device_assigned_accounts(device_id: str, alias: str):
         return {"code": 0, "msg": "ok", "items": items, "count": len(items)}
     finally:
         conn.close()
+
+
+@app.post("/api/device/assigned_account/set_auto_switch_excluded")
+def device_assigned_account_set_auto_switch_excluded(
+    payload: DeviceAssignedAccountAutoSwitchExcludedRequest,
+):
+    """设备端：将单个账号设为参与 / 不参与自动切号。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    username = str(payload.username or "").strip().lstrip("@")
+    alias_key = _normalize_alias_key(payload.alias)
+    if not owner or not username or not alias_key:
+        return {"code": 1, "msg": "参数无效"}
+    excluded_i = 1 if bool(payload.excluded) else 0
+    now = now_text()
+    updated_rows = 0
+    affected_aliases: set[str] = set()
+    matched_row_index: int | None = None
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias, auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            ORDER BY row_index ASC
+            """,
+            (owner, username),
+        ).fetchall()
+        if not rows:
+            return {"code": 1, "msg": "未找到对应设备账号记录"}
+        for row in rows:
+            item = {
+                "row_index": int(row["row_index"] or 0),
+                "username": str(row["username"] or "").strip(),
+                "assigned_alias": str(row["assigned_alias"] or "").strip(),
+                "device_alias": str(row["device_alias"] or "").strip(),
+            }
+            row_alias = _device_editor_effective_alias(item)
+            if _normalize_alias_key(row_alias) != alias_key:
+                continue
+            matched_row_index = int(item["row_index"])
+            affected_aliases.add(alias_key)
+            if int(row["auto_switch_excluded"] or 0) == excluded_i:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET auto_switch_excluded = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (excluded_i, now, owner, matched_row_index),
+            )
+            if int(cur.rowcount or 0) > 0:
+                updated_rows += 1
+        if matched_row_index is None:
+            return {"code": 1, "msg": "该账号不属于当前设备别名桶"}
+        if updated_rows > 0:
+            conn.commit()
+    finally:
+        conn.close()
+
+    plan_info = _refresh_auto_switch_plans_for_alias(owner, alias_key)
+    sync_info = _resync_auto_switch_devices_for_alias(
+        owner, alias_key, int(plan_info.get("bucket_size") or 0)
+    )
+    if updated_rows > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+    return {
+        "code": 0,
+        "msg": "自动切号参与状态已更新",
+        "username": username,
+        "excluded": bool(excluded_i),
+        "participating": not bool(excluded_i),
+        "updated_rows": updated_rows,
+        "row_index": matched_row_index,
+        "alias": alias_key,
+        "bucket_size": int(plan_info.get("bucket_size") or 0),
+        "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+        "devices_notified": int(sync_info.get("notified") or 0),
+        "devices_disabled": int(sync_info.get("disabled") or 0),
+    }
+
+
+@app.post("/api/device/assigned_accounts/sync_auto_switch_participation")
+def device_assigned_accounts_sync_auto_switch_participation(
+    payload: DeviceAssignedAccountsSyncParticipationRequest,
+):
+    """设备端：按挑选结果同步别名桶内全部账号的自动切号参与状态。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    alias_key = _normalize_alias_key(payload.alias)
+    did = str(payload.device_id or "").strip()
+    if not owner or not alias_key or not did:
+        return {"code": 1, "msg": "参数无效"}
+
+    update_accounts = payload.participate_usernames is not None
+    want_enable = payload.enable_device_auto_switch
+    if not update_accounts and want_enable is None:
+        return {"code": 1, "msg": "未指定要同步的参与名单或设备开关"}
+
+    participate_keys: set[str] = set()
+    participate_names: list[str] = []
+    if update_accounts:
+        for raw in payload.participate_usernames or []:
+            name = str(raw or "").strip().lstrip("@")
+            if not name:
+                continue
+            key = name.lower()
+            if key in participate_keys:
+                continue
+            participate_keys.add(key)
+            participate_names.append(name)
+
+    now = now_text()
+    updated_rows = 0
+    unchanged_rows = 0
+    set_participate: list[str] = []
+    set_exclude: list[str] = []
+    if update_accounts:
+        conn = _get_db()
+        try:
+            rows = conn.execute(
+                """
+                SELECT row_index, username, assigned_alias, device_alias, auto_switch_excluded
+                FROM device_editor_rows
+                WHERE owner_username = ? AND TRIM(username) <> ''
+                ORDER BY row_index ASC
+                """,
+                (owner,),
+            ).fetchall()
+            for row in rows or []:
+                item = {
+                    "row_index": int(row["row_index"] or 0),
+                    "username": str(row["username"] or "").strip(),
+                    "assigned_alias": str(row["assigned_alias"] or "").strip(),
+                    "device_alias": str(row["device_alias"] or "").strip(),
+                }
+                username = item["username"]
+                if not username:
+                    continue
+                if _normalize_alias_key(_device_editor_effective_alias(item)) != alias_key:
+                    continue
+                want_excluded = 0 if username.lower() in participate_keys else 1
+                current = int(row["auto_switch_excluded"] or 0)
+                if current == want_excluded:
+                    unchanged_rows += 1
+                    continue
+                cur = conn.execute(
+                    """
+                    UPDATE device_editor_rows
+                    SET auto_switch_excluded = ?, updated_at = ?
+                    WHERE owner_username = ? AND row_index = ?
+                    """,
+                    (want_excluded, now, owner, int(item["row_index"])),
+                )
+                if int(cur.rowcount or 0) > 0:
+                    updated_rows += 1
+                    if want_excluded:
+                        set_exclude.append(username)
+                    else:
+                        set_participate.append(username)
+            if updated_rows > 0:
+                conn.commit()
+        finally:
+            conn.close()
+
+    # 关设备：先关，避免后续 resync 仍把本机算进已开启列表并误投 enter。
+    device_switch_info: dict[str, Any] | None = None
+    if want_enable is False:
+        device_switch_info = _apply_device_auto_switch_enabled_for_device(did, False)
+
+    plan_info: dict[str, Any] = {"bucket_size": 0, "plan_regenerated": False}
+    sync_info: dict[str, Any] = {"notified": 0, "disabled": 0, "session_id": "", "bundle_revision": 0}
+    if update_accounts:
+        plan_info = _refresh_auto_switch_plans_for_alias(owner, alias_key)
+        sync_info = _resync_auto_switch_devices_for_alias(
+            owner, alias_key, int(plan_info.get("bucket_size") or 0)
+        )
+        if updated_rows > 0:
+            _reset_device_editor_read_maintain_schedule(owner)
+
+    # 开设备：放在账号同步/resync 之后；已开启也强制重投 enter，避免 APP 切模式后本地未进自治。
+    if want_enable is True:
+        device_switch_info = _apply_device_auto_switch_enabled_for_device(
+            did, True, force_resync_if_already_on=True
+        )
+
+    return {
+        "code": 0,
+        "msg": "自动切号参与名单已同步" if update_accounts else "设备自动切号开关已更新",
+        "alias": alias_key,
+        "requested_participate": participate_names,
+        "accounts_updated": bool(update_accounts),
+        "updated_rows": updated_rows,
+        "unchanged_rows": unchanged_rows,
+        "set_participate": set_participate,
+        "set_exclude": set_exclude,
+        "bucket_size": int(plan_info.get("bucket_size") or 0),
+        "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+        "devices_notified": int(sync_info.get("notified") or 0),
+        "devices_disabled": int(sync_info.get("disabled") or 0),
+        "device_auto_switch": device_switch_info,
+    }
 
 
 @app.get("/api/device/assigned_account")
@@ -11314,14 +11694,23 @@ def device_ops_report(payload: DeviceOpReportRequest):
     if error:
         return error
 
-    if _device_op_report_is_duplicate(payload.op_id, payload.status):
-        print(
-            f"[{now_text()}] device_ops.report | duplicate_ignored | op_id={payload.op_id} "
-            f"status={payload.status}"
-        )
-        return {"code": 0, "msg": "重复回报已忽略", "duplicate": True}
-
     data = payload.data or {}
+    if _device_op_report_is_duplicate(payload.op_id, payload.status):
+        existing = _get_device_op_result(payload.op_id) or {}
+        existing_data = existing.get("data") if isinstance(existing, dict) else None
+        was_final = (
+            isinstance(existing_data, dict)
+            and bool(existing_data.get("publish_post_outcome_report"))
+        )
+        is_final = isinstance(data, dict) and bool(data.get("publish_post_outcome_report"))
+        # 发作品：允许「最终结果」覆盖「仅入队/已收到」的早期回执，供网页端汇总成败。
+        if not (is_final and not was_final):
+            print(
+                f"[{now_text()}] device_ops.report | duplicate_ignored | op_id={payload.op_id} "
+                f"status={payload.status}"
+            )
+            return {"code": 0, "msg": "重复回报已忽略", "duplicate": True}
+
     result = {
         "op_id": payload.op_id,
         "status": payload.status,
@@ -15766,6 +16155,278 @@ def tiktok_profile_stats(payload: TikTokProfileStatsRequest):
         write_back=payload.write_back,
         query_index=payload.query_index,
         query_total=payload.query_total,
+    )
+
+
+def _tiktok_stats_xlsx_extract_metrics(extract: dict | None) -> dict[str, str]:
+    source = extract if isinstance(extract, dict) else {}
+    pub = source.get("to_publish_style_metrics")
+    pub = pub if isinstance(pub, dict) else {}
+    fallback = {
+        "粉丝量": source.get("follower_count"),
+        "关注数": source.get("following_count"),
+        "总赞": source.get("heart_count"),
+        "视频数": source.get("video_count"),
+        "点赞量": source.get("heart_count"),
+    }
+    metrics: dict[str, str] = {}
+    for key in TIKTOK_STATS_XLSX_METRIC_HEADERS:
+        raw = pub.get(key)
+        if raw is None:
+            raw = fallback.get(key)
+        metrics[key] = "" if raw is None else str(raw)
+    return metrics
+
+
+def _tiktok_stats_xlsx_ensure_metric_columns(sheet) -> dict[str, int]:
+    max_col = int(sheet.max_column or 1)
+    headers: list[str] = []
+    last_used = 1
+    for col in range(1, max_col + 1):
+        header = _xlsx_cell_str(sheet.cell(1, col).value)
+        headers.append(header)
+        if header:
+            last_used = col
+    col_map: dict[str, int] = {}
+    for name in TIKTOK_STATS_XLSX_METRIC_HEADERS:
+        idx = next((i + 1 for i, header in enumerate(headers) if header == name), None)
+        if idx is None:
+            last_used += 1
+            sheet.cell(1, last_used).value = name
+            while len(headers) < last_used:
+                headers.append("")
+            headers[last_used - 1] = name
+            idx = last_used
+        col_map[name] = idx
+    return col_map
+
+
+def _tiktok_stats_xlsx_parse_rows(sheet) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    max_row = min(int(sheet.max_row or 1), 5001)
+    for sheet_row in range(2, max_row + 1):
+        username = _xlsx_cell_str(sheet.cell(sheet_row, 1).value).lstrip("@")
+        if not username:
+            continue
+        rows.append({"sheet_row": sheet_row, "username": username})
+    return rows
+
+
+def _tiktok_stats_xlsx_get_session(session_id: str, owner: str) -> dict[str, Any] | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    with _tiktok_stats_xlsx_lock:
+        session = _tiktok_stats_xlsx_sessions.get(sid)
+        if not session:
+            return None
+        if owner and str(session.get("owner") or "").strip() != owner:
+            return None
+        return session
+
+
+def _tiktok_stats_xlsx_write_metrics(file_path: Path, col_map: dict[str, int], sheet_row: int, metrics: dict[str, str]) -> None:
+    wb = load_workbook(file_path)
+    try:
+        sheet = wb.worksheets[0]
+        for name in TIKTOK_STATS_XLSX_METRIC_HEADERS:
+            col = int(col_map.get(name) or 0)
+            if col < 1:
+                continue
+            value = metrics.get(name)
+            sheet.cell(int(sheet_row), col).value = "" if value is None else str(value)
+        wb.save(file_path)
+    finally:
+        wb.close()
+
+
+@app.post("/api/admin/tiktok_profile_stats/xlsx_upload")
+async def tiktok_profile_stats_xlsx_upload(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    err, session_login = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法处理 xlsx"}
+    owner = str(session_login.get("username") or "").strip()
+    filename = str(file.filename or "").strip()
+    if not filename.lower().endswith(".xlsx"):
+        return {"code": 1, "msg": "请上传 .xlsx 文件"}
+    content = await file.read()
+    if not content:
+        return {"code": 1, "msg": "文件为空"}
+    if len(content) > 10 * 1024 * 1024:
+        return {"code": 1, "msg": "文件过大，请不超过 10MB"}
+    session_id = f"ts_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    owner_dir = (TIKTOK_STATS_XLSX_DIR / re.sub(r"[^\w\-.@]+", "_", owner or "unknown")).resolve()
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    dest = owner_dir / f"{session_id}.xlsx"
+    try:
+        dest.write_bytes(content)
+        wb = load_workbook(dest)
+        try:
+            sheet = wb.worksheets[0]
+            col_map = _tiktok_stats_xlsx_ensure_metric_columns(sheet)
+            rows = _tiktok_stats_xlsx_parse_rows(sheet)
+            wb.save(dest)
+        finally:
+            wb.close()
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            dest.unlink(missing_ok=True)
+        return {"code": 1, "msg": f"解析 Excel 失败：{exc}"}
+    if not rows:
+        with contextlib.suppress(Exception):
+            dest.unlink(missing_ok=True)
+        return {"code": 1, "msg": "未找到可查询的 username（首列为 username，第二行起为数据）"}
+    if len(rows) > 1000:
+        with contextlib.suppress(Exception):
+            dest.unlink(missing_ok=True)
+        return {"code": 1, "msg": "单次最多查询 1000 行"}
+    original_stem = Path(filename).stem or "tiktok_stats"
+    download_name = f"{original_stem}_queried.xlsx"
+    with _tiktok_stats_xlsx_lock:
+        _tiktok_stats_xlsx_sessions[session_id] = {
+            "session_id": session_id,
+            "owner": owner,
+            "file_path": str(dest),
+            "original_name": filename,
+            "download_name": download_name,
+            "col_map": col_map,
+            "rows": rows,
+            "created_at": now_text(),
+        }
+    return {
+        "code": 0,
+        "msg": "Excel 已上传",
+        "session_id": session_id,
+        "download_name": download_name,
+        "row_count": len(rows),
+        "rows": rows,
+    }
+
+
+@app.post("/api/admin/tiktok_profile_stats/xlsx_query_row")
+def tiktok_profile_stats_xlsx_query_row(
+    payload: TikTokStatsXlsxQueryRowRequest,
+    authorization: str | None = Header(default=None),
+):
+    err, session_login = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法写回 xlsx"}
+    owner = str(session_login.get("username") or "").strip()
+    session = _tiktok_stats_xlsx_get_session(payload.session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "会话不存在或无权访问"}
+    row = next(
+        (
+            item
+            for item in (session.get("rows") or [])
+            if int(item.get("sheet_row") or 0) == int(payload.sheet_row)
+        ),
+        None,
+    )
+    if not row:
+        return {"code": 1, "msg": f"未找到第 {payload.sheet_row} 行"}
+    username = str(row.get("username") or "").strip()
+    if not username:
+        return {
+            "code": 0,
+            "query_ok": False,
+            "username": username,
+            "sheet_row": int(payload.sheet_row),
+            "metrics": {},
+            "msg": "用户名为空",
+        }
+    if len(username) > 64:
+        return {
+            "code": 0,
+            "query_ok": False,
+            "username": username,
+            "sheet_row": int(payload.sheet_row),
+            "metrics": {},
+            "msg": "用户名过长（最多 64 个字符）",
+        }
+    try:
+        result = fetch_tiktok_profile_stats(
+            username,
+            include_raw=payload.include_raw,
+            write_back=False,
+        )
+    except Exception as exc:
+        return {
+            "code": 0,
+            "query_ok": False,
+            "username": username,
+            "sheet_row": int(payload.sheet_row),
+            "metrics": {},
+            "msg": f"查询失败: {exc}",
+        }
+    if not isinstance(result, dict):
+        result = {"code": 1, "msg": "查询返回异常"}
+    try:
+        query_ok = int(result.get("code", 1)) == 0
+    except (TypeError, ValueError):
+        query_ok = False
+    metrics = _tiktok_stats_xlsx_extract_metrics(result.get("universal_extract") if query_ok else None)
+    if query_ok:
+        try:
+            with _tiktok_stats_xlsx_lock:
+                _tiktok_stats_xlsx_write_metrics(
+                    Path(str(session.get("file_path") or "")),
+                    session.get("col_map") or {},
+                    int(payload.sheet_row),
+                    metrics,
+                )
+        except Exception as exc:
+            return {
+                "code": 1,
+                "msg": f"写回 Excel 失败：{exc}",
+                "username": username,
+                "sheet_row": int(payload.sheet_row),
+            }
+    payload_out: dict[str, Any] = {
+        "code": 0,
+        "query_ok": query_ok,
+        "username": username,
+        "sheet_row": int(payload.sheet_row),
+        "metrics": metrics if query_ok else {},
+        "msg": "ok" if query_ok else str((result or {}).get("msg") or "查询失败"),
+        "private_account_guess": result.get("private_account_guess") if query_ok else None,
+    }
+    if payload.include_raw:
+        payload_out["debug"] = result.get("debug")
+        payload_out["raw_response"] = result.get("raw_response")
+        payload_out["private_account_reason"] = result.get("private_account_reason")
+        payload_out["profile_following_visibility"] = result.get("profile_following_visibility")
+        payload_out["following_list_hidden_guess"] = result.get("following_list_hidden_guess")
+        payload_out["following_list_hidden_reason"] = result.get("following_list_hidden_reason")
+    return payload_out
+
+
+@app.get("/api/admin/tiktok_profile_stats/xlsx_download/{session_id}")
+def tiktok_profile_stats_xlsx_download(
+    session_id: str,
+    authorization: str | None = Header(default=None),
+):
+    err, session_login = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session_login.get("username") or "").strip()
+    session = _tiktok_stats_xlsx_get_session(session_id, owner)
+    if not session:
+        return {"code": 1, "msg": "会话不存在或无权访问"}
+    file_path = Path(str(session.get("file_path") or ""))
+    if not file_path.is_file():
+        return {"code": 1, "msg": "会话文件不存在"}
+    return FileResponse(
+        path=file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{session_id}.xlsx",
     )
 
 

@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var logStickToBottom = true
     /** 防止连点弹出多个确认框 / 并发提交更新邮箱。 */
     private var updatingAccountEmailFromIssued = false
+    /** 切换云端模式前的账号参与挑选（勾选=参与）。 */
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,7 +63,9 @@ class MainActivity : AppCompatActivity() {
         setupBindingSection()
         setupAssignedAccountSection()
         setupIssuedNewEmailSection()
+        // 运行模式已独立为 ControlModeActivity
         setupManualTaskSection()
+        applyControlModeUi()
         renderDeviceInfo()
         observeLogs()
 
@@ -93,10 +96,23 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch {
                 val alias = PrefsStore.getAlias().orEmpty()
                 logStickToBottom = false
+                if (!ManualDeviceControl.ENABLED && PrefsStore.isAutoSwitchAutonomousMode()) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "云端自动切号自治中：请先用「切回本机手动模式」关闭，再硬停",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    LogCenter.op(alias, "硬停被拒绝：云端自动切号自治中，请先切回本机手动")
+                    return@launch
+                }
                 AppCoordinator.requestUserGracefulHardStop()
                 LogCenter.op(
                     alias,
-                    "已请求硬停：当前步骤结束后停下自动任务；若已开本机自动切号会暂停并清脏数据（计划文件保留）；点击「启动后台服务」可按计划续跑；后台继续轮询 check_start / 设备指令",
+                    if (ManualDeviceControl.ENABLED) {
+                        "已请求硬停：当前步骤结束后停下自动任务；若已开本机自动切号会暂停并清脏数据（计划文件保留）；点击「启动后台服务」可按计划续跑；后台继续轮询 check_start / 设备指令"
+                    } else {
+                        "已请求硬停：当前步骤结束后停下自动任务；后台继续轮询 check_start / 设备指令"
+                    },
                 )
                 runCatching { WorkerService.start(this@MainActivity) }
                     .onFailure { err ->
@@ -110,6 +126,9 @@ class MainActivity : AppCompatActivity() {
 
         binding.openConfigParamsButton.setOnClickListener { openConfigParamsScreen() }
         binding.showSettingsButton.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        binding.showControlModeButton.setOnClickListener {
+            startActivity(Intent(this, ControlModeActivity::class.java))
+        }
         binding.showVideoDedButton.setOnClickListener {
             startActivity(Intent(this, VideoDedMainActivity::class.java))
         }
@@ -159,6 +178,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        applyControlModeUi()
         updateConfigSummaryLine()
         if (requireCloudLoginIfNeeded()) {
             renderDeviceInfo()
@@ -703,6 +723,13 @@ class MainActivity : AppCompatActivity() {
             refreshManualAccountStatus()
         }
         refreshManualAutoSwitchStatus()
+        applyControlModeUi()
+    }
+
+    private fun applyControlModeUi() {
+        val manual = ManualDeviceControl.ENABLED
+        binding.manualTaskSection.visibility = if (manual) View.VISIBLE else View.GONE
+        binding.manualLocalAutoSwitchSection.visibility = if (manual) View.VISIBLE else View.GONE
     }
 
     private fun setupManualTaskSection() {

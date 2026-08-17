@@ -102,6 +102,7 @@ class VideoDedDeviceService : Service() {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID) ?: return START_STICKY
                 val targetPath = intent.getStringExtra(EXTRA_TARGET_PATH)
                 val filesJson = intent.getStringExtra(EXTRA_FILES_JSON) ?: return START_STICKY
+                val adbPushed = intent.getBooleanExtra(EXTRA_ADB_PUSHED, false)
                 val files = runCatching { TaskDownloadWorkflow.parseFilesJson(filesJson) }.getOrElse { emptyList() }
                 if (files.isEmpty()) return START_STICKY
                 scope.launch {
@@ -111,6 +112,7 @@ class VideoDedDeviceService : Service() {
                             taskId,
                             files,
                             targetPath,
+                            adbPushed = adbPushed,
                         ) { msg ->
                             updateNotification(msg)
                             StatusLogBuffer.append(msg)
@@ -151,9 +153,21 @@ class VideoDedDeviceService : Service() {
                     files = task.files.map { TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null) },
                 ),
             )
-            if (task.companionPullNotified != true) {
-                enqueueDownloadTask(applicationContext, task.taskId, task.files, resolvedTarget)
-                StatusLogBuffer.append("任务 ${task.taskId} 已创建（PC 未通知，本机已入队下载）")
+            if (task.adbPushed == true || task.companionPullNotified != true) {
+                enqueueDownloadTask(
+                    applicationContext,
+                    task.taskId,
+                    task.files,
+                    resolvedTarget,
+                    adbPushed = task.adbPushed == true,
+                )
+                StatusLogBuffer.append(
+                    if (task.adbPushed == true) {
+                        "任务 ${task.taskId} 已创建（USB 已推送，本机校验入队）"
+                    } else {
+                        "任务 ${task.taskId} 已创建（PC 未通知，本机已入队下载）"
+                    },
+                )
             } else {
                 StatusLogBuffer.append("任务 ${task.taskId} 已创建，PC 已触发下载")
             }
@@ -305,10 +319,17 @@ class VideoDedDeviceService : Service() {
         const val EXTRA_TARGET_PATH = "targetPath"
         const val EXTRA_TASK_ID = "taskId"
         const val EXTRA_FILES_JSON = "filesJson"
+        const val EXTRA_ADB_PUSHED = "adbPushed"
         private const val SOCKET_READ_TIMEOUT = 0
 
         /** @return 是否已入队（false 表示同 taskId 已在下载或入队被跳过） */
-        fun enqueueDownloadTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
+        fun enqueueDownloadTask(
+            context: Context,
+            taskId: String,
+            files: List<TaskFileInfo>,
+            targetPath: String?,
+            adbPushed: Boolean = false,
+        ): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
                 Log.d("DeviceService", "enqueueDownloadTask skipped duplicate taskId=$taskId")
                 return false
@@ -318,6 +339,7 @@ class VideoDedDeviceService : Service() {
                 putExtra(EXTRA_TASK_ID, taskId)
                 putExtra(EXTRA_TARGET_PATH, targetPath)
                 putExtra(EXTRA_FILES_JSON, TaskDownloadWorkflow.toFilesJson(files))
+                putExtra(EXTRA_ADB_PUSHED, adbPushed)
             }
             ContextCompat.startForegroundService(context, intent)
             return true

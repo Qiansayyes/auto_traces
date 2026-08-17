@@ -413,11 +413,11 @@ class VideoDedMainActivity : ComponentActivity() {
                 )
             )
             refreshHistorySummary()
-            appendLog("创建任务：${task.taskId}")
-            if (task.companionPullNotified == true) {
-                appendLog("PC 已触发下载（follow-pc），本界面不重复执行")
+            appendLog("创建任务：${task.taskId} channel=${task.deliveryChannel ?: "http"} pushed=${task.adbPushed == true}")
+            if (task.adbPushed == true || task.companionPullNotified != true) {
+                downloadTask(task.taskId, task.files, targetPath, adbPushed = task.adbPushed == true)
             } else {
-                downloadTask(task.taskId, task.files, targetPath)
+                appendLog("PC 已触发下载（follow-pc），本界面不重复执行")
             }
         } catch (t: Throwable) {
             Log.e(TAG, "requestVideos failed", t)
@@ -426,14 +426,20 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun downloadTask(taskId: String, files: List<TaskFileInfo>, targetPath: String?) {
+    private suspend fun downloadTask(
+        taskId: String,
+        files: List<TaskFileInfo>,
+        targetPath: String?,
+        adbPushed: Boolean = false,
+    ) {
         try {
-            Log.d(TAG, "downloadTask start taskId=$taskId files=${files.size} targetPath=$targetPath")
+            Log.d(TAG, "downloadTask start taskId=$taskId files=${files.size} targetPath=$targetPath adbPushed=$adbPushed")
             TaskDownloadWorkflow.downloadVerifyAndAck(
                 applicationContext,
                 taskId,
                 files,
                 targetPath,
+                adbPushed = adbPushed,
             ) { msg ->
                 Log.d(TAG, "downloadTask progress taskId=$taskId msg=$msg")
                 appendLog(msg)

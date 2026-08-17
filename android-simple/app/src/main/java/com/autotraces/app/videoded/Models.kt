@@ -47,6 +47,12 @@ data class CreateTaskResponse(
     val files: List<TaskFileInfo> = emptyList(),
     /** PC 是否已成功调用本机 follow-pc；为 false 时需本机 fallback 入队。 */
     val companionPullNotified: Boolean? = null,
+    /** 素材传输通道：`adb_usb` / `adb_usb_http` / `http`。 */
+    val deliveryChannel: String? = null,
+    /** PC 是否已通过 USB `adb push` 把本任务文件推到 targetPath。 */
+    val adbPushed: Boolean? = null,
+    /** 本次绑定的 USB ADB 序列号（多机隔离用）。 */
+    val usbSerial: String? = null,
 )
 
 data class TaskFileInfo(

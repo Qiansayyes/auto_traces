@@ -10,8 +10,9 @@ import java.util.concurrent.atomic.AtomicReference
  * 本机自动切号自治由 APP 开关 + [ManualAutoSwitchPlanBuilder] 本地计划驱动。
  */
 object ManualDeviceControl {
-    /** 本工程恒为手动模式。 */
-    const val ENABLED: Boolean = true
+    /** 本机手动模式（运行时可切换；false 时走云端 client 行为）。 */
+    val ENABLED: Boolean
+        get() = PrefsStore.isManualControlMode()
 
     val CLOUD_TASK_OP_TYPES: Set<String> = setOf(
         "mutual_click_start",

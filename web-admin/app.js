@@ -194,6 +194,10 @@ const statsIncludeRawInput = document.getElementById("statsIncludeRaw");
 const fetchTiktokStatsBtn = document.getElementById("fetchTiktokStats");
 const fetchTiktokStatsFullBtn = document.getElementById("fetchTiktokStatsFull");
 const statsResultEl = document.getElementById("statsResult");
+const statsXlsxFileInput = document.getElementById("statsXlsxFile");
+const statsXlsxHintEl = document.getElementById("statsXlsxHint");
+const fetchTiktokStatsXlsxBtn = document.getElementById("fetchTiktokStatsXlsx");
+const downloadTiktokStatsXlsxBtn = document.getElementById("downloadTiktokStatsXlsx");
 const cvAccessFilterEl = document.getElementById("cvAccessFilter");
 const queryCvAccessDataBtn = document.getElementById("queryCvAccessData");
 const triggerProcessQueueInlineBtn = document.getElementById("triggerProcessQueueInline");
@@ -242,6 +246,7 @@ const galleryLibraryThumbUrls = new Map();
 const deviceLogDeviceSelect = document.getElementById("deviceLogDeviceSelect");
 const deviceLogPullBtn = document.getElementById("deviceLogPullBtn");
 const deviceExecLogsEl = document.getElementById("deviceExecLogs");
+const publishPostBatchLogsEl = document.getElementById("publishPostBatchLogs");
 const backupCloudInfoEl = document.getElementById("backupCloudInfo");
 const addBlankRecordBtn = document.getElementById("addBlankRecordBtn");
 const addDeviceBlankRecordBtn = document.getElementById("addDeviceBlankRecordBtn");
@@ -301,6 +306,10 @@ let accountFilterUnassignedOnly = false;
 let batchStreamSessionId = "";
 let batchStreamBusy = false;
 let batchStreamLastSnapshot = "";
+let statsXlsxBatchToken = 0;
+let statsXlsxBusy = false;
+let statsXlsxSessionId = "";
+let statsXlsxDownloadName = "";
 let accountRecordsSearchQuery = "";
 let accountRecordsSearchField = "";
 let currentAccountRecordsPage = 1;
@@ -721,6 +730,77 @@ function appendGalleryDispatchLog(line, reset = false) {
     galleryDispatchLogsEl.textContent = `${current}\n${text}`;
   }
   galleryDispatchLogsEl.scrollTop = galleryDispatchLogsEl.scrollHeight;
+}
+
+function appendPublishPostBatchLog(line, reset = false) {
+  if (!publishPostBatchLogsEl) return;
+  const text = String(line || "");
+  if (reset) {
+    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇总";
+    publishPostBatchLogsEl.scrollTop = 0;
+    return;
+  }
+  const current = String(publishPostBatchLogsEl.textContent || "").trim();
+  if (!current || current === "暂无汇总") {
+    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇总";
+  } else {
+    publishPostBatchLogsEl.textContent = `${current}\n${text}`;
+  }
+  publishPostBatchLogsEl.scrollTop = publishPostBatchLogsEl.scrollHeight;
+}
+
+/** 轮询发作品最终回执（须带 publish_post_outcome_report；忽略旧版「已收到」早期 success）。 */
+async function waitForPublishPostFinalResult(opId, timeoutMs = 900000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const pollPath = `/api/admin/device_tiktok/op_result?op_id=${encodeURIComponent(opId)}`;
+    const base = String(await resolvedApiBase()).replace(/\/$/, "");
+    const dedupedPollPath = base.endsWith("/api") && pollPath.startsWith("/api/")
+      ? pollPath.slice(4)
+      : pollPath;
+    const pollUrl = `${base}${dedupedPollPath}`;
+    const token = authToken();
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const response = await fetch(pollUrl, { method: "GET", headers, cache: "no-store" });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {
+      data = { code: response.ok ? 0 : 1, msg: text };
+    }
+    if (!response.ok) {
+      throw new Error((data && data.msg) || `轮询请求失败（HTTP ${response.status}）`);
+    }
+    if (data.status === "done" || data.code === 0) {
+      const result = data?.result || null;
+      const outcome = result?.data && typeof result.data === "object" ? result.data : {};
+      if (outcome.publish_post_outcome_report) {
+        return result;
+      }
+      // 旧 App 可能先报「已收到」：继续等最终结果
+    } else if (data.status !== "pending" && data.code !== 1) {
+      throw new Error(data?.msg || "发作品结果轮询异常");
+    }
+    await new Promise((res) => setTimeout(res, 3000));
+  }
+  throw new Error("等待发作品最终结果超时（设备可能仍在执行）");
+}
+
+function formatPublishPostFinalLine(alias, result, errMsg) {
+  if (errMsg) {
+    return `❌ ${alias}：超时/异常 — ${errMsg}`;
+  }
+  const data = result?.data && typeof result.data === "object" ? result.data : {};
+  const ok = result?.status === "success" && Boolean(data.publish_post_completed);
+  const successCount = Number(data.publish_success_count);
+  const targetCount = Number(data.publish_target_count);
+  const countHint =
+    Number.isFinite(successCount) && Number.isFinite(targetCount) && (successCount > 0 || targetCount > 0)
+      ? `（${successCount}/${targetCount}）`
+      : "";
+  const msg = String(result?.message || "").trim() || (ok ? "发作品成功" : "发作品失败");
+  return `${ok ? "✅" : "❌"} ${alias}${countHint}：${msg}`;
 }
 
 const sections = document.querySelectorAll(".panel");
@@ -2224,19 +2304,42 @@ function renderDevices(devices, options = {}) {
       if (!did || !alias || el.disabled) return;
       const oldText = String(el.textContent || "发布作品").trim() || "发布作品";
       el.disabled = true;
-      el.textContent = "下发中…";
+      el.textContent = "执行中…";
       try {
+        appendPublishPostBatchLog(
+          `======== 发作品单台 ${new Date().toLocaleString()} · ${alias} ========\n下发中…`,
+          true,
+        );
         setStatus(`正在下发发作品入口：${alias}…`, "info");
-        await apiPublishPostStart({
+        const resp = await apiPublishPostStart({
           device_id: did,
           alias,
           package_name: "com.zhiliaoapp.musically",
         });
+        const opId = String(resp?.op_id || "").trim();
+        if (!opId) {
+          throw new Error(resp?.msg || "未返回 op_id");
+        }
+        appendPublishPostBatchLog(`⏳ ${alias}：已下发，等待最终结果…`);
+        setStatus(`已下发 ${alias}，等待发作品最终结果…`, "info");
+        const result = await waitForPublishPostFinalResult(opId, 900000);
+        const line = formatPublishPostFinalLine(alias, result, null);
+        appendPublishPostBatchLog(
+          `======== 发作品最终结果 ${new Date().toLocaleString()} ========\n${line}`,
+          true,
+        );
         await loadOverview();
         bindDeviceSelection();
-        setStatus(`发作品入口已下发：${alias}（云端已关闭该设备自动起号策略参与）`, "success");
+        const data = result?.data && typeof result.data === "object" ? result.data : {};
+        const ok = result?.status === "success" && Boolean(data.publish_post_completed);
+        setStatus(ok ? `发作品成功：${alias}` : `发作品失败：${alias}`, ok ? "success" : "error");
       } catch (error) {
-        setStatus(error.message || "发作品下发失败", "error");
+        const msg = error.message || "发作品失败";
+        appendPublishPostBatchLog(
+          `======== 发作品最终结果 ${new Date().toLocaleString()} ========\n❌ ${alias}：${msg}`,
+          true,
+        );
+        setStatus(msg, "error");
       } finally {
         el.disabled = false;
         el.textContent = oldText;
@@ -5969,22 +6072,78 @@ async function startPublishPostForSelectedDevices() {
     return;
   }
 
-  let successCount = 0;
-  let failedCount = 0;
-  setStatus(`正在为所选设备下发发作品入口（${targets.length} 台）...`, "info");
-  for (const payload of targets) {
-    try {
-      await apiPublishPostStart(payload);
-      successCount += 1;
-    } catch (_) {
-      failedCount += 1;
+  if (publishPostStartSelectedBtn) publishPostStartSelectedBtn.disabled = true;
+  try {
+    const startedAt = new Date().toLocaleString();
+    appendPublishPostBatchLog(
+      `======== 发作品批量执行 ${startedAt}（${targets.length} 台）========\n下发中…`,
+      true,
+    );
+    setStatus(`正在为所选设备下发发作品入口（${targets.length} 台）...`, "info");
+
+    const queued = [];
+    const enqueueFailed = [];
+    for (const payload of targets) {
+      try {
+        const resp = await apiPublishPostStart(payload);
+        const opId = String(resp?.op_id || "").trim();
+        if (!opId) {
+          enqueueFailed.push({ alias: payload.alias, error: resp?.msg || "未返回 op_id" });
+          appendPublishPostBatchLog(`❌ ${payload.alias}：下发失败（无 op_id）`);
+          continue;
+        }
+        queued.push({ ...payload, opId });
+        appendPublishPostBatchLog(`⏳ ${payload.alias}：已下发，等待最终结果（op=${opId.slice(0, 8)}…）`);
+      } catch (err) {
+        const msg = err?.message || "下发失败";
+        enqueueFailed.push({ alias: payload.alias, error: msg });
+        appendPublishPostBatchLog(`❌ ${payload.alias}：下发失败 — ${msg}`);
+      }
     }
-  }
-  await loadOverview();
-  if (!failedCount) {
-    setStatus(`发作品入口指令已下发（${successCount}/${targets.length}）；云端已关闭对应设备自动起号策略参与`, "success");
-  } else {
-    setStatus(`发作品入口部分下发失败：成功 ${successCount}，失败 ${failedCount}`, "warning");
+
+    setStatus(
+      `发作品已下发 ${queued.length}/${targets.length} 台，正在等待各设备最终执行结果…`,
+      queued.length ? "info" : "error",
+    );
+
+    const finals = await Promise.all(
+      queued.map(async (item) => {
+        try {
+          const result = await waitForPublishPostFinalResult(item.opId, 900000);
+          return { alias: item.alias, result, error: null };
+        } catch (err) {
+          return { alias: item.alias, result: null, error: err?.message || "等待超时" };
+        }
+      }),
+    );
+
+    let okCount = 0;
+    let failCount = enqueueFailed.length;
+    const lines = [`======== 发作品最终结果汇总 ${new Date().toLocaleString()} ========`];
+    for (const row of enqueueFailed) {
+      lines.push(`❌ ${row.alias}：下发失败 — ${row.error}`);
+    }
+    for (const row of finals) {
+      const line = formatPublishPostFinalLine(row.alias, row.result, row.error);
+      lines.push(line);
+      const data = row.result?.data && typeof row.result.data === "object" ? row.result.data : {};
+      const ok = !row.error && row.result?.status === "success" && Boolean(data.publish_post_completed);
+      if (ok) okCount += 1;
+      else failCount += 1;
+    }
+    lines.push(`-------- 合计：成功 ${okCount} · 失败 ${failCount} · 共 ${targets.length} 台 --------`);
+    appendPublishPostBatchLog(lines.join("\n"), true);
+
+    await loadOverview();
+    if (!failCount) {
+      setStatus(`发作品全部成功（${okCount}/${targets.length}），详见「发作品执行汇总」`, "success");
+    } else if (okCount > 0) {
+      setStatus(`发作品部分完成：成功 ${okCount}，失败 ${failCount}，详见「发作品执行汇总」`, "warning");
+    } else {
+      setStatus(`发作品全部失败（${failCount}/${targets.length}），详见「发作品执行汇总」`, "error");
+    }
+  } finally {
+    if (publishPostStartSelectedBtn) publishPostStartSelectedBtn.disabled = false;
   }
 }
 
@@ -6276,6 +6435,10 @@ async function collectBackupArchiveUsernamesForQuery(options = {}) {
 }
 
 async function fetchTiktokStats() {
+  if (statsXlsxBusy) {
+    setStatus("批量查询进行中，请稍候", "warning");
+    return;
+  }
   const username = (statsUsernameInput?.value || "").trim();
 
   if (!username) {
@@ -6332,6 +6495,187 @@ async function fetchTiktokStats() {
       statsResultEl.textContent = `查询失败: ${error.message || "unknown error"}`;
     }
     setStatus(error.message || "查询失败", "error");
+  }
+}
+
+function formatTiktokStatsMetricsLine(metrics) {
+  const keys = ["粉丝量", "关注数", "总赞", "视频数", "点赞量"];
+  return keys.map((key) => `${key}=${metrics?.[key] ?? ""}`).join("  ");
+}
+
+function setTiktokStatsXlsxBusy(busy) {
+  statsXlsxBusy = Boolean(busy);
+  if (fetchTiktokStatsBtn) fetchTiktokStatsBtn.disabled = statsXlsxBusy;
+  if (fetchTiktokStatsXlsxBtn) {
+    fetchTiktokStatsXlsxBtn.disabled = statsXlsxBusy;
+    fetchTiktokStatsXlsxBtn.textContent = statsXlsxBusy ? "批量查询中..." : "上传表格并查询";
+  }
+  if (statsXlsxFileInput) statsXlsxFileInput.disabled = statsXlsxBusy;
+  if (downloadTiktokStatsXlsxBtn) {
+    downloadTiktokStatsXlsxBtn.disabled = statsXlsxBusy || !statsXlsxSessionId;
+  }
+}
+
+function renderTiktokStatsXlsxProgress(lines, debugPayload) {
+  if (!statsResultEl) return;
+  const body = lines.join("\n");
+  if (debugPayload) {
+    statsResultEl.textContent = `${body}\n\n--- 调试信息（已省略完整 HTTP headers）---\n${JSON.stringify(debugPayload, null, 2)}`;
+    return;
+  }
+  statsResultEl.textContent = body;
+}
+
+async function downloadTiktokStatsXlsx() {
+  if (!statsXlsxSessionId) {
+    setStatus("请先完成表格查询", "warning");
+    return;
+  }
+  const token = authToken();
+  const url = await buildApiUrl(
+    `/api/admin/tiktok_profile_stats/xlsx_download/${encodeURIComponent(statsXlsxSessionId)}`,
+  );
+  const response = await fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    cache: "no-store",
+  });
+  const contentType = String(response.headers.get("content-type") || "");
+  if (!response.ok || contentType.includes("application/json")) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(String(data?.msg || `下载失败 (HTTP ${response.status})`));
+  }
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = statsXlsxDownloadName || "tiktok_stats_queried.xlsx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+async function runTiktokStatsXlsxBatch(file) {
+  if (!file || statsXlsxBusy) return;
+  const name = String(file.name || "").toLowerCase();
+  if (!name.endsWith(".xlsx")) {
+    setStatus("请选择 .xlsx 文件", "warning");
+    return;
+  }
+  const token = ++statsXlsxBatchToken;
+  setTiktokStatsXlsxBusy(true);
+  const includeRaw = Boolean(statsIncludeRawInput?.checked);
+  const progressLines = [];
+  try {
+    if (statsXlsxHintEl) statsXlsxHintEl.textContent = `正在上传 ${file.name} ...`;
+    renderTiktokStatsXlsxProgress(["正在上传表格..."]);
+    setStatus("正在上传表格...", "info");
+    const form = new FormData();
+    form.append("file", file);
+    const uploadData = await fetchFormDataApi("/api/admin/tiktok_profile_stats/xlsx_upload", form);
+    if (token !== statsXlsxBatchToken) return;
+    statsXlsxSessionId = String(uploadData?.session_id || "").trim();
+    statsXlsxDownloadName = String(uploadData?.download_name || "").trim();
+    const rows = Array.isArray(uploadData?.rows) ? uploadData.rows : [];
+    const total = rows.length;
+    if (statsXlsxHintEl) {
+      statsXlsxHintEl.textContent = `已上传 ${file.name}，共 ${total} 行，开始查询...`;
+    }
+    if (!statsXlsxSessionId || !total) {
+      throw new Error("表格中没有可查询的 username");
+    }
+    let okCount = 0;
+    let failCount = 0;
+    for (let i = 0; i < total; i += 1) {
+      if (token !== statsXlsxBatchToken) return;
+      const row = rows[i] || {};
+      const username = String(row.username || "").trim();
+      const sheetRow = Number(row.sheet_row || 0);
+      progressLines.push(`[${i + 1}/${total}] ${username || "-"} 查询中...`);
+      renderTiktokStatsXlsxProgress(progressLines);
+      setStatus(`正在查询 ${i + 1}/${total}：${username}`, "info");
+      let line = `[${i + 1}/${total}] ${username || "-"}`;
+      let debugPayload = null;
+      try {
+        const data = await request("/api/admin/tiktok_profile_stats/xlsx_query_row", {
+          method: "POST",
+          timeoutMs: 45000,
+          body: JSON.stringify({
+            session_id: statsXlsxSessionId,
+            sheet_row: sheetRow,
+            include_raw: includeRaw,
+          }),
+        });
+        if (token !== statsXlsxBatchToken) return;
+        if (data?.query_ok) {
+          okCount += 1;
+          line = `${line}  ${formatTiktokStatsMetricsLine(data.metrics)}`;
+        } else {
+          failCount += 1;
+          line = `${line}  失败：${data?.msg || "查询失败"}`;
+        }
+        if (includeRaw) {
+          debugPayload = {
+            username: data?.username,
+            private_account_guess: data?.private_account_guess,
+            private_account_reason: data?.private_account_reason,
+            profile_following_visibility: data?.profile_following_visibility,
+            following_list_hidden_guess: data?.following_list_hidden_guess,
+            following_list_hidden_reason: data?.following_list_hidden_reason,
+            debug: data?.debug,
+            raw_response: data?.raw_response,
+          };
+        }
+      } catch (error) {
+        failCount += 1;
+        line = `${line}  失败：${error.message || "查询失败"}`;
+      }
+      progressLines[progressLines.length - 1] = line;
+      renderTiktokStatsXlsxProgress(progressLines, debugPayload);
+      if (i < total - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+    progressLines.push("");
+    progressLines.push(`完成：成功 ${okCount}，失败 ${failCount}，共 ${total} 行`);
+    renderTiktokStatsXlsxProgress(progressLines);
+    if (statsXlsxHintEl) {
+      statsXlsxHintEl.textContent = `查询完成：成功 ${okCount}，失败 ${failCount}。可下载写回后的表格。`;
+    }
+    try {
+      await downloadTiktokStatsXlsx();
+      setStatus(`批量查询完成，已下载表格（成功 ${okCount}，失败 ${failCount}）`, failCount ? "warning" : "success");
+    } catch (downloadError) {
+      setStatus(
+        `查询完成，但自动下载失败：${downloadError.message || "unknown error"}。请点击「下载写回表格」`,
+        "warning",
+      );
+    }
+  } catch (error) {
+    if (token !== statsXlsxBatchToken) return;
+    const msg = error.message || "unknown error";
+    if (statsResultEl) {
+      if (progressLines.length) {
+        progressLines.push(`批量查询中断: ${msg}`);
+        renderTiktokStatsXlsxProgress(progressLines);
+      } else {
+        statsResultEl.textContent = `批量查询失败: ${msg}`;
+      }
+    }
+    setStatus(error.message || "批量查询失败", "error");
+  } finally {
+    if (token === statsXlsxBatchToken) {
+      setTiktokStatsXlsxBusy(false);
+      if (statsXlsxFileInput) statsXlsxFileInput.value = "";
+    }
+  }
+}
+
+function pickTiktokStatsXlsxFile() {
+  if (statsXlsxBusy) return;
+  if (statsXlsxFileInput) {
+    statsXlsxFileInput.click();
+    return;
   }
 }
 
@@ -8428,6 +8772,26 @@ if (importLiveCustomersBtn) {
 }
 if (fetchTiktokStatsBtn) {
   fetchTiktokStatsBtn.addEventListener("click", () => fetchTiktokStats());
+}
+if (fetchTiktokStatsXlsxBtn) {
+  fetchTiktokStatsXlsxBtn.addEventListener("click", () => pickTiktokStatsXlsxFile());
+}
+if (statsXlsxFileInput) {
+  statsXlsxFileInput.addEventListener("change", () => {
+    const file = statsXlsxFileInput.files && statsXlsxFileInput.files[0];
+    if (file) {
+      runTiktokStatsXlsxBatch(file).catch((error) => {
+        setStatus(error.message || "批量查询失败", "error");
+      });
+    }
+  });
+}
+if (downloadTiktokStatsXlsxBtn) {
+  downloadTiktokStatsXlsxBtn.addEventListener("click", () => {
+    downloadTiktokStatsXlsx().catch((error) => {
+      setStatus(error.message || "下载 Excel 失败", "error");
+    });
+  });
 }
 if (fetchTiktokStatsFullBtn) {
   fetchTiktokStatsFullBtn.addEventListener("click", () => {

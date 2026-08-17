@@ -47,6 +47,11 @@ object PrefsStore {
     const val MAX_MANUAL_FOR_YOU_SWIPE_SEC: Int = 3600
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
+    /**
+     * 运行模式：true=本机手动（simple）；false=云端 client。
+     * 默认本机手动，与 android-simple 历史行为一致。
+     */
+    private const val KEY_MANUAL_CONTROL_MODE = "manual_control_mode_enabled"
     /** 最近一次从「待注册TK账号」领取并转入邮箱账户管理的邮箱。 */
     private const val KEY_ISSUED_TK_PENDING_EMAIL = "issued_tk_pending_email"
     private const val KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD = "issued_tk_pending_email_password"
@@ -651,6 +656,9 @@ object PrefsStore {
             .apply()
     }
 
+    fun peekPublishPostLastActualSuccessCount(): Int =
+        prefs.getInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, 0).coerceAtLeast(0)
+
     fun getAndClearPublishPostLastActualSuccessCount(): Int {
         val v = prefs.getInt(KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT, 0).coerceAtLeast(0)
         if (v > 0) {
@@ -1155,6 +1163,14 @@ object PrefsStore {
 
     fun setManualLocalAutoSwitchEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MANUAL_LOCAL_AUTO_SWITCH, enabled).apply()
+    }
+
+    /** true=本机手动模式；false=云端 client 模式。 */
+    fun isManualControlMode(): Boolean =
+        prefs.getBoolean(KEY_MANUAL_CONTROL_MODE, true)
+
+    fun setManualControlMode(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_MANUAL_CONTROL_MODE, enabled).apply()
     }
 
     fun getManualAutoSwitchSlotMinutes(): Int =

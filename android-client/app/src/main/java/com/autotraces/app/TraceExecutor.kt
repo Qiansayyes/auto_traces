@@ -12781,7 +12781,13 @@ class RealTraceExecutor(
                     },
                 ),
             )
-            TaskDownloadWorkflow.downloadVerifyAndAck(app, task.taskId, task.files, targetPath)
+            TaskDownloadWorkflow.downloadVerifyAndAck(
+                app,
+                task.taskId,
+                task.files,
+                targetPath,
+                adbPushed = task.adbPushed == true,
+            )
             val stats = publishPostResolveGalleryMaterialStats()
             devOp(
                 alias,

@@ -202,6 +202,29 @@ object AppCoordinator {
     private var basicProfileEditRunning: Boolean = false
 
     /**
+     * 手动按钮分发协程（改资料等同步跑在 enqueue 内的 OP）：新按钮抢占时 cancel，尽快让出 TikTok。
+     */
+    private var manualDispatchJob: Job? = null
+
+    /**
+     * 手动抢占窗口内禁止「任务结束后自动涨粉」，避免旧任务 completion 顶掉新任务。
+     */
+    @Volatile
+    private var suppressManualAutoGrowthUntilElapsed: Long = 0L
+
+    /** 本机手动区可点任务种类（用于「同功能忽略、异功能立即抢占」）。 */
+    private enum class ManualTaskKind(val label: String) {
+        GROWTH("涨粉"),
+        FOR_YOU_SWIPE("For You预滑"),
+        MUTUAL_CLICK("引流互点"),
+        PUBLISH_POST("发作品"),
+        EDIT_PROFILE("修改基本资料"),
+        AUTO_LOGIN("自动登录"),
+        SWITCH_ACCOUNT("切号"),
+        BACKUP("备份"),
+    }
+
+    /**
      * 切号完成后的衔接协程尚未跑完：禁止 drain 队列时抢先恢复涨粉，
      * 避免插队导致改资料 / 主播访问饿死、调度空转。
      */
@@ -265,6 +288,86 @@ object AppCoordinator {
     private var autoSwitchLoginRecoveryJob: Job? = null
 
     private fun isPublishPostSwitchActive(): Boolean = publishPostSwitchJob?.isActive == true
+
+    /** PC 遥控发作品：本轮 session 与最终结果（供 simple/status 轮询汇总）。 */
+    data class ManualPublishOutcome(
+        val sessionId: String,
+        val success: Boolean,
+        val message: String,
+        val targetCount: Int,
+        val successCount: Int,
+        val username: String,
+        val finishedAtMs: Long = System.currentTimeMillis(),
+    )
+
+    @Volatile
+    private var manualPublishSessionId: String? = null
+
+    @Volatile
+    private var lastManualPublishOutcome: ManualPublishOutcome? = null
+
+    /** 发作品协程/独占阶段真正在跑（不含磁盘残留 pending）。 */
+    fun isManualPublishPostActuallyRunning(): Boolean =
+        isPublishPostSwitchActive() || PublishPostGrowthGate.isBlockingGrowth()
+
+    fun isManualPublishPostActive(): Boolean =
+        isManualPublishPostActuallyRunning() ||
+            PrefsStore.isPublishPostPending() ||
+            PrefsStore.isPublishPostRequested()
+
+    /**
+     * PC 再发作品时：若只有残留 pending、实际没在跑，清掉标记以免把新指令挡掉。
+     * @return 是否清掉了残留
+     */
+    fun clearStaleManualPublishIfIdle(): Boolean {
+        if (isManualPublishPostActuallyRunning()) return false
+        if (!PrefsStore.isPublishPostPending() && !PrefsStore.isPublishPostRequested()) return false
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        PrefsStore.clearPublishPostState()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "发作品：已清除残留 pending（任务未在跑），允许接收新指令")
+        }
+        return true
+    }
+
+    fun currentManualPublishSessionId(): String? = manualPublishSessionId
+
+    fun lastManualPublishOutcome(): ManualPublishOutcome? = lastManualPublishOutcome
+
+    /** 开启新一轮 PC/手动发作品会话；返回 sessionId。 */
+    fun beginManualPublishSession(sessionId: String = "pub-${System.currentTimeMillis()}") {
+        manualPublishSessionId = sessionId
+        lastManualPublishOutcome = null
+    }
+
+    private fun recordManualPublishOutcome(
+        success: Boolean,
+        message: String,
+        targetCount: Int,
+        successCount: Int,
+    ) {
+        val session = manualPublishSessionId ?: "pub-${System.currentTimeMillis()}"
+        val user = ManualDeviceControl.selectedManualUsername()
+            .ifBlank { PrefsStore.getLogContextUsername().orEmpty() }
+        lastManualPublishOutcome = ManualPublishOutcome(
+            sessionId = session,
+            success = success,
+            message = message,
+            targetCount = targetCount.coerceAtLeast(0),
+            successCount = successCount.coerceAtLeast(0),
+            username = user,
+        )
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val summary =
+            if (success) {
+                "发作品最终结果：成功（$successCount/$targetCount）$message"
+            } else {
+                "发作品最终结果：失败（已成功 $successCount/$targetCount）$message"
+            }
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, summary)
+        }
+    }
 
     private fun isAutoSwitchPublishLocallyActive(): Boolean = isPublishPostSwitchActive()
 
@@ -1809,7 +1912,14 @@ object AppCoordinator {
             LogCenter.op(PrefsStore.getAlias(), "手动涨粉：请先切号完成（有备份还原 / 无备份自动登录）")
             return
         }
-        scope.launch {
+        // 必须先判重再 cancel：否则会掐死旧任务又因「重复」不启动新任务
+        if (detectActiveManualTaskKind() == ManualTaskKind.GROWTH) {
+            LogCenter.op(PrefsStore.getAlias(), "手动任务：涨粉已在进行中，忽略重复点击")
+            return
+        }
+        manualDispatchJob?.cancel()
+        manualDispatchJob = scope.launch {
+            if (!prepareManualTaskTakeover(ManualTaskKind.GROWTH, reason)) return@launch
             PrefsStore.setTransientPausedForDestructiveOp(false)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
@@ -1827,10 +1937,22 @@ object AppCoordinator {
     fun manualStopGrowth(reason: String = "手动停止涨粉") {
         if (!ManualDeviceControl.ENABLED) return
         scope.launch {
+            // 停止涨粉：同样尽快打断当前 TikTok 步骤，但不启动新任务
+            PrefsStore.setAutoSwitchExclusivePreempt(true)
             pullLoopJob?.cancel()
             pullLoopJob = null
             forYouSwipeJob?.cancel()
             forYouSwipeJob = null
+            pendingUsernames.clear()
+            forceStopTikTokForExclusiveEnqueue("手动停止涨粉")
+            val deadline = SystemClock.elapsedRealtime() + 2_000L
+            while (ExecutionScope.isActive() && SystemClock.elapsedRealtime() < deadline) {
+                delay(40)
+            }
+            if (ExecutionScope.isActive()) {
+                ExecutionScope.forceClearIfStuck("手动停止涨粉")
+            }
+            PrefsStore.setAutoSwitchExclusivePreempt(false)
             PrefsStore.saveLocalStatus("online")
             updateRuntime(localStatus = "online", lastMessage = reason)
             LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason")
@@ -1849,26 +1971,18 @@ object AppCoordinator {
             LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：请先切号完成（有备份还原 / 无备份自动登录）")
             return
         }
-        if (forYouSwipeJob?.isActive == true) {
-            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：已在进行中，忽略重复点击")
-            return
-        }
-        if (isPublishPostSwitchActive() || isMutualSwitchActive() || isLiveVisitSwitchActive()) {
-            LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：其它独占任务进行中，请稍后再试")
-            return
-        }
         val sec = totalSec.coerceIn(
             PrefsStore.MIN_MANUAL_FOR_YOU_SWIPE_SEC,
             PrefsStore.MAX_MANUAL_FOR_YOU_SWIPE_SEC,
         )
         PrefsStore.setManualForYouSwipeSec(sec)
-        forYouSwipeJob = scope.launch {
-            // 与涨粉并发会互抢 TikTok：先停拉取循环
-            if (pullLoopJob?.isActive == true) {
-                LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：先暂停涨粉拉取")
-                pullLoopJob?.cancel()
-                pullLoopJob = null
-            }
+        if (detectActiveManualTaskKind() == ManualTaskKind.FOR_YOU_SWIPE) {
+            LogCenter.op(PrefsStore.getAlias(), "手动任务：For You预滑已在进行中，忽略重复点击")
+            return
+        }
+        manualDispatchJob?.cancel()
+        manualDispatchJob = scope.launch {
+            if (!prepareManualTaskTakeover(ManualTaskKind.FOR_YOU_SWIPE, "手动 For You 预滑")) return@launch
             PrefsStore.setTransientPausedForDestructiveOp(false)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
@@ -1877,6 +1991,7 @@ object AppCoordinator {
             PrefsStore.saveLocalStatus("running")
             updateRuntime(localStatus = "running", hardStopRequested = false, lastMessage = "手动 For You 预滑 ${sec}s")
             fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+            forYouSwipeJob = currentCoroutineContext()[Job]
             ExecutionScope.enter()
             val result = try {
                 LogCenter.op(PrefsStore.getAlias(), "手动模式：开始 For You 预滑（@$user · ${sec}s）")
@@ -1890,7 +2005,9 @@ object AppCoordinator {
                 }
             } finally {
                 ExecutionScope.exit()
-                forYouSwipeJob = null
+                if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                    forYouSwipeJob = null
+                }
             }
             PrefsStore.saveLocalStatus("online")
             updateRuntime(localStatus = "online", lastMessage = result)
@@ -1924,6 +2041,7 @@ object AppCoordinator {
             PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
         )
         PrefsStore.setManualPublishCount(count)
+        beginManualPublishSession()
         enqueueManualTaskOp("publish_post_start") { alias, deviceId, pkg ->
             PrefsStore.setPublishPostPackageName(pkg)
             PrefsStore.setPublishPostTargetCount(count)
@@ -1942,6 +2060,39 @@ object AppCoordinator {
                 ),
             )
         }
+    }
+
+    /**
+     * PC 遥控发作品：启动任务并返回 sessionId；最终结果写入 [lastManualPublishOutcome]，
+     * 由 PC 轮询 status 汇总成败。
+     */
+    fun manualStartPublishPostForRemote(publishCount: Int): String {
+        val count = publishCount.coerceIn(
+            PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+            PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+        )
+        val sessionId = "pub-${System.currentTimeMillis()}-${(Math.random() * 1_000_000).toInt()}"
+        PrefsStore.setManualPublishCount(count)
+        beginManualPublishSession(sessionId)
+        enqueueManualTaskOp("publish_post_start") { alias, deviceId, pkg ->
+            PrefsStore.setPublishPostPackageName(pkg)
+            PrefsStore.setPublishPostTargetCount(count)
+            PrefsStore.setPublishPostRequested(true)
+            PrefsStore.setPublishPostPending(true)
+            DeviceOp(
+                op_id = ManualDeviceControl.newLocalManualOpId("publish"),
+                op_type = "publish_post_start",
+                payload = DeviceOpPayload(
+                    device_id = deviceId,
+                    alias = alias,
+                    package_name = pkg,
+                    account_username = ManualDeviceControl.selectedManualUsername(),
+                    source = "manual",
+                    publish_count = count,
+                ),
+            )
+        }
+        return sessionId
     }
 
     fun manualStartEditBasicProfile() {
@@ -1978,7 +2129,13 @@ object AppCoordinator {
             LogCenter.op(alias, "自动登录：本地无 @$user 凭据，请先点「拉取云端最新账号信息」")
             return
         }
-        scope.launch {
+        if (detectActiveManualTaskKind() == ManualTaskKind.AUTO_LOGIN) {
+            LogCenter.op(alias, "手动任务：自动登录已在进行中，忽略重复点击")
+            return
+        }
+        manualDispatchJob?.cancel()
+        manualDispatchJob = scope.launch {
+            if (!prepareManualTaskTakeover(ManualTaskKind.AUTO_LOGIN, reason)) return@launch
             PrefsStore.setTransientPausedForDestructiveOp(false)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
@@ -2232,19 +2389,19 @@ object AppCoordinator {
         PrefsStore.setManualSelectedUsername(target)
         // 同步置 busy，避免 UI 在协程启动前仍可点「手动切号完毕」
         _manualSwitchBusy.value = true
+        manualDispatchJob?.cancel()
         manualSwitchJob = scope.launch {
             var restoredFromBackup = false
             /** 已对 TikTok 执行 clear/restore 后，失败不应再回滚选中到旧号。 */
             var tikTokSwitched = false
             try {
+                if (!prepareManualTaskTakeover(ManualTaskKind.SWITCH_ACCOUNT, "手动切号")) {
+                    return@launch
+                }
                 PrefsStore.setTransientPausedForDestructiveOp(false)
                 PrefsStore.setHardStopRequested(false)
                 manuallyPaused = false
                 if (!started.get()) started.set(true)
-                pullLoopJob?.cancel()
-                pullLoopJob = null
-                forYouSwipeJob?.cancel()
-                forYouSwipeJob = null
                 PrefsStore.saveLocalStatus("running")
                 updateRuntime(localStatus = "running", lastMessage = "手动切号 → @$target")
                 val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
@@ -2500,6 +2657,144 @@ object AppCoordinator {
         }
     }
 
+    private fun detectActiveManualTaskKind(): ManualTaskKind? = when {
+        isPublishPostSwitchActive() || PublishPostGrowthGate.isBlockingGrowth() -> ManualTaskKind.PUBLISH_POST
+        isMutualSwitchActive() -> ManualTaskKind.MUTUAL_CLICK
+        basicProfileEditRunning -> ManualTaskKind.EDIT_PROFILE
+        autoLoginActive -> ManualTaskKind.AUTO_LOGIN
+        forYouSwipeJob?.isActive == true -> ManualTaskKind.FOR_YOU_SWIPE
+        manualSwitchJob?.isActive == true || _manualSwitchBusy.value -> ManualTaskKind.SWITCH_ACCOUNT
+        pullLoopJob?.isActive == true -> ManualTaskKind.GROWTH
+        else -> null
+    }
+
+    /**
+     * 手动区新任务接管：异功能则以最快速度停掉当前任务（协作退出 + cancel + force-stop TikTok）；
+     * 同功能已在跑则返回 false（忽略重复点击）。
+     * 注意：调用方协程若已计入 [detectActiveManualTaskKind]（如切号），须排除「自己」以免误判重复。
+     */
+    private suspend fun prepareManualTaskTakeover(target: ManualTaskKind, reason: String): Boolean {
+        if (!ManualDeviceControl.ENABLED) return true
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val active = detectActiveManualTaskKind()
+        val selfJob = currentCoroutineContext()[Job]
+        val activeIsSelf = when (target) {
+            ManualTaskKind.SWITCH_ACCOUNT ->
+                active == ManualTaskKind.SWITCH_ACCOUNT && manualSwitchJob === selfJob
+            ManualTaskKind.FOR_YOU_SWIPE ->
+                active == ManualTaskKind.FOR_YOU_SWIPE && forYouSwipeJob === selfJob
+            ManualTaskKind.GROWTH ->
+                active == ManualTaskKind.GROWTH && pullLoopJob === selfJob
+            else -> false
+        }
+        if (active == target && !activeIsSelf) {
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "手动任务：${target.label}已在进行中，忽略重复点击")
+            }
+            return false
+        }
+
+        val stickyForeignPublish =
+            target != ManualTaskKind.PUBLISH_POST &&
+                (PrefsStore.isPublishPostRequested() || PrefsStore.isPublishPostPending())
+        val stickyForeignMutual =
+            target != ManualTaskKind.MUTUAL_CLICK &&
+                (PrefsStore.isMutualClickRequested() || PrefsStore.isMutualClickPending())
+
+        val busy = (!activeIsSelf && active != null && active != target) ||
+            (target != ManualTaskKind.GROWTH && pullLoopJob?.isActive == true) ||
+            (target != ManualTaskKind.FOR_YOU_SWIPE && forYouSwipeJob?.isActive == true) ||
+            (target != ManualTaskKind.PUBLISH_POST && isPublishPostSwitchActive()) ||
+            (target != ManualTaskKind.MUTUAL_CLICK && isMutualSwitchActive()) ||
+            isLiveVisitSwitchActive() ||
+            (target != ManualTaskKind.EDIT_PROFILE && basicProfileEditRunning) ||
+            (target != ManualTaskKind.AUTO_LOGIN && autoLoginActive) ||
+            (target != ManualTaskKind.PUBLISH_POST && PublishPostGrowthGate.isBlockingGrowth()) ||
+            ExecutionScope.isActive() ||
+            stickyForeignPublish ||
+            stickyForeignMutual
+
+        if (!busy) return true
+
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "手动抢占：停止${active?.label ?: "当前任务"} → 执行${target.label}（$reason）",
+            )
+        }
+
+        // 让涨粉/互点长步骤尽快协作退出（勿用硬停：硬停会挡住随后的新任务）
+        PrefsStore.setAutoSwitchExclusivePreempt(true)
+        PrefsStore.setHardStopRequested(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        manuallyPaused = false
+
+        var cancelledExclusiveThatAutoGrows = false
+        if (target != ManualTaskKind.PUBLISH_POST) {
+            if (isPublishPostSwitchActive()) {
+                publishPostSwitchJob?.cancel()
+                publishPostSwitchJob = null
+                cancelledExclusiveThatAutoGrows = true
+            }
+            PrefsStore.clearPublishPostState()
+            PrefsStore.clearPublishPostTaskScope()
+            PublishPostGrowthGate.exitExclusivePublishPhase()
+        }
+        if (target != ManualTaskKind.MUTUAL_CLICK) {
+            val hadMutual =
+                PrefsStore.isMutualClickRequested() ||
+                    PrefsStore.isMutualClickPending() ||
+                    isMutualSwitchActive()
+            if (hadMutual) cancelledExclusiveThatAutoGrows = true
+            clearMutualClickStateForInterrupt("手动抢占→${target.label}")
+        }
+        if (target != ManualTaskKind.FOR_YOU_SWIPE) {
+            forYouSwipeJob?.takeIf { it !== selfJob }?.cancel()
+            if (forYouSwipeJob !== selfJob) forYouSwipeJob = null
+        }
+        if (target != ManualTaskKind.GROWTH) {
+            pullLoopJob?.takeIf { it !== selfJob }?.cancel()
+            if (pullLoopJob !== selfJob) {
+                pullLoopJob = null
+                pendingUsernames.clear()
+            }
+        }
+        if (target != ManualTaskKind.SWITCH_ACCOUNT) {
+            manualSwitchJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+        }
+        if (target != ManualTaskKind.EDIT_PROFILE && basicProfileEditRunning) {
+            cancelledExclusiveThatAutoGrows = true
+        }
+        liveVisitSwitchJob?.cancel()
+        liveVisitSwitchJob = null
+
+        // 仅当确实打断了「结束后会自动涨粉」的独占任务时，短暂抑制 completion 回调
+        if (cancelledExclusiveThatAutoGrows) {
+            suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 3_000L
+        }
+
+        // 尽快打断 OCR/点击：强停 TikTok（发作品独占标记已在上面清掉）
+        forceStopTikTokForExclusiveEnqueue("手动抢占→${target.label}")
+
+        val deadline = SystemClock.elapsedRealtime() + 2_500L
+        while (
+            (ExecutionScope.isActive() ||
+                (target != ManualTaskKind.PUBLISH_POST && isPublishPostSwitchActive()) ||
+                (target != ManualTaskKind.MUTUAL_CLICK && isMutualSwitchActive()) ||
+                (target != ManualTaskKind.GROWTH && pullLoopJob?.isActive == true) ||
+                (target != ManualTaskKind.FOR_YOU_SWIPE && forYouSwipeJob?.isActive == true)) &&
+            SystemClock.elapsedRealtime() < deadline
+        ) {
+            delay(40)
+        }
+        if (ExecutionScope.isActive()) {
+            ExecutionScope.forceClearIfStuck("手动抢占→${target.label}")
+        }
+
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        return true
+    }
+
     private fun enqueueManualTaskOp(
         label: String,
         buildOp: (alias: String, deviceId: String, pkg: String) -> DeviceOp?,
@@ -2520,7 +2815,22 @@ object AppCoordinator {
             LogCenter.op(alias, "手动$label：请先切号完成（有备份还原 / 无备份自动登录）")
             return
         }
-        scope.launch {
+        val kind = when (label) {
+            "publish_post_start" -> ManualTaskKind.PUBLISH_POST
+            "mutual_click_start" -> ManualTaskKind.MUTUAL_CLICK
+            "tiktok_edit_basic_profile" -> ManualTaskKind.EDIT_PROFILE
+            else -> {
+                LogCenter.op(alias, "手动$label：未知任务类型，已忽略")
+                return
+            }
+        }
+        if (detectActiveManualTaskKind() == kind) {
+            LogCenter.op(alias, "手动任务：${kind.label}已在进行中，忽略重复点击")
+            return
+        }
+        manualDispatchJob?.cancel()
+        manualDispatchJob = scope.launch {
+            if (!prepareManualTaskTakeover(kind, "手动$label")) return@launch
             PrefsStore.setTransientPausedForDestructiveOp(false)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
@@ -2537,6 +2847,10 @@ object AppCoordinator {
 
     private fun maybeManualAutoGrowthAfterTask(reason: String) {
         if (!ManualDeviceControl.ENABLED) return
+        if (SystemClock.elapsedRealtime() < suppressManualAutoGrowthUntilElapsed) {
+            LogCenter.op(PrefsStore.getAlias(), "手动抢占窗口内：跳过「$reason」后的自动涨粉")
+            return
+        }
         if (!PrefsStore.isAutoGrowthAfterTasksEnabled()) {
             PrefsStore.saveLocalStatus("online")
             updateRuntime(localStatus = "online", lastMessage = "$reason（未勾选完成后自动涨粉）")
@@ -2550,6 +2864,184 @@ object AppCoordinator {
         }
         LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason → 自动进入涨粉")
         manualStartGrowth("$reason → 自动涨粉")
+    }
+
+    data class AutoSwitchParticipationAccount(
+        val username: String,
+        val rowIndex: Int?,
+        val autoSwitchExcluded: Boolean,
+        val looksBanned: Boolean,
+        val cloudIsLogin: Boolean?,
+    ) {
+        val participating: Boolean get() = !autoSwitchExcluded && !looksBanned
+    }
+
+    /** 拉取别名桶账号（含不参与 / banned），供切换云端模式前展示。 */
+    suspend fun fetchAutoSwitchParticipationRoster(): Result<List<AutoSwitchParticipationAccount>> {
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) {
+            return Result.failure(IllegalStateException("请先绑定设备"))
+        }
+        return runCatching {
+            val resp = ApiService.getDeviceAssignedAccountsRoster(deviceId, alias)
+            if (resp.code != 0) {
+                throw IllegalStateException(resp.msg?.trim().orEmpty().ifBlank { "拉取账号失败" })
+            }
+            resp.items.orEmpty().mapNotNull { item ->
+                val username = item.username?.trim()?.removePrefix("@").orEmpty()
+                if (username.isEmpty()) return@mapNotNull null
+                AutoSwitchParticipationAccount(
+                    username = username,
+                    rowIndex = item.row_index ?: item.account_row_index,
+                    autoSwitchExcluded = item.auto_switch_excluded == true,
+                    looksBanned = item.looks_banned == true ||
+                        ManualDeviceControl.isBannedMarker(item.password) ||
+                        ManualDeviceControl.isBannedMarker(item.email) ||
+                        ManualDeviceControl.isBannedMarker(item.email_password),
+                    cloudIsLogin = item.is_login,
+                )
+            }
+        }
+    }
+
+    /** 单账号立即同步云端「参与 / 不参与自动切号」。 */
+    suspend fun setAccountAutoSwitchParticipating(
+        username: String,
+        participating: Boolean,
+    ): Result<DeviceAssignedAccountSetAutoSwitchExcludedResponse> {
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val user = username.trim().removePrefix("@")
+        if (deviceId.isBlank() || alias.isBlank() || user.isBlank()) {
+            return Result.failure(IllegalStateException("参数无效"))
+        }
+        return runCatching {
+            val resp = ApiService.setDeviceAssignedAccountAutoSwitchExcluded(
+                deviceId = deviceId,
+                alias = alias,
+                username = user,
+                excluded = !participating,
+            )
+            if (resp.code != 0) {
+                throw IllegalStateException(resp.msg?.trim().orEmpty().ifBlank { "更新失败" })
+            }
+            LogCenter.op(
+                alias,
+                if (participating) {
+                    "已将 @$user 设为参与自动切号"
+                } else {
+                    "已将 @$user 设为不参与自动切号"
+                },
+            )
+            resp
+        }
+    }
+
+    /**
+     * 切换到云端 client：先按挑选名单同步账号参与状态并开启本设备云端自动切号，
+     * 再关闭本机手动模式 / 本机自治。
+     */
+    suspend fun switchToCloudClientMode(participateUsernames: List<String>): Result<String> {
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) {
+            return Result.failure(IllegalStateException("请先绑定设备"))
+        }
+        if (PrefsStore.getAuthToken().isNullOrBlank()) {
+            return Result.failure(IllegalStateException("请先登录云端"))
+        }
+        val participate = participateUsernames
+            .map { it.trim().removePrefix("@") }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+
+        return runCatching {
+            if (PrefsStore.isManualLocalAutoSwitchEnabled()) {
+                PrefsStore.setManualLocalAutoSwitchEnabled(false)
+                clearOrphanedAutoSwitchAfterManualDisable("切换云端模式")
+            }
+            // 轻量收尾：停本机拉号/任务，但不走硬停 opt_out（避免切到云端后无法自动开启）
+            clearMutualClickStateForInterrupt("切换云端模式")
+            pullLoopJob?.cancel()
+            pullLoopJob = null
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            PrefsStore.setTransientPausedForDestructiveOp(false)
+            started.set(true)
+
+            // 必须先切出手动模式，再开启云端自动切号 / 投递 enter。
+            // 否则 mode_wait 并发收到 enter 时会因 ManualDeviceControl.ENABLED 仍为 true 被忽略并推进 lastModeEventId，事件永久丢失。
+            PrefsStore.setManualControlMode(false)
+
+            val sync = ApiService.syncDeviceAssignedAccountsAutoSwitchParticipation(
+                deviceId = deviceId,
+                alias = alias,
+                participateUsernames = participate,
+                // 至少有一个参与账号时开启本设备云端自动切号；0 个则只切模式、不抢开设备开关
+                enableDeviceAutoSwitch = participate.isNotEmpty(),
+            )
+            if (sync.code != 0) {
+                // 同步失败则回滚模式，避免卡在「本地已是云端、云端未开」的半状态
+                PrefsStore.setManualControlMode(true)
+                throw IllegalStateException(sync.msg?.trim().orEmpty().ifBlank { "同步参与名单失败" })
+            }
+            val tip = when {
+                participate.isEmpty() ->
+                    "已切换到云端模式；未挑选参与账号（桶内均已标为不参与），设备云端自动切号未开启"
+                participate.size < 2 ->
+                    "已切换到云端模式；参与 ${participate.size} 个账号（云端计划通常需 ≥2 个才续跑自动切号）"
+                else ->
+                    "已切换到云端模式；参与自动切号 ${participate.size} 个账号"
+            }
+            LogCenter.op(
+                alias,
+                "$tip（更新 ${sync.updated_rows ?: 0} 行，计划桶 ${sync.bucket_size ?: 0}）",
+            )
+            updateRuntime(
+                localStatus = PrefsStore.getLocalStatus(),
+                lastMessage = "已切换到云端 client 模式",
+            )
+            if (!WorkerServiceTracker.isRunning) {
+                runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "switch_to_cloud_client") }
+            }
+            ensureLoopsRunning()
+            // 设备原本已开启时服务端可能不重投 enter；显式拉起云端恢复路径。
+            if (participate.isNotEmpty()) {
+                forceStartRunningNow("切换到云端模式后恢复")
+            }
+            tip
+        }
+    }
+
+    /** 切回本机手动：关闭本设备云端自动切号，保留账号参与标记，打开手动模式。 */
+    suspend fun switchToManualControlMode(): Result<String> {
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) {
+            return Result.failure(IllegalStateException("请先绑定设备"))
+        }
+        return runCatching {
+            // participate_usernames=null：只关设备开关，绝不改账号参与标记（避免拉名单失败时把全部标成不参与）
+            val sync = ApiService.syncDeviceAssignedAccountsAutoSwitchParticipation(
+                deviceId = deviceId,
+                alias = alias,
+                participateUsernames = null,
+                enableDeviceAutoSwitch = false,
+            )
+            if (sync.code != 0) {
+                throw IllegalStateException(sync.msg?.trim().orEmpty().ifBlank { "关闭云端自动切号失败" })
+            }
+            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+                clearOrphanedAutoSwitchAfterManualDisable("切回本机手动")
+            }
+            PrefsStore.setManualControlMode(true)
+            PrefsStore.setHardStopRequested(false)
+            manuallyPaused = false
+            LogCenter.op(alias, "已切回本机手动模式（云端自动切号已关；账号参与标记保留）")
+            updateRuntime(lastMessage = "已切回本机手动模式")
+            "已切回本机手动模式"
+        }
     }
 
     /** 开启本机自动切号自治：按当前账号列表生成计划并启动调度。 */
@@ -7724,15 +8216,8 @@ object AppCoordinator {
                 "[OP][$opId] 发作品指令$autoSwitchHint 已收到，准备切入发作品入口流程$countHint"
             PrefsStore.setPublishPostQueuedAfterMutual(false)
             LogCenter.op(alias, lineStart)
+            // 不在此处上报 success：网页端需轮询最终发作品成败；启动即 success 会挡住终态回执。
             triggerPublishPostNow(alias)
-            reportDeviceOpToCloud(
-                deviceId = deviceId,
-                alias = alias,
-                opId = opId,
-                status = "success",
-                message = "已收到并发作品入口任务",
-                data = publishPostStartReportData(deviceId, opId, payload, slotKey),
-            )
             return
         }
         if (packageName.isBlank()) {
@@ -9574,6 +10059,11 @@ object AppCoordinator {
             return
         }
         mutualSwitchJob = scope.launch {
+            if (ManualDeviceControl.ENABLED) {
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                pendingUsernames.clear()
+            }
             ExecutionScope.enter()
             var switchResult = ""
             try {
@@ -9714,6 +10204,54 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * 云端「发布作品」下发的最终回执（非自动切号）。
+     * 网页端轮询 op_result，据此汇总各设备成败。
+     */
+    private suspend fun reportCloudPublishFinalOutcome(
+        alias: String,
+        deviceId: String,
+        opId: String,
+        completed: Boolean,
+        loginFailed: Boolean,
+        message: String,
+        successCount: Int,
+        targetCount: Int,
+    ) {
+        if (opId.isBlank()) return
+        if (PrefsStore.isAutoSwitchAutonomousMode()) return
+        val status = if (completed) "success" else "failed"
+        val summary =
+            if (completed) {
+                "发作品最终结果：成功（$successCount/$targetCount）$message"
+            } else {
+                "发作品最终结果：失败（已成功 $successCount/$targetCount）$message"
+            }
+        runCatching {
+            withContext(Dispatchers.IO) {
+                reportDeviceOpToCloud(
+                    deviceId = deviceId.ifBlank { PrefsStore.getDeviceId().orEmpty() },
+                    alias = alias,
+                    opId = opId,
+                    status = status,
+                    message = summary,
+                    data = mapOf(
+                        "op_type" to "publish_post_start",
+                        "device_id" to deviceId,
+                        "publish_post_outcome_report" to true,
+                        "publish_post_completed" to completed,
+                        "publish_success_count" to successCount.coerceAtLeast(0),
+                        "publish_target_count" to targetCount.coerceAtLeast(0),
+                        "publish_login_failed" to loginFailed,
+                        "operation_logs" to listOf("[OP][$opId] $summary"),
+                    ),
+                )
+            }
+        }.onFailure { err ->
+            LogCenter.op(alias, "发作品最终结果上报失败：${err.message}")
+        }
+    }
+
     private suspend fun reportAutoSwitchPublishOutcomeIfNeeded(
         alias: String,
         deviceId: String,
@@ -9831,7 +10369,12 @@ object AppCoordinator {
         }
         clearMutualClickStateForInterrupt("发作品入口")
         publishPostSwitchJob = scope.launch {
-            if (PrefsStore.isAutoSwitchAutonomousMode()) {
+            if (ManualDeviceControl.ENABLED) {
+                // 手动发作品：素材准备阶段也必须立刻停涨粉（按钮抢占已做一遍，这里再兜底）
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+                pendingUsernames.clear()
+            } else if (PrefsStore.isAutoSwitchAutonomousMode()) {
                 pauseGrowthForAutoSwitchExclusiveOp()
             }
             ExecutionScope.enter()
@@ -9844,7 +10387,11 @@ object AppCoordinator {
             )
             LogCenter.op(
                 alias,
-                "发作品切换任务准备执行特殊用户名 __publish_post__（素材准备阶段不暂停涨粉）：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}",
+                if (ManualDeviceControl.ENABLED) {
+                    "发作品切换任务准备执行特殊用户名 __publish_post__（手动模式：已抢占/暂停涨粉）：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}"
+                } else {
+                    "发作品切换任务准备执行特殊用户名 __publish_post__（素材准备阶段不暂停涨粉）：requested=${PrefsStore.isPublishPostRequested()} pending=${PrefsStore.isPublishPostPending()}"
+                },
             )
             val deviceIdForPublish = PrefsStore.getDeviceId().orEmpty()
             val publishOpId = PrefsStore.getPublishPostTaskOpId().orEmpty()
@@ -9852,6 +10399,14 @@ object AppCoordinator {
             val autoSwitchPublishAtStart = AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()
             if (deviceIdForPublish.isBlank()) {
                 LogCenter.op(alias, "发作品切换任务：未绑定 deviceId，已跳过")
+                if (ManualDeviceControl.ENABLED) {
+                    recordManualPublishOutcome(
+                        success = false,
+                        message = "未绑定 deviceId，发作品入口未执行",
+                        targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
+                        successCount = 0,
+                    )
+                }
                 if (PrefsStore.isAutoSwitchPublishTask() && publishOpId.isNotBlank()) {
                     reportAutoSwitchPublishOutcomeIfNeeded(
                         alias = alias,
@@ -9861,6 +10416,17 @@ object AppCoordinator {
                         loginFailed = false,
                         accountChanged = false,
                         message = "未绑定 deviceId，发作品入口未执行",
+                    )
+                } else if (publishOpId.isNotBlank()) {
+                    reportCloudPublishFinalOutcome(
+                        alias = alias,
+                        deviceId = PrefsStore.getDeviceId().orEmpty(),
+                        opId = publishOpId,
+                        completed = false,
+                        loginFailed = false,
+                        message = "未绑定 deviceId，发作品入口未执行",
+                        successCount = 0,
+                        targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
                     )
                 }
                 return@launch
@@ -9930,14 +10496,35 @@ object AppCoordinator {
                         "发作品保障自动登录失败",
                     )
                     if (publishOpId.isNotBlank()) {
-                        reportAutoSwitchPublishOutcomeIfNeeded(
-                            alias = alias,
-                            deviceId = deviceIdForPublish,
-                            opId = publishOpId,
-                            completed = false,
-                            loginFailed = true,
-                            accountChanged = false,
+                        if (PrefsStore.isAutoSwitchPublishTask()) {
+                            reportAutoSwitchPublishOutcomeIfNeeded(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = true,
+                                accountChanged = false,
+                                message = switchResult,
+                            )
+                        } else {
+                            reportCloudPublishFinalOutcome(
+                                alias = alias,
+                                deviceId = deviceIdForPublish,
+                                opId = publishOpId,
+                                completed = false,
+                                loginFailed = true,
+                                message = switchResult,
+                                successCount = 0,
+                                targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
+                            )
+                        }
+                    }
+                    if (ManualDeviceControl.ENABLED) {
+                        recordManualPublishOutcome(
+                            success = false,
                             message = switchResult,
+                            targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
+                            successCount = 0,
                         )
                     }
                     LogCenter.op(alias, switchResult)
@@ -9953,6 +10540,26 @@ object AppCoordinator {
                 )
             }
             val publishCompleted = switchResult.contains("已完成") && !publishLoginFailed
+            val accountKeyForCount =
+                PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: ManualDeviceControl.selectedManualUsername().takeIf { it.isNotBlank() }
+                    ?: alias
+            val targetCount = PrefsStore.getPublishPostTargetCount() ?: 0
+            val successCount = when {
+                publishCompleted -> {
+                    val actual = PrefsStore.peekPublishPostLastActualSuccessCount()
+                    if (actual > 0) actual else targetCount
+                }
+                else -> PrefsStore.getPublishPostResumeNextIndex(accountKeyForCount).coerceAtLeast(0)
+            }
+            if (ManualDeviceControl.ENABLED) {
+                recordManualPublishOutcome(
+                    success = publishCompleted,
+                    message = switchResult,
+                    targetCount = targetCount,
+                    successCount = successCount,
+                )
+            }
             if (autoSwitchPublishAtStart && publishOpId.isNotBlank()) {
                 reportAutoSwitchPublishOutcomeIfNeeded(
                     alias = alias,
@@ -9973,6 +10580,17 @@ object AppCoordinator {
                     loginFailed = publishLoginFailed,
                     accountChanged = false,
                     message = switchResult,
+                )
+            } else if (publishOpId.isNotBlank() && deviceIdForPublish.isNotBlank()) {
+                reportCloudPublishFinalOutcome(
+                    alias = alias,
+                    deviceId = deviceIdForPublish,
+                    opId = publishOpId,
+                    completed = publishCompleted,
+                    loginFailed = publishLoginFailed,
+                    message = switchResult,
+                    successCount = successCount,
+                    targetCount = targetCount,
                 )
             }
             LogCenter.op(alias, switchResult)
@@ -9996,6 +10614,15 @@ object AppCoordinator {
                 ExecutionScope.exit()
                 PublishPostGrowthGate.exitExclusivePublishPhase()
                 cleanupOrphanedAutoSwitchPublishState(alias)
+                if (ManualDeviceControl.ENABLED && !PrefsStore.isAutoSwitchPublishTask()) {
+                    val accountKey = PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: ManualDeviceControl.selectedManualUsername().takeIf { it.isNotBlank() }
+                        ?: alias
+                    val keepResume = PrefsStore.getPublishPostResumeNextIndex(accountKey) > 0
+                    if (!keepResume) {
+                        PrefsStore.clearPublishPostState()
+                    }
+                }
                 val did = PrefsStore.getDeviceId()
                 val devAlias = PrefsStore.getAlias()
                 if (!did.isNullOrBlank() && !devAlias.isNullOrBlank()) {
