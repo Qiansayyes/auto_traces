@@ -5585,19 +5585,11 @@ class RealTraceExecutor(
                     w,
                     h,
                 )
-                val checkPt = findRowAlignedCheckmarkTapForProfileEdit(vision, syncRow, w)
-                if (checkPt != null) {
-                    val ck = coerceTapToScreen(checkPt, w, h)
-                    devOp(
-                        logAlias,
-                        "「修改基本资料」Username 已同步修改：将对勾估点 tap=(${ck.x},${ck.y})（与 Sync/Username 同行；未识别符号时可能为屏右几何回退）",
-                    )
-                    if (runSuCommand("input tap ${ck.x} ${ck.y}")) {
-                        delay(420)
-                    } else {
-                        devOp(logAlias, "「修改基本资料」Username 同步行对勾 tap 失败（su），仍继续尝试点 Confirm")
-                    }
-                }
+                devOp(
+                    logAlias,
+                    "「修改基本资料」检测到 Username/Sync 行，停止自动操作，需人工确认后继续",
+                )
+                return false
             }
             val hit = findStrictExactLabelHit(vision, "Confirm")
             if (hit == null) {
