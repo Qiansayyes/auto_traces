@@ -5568,27 +5568,64 @@ class RealTraceExecutor(
             }
             val syncRow = findProfileEditSyncOrUsernameRowHit(vision)
             if (syncRow != null) {
+                val matchedLabel = vision.textBlocks.flatMap { b -> b.lines.flatMap { l -> l.elements } }
+                    .firstOrNull { el ->
+                        val bb = el.boundingBox
+                        bb != null &&
+                            kotlin.math.abs(bb.centerY() - syncRow.rect.centerY()) < 20 &&
+                            kotlin.math.abs(bb.centerX() - syncRow.rect.centerX()) < 40
+                    }?.text?.trim()
+                    ?: vision.textBlocks.flatMap { it.lines }
+                        .firstOrNull { line ->
+                            val bb = line.boundingBox
+                            bb != null &&
+                                kotlin.math.abs(bb.centerY() - syncRow.rect.centerY()) < 20 &&
+                                kotlin.math.abs(bb.centerX() - syncRow.rect.centerX()) < 40
+                        }?.text?.trim()
+                    ?: "Sync|Username"
+                val ocrPreview = buildProfileEditOcrPreview(vision, maxLines = 48)
+                val plannedCheckPt = findRowAlignedCheckmarkTapForProfileEdit(vision, syncRow, w)
+                val plannedCheckTap = plannedCheckPt?.let { coerceTapToScreen(it, w, h) }
+                val confirmHit = findStrictExactLabelHit(vision, "Confirm")
+                val plannedConfirmTap = confirmHit?.let { coerceTapToScreen(it.point, w, h) }
                 profileEditLogStrictHit(
                     logAlias,
                     "Username/Sync 行(确认前)",
-                    syncRow.let { sr ->
-                        val raw = vision.textBlocks.flatMap { b -> b.lines.flatMap { l -> l.elements } }
-                            .firstOrNull { el ->
-                                val bb = el.boundingBox
-                                bb != null &&
-                                    kotlin.math.abs(bb.centerY() - sr.rect.centerY()) < 20 &&
-                                    kotlin.math.abs(bb.centerX() - sr.rect.centerX()) < 40
-                            }?.text?.trim()
-                        raw?.take(24) ?: "Sync|Username"
-                    },
+                    matchedLabel.take(24),
                     syncRow,
                     w,
                     h,
                 )
                 devOp(
                     logAlias,
-                    "「修改基本资料」检测到 Username/Sync 行，停止自动操作，需人工确认后继续",
+                    "「修改基本资料」检测到 Username/Sync 行，停止自动操作，需人工确认后继续；" +
+                        "OCR命中文案=\"${matchedLabel.replace("\n", " ").take(80)}\" " +
+                        "bbox=(${syncRow.rect.left},${syncRow.rect.top},${syncRow.rect.right},${syncRow.rect.bottom}) " +
+                        "center=(${syncRow.point.x},${syncRow.point.y})",
                 )
+                devOp(
+                    logAlias,
+                    "「修改基本资料」Username/Sync 停止时整屏 OCR 文案：$ocrPreview",
+                )
+                val plannedAction = buildString {
+                    append("「修改基本资料」按原逻辑本将执行：")
+                    if (plannedCheckTap != null) {
+                        append(
+                            "① 先点 Username/Sync 同行右侧对勾 tap=(${plannedCheckTap.x},${plannedCheckTap.y})，等待约 420ms；",
+                        )
+                    } else {
+                        append("① 未能估算出 Username/Sync 同行对勾坐标，原逻辑会跳过对勾；")
+                    }
+                    if (plannedConfirmTap != null) {
+                        append(
+                            "② 再点 Confirm tap=(${plannedConfirmTap.x},${plannedConfirmTap.y})；",
+                        )
+                    } else {
+                        append("② 本屏尚未识别到 Confirm，原逻辑会继续 OCR 重试 Confirm（至多 $maxPasses 次）；")
+                    }
+                    append("③ Confirm 成功后延迟 1s，再 OCR 校验资料页出现 Change photo（至多 7 次）")
+                }
+                devOp(logAlias, plannedAction)
                 return false
             }
             val hit = findStrictExactLabelHit(vision, "Confirm")
