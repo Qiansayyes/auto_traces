@@ -67,6 +67,12 @@ object PrefsStore {
     const val MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 180
     /** 各账号累计活跃时长（分钟），JSON 对象 username→minutes。 */
     private const val KEY_MANUAL_ACTIVATE_TOTAL_MINUTES = "manual_activate_total_minutes_json"
+    /** 各账号待活跃队列累计涨粉模式时长（分钟）。 */
+    private const val KEY_MANUAL_ACTIVATE_GROWTH_MINUTES = "manual_activate_growth_minutes_json"
+    /** 各账号待活跃队列累计 For You 预滑时长（分钟）。 */
+    private const val KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES = "manual_activate_for_you_minutes_json"
+    /** 各账号最近一次加入待活跃队列时间（epoch ms）。 */
+    private const val KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT = "manual_pending_activate_enqueue_at_json"
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
     /**
@@ -1336,6 +1342,118 @@ object PrefsStore {
         prefs.edit().remove(KEY_MANUAL_ACTIVATE_TOTAL_MINUTES).apply()
     }
 
+    private fun readIntMinutesMap(key: String): Map<String, Int> {
+        val raw = prefs.getString(key, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next().trim().removePrefix("@")
+                    if (k.isEmpty()) continue
+                    val v = obj.optInt(k, 0).coerceAtLeast(0)
+                    if (v > 0) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveIntMinutesMap(key: String, map: Map<String, Int>) {
+        val normalized = map.mapKeys { it.key.trim().removePrefix("@") }
+            .filterKeys { it.isNotEmpty() }
+            .mapValues { it.value.coerceAtLeast(0) }
+            .filterValues { it > 0 }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(key).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        normalized.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString(key, obj.toString()).apply()
+    }
+
+    private fun addIntMinutes(key: String, username: String, addMinutes: Int) {
+        val u = username.trim().removePrefix("@")
+        val add = addMinutes.coerceAtLeast(0)
+        if (u.isEmpty() || add <= 0) return
+        val cur = readIntMinutesMap(key).toMutableMap()
+        val mapKey = cur.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        cur[mapKey] = (cur[mapKey] ?: 0) + add
+        saveIntMinutesMap(key, cur)
+    }
+
+    private fun getIntMinutes(key: String, username: String): Int {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return 0
+        return readIntMinutesMap(key).entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }
+            ?.value ?: 0
+    }
+
+    fun getActivateGrowthMinutes(username: String): Int =
+        getIntMinutes(KEY_MANUAL_ACTIVATE_GROWTH_MINUTES, username)
+
+    fun getActivateForYouMinutes(username: String): Int =
+        getIntMinutes(KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES, username)
+
+    fun addActivateGrowthMinutes(username: String, addMinutes: Int) {
+        addIntMinutes(KEY_MANUAL_ACTIVATE_GROWTH_MINUTES, username, addMinutes)
+    }
+
+    fun addActivateForYouMinutes(username: String, addMinutes: Int) {
+        addIntMinutes(KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES, username, addMinutes)
+    }
+
+    private fun readEnqueueAtMap(): Map<String, Long> {
+        val raw = prefs.getString(KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next().trim().removePrefix("@")
+                    if (k.isEmpty()) continue
+                    val v = obj.optLong(k, 0L)
+                    if (v > 0L) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveEnqueueAtMap(map: Map<String, Long>) {
+        val normalized = map.mapKeys { it.key.trim().removePrefix("@") }
+            .filterKeys { it.isNotEmpty() }
+            .mapValues { it.value.coerceAtLeast(0L) }
+            .filterValues { it > 0L }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        normalized.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString(KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT, obj.toString()).apply()
+    }
+
+    fun getPendingActivateEnqueueAt(username: String): Long? {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return null
+        val v = readEnqueueAtMap().entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }
+            ?.value ?: return null
+        return if (v > 0L) v else null
+    }
+
+    fun setPendingActivateEnqueueAt(username: String, atMs: Long = System.currentTimeMillis()) {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return
+        val cur = readEnqueueAtMap().toMutableMap()
+        val mapKey = cur.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        cur[mapKey] = atMs.coerceAtLeast(0L)
+        saveEnqueueAtMap(cur)
+    }
+
     /** 待活跃队列（FIFO，username 不含 @）。 */
     fun getPendingActivateUsernames(): List<String> {
         val raw = prefs.getString(KEY_MANUAL_PENDING_ACTIVATE_QUEUE, null)?.trim().orEmpty()
@@ -1371,6 +1489,7 @@ object PrefsStore {
         if (cur.any { it.equals(u, ignoreCase = true) }) return false
         cur.add(u)
         savePendingActivateUsernames(cur)
+        setPendingActivateEnqueueAt(u)
         return true
     }
 
@@ -1397,9 +1516,20 @@ object PrefsStore {
         prefs.edit().remove(KEY_MANUAL_PENDING_ACTIVATE_QUEUE).apply()
     }
 
-    /** 整体替换待活跃队列（用于按活跃时长编辑）。 */
+    /** 整体替换待活跃队列（用于按活跃时长编辑）。新入队账号会记录加入时间。 */
     fun setPendingActivateUsernames(usernames: List<String>) {
-        savePendingActivateUsernames(usernames)
+        val oldSet = getPendingActivateUsernames()
+            .map { it.lowercase(Locale.US) }
+            .toSet()
+        val normalized = usernames.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.US) }
+        savePendingActivateUsernames(normalized)
+        val now = System.currentTimeMillis()
+        normalized.forEach { u ->
+            if (!oldSet.contains(u.lowercase(Locale.US))) {
+                setPendingActivateEnqueueAt(u, now)
+            }
+        }
     }
 
     fun getManualPublishCount(): Int =

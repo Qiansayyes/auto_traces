@@ -1844,11 +1844,24 @@ button.danger {
   background: #fff;
 }
 
+.account-editor-table-wrap--creds-collapsed {
+  overflow-x: auto;
+}
+
 .account-editor-table {
   width: 100%;
   min-width: 1280px;
   border-collapse: collapse;
   font-size: 12px;
+}
+
+.account-editor-table--creds-collapsed {
+  min-width: 980px;
+  table-layout: fixed;
+}
+
+.account-editor-table--creds-collapsed .account-editor-table__cred-col {
+  display: none;
 }
 
 .account-editor-table thead th {
@@ -1872,6 +1885,57 @@ button.danger {
 
 .account-editor-table tbody tr:hover {
   background: #f8faff;
+}
+
+.account-editor-table__username {
+  min-width: 108px;
+  width: 12%;
+}
+
+.account-editor-table__login {
+  width: 52px;
+  min-width: 52px;
+  max-width: 52px;
+}
+
+.account-editor-table__login-select {
+  min-width: 46px;
+  padding-left: 2px;
+  padding-right: 18px;
+}
+
+.account-editor-table__login-time {
+  min-width: 122px;
+  width: 11%;
+}
+
+.account-editor-table__login-time-input {
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+.account-editor-table__region {
+  width: 48px;
+  min-width: 48px;
+  max-width: 56px;
+}
+
+.account-editor-table__region .account-editor-table__input {
+  text-align: center;
+  padding-left: 2px;
+  padding-right: 2px;
+}
+
+.account-editor-table__profile {
+  width: 52px;
+  min-width: 52px;
+  max-width: 52px;
+}
+
+.account-editor-table__profile-select {
+  min-width: 46px;
+  padding-left: 2px;
+  padding-right: 18px;
 }
 
 .account-editor-table__num {
@@ -1899,14 +1963,28 @@ button.danger {
   box-shadow: 0 0 0 2px var(--primary-weak);
 }
 
-.account-editor-table__api {
+.account-editor-table__cred-col--password,
+.account-editor-table__cred-col--email {
+  min-width: 96px;
+}
+
+.account-editor-table__cred-col--email-pwd {
+  min-width: 88px;
+}
+
+.account-editor-table__cred-col--api {
   min-width: 140px;
   max-width: 200px;
 }
 
 .account-editor-table__alias {
-  min-width: 72px;
+  min-width: 68px;
+  width: 6%;
   max-width: 88px;
+}
+
+.account-editor-table__alias-select {
+  font-size: 11px;
 }
 
 .account-editor-table__alias-locked {
@@ -1920,13 +1998,21 @@ button.danger {
 }
 
 .account-editor-table__stat {
-  width: 52px;
+  width: 56px;
+  min-width: 56px;
+  max-width: 64px;
 }
 
 .account-editor-table__growth {
-  min-width: 72px;
-  max-width: 88px;
+  min-width: 88px;
+  width: 8%;
+  max-width: 104px;
   vertical-align: middle;
+}
+
+.account-editor-table--creds-collapsed .account-editor-table__growth {
+  min-width: 96px;
+  width: 9%;
 }
 
 .account-growth-triple {
@@ -1957,6 +2043,7 @@ button.danger {
 
 .account-editor-table__actions {
   width: 36px;
+  min-width: 36px;
   text-align: center;
 }
 
@@ -1968,6 +2055,7 @@ button.danger {
 
 .account-editor-table__select {
   width: 36px;
+  min-width: 36px;
   text-align: center;
   vertical-align: middle;
 }
@@ -1976,6 +2064,10 @@ button.danger {
   width: 15px;
   height: 15px;
   cursor: pointer;
+}
+
+#accountRecordsToggleCredColsBtn {
+  white-space: nowrap;
 }
 
 #accountRecordsBatchDeleteBtn:disabled {

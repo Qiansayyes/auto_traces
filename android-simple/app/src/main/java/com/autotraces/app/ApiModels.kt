@@ -468,6 +468,13 @@ data class DeviceAssignedAccountItem(
     val auto_switch_excluded: Boolean? = null,
     /** 云端 password/email/email_password 标 banned。 */
     val looks_banned: Boolean? = null,
+    val video_count: String? = null,
+    val follower_count: String? = null,
+    /** 今日粉丝增长（优先 follower_growth_today）。 */
+    val follower_growth: String? = null,
+    val heart_count: String? = null,
+    /** 今日总赞增长。 */
+    val heart_growth: String? = null,
 )
 
 /** GET /api/device/assigned_accounts */

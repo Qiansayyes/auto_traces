@@ -25,26 +25,8 @@ class ControlModeActivity : AppCompatActivity() {
         binding = ActivityControlModeBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.showSettingsButton.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-            finish()
-        }
-        binding.showActionButton.setOnClickListener {
-            startActivity(
-                Intent(this, MainActivity::class.java).putExtra(EXTRA_INITIAL_PANEL, "action"),
-            )
-            finish()
-        }
+        TopNavHelper.wire(this, TopNavHelper.Tab.CONTROL_MODE)
         binding.showControlModeButton.setOnClickListener { /* current */ }
-        binding.showVideoDedButton.setOnClickListener {
-            startActivity(Intent(this, VideoDedMainActivity::class.java))
-        }
-        binding.showLogButton.setOnClickListener {
-            startActivity(
-                Intent(this, MainActivity::class.java).putExtra(EXTRA_INITIAL_PANEL, "log"),
-            )
-            finish()
-        }
 
         binding.refreshParticipationButton.setOnClickListener {
             lifecycleScope.launch { refreshParticipationRoster(showToast = true) }

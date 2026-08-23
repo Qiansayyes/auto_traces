@@ -11094,7 +11094,8 @@ def _account_bundle_fields_for_username(
     acct = conn.execute(
         """
         SELECT row_index, username, password, email, email_password, api, is_login, login_time,
-               basic_profile_modified
+               basic_profile_modified, video_count, follower_count, follower_growth, heart_count,
+               follower_growth_today, heart_growth_today
         FROM account_editor_rows
         WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
         LIMIT 1
@@ -11122,6 +11123,11 @@ def _account_bundle_fields_for_username(
         "login_time": str(row.get("login_time") or "").strip(),
         "basic_profile_modified": _normalize_switch_highlight(row.get("basic_profile_modified")),
         "mail_module_code_available": mail_module_code_available,
+        "video_count": str(row.get("video_count") or "").strip(),
+        "follower_count": str(row.get("follower_count") or "").strip(),
+        "follower_growth": str(row.get("follower_growth_today") or row.get("follower_growth") or "").strip(),
+        "heart_count": str(row.get("heart_count") or "").strip(),
+        "heart_growth": str(row.get("heart_growth_today") or "").strip(),
     }
 
 
@@ -11280,6 +11286,11 @@ def _fetch_device_assigned_accounts_list(
                 "env_status": str(pick.get("env_status") or "").strip(),
                 "auto_switch_excluded": bool(int(pick.get("auto_switch_excluded") or 0)),
                 "looks_banned": bool(looks_banned),
+                "video_count": str(fields.get("video_count") or "").strip(),
+                "follower_count": str(fields.get("follower_count") or "").strip(),
+                "follower_growth": str(fields.get("follower_growth") or "").strip(),
+                "heart_count": str(fields.get("heart_count") or "").strip(),
+                "heart_growth": str(fields.get("heart_growth") or "").strip(),
             }
         )
     return items

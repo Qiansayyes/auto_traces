@@ -2041,10 +2041,15 @@ object AppCoordinator {
 
         currentCoroutineContext().ensureActive()
         PrefsStore.addActivateTotalMinutes(target, minutes)
+        if (useForYou) {
+            PrefsStore.addActivateForYouMinutes(target, minutes)
+        } else {
+            PrefsStore.addActivateGrowthMinutes(target, minutes)
+        }
         notifyManualAccountUi()
         LogCenter.op(
             alias,
-            "$logTag：@$target 完成（$modeLabel · ${minutes}分钟，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟）",
+            "$logTag：@$target 完成（$modeLabel · ${minutes}分钟，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟，涨粉 ${PrefsStore.getActivateGrowthMinutes(target)} / ForYou ${PrefsStore.getActivateForYouMinutes(target)}）",
         )
         return modeLabel
     }

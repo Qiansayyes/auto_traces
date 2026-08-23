@@ -35,6 +35,12 @@
             android:name=".ControlModeActivity"
             android:exported="false" />
         <activity
+            android:name=".PendingActivateActivity"
+            android:exported="false" />
+        <activity
+            android:name=".PendingActivateQueueManageActivity"
+            android:exported="false" />
+        <activity
             android:name=".SettingsActivity"
             android:exported="false" />
         <activity

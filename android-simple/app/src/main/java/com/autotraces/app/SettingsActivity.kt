@@ -5,7 +5,6 @@ import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.autotraces.app.databinding.ActivitySettingsBinding
-import com.autotraces.app.videoded.VideoDedMainActivity
 import kotlinx.coroutines.launch
 
 class SettingsActivity : AppCompatActivity() {
@@ -22,30 +21,8 @@ class SettingsActivity : AppCompatActivity() {
         renderDeviceInfo()
         binding.versionText.text = AppInfo.versionLabel()
 
-        binding.showSettingsButton.setOnClickListener {
-            // 当前页即设置页，保持不跳转
-        }
-        binding.showActionButton.setOnClickListener {
-            startActivity(
-                Intent(this, MainActivity::class.java)
-                    .putExtra(EXTRA_INITIAL_PANEL, "action")
-            )
-            finish()
-        }
-        binding.showControlModeButton.setOnClickListener {
-            startActivity(Intent(this, ControlModeActivity::class.java))
-            finish()
-        }
-        binding.showVideoDedButton.setOnClickListener {
-            startActivity(Intent(this, VideoDedMainActivity::class.java))
-        }
-        binding.showLogButton.setOnClickListener {
-            startActivity(
-                Intent(this, MainActivity::class.java)
-                    .putExtra(EXTRA_INITIAL_PANEL, "log")
-            )
-            finish()
-        }
+        TopNavHelper.wire(this, TopNavHelper.Tab.SETTINGS)
+        binding.showSettingsButton.setOnClickListener { /* current */ }
 
         binding.cloudLoginButton.setOnClickListener {
             val u = binding.cloudUsernameInput.text?.toString()?.trim().orEmpty()

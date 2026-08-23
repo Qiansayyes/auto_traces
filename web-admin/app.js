@@ -300,9 +300,11 @@ const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageS
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
 const accountRecordsBatchProfileBtn = document.getElementById("accountRecordsBatchProfileBtn");
 const accountRecordsBatchProfileSelect = document.getElementById("accountRecordsBatchProfileSelect");
+const accountRecordsToggleCredColsBtn = document.getElementById("accountRecordsToggleCredColsBtn");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
+const ACCOUNT_EDITOR_CREDS_EXPANDED_LS_KEY = "auto_traces_account_editor_creds_expanded_v1";
 const DEVICE_EDITOR_STORAGE_KEY = "auto_traces_device_editor_rows_v1";
 const ACCOUNT_ROWS_API = "/api/admin/editor/account_rows";
 const DEVICE_ROWS_API = "/api/admin/editor/device_rows";
@@ -327,6 +329,8 @@ let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
 /** 账号记录批量删除勾选，键为数据库 row_index */
 const accountRecordsSelectedRowIndexes = new Set();
+/** 是否展开 password / email / email_pwd / api 四列（默认收起以留出可视空间） */
+let accountRecordsCredColsExpanded = loadAccountRecordsCredColsExpanded();
 const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
 const ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX = 100;
 let backupArchiveSearchQuery = "";
@@ -344,6 +348,7 @@ let backupArchiveAliasTotal = 0;
 const DEFAULT_OVERVIEW_PAGE_SIZE = 20;
 const DEFAULT_BACKUP_ARCHIVE_PAGE_SIZE = 20;
 const DEFAULT_ACCOUNT_RECORDS_PAGE_SIZE = 50;
+const ACCOUNT_RECORDS_CRED_COLS_STORAGE_KEY = "accountRecordsCredColsExpanded";
 const MAX_OVERVIEW_PAGE_SIZE = 500;
 const MAX_BACKUP_ARCHIVE_PAGE_SIZE = 200;
 const MAX_ACCOUNT_RECORDS_PAGE_SIZE = 200;
@@ -10859,12 +10864,56 @@ function canEditAccountAlias(row = {}) {
   return isAccountAliasUnassigned(row);
 }
 
-function accountEditorCellInput(idx, field, value, extraAttrs = "") {
-  return `<input class="account-editor-table__input" type="text" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" value="${escapeHtml(value)}" title="${field}" ${extraAttrs} />`;
+function loadAccountRecordsCredColsExpanded() {
+  try {
+    const raw = localStorage.getItem(ACCOUNT_RECORDS_CRED_COLS_STORAGE_KEY);
+    if (raw === "1") return true;
+    if (raw === "0") return false;
+  } catch (_) { /* ignore */ }
+  return false;
 }
 
-function accountEditorCellSelect(idx, field, innerHtml) {
-  return `<select class="account-editor-table__input" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" title="${field}">${innerHtml}</select>`;
+function persistAccountRecordsCredColsExpanded() {
+  try {
+    localStorage.setItem(
+      ACCOUNT_RECORDS_CRED_COLS_STORAGE_KEY,
+      accountRecordsCredColsExpanded ? "1" : "0",
+    );
+  } catch (_) { /* ignore */ }
+}
+
+function updateAccountRecordsCredColsToggleBtn() {
+  if (!accountRecordsToggleCredColsBtn) return;
+  if (accountRecordsCredColsExpanded) {
+    accountRecordsToggleCredColsBtn.textContent = "收起凭据列";
+    accountRecordsToggleCredColsBtn.title =
+      "收起 password / email / email_pwd / api 列，为登录、统计等列腾出空间";
+  } else {
+    accountRecordsToggleCredColsBtn.textContent = "展开凭据列";
+    accountRecordsToggleCredColsBtn.title =
+      "展开 password / email / email_pwd / api 列（默认收起）";
+  }
+}
+
+function setAccountRecordsCredColsExpanded(expanded) {
+  accountRecordsCredColsExpanded = Boolean(expanded);
+  persistAccountRecordsCredColsExpanded();
+  updateAccountRecordsCredColsToggleBtn();
+  renderAccountEditorRows();
+}
+
+function toggleAccountRecordsCredCols() {
+  setAccountRecordsCredColsExpanded(!accountRecordsCredColsExpanded);
+}
+
+function accountEditorCellInput(idx, field, value, extraAttrs = "", inputClass = "") {
+  const className = ["account-editor-table__input", inputClass].filter(Boolean).join(" ");
+  return `<input class="${className}" type="text" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" value="${escapeHtml(value)}" title="${field}" ${extraAttrs} />`;
+}
+
+function accountEditorCellSelect(idx, field, innerHtml, cellClass = "") {
+  const className = ["account-editor-table__input", cellClass].filter(Boolean).join(" ");
+  return `<select class="${className}" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" title="${field}">${innerHtml}</select>`;
 }
 
 function formatAccountGrowthTriple(row = {}, prefix = "follower") {
@@ -10911,20 +10960,26 @@ function renderAccountEditorRows() {
     return;
   }
   try {
+    const credExpanded = accountRecordsCredColsExpanded;
+    const tableClass = credExpanded
+      ? "account-editor-table"
+      : "account-editor-table account-editor-table--creds-collapsed";
     const bodyHtml = pageRows.map(({ row, idx }, localIdx) => {
       const aliasLocked = isAccountAliasLocked(row);
       const aliasCell = aliasLocked
         ? `<span class="account-editor-table__alias-locked" title="已分配别名不可改；删除记录将同步删除备份档案">${escapeHtml(getEffectiveAccountAssignedAlias(row))}</span>`
-        : accountEditorCellSelect(idx, "assigned_alias", getAssignableAliasOptions(getEffectiveAccountAssignedAlias(row)));
+        : accountEditorCellSelect(idx, "assigned_alias", getAssignableAliasOptions(getEffectiveAccountAssignedAlias(row)), "account-editor-table__alias-select");
       const loginSelect = accountEditorCellSelect(
         idx,
         "is_login",
-        `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`
+        `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`,
+        "account-editor-table__login-select",
       );
       const profileSelect = accountEditorCellSelect(
         idx,
         "basic_profile_modified",
-        `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`
+        `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`,
+        "account-editor-table__profile-select",
       );
       const displayNum = start + localIdx + 1;
       const dbRowIndex = resolveAccountRowIndex(row, idx);
@@ -10934,54 +10989,55 @@ function renderAccountEditorRows() {
           <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量操作"${rowChecked ? " checked" : ""} />
         </td>
         <td class="account-editor-table__num">${displayNum}</td>
-        <td>${accountEditorCellInput(idx, "username", row.username)}</td>
-        <td>${accountEditorCellInput(idx, "password", row.password)}</td>
-        <td>${accountEditorCellInput(idx, "email", row.email)}</td>
-        <td>${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
-        <td class="account-editor-table__api">${accountEditorCellInput(idx, "api", row.api)}</td>
-        <td>${loginSelect}</td>
-        <td>${accountEditorCellInput(idx, "login_time", row.login_time)}</td>
-        <td>${accountEditorCellInput(idx, "region", row.region)}</td>
+        <td class="account-editor-table__username">${accountEditorCellInput(idx, "username", row.username)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--password">${accountEditorCellInput(idx, "password", row.password)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--email">${accountEditorCellInput(idx, "email", row.email)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
+        <td class="account-editor-table__login">${loginSelect}</td>
+        <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
+        <td class="account-editor-table__region">${accountEditorCellInput(idx, "region", row.region)}</td>
         <td class="account-editor-table__alias">${aliasCell}</td>
         <td class="account-editor-table__stat">${accountEditorCellInput(idx, "video_count", row.video_count, 'inputmode="numeric"')}</td>
         <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_count", row.follower_count, 'inputmode="numeric"')}</td>
         <td class="account-editor-table__stat">${accountEditorCellInput(idx, "heart_count", row.heart_count, 'inputmode="numeric"')}</td>
         <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
         <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
-        <td>${profileSelect}</td>
+        <td class="account-editor-table__profile">${profileSelect}</td>
         <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
       </tr>`;
     }).join("");
     accountEditorListEl.innerHTML = `
-      <div class="account-editor-table-wrap">
-        <table class="account-editor-table">
+      <div class="account-editor-table-wrap${credExpanded ? "" : " account-editor-table-wrap--creds-collapsed"}">
+        <table class="${tableClass}">
           <thead>
             <tr>
               <th class="account-editor-table__select">
                 <input type="checkbox" class="account-records-select-all" title="全选本页" />
               </th>
-              <th>#</th>
-              <th>username</th>
-              <th>password</th>
-              <th>email</th>
-              <th>email_pwd</th>
-              <th>api</th>
-              <th>登录</th>
-              <th>登录时间</th>
-              <th>地区</th>
-              <th>别名</th>
-              <th>视频</th>
-              <th>粉丝</th>
-              <th>总赞</th>
-              <th>粉丝增长</th>
-              <th>总赞增长</th>
-              <th>资料</th>
-              <th></th>
+              <th class="account-editor-table__num">#</th>
+              <th class="account-editor-table__username">username</th>
+              <th class="account-editor-table__cred-col account-editor-table__cred-col--password">password</th>
+              <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
+              <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
+              <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
+              <th class="account-editor-table__login">登录</th>
+              <th class="account-editor-table__login-time">登录时间</th>
+              <th class="account-editor-table__region">地区</th>
+              <th class="account-editor-table__alias">别名</th>
+              <th class="account-editor-table__stat">视频</th>
+              <th class="account-editor-table__stat">粉丝</th>
+              <th class="account-editor-table__stat">总赞</th>
+              <th class="account-editor-table__growth">粉丝增长</th>
+              <th class="account-editor-table__growth">总赞增长</th>
+              <th class="account-editor-table__profile">资料</th>
+              <th class="account-editor-table__actions"></th>
             </tr>
           </thead>
           <tbody>${bodyHtml}</tbody>
         </table>
       </div>`;
+    updateAccountRecordsCredColsToggleBtn();
     syncAccountRecordsPageSelectAllCheckbox();
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
@@ -12310,6 +12366,12 @@ if (accountRecordsPageSizeInput) {
   persistAccountRecordsPageSize();
   accountRecordsPageSizeInput.addEventListener("change", onAccountRecordsPageSizeChanged);
   accountRecordsPageSizeInput.addEventListener("blur", onAccountRecordsPageSizeChanged);
+}
+if (accountRecordsToggleCredColsBtn) {
+  updateAccountRecordsCredColsToggleBtn();
+  accountRecordsToggleCredColsBtn.addEventListener("click", () => {
+    toggleAccountRecordsCredCols();
+  });
 }
 if (backupArchiveSearchInput) {
   let backupSearchTimer = null;
