@@ -7344,10 +7344,12 @@ class RealTraceExecutor(
         val service = appContextProvider()
         val alias = PrefsStore.getAlias() ?: "unknown"
         lastConfigSnapshot = config
-        val sec = totalSec.coerceIn(
-            PrefsStore.MIN_MANUAL_FOR_YOU_SWIPE_SEC,
+        // 手动预滑上限 3600s；「活跃下个账号」可到 MAX_MANUAL_ACTIVATE_DURATION_MIN 分钟
+        val maxSec = maxOf(
             PrefsStore.MAX_MANUAL_FOR_YOU_SWIPE_SEC,
+            PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_MIN * 60,
         )
+        val sec = totalSec.coerceIn(PrefsStore.MIN_MANUAL_FOR_YOU_SWIPE_SEC, maxSec)
         if (hardStopOrNull(alias, "手动 For You 预滑")) {
             return "已硬停，跳过 For You 预滑"
         }

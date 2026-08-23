@@ -1923,6 +1923,34 @@ button.danger {
   width: 52px;
 }
 
+.account-editor-table__growth {
+  min-width: 72px;
+  max-width: 88px;
+  vertical-align: middle;
+}
+
+.account-growth-triple {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11px;
+  line-height: 1.25;
+  color: #334155;
+}
+
+.account-growth-triple__item {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.account-growth-triple__item em {
+  font-style: normal;
+  color: #94a3b8;
+  min-width: 14px;
+}
+
 .account-editor-table__stat .account-editor-table__input {
   text-align: right;
 }

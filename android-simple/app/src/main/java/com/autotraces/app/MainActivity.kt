@@ -857,6 +857,8 @@ class MainActivity : AppCompatActivity() {
 
         // 备份/清理已移除：切号由账号下拉触发完整备份→清理→还原链
 
+        setupManualCutSwitchSchemeSpinner()
+
         binding.manualConfirmSwitchDoneButton.setOnClickListener {
             if (AppCoordinator.isManualSwitchBusy()) {
                 Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
@@ -923,6 +925,177 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.manualStartForYouSwipe(sec)
         }
 
+        binding.manualActivateDurationMinInput.setText(
+            PrefsStore.getManualActivateDurationMin().toString(),
+        )
+        binding.manualEnqueueActivateButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy() || AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "任务进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val user = selectedManualUsername()
+            if (user.isBlank()) {
+                Toast.makeText(this, "请先选择要加入待活跃的账号", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val added = AppCoordinator.manualEnqueuePendingActivate(user)
+            refreshPendingActivateQueueText()
+            binding.manualTaskStatusText.text = if (added) {
+                "已加入待活跃：@$user"
+            } else {
+                "@$user 已在待活跃队列中"
+            }
+            Toast.makeText(
+                this,
+                if (added) "已加入 @$user" else "已在队列中",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+        binding.manualClearActivateQueueButton.setOnClickListener {
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            AppCoordinator.manualClearPendingActivateQueue()
+            refreshPendingActivateQueueText()
+            binding.manualTaskStatusText.text = "已清空待活跃队列"
+        }
+        binding.manualActivateNextButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (PrefsStore.getPendingActivateUsernames().isEmpty()) {
+                Toast.makeText(this, "待活跃队列为空，请先「加入待活跃」", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val raw = binding.manualActivateDurationMinInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualActivateDurationMin()
+            val minutes = raw.coerceIn(
+                PrefsStore.MIN_MANUAL_ACTIVATE_DURATION_MIN,
+                PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_MIN,
+            )
+            PrefsStore.setManualActivateDurationMin(minutes)
+            binding.manualActivateDurationMinInput.setText(minutes.toString())
+            val next = PrefsStore.getPendingActivateUsernames().firstOrNull().orEmpty()
+            binding.manualTaskStatusText.text =
+                "已请求活跃下个账号（@$next · ${minutes}分钟 · For You/涨粉随机）"
+            AppCoordinator.manualActivateNextAccount(minutes)
+            refreshPendingActivateQueueText()
+            setManualTaskButtonsEnabled(true)
+        }
+        binding.manualAutoActiveButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val raw = binding.manualActivateDurationMinInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualActivateDurationMin()
+            val minutes = raw.coerceIn(
+                PrefsStore.MIN_MANUAL_ACTIVATE_DURATION_MIN,
+                PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_MIN,
+            )
+            PrefsStore.setManualActivateDurationMin(minutes)
+            binding.manualActivateDurationMinInput.setText(minutes.toString())
+            val queued = PrefsStore.getPendingActivateUsernames()
+            if (queued.isNotEmpty()) {
+                AlertDialog.Builder(this)
+                    .setTitle("自动活跃")
+                    .setMessage(
+                        "待活跃队列已有 ${queued.size} 个账号。\n" +
+                            "每号 ${minutes} 分钟，随机 For You/涨粉；切号按当前方案。",
+                    )
+                    .setPositiveButton("用当前队列开始") { _, _ ->
+                        binding.manualTaskStatusText.text =
+                            "已请求自动活跃（${queued.size}个 · 每号${minutes}分钟）"
+                        AppCoordinator.manualStartAutoActive(null, minutes)
+                        refreshPendingActivateQueueText()
+                        setManualTaskButtonsEnabled(true)
+                    }
+                    .setNeutralButton("重新勾选账号") { _, _ ->
+                        showPickAccountsDialog(
+                            title = "选择要自动活跃的账号",
+                            preselected = queued.toSet(),
+                        ) { picked ->
+                            if (picked.isEmpty()) {
+                                Toast.makeText(this, "请至少勾选一个账号", Toast.LENGTH_SHORT).show()
+                                return@showPickAccountsDialog
+                            }
+                            binding.manualTaskStatusText.text =
+                                "已请求自动活跃（${picked.size}个 · 每号${minutes}分钟）"
+                            AppCoordinator.manualStartAutoActive(picked, minutes)
+                            refreshPendingActivateQueueText()
+                            setManualTaskButtonsEnabled(true)
+                        }
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            } else {
+                showPickAccountsDialog(title = "选择要自动活跃的账号") { picked ->
+                    if (picked.isEmpty()) {
+                        Toast.makeText(this, "请至少勾选一个账号", Toast.LENGTH_SHORT).show()
+                        return@showPickAccountsDialog
+                    }
+                    binding.manualTaskStatusText.text =
+                        "已请求自动活跃（${picked.size}个 · 每号${minutes}分钟）"
+                    AppCoordinator.manualStartAutoActive(picked, minutes)
+                    refreshPendingActivateQueueText()
+                    setManualTaskButtonsEnabled(true)
+                }
+            }
+        }
+        binding.manualSortActivateByMinutesButton.setOnClickListener {
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val sorted = AppCoordinator.manualSortPendingActivateByTotalMinutesAsc()
+            refreshPendingActivateQueueText()
+            binding.manualTaskStatusText.text =
+                if (sorted.isEmpty()) "待活跃队列为空" else "已按累计活跃时长升序重排（少活跃优先）"
+            Toast.makeText(this, "已按时长升序", Toast.LENGTH_SHORT).show()
+        }
+        binding.manualTrimActivateByMinutesButton.setOnClickListener {
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val input = android.widget.EditText(this).apply {
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                hint = "累计活跃 ≥ 多少分钟则移除"
+                setText("60")
+            }
+            AlertDialog.Builder(this)
+                .setTitle("按活跃时长编辑队列")
+                .setMessage("移除累计活跃时长 ≥ 指定分钟的账号（保留还需继续活跃的）。")
+                .setView(input)
+                .setPositiveButton("移除") { _, _ ->
+                    val threshold = input.text?.toString()?.toIntOrNull() ?: 60
+                    if (threshold <= 0) {
+                        Toast.makeText(this, "请输入正整数分钟", Toast.LENGTH_SHORT).show()
+                        return@setPositiveButton
+                    }
+                    val removed = AppCoordinator.manualTrimPendingActivateByMinTotal(threshold)
+                    refreshPendingActivateQueueText()
+                    binding.manualTaskStatusText.text =
+                        "已移除累计≥${threshold}分钟的账号 $removed 个，剩余 ${PrefsStore.getPendingActivateUsernames().size}"
+                    Toast.makeText(this, "已移除 $removed 个", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("取消", null)
+                .show()
+        }
+
         binding.manualMutualButton.setOnClickListener {
             if (!guardManualTaskReady("引流互点")) return@setOnClickListener
             binding.manualTaskStatusText.text = "已请求引流互点"
@@ -931,6 +1104,9 @@ class MainActivity : AppCompatActivity() {
 
         binding.manualPublishCountInput.setText(
             PrefsStore.getManualPublishCount().toString(),
+        )
+        binding.manualBatchPublishAfterMinInput.setText(
+            PrefsStore.getManualBatchPublishAfterMin().toString(),
         )
         binding.manualPublishButton.setOnClickListener {
             if (!guardManualTaskReady("发作品")) return@setOnClickListener
@@ -944,6 +1120,48 @@ class MainActivity : AppCompatActivity() {
             binding.manualPublishCountInput.setText(count.toString())
             binding.manualTaskStatusText.text = "已请求发作品（${count}条）"
             AppCoordinator.manualStartPublishPost(count)
+        }
+        binding.manualBatchPublishButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            if (manualAccounts.isEmpty()) {
+                Toast.makeText(this, "请先拉取云端账号列表", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val countRaw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualPublishCount()
+            val count = countRaw.coerceIn(
+                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+            )
+            val afterRaw = binding.manualBatchPublishAfterMinInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualBatchPublishAfterMin()
+            val afterMin = afterRaw.coerceIn(
+                PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+                PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+            )
+            PrefsStore.setManualPublishCount(count)
+            PrefsStore.setManualBatchPublishAfterMin(afterMin)
+            binding.manualPublishCountInput.setText(count.toString())
+            binding.manualBatchPublishAfterMinInput.setText(afterMin.toString())
+            showPickAccountsDialog(title = "选择批量发作品账号") { picked ->
+                if (picked.isEmpty()) {
+                    Toast.makeText(this, "请至少勾选一个账号", Toast.LENGTH_SHORT).show()
+                    return@showPickAccountsDialog
+                }
+                val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
+                binding.manualTaskStatusText.text =
+                    "已请求批量发作品（${picked.size}个 · 每号${count}条 · 发后${afterMin}分钟 · $scheme）"
+                AppCoordinator.manualStartBatchPublish(picked, count, afterMin)
+                setManualTaskButtonsEnabled(true)
+            }
         }
 
         binding.manualProfileEditButton.setOnClickListener {
@@ -1033,23 +1251,114 @@ class MainActivity : AppCompatActivity() {
 
     private fun setManualTaskButtonsEnabled(enabled: Boolean) {
         val busy = AppCoordinator.isManualSwitchBusy()
-        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !busy
-        binding.manualAccountSelect.isEnabled = !busy
-        binding.manualRefreshAccountsButton.isEnabled = !busy
+        val sessionBusy = AppCoordinator.isBatchAccountSessionBusy()
+        val blocked = busy || sessionBusy
+        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !blocked
+        binding.manualAccountSelect.isEnabled = !blocked
+        binding.manualRefreshAccountsButton.isEnabled = !blocked
+        binding.manualCutSwitchSchemeSpinner.isEnabled = !blocked
         // 手动切号完毕：未在自动切号中即可点（用户已在设备上切好号后告知程序）
-        binding.manualConfirmSwitchDoneButton.isEnabled = !busy && selectedManualUsername().isNotBlank()
+        binding.manualConfirmSwitchDoneButton.isEnabled =
+            !blocked && selectedManualUsername().isNotBlank()
         binding.manualAutoGrowthAfterTasksCheck.isEnabled = aligned
         binding.manualStartGrowthButton.isEnabled = aligned
         binding.manualStopGrowthButton.isEnabled = true
         binding.manualForYouSwipeButton.isEnabled = aligned
         binding.manualForYouSwipeSecInput.isEnabled = aligned
+        // 待活跃：加入/清空不要求已切号对齐；活跃下个会自己切号
+        binding.manualEnqueueActivateButton.isEnabled =
+            !blocked && selectedManualUsername().isNotBlank()
+        binding.manualClearActivateQueueButton.isEnabled = !blocked
+        binding.manualActivateNextButton.isEnabled = !blocked
+        binding.manualActivateDurationMinInput.isEnabled = !blocked
+        binding.manualAutoActiveButton.isEnabled = !blocked
+        binding.manualSortActivateByMinutesButton.isEnabled = !blocked
+        binding.manualTrimActivateByMinutesButton.isEnabled = !blocked
         binding.manualMutualButton.isEnabled = aligned
         binding.manualPublishButton.isEnabled = aligned
+        binding.manualPublishCountInput.isEnabled = !blocked
+        binding.manualBatchPublishButton.isEnabled = !blocked
+        binding.manualBatchPublishAfterMinInput.isEnabled = !blocked
         binding.manualProfileEditButton.isEnabled = aligned
         // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
         val statusUser = selectedManualUsername()
         val firstDone = statusUser.isNotBlank() && PrefsStore.isManualFirstLoginDone(statusUser)
         binding.manualAutoLoginButton.isEnabled = aligned && !firstDone
+    }
+
+    private fun refreshPendingActivateQueueText() {
+        val queue = PrefsStore.getPendingActivateUsernames()
+        binding.manualPendingActivateQueueText.text = if (queue.isEmpty()) {
+            "待活跃队列：空"
+        } else {
+            "待活跃队列（${queue.size}）：" + queue.joinToString(" → ") { u ->
+                val total = PrefsStore.getActivateTotalMinutes(u)
+                "@$u(${total}分)"
+            }
+        }
+    }
+
+    /** 多选账号对话框；回调给出勾选的 username 列表（保持列表顺序）。 */
+    private fun showPickAccountsDialog(
+        title: String,
+        preselected: Set<String> = emptySet(),
+        onPicked: (List<String>) -> Unit,
+    ) {
+        if (manualAccounts.isEmpty()) {
+            Toast.makeText(this, "请先拉取云端账号列表", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val labels = manualAccounts.map { opt ->
+            val total = PrefsStore.getActivateTotalMinutes(opt.username)
+            "@${opt.username}（累计活跃 ${total} 分）"
+        }.toTypedArray()
+        val checked = BooleanArray(manualAccounts.size) { i ->
+            val u = manualAccounts[i].username
+            preselected.any { it.equals(u, ignoreCase = true) }
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setPositiveButton("确定") { _, _ ->
+                val picked = manualAccounts.mapIndexedNotNull { i, opt ->
+                    if (checked[i]) opt.username else null
+                }
+                onPicked(picked)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun setupManualCutSwitchSchemeSpinner() {
+        val labels = listOf("备份还原", "登录切号")
+        binding.manualCutSwitchSchemeSpinner.adapter =
+            ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
+        val login = PrefsStore.prefersManualLoginCutSwitch()
+        binding.manualCutSwitchSchemeSpinner.setSelection(if (login) 1 else 0, false)
+        binding.manualCutSwitchSchemeSpinner.onItemSelectedListener =
+            object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long,
+                ) {
+                    val scheme = if (position == 1) {
+                        PrefsStore.CUT_SWITCH_SCHEME_LOGIN
+                    } else {
+                        PrefsStore.CUT_SWITCH_SCHEME_BACKUP
+                    }
+                    if (scheme == PrefsStore.getManualCutSwitchScheme()) return
+                    PrefsStore.setManualCutSwitchScheme(scheme)
+                    val label = if (scheme == PrefsStore.CUT_SWITCH_SCHEME_LOGIN) "登录切号" else "备份还原"
+                    binding.manualTaskStatusText.text = "切号方案已设为：$label"
+                    Toast.makeText(this@MainActivity, "切号方案：$label", Toast.LENGTH_SHORT).show()
+                }
+
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
     }
 
     private fun selectedManualUsername(): String {
@@ -1121,6 +1430,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshManualAccountStatus() {
+        refreshPendingActivateQueueText()
         val user = selectedManualUsername()
         if (user.isBlank()) {
             binding.manualAccountStatusText.text = "账号状态：未选择"
@@ -1130,16 +1440,20 @@ class MainActivity : AppCompatActivity() {
         }
         val status = AppCoordinator.manualQuerySwitchStatus(user)
         val busy = AppCoordinator.isManualSwitchBusy()
+        val sessionBusy = AppCoordinator.isBatchAccountSessionBusy()
         val aligned = AppCoordinator.isManualAccountAligned()
         binding.manualAccountStatusText.text = buildString {
             append("账号状态：${status.message}")
+            val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
+            append(" · 切号=$scheme")
             when {
+                sessionBusy -> append(" · 多账号会话中…")
                 busy -> append(" · 切号中…")
                 !aligned -> append(" · 待切号对齐")
             }
         }
         binding.manualClearAndRestoreButton.visibility = View.GONE
-        setManualTaskButtonsEnabled(!busy && aligned)
+        setManualTaskButtonsEnabled(!busy && !sessionBusy && aligned)
     }
 
     private fun refreshManualAutoSwitchStatus() {

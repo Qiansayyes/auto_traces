@@ -58,6 +58,28 @@
     </div>
   </div>
 
+  <div id="accountStatsQueryModal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-card modal-card--wide modal-card--import-preview">
+      <div class="modal-header">
+        <h3>全量查询并落库 — 选择别名</h3>
+        <button id="closeAccountStatsQueryModalBtn" type="button" class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-hint">勾选需要查询的别名，系统将查询对应 username 的视频、粉丝、总赞数，并计算前天/昨天/今天的增长。选择会记住，下次打开仍保留。</p>
+      <div class="import-preview-toolbar">
+        <label class="import-preview-select-all">
+          <input id="accountStatsQuerySelectAll" type="checkbox" />
+          全选别名
+        </label>
+        <span id="accountStatsQuerySummary" class="hint"></span>
+      </div>
+      <div id="accountStatsQueryAliasList" class="import-preview-table-wrap"></div>
+      <div class="modal-actions">
+        <button id="cancelAccountStatsQueryModalBtn" type="button" class="ghost">取消</button>
+        <button id="confirmAccountStatsQueryBtn" type="button" class="primary">确认并开始查询</button>
+      </div>
+    </div>
+  </div>
+
   <div id="groupMoveModal" class="modal-overlay hidden" aria-hidden="true">
     <div class="modal-card modal-card--wide">
       <div class="modal-header">
@@ -768,6 +790,12 @@
           <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;flex-wrap:wrap;">
             <h3 style="margin:0;">账号记录</h3>
             <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+              <button id="accountStatsQueryBtn" type="button" class="ghost" title="按所选别名批量查询 TikTok 数据并落库">全量查询并落库</button>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#666;" title="每天在指定时间自动查询已选别名下的账号">
+                <input id="accountStatsQueryScheduleToggle" type="checkbox" />
+                定时查询
+              </label>
+              <input id="accountStatsQueryScheduleTime" type="time" class="ui-input" value="09:00" style="width:110px;" title="北京时间，定时查询触发时间" />
               <select id="accountRecordsSearchFieldSelect" class="ui-select" style="min-width:108px;" title="选择搜索字段">
                 <option value="">全部</option>
                 <option value="alias">别名</option>
@@ -856,6 +884,13 @@
               <button id="autoSwitchSelectAllEnableBtn" type="button" class="ghost" title="为当前账号下全部设备开启自动切号（无需逐个勾选）">全选并开启</button>
               <button id="autoSwitchEnableSelectedBtn" type="button" class="ghost" title="为勾选的别名组/备份记录对应设备开启自动切号（本机自治调度）">开启选中设备自动切号</button>
               <button id="autoSwitchDisableSelectedBtn" type="button" class="ghost" title="关闭勾选别名组/记录对应设备的自动切号">关闭选中设备自动切号</button>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#444;" title="备份切号=备份→清理→还原；登录切号=退出TikTok并清数据后直接登录目标号（不还原备份）">
+                切号方案
+                <select id="autoSwitchCutSchemeSelect" class="ui-select" style="min-width:120px;">
+                  <option value="backup">备份切号</option>
+                  <option value="login">登录切号</option>
+                </select>
+              </label>
               <button id="autoSwitchExcludedBatchBtn" type="button" class="ghost" title="按 username 批量设置/取消不参加自动切号">批量不参加自动切号</button>
               <span id="autoSwitchEnabledCountHint" class="hint"></span>
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>

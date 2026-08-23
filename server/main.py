@@ -217,6 +217,10 @@ BACKUP_STATS_FULL_QUERY_SCHEDULE_AVAILABLE = False
 BACKUP_STATS_FULL_QUERY_MANUAL_AVAILABLE = False
 BACKUP_STATS_FULL_QUERY_TICK_INTERVAL_SEC = 60
 BACKUP_STATS_FULL_QUERY_REQUEST_GAP_SEC = 0.3
+ACCOUNT_STATS_QUERY_LOG_KEY = "account_stats_query"
+ACCOUNT_STATS_QUERY_USER_CONFIG_KEY = "account_stats_query"
+ACCOUNT_STATS_QUERY_TICK_INTERVAL_SEC = 60
+ACCOUNT_STATS_QUERY_REQUEST_GAP_SEC = 0.3
 MOBILE_PENDING_AUTO_REFILL_TICK_INTERVAL_SEC = 60
 MOBILE_PENDING_AUTO_REFILL_DEFAULT_THRESHOLD = 5000
 # 临时方案（涨粉）：pull_username 从 tiktok_roots 随机只读下发；原 mobile_pending 队列消费见 pull_username 内注释块。
@@ -766,6 +770,25 @@ def init_follow_db():
             )
         except sqlite3.OperationalError:
             pass
+
+        _account_stats_extra_column_defs = (
+            ("heart_count", "TEXT NOT NULL DEFAULT ''"),
+            ("follower_growth_day_before", "TEXT NOT NULL DEFAULT ''"),
+            ("follower_growth_yesterday", "TEXT NOT NULL DEFAULT ''"),
+            ("follower_growth_today", "TEXT NOT NULL DEFAULT ''"),
+            ("heart_growth_day_before", "TEXT NOT NULL DEFAULT ''"),
+            ("heart_growth_yesterday", "TEXT NOT NULL DEFAULT ''"),
+            ("heart_growth_today", "TEXT NOT NULL DEFAULT ''"),
+            ("stats_baseline_date", "TEXT NOT NULL DEFAULT ''"),
+            ("follower_baseline_count", "TEXT NOT NULL DEFAULT ''"),
+            ("heart_baseline_count", "TEXT NOT NULL DEFAULT ''"),
+        )
+        for table in ("account_editor_rows", "device_editor_rows"):
+            for col, col_type in _account_stats_extra_column_defs:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
 
         # follower_queue 新字段迁移
         try:
@@ -1686,6 +1709,7 @@ class MemoryStore:
     backup_stats_full_query_enabled: bool = False
     backup_stats_full_query_last_run_date: str = ""
     backup_stats_full_query_in_flight: bool = False
+    account_stats_query_in_flight: Dict[str, bool] = field(default_factory=dict)
     mobile_pending_auto_refill_last_run_ts: float = 0.0
     mobile_pending_auto_refill_in_flight: bool = False
     task_processes: Dict[str, subprocess.Popen] = field(default_factory=dict)
@@ -2253,6 +2277,78 @@ def _collect_orphan_alias_template_refs(data: dict, effective_keys: set[str]) ->
     return out
 
 
+CUT_SWITCH_SCHEME_BACKUP = "backup"
+CUT_SWITCH_SCHEME_LOGIN = "login"
+CUT_SWITCH_SCHEME_KEY = "cut_switch_scheme"
+
+
+def _normalize_cut_switch_scheme(raw: object) -> str:
+    text = str(raw or "").strip().lower()
+    if text in ("login", "login_switch", "exclusive_login", "登录切号"):
+        return CUT_SWITCH_SCHEME_LOGIN
+    return CUT_SWITCH_SCHEME_BACKUP
+
+
+def _load_cut_switch_scheme(owner: str) -> str:
+    owner = str(owner or "").strip()
+    if not owner:
+        return CUT_SWITCH_SCHEME_BACKUP
+    state = _load_user_runtime_state(owner)
+    return _normalize_cut_switch_scheme(state.get(CUT_SWITCH_SCHEME_KEY))
+
+
+def _save_cut_switch_scheme(owner: str, scheme: str) -> str:
+    owner = str(owner or "").strip()
+    normalized = _normalize_cut_switch_scheme(scheme)
+    if owner:
+        _save_user_runtime_state(owner, {CUT_SWITCH_SCHEME_KEY: normalized})
+    return normalized
+
+
+def _resync_auto_switch_devices_for_owner_scheme(owner_username: str) -> dict[str, Any]:
+    """切号方案变更后，对 owner 下已开启自动切号的设备推送资料重同步。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {"notified": 0, "session_id": "", "bundle_revision": 0}
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT device_id
+            FROM client_devices
+            WHERE owner_username = ?
+              AND COALESCE(auto_switch_enabled, 0) = 1
+            ORDER BY updated_at DESC, device_id ASC
+            """,
+            (owner,),
+        ).fetchall()
+        device_ids = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    finally:
+        conn.close()
+    if not device_ids:
+        return {"notified": 0, "session_id": "", "bundle_revision": 0}
+    session_id = _new_auto_switch_session_id(entering=True)
+    with store.lock:
+        store.auto_switch_bundle_revision = int(store.auto_switch_bundle_revision or 0) + 1
+        bundle_revision = int(store.auto_switch_bundle_revision)
+        store.auto_switch_align_on_next_tick = True
+    persist_runtime_state()
+    _persist_auto_switch_session_row(session_id, enabled=True, bundle_revision=bundle_revision)
+    notified = 0
+    for did in device_ids:
+        if not store.devices.get(did):
+            _hydrate_device_from_db(did)
+        _close_active_auto_switch_enter_sessions_for_device(did, except_session_id=session_id)
+        _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+        if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
+            notified += 1
+            _append_device_log(
+                did,
+                f"[{now_text()}] 自动切号 | 切号方案已变更，已下发资料重同步 session={session_id} revision={bundle_revision}",
+            )
+    return {"notified": notified, "session_id": session_id, "bundle_revision": bundle_revision}
+
+
 def _default_user_config_state() -> dict:
     default_template = "default"
     return {
@@ -2263,6 +2359,7 @@ def _default_user_config_state() -> dict:
         "default_config": dict(MODE_DEFAULT_CONFIGS["growth"]),
         # 是否开启「设备端自动启动」策略（按用户）
         "auto_start_enabled": False,
+        CUT_SWITCH_SCHEME_KEY: CUT_SWITCH_SCHEME_BACKUP,
     }
 
 
@@ -2999,6 +3096,7 @@ def _normalize_user_runtime_state(raw_state: dict | None) -> dict:
     auto_start_enabled = data.get("auto_start_enabled")
     if isinstance(auto_start_enabled, bool):
         result["auto_start_enabled"] = auto_start_enabled
+    result[CUT_SWITCH_SCHEME_KEY] = _normalize_cut_switch_scheme(data.get(CUT_SWITCH_SCHEME_KEY))
 
     alias_template_by_mode: Dict[str, Dict[str, str]] = {
         "growth": {},
@@ -3725,6 +3823,7 @@ class AutoStartRequest(BaseModel):
 
 class AutoSwitchConfigRequest(BaseModel):
     enabled: bool | None = None
+    cut_switch_scheme: str | None = Field(default=None, max_length=32)
 
 
 class AutoSwitchDevicesRequest(BaseModel):
@@ -3732,8 +3831,22 @@ class AutoSwitchDevicesRequest(BaseModel):
     enabled: bool
 
 
+class AutoSwitchCutSchemeRequest(BaseModel):
+    cut_switch_scheme: str = Field(..., max_length=32)
+
+
 class BackupStatsFullQueryConfigRequest(BaseModel):
     enabled: bool | None = None
+
+
+class AccountStatsQueryConfigRequest(BaseModel):
+    selected_aliases: List[str] | None = None
+    schedule_enabled: bool | None = None
+    schedule_time: str | None = Field(default=None, max_length=8)
+
+
+class AccountStatsQueryRunRequest(BaseModel):
+    selected_aliases: List[str] | None = None
 
 
 class SchedulerConfigRequest(BaseModel):
@@ -3935,6 +4048,13 @@ class AccountEditorRowUpsertRequest(BaseModel):
     video_count: str = ""
     follower_count: str = ""
     follower_growth: str = ""
+    heart_count: str = ""
+    follower_growth_day_before: str = ""
+    follower_growth_yesterday: str = ""
+    follower_growth_today: str = ""
+    heart_growth_day_before: str = ""
+    heart_growth_yesterday: str = ""
+    heart_growth_today: str = ""
     basic_profile_modified: str = "否"
 
     @field_validator("basic_profile_modified", mode="before")
@@ -7494,6 +7614,16 @@ def _sync_account_editor_stats(
     video_count: str | None = None,
     follower_count: str | None = None,
     follower_growth: str | None = None,
+    heart_count: str | None = None,
+    follower_growth_day_before: str | None = None,
+    follower_growth_yesterday: str | None = None,
+    follower_growth_today: str | None = None,
+    heart_growth_day_before: str | None = None,
+    heart_growth_yesterday: str | None = None,
+    heart_growth_today: str | None = None,
+    stats_baseline_date: str | None = None,
+    follower_baseline_count: str | None = None,
+    heart_baseline_count: str | None = None,
     now: str | None = None,
 ) -> int:
     """设备/统计回写后，将粉丝与视频数同步持久化到 account_editor_rows。"""
@@ -7502,15 +7632,25 @@ def _sync_account_editor_stats(
         return 0
     sets: list[str] = []
     params: list[object] = []
-    if video_count is not None:
-        sets.append("video_count = ?")
-        params.append(str(video_count))
-    if follower_count is not None:
-        sets.append("follower_count = ?")
-        params.append(str(follower_count))
-    if follower_growth is not None:
-        sets.append("follower_growth = ?")
-        params.append(str(follower_growth))
+    field_pairs = (
+        ("video_count", video_count),
+        ("follower_count", follower_count),
+        ("follower_growth", follower_growth),
+        ("heart_count", heart_count),
+        ("follower_growth_day_before", follower_growth_day_before),
+        ("follower_growth_yesterday", follower_growth_yesterday),
+        ("follower_growth_today", follower_growth_today),
+        ("heart_growth_day_before", heart_growth_day_before),
+        ("heart_growth_yesterday", heart_growth_yesterday),
+        ("heart_growth_today", heart_growth_today),
+        ("stats_baseline_date", stats_baseline_date),
+        ("follower_baseline_count", follower_baseline_count),
+        ("heart_baseline_count", heart_baseline_count),
+    )
+    for col, val in field_pairs:
+        if val is not None:
+            sets.append(f"{col} = ?")
+            params.append(str(val))
     if not sets:
         return 0
     now_val = now or now_text()
@@ -8590,6 +8730,521 @@ def _filter_out_private_usernames(usernames: List[str], scene: str = "") -> tupl
     return cleaned, skipped
 
 
+def _account_stats_query_log(line: str) -> None:
+    with store.lock:
+        logs = store.task_logs.setdefault(ACCOUNT_STATS_QUERY_LOG_KEY, [])
+        logs.append(line)
+        if len(logs) > 500:
+            del logs[: len(logs) - 500]
+
+
+def _default_account_stats_query_config() -> dict[str, object]:
+    return {
+        "selected_aliases": [],
+        "schedule_enabled": False,
+        "schedule_time": "09:00",
+        "last_schedule_run_date": "",
+    }
+
+
+def _load_account_stats_query_config(owner: str) -> dict[str, object]:
+    owner = str(owner or "").strip()
+    cfg = _default_account_stats_query_config()
+    if not owner:
+        return cfg
+    state = _load_user_runtime_state(owner)
+    raw = state.get(ACCOUNT_STATS_QUERY_USER_CONFIG_KEY)
+    if isinstance(raw, dict):
+        aliases = raw.get("selected_aliases")
+        if isinstance(aliases, list):
+            cfg["selected_aliases"] = [
+                _normalized_alias(str(a)) for a in aliases if _normalized_alias(str(a))
+            ]
+        if isinstance(raw.get("schedule_enabled"), bool):
+            cfg["schedule_enabled"] = bool(raw["schedule_enabled"])
+        schedule_time = str(raw.get("schedule_time") or "09:00").strip()
+        if re.match(r"^\d{1,2}:\d{2}$", schedule_time):
+            hh, mm = schedule_time.split(":", 1)
+            cfg["schedule_time"] = f"{int(hh):02d}:{mm}"
+        last_run = str(raw.get("last_schedule_run_date") or "").strip()
+        if last_run:
+            cfg["last_schedule_run_date"] = last_run
+    return cfg
+
+
+def _save_account_stats_query_config(owner: str, patch: dict[str, object]) -> dict[str, object]:
+    owner = str(owner or "").strip()
+    cfg = _load_account_stats_query_config(owner)
+    if "selected_aliases" in patch and isinstance(patch["selected_aliases"], list):
+        cfg["selected_aliases"] = [
+            _normalized_alias(str(a)) for a in patch["selected_aliases"] if _normalized_alias(str(a))
+        ]
+    if "schedule_enabled" in patch and patch["schedule_enabled"] is not None:
+        cfg["schedule_enabled"] = bool(patch["schedule_enabled"])
+    if "schedule_time" in patch and patch["schedule_time"] is not None:
+        schedule_time = str(patch["schedule_time"] or "09:00").strip()
+        if re.match(r"^\d{1,2}:\d{2}$", schedule_time):
+            hh, mm = schedule_time.split(":", 1)
+            cfg["schedule_time"] = f"{int(hh):02d}:{mm}"
+    if "last_schedule_run_date" in patch and patch["last_schedule_run_date"] is not None:
+        cfg["last_schedule_run_date"] = str(patch["last_schedule_run_date"] or "").strip()
+    _save_user_runtime_state(owner, {ACCOUNT_STATS_QUERY_USER_CONFIG_KEY: cfg})
+    return cfg
+
+
+def _account_stats_row_alias(row: dict) -> str:
+    assigned = _normalized_alias(str(row.get("assigned_alias") or ""))
+    if assigned:
+        return assigned
+    mobile = _normalized_alias(str(row.get("mobile_alias") or row.get("device_alias") or ""))
+    return mobile
+
+
+def _list_account_alias_groups(owner: str) -> list[dict[str, object]]:
+    owner = str(owner or "").strip()
+    if not owner:
+        return []
+    conn = _get_db()
+    try:
+        account_rows = conn.execute(
+            """
+            SELECT username, assigned_alias
+            FROM account_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+        device_rows = conn.execute(
+            f"""
+            SELECT username, assigned_alias, {_backup_record_alias_expr()} AS mobile_alias
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY updated_at DESC, row_index DESC
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    alias_by_user: dict[str, str] = {}
+    for dr in device_rows:
+        uname = str(dr["username"] or "").strip()
+        if not uname:
+            continue
+        alias = _account_stats_row_alias(dict(dr))
+        if alias:
+            alias_by_user.setdefault(uname.lower(), alias)
+
+    groups: dict[str, list[str]] = {}
+    for ar in account_rows:
+        uname = str(ar["username"] or "").strip()
+        if not uname:
+            continue
+        alias = _normalized_alias(str(ar["assigned_alias"] or "")) or alias_by_user.get(uname.lower(), "")
+        if not alias:
+            continue
+        bucket = groups.setdefault(alias, [])
+        if uname.lower() not in {u.lower() for u in bucket}:
+            bucket.append(uname)
+
+    return [
+        {"alias": alias, "usernames": sorted(usernames, key=lambda x: x.lower()), "count": len(usernames)}
+        for alias, usernames in sorted(groups.items(), key=lambda item: item[0].lower())
+    ]
+
+
+def _list_usernames_for_owner_by_aliases(owner: str, aliases: list[str]) -> list[str]:
+    norm_aliases = {_normalized_alias(a) for a in aliases if _normalized_alias(a)}
+    if not norm_aliases:
+        return []
+    groups = _list_account_alias_groups(owner)
+    seen: set[str] = set()
+    result: list[str] = []
+    for group in groups:
+        alias = _normalized_alias(str(group.get("alias") or ""))
+        if alias not in norm_aliases:
+            continue
+        for uname in group.get("usernames") or []:
+            u = str(uname or "").strip()
+            key = u.lower()
+            if u and key not in seen:
+                seen.add(key)
+                result.append(u)
+    return result
+
+
+def _compute_daily_growth_fields(
+    *,
+    today_date: str,
+    stats_baseline_date: str,
+    follower_baseline: int | None,
+    heart_baseline: int | None,
+    prev_follower_count: int | None,
+    prev_heart_count: int | None,
+    new_follower_count: int | None,
+    new_heart_count: int | None,
+    fg_day_before: str,
+    fg_yesterday: str,
+    fg_today: str,
+    hg_day_before: str,
+    hg_yesterday: str,
+    hg_today: str,
+) -> dict[str, str]:
+    result = {
+        "follower_growth_day_before": str(fg_day_before or ""),
+        "follower_growth_yesterday": str(fg_yesterday or ""),
+        "follower_growth_today": str(fg_today or ""),
+        "heart_growth_day_before": str(hg_day_before or ""),
+        "heart_growth_yesterday": str(hg_yesterday or ""),
+        "heart_growth_today": str(hg_today or ""),
+        "stats_baseline_date": str(stats_baseline_date or ""),
+        "follower_baseline_count": "" if follower_baseline is None else str(follower_baseline),
+        "heart_baseline_count": "" if heart_baseline is None else str(heart_baseline),
+    }
+
+    if stats_baseline_date != today_date:
+        result["follower_growth_day_before"] = str(fg_yesterday or "")
+        result["follower_growth_yesterday"] = str(fg_today or "")
+        result["heart_growth_day_before"] = str(hg_yesterday or "")
+        result["heart_growth_yesterday"] = str(hg_today or "")
+        fb = prev_follower_count if prev_follower_count is not None else new_follower_count
+        hb = prev_heart_count if prev_heart_count is not None else new_heart_count
+        result["stats_baseline_date"] = today_date
+        result["follower_baseline_count"] = "" if fb is None else str(fb)
+        result["heart_baseline_count"] = "" if hb is None else str(hb)
+        if isinstance(new_follower_count, int) and isinstance(fb, int):
+            result["follower_growth_today"] = str(max(new_follower_count - fb, 0))
+        elif isinstance(new_follower_count, int):
+            result["follower_growth_today"] = "0"
+        if isinstance(new_heart_count, int) and isinstance(hb, int):
+            result["heart_growth_today"] = str(max(new_heart_count - hb, 0))
+        elif isinstance(new_heart_count, int):
+            result["heart_growth_today"] = "0"
+    else:
+        fb = follower_baseline if follower_baseline is not None else prev_follower_count
+        hb = heart_baseline if heart_baseline is not None else prev_heart_count
+        if isinstance(new_follower_count, int) and isinstance(fb, int):
+            result["follower_growth_today"] = str(max(new_follower_count - fb, 0))
+        elif isinstance(new_follower_count, int):
+            result["follower_growth_today"] = "0"
+        if isinstance(new_heart_count, int) and isinstance(hb, int):
+            result["heart_growth_today"] = str(max(new_heart_count - hb, 0))
+        elif isinstance(new_heart_count, int):
+            result["heart_growth_today"] = "0"
+
+    result["follower_growth"] = result["follower_growth_today"]
+    return result
+
+
+def _load_account_stats_snapshot(conn, owner: str, username: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT row_index, username, video_count, follower_count, follower_growth, heart_count,
+               follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+               heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+               stats_baseline_date, follower_baseline_count, heart_baseline_count
+        FROM account_editor_rows
+        WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(TRIM(?))
+        ORDER BY row_index ASC
+        LIMIT 1
+        """,
+        (owner, username),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _apply_profile_stats_write_back(
+    username: str,
+    extract_dict: dict,
+    *,
+    owner_username: str = "",
+) -> bool:
+    video_count = extract_dict.get("video_count")
+    follower_count = extract_dict.get("follower_count")
+    heart_count = extract_dict.get("heart_count")
+    new_fc = follower_count if isinstance(follower_count, int) else None
+    new_hc = heart_count if isinstance(heart_count, int) else None
+    today_date = _beijing_date_str()
+    now = now_text()
+    conn = _get_db()
+    updated = False
+    try:
+        owner = str(owner_username or "").strip()
+        acct = None
+        if owner:
+            acct = _load_account_stats_snapshot(conn, owner, username)
+        if not acct:
+            row = conn.execute(
+                """
+                SELECT row_index, owner_username, username, video_count, follower_count, follower_growth, heart_count,
+                       follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                       heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                       stats_baseline_date, follower_baseline_count, heart_baseline_count
+                FROM account_editor_rows
+                WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))
+                ORDER BY updated_at DESC, row_index DESC
+                LIMIT 1
+                """,
+                (username,),
+            ).fetchone()
+            acct = dict(row) if row else None
+            if acct and not owner:
+                owner = str(acct.get("owner_username") or "").strip()
+
+        device_row = conn.execute(
+            f"""
+            SELECT row_index, owner_username, username, follower_count, heart_count,
+                   follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                   heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                   stats_baseline_date, follower_baseline_count, heart_baseline_count
+            FROM device_editor_rows
+            WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))
+            ORDER BY updated_at DESC, row_index DESC
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+
+        source = acct or (dict(device_row) if device_row else None)
+        if not source and new_fc is None and new_hc is None and video_count is None:
+            return False
+
+        prev_fc = _parse_count_text_to_int(str(source.get("follower_count") if source else ""))
+        prev_hc = _parse_count_text_to_int(str(source.get("heart_count") if source else ""))
+        growth = _compute_daily_growth_fields(
+            today_date=today_date,
+            stats_baseline_date=str(source.get("stats_baseline_date") if source else ""),
+            follower_baseline=_parse_count_text_to_int(str(source.get("follower_baseline_count") if source else "")),
+            heart_baseline=_parse_count_text_to_int(str(source.get("heart_baseline_count") if source else "")),
+            prev_follower_count=prev_fc,
+            prev_heart_count=prev_hc,
+            new_follower_count=new_fc,
+            new_heart_count=new_hc,
+            fg_day_before=str(source.get("follower_growth_day_before") if source else ""),
+            fg_yesterday=str(source.get("follower_growth_yesterday") if source else ""),
+            fg_today=str(source.get("follower_growth_today") if source else source.get("follower_growth") if source else ""),
+            hg_day_before=str(source.get("heart_growth_day_before") if source else ""),
+            hg_yesterday=str(source.get("heart_growth_yesterday") if source else ""),
+            hg_today=str(source.get("heart_growth_today") if source else ""),
+        )
+        vc_text = "" if video_count is None else str(video_count)
+        fc_text = "" if follower_count is None else str(follower_count)
+        hc_text = "" if heart_count is None else str(heart_count)
+
+        if acct and owner:
+            conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET video_count = ?, follower_count = ?, follower_growth = ?, heart_count = ?,
+                    follower_growth_day_before = ?, follower_growth_yesterday = ?, follower_growth_today = ?,
+                    heart_growth_day_before = ?, heart_growth_yesterday = ?, heart_growth_today = ?,
+                    stats_baseline_date = ?, follower_baseline_count = ?, heart_baseline_count = ?,
+                    updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (
+                    vc_text,
+                    fc_text,
+                    growth["follower_growth"],
+                    hc_text,
+                    growth["follower_growth_day_before"],
+                    growth["follower_growth_yesterday"],
+                    growth["follower_growth_today"],
+                    growth["heart_growth_day_before"],
+                    growth["heart_growth_yesterday"],
+                    growth["heart_growth_today"],
+                    growth["stats_baseline_date"],
+                    growth["follower_baseline_count"],
+                    growth["heart_baseline_count"],
+                    now,
+                    owner,
+                    int(acct["row_index"]),
+                ),
+            )
+            updated = True
+
+        if device_row:
+            if not owner:
+                owner = str(device_row["owner_username"] or "").strip()
+            conn.execute(
+                """
+                UPDATE device_editor_rows
+                SET video_count = ?, follower_count = ?, follower_growth = ?, heart_count = ?,
+                    follower_growth_day_before = ?, follower_growth_yesterday = ?, follower_growth_today = ?,
+                    heart_growth_day_before = ?, heart_growth_yesterday = ?, heart_growth_today = ?,
+                    stats_baseline_date = ?, follower_baseline_count = ?, heart_baseline_count = ?,
+                    updated_at = ?
+                WHERE row_index = ?
+                """,
+                (
+                    vc_text,
+                    fc_text,
+                    growth["follower_growth"],
+                    hc_text,
+                    growth["follower_growth_day_before"],
+                    growth["follower_growth_yesterday"],
+                    growth["follower_growth_today"],
+                    growth["heart_growth_day_before"],
+                    growth["heart_growth_yesterday"],
+                    growth["heart_growth_today"],
+                    growth["stats_baseline_date"],
+                    growth["follower_baseline_count"],
+                    growth["heart_baseline_count"],
+                    now,
+                    int(device_row["row_index"]),
+                ),
+            )
+            updated = True
+            if owner:
+                _sync_account_editor_stats(
+                    conn,
+                    username,
+                    owner_username=owner,
+                    video_count=vc_text if video_count is not None else None,
+                    follower_count=fc_text if follower_count is not None else None,
+                    follower_growth=growth["follower_growth"],
+                    heart_count=hc_text if heart_count is not None else None,
+                    follower_growth_day_before=growth["follower_growth_day_before"],
+                    follower_growth_yesterday=growth["follower_growth_yesterday"],
+                    follower_growth_today=growth["follower_growth_today"],
+                    heart_growth_day_before=growth["heart_growth_day_before"],
+                    heart_growth_yesterday=growth["heart_growth_yesterday"],
+                    heart_growth_today=growth["heart_growth_today"],
+                    stats_baseline_date=growth["stats_baseline_date"],
+                    follower_baseline_count=growth["follower_baseline_count"],
+                    heart_baseline_count=growth["heart_baseline_count"],
+                    now=now,
+                )
+
+        if updated:
+            conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def _run_account_stats_query_job(owner: str, selected_aliases: list[str], *, source: str = "manual") -> dict[str, int]:
+    usernames = _list_usernames_for_owner_by_aliases(owner, selected_aliases)
+    if not usernames:
+        _account_stats_query_log(f"[{now_text()}] owner={owner} | 跳过：所选别名下无账号 ({source})")
+        return {"total": 0, "ok": 0, "fail": 0}
+    total = len(usernames)
+    ok = 0
+    fail = 0
+    _account_stats_query_log(
+        f"[{now_text()}] owner={owner} | 开始查询 {total} 个账号 | 别名={','.join(selected_aliases)} | source={source}"
+    )
+    for idx, username in enumerate(usernames, start=1):
+        try:
+            result = fetch_tiktok_profile_stats(
+                username,
+                write_back=True,
+                query_index=idx,
+                query_total=total,
+                owner_username=owner,
+            )
+            if isinstance(result, dict) and int(result.get("code", 1)) == 0:
+                ok += 1
+            else:
+                fail += 1
+                msg = result.get("msg") if isinstance(result, dict) else "unknown"
+                _account_stats_query_log(f"[{now_text()}] 失败 @{username} | {msg}")
+        except Exception as exc:
+            fail += 1
+            _account_stats_query_log(f"[{now_text()}] 异常 @{username} | {exc}")
+        if idx < total:
+            time.sleep(ACCOUNT_STATS_QUERY_REQUEST_GAP_SEC)
+    _account_stats_query_log(
+        f"[{now_text()}] owner={owner} | 查询完成 | 成功 {ok}/{total} | 失败 {fail} | source={source}"
+    )
+    return {"total": total, "ok": ok, "fail": fail}
+
+
+def _account_stats_query_worker(owner: str, selected_aliases: list[str], *, source: str = "manual") -> None:
+    try:
+        _run_account_stats_query_job(owner, selected_aliases, source=source)
+    except Exception as exc:
+        _account_stats_query_log(f"[{now_text()}] owner={owner} | 任务异常: {exc}")
+    finally:
+        with store.lock:
+            store.account_stats_query_in_flight[owner] = False
+
+
+def _start_account_stats_query_async(owner: str, selected_aliases: list[str], *, source: str = "manual") -> bool:
+    owner = str(owner or "").strip()
+    if not owner:
+        return False
+    with store.lock:
+        if store.account_stats_query_in_flight.get(owner):
+            return False
+        store.account_stats_query_in_flight[owner] = True
+    Thread(
+        target=_account_stats_query_worker,
+        args=(owner, selected_aliases),
+        kwargs={"source": source},
+        name=f"account_stats_query_{owner}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _account_stats_query_tick() -> None:
+    today = _beijing_date_str()
+    current_hm = _beijing_now().strftime("%H:%M")
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT username, config_json FROM user_runtime_configs WHERE config_key = ?",
+            (ACCOUNT_STATS_QUERY_USER_CONFIG_KEY,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        owner = str(row["username"] or "").strip()
+        if not owner:
+            continue
+        try:
+            raw = json.loads(row["config_json"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(raw, dict) or not raw.get("schedule_enabled"):
+            continue
+        schedule_time = str(raw.get("schedule_time") or "09:00").strip()[:5]
+        if schedule_time != current_hm:
+            continue
+        if str(raw.get("last_schedule_run_date") or "").strip() == today:
+            continue
+        selected = [
+            _normalized_alias(str(a)) for a in (raw.get("selected_aliases") or []) if _normalized_alias(str(a))
+        ]
+        if not selected:
+            continue
+        with store.lock:
+            if store.account_stats_query_in_flight.get(owner):
+                continue
+        _save_account_stats_query_config(owner, {"last_schedule_run_date": today})
+        _account_stats_query_log(f"[{now_text()}] owner={owner} | 定时触发 | 时间={schedule_time}")
+        _start_account_stats_query_async(owner, selected, source="schedule")
+
+
+def _account_stats_query_worker_loop() -> None:
+    _account_stats_query_log("账号统计定时查询调度线程已启动")
+    while not _APP_SHUTDOWN_EVENT.wait(ACCOUNT_STATS_QUERY_TICK_INTERVAL_SEC):
+        try:
+            _account_stats_query_tick()
+        except Exception as exc:
+            _account_stats_query_log(f"调度异常: {exc}")
+
+
+def _start_account_stats_query_worker() -> None:
+    Thread(
+        target=_account_stats_query_worker_loop,
+        name="account_stats_query_scheduler",
+        daemon=True,
+    ).start()
+
+
 def fetch_tiktok_profile_stats(
     username: str,
     include_raw: bool = False,
@@ -8597,6 +9252,7 @@ def fetch_tiktok_profile_stats(
     write_back: bool = False,
     query_index: int | None = None,
     query_total: int | None = None,
+    owner_username: str = "",
 ):
     """抓取 TikTok 主页并解析 __UNIVERSAL_DATA_FOR_REHYDRATION__，返回结构与 autoSearch extract 一致。"""
     username = username.strip().lstrip("@")
@@ -8671,72 +9327,11 @@ def fetch_tiktok_profile_stats(
     )
 
     if write_back:
-        video_count = extract_dict.get("video_count")
-        follower_count = extract_dict.get("follower_count")
-        new_fc = follower_count if isinstance(follower_count, int) else None
-        conn = _get_db()
-        try:
-            row = conn.execute(
-                """
-                SELECT row_index, owner_username, username, follower_count, {_alias} AS mobile_alias
-                FROM device_editor_rows
-                WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))
-                ORDER BY updated_at DESC, row_index DESC
-                LIMIT 1
-                """.format(_alias=_backup_record_alias_expr()),
-                (username,),
-            ).fetchone()
-            if row:
-                prev_fc = _parse_count_text_to_int(row["follower_count"])
-                follower_growth = ""
-                if isinstance(new_fc, int) and isinstance(prev_fc, int):
-                    follower_growth = str(max(new_fc - prev_fc, 0))
-                elif isinstance(new_fc, int):
-                    follower_growth = "0"
-                now = now_text()
-                vc_text = "" if video_count is None else str(video_count)
-                fc_text = "" if follower_count is None else str(follower_count)
-                conn.execute(
-                    """
-                    UPDATE device_editor_rows
-                    SET video_count = ?, follower_count = ?, follower_growth = ?, updated_at = ?
-                    WHERE row_index = ?
-                    """,
-                    (
-                        vc_text,
-                        fc_text,
-                        follower_growth,
-                        now,
-                        int(row["row_index"]),
-                    ),
-                )
-                owner = str(row["owner_username"] or "").strip()
-                _sync_account_editor_stats(
-                    conn,
-                    username,
-                    owner_username=owner,
-                    video_count=vc_text,
-                    follower_count=fc_text,
-                    follower_growth=follower_growth,
-                    now=now,
-                )
-                conn.commit()
-            elif isinstance(new_fc, int) or video_count is not None:
-                now = now_text()
-                vc_text = "" if video_count is None else str(video_count)
-                fc_text = "" if follower_count is None else str(follower_count)
-                fg_text = "0" if isinstance(new_fc, int) else ""
-                _sync_account_editor_stats(
-                    conn,
-                    username,
-                    video_count=vc_text if video_count is not None else None,
-                    follower_count=fc_text if follower_count is not None else None,
-                    follower_growth=fg_text if fg_text else None,
-                    now=now,
-                )
-                conn.commit()
-        finally:
-            conn.close()
+        _apply_profile_stats_write_back(
+            username,
+            extract_dict,
+            owner_username=owner_username,
+        )
 
     result = {
         "code": 0,
@@ -12810,7 +13405,11 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
         _maybe_maintain_device_editor_on_read(conn, owner)
         rows = conn.execute(
             """
-            SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
+            SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias,
+                   video_count, follower_count, follower_growth, heart_count,
+                   follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                   heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                   basic_profile_modified
             FROM account_editor_rows
             WHERE owner_username = ?
             ORDER BY row_index ASC
@@ -12913,8 +13512,8 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
         conn.execute(
             """
             INSERT INTO account_editor_rows
-                (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
+                (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, heart_count, follower_growth_day_before, follower_growth_yesterday, follower_growth_today, heart_growth_day_before, heart_growth_yesterday, heart_growth_today, basic_profile_modified, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
             ON CONFLICT(owner_username, row_index) DO UPDATE SET
                 username = excluded.username,
                 password = excluded.password,
@@ -12935,6 +13534,13 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 video_count = COALESCE(excluded.video_count, ''),
                 follower_count = COALESCE(excluded.follower_count, ''),
                 follower_growth = COALESCE(excluded.follower_growth, ''),
+                heart_count = COALESCE(excluded.heart_count, ''),
+                follower_growth_day_before = COALESCE(excluded.follower_growth_day_before, ''),
+                follower_growth_yesterday = COALESCE(excluded.follower_growth_yesterday, ''),
+                follower_growth_today = COALESCE(excluded.follower_growth_today, ''),
+                heart_growth_day_before = COALESCE(excluded.heart_growth_day_before, ''),
+                heart_growth_yesterday = COALESCE(excluded.heart_growth_yesterday, ''),
+                heart_growth_today = COALESCE(excluded.heart_growth_today, ''),
                 basic_profile_modified = COALESCE(excluded.basic_profile_modified, '否'),
                 updated_at = excluded.updated_at
             """,
@@ -12953,6 +13559,13 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 vc_input,
                 _blank_if_none(payload.follower_count),
                 _blank_if_none(payload.follower_growth),
+                _blank_if_none(payload.heart_count),
+                _blank_if_none(payload.follower_growth_day_before),
+                _blank_if_none(payload.follower_growth_yesterday),
+                _blank_if_none(payload.follower_growth_today),
+                _blank_if_none(payload.heart_growth_day_before),
+                _blank_if_none(payload.heart_growth_yesterday),
+                _blank_if_none(payload.heart_growth_today),
                 _normalize_switch_highlight(payload.basic_profile_modified),
                 now,
             ),
@@ -17043,6 +17656,83 @@ def trigger_backup_stats_full_query_once(authorization: str | None = Header(defa
     return {"code": 0, "msg": "已提交后台全量查询任务，请在任务日志中查看进度"}
 
 
+@app.get("/api/admin/account_stats_query/config")
+def get_account_stats_query_config(authorization: str | None = Header(default=None)):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    cfg = _load_account_stats_query_config(owner)
+    with store.lock:
+        in_flight = bool(store.account_stats_query_in_flight.get(owner))
+    groups = _list_account_alias_groups(owner)
+    return {
+        "code": 0,
+        "data": {
+            **cfg,
+            "in_flight": in_flight,
+            "alias_groups": groups,
+            "beijing_date": _beijing_date_str(),
+            "beijing_time": _beijing_now().strftime("%H:%M:%S"),
+        },
+    }
+
+
+@app.post("/api/admin/account_stats_query/config")
+def save_account_stats_query_config(
+    payload: AccountStatsQueryConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    patch: dict[str, object] = {}
+    if payload.selected_aliases is not None:
+        patch["selected_aliases"] = payload.selected_aliases
+    if payload.schedule_enabled is not None:
+        patch["schedule_enabled"] = payload.schedule_enabled
+    if payload.schedule_time is not None:
+        patch["schedule_time"] = payload.schedule_time
+    cfg = _save_account_stats_query_config(owner, patch)
+    if payload.schedule_enabled is not None:
+        _account_stats_query_log(
+            f"[{now_text()}] owner={owner} | 定时查询已{'开启' if cfg.get('schedule_enabled') else '关闭'} | 时间={cfg.get('schedule_time')}"
+        )
+    return {"code": 0, "msg": "账号统计查询配置已保存", "data": cfg}
+
+
+@app.post("/api/admin/account_stats_query/run")
+def run_account_stats_query(
+    payload: AccountStatsQueryRunRequest,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session["username"] or "").strip()
+    cfg = _load_account_stats_query_config(owner)
+    selected = [
+        _normalized_alias(str(a))
+        for a in (payload.selected_aliases if payload.selected_aliases is not None else cfg.get("selected_aliases") or [])
+        if _normalized_alias(str(a))
+    ]
+    if not selected:
+        return {"code": 1, "msg": "请至少选择一个别名"}
+    if payload.selected_aliases is not None:
+        _save_account_stats_query_config(owner, {"selected_aliases": selected})
+    with store.lock:
+        if store.account_stats_query_in_flight.get(owner):
+            return {"code": 1, "msg": "查询任务正在执行中，请稍后再试"}
+    if not _start_account_stats_query_async(owner, selected, source="manual"):
+        return {"code": 1, "msg": "查询任务正在执行中，请稍后再试"}
+    return {
+        "code": 0,
+        "msg": f"已提交查询任务，将查询 {len(_list_usernames_for_owner_by_aliases(owner, selected))} 个账号",
+        "data": {"selected_aliases": selected},
+    }
+
+
 AUTO_SWITCH_MANUAL_BLOCK_MSG = "该设备已开启自动切号，请先关闭后再执行手动操作"
 
 
@@ -17717,6 +18407,7 @@ def _build_auto_switch_bundle_for_device(
         live_visit_n = 0
     live_visit_n = max(0, min(live_visit_n, 50))
     pc_service_url = _load_device_pc_service_url(str(device_id or "").strip())
+    cut_switch_scheme = _load_cut_switch_scheme(owner)
     return {
         "session_id": str(session_id or "").strip(),
         "revision": int(revision or 0),
@@ -17729,6 +18420,7 @@ def _build_auto_switch_bundle_for_device(
         "device_alias": alias_key,
         "device_id": str(device_id or "").strip(),
         "pc_service_url": pc_service_url,
+        "cut_switch_scheme": cut_switch_scheme,
         "run_config": {
             "run_mode": mode,
             "active_template": str(active_template or ""),
@@ -17894,6 +18586,8 @@ def get_auto_switch_config(authorization: str | None = Header(default=None)):
         return {"code": 503, "msg": "服务繁忙，请稍后重试"}
     enabled_count = sum(1 for d in devices_out if d.get("enabled"))
     autonomous_mode = enabled_count > 0
+    owner = str(session.get("username") or "").strip()
+    cut_switch_scheme = _load_cut_switch_scheme(owner)
     return {
         "code": 0,
         "data": {
@@ -17906,6 +18600,43 @@ def get_auto_switch_config(authorization: str | None = Header(default=None)):
             "beijing_date": _beijing_date_str(),
             "beijing_time": _beijing_now().strftime("%H:%M:%S"),
             "tick_interval_sec": AUTO_SWITCH_TICK_INTERVAL_SEC,
+            "cut_switch_scheme": cut_switch_scheme,
+            "cut_switch_scheme_options": [
+                {"value": CUT_SWITCH_SCHEME_BACKUP, "label": "备份切号"},
+                {"value": CUT_SWITCH_SCHEME_LOGIN, "label": "登录切号"},
+            ],
+        },
+    }
+
+
+@app.post("/api/admin/auto_switch/cut_switch_scheme")
+def set_auto_switch_cut_scheme(
+    payload: AutoSwitchCutSchemeRequest,
+    authorization: str | None = Header(default=None),
+):
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    owner = str(session.get("username") or "").strip()
+    if not owner:
+        return {"code": 1, "msg": "未登录"}
+    prev = _load_cut_switch_scheme(owner)
+    scheme = _save_cut_switch_scheme(owner, payload.cut_switch_scheme)
+    sync_info: dict[str, Any] = {"notified": 0, "session_id": "", "bundle_revision": 0}
+    if scheme != prev:
+        sync_info = _resync_auto_switch_devices_for_owner_scheme(owner)
+        _auto_switch_log(
+            f"[{now_text()}] owner={owner} | 切号方案 {prev} → {scheme} | "
+            f"重同步 notified={sync_info.get('notified')} revision={sync_info.get('bundle_revision')}"
+        )
+    label = "登录切号" if scheme == CUT_SWITCH_SCHEME_LOGIN else "备份切号"
+    return {
+        "code": 0,
+        "msg": f"已切换为{label}",
+        "data": {
+            "cut_switch_scheme": scheme,
+            "prev_scheme": prev,
+            **sync_info,
         },
     }
 
@@ -18042,10 +18773,16 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
 
 @app.post("/api/admin/auto_switch/config")
 def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | None = Header(default=None)):
-    """兼容旧全局开关：转为对当前用户全部设备批量开/关。"""
+    """兼容旧全局开关：转为对当前用户全部设备批量开/关；也可单独更新切号方案。"""
     err, session = _require_login({"authorization": authorization} if authorization else {})
     if err:
         return err
+    owner = str(session.get("username") or "").strip()
+    if payload.cut_switch_scheme is not None:
+        prev = _load_cut_switch_scheme(owner)
+        scheme = _save_cut_switch_scheme(owner, payload.cut_switch_scheme)
+        if scheme != prev:
+            _resync_auto_switch_devices_for_owner_scheme(owner)
     if payload.enabled is None:
         return get_auto_switch_config(authorization=authorization)
     allowed = sorted(_session_device_ids(session))
@@ -20287,6 +21024,7 @@ if _backup_stats_full_query_schedule_available():
     _start_backup_stats_full_query_worker()
 else:
     _backup_stats_full_query_log("每日定时全量查询调度未启动（功能暂时不可用）")
+_start_account_stats_query_worker()
 _start_mobile_pending_auto_refill_worker()
 
 try:

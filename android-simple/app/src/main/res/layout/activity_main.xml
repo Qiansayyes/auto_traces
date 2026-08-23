@@ -264,6 +264,35 @@
                 android:textColor="@android:color/darker_gray"
                 android:textSize="12sp" />
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="切号方案"
+                    android:textSize="13sp" />
+
+                <Spinner
+                    android:id="@+id/manualCutSwitchSchemeSpinner"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="备份还原：有备份则还原；登录切号：清理后自动登录。批量发作品/自动活跃/活跃下个均按此方案切号。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="11sp" />
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualConfirmSwitchDoneButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
@@ -373,6 +402,100 @@
                     android:text="For You 预滑" />
             </LinearLayout>
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualEnqueueActivateButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="加入待活跃" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualClearActivateQueueButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="清空待活跃" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="活跃时长(分钟)">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/manualActivateDurationMinInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:maxLines="1" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualActivateNextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="活跃下个账号" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualAutoActiveButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="自动活跃（指定账号轮流）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualSortActivateByMinutesButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="按时长升序" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualTrimActivateByMinutesButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="移除已活跃满N分" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/manualPendingActivateQueueText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="待活跃队列：空"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="12sp" />
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualMutualButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
@@ -410,6 +533,44 @@
                     android:layout_marginStart="8dp"
                     android:text="发作品" />
             </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="发后活跃(分钟)">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/manualBatchPublishAfterMinInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:maxLines="1" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualBatchPublishButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="批量发作品" />
+            </LinearLayout>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="批量发作品：勾选账号后依次切号→发作品→发完随机 For You/涨粉（时长见上）。条数沿用「发作品条数」。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualProfileEditButton"

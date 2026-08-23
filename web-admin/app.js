@@ -150,6 +150,7 @@ const schedulerLogsScrollBottomBtn = document.getElementById("schedulerLogsScrol
 const autoSwitchSelectAllEnableBtn = document.getElementById("autoSwitchSelectAllEnableBtn");
 const autoSwitchEnableSelectedBtn = document.getElementById("autoSwitchEnableSelectedBtn");
 const autoSwitchDisableSelectedBtn = document.getElementById("autoSwitchDisableSelectedBtn");
+const autoSwitchCutSchemeSelect = document.getElementById("autoSwitchCutSchemeSelect");
 const autoSwitchExcludedBatchBtn = document.getElementById("autoSwitchExcludedBatchBtn");
 const autoSwitchExcludedBatchModalEl = document.getElementById("autoSwitchExcludedBatchModal");
 const autoSwitchExcludedBatchTextarea = document.getElementById("autoSwitchExcludedBatchTextarea");
@@ -264,6 +265,16 @@ const accountBatchPreviewBulkAliasEl = document.getElementById("accountBatchPrev
 const accountBatchPreviewApplyAliasBtn = document.getElementById("accountBatchPreviewApplyAliasBtn");
 const accountBatchPreviewSummaryEl = document.getElementById("accountBatchPreviewSummary");
 const accountBatchPreviewTableWrapEl = document.getElementById("accountBatchPreviewTableWrap");
+const accountStatsQueryBtn = document.getElementById("accountStatsQueryBtn");
+const accountStatsQueryScheduleToggle = document.getElementById("accountStatsQueryScheduleToggle");
+const accountStatsQueryScheduleTime = document.getElementById("accountStatsQueryScheduleTime");
+const accountStatsQueryModalEl = document.getElementById("accountStatsQueryModal");
+const closeAccountStatsQueryModalBtn = document.getElementById("closeAccountStatsQueryModalBtn");
+const cancelAccountStatsQueryModalBtn = document.getElementById("cancelAccountStatsQueryModalBtn");
+const confirmAccountStatsQueryBtn = document.getElementById("confirmAccountStatsQueryBtn");
+const accountStatsQuerySelectAllEl = document.getElementById("accountStatsQuerySelectAll");
+const accountStatsQuerySummaryEl = document.getElementById("accountStatsQuerySummary");
+const accountStatsQueryAliasListEl = document.getElementById("accountStatsQueryAliasList");
 const batchStreamAliasSelect = document.getElementById("batchStreamAliasSelect");
 const batchStreamHoursInput = document.getElementById("batchStreamHoursInput");
 const batchStreamRoundsInput = document.getElementById("batchStreamRoundsInput");
@@ -828,12 +839,19 @@ const ACCOUNT_RECORDS_PAGE_SIZE_KEY = "auto_traces_account_records_page_size_v1"
 let autoSwitchDailyPlansByAlias = {};
 let autoSwitchDailyPlanDate = "";
 let backupArchiveSlotHighlightTimer = null;
+let autoSwitchCutScheme = "backup";
+let autoSwitchCutSchemeSaveInFlight = false;
 let autoSwitchDevicesById = new Map();
 let autoSwitchPickDeviceIds = new Set();
 let autoSwitchSaveInFlight = false;
 let backupStatsFullQueryScheduleAvailable = false;
 let backupStatsFullQueryManualAvailable = false;
 let backupStatsFullQuerySaveInFlight = false;
+let accountStatsQueryConfig = null;
+let accountStatsQueryAliasGroups = [];
+let accountStatsQuerySelectedAliases = new Set();
+let accountStatsQueryInFlight = false;
+let accountStatsQueryConfigSaveInFlight = false;
 const DB_PAGE_KEY = "auto_traces_db_page_v1";
 const DB_SEARCH_FIELD_KEY = "auto_traces_db_search_field_v1";
 const DB_SEARCH_KEYWORD_KEY = "auto_traces_db_search_keyword_v1";
@@ -5499,6 +5517,15 @@ async function loadAutoSwitchConfig(options = {}) {
       const did = String(item?.device_id || "").trim();
       if (did) autoSwitchDevicesById.set(did, !!item?.enabled);
     });
+    autoSwitchCutScheme = String(cfg.cut_switch_scheme || "backup").trim().toLowerCase() === "login"
+      ? "login"
+      : "backup";
+    if (autoSwitchCutSchemeSelect) {
+      autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
+      autoSwitchCutSchemeSelect.title = autoSwitchCutScheme === "login"
+        ? "当前：登录切号（清数据后直接登录目标号，不还原备份）"
+        : "当前：备份切号（备份→清理→还原）";
+    }
     applyAutoSwitchManualOpsUi();
     populateAutoSwitchSessionSummariesAliasOptions();
     await loadAutoSwitchSessionSummaries();
@@ -5508,6 +5535,43 @@ async function loadAutoSwitchConfig(options = {}) {
   } catch (_) {
     /* ignore */
   }
+}
+
+async function saveAutoSwitchCutScheme(scheme) {
+  // 并发保存排队等待，避免下拉已切到新值但请求被静默丢弃
+  while (autoSwitchCutSchemeSaveInFlight) {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  const next = String(scheme || "backup").trim().toLowerCase() === "login" ? "login" : "backup";
+  autoSwitchCutSchemeSaveInFlight = true;
+  if (autoSwitchCutSchemeSelect) autoSwitchCutSchemeSelect.disabled = true;
+  try {
+    const data = await request("/api/admin/auto_switch/cut_switch_scheme", {
+      method: "POST",
+      body: JSON.stringify({ cut_switch_scheme: next }),
+    });
+    autoSwitchCutScheme = String(data?.data?.cut_switch_scheme || next) === "login" ? "login" : "backup";
+    if (autoSwitchCutSchemeSelect) {
+      autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
+      autoSwitchCutSchemeSelect.title = autoSwitchCutScheme === "login"
+        ? "当前：登录切号（清数据后直接登录目标号，不还原备份）"
+        : "当前：备份切号（备份→清理→还原）";
+    }
+    const notified = Number(data?.data?.notified || 0);
+    const parts = [data?.msg || (autoSwitchCutScheme === "login" ? "已切换为登录切号" : "已切换为备份切号")];
+    if (notified > 0) parts.push(`已通知 ${notified} 台自动切号设备重同步`);
+    setStatus(parts.join("；"), "success");
+  } catch (error) {
+    if (autoSwitchCutSchemeSelect) autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
+    setStatus(error.message || "保存切号方案失败", "error");
+  } finally {
+    autoSwitchCutSchemeSaveInFlight = false;
+    if (autoSwitchCutSchemeSelect) autoSwitchCutSchemeSelect.disabled = false;
+  }
+}
+
+function isLoginCutSwitchScheme() {
+  return autoSwitchCutScheme === "login";
 }
 
 function renderSmartTemplateDebugBlock(debug) {
@@ -7287,7 +7351,15 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   if (bucketSize > 1 && !bucketHasHighlight) {
     const opsIdentity = resolveLiveDeviceIdentityForArchive(actionAlias, clickedDeviceId);
     if (!opsIdentity) return;
-    const detailLines = canRestoreToDevice
+    const useLoginScheme = isLoginCutSwitchScheme();
+    const detailLines = useLoginScheme
+      ? [
+        `设备别名：${actionAlias}`,
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "切号方案：登录切号 — 将【清理 TikTok 全部数据】后直接登录目标号（不还原备份）。",
+        `目标 username：${targetUser || "-"}`,
+      ]
+      : canRestoreToDevice
       ? [
         `设备别名：${actionAlias}`,
         "确认后将立即切换环境归属高亮到目标账号。",
@@ -7306,10 +7378,12 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
         skipConfirm: true,
         refreshAfter: false,
         ...cutSwitchWait,
-        cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
+        cutSwitchAfterBackup: useLoginScheme || !canRestoreToDevice
+          ? "exclusive_activate_target"
+          : "clear_source_for_restore",
         cutSwitchTargetRowIndex: targetRi,
       });
-      if (canRestoreToDevice) {
+      if (!useLoginScheme && canRestoreToDevice) {
         await handleRestoreClick(actionAlias, targetBackup, opsIdentity.device_id, {
           skipConfirm: true,
           skipPmClear: true,
@@ -7320,7 +7394,9 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
         });
       }
       setStatus(
-        canRestoreToDevice
+        useLoginScheme
+          ? "切号：环境归属已切换；设备将清理后自动登录目标号"
+          : canRestoreToDevice
           ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
           : "切号：环境归属已切换；设备清理任务已完成",
         "success",
@@ -7356,7 +7432,14 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   const opsIdentity = resolveLiveDeviceIdentityForArchive(actionAlias, sourceDeviceId || clickedDeviceId);
   if (!opsIdentity) return;
 
-  const detailLines = canRestoreToDevice
+  const detailLines = isLoginCutSwitchScheme()
+    ? [
+      `设备别名：${actionAlias}`,
+      "确认后将立即切换环境归属高亮到目标账号。",
+      "切号方案：登录切号 — 将【清理 TikTok 全部数据】后直接登录目标号（不备份、不还原）。",
+      `目标 username：${targetUser || "-"}`,
+    ]
+    : canRestoreToDevice
     ? [
       `设备别名：${actionAlias}`,
       "确认后将立即切换环境归属高亮到目标账号。",
@@ -7376,30 +7459,42 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     const sUser = String(sourceCard.getAttribute("data-row-username") || "").trim();
     const sid = resolveLiveDeviceIdentityForArchive(actionAlias, sourceDeviceId || clickedDeviceId);
     if (!sid) return;
-    const backupRecordId = Number.isFinite(sRi) && sRi >= 0 ? sRi : undefined;
-    await handleBackupAndClearClick(actionAlias, backupRecordId, sUser, sid.device_id, {
-      skipConfirm: true,
-      refreshAfter: false,
-      ...cutSwitchWait,
-      cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
-      cutSwitchTargetRowIndex: targetRi,
-    });
-    if (canRestoreToDevice) {
-      await handleRestoreClick(actionAlias, targetBackup, sid.device_id, {
+    const useLoginScheme = isLoginCutSwitchScheme();
+    if (useLoginScheme) {
+      await handleAliasClearClick(actionAlias, sid.device_id, {
         skipConfirm: true,
-        skipPmClear: true,
         refreshAfter: false,
-        cutSwitchTargetRowIndex: targetRi,
         ...cutSwitchWait,
-        refreshOnEnqueue: false,
+        cutSwitchAfterBackup: "exclusive_activate_target",
+        cutSwitchTargetRowIndex: targetRi,
       });
+      setStatus("切号：环境归属已切换；设备将清理后自动登录目标号", "success");
+    } else {
+      const backupRecordId = Number.isFinite(sRi) && sRi >= 0 ? sRi : undefined;
+      await handleBackupAndClearClick(actionAlias, backupRecordId, sUser, sid.device_id, {
+        skipConfirm: true,
+        refreshAfter: false,
+        ...cutSwitchWait,
+        cutSwitchAfterBackup: canRestoreToDevice ? "clear_source_for_restore" : "exclusive_activate_target",
+        cutSwitchTargetRowIndex: targetRi,
+      });
+      if (canRestoreToDevice) {
+        await handleRestoreClick(actionAlias, targetBackup, sid.device_id, {
+          skipConfirm: true,
+          skipPmClear: true,
+          refreshAfter: false,
+          cutSwitchTargetRowIndex: targetRi,
+          ...cutSwitchWait,
+          refreshOnEnqueue: false,
+        });
+      }
+      setStatus(
+        canRestoreToDevice
+          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
+          : "切号：环境归属已切换；设备备份并清理任务已完成",
+        "success",
+      );
     }
-    setStatus(
-      canRestoreToDevice
-        ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
-        : "切号：环境归属已切换；设备备份并清理任务已完成",
-      "success",
-    );
   } catch (e) {
     const msg = e?.message || "切号失败";
     const timedOut = /超时/.test(msg);
@@ -8619,6 +8714,13 @@ if (autoSwitchDisableSelectedBtn) {
     );
   });
 }
+if (autoSwitchCutSchemeSelect) {
+  autoSwitchCutSchemeSelect.addEventListener("change", () => {
+    saveAutoSwitchCutScheme(autoSwitchCutSchemeSelect.value).catch((e) => {
+      setStatus(e.message || "保存切号方案失败", "error");
+    });
+  });
+}
 if (autoSwitchExcludedBatchBtn) {
   autoSwitchExcludedBatchBtn.addEventListener("click", () => openAutoSwitchExcludedBatchModal());
 }
@@ -9161,6 +9263,7 @@ async function refreshAccountEditorLight({ refreshArchive = false } = {}) {
   await loadAccountEditorRows();
   renderAccountEditorRows();
   renderDeviceRegionPresetOptions();
+  void loadAccountStatsQueryConfig().catch(() => {});
   if (refreshArchive && document.getElementById("backup-section")?.classList.contains("active")) {
     await loadBackupArchiveRecords();
   }
@@ -9615,6 +9718,218 @@ function closeAccountBatchPreviewModal() {
   accountBatchPreviewItems = [];
 }
 
+let accountStatsQueryPollTimer = null;
+
+function applyAccountStatsQueryScheduleUi(cfg = {}) {
+  accountStatsQueryInFlight = !!cfg.in_flight;
+  if (accountStatsQueryScheduleToggle) {
+    accountStatsQueryScheduleToggle.checked = !!cfg.schedule_enabled;
+  }
+  if (accountStatsQueryScheduleTime) {
+    accountStatsQueryScheduleTime.value = String(cfg.schedule_time || "09:00").slice(0, 5);
+    accountStatsQueryScheduleTime.disabled = !accountStatsQueryScheduleToggle?.checked;
+  }
+  if (accountStatsQueryBtn) {
+    accountStatsQueryBtn.disabled = accountStatsQueryInFlight;
+    accountStatsQueryBtn.textContent = accountStatsQueryInFlight ? "查询进行中…" : "全量查询并落库";
+  }
+}
+
+function updateAccountStatsQuerySummary() {
+  if (!accountStatsQuerySummaryEl) return;
+  const selectedCount = accountStatsQuerySelectedAliases.size;
+  const totalAliases = accountStatsQueryAliasGroups.length;
+  let usernameCount = 0;
+  accountStatsQueryAliasGroups.forEach((group) => {
+    const alias = normalizeAliasValue(group?.alias);
+    if (alias && accountStatsQuerySelectedAliases.has(alias)) {
+      usernameCount += Number(group?.count) || (Array.isArray(group?.usernames) ? group.usernames.length : 0);
+    }
+  });
+  accountStatsQuerySummaryEl.textContent = `已选 ${selectedCount}/${totalAliases} 个别名，约 ${usernameCount} 个账号`;
+}
+
+function syncAccountStatsQuerySelectAllState() {
+  if (!accountStatsQuerySelectAllEl) return;
+  const allAliases = accountStatsQueryAliasGroups.map((g) => normalizeAliasValue(g?.alias)).filter(Boolean);
+  const selectedCount = allAliases.filter((a) => accountStatsQuerySelectedAliases.has(a)).length;
+  accountStatsQuerySelectAllEl.checked = allAliases.length > 0 && selectedCount === allAliases.length;
+  accountStatsQuerySelectAllEl.indeterminate = selectedCount > 0 && selectedCount < allAliases.length;
+}
+
+function renderAccountStatsQueryAliasList() {
+  if (!accountStatsQueryAliasListEl) return;
+  if (!accountStatsQueryAliasGroups.length) {
+    accountStatsQueryAliasListEl.innerHTML = '<div class="hint" style="padding:16px;">暂无已分配别名的账号，请先在账号记录或设备档案中分配别名。</div>';
+    updateAccountStatsQuerySummary();
+    syncAccountStatsQuerySelectAllState();
+    return;
+  }
+  const rowsHtml = accountStatsQueryAliasGroups.map((group) => {
+    const alias = normalizeAliasValue(group?.alias);
+    const count = Number(group?.count) || (Array.isArray(group?.usernames) ? group.usernames.length : 0);
+    const checked = alias && accountStatsQuerySelectedAliases.has(alias);
+    const preview = (Array.isArray(group?.usernames) ? group.usernames.slice(0, 5) : []).join(", ");
+    const more = count > 5 ? ` 等 ${count} 个` : "";
+    return `<tr>
+      <td style="width:40px;text-align:center;">
+        <input type="checkbox" class="account-stats-query-alias-check" data-alias="${escapeHtml(alias)}"${checked ? " checked" : ""} />
+      </td>
+      <td><strong>${escapeHtml(alias)}</strong></td>
+      <td>${count}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(preview + more)}">${escapeHtml(preview)}${escapeHtml(more)}</td>
+    </tr>`;
+  }).join("");
+  accountStatsQueryAliasListEl.innerHTML = `<table class="import-preview-table">
+    <thead><tr><th></th><th>别名</th><th>账号数</th><th>username 预览</th></tr></thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>`;
+  updateAccountStatsQuerySummary();
+  syncAccountStatsQuerySelectAllState();
+}
+
+async function loadAccountStatsQueryConfig() {
+  try {
+    const data = await request("/api/admin/account_stats_query/config");
+    const cfg = data.data || {};
+    accountStatsQueryConfig = cfg;
+    accountStatsQueryAliasGroups = Array.isArray(cfg.alias_groups) ? cfg.alias_groups : [];
+    accountStatsQuerySelectedAliases = new Set(
+      (Array.isArray(cfg.selected_aliases) ? cfg.selected_aliases : [])
+        .map((a) => normalizeAliasValue(a))
+        .filter(Boolean),
+    );
+    applyAccountStatsQueryScheduleUi(cfg);
+    if (accountStatsQueryModalEl && !accountStatsQueryModalEl.classList.contains("hidden")) {
+      renderAccountStatsQueryAliasList();
+    }
+    scheduleAccountStatsQueryPoll(!!cfg.in_flight);
+    return cfg;
+  } catch (error) {
+    applyAccountStatsQueryScheduleUi({});
+    throw error;
+  }
+}
+
+function scheduleAccountStatsQueryPoll(active) {
+  if (accountStatsQueryPollTimer) {
+    clearInterval(accountStatsQueryPollTimer);
+    accountStatsQueryPollTimer = null;
+  }
+  if (!active) return;
+  accountStatsQueryPollTimer = setInterval(async () => {
+    try {
+      const prevInFlight = accountStatsQueryInFlight;
+      const cfg = await loadAccountStatsQueryConfig();
+      if (prevInFlight && !cfg.in_flight) {
+        await refreshAccountEditorLight();
+        setStatus("账号统计查询已完成，表格已刷新", "success");
+      }
+    } catch (_) {
+      // 静默轮询失败
+    }
+  }, 4000);
+}
+
+function restoreAccountStatsQuerySelectionFromConfig() {
+  const saved = Array.isArray(accountStatsQueryConfig?.selected_aliases)
+    ? accountStatsQueryConfig.selected_aliases
+    : [];
+  accountStatsQuerySelectedAliases = new Set(
+    saved.map((a) => normalizeAliasValue(a)).filter(Boolean),
+  );
+}
+
+async function saveAccountStatsQueryConfig(options = {}) {
+  // 并发保存时排队等待，避免“看起来成功但其实没写库”
+  while (accountStatsQueryConfigSaveInFlight) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  accountStatsQueryConfigSaveInFlight = true;
+  try {
+    const body = {};
+    if (options.selected_aliases != null) {
+      // 仅在明确传入时更新别名；不要用弹窗里未确认的勾选覆盖已保存记忆
+      const aliases = Array.isArray(options.selected_aliases)
+        ? options.selected_aliases
+        : Array.from(accountStatsQuerySelectedAliases);
+      body.selected_aliases = aliases.map((a) => normalizeAliasValue(a)).filter(Boolean);
+    }
+    if (options.schedule_enabled != null) {
+      body.schedule_enabled = !!options.schedule_enabled;
+    }
+    if (options.schedule_time != null) {
+      body.schedule_time = String(options.schedule_time || "09:00").slice(0, 5);
+    }
+    const data = await request("/api/admin/account_stats_query/config", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    accountStatsQueryConfig = data.data || accountStatsQueryConfig;
+    if (body.selected_aliases) {
+      accountStatsQuerySelectedAliases = new Set(body.selected_aliases);
+    }
+    applyAccountStatsQueryScheduleUi({ ...accountStatsQueryConfig, in_flight: accountStatsQueryInFlight });
+    return data;
+  } finally {
+    accountStatsQueryConfigSaveInFlight = false;
+  }
+}
+
+function openAccountStatsQueryModal() {
+  if (!accountStatsQueryModalEl) return;
+  renderAccountStatsQueryAliasList();
+  accountStatsQueryModalEl.classList.remove("hidden");
+  accountStatsQueryModalEl.setAttribute("aria-hidden", "false");
+}
+
+function closeAccountStatsQueryModal({ discardSelection = true } = {}) {
+  if (!accountStatsQueryModalEl) return;
+  accountStatsQueryModalEl.classList.add("hidden");
+  accountStatsQueryModalEl.setAttribute("aria-hidden", "true");
+  // 取消/关闭时丢弃未确认勾选，避免污染定时保存与下次记忆
+  if (discardSelection) restoreAccountStatsQuerySelectionFromConfig();
+}
+
+async function openAccountStatsQueryFlow() {
+  if (accountStatsQueryInFlight) {
+    setStatus("查询任务正在执行中，请稍后再试", "warning");
+    return;
+  }
+  try {
+    await loadAccountStatsQueryConfig();
+    openAccountStatsQueryModal();
+  } catch (error) {
+    setStatus(error.message || "加载查询配置失败", "error");
+  }
+}
+
+async function confirmAccountStatsQueryRun() {
+  if (accountStatsQueryInFlight) {
+    setStatus("查询任务正在执行中，请稍后再试", "warning");
+    return;
+  }
+  const selected = Array.from(accountStatsQuerySelectedAliases).filter(Boolean);
+  if (!selected.length) {
+    setStatus("请至少选择一个别名", "warning");
+    return;
+  }
+  try {
+    await saveAccountStatsQueryConfig({ selected_aliases: selected });
+    const data = await request("/api/admin/account_stats_query/run", {
+      method: "POST",
+      body: JSON.stringify({ selected_aliases: selected }),
+    });
+    closeAccountStatsQueryModal({ discardSelection: false });
+    accountStatsQueryInFlight = true;
+    applyAccountStatsQueryScheduleUi({ ...accountStatsQueryConfig, in_flight: true });
+    scheduleAccountStatsQueryPoll(true);
+    setStatus(data.msg || "已提交查询任务", "success");
+  } catch (error) {
+    setStatus(error.message || "提交查询失败", "error");
+  }
+}
+
 function buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex) {
   const seenInBatch = new Set();
   const items = [];
@@ -10004,6 +10319,13 @@ function getAccountRowTemplate(source = {}) {
     video_count: source.video_count || "",
     follower_count: source.follower_count || "",
     follower_growth: source.follower_growth || "",
+    heart_count: source.heart_count || "",
+    follower_growth_day_before: source.follower_growth_day_before || "",
+    follower_growth_yesterday: source.follower_growth_yesterday || "",
+    follower_growth_today: source.follower_growth_today || "",
+    heart_growth_day_before: source.heart_growth_day_before || "",
+    heart_growth_yesterday: source.heart_growth_yesterday || "",
+    heart_growth_today: source.heart_growth_today || "",
     basic_profile_modified: normalizeBasicProfileModifiedField(source.basic_profile_modified),
     // 分配别名仅以账号表单字段为准；备份档案别名由 backupAliasByUsername / 渲染层展示。
     assigned_alias: normalizeAliasValue(source.assigned_alias) || "",
@@ -10545,6 +10867,20 @@ function accountEditorCellSelect(idx, field, innerHtml) {
   return `<select class="account-editor-table__input" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" title="${field}">${innerHtml}</select>`;
 }
 
+function formatAccountGrowthTriple(row = {}, prefix = "follower") {
+  const dayBefore = String(row[`${prefix}_growth_day_before`] ?? "").trim();
+  const yesterday = String(row[`${prefix}_growth_yesterday`] ?? "").trim();
+  let today = String(row[`${prefix}_growth_today`] ?? "").trim();
+  if (!today && prefix === "follower") {
+    today = String(row.follower_growth ?? "").trim();
+  }
+  const fmt = (label, value) => {
+    const text = value === "" ? "-" : value;
+    return `<span class="account-growth-triple__item"><em>${label}</em>${escapeHtml(text)}</span>`;
+  };
+  return `<div class="account-growth-triple" title="${prefix === "follower" ? "粉丝" : "总赞"}增长（前天/昨天/今天）">${fmt("前", dayBefore)}${fmt("昨", yesterday)}${fmt("今", today)}</div>`;
+}
+
 function renderAccountEditorRows() {
   if (!accountEditorListEl) return;
   const existingRowIndexes = new Set(
@@ -10609,7 +10945,9 @@ function renderAccountEditorRows() {
         <td class="account-editor-table__alias">${aliasCell}</td>
         <td class="account-editor-table__stat">${accountEditorCellInput(idx, "video_count", row.video_count, 'inputmode="numeric"')}</td>
         <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_count", row.follower_count, 'inputmode="numeric"')}</td>
-        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_growth", row.follower_growth, 'inputmode="numeric"')}</td>
+        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "heart_count", row.heart_count, 'inputmode="numeric"')}</td>
+        <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
+        <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
         <td>${profileSelect}</td>
         <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
       </tr>`;
@@ -10634,7 +10972,9 @@ function renderAccountEditorRows() {
               <th>别名</th>
               <th>视频</th>
               <th>粉丝</th>
-              <th>增长</th>
+              <th>总赞</th>
+              <th>粉丝增长</th>
+              <th>总赞增长</th>
               <th>资料</th>
               <th></th>
             </tr>
@@ -11802,6 +12142,97 @@ if (confirmAccountBatchPreviewBtn) {
     });
   });
 }
+if (accountStatsQueryBtn) {
+  accountStatsQueryBtn.addEventListener("click", () => {
+    openAccountStatsQueryFlow().catch((error) => {
+      setStatus(error.message || "打开查询面板失败", "error");
+    });
+  });
+}
+if (closeAccountStatsQueryModalBtn) {
+  closeAccountStatsQueryModalBtn.addEventListener("click", closeAccountStatsQueryModal);
+}
+if (cancelAccountStatsQueryModalBtn) {
+  cancelAccountStatsQueryModalBtn.addEventListener("click", closeAccountStatsQueryModal);
+}
+if (confirmAccountStatsQueryBtn) {
+  confirmAccountStatsQueryBtn.addEventListener("click", () => {
+    confirmAccountStatsQueryRun().catch((error) => {
+      setStatus(error.message || "提交查询失败", "error");
+    });
+  });
+}
+if (accountStatsQueryModalEl) {
+  accountStatsQueryModalEl.addEventListener("click", (event) => {
+    if (event.target === accountStatsQueryModalEl) closeAccountStatsQueryModal();
+  });
+}
+if (accountStatsQuerySelectAllEl) {
+  accountStatsQuerySelectAllEl.addEventListener("change", () => {
+    const checked = Boolean(accountStatsQuerySelectAllEl.checked);
+    accountStatsQueryAliasGroups.forEach((group) => {
+      const alias = normalizeAliasValue(group?.alias);
+      if (!alias) return;
+      if (checked) accountStatsQuerySelectedAliases.add(alias);
+      else accountStatsQuerySelectedAliases.delete(alias);
+    });
+    renderAccountStatsQueryAliasList();
+  });
+}
+if (accountStatsQueryAliasListEl) {
+  accountStatsQueryAliasListEl.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || !target.classList.contains("account-stats-query-alias-check")) return;
+    const alias = normalizeAliasValue(target.dataset.alias);
+    if (!alias) return;
+    if (target.checked) accountStatsQuerySelectedAliases.add(alias);
+    else accountStatsQuerySelectedAliases.delete(alias);
+    updateAccountStatsQuerySummary();
+    syncAccountStatsQuerySelectAllState();
+  });
+}
+if (accountStatsQueryScheduleToggle) {
+  accountStatsQueryScheduleToggle.addEventListener("change", () => {
+    const enabled = Boolean(accountStatsQueryScheduleToggle.checked);
+    if (accountStatsQueryScheduleTime) accountStatsQueryScheduleTime.disabled = !enabled;
+    void (async () => {
+      try {
+        if (!accountStatsQueryConfig) {
+          await loadAccountStatsQueryConfig();
+        }
+        const savedAliasCount = Array.isArray(accountStatsQueryConfig?.selected_aliases)
+          ? accountStatsQueryConfig.selected_aliases.length
+          : 0;
+        if (enabled && !savedAliasCount) {
+          accountStatsQueryScheduleToggle.checked = false;
+          if (accountStatsQueryScheduleTime) accountStatsQueryScheduleTime.disabled = true;
+          setStatus("请先通过「全量查询并落库」勾选并确认别名，再开启定时查询", "warning");
+          return;
+        }
+        // 只改定时开关/时间，不覆盖已保存的别名记忆
+        await saveAccountStatsQueryConfig({
+          schedule_enabled: enabled,
+          schedule_time: accountStatsQueryScheduleTime?.value || "09:00",
+        });
+        setStatus(enabled ? "已开启定时查询" : "已关闭定时查询", "success");
+      } catch (error) {
+        setStatus(error.message || "保存定时配置失败", "error");
+        loadAccountStatsQueryConfig().catch(() => {});
+      }
+    })();
+  });
+}
+if (accountStatsQueryScheduleTime) {
+  accountStatsQueryScheduleTime.addEventListener("change", () => {
+    if (!accountStatsQueryScheduleToggle?.checked) return;
+    saveAccountStatsQueryConfig({
+      schedule_enabled: true,
+      schedule_time: accountStatsQueryScheduleTime.value || "09:00",
+    }).catch((error) => {
+      setStatus(error.message || "保存定时时间失败", "error");
+    });
+  });
+}
 if (batchStreamFileInput) {
   batchStreamFileInput.addEventListener("change", () => {
     const file = batchStreamFileInput.files?.[0];
@@ -12245,6 +12676,7 @@ if (apiBaseInput) {
       renderAccountEditorRows();
       void syncAssignableAliasOptionsIfNeeded();
       void loadBackupStatsFullQueryConfig();
+      void loadAccountStatsQueryConfig();
     }).catch((error) => {
       // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因
       const msg = error?.message || error?.toString?.() || "unknown";

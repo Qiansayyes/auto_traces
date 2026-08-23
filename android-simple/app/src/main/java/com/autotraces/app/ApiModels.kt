@@ -674,6 +674,12 @@ data class AutoSwitchBundle(
     val device_id: String? = null,
     /** 云端为该设备配置的 PC 伴侣服务地址；与本地不一致时由 applyAutoSwitchBundle 同步。 */
     val pc_service_url: String? = null,
+    /**
+     * 切号方案：
+     * - backup（默认）：备份 → 清理 → 还原/登录
+     * - login：不备份不还原，清理 TikTok 数据后直接登录目标号
+     */
+    val cut_switch_scheme: String? = null,
     val run_config: AutoSwitchRunConfig? = null,
     /** 按 TikTok 用户名（小写）打包的 enter 冻结配置；切号时本地切换，不再拉 getConfig。 */
     val configs_by_username: Map<String, AutoSwitchBundledAccountConfig>? = null,
@@ -683,7 +689,12 @@ data class AutoSwitchBundle(
     val daily_plan: AutoSwitchDailyPlan? = null,
     val weekly_plan: AutoSwitchWeeklyPlan? = null,
     val retry_policy: AutoSwitchRetryPolicy? = null,
-)
+) {
+    fun prefersLoginCutSwitch(): Boolean {
+        val scheme = cut_switch_scheme?.trim()?.lowercase().orEmpty()
+        return scheme == "login" || scheme == "login_switch" || scheme == "exclusive_login"
+    }
+}
 
 data class AutoSwitchBundledAccountConfig(
     val active_template: String? = null,

@@ -109,7 +109,20 @@ object SimpleRemoteControl {
                 }
                 result.fold(
                     onSuccess = { list ->
-                        ok("已拉取 ${list.size} 个账号").put("accountsCount", list.size)
+                        val accountsArr = JSONArray()
+                        list.forEach { opt ->
+                            accountsArr.put(
+                                JSONObject()
+                                    .put("username", opt.username)
+                                    .put("hasBackup", opt.backupPath.isNotBlank() || opt.backupName.isNotBlank())
+                                    .put("firstLoginDone", PrefsStore.isManualFirstLoginDone(opt.username)),
+                            )
+                        }
+                        ok("已拉取 ${list.size} 个账号")
+                            .put("accountsCount", list.size)
+                            .put("accounts", accountsArr)
+                            .put("selectedUsername", ManualDeviceControl.selectedManualUsername())
+                            .put("activeUsername", ManualDeviceControl.activeManualUsername())
                     },
                     onFailure = { err ->
                         fail("refresh_failed", err.message ?: "拉取失败")

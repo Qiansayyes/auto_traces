@@ -45,6 +45,28 @@ object PrefsStore {
     const val DEFAULT_MANUAL_FOR_YOU_SWIPE_SEC: Int = 60
     const val MIN_MANUAL_FOR_YOU_SWIPE_SEC: Int = 10
     const val MAX_MANUAL_FOR_YOU_SWIPE_SEC: Int = 3600
+    /** 手动模式：待活跃队列（有序 JSON 数组）。 */
+    private const val KEY_MANUAL_PENDING_ACTIVATE_QUEUE = "manual_pending_activate_queue_json"
+    /** 手动模式：活跃下个账号时长（分钟）；For You / 涨粉随机二选一共用。 */
+    private const val KEY_MANUAL_ACTIVATE_DURATION_MIN = "manual_activate_duration_min"
+    const val DEFAULT_MANUAL_ACTIVATE_DURATION_MIN: Int = 30
+    const val MIN_MANUAL_ACTIVATE_DURATION_MIN: Int = 5
+    const val MAX_MANUAL_ACTIVATE_DURATION_MIN: Int = 180
+    /**
+     * 手动切号方案：
+     * - backup（默认）：备份当前号 → 清理 → 还原/登录
+     * - login：不备份不还原，清理后直接登录目标号
+     */
+    private const val KEY_MANUAL_CUT_SWITCH_SCHEME = "manual_cut_switch_scheme"
+    const val CUT_SWITCH_SCHEME_BACKUP: String = "backup"
+    const val CUT_SWITCH_SCHEME_LOGIN: String = "login"
+    /** 批量发作品：每号发完后 For You/涨粉随机活跃时长（分钟）。 */
+    private const val KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN = "manual_batch_publish_after_min"
+    const val DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 10
+    const val MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 1
+    const val MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 180
+    /** 各账号累计活跃时长（分钟），JSON 对象 username→minutes。 */
+    private const val KEY_MANUAL_ACTIVATE_TOTAL_MINUTES = "manual_activate_total_minutes_json"
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
     /**
@@ -1151,7 +1173,7 @@ object PrefsStore {
         prefs.getString(KEY_LAST_PROCESS_CRASH_LINE, null)?.trim()?.takeIf { it.isNotEmpty() }
 
     fun isAutoGrowthAfterTasksEnabled(): Boolean =
-        prefs.getBoolean(KEY_AUTO_GROWTH_AFTER_TASKS, false)
+        prefs.getBoolean(KEY_AUTO_GROWTH_AFTER_TASKS, true)
 
     fun setAutoGrowthAfterTasksEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_GROWTH_AFTER_TASKS, enabled).apply()
@@ -1199,6 +1221,185 @@ object PrefsStore {
                 sec.coerceIn(MIN_MANUAL_FOR_YOU_SWIPE_SEC, MAX_MANUAL_FOR_YOU_SWIPE_SEC),
             )
             .apply()
+    }
+
+    fun getManualActivateDurationMin(): Int =
+        prefs.getInt(KEY_MANUAL_ACTIVATE_DURATION_MIN, DEFAULT_MANUAL_ACTIVATE_DURATION_MIN)
+            .coerceIn(MIN_MANUAL_ACTIVATE_DURATION_MIN, MAX_MANUAL_ACTIVATE_DURATION_MIN)
+
+    fun setManualActivateDurationMin(minutes: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_MANUAL_ACTIVATE_DURATION_MIN,
+                minutes.coerceIn(MIN_MANUAL_ACTIVATE_DURATION_MIN, MAX_MANUAL_ACTIVATE_DURATION_MIN),
+            )
+            .apply()
+    }
+
+    fun getManualCutSwitchScheme(): String {
+        val raw = prefs.getString(KEY_MANUAL_CUT_SWITCH_SCHEME, CUT_SWITCH_SCHEME_BACKUP)
+            ?.trim()?.lowercase(Locale.US).orEmpty()
+        return when (raw) {
+            CUT_SWITCH_SCHEME_LOGIN, "login_switch", "exclusive_login" -> CUT_SWITCH_SCHEME_LOGIN
+            else -> CUT_SWITCH_SCHEME_BACKUP
+        }
+    }
+
+    fun setManualCutSwitchScheme(scheme: String) {
+        val normalized = when (scheme.trim().lowercase(Locale.US)) {
+            CUT_SWITCH_SCHEME_LOGIN, "login_switch", "exclusive_login" -> CUT_SWITCH_SCHEME_LOGIN
+            else -> CUT_SWITCH_SCHEME_BACKUP
+        }
+        prefs.edit().putString(KEY_MANUAL_CUT_SWITCH_SCHEME, normalized).apply()
+    }
+
+    fun prefersManualLoginCutSwitch(): Boolean =
+        getManualCutSwitchScheme() == CUT_SWITCH_SCHEME_LOGIN
+
+    fun getManualBatchPublishAfterMin(): Int =
+        prefs.getInt(KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN, DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN)
+            .coerceIn(MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN, MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN)
+
+    fun setManualBatchPublishAfterMin(minutes: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+                minutes.coerceIn(MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN, MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN),
+            )
+            .apply()
+    }
+
+    /** 各账号累计活跃分钟（不含 @）。 */
+    fun getActivateTotalMinutesMap(): Map<String, Int> {
+        val raw = prefs.getString(KEY_MANUAL_ACTIVATE_TOTAL_MINUTES, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next().trim().removePrefix("@")
+                    if (k.isEmpty()) continue
+                    val v = obj.optInt(k, 0).coerceAtLeast(0)
+                    if (v > 0) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveActivateTotalMinutesMap(map: Map<String, Int>) {
+        val normalized = map.mapKeys { it.key.trim().removePrefix("@") }
+            .filterKeys { it.isNotEmpty() }
+            .mapValues { it.value.coerceAtLeast(0) }
+            .filterValues { it > 0 }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_MANUAL_ACTIVATE_TOTAL_MINUTES).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        normalized.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString(KEY_MANUAL_ACTIVATE_TOTAL_MINUTES, obj.toString()).apply()
+    }
+
+    fun getActivateTotalMinutes(username: String): Int {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return 0
+        return getActivateTotalMinutesMap().entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }
+            ?.value ?: 0
+    }
+
+    fun addActivateTotalMinutes(username: String, addMinutes: Int) {
+        val u = username.trim().removePrefix("@")
+        val add = addMinutes.coerceAtLeast(0)
+        if (u.isEmpty() || add <= 0) return
+        val cur = getActivateTotalMinutesMap().toMutableMap()
+        val key = cur.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        cur[key] = (cur[key] ?: 0) + add
+        saveActivateTotalMinutesMap(cur)
+    }
+
+    fun setActivateTotalMinutes(username: String, minutes: Int) {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return
+        val cur = getActivateTotalMinutesMap().toMutableMap()
+        val key = cur.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        if (minutes <= 0) {
+            cur.remove(key)
+        } else {
+            cur[key] = minutes
+        }
+        saveActivateTotalMinutesMap(cur)
+    }
+
+    fun clearActivateTotalMinutes() {
+        prefs.edit().remove(KEY_MANUAL_ACTIVATE_TOTAL_MINUTES).apply()
+    }
+
+    /** 待活跃队列（FIFO，username 不含 @）。 */
+    fun getPendingActivateUsernames(): List<String> {
+        val raw = prefs.getString(KEY_MANUAL_PENDING_ACTIVATE_QUEUE, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyList()
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val u = arr.optString(i, "").trim().removePrefix("@")
+                    if (u.isNotEmpty()) add(u)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun savePendingActivateUsernames(list: List<String>) {
+        val normalized = list.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.US) }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_MANUAL_PENDING_ACTIVATE_QUEUE).apply()
+            return
+        }
+        val arr = org.json.JSONArray()
+        normalized.forEach { arr.put(it) }
+        prefs.edit().putString(KEY_MANUAL_PENDING_ACTIVATE_QUEUE, arr.toString()).apply()
+    }
+
+    /** @return true 表示新加入；false 表示已在队列中或 username 无效。 */
+    fun enqueuePendingActivateUsername(username: String): Boolean {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return false
+        val cur = getPendingActivateUsernames().toMutableList()
+        if (cur.any { it.equals(u, ignoreCase = true) }) return false
+        cur.add(u)
+        savePendingActivateUsernames(cur)
+        return true
+    }
+
+    fun popPendingActivateUsername(): String? {
+        val cur = getPendingActivateUsernames().toMutableList()
+        if (cur.isEmpty()) return null
+        val first = cur.removeAt(0)
+        savePendingActivateUsernames(cur)
+        return first
+    }
+
+    /** 切号/活跃失败时放回队首，避免丢号。 */
+    fun requeuePendingActivateUsernameFront(username: String) {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return
+        val cur = getPendingActivateUsernames().toMutableList()
+            .filterNot { it.equals(u, ignoreCase = true) }
+            .toMutableList()
+        cur.add(0, u)
+        savePendingActivateUsernames(cur)
+    }
+
+    fun clearPendingActivateUsernames() {
+        prefs.edit().remove(KEY_MANUAL_PENDING_ACTIVATE_QUEUE).apply()
+    }
+
+    /** 整体替换待活跃队列（用于按活跃时长编辑）。 */
+    fun setPendingActivateUsernames(usernames: List<String>) {
+        savePendingActivateUsernames(usernames)
     }
 
     fun getManualPublishCount(): Int =

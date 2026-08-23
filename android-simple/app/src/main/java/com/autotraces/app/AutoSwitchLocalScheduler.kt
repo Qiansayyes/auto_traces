@@ -541,8 +541,35 @@ class AutoSwitchLocalScheduler(
     }
 
     private fun refreshBundleFromPlan(cloud: AutoSwitchBundle) {
+        val wasLogin = bundle?.prefersLoginCutSwitch() == true
         bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(cloud.withCurrentTimeSlotHighlight())
         syncBundleHolder()
+        // 切到登录切号后，必须丢掉已入队的还原 OP，否则会仍按备份方案还原
+        if (bundle?.prefersLoginCutSwitch() == true) {
+            purgePendingRestoreOpsForLoginScheme(reason = if (wasLogin) "登录切号刷新" else "切号方案改为登录切号")
+        }
+    }
+
+    /** 登录切号生效时取消队列中尚未执行的 tiktok_restore。 */
+    private fun purgePendingRestoreOpsForLoginScheme(reason: String) {
+        val removed = mutableListOf<String>()
+        val kept = opQueue.filterNot { op ->
+            val isAutoRestore = op.op_type == "tiktok_restore" &&
+                (op.payload?.source?.trim().orEmpty() == "auto_switch" ||
+                    !op.payload?.auto_switch_slot_key.isNullOrBlank())
+            if (isAutoRestore) {
+                removed.add(op.op_id)
+                true
+            } else {
+                false
+            }
+        }
+        if (removed.isEmpty()) return
+        opQueue.clear()
+        opQueue.addAll(kept)
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】$reason：已取消 ${removed.size} 个待执行还原任务")
+        }
     }
 
     private fun currentSlotEntry(plan: AutoSwitchLocalPlan): SlotPlanEntry? {
@@ -871,6 +898,9 @@ class AutoSwitchLocalScheduler(
                 logCutSwitchSkip("切号进行中 slot=$slotKey step=RESTORE_OR_LOGIN（plan 续跑还原/自动登录）")
                 return
             }
+            if (bundle.prefersLoginCutSwitch()) {
+                cancelDuplicatePendingCutSwitchOps(slotKey, restoreOnly = true)
+            }
             val sourceRow = resolveSourceAccount(accounts, entry, previousSlotKey)
             val enqueued = enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
             if (enqueued) {
@@ -896,7 +926,24 @@ class AutoSwitchLocalScheduler(
 
         val enqueued = when (nextStep) {
             CutSwitchStepKind.BACKUP -> {
-                if (sourceRow == null) {
+                if (bundle.prefersLoginCutSwitch()) {
+                    // 登录切号：跳过备份与还原，清理后 exclusive 自动登录目标号
+                    cancelDuplicatePendingCutSwitchOps(slotKey, restoreOnly = true)
+                    AutoSwitchLocalPlanStore.setCutSwitchMode(
+                        slotKey,
+                        "bootstrap",
+                        sourceRow?.row_index,
+                        sourceRow?.username?.trim(),
+                    )
+                    if (alias.isNotBlank()) {
+                        LogCenter.op(
+                            alias,
+                            "【自动切号】切号方案=登录切号：跳过备份/还原，清理后直接登录 " +
+                                "→ @${entry.target_username.trim()}",
+                        )
+                    }
+                    enqueueBootstrapCutSwitch(bundle, targetRow, slotKey)
+                } else if (sourceRow == null) {
                     val reason = AutoSwitchLocalPlanStore.describeCutSwitchSourceResolutionFailure(
                         slotKey,
                         previousSlotKey,
@@ -925,13 +972,20 @@ class AutoSwitchLocalScheduler(
                 }
             }
             CutSwitchStepKind.CLEAR -> {
-                if (planSlot.cut_switch.mode == "bootstrap") {
+                if (bundle.prefersLoginCutSwitch()) {
+                    // 方案中途改为登录切号：清理前先丢掉已排队还原
+                    cancelDuplicatePendingCutSwitchOps(slotKey, restoreOnly = true)
+                }
+                if (planSlot.cut_switch.mode == "bootstrap" || bundle.prefersLoginCutSwitch()) {
                     enqueueBootstrapClearOnly(bundle, targetRow, slotKey)
                 } else {
                     enqueueSwitchClearOnly(bundle, targetRow, slotKey)
                 }
             }
             CutSwitchStepKind.RESTORE_OR_LOGIN -> {
+                if (bundle.prefersLoginCutSwitch()) {
+                    cancelDuplicatePendingCutSwitchOps(slotKey, restoreOnly = true)
+                }
                 enqueueRestoreOnly(bundle, targetRow, slotKey, sourceRow?.row_index)
             }
         }
@@ -1461,11 +1515,15 @@ class AutoSwitchLocalScheduler(
                 cloudRaw.isEmpty() || cloudRaw == "-" -> "-"
                 else -> File(cloudRaw).name
             }
-            logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, cloudBackupLabel)
+            if (bundle?.prefersLoginCutSwitch() == true) {
+                LogCenter.op(alias, "【自动切号】登录切号续跑：@$targetUser 清理后自动登录（忽略备份）")
+            } else {
+                logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, cloudBackupLabel)
+                LogCenter.op(alias, "【自动切号】断点续跑：@$targetUser 无本地备份，入队自动登录")
+            }
             enqueueExclusiveOp(
                 buildClearOp(aliasClean, pkg(bundle), targetRi, targetUser, slotKey, "exclusive_activate_target"),
             )
-            LogCenter.op(alias, "【自动切号】断点续跑：@$targetUser 无本地备份，入队自动登录")
             return true
         }
         val (backupName, backupPath) = resolved
@@ -1502,7 +1560,12 @@ class AutoSwitchLocalScheduler(
         val aliasClean = aliasClean(bundle)
         val pkgName = pkg(bundle)
         val resolved = resolveTargetRestoreBackup(targetRow, targetUser, aliasClean)
-        if (targetRow.backup_name?.trim()?.isNotEmpty() == true && targetRow.backup_name != "-" && resolved == null) {
+        if (
+            bundle?.prefersLoginCutSwitch() != true &&
+            targetRow.backup_name?.trim()?.isNotEmpty() == true &&
+            targetRow.backup_name != "-" &&
+            resolved == null
+        ) {
             logCutSwitchMissingBackupUseAutoLogin(slotKey, targetUser, File(targetRow.backup_name!!).name)
         }
         val canRestore = resolved != null
@@ -1619,6 +1682,8 @@ class AutoSwitchLocalScheduler(
         targetUser: String,
         aliasClean: String,
     ): Pair<String, String>? {
+        // 登录切号：强制不还原备份，一律走清理后自动登录
+        if (bundle?.prefersLoginCutSwitch() == true) return null
         val cloudRaw = targetRow.backup_name?.trim().orEmpty()
         if (cloudRaw.isEmpty() || cloudRaw == "-") return null
         val backupName = File(cloudRaw).name
