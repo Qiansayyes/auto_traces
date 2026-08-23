@@ -2006,24 +2006,20 @@ object AppCoordinator {
         fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
 
         if (useForYou) {
+            forYouSwipeJob = currentCoroutineContext()[Job]
             ExecutionScope.enter()
-            val swipeJob = launch {
+            try {
                 try {
                     executor.runForYouSwipe(durationSec, _config.value)
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
                     LogCenter.op(alias, "$logTag For You 异常：${t.message}")
                 }
-            }
-            forYouSwipeJob = swipeJob
-            try {
-                swipeJob.join()
                 currentCoroutineContext().ensureActive()
-                if (swipeJob.isCancelled) {
-                    error("$logTag For You 被中断")
-                }
             } finally {
-                if (forYouSwipeJob === swipeJob) forYouSwipeJob = null
+                if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                    forYouSwipeJob = null
+                }
                 ExecutionScope.exit()
             }
         } else {
