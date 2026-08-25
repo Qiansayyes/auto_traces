@@ -47,11 +47,16 @@ object PrefsStore {
     const val MAX_MANUAL_FOR_YOU_SWIPE_SEC: Int = 3600
     /** 手动模式：待活跃队列（有序 JSON 数组）。 */
     private const val KEY_MANUAL_PENDING_ACTIVATE_QUEUE = "manual_pending_activate_queue_json"
-    /** 手动模式：活跃下个账号时长（分钟）；For You / 涨粉随机二选一共用。 */
+    /** 手动模式：活跃时长（内部存分钟；界面以小时展示）。 */
     private const val KEY_MANUAL_ACTIVATE_DURATION_MIN = "manual_activate_duration_min"
     const val DEFAULT_MANUAL_ACTIVATE_DURATION_MIN: Int = 30
-    const val MIN_MANUAL_ACTIVATE_DURATION_MIN: Int = 5
-    const val MAX_MANUAL_ACTIVATE_DURATION_MIN: Int = 180
+    /** 0.5 小时 */
+    const val MIN_MANUAL_ACTIVATE_DURATION_MIN: Int = 30
+    /** 24 小时 */
+    const val MAX_MANUAL_ACTIVATE_DURATION_MIN: Int = 1440
+    const val MIN_MANUAL_ACTIVATE_DURATION_HOURS: Double = 0.5
+    const val MAX_MANUAL_ACTIVATE_DURATION_HOURS: Double = 24.0
+    const val DEFAULT_MANUAL_ACTIVATE_DURATION_HOURS: Double = 0.5
     /**
      * 手动切号方案：
      * - backup（默认）：备份当前号 → 清理 → 还原/登录
@@ -73,6 +78,18 @@ object PrefsStore {
     private const val KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES = "manual_activate_for_you_minutes_json"
     /** 各账号最近一次加入待活跃队列时间（epoch ms）。 */
     private const val KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT = "manual_pending_activate_enqueue_at_json"
+    /** 待活跃未完成会话：username → 剩余秒数（中断后续跑，不切号）。 */
+    private const val KEY_MANUAL_ACTIVATE_SESSION_REMAINING = "manual_activate_session_remaining_json"
+    /** 与剩余秒数配套的 plannedMin；改「活跃时长」后不再沿用旧续跑。 */
+    private const val KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN = "manual_activate_session_planned_min_json"
+    /** 三天总赞增长 ≤ 该阈值则推荐入待活跃队列。 */
+    private const val KEY_PENDING_ACTIVATE_HEART_GROWTH_MAX = "pending_activate_heart_growth_max"
+    const val DEFAULT_PENDING_ACTIVATE_HEART_GROWTH_MAX: Int = 10
+    const val MIN_PENDING_ACTIVATE_HEART_GROWTH_MAX: Int = 0
+    const val MAX_PENDING_ACTIVATE_HEART_GROWTH_MAX: Int = 1_000_000
+    /** 推荐计算结果缓存（8 小时内复用）。 */
+    private const val KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON = "pending_activate_recommend_cache_json"
+    const val PENDING_ACTIVATE_RECOMMEND_CACHE_TTL_MS: Long = 8L * 60L * 60L * 1000L
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
     /**
@@ -1242,6 +1259,42 @@ object PrefsStore {
             .apply()
     }
 
+    fun getManualActivateDurationHours(): Double =
+        getManualActivateDurationMin() / 60.0
+
+    fun setManualActivateDurationHours(hours: Double) {
+        val min = kotlin.math.round(
+            hours.coerceIn(MIN_MANUAL_ACTIVATE_DURATION_HOURS, MAX_MANUAL_ACTIVATE_DURATION_HOURS) * 60.0,
+        ).toInt()
+        setManualActivateDurationMin(min)
+    }
+
+    /**
+     * 解析界面输入。正常按小时；若数字明显大于 24（例如旧习惯填 480 分钟），按分钟换算。
+     */
+    fun parseManualActivateDurationHours(raw: String?): Double {
+        val parsed = raw?.trim()?.replace(',', '.')?.toDoubleOrNull()
+            ?: return getManualActivateDurationHours()
+        val hours = if (parsed > MAX_MANUAL_ACTIVATE_DURATION_HOURS) {
+            parsed / 60.0
+        } else {
+            parsed
+        }
+        return hours.coerceIn(MIN_MANUAL_ACTIVATE_DURATION_HOURS, MAX_MANUAL_ACTIVATE_DURATION_HOURS)
+    }
+
+    fun formatManualActivateDurationHours(hours: Double): String {
+        val normalized = hours.coerceIn(MIN_MANUAL_ACTIVATE_DURATION_HOURS, MAX_MANUAL_ACTIVATE_DURATION_HOURS)
+        val rounded = kotlin.math.round(normalized * 100.0) / 100.0
+        return if (kotlin.math.abs(rounded - rounded.toLong()) < 0.001) {
+            rounded.toLong().toString()
+        } else {
+            String.format(java.util.Locale.US, "%.2f", rounded)
+                .trimEnd('0')
+                .trimEnd('.')
+        }
+    }
+
     fun getManualCutSwitchScheme(): String {
         val raw = prefs.getString(KEY_MANUAL_CUT_SWITCH_SCHEME, CUT_SWITCH_SCHEME_BACKUP)
             ?.trim()?.lowercase(Locale.US).orEmpty()
@@ -1469,6 +1522,55 @@ object PrefsStore {
         }.getOrDefault(emptyList())
     }
 
+    /** 是否在待活跃队列中。 */
+    fun isInPendingActivateQueue(username: String): Boolean =
+        pendingActivateQueueIndex(username) != null
+
+    /**
+     * 待活跃队列中的位置（1-based）；不在队列则 null。
+     */
+    fun pendingActivateQueueIndex(username: String): Int? {
+        val key = username.trim().removePrefix("@")
+        if (key.isEmpty()) return null
+        val idx = getPendingActivateUsernames().indexOfFirst { it.equals(key, ignoreCase = true) }
+        return if (idx >= 0) idx + 1 else null
+    }
+
+    /** 1-based 队列位；不在队列则 null。 */
+    fun pendingActivateQueuePosition(username: String): Int? {
+        val key = username.trim().removePrefix("@")
+        if (key.isEmpty()) return null
+        val idx = getPendingActivateUsernames().indexOfFirst { it.equals(key, ignoreCase = true) }
+        return if (idx >= 0) idx + 1 else null
+    }
+
+    fun getPendingActivateHeartGrowthMax(): Int =
+        prefs.getInt(KEY_PENDING_ACTIVATE_HEART_GROWTH_MAX, DEFAULT_PENDING_ACTIVATE_HEART_GROWTH_MAX)
+            .coerceIn(MIN_PENDING_ACTIVATE_HEART_GROWTH_MAX, MAX_PENDING_ACTIVATE_HEART_GROWTH_MAX)
+
+    fun setPendingActivateHeartGrowthMax(value: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_PENDING_ACTIVATE_HEART_GROWTH_MAX,
+                value.coerceIn(MIN_PENDING_ACTIVATE_HEART_GROWTH_MAX, MAX_PENDING_ACTIVATE_HEART_GROWTH_MAX),
+            )
+            .apply()
+    }
+
+    fun getPendingActivateRecommendCacheJson(): String? =
+        prefs.getString(KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON, null)?.trim()?.takeIf { it.isNotEmpty() }
+
+    fun setPendingActivateRecommendCacheJson(json: String?) {
+        val text = json?.trim().orEmpty()
+        prefs.edit().apply {
+            if (text.isEmpty()) {
+                remove(KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON)
+            } else {
+                putString(KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON, text)
+            }
+        }.apply()
+    }
+
     private fun savePendingActivateUsernames(list: List<String>) {
         val normalized = list.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
             .distinctBy { it.lowercase(Locale.US) }
@@ -1501,6 +1603,138 @@ object PrefsStore {
         return first
     }
 
+    /** 队首账号（不移除），供活跃下个 / 自动活跃轮询。 */
+    fun peekPendingActivateUsername(): String? = getPendingActivateUsernames().firstOrNull()
+
+    /** 队首活跃完成后移到队尾，队列成员不变、顺序轮转。 */
+    fun rotatePendingActivateQueueFrontToBack() {
+        val cur = getPendingActivateUsernames().toMutableList()
+        if (cur.size <= 1) return
+        val first = cur.removeAt(0)
+        cur.add(first)
+        savePendingActivateUsernames(cur)
+    }
+
+    fun getActivateSessionRemainingSec(username: String, plannedMin: Int? = null): Int? {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return null
+        val map = getActivateSessionRemainingMap()
+        val remaining = map.entries.firstOrNull { it.key.equals(u, ignoreCase = true) }?.value?.takeIf { it > 0 }
+            ?: return null
+        if (plannedMin == null) return remaining
+        val storedMin = getActivateSessionPlannedMinMap().entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }?.value
+        if (storedMin != null && storedMin != plannedMin) {
+            clearActivateSession(u)
+            return null
+        }
+        return remaining
+    }
+
+    fun getActivateSessionPlannedMin(username: String): Int? {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return null
+        return getActivateSessionPlannedMinMap().entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }?.value
+    }
+
+    fun setActivateSessionRemaining(username: String, remainingSec: Int, plannedMin: Int) {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return
+        val sec = remainingSec.coerceAtLeast(0)
+        val min = plannedMin.coerceIn(MIN_MANUAL_ACTIVATE_DURATION_MIN, MAX_MANUAL_ACTIVATE_DURATION_MIN)
+        val curSec = getActivateSessionRemainingMap().toMutableMap()
+        val curMin = getActivateSessionPlannedMinMap().toMutableMap()
+        val key = curSec.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        if (sec <= 0) {
+            curSec.remove(key)
+            curMin.remove(key)
+        } else {
+            curSec[key] = sec
+            curMin[key] = min
+        }
+        saveActivateSessionRemainingMap(curSec)
+        saveActivateSessionPlannedMinMap(curMin)
+    }
+
+    @Deprecated("Use setActivateSessionRemaining(username, sec, plannedMin)")
+    fun setActivateSessionRemainingLegacy(username: String, remainingSec: Int) {
+        setActivateSessionRemaining(username, remainingSec, getManualActivateDurationMin())
+    }
+
+    fun clearActivateSession(username: String? = null) {
+        if (username.isNullOrBlank()) {
+            prefs.edit()
+                .remove(KEY_MANUAL_ACTIVATE_SESSION_REMAINING)
+                .remove(KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN)
+                .apply()
+            return
+        }
+        setActivateSessionRemaining(username, 0, getManualActivateDurationMin())
+    }
+
+    private fun getActivateSessionPlannedMinMap(): Map<String, Int> {
+        val raw = prefs.getString(KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next().trim().removePrefix("@")
+                    if (k.isEmpty()) continue
+                    val v = obj.optInt(k, 0).coerceAtLeast(0)
+                    if (v > 0) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveActivateSessionPlannedMinMap(map: Map<String, Int>) {
+        val normalized = map.mapKeys { it.key.trim().removePrefix("@") }
+            .filterKeys { it.isNotEmpty() }
+            .mapValues { it.value.coerceAtLeast(0) }
+            .filterValues { it > 0 }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        normalized.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString(KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN, obj.toString()).apply()
+    }
+
+    private fun getActivateSessionRemainingMap(): Map<String, Int> {
+        val raw = prefs.getString(KEY_MANUAL_ACTIVATE_SESSION_REMAINING, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next().trim().removePrefix("@")
+                    if (k.isEmpty()) continue
+                    val v = obj.optInt(k, 0).coerceAtLeast(0)
+                    if (v > 0) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveActivateSessionRemainingMap(map: Map<String, Int>) {
+        val normalized = map.mapKeys { it.key.trim().removePrefix("@") }
+            .filterKeys { it.isNotEmpty() }
+            .mapValues { it.value.coerceAtLeast(0) }
+            .filterValues { it > 0 }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_MANUAL_ACTIVATE_SESSION_REMAINING).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        normalized.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString(KEY_MANUAL_ACTIVATE_SESSION_REMAINING, obj.toString()).apply()
+    }
+
     /** 切号/活跃失败时放回队首，避免丢号。 */
     fun requeuePendingActivateUsernameFront(username: String) {
         val u = username.trim().removePrefix("@")
@@ -1514,6 +1748,18 @@ object PrefsStore {
 
     fun clearPendingActivateUsernames() {
         prefs.edit().remove(KEY_MANUAL_PENDING_ACTIVATE_QUEUE).apply()
+    }
+
+    /** 从待活跃队列移除指定账号（不影响其余顺序）。 */
+    fun removePendingActivateUsername(username: String): Boolean {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return false
+        val cur = getPendingActivateUsernames().toMutableList()
+        val idx = cur.indexOfFirst { it.equals(u, ignoreCase = true) }
+        if (idx < 0) return false
+        cur.removeAt(idx)
+        savePendingActivateUsernames(cur)
+        return true
     }
 
     /** 整体替换待活跃队列（用于按活跃时长编辑）。新入队账号会记录加入时间。 */

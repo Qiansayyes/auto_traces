@@ -44,33 +44,63 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <Spinner
-                android:id="@+id/pendingAccountSpinner"
+            <TextView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_weight="1" />
+                android:layout_weight="1"
+                android:text="全部账号"
+                android:textStyle="bold" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/pendingRefreshAccountsButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
                 android:text="刷新账号" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <com.google.android.material.textfield.TextInputLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="三天总赞增长≤X则推荐">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/pendingRecommendHeartGrowthMaxInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="number"
+                    android:maxLines="1" />
+            </com.google.android.material.textfield.TextInputLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/pendingEnqueueRecommendedButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="一键加入推荐" />
         </LinearLayout>
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="云端账号数据（优化参考）"
-            android:textStyle="bold" />
+            android:layout_marginTop="4dp"
+            android:text="列出本别名下全部账号；右侧显示是否在待活跃队列，可点「加入 / 退出」。三天总赞增长（前天+昨天+今天）不超过阈值的账号会标成推荐。"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="11sp" />
 
         <LinearLayout
             android:id="@+id/pendingAccountStatsList"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="8dp"
             android:orientation="vertical" />
 
         <TextView
@@ -87,21 +117,11 @@
             android:orientation="horizontal">
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/pendingEnqueueButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="加入待活跃" />
-
-            <com.google.android.material.button.MaterialButton
                 android:id="@+id/pendingClearQueueButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="0dp"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:text="清空待活跃" />
+                android:text="清空待活跃队列" />
         </LinearLayout>
 
         <LinearLayout
@@ -115,13 +135,13 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="活跃时长(分钟)">
+                android:hint="活跃时长(小时，如8=8小时)">
 
                 <com.google.android.material.textfield.TextInputEditText
                     android:id="@+id/pendingActivateDurationMinInput"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:inputType="number"
+                    android:inputType="numberDecimal"
                     android:maxLines="1" />
             </com.google.android.material.textfield.TextInputLayout>
 

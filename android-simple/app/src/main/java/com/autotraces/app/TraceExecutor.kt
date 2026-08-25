@@ -674,9 +674,17 @@ class RealTraceExecutor(
     private var accountStatusInlineOkTapCount: Int = 0
 
     /** 涨粉 / 互点 / 发作品：该深度 >0 时 OCR 须观察 Account status 弹窗；
-     * Log in / Sign up / 登录入口文案与 Add another account 在所有 OCR 步骤检测（auto_login 除外）。 */
+     * 互点/发作品另观察 Log in / Sign up / 登录入口；涨粉见 [growthNarrowLogoutWatchDepth]。
+     * Add another account 在所有 OCR 步骤检测（auto_login 除外）。 */
     @Volatile
     private var accountStatusOcrWatchDepth: Int = 0
+
+    /**
+     * 涨粉用户名执行中：掉登录只认 Account status 弹窗与 Add another account，
+     * 忽略他人主页/Feed 上的 Log in、Sign up、password 等宽口径文案。
+     */
+    @Volatile
+    private var growthNarrowLogoutWatchDepth: Int = 0
 
     /** [runLoginSafeguardMeasure] 执行期间：其内所有 OCR（含 auto_login_* 预处理）也探测掉登录信号。 */
     @Volatile
@@ -711,6 +719,21 @@ class RealTraceExecutor(
             return block()
         } finally {
             accountStatusOcrWatchDepth = (accountStatusOcrWatchDepth - 1).coerceAtLeast(0)
+        }
+    }
+
+    private fun isGrowthNarrowLogoutWatchActive(): Boolean = growthNarrowLogoutWatchDepth > 0
+
+    private suspend inline fun <T> withGrowthNarrowLogoutWatchIf(
+        enabled: Boolean,
+        block: suspend () -> T,
+    ): T {
+        if (!enabled) return block()
+        growthNarrowLogoutWatchDepth++
+        try {
+            return block()
+        } finally {
+            growthNarrowLogoutWatchDepth = (growthNarrowLogoutWatchDepth - 1).coerceAtLeast(0)
         }
     }
 
@@ -758,6 +781,8 @@ class RealTraceExecutor(
     private fun shouldObserveLoginSafeguardLogoutOnOcr(fileTag: String?): Boolean {
         // 已在自动登录：勿把同页 Log in/Sign up 再当成「掉登录需重登」。
         if (autoLoginChainInProgress) return false
+        // 涨粉执行中只盯 Account status / Add another account，避免他人主页误判掉登录。
+        if (isGrowthNarrowLogoutWatchActive()) return false
         if (!isLogoutProbeContextActive() && !loginSafeguardLogoutProbeActive) return false
         val tag = fileTag?.trim().orEmpty()
         if (tag.startsWith("profile_edit")) return false
@@ -780,9 +805,9 @@ class RealTraceExecutor(
     }
 
     /**
-     * 涨粉/互点/发作品 OCR：见 Log in / Sign up / 登录表单等（与 [safeguardVisionNeedsAutoLogin] 一致；
-     * 同屏 Sponsored/Replay/Shop 广告流时 Sign up/Log in 不视为掉登录），
-     * 中止当前步骤并由协调器从登录入口续接自动登录。
+     * 互点/发作品 OCR：见 Log in / Sign up / 登录表单等（与 [safeguardVisionNeedsAutoLogin] 一致；
+     * 同屏 Sponsored/Replay/Shop 广告流时 Sign up/Log in 不视为掉登录）。
+     * 涨粉执行中 [isGrowthNarrowLogoutWatchActive] 为真时不走本探测。
      */
     private suspend fun probeLoginEntryLogoutFromOcrVision(
         ctx: Context,
@@ -1337,13 +1362,24 @@ class RealTraceExecutor(
             invalidateForegroundProbeCache()
         }
 
+        // 点掉权限页后 TikTok 可能已在前台：即使本次是 force-stop 冷启，也勿再切回 AutoTraces，否则又把权限页/TT 盖掉。
+        val tiktokReadyAfterPerm =
+            !isSystemPermissionGrantDialogForeground() && isTikTokForeground()
         val hostWasForeground = isHostAppInForeground()
         val tiktokAlreadyForeground =
-            allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()
+            tiktokReadyAfterPerm ||
+                (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground())
         if (!hostWasForeground && !tiktokAlreadyForeground) {
-            devOp(alias, "$tag：当前不在本应用界面，先切回 AutoTraces 再拉起 TikTok")
-            bringHostAppToForeground(ctx)
-            delay(400)
+            if (isSystemPermissionGrantDialogForeground()) {
+                // 权限页仍盖住前台：切回本应用会把 Don't allow 藏掉，改再试点取消。
+                devOp(alias, "$tag：权限授权页仍在前台，不切回 AutoTraces，再试 Don't allow")
+                dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·拉起前再试")
+                invalidateForegroundProbeCache()
+            } else {
+                devOp(alias, "$tag：当前不在本应用界面，先切回 AutoTraces 再拉起 TikTok")
+                bringHostAppToForeground(ctx)
+                delay(400)
+            }
         }
 
         var didLaunchCommand = false
@@ -1453,13 +1489,10 @@ class RealTraceExecutor(
         alias: String,
         tag: String,
     ): Boolean {
-        // 暂时禁用：root 拉起 TikTok 后的权限弹窗 OCR 取消
-        return false
-        /*
         return tryDismissDontAllowOcr(
             ctx = ctx,
             alias = alias,
-            phaseLog = "拉起后 Don't allow OCR 取消",
+            phaseLog = "拉起后 Don't allow OCR",
             logSuffix = tag.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "launch" },
             maxPasses = TIKTOK_LAUNCH_DONT_ALLOW_OCR_MAX_PASSES,
             retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
@@ -1468,7 +1501,6 @@ class RealTraceExecutor(
             useSideEffectFreeOcr = true,
             findDismissHit = { findLaunchPermissionDismissHit(it) },
         )
-        */
     }
 
     override suspend fun launchTikTokWithForegroundVerification(
@@ -7251,22 +7283,26 @@ class RealTraceExecutor(
         alias: String,
         tag: String,
     ): Boolean {
-        // 暂时禁用：系统权限授权页在前台时 OCR 点 Don't allow 并恢复 TikTok
-        return false
-        /*
         if (!isSystemPermissionGrantDialogForeground()) return false
+        // 权限页在前台即可点 Don't allow，不必等 TikTok 焦点（permissioncontroller 盖住时 TikTok 常在后台）。
         devOp(alias, "$tag：检测到系统权限授权页在前台（TikTok 可能在后台），整屏 OCR 点 Don't allow")
         val logSuffix = tag.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "perm" }
-        tryDismissDontAllowOcr(
+        var dismissed = tryDismissDontAllowOcr(
             ctx = ctx,
             alias = alias,
-            phaseLog = "权限弹窗 OCR 取消",
+            phaseLog = "权限弹窗 OCR Don't allow",
             logSuffix = logSuffix,
             maxPasses = TIKTOK_LAUNCH_DONT_ALLOW_OCR_MAX_PASSES,
             retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
             useSideEffectFreeOcr = true,
             findDismissHit = { findLaunchPermissionDismissHit(it) },
         )
+        if (!dismissed && isSystemPermissionGrantDialogForeground()) {
+            dismissed = tapDontAllowViaUiAutomatorDump(alias, "$tag·uiautomator")
+        }
+        if (!dismissed && isSystemPermissionGrantDialogForeground()) {
+            dismissed = tapDontAllowFallbackByScreenRatio(ctx, alias, "$tag·坐标兜底")
+        }
         invalidateForegroundProbeCache()
         delay(400L)
         if (isTikTokForeground()) {
@@ -7274,6 +7310,30 @@ class RealTraceExecutor(
             dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
             invalidateForegroundProbeCache()
             return isTikTokForeground()
+        }
+        // 若权限页仍在：再补一轮（OCR 可能首轮弹窗动画未稳）
+        if (isSystemPermissionGrantDialogForeground()) {
+            devOp(alias, "$tag：点后权限页仍在，再试一轮 Don't allow")
+            val retryOk = tryDismissDontAllowOcr(
+                ctx = ctx,
+                alias = alias,
+                phaseLog = "权限弹窗 OCR Don't allow(再试)",
+                logSuffix = "${logSuffix}_retry",
+                maxPasses = 2,
+                retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
+                useSideEffectFreeOcr = true,
+                findDismissHit = { findLaunchPermissionDismissHit(it) },
+            ) || tapDontAllowViaUiAutomatorDump(alias, "$tag·uiautomator再试") ||
+                tapDontAllowFallbackByScreenRatio(ctx, alias, "$tag·坐标再试")
+            if (retryOk) {
+                devOp(alias, "$tag：再试 Don't allow 已点击")
+            }
+            invalidateForegroundProbeCache()
+            delay(400L)
+            if (isTikTokForeground()) {
+                devOp(alias, "$tag：再试后 TikTok 已回到前台")
+                return true
+            }
         }
         devOp(alias, "$tag：点 Don't allow 后 TikTok 仍非前台，尝试拉起并严格校验")
         if (!bringTikTokToForegroundAndConfirm(ctx, alias, tag)) {
@@ -7285,7 +7345,67 @@ class RealTraceExecutor(
         dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
         invalidateForegroundProbeCache()
         return isTikTokForeground()
-        */
+    }
+
+    /**
+     * 系统权限页：uiautomator dump 按文案定位 Don't allow / Deny / 不允许 并点击中心。
+     * 不依赖 TikTok 前台；OCR 未命中时的可靠兜底。
+     */
+    private suspend fun tapDontAllowViaUiAutomatorDump(alias: String, tag: String): Boolean {
+        val xml = runUiAutomatorDumpWindowXml(alias) ?: return false
+        val labels = listOf(
+            "Don't allow",
+            "Don’t allow",
+            "Dont allow",
+            "Deny",
+            "不允许",
+            "取消",
+        )
+        for (label in labels) {
+            val escaped = Regex.escape(label)
+            val re = Regex(
+                """text="$escaped"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"""" +
+                    """|bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*text="$escaped"""",
+            )
+            val m = re.find(xml) ?: continue
+            val g = m.groupValues
+            val (l, t, r, b) = if (g[1].isNotEmpty()) {
+                listOf(g[1].toInt(), g[2].toInt(), g[3].toInt(), g[4].toInt())
+            } else {
+                listOf(g[5].toInt(), g[6].toInt(), g[7].toInt(), g[8].toInt())
+            }
+            val x = ((l + r) / 2).coerceAtLeast(1)
+            val y = ((t + b) / 2).coerceAtLeast(1)
+            devOp(alias, "$tag：uiautomator 命中「$label」bounds=[$l,$t][$r,$b]，tap ($x,$y)")
+            if (runSuCommand("input tap $x $y")) {
+                delay(450L)
+                return true
+            }
+        }
+        devOp(alias, "$tag：uiautomator 未找到 Don't allow 文案")
+        return false
+    }
+
+    /**
+     * 权限页仍在且 OCR/uiautomator 均未点到时：按三按钮布局点最底部「Don't allow」大致位置。
+     * 仅在 [isSystemPermissionGrantDialogForeground] 为真时调用，避免误点 TikTok。
+     */
+    private suspend fun tapDontAllowFallbackByScreenRatio(
+        ctx: Context,
+        alias: String,
+        tag: String,
+    ): Boolean {
+        if (!isSystemPermissionGrantDialogForeground()) return false
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        // 定位权限三按钮：While using / Only this time / Don't allow，最底一项约在 0.70~0.76H
+        val x = (w * 0.50).toInt().coerceIn(1, w - 1)
+        val y = (h * 0.72).toInt().coerceIn(1, h - 1)
+        devOp(alias, "$tag：权限页仍在，按屏比点 Don't allow 区域 ($x,$y)")
+        if (!runSuCommand("input tap $x $y")) return false
+        delay(450L)
+        return true
     }
 
     private suspend fun ensureTikTokInForeground(
@@ -7696,6 +7816,7 @@ class RealTraceExecutor(
             // 互点执行期间保留 requested/pending，避免独占抢占标志误触发协作退出；收尾由 AppCoordinator 清理。
             return enterMutualClickMode(service, config, commentOnlyForMessage, followOnlyForMessage)
         }
+        return withGrowthNarrowLogoutWatchIf(runMode == ServerRunMode.GROWTH) {
         if ((runMode == ServerRunMode.GROWTH || runMode == ServerRunMode.MUTUAL) && restartFromMagnifierForGrowth) {
             devOp(alias, "涨粉：上一名 Users 恢复失败，本用户从放大镜重新搜索（未强关 TikTok，不复用 Users）")
             restartFromMagnifierForGrowth = false
@@ -7848,6 +7969,7 @@ class RealTraceExecutor(
             throw ex
         }
         return "已拉取用户名 $username，已完成：搜索 → 点头像 → 进粉丝列表并处理用户"
+        }
         }
     }
 
@@ -9790,7 +9912,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * For You 预滑：每段开始前整屏 OCR，探测 Account status / Log in / Sign up / Add another account 并走既有掉登录分支。
+     * For You 预滑：每段开始前整屏 OCR 探测掉登录。
+     * 涨粉仅 Account status / Add another account；互点/发作品另含 Log in / Sign up。
      * 长预滑（≥5 分钟）分 [FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES] 段；短预滑至少在开始前探测 1 次。
      */
     private suspend fun probeForYouWarmupLogoutSignalsAtPhaseStart(
@@ -9801,7 +9924,8 @@ class RealTraceExecutor(
     ) {
         devOp(
             alias,
-            "For You 预滑：第 $phase/$phaseTotal 时间段开始前掉登录检测（Account status / Log in / Sign up / Add another account）",
+            "For You 预滑：第 $phase/$phaseTotal 时间段开始前掉登录检测（Account status / Add another account" +
+                if (isGrowthNarrowLogoutWatchActive()) ")" else " / Log in / Sign up）",
         )
         val tag = "for_you_warmup_logout_probe_$phase"
         val (vision, err) = mlKitRecognizeFullScreen(ctx, tag)

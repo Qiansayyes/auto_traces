@@ -11072,6 +11072,16 @@ def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username:
     return dict(acct) if acct else None
 
 
+def _parse_growth_int(raw: Any) -> int:
+    text = str(raw or "").strip().replace(",", "")
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _account_bundle_fields_for_username(
     conn: sqlite3.Connection, owner_username: str, username: str
 ) -> dict[str, Any]:
@@ -11095,7 +11105,9 @@ def _account_bundle_fields_for_username(
         """
         SELECT row_index, username, password, email, email_password, api, is_login, login_time,
                basic_profile_modified, video_count, follower_count, follower_growth, heart_count,
-               follower_growth_today, heart_growth_today
+               follower_growth_today, heart_growth_today,
+               follower_growth_day_before, follower_growth_yesterday,
+               heart_growth_day_before, heart_growth_yesterday
         FROM account_editor_rows
         WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
         LIMIT 1
@@ -11113,6 +11125,9 @@ def _account_bundle_fields_for_username(
         mail_module_code_available = mail_module_can_fetch_code(owner, account_email)
     except ImportError:
         mail_module_code_available = False
+    hg_day_before = str(row.get("heart_growth_day_before") or "").strip()
+    hg_yesterday = str(row.get("heart_growth_yesterday") or "").strip()
+    hg_today = str(row.get("heart_growth_today") or "").strip()
     return {
         "account_row_index": int(row.get("row_index") or 0),
         "email": account_email,
@@ -11127,7 +11142,15 @@ def _account_bundle_fields_for_username(
         "follower_count": str(row.get("follower_count") or "").strip(),
         "follower_growth": str(row.get("follower_growth_today") or row.get("follower_growth") or "").strip(),
         "heart_count": str(row.get("heart_count") or "").strip(),
-        "heart_growth": str(row.get("heart_growth_today") or "").strip(),
+        "heart_growth_day_before": hg_day_before,
+        "heart_growth_yesterday": hg_yesterday,
+        "heart_growth_today": hg_today,
+        # 设备端「总赞增长」= 前天+昨天+今天
+        "heart_growth": str(
+            _parse_growth_int(hg_day_before)
+            + _parse_growth_int(hg_yesterday)
+            + _parse_growth_int(hg_today)
+        ),
     }
 
 
@@ -11291,6 +11314,9 @@ def _fetch_device_assigned_accounts_list(
                 "follower_growth": str(fields.get("follower_growth") or "").strip(),
                 "heart_count": str(fields.get("heart_count") or "").strip(),
                 "heart_growth": str(fields.get("heart_growth") or "").strip(),
+                "heart_growth_day_before": str(fields.get("heart_growth_day_before") or "").strip(),
+                "heart_growth_yesterday": str(fields.get("heart_growth_yesterday") or "").strip(),
+                "heart_growth_today": str(fields.get("heart_growth_today") or "").strip(),
             }
         )
     return items

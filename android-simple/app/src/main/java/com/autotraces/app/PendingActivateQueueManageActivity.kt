@@ -57,9 +57,9 @@ class PendingActivateQueueManageActivity : AppCompatActivity() {
             return
         }
         runCatching {
-            val resp = ApiService.getDeviceAssignedAccounts(deviceId, alias)
+            val resp = ApiService.getDeviceAssignedAccountsRoster(deviceId, alias)
             if (resp.code != 0) error(resp.msg.orEmpty())
-            accounts = resp.items.orEmpty()
+            accounts = resp.items.orEmpty().filter { it.username?.trim().orEmpty().isNotEmpty() }
         }.onSuccess {
             if (showToast) Toast.makeText(this, "已刷新 ${accounts.size} 个账号", Toast.LENGTH_SHORT).show()
             ensureAllAccountsInOrder()

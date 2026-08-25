@@ -152,6 +152,8 @@ object ManualDeviceControl {
         val basicProfileModified: String = "否",
         val mailModuleCodeAvailable: Boolean = false,
         val switchHighlight: String = "否",
+        /** 云端勾了「不参加自动切号」；切号下拉/待活跃仍可见，本机自动切号计划会跳过。 */
+        val autoSwitchExcluded: Boolean = false,
     )
 
     data class SwitchAccountStatus(
@@ -186,9 +188,8 @@ object ManualDeviceControl {
             basicProfileModified = item.basic_profile_modified?.trim().orEmpty().ifBlank { "否" },
             mailModuleCodeAvailable = item.mail_module_code_available == true,
             switchHighlight = item.switch_highlight?.trim().orEmpty().ifBlank { "否" },
+            autoSwitchExcluded = item.auto_switch_excluded == true,
         )
-        // 云端已标 banned 的账号不下发到本机计划 / 下拉列表
-        if (accountLooksBanned(opt)) return null
         return opt
     }
 
@@ -227,6 +228,7 @@ object ManualDeviceControl {
                     put("basicProfileModified", a.basicProfileModified)
                     put("mailModuleCodeAvailable", a.mailModuleCodeAvailable)
                     put("switchHighlight", a.switchHighlight)
+                    put("autoSwitchExcluded", a.autoSwitchExcluded)
                 },
             )
         }
@@ -258,6 +260,7 @@ object ManualDeviceControl {
                         basicProfileModified = o.optString("basicProfileModified").ifBlank { "否" },
                         mailModuleCodeAvailable = o.optBoolean("mailModuleCodeAvailable"),
                         switchHighlight = o.optString("switchHighlight").ifBlank { "否" },
+                        autoSwitchExcluded = o.optBoolean("autoSwitchExcluded"),
                     )
                     if (accountLooksBanned(opt)) continue
                     add(opt)

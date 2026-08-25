@@ -489,6 +489,22 @@
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualBatchPublishNonPendingButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="非待活跃批量发" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="非待活跃批量发：一点即自动拉取本机设备云端账号，对未在待活跃队列的全部账号发作品（跳过 banned）。条数/发后活跃同上。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualProfileEditButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"

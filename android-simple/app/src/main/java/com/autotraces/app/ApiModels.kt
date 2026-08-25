@@ -473,8 +473,11 @@ data class DeviceAssignedAccountItem(
     /** 今日粉丝增长（优先 follower_growth_today）。 */
     val follower_growth: String? = null,
     val heart_count: String? = null,
-    /** 今日总赞增长。 */
+    /** 三天总赞增长（前天+昨天+今天）。 */
     val heart_growth: String? = null,
+    val heart_growth_day_before: String? = null,
+    val heart_growth_yesterday: String? = null,
+    val heart_growth_today: String? = null,
 )
 
 /** GET /api/device/assigned_accounts */

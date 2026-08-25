@@ -845,10 +845,11 @@ class MainActivity : AppCompatActivity() {
                     val active = ManualDeviceControl.activeManualUsername()
                     val activeStillListed = active.isNotBlank() &&
                         list.any { it.username.equals(active, ignoreCase = true) }
+                    val pendingCount = PrefsStore.getPendingActivateUsernames().size
                     binding.manualTaskStatusText.text = when {
                         active.isNotBlank() && !activeStillListed ->
-                            "已拉取 ${list.size} 个账号；本机当前 @$active 已不参与，请切到其他账号"
-                        else -> "已拉取 ${list.size} 个账号"
+                            "已拉取 ${list.size} 个账号（待活跃 $pendingCount）；本机当前 @$active 已不在列表，请切到其他账号"
+                        else -> "已拉取 ${list.size} 个账号（其中待活跃队列 $pendingCount 个）"
                     }
                     refreshManualAutoSwitchStatus()
                     // 不要再调 refreshAssignedAccountFields：它会用云端「高亮」单账号覆盖下拉选中凭据
@@ -995,6 +996,62 @@ class MainActivity : AppCompatActivity() {
                 setManualTaskButtonsEnabled(true)
             }
         }
+        binding.manualBatchPublishNonPendingButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val countRaw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualPublishCount()
+            val count = countRaw.coerceIn(
+                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+            )
+            val afterRaw = binding.manualBatchPublishAfterMinInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getManualBatchPublishAfterMin()
+            val afterMin = afterRaw.coerceIn(
+                PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+                PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+            )
+            PrefsStore.setManualPublishCount(count)
+            PrefsStore.setManualBatchPublishAfterMin(afterMin)
+            binding.manualPublishCountInput.setText(count.toString())
+            binding.manualBatchPublishAfterMinInput.setText(afterMin.toString())
+            val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
+
+            lifecycleScope.launch {
+                binding.manualBatchPublishNonPendingButton.isEnabled = false
+                binding.manualTaskStatusText.text = "非待活跃批量发：正在拉取云端账号…"
+                val result = AppCoordinator.manualStartBatchPublishNonPendingActivate(
+                    publishCount = count,
+                    afterActiveMin = afterMin,
+                )
+                bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
+                result.onSuccess { started ->
+                    binding.manualTaskStatusText.text =
+                        "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发后${afterMin}分钟 · $scheme）"
+                    Toast.makeText(
+                        this@MainActivity,
+                        "已开始：${started} 个非待活跃账号",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }.onFailure { err ->
+                    binding.manualTaskStatusText.text =
+                        err.message?.takeIf { it.isNotBlank() } ?: "非待活跃批量发失败"
+                    Toast.makeText(
+                        this@MainActivity,
+                        err.message ?: "非待活跃批量发失败",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                setManualTaskButtonsEnabled(true)
+            }
+        }
 
         binding.manualProfileEditButton.setOnClickListener {
             if (!guardManualTaskReady("修改基本资料")) return@setOnClickListener
@@ -1101,6 +1158,7 @@ class MainActivity : AppCompatActivity() {
         binding.manualPublishButton.isEnabled = aligned
         binding.manualPublishCountInput.isEnabled = !blocked
         binding.manualBatchPublishButton.isEnabled = !blocked
+        binding.manualBatchPublishNonPendingButton.isEnabled = !blocked
         binding.manualBatchPublishAfterMinInput.isEnabled = !blocked
         binding.manualProfileEditButton.isEnabled = aligned
         // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
@@ -1181,7 +1239,7 @@ class MainActivity : AppCompatActivity() {
     private fun bindManualAccountSpinner(list: List<ManualDeviceControl.AccountOption>) {
         manualAccounts = list
         val active = ManualDeviceControl.activeManualUsername()
-        val labels = list.map { opt -> formatManualAccountSpinnerLabel(opt.username, active) }
+        val labels = list.map { opt -> formatManualAccountSpinnerLabel(opt, active) }
         suppressingManualSpinnerCallback = true
         binding.manualAccountSelect.adapter =
             ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
@@ -1199,21 +1257,36 @@ class MainActivity : AppCompatActivity() {
         refreshManualAccountStatus()
     }
 
-    /** 下拉项文案：只标注本机切号后的当前活跃账号，不展示云端高亮/is_login（易误导）。 */
-    private fun formatManualAccountSpinnerLabel(username: String, activeUsername: String = ManualDeviceControl.activeManualUsername()): String {
+    /**
+     * 下拉项文案：全量账号；标注本机当前 / 待活跃队列位置 / 不参加自动切号。
+     * 不展示云端高亮/is_login（易误导）。
+     */
+    private fun formatManualAccountSpinnerLabel(
+        opt: ManualDeviceControl.AccountOption,
+        activeUsername: String = ManualDeviceControl.activeManualUsername(),
+    ): String {
         return buildString {
-            append("@$username")
-            if (activeUsername.isNotBlank() && username.equals(activeUsername, ignoreCase = true)) {
+            append("@${opt.username}")
+            if (activeUsername.isNotBlank() && opt.username.equals(activeUsername, ignoreCase = true)) {
                 append(" ·本机当前")
+            }
+            PrefsStore.pendingActivateQueueIndex(opt.username)?.let { pos ->
+                append(" ·待活跃#$pos")
+            }
+            if (opt.autoSwitchExcluded) {
+                append(" ·不切号")
+            }
+            if (PendingActivateRecommend.isRecommended(opt.username)) {
+                append(" ·推荐")
             }
         }
     }
 
-    /** 切号完成后刷新「本机当前」标记，保持下拉选中位置不变。 */
+    /** 切号完成后刷新「本机当前 / 待活跃」标记，保持下拉选中位置不变。 */
     private fun refreshManualAccountSpinnerLabels() {
         if (manualAccounts.isEmpty()) return
         val active = ManualDeviceControl.activeManualUsername()
-        val labels = manualAccounts.map { formatManualAccountSpinnerLabel(it.username, active) }
+        val labels = manualAccounts.map { formatManualAccountSpinnerLabel(it, active) }
         val rawPos = binding.manualAccountSelect.selectedItemPosition
         val selectedPos = if (rawPos in manualAccounts.indices) rawPos else 0
         suppressingManualSpinnerCallback = true

@@ -1656,6 +1656,24 @@ object AppCoordinator {
                     }
                     return@launch
                 }
+                // 活跃下个 / 自动活跃 / 批量发后活跃：须保持 running，否则涨粉拉取循环空转。
+                if (isBatchAccountSessionBusy()) {
+                    PrefsStore.saveLocalStatus("running")
+                    updateRuntime(
+                        localStatus = "running",
+                        hardStopRequested = false,
+                        lastMessage = reason,
+                    )
+                    if (!WorkerServiceTracker.isRunning) {
+                        runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "force_start_running_now") }
+                    }
+                    startCheckLoop()
+                    ensureDeviceOpsLoopIfBound()
+                    if (!alias.isNullOrBlank()) {
+                        LogCenter.op(alias, "手动活跃会话中：保持 running（$reason）")
+                    }
+                    return@launch
+                }
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(
                     localStatus = "online",
@@ -1742,12 +1760,13 @@ object AppCoordinator {
         }
         return withContext(Dispatchers.IO) {
             runCatching {
-                val resp = ApiService.getDeviceAssignedAccounts(deviceId, alias)
+                val resp = ApiService.getDeviceAssignedAccountsRoster(deviceId, alias)
                 if (resp.code != 0) {
                     error(resp.msg?.trim().orEmpty().ifBlank { "拉取账号列表失败" })
                 }
                 val options = resp.items.orEmpty().mapNotNull { ManualDeviceControl.fromAssignedItem(it) }
-                if (options.isEmpty()) error("云端未返回可用账号（可能均已设为不参加自动切号）")
+                if (options.isEmpty()) error("云端未返回可用账号")
+                PendingActivateRecommend.ingestRoster(resp.items.orEmpty())
                 val oldUsers = ManualDeviceControl.getCachedAccounts()
                     .map { it.username.trim().removePrefix("@").lowercase() }
                     .filter { it.isNotEmpty() }
@@ -1786,9 +1805,10 @@ object AppCoordinator {
                         LogCenter.op(alias, "手动模式：账号列表已更新，但本机计划重建失败，请手动点「重建计划」")
                     }
                 }
+                val pendingCount = PrefsStore.getPendingActivateUsernames().size
                 LogCenter.op(
                     alias,
-                    "手动模式：已刷新云端账号 ${options.size} 个，当前选中 @${keep.username}" +
+                    "手动模式：已刷新云端账号 ${options.size} 个（待活跃队列 $pendingCount），当前选中 @${keep.username}" +
                         if (activeDropped) "（本机当前仍为 @$activeKey，待切号）" else "",
                 )
                 options
@@ -1894,11 +1914,48 @@ object AppCoordinator {
         return added
     }
 
+    fun manualRemovePendingActivate(username: String): Boolean {
+        if (!ManualDeviceControl.ENABLED) return false
+        val user = username.trim().removePrefix("@")
+        if (user.isBlank()) return false
+        val removed = PrefsStore.removePendingActivateUsername(user)
+        if (removed) {
+            LogCenter.op(
+                PrefsStore.getAlias()?.trim().orEmpty().ifBlank { null },
+                "待活跃：已移出 @$user（队列 ${PrefsStore.getPendingActivateUsernames().size}）",
+            )
+            notifyManualAccountUi()
+        } else {
+            LogCenter.op(PrefsStore.getAlias()?.trim().orEmpty().ifBlank { null }, "待活跃：@$user 不在队列中")
+        }
+        return removed
+    }
+
     fun manualClearPendingActivateQueue() {
         if (!ManualDeviceControl.ENABLED) return
         PrefsStore.clearPendingActivateUsernames()
         LogCenter.op(PrefsStore.getAlias(), "待活跃：已清空队列")
         notifyManualAccountUi()
+    }
+
+    /**
+     * 将「三天总赞增长 ≤ 阈值」的推荐账号一次性加入待活跃队列。
+     * @return 新加入数量。
+     */
+    fun manualEnqueueRecommendedPendingActivate(): Int {
+        if (!ManualDeviceControl.ENABLED) return 0
+        var added = 0
+        for (username in PendingActivateRecommend.recommendedUsernamesNotInQueue()) {
+            if (PrefsStore.enqueuePendingActivateUsername(username)) added++
+        }
+        if (added > 0) {
+            LogCenter.op(
+                PrefsStore.getAlias(),
+                "待活跃：一键加入推荐 $added 个（阈值=${PrefsStore.getPendingActivateHeartGrowthMax()}）",
+            )
+            notifyManualAccountUi()
+        }
+        return added
     }
 
     /** 按指定顺序整体替换待活跃队列（用于按活跃时长编辑）。 */
@@ -1985,73 +2042,206 @@ object AppCoordinator {
         }
     }
 
+    private fun isAccountInPendingActivateQueue(username: String): Boolean {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return false
+        return PrefsStore.getPendingActivateUsernames().any { it.equals(u, ignoreCase = true) }
+    }
+
+    /**
+     * 待活跃：本机已是目标且（在队列中或有未完成时长）则跳过切号，直接活跃/续跑。
+     */
+    private suspend fun switchToAccountForActivateIfNeeded(target: String, logTag: String): Boolean {
+        val active = ManualDeviceControl.activeManualUsername()
+        val aligned = active.isNotBlank() &&
+            active.equals(target, ignoreCase = true) &&
+            PrefsStore.isManualFirstLoginDone(target)
+        if (!aligned) {
+            return switchToAccountForBatchSession(target)
+        }
+        PrefsStore.setManualSelectedUsername(target)
+        PrefsStore.setLogContextUsername(target)
+        val remaining = PrefsStore.getActivateSessionRemainingSec(
+            target,
+            PrefsStore.getManualActivateDurationMin(),
+        ) ?: 0
+        val inQueue = isAccountInPendingActivateQueue(target)
+        val suffix = when {
+            remaining > 0 -> "，续跑剩余 ${formatActivateRemainingLabel(remaining)}"
+            inQueue -> "，队列内直接活跃"
+            else -> ""
+        }
+        LogCenter.op(PrefsStore.getAlias(), "$logTag：本机已是 @$target，跳过切号$suffix")
+        return true
+    }
+
+    /**
+     * 手动模式「活跃下个 / 自动活跃 / 批量发后活跃」内启动涨粉拉取。
+     * 必须同步写入 PrefsStore running；不可走 [forceStartRunningNow] 的手动 online 分支。
+     */
+    private suspend fun ensureManualActivateGrowthPullRunning(reason: String) {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        if (PrefsStore.isHardStopRequested()) {
+            PrefsStore.setHardStopRequested(false)
+        }
+        manuallyPaused = false
+        if (!started.get()) started.set(true)
+        growthModeLoginSafeguardPending = true
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(
+            localStatus = "running",
+            hardStopRequested = false,
+            lastMessage = reason,
+        )
+        if (!WorkerServiceTracker.isRunning) {
+            runCatching { WorkerServiceWatchdog.ensureWorkerService(appContext, "manual_activate_growth") }
+        }
+        startCheckLoop()
+        ensureDeviceOpsLoopIfBound()
+        startPullLoop()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "手动活跃涨粉：已启动拉取循环（$reason）")
+        }
+    }
+
+    /** 本机在队列中且仍有未完成活跃时长 → 优先续跑当前号。 */
+    private fun resolveActivateResumeTarget(queue: List<String>, plannedMin: Int): String? {
+        val active = ManualDeviceControl.activeManualUsername().trim().removePrefix("@")
+        if (active.isBlank()) return null
+        val remaining = PrefsStore.getActivateSessionRemainingSec(active, plannedMin) ?: 0
+        if (remaining <= 0) return null
+        if (!queue.any { it.equals(active, ignoreCase = true) }) return null
+        return active
+    }
+
+    private fun formatActivateDurationLabel(minutes: Int): String {
+        val hours = minutes / 60.0
+        return "${PrefsStore.formatManualActivateDurationHours(hours)}小时"
+    }
+
+    private fun formatActivateRemainingLabel(remainingSec: Int): String {
+        val min = (remainingSec + 59) / 60
+        return formatActivateDurationLabel(min)
+    }
+
+    private fun creditActivateMinutes(target: String, elapsedSec: Int, modeLabel: String) {
+        val credited = ((elapsedSec + 59) / 60).coerceAtLeast(0)
+        if (credited <= 0) return
+        PrefsStore.addActivateTotalMinutes(target, credited)
+        if (modeLabel.contains("For You")) {
+            PrefsStore.addActivateForYouMinutes(target, credited)
+        } else {
+            PrefsStore.addActivateGrowthMinutes(target, credited)
+        }
+    }
+
     /**
      * 随机 For You 预滑 / 涨粉一段时间；成功后累加账号活跃总时长。
+     * 中断时保存剩余秒数，下次同号在队列内可直接续跑而不切号。
+     * @return 是否完整跑完计划时长（true=可切下一号）。
      */
     private suspend fun runRandomActivatePhase(
         target: String,
         minutes: Int,
         logTag: String,
-    ): String {
+    ): Boolean {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
-        val durationSec = minutes * 60
+        val plannedSec = minutes * 60
+        val durationSec = PrefsStore.getActivateSessionRemainingSec(target, minutes)?.takeIf { it > 0 }
+            ?: plannedSec
+        val resuming = durationSec < plannedSec
         PrefsStore.setLogContextUsername(target)
         val useForYou = Random.nextBoolean()
         val modeLabel = if (useForYou) "For You 预滑" else "涨粉"
-        LogCenter.op(alias, "$logTag：@$target 随机 → $modeLabel（${minutes} 分钟）")
+        val durationLabel = formatActivateRemainingLabel(durationSec)
+        LogCenter.op(
+            alias,
+            "$logTag：@$target 随机 → $modeLabel（" +
+                (if (resuming) "续跑 $durationLabel" else durationLabel) +
+                "）",
+        )
+        PrefsStore.saveLocalStatus("running")
         updateRuntime(
             localStatus = "running",
-            lastMessage = "活跃中：@$target · $modeLabel · ${minutes}分钟",
+            lastMessage = "活跃中：@$target · $modeLabel · $durationLabel",
         )
         fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
 
-        if (useForYou) {
-            forYouSwipeJob = currentCoroutineContext()[Job]
-            ExecutionScope.enter()
-            try {
+        val startedAt = SystemClock.elapsedRealtime()
+        var interrupted = false
+        try {
+            if (useForYou) {
+                // 须在父 Job 内直接 suspend 调用；裸 launch {} 无 CoroutineScope 接收者，无法编译。
+                ExecutionScope.enter()
+                forYouSwipeJob = currentCoroutineContext()[Job]
                 try {
                     executor.runForYouSwipe(durationSec, _config.value)
+                    currentCoroutineContext().ensureActive()
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
                     LogCenter.op(alias, "$logTag For You 异常：${t.message}")
+                } finally {
+                    if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                        forYouSwipeJob = null
+                    }
+                    ExecutionScope.exit()
                 }
-                currentCoroutineContext().ensureActive()
-            } finally {
-                if (forYouSwipeJob === currentCoroutineContext()[Job]) {
-                    forYouSwipeJob = null
+            } else {
+                ensureManualActivateGrowthPullRunning(
+                    "活跃中：@$target · $modeLabel · $durationLabel",
+                )
+                if (pullLoopJob?.isActive != true) {
+                    error("$logTag 涨粉未能启动拉取循环")
                 }
-                ExecutionScope.exit()
+                val endAt = startedAt + durationSec * 1000L
+                while (SystemClock.elapsedRealtime() < endAt) {
+                    if (PrefsStore.isHardStopRequested()) {
+                        interrupted = true
+                        break
+                    }
+                    currentCoroutineContext().ensureActive()
+                    delay(5_000)
+                }
+                pullLoopJob?.cancel()
+                pullLoopJob = null
             }
-        } else {
-            growthModeLoginSafeguardPending = true
-            forceStartRunningNow("$logTag：涨粉 @$target")
-            startPullLoop()
-            if (pullLoopJob?.isActive != true) {
-                error("$logTag 涨粉未能启动拉取循环")
+            currentCoroutineContext().ensureActive()
+        } catch (t: Throwable) {
+            if (t is CancellationException) {
+                interrupted = true
+                throw t
             }
-            val endAt = SystemClock.elapsedRealtime() + durationSec * 1000L
-            while (SystemClock.elapsedRealtime() < endAt) {
-                if (PrefsStore.isHardStopRequested()) break
-                currentCoroutineContext().ensureActive()
-                delay(5_000)
-            }
-            pullLoopJob?.cancel()
-            pullLoopJob = null
+            throw t
         }
 
-        currentCoroutineContext().ensureActive()
-        PrefsStore.addActivateTotalMinutes(target, minutes)
-        if (useForYou) {
-            PrefsStore.addActivateForYouMinutes(target, minutes)
-        } else {
-            PrefsStore.addActivateGrowthMinutes(target, minutes)
-        }
+        val elapsedSec = ((SystemClock.elapsedRealtime() - startedAt) / 1000)
+            .toInt().coerceIn(0, durationSec)
+        val completedFully = !interrupted && elapsedSec >= durationSec - 2
+
+        creditActivateMinutes(target, elapsedSec, modeLabel)
         notifyManualAccountUi()
-        LogCenter.op(
-            alias,
-            "$logTag：@$target 完成（$modeLabel · ${minutes}分钟，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟，涨粉 ${PrefsStore.getActivateGrowthMinutes(target)} / ForYou ${PrefsStore.getActivateForYouMinutes(target)}）",
-        )
-        return modeLabel
+
+        if (completedFully) {
+            PrefsStore.clearActivateSession(target)
+            LogCenter.op(
+                alias,
+                "$logTag：@$target 完成（$modeLabel · $durationLabel，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟）",
+            )
+            return true
+        }
+
+        val remaining = (durationSec - elapsedSec).coerceAtLeast(0)
+        if (remaining > 0 && isAccountInPendingActivateQueue(target)) {
+            PrefsStore.setActivateSessionRemaining(target, remaining, minutes)
+            LogCenter.op(
+                alias,
+                "$logTag：@$target 未完成（剩余 ${formatActivateRemainingLabel(remaining)}，已跳过切号等待续跑）",
+            )
+        } else {
+            PrefsStore.clearActivateSession(target)
+        }
+        return false
     }
 
     /**
@@ -2110,8 +2300,8 @@ object AppCoordinator {
     }
 
     /**
-     * 活跃下个账号：从待活跃队列取出队首 → 自动切号 →
-     * 随机 For You 预滑 / 涨粉（时长可配，分钟）。
+     * 活跃下个账号：队首（或本机未完成续跑）→ 满时长活跃 → 完成后队首轮转。
+     * 本机已在队列中且活跃时长未满时不切号，直接续跑。
      */
     fun manualActivateNextAccount(durationMin: Int = PrefsStore.getManualActivateDurationMin()) {
         if (!ManualDeviceControl.ENABLED) return
@@ -2140,7 +2330,8 @@ object AppCoordinator {
             updateRuntime(lastMessage = "待活跃队列为空")
             return
         }
-        val target = PrefsStore.popPendingActivateUsername()
+        val target = resolveActivateResumeTarget(queued, minutes)
+            ?: PrefsStore.peekPendingActivateUsername()
         if (target.isNullOrBlank()) {
             LogCenter.op(alias, "活跃下个账号：队列为空")
             return
@@ -2151,7 +2342,6 @@ object AppCoordinator {
             var finishedOk = false
             try {
                 if (!prepareManualTaskTakeover(ManualTaskKind.ACTIVATE_NEXT, "活跃下个账号")) {
-                    PrefsStore.requeuePendingActivateUsernameFront(target)
                     notifyManualAccountUi()
                     return@launch
                 }
@@ -2162,39 +2352,42 @@ object AppCoordinator {
 
                 LogCenter.op(
                     alias,
-                    "活跃下个账号：开始 @$target（${minutes} 分钟，剩余队列 ${PrefsStore.getPendingActivateUsernames().size}，切号=${PrefsStore.getManualCutSwitchScheme()}）",
+                    "活跃下个账号：开始 @$target（${formatActivateDurationLabel(minutes)}，队列 ${queued.size} 个，切号=${PrefsStore.getManualCutSwitchScheme()}）",
                 )
                 updateRuntime(
                     localStatus = "running",
                     hardStopRequested = false,
-                    lastMessage = "活跃下个账号：切号 → @$target",
+                    lastMessage = "活跃下个账号：准备 @$target",
                 )
                 PrefsStore.saveLocalStatus("running")
 
                 activateNextOwnsSwitch = true
-                val switchedOk = try {
-                    switchToAccountForBatchSession(target)
-                } finally {
-                    // keep owns until phase ends
-                }
+                val switchedOk = switchToAccountForActivateIfNeeded(target, "活跃下个账号")
                 if (!switchedOk) {
-                    PrefsStore.requeuePendingActivateUsernameFront(target)
                     notifyManualAccountUi()
                     PrefsStore.saveLocalStatus("online")
                     updateRuntime(
                         localStatus = "online",
-                        lastMessage = "活跃下个账号：@$target 切号未就绪，已放回队首",
+                        lastMessage = "活跃下个账号：@$target 切号未就绪",
                     )
-                    LogCenter.op(alias, "活跃下个账号：@$target 切号未就绪，已放回队首")
+                    LogCenter.op(alias, "活跃下个账号：@$target 切号未就绪")
                     return@launch
                 }
 
-                val modeLabel = runRandomActivatePhase(target, minutes, "活跃下个账号")
-                finishedOk = true
+                val completed = runRandomActivatePhase(target, minutes, "活跃下个账号")
+                finishedOk = completed
+                if (completed && target.equals(PrefsStore.peekPendingActivateUsername(), ignoreCase = true)) {
+                    PrefsStore.rotatePendingActivateQueueFrontToBack()
+                    notifyManualAccountUi()
+                }
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(
                     localStatus = "online",
-                    lastMessage = "活跃完成：@$target · $modeLabel · ${minutes}分钟",
+                    lastMessage = if (completed) {
+                        "活跃完成：@$target · ${formatActivateDurationLabel(minutes)}"
+                    } else {
+                        "活跃未完成：@$target 已保存剩余时长，下轮续跑不切号"
+                    },
                 )
                 if (detectActiveManualTaskKind() == null ||
                     detectActiveManualTaskKind() == ManualTaskKind.ACTIVATE_NEXT
@@ -2203,17 +2396,10 @@ object AppCoordinator {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) {
-                    if (!finishedOk) {
-                        PrefsStore.requeuePendingActivateUsernameFront(target)
-                        notifyManualAccountUi()
-                        LogCenter.op(alias, "活跃下个账号：已取消 → @$target（已放回队首）")
-                    } else {
-                        LogCenter.op(alias, "活跃下个账号：@$target 结束后收尾被取消")
-                    }
+                    LogCenter.op(alias, "活跃下个账号：已取消 → @$target")
                     updateRuntime(localStatus = "online", lastMessage = "活跃下个账号已取消")
                     throw t
                 }
-                PrefsStore.requeuePendingActivateUsernameFront(target)
                 notifyManualAccountUi()
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(localStatus = "online", lastMessage = "活跃失败：${t.message}")
@@ -2229,8 +2415,8 @@ object AppCoordinator {
     }
 
     /**
-     * 自动活跃：对待活跃队列整队依次切号，并随机 For You / 涨粉（时长可配）。
-     * 每号完成后累加活跃总时长，便于按时长编辑待活跃队列。
+     * 自动活跃：按队列顺序轮流活跃；一轮结束后从头循环（不 pop 队列）。
+     * 仅当单号满时长后才切下一号；本机在队列且时长未满则不切号直接续跑。
      */
     fun manualStartAutoActive(
         usernames: List<String>? = null,
@@ -2285,45 +2471,65 @@ object AppCoordinator {
                 val scheme = PrefsStore.getManualCutSwitchScheme()
                 LogCenter.op(
                     alias,
-                    "自动活跃：开始（每号 ${minutes} 分钟，队列 ${PrefsStore.getPendingActivateUsernames().size}，切号=$scheme）",
+                    "自动活跃：开始（每号 ${formatActivateDurationLabel(minutes)}，队列 ${PrefsStore.getPendingActivateUsernames().size}，切号=$scheme）",
                 )
                 PrefsStore.saveLocalStatus("running")
 
                 while (true) {
                     currentCoroutineContext().ensureActive()
                     if (PrefsStore.isHardStopRequested()) break
-                    val target = PrefsStore.popPendingActivateUsername() ?: break
+                    val queue = PrefsStore.getPendingActivateUsernames()
+                    if (queue.isEmpty()) break
+
+                    val target = resolveActivateResumeTarget(queue, minutes)
+                        ?: PrefsStore.peekPendingActivateUsername()
+                        ?: break
                     notifyManualAccountUi()
+                    PrefsStore.saveLocalStatus("running")
                     updateRuntime(
                         localStatus = "running",
-                        lastMessage = "自动活跃：切号 → @$target",
+                        lastMessage = "自动活跃：准备 @$target",
                     )
-                    val switchedOk = switchToAccountForBatchSession(target)
+                    val switchedOk = switchToAccountForActivateIfNeeded(target, "自动活跃")
                     if (!switchedOk) {
-                        PrefsStore.requeuePendingActivateUsernameFront(target)
                         notifyManualAccountUi()
-                        LogCenter.op(alias, "自动活跃：@$target 切号未就绪，已放回队首并停止")
+                        PrefsStore.saveLocalStatus("online")
+                        LogCenter.op(alias, "自动活跃：@$target 切号未就绪，已停止")
                         updateRuntime(
                             localStatus = "online",
                             lastMessage = "自动活跃：@$target 切号失败，已停止",
                         )
                         break
                     }
-                    val modeLabel = runRandomActivatePhase(target, minutes, "自动活跃")
+                    val completed = runRandomActivatePhase(target, minutes, "自动活跃")
                     processed++
+                    if (completed) {
+                        updateRuntime(
+                            localStatus = "running",
+                            lastMessage = "自动活跃完成：@$target（第 $processed 次，队列 ${queue.size} 轮转）",
+                        )
+                        if (target.equals(PrefsStore.peekPendingActivateUsername(), ignoreCase = true)) {
+                            PrefsStore.rotatePendingActivateQueueFrontToBack()
+                            notifyManualAccountUi()
+                        }
+                        forceStopTikTokForExclusiveEnqueue("自动活跃单号结束")
+                        continue
+                    }
                     updateRuntime(
-                        localStatus = "running",
-                        lastMessage = "自动活跃完成：@$target · $modeLabel（已处理 $processed）",
+                        localStatus = "online",
+                        lastMessage = "自动活跃未完成：@$target 已保存剩余时长，下轮续跑不切号",
                     )
+                    PrefsStore.saveLocalStatus("online")
                     forceStopTikTokForExclusiveEnqueue("自动活跃单号结束")
+                    break
                 }
 
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(
                     localStatus = "online",
-                    lastMessage = "自动活跃结束：已处理 $processed 个账号，剩余队列 ${PrefsStore.getPendingActivateUsernames().size}",
+                    lastMessage = "自动活跃结束：共完成 $processed 次单号活跃，队列 ${PrefsStore.getPendingActivateUsernames().size} 个账号轮转",
                 )
-                LogCenter.op(alias, "自动活跃结束：已处理 $processed 个账号")
+                LogCenter.op(alias, "自动活跃结束：共 $processed 次单号活跃")
                 if (detectActiveManualTaskKind() == null ||
                     detectActiveManualTaskKind() == ManualTaskKind.AUTO_ACTIVE
                 ) {
@@ -2346,6 +2552,76 @@ object AppCoordinator {
                 notifyManualAccountUi()
             }
         }
+    }
+
+    /**
+     * 本机绑定设备上「未在待活跃队列」的账号（默认排除云端 banned）。
+     * 账号来源为已缓存的设备分配列表；顺序与列表一致。
+     */
+    fun listBoundDeviceNonPendingActivateUsernames(
+        excludeBanned: Boolean = true,
+    ): List<String> {
+        val pending = PrefsStore.getPendingActivateUsernames()
+            .map { it.trim().removePrefix("@").lowercase(java.util.Locale.US) }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        return ManualDeviceControl.getCachedAccounts()
+            .asSequence()
+            .filter { !excludeBanned || !ManualDeviceControl.accountLooksBanned(it) }
+            .map { it.username.trim().removePrefix("@") }
+            .filter { it.isNotEmpty() }
+            .filter { it.lowercase(java.util.Locale.US) !in pending }
+            .distinctBy { it.lowercase(java.util.Locale.US) }
+            .toList()
+    }
+
+    /**
+     * 自动拉取本机绑定设备云端账号后，对全部非待活跃账号批量发作品。
+     * @return 实际入队账号数；失败时带异常信息。
+     */
+    suspend fun manualStartBatchPublishNonPendingActivate(
+        publishCount: Int = PrefsStore.getManualPublishCount(),
+        afterActiveMin: Int = PrefsStore.getManualBatchPublishAfterMin(),
+        excludeBanned: Boolean = true,
+    ): Result<Int> {
+        if (!ManualDeviceControl.ENABLED) {
+            return Result.failure(IllegalStateException("非手动模式"))
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isBlank() || PrefsStore.getDeviceId()?.trim().isNullOrBlank()) {
+            return Result.failure(IllegalStateException("设备未绑定"))
+        }
+        if (isBatchAccountSessionBusy()) {
+            return Result.failure(IllegalStateException("多账号会话进行中，请稍候"))
+        }
+        if (isManualSwitchBusy()) {
+            return Result.failure(IllegalStateException("切号进行中，请稍候"))
+        }
+        updateRuntime(localStatus = "online", lastMessage = "非待活跃批量发：正在拉取云端账号…")
+        LogCenter.op(alias, "非待活跃批量发作品：自动拉取本机设备账号列表")
+        val refresh = manualRefreshAssignedAccounts()
+        val roster = refresh.getOrElse { err ->
+            updateRuntime(
+                localStatus = "online",
+                lastMessage = "非待活跃批量发：拉取账号失败：${err.message}",
+            )
+            return Result.failure(err)
+        }
+        val targets = listBoundDeviceNonPendingActivateUsernames(excludeBanned = excludeBanned)
+        if (targets.isEmpty()) {
+            val pending = PrefsStore.getPendingActivateUsernames().size
+            val msg =
+                "非待活跃批量发：无可用账号（云端 ${roster.size} 个，待活跃 $pending 个，其余为空或已封禁）"
+            LogCenter.op(alias, msg)
+            updateRuntime(localStatus = "online", lastMessage = msg)
+            return Result.failure(IllegalStateException(msg))
+        }
+        LogCenter.op(
+            alias,
+            "非待活跃批量发作品：本机设备共 ${targets.size} 个账号（已排除待活跃队列，云端 ${roster.size}）",
+        )
+        manualStartBatchPublish(targets, publishCount, afterActiveMin)
+        return Result.success(targets.size)
     }
 
     /**
@@ -3914,7 +4190,7 @@ object AppCoordinator {
         if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return false
         if (shouldHonorUserHardStop()) return false
         val accounts = ManualDeviceControl.getCachedAccounts()
-            .filterNot { ManualDeviceControl.accountLooksBanned(it) }
+            .filterNot { ManualDeviceControl.accountLooksBanned(it) || it.autoSwitchExcluded }
         if (accounts.isEmpty()) {
             LogCenter.op(alias, "本机自动切号失败：请先拉取云端账号列表（或列表中账号均已封禁）")
             return false
@@ -12279,7 +12555,7 @@ object AppCoordinator {
                 clearMutualClickStateForInterrupt("掉登录(涨粉)")
                 LogCenter.op(
                     alias,
-                    "涨粉：OCR 见 Log in/Sign up/Add another account 等登录入口（与登录状态保障一致），" +
+                    "涨粉：OCR 见 Add another account（涨粉期不把 Log in/Sign up 当掉登录），" +
                         "终止 $username 并从登录入口续接自动登录",
                 )
                 pendingUsernames.add(0, username)

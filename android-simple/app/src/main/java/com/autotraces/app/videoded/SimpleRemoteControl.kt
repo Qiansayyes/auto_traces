@@ -4,6 +4,7 @@ import android.content.Context
 import com.autotraces.app.AppCoordinator
 import com.autotraces.app.LogCenter
 import com.autotraces.app.ManualDeviceControl
+import com.autotraces.app.PendingActivateRecommend
 import com.autotraces.app.PrefsStore
 import com.autotraces.app.WorkerService
 import com.autotraces.app.WorkerServiceTracker
@@ -18,16 +19,7 @@ object SimpleRemoteControl {
     fun buildStatus(): JSONObject {
         val selected = ManualDeviceControl.selectedManualUsername()
         val active = ManualDeviceControl.activeManualUsername()
-        val accounts = ManualDeviceControl.getCachedAccounts()
-        val accountsArr = JSONArray()
-        accounts.forEach { opt ->
-            accountsArr.put(
-                JSONObject()
-                    .put("username", opt.username)
-                    .put("hasBackup", opt.backupPath.isNotBlank() || opt.backupName.isNotBlank())
-                    .put("firstLoginDone", PrefsStore.isManualFirstLoginDone(opt.username)),
-            )
-        }
+        val accountsArr = buildAccountsJson(ManualDeviceControl.getCachedAccounts())
         val runtime = AppCoordinator.runtimeState.value
         val publishOutcome = AppCoordinator.lastManualPublishOutcome()
         val outcomeJson = if (publishOutcome == null) {
@@ -69,6 +61,19 @@ object SimpleRemoteControl {
             .put("localStatus", runtime.localStatus)
             .put("lastMessage", runtime.lastMessage)
             .put("accounts", accountsArr)
+            .put("activateDurationMin", PrefsStore.getManualActivateDurationMin())
+            .put("activateDurationHours", PrefsStore.getManualActivateDurationHours())
+            .put("heartGrowthRecommendMax", PrefsStore.getPendingActivateHeartGrowthMax())
+            .put("recommendedCount", PendingActivateRecommend.recommendedCount())
+            .put("recommendCacheLabel", PendingActivateRecommend.cacheAgeLabel())
+            .put("batchSessionBusy", AppCoordinator.isBatchAccountSessionBusy())
+            .put("activateNextBusy", AppCoordinator.isActivateNextBusy())
+            .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            .put(
+                "nonPendingActivateCount",
+                AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size,
+            )
+            .put("batchPublishAfterMin", PrefsStore.getManualBatchPublishAfterMin())
     }
 
     fun handleAction(context: Context, body: JSONObject): JSONObject {
@@ -109,18 +114,19 @@ object SimpleRemoteControl {
                 }
                 result.fold(
                     onSuccess = { list ->
-                        val accountsArr = JSONArray()
-                        list.forEach { opt ->
-                            accountsArr.put(
-                                JSONObject()
-                                    .put("username", opt.username)
-                                    .put("hasBackup", opt.backupPath.isNotBlank() || opt.backupName.isNotBlank())
-                                    .put("firstLoginDone", PrefsStore.isManualFirstLoginDone(opt.username)),
-                            )
-                        }
-                        ok("已拉取 ${list.size} 个账号")
+                        val accountsArr = buildAccountsJson(list)
+                        val pendingCount = PrefsStore.getPendingActivateUsernames().size
+                        val rec = PendingActivateRecommend.recommendedCount()
+                        ok(
+                            "已拉取 ${list.size} 个账号（待活跃 $pendingCount，推荐 $rec，" +
+                                "${PendingActivateRecommend.cacheAgeLabel()}）",
+                        )
                             .put("accountsCount", list.size)
                             .put("accounts", accountsArr)
+                            .put("pendingActivateQueue", buildPendingActivateQueueJson())
+                            .put("recommendedCount", rec)
+                            .put("heartGrowthRecommendMax", PrefsStore.getPendingActivateHeartGrowthMax())
+                            .put("recommendCacheLabel", PendingActivateRecommend.cacheAgeLabel())
                             .put("selectedUsername", ManualDeviceControl.selectedManualUsername())
                             .put("activeUsername", ManualDeviceControl.activeManualUsername())
                     },
@@ -317,6 +323,246 @@ object SimpleRemoteControl {
                 )
             }
 
+            "enqueue_pending_activate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val username = body.optString("username", "").trim().removePrefix("@")
+                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                if (username.isBlank()) return fail("username_required", "请选择账号")
+                val added = AppCoordinator.manualEnqueuePendingActivate(username)
+                ok(
+                    if (added) "已加入待活跃队列：@$username" else "@$username 已在队列中",
+                )
+                    .put("added", added)
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "set_heart_growth_recommend_max" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                val raw = body.optInt(
+                    "max",
+                    body.optInt("heartGrowthRecommendMax", PrefsStore.getPendingActivateHeartGrowthMax()),
+                )
+                val value = raw.coerceIn(
+                    PrefsStore.MIN_PENDING_ACTIVATE_HEART_GROWTH_MAX,
+                    PrefsStore.MAX_PENDING_ACTIVATE_HEART_GROWTH_MAX,
+                )
+                PrefsStore.setPendingActivateHeartGrowthMax(value)
+                ok("已设置三天总赞增长推荐阈值 ≤$value")
+                    .put("heartGrowthRecommendMax", value)
+                    .put("recommendedCount", PendingActivateRecommend.recommendedCount())
+                    .put("accounts", buildAccountsJson(ManualDeviceControl.getCachedAccounts()))
+            }
+
+            "enqueue_recommended_pending_activate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                if (body.has("max") || body.has("heartGrowthRecommendMax")) {
+                    val raw = body.optInt(
+                        "max",
+                        body.optInt("heartGrowthRecommendMax", PrefsStore.getPendingActivateHeartGrowthMax()),
+                    )
+                    PrefsStore.setPendingActivateHeartGrowthMax(
+                        raw.coerceIn(
+                            PrefsStore.MIN_PENDING_ACTIVATE_HEART_GROWTH_MAX,
+                            PrefsStore.MAX_PENDING_ACTIVATE_HEART_GROWTH_MAX,
+                        ),
+                    )
+                }
+                val added = AppCoordinator.manualEnqueueRecommendedPendingActivate()
+                val recTotal = PendingActivateRecommend.recommendedCount()
+                val msg = when {
+                    added > 0 -> "已将 $added 个推荐账号加入待活跃队列"
+                    recTotal == 0 ->
+                        "当前没有推荐账号（三天总赞增长均大于 ${PrefsStore.getPendingActivateHeartGrowthMax()}）"
+                    else -> "推荐账号都已在队列中（共 $recTotal 个）"
+                }
+                ok(msg)
+                    .put("added", added)
+                    .put("recommendedCount", recTotal)
+                    .put("heartGrowthRecommendMax", PrefsStore.getPendingActivateHeartGrowthMax())
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+                    .put("accounts", buildAccountsJson(ManualDeviceControl.getCachedAccounts()))
+            }
+
+            "remove_pending_activate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val username = body.optString("username", "").trim().removePrefix("@")
+                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                if (username.isBlank()) return fail("username_required", "请选择账号")
+                val removed = AppCoordinator.manualRemovePendingActivate(username)
+                ok(
+                    if (removed) "已移出待活跃队列：@$username" else "@$username 不在队列中",
+                )
+                    .put("removed", removed)
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "clear_pending_activate_queue" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                AppCoordinator.manualClearPendingActivateQueue()
+                ok("已清空待活跃队列")
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "set_pending_activate_queue" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val names = parseUsernamesFromBody(body)
+                if (names.isEmpty()) return fail("usernames_required", "请提供 usernames 列表")
+                AppCoordinator.manualReplacePendingActivateQueue(names)
+                ok("已更新待活跃队列（${names.size} 个）")
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "sort_pending_activate_asc" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                AppCoordinator.manualSortPendingActivateByTotalMinutesAsc()
+                ok("已按累计活跃时长升序重排")
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "trim_pending_activate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val min = body.optInt(
+                    "minutes",
+                    PrefsStore.getManualActivateDurationMin(),
+                ).coerceAtLeast(0)
+                val removed = AppCoordinator.manualTrimPendingActivateByMinTotal(min)
+                ok("已移除累计≥${min}分钟的账号 $removed 个")
+                    .put("removed", removed)
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
+            "activate_next_account" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    return fail("switch_busy", "切号进行中，请稍候")
+                }
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                if (PrefsStore.getPendingActivateUsernames().isEmpty()) {
+                    return fail("queue_empty", "待活跃队列为空，请先将账号加入队列")
+                }
+                ensureWorkerForManualTask(app)
+                val minutes = resolveActivateMinutes(body)
+                PrefsStore.setManualActivateDurationMin(minutes)
+                AppCoordinator.manualActivateNextAccount(minutes)
+                ok("已请求活跃下个账号（${minutes} 分钟）")
+                    .put("minutes", minutes)
+            }
+
+            "auto_active" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    return fail("switch_busy", "切号进行中，请稍候")
+                }
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val names = parseUsernamesFromBody(body)
+                if (names.isEmpty() && PrefsStore.getPendingActivateUsernames().isEmpty()) {
+                    return fail("queue_empty", "待活跃队列为空，请先加入账号或指定 usernames")
+                }
+                ensureWorkerForManualTask(app)
+                val minutes = resolveActivateMinutes(body)
+                PrefsStore.setManualActivateDurationMin(minutes)
+                AppCoordinator.manualStartAutoActive(
+                    if (names.isEmpty()) null else names,
+                    minutes,
+                )
+                val queueSize = PrefsStore.getPendingActivateUsernames().size
+                ok("已请求自动活跃（每号 ${minutes} 分钟，队列 $queueSize 个）")
+                    .put("minutes", minutes)
+                    .put("queueSize", queueSize)
+            }
+
+            "batch_publish_non_pending" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    return fail("switch_busy", "切号进行中，请稍候")
+                }
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val excludeBanned = body.optBoolean("excludeBanned", true)
+                val countRaw = if (body.has("count")) {
+                    body.optInt("count")
+                } else {
+                    PrefsStore.getManualPublishCount()
+                }
+                val count = countRaw.coerceIn(
+                    PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                    PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+                )
+                val afterRaw = if (body.has("afterActiveMin")) {
+                    body.optInt("afterActiveMin")
+                } else {
+                    PrefsStore.getManualBatchPublishAfterMin()
+                }
+                val afterMin = afterRaw.coerceIn(
+                    PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+                    PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+                )
+                PrefsStore.setManualPublishCount(count)
+                PrefsStore.setManualBatchPublishAfterMin(afterMin)
+                ensureWorkerForManualTask(app)
+                val startedResult = kotlinx.coroutines.runBlocking {
+                    AppCoordinator.manualStartBatchPublishNonPendingActivate(
+                        publishCount = count,
+                        afterActiveMin = afterMin,
+                        excludeBanned = excludeBanned,
+                    )
+                }
+                startedResult.fold(
+                    onSuccess = { started ->
+                        val targets = AppCoordinator.listBoundDeviceNonPendingActivateUsernames(
+                            excludeBanned = excludeBanned,
+                        )
+                        ok(
+                            "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发后${afterMin}分钟）",
+                        )
+                            .put("targetCount", started)
+                            .put("count", count)
+                            .put("afterActiveMin", afterMin)
+                            .put("usernames", JSONArray(targets))
+                            .put(
+                                "pendingActivateCount",
+                                PrefsStore.getPendingActivateUsernames().size,
+                            )
+                    },
+                    onFailure = { err ->
+                        fail(
+                            "start_failed",
+                            err.message ?: "未能启动非待活跃批量发作品",
+                        )
+                            .put("pendingActivateCount", PrefsStore.getPendingActivateUsernames().size)
+                            .put("accountCount", ManualDeviceControl.getCachedAccounts().size)
+                    },
+                )
+            }
+
             else -> fail("unknown_action", "未知 action：$action")
         }.also { resp ->
             if (resp.optBoolean("success", false)) {
@@ -325,6 +571,105 @@ object SimpleRemoteControl {
                     "PC 遥控：$action → ${resp.optString("message")}",
                 )
             }
+        }
+    }
+
+    /** 全量账号列表；已在待活跃队列的会带 inPendingActivateQueue / pendingQueueIndex。 */
+    private fun buildAccountsJson(accounts: List<ManualDeviceControl.AccountOption>): JSONArray {
+        val arr = JSONArray()
+        val active = ManualDeviceControl.activeManualUsername()
+        accounts.forEach { opt ->
+            val queueIndex = PrefsStore.pendingActivateQueueIndex(opt.username)
+            arr.put(
+                JSONObject()
+                    .put("username", opt.username)
+                    .put("hasBackup", opt.backupPath.isNotBlank() || opt.backupName.isNotBlank())
+                    .put("firstLoginDone", PrefsStore.isManualFirstLoginDone(opt.username))
+                    .put("autoSwitchExcluded", opt.autoSwitchExcluded)
+                    .put("inPendingActivateQueue", queueIndex != null)
+                    .put(
+                        "pendingQueueIndex",
+                        if (queueIndex != null) queueIndex else JSONObject.NULL,
+                    )
+                    .put(
+                        "isActive",
+                        active.isNotBlank() && opt.username.equals(active, ignoreCase = true),
+                    )
+                    .put("activateTotalMinutes", PrefsStore.getActivateTotalMinutes(opt.username))
+                    .put("recommended", PendingActivateRecommend.isRecommended(opt.username))
+                    .put(
+                        "heartGrowth3d",
+                        PendingActivateRecommend.snapshot(opt.username)?.heartGrowth3d
+                            ?: JSONObject.NULL,
+                    ),
+            )
+        }
+        return arr
+    }
+
+    private fun buildPendingActivateQueueJson(): JSONArray {
+        val arr = JSONArray()
+        PrefsStore.getPendingActivateUsernames().forEachIndexed { index, username ->
+            val plannedMin = PrefsStore.getManualActivateDurationMin()
+            val remaining = PrefsStore.getActivateSessionRemainingSec(username, plannedMin)
+            arr.put(
+                JSONObject()
+                    .put("username", username)
+                    .put("queueIndex", index + 1)
+                    .put("totalMinutes", PrefsStore.getActivateTotalMinutes(username))
+                    .put(
+                        "remainingSec",
+                        if (remaining != null && remaining > 0) remaining else JSONObject.NULL,
+                    ),
+            )
+        }
+        return arr
+    }
+
+    private fun parseUsernamesFromBody(body: JSONObject): List<String> {
+        val names = mutableListOf<String>()
+        val arr = body.optJSONArray("usernames")
+            ?: body.optJSONArray("pendingUsernames")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val u = arr.optString(i, "").trim().removePrefix("@")
+                if (u.isNotEmpty() && names.none { it.equals(u, ignoreCase = true) }) {
+                    names.add(u)
+                }
+            }
+        }
+        return names
+    }
+
+    private fun resolveActivateMinutes(body: JSONObject): Int {
+        if (body.has("hours")) {
+            val hours = body.optDouble("hours", PrefsStore.getManualActivateDurationHours())
+                .coerceIn(
+                    PrefsStore.MIN_MANUAL_ACTIVATE_DURATION_HOURS,
+                    PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_HOURS,
+                )
+            return kotlin.math.round(hours * 60.0)
+                .toInt()
+                .coerceIn(
+                    PrefsStore.MIN_MANUAL_ACTIVATE_DURATION_MIN,
+                    PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_MIN,
+                )
+        }
+        val raw = if (body.has("minutes")) {
+            body.optInt("minutes")
+        } else {
+            PrefsStore.getManualActivateDurationMin()
+        }
+        return raw.coerceIn(
+            PrefsStore.MIN_MANUAL_ACTIVATE_DURATION_MIN,
+            PrefsStore.MAX_MANUAL_ACTIVATE_DURATION_MIN,
+        )
+    }
+
+    private fun ensureWorkerForManualTask(app: Context) {
+        if (!WorkerServiceTracker.isRunning) {
+            WorkerService.startResumingAutomation(app)
+            LogCenter.op(PrefsStore.getAlias(), "PC 遥控活跃任务：后台服务未启动，已自动拉起")
         }
     }
 
