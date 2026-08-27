@@ -765,7 +765,7 @@
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;">
             <div>
               <h3 style="margin:0 0 6px;">账号表单</h3>
-              <div class="hint">保存账号基础字段（username、password、email、email_password、api）。</div>
+              <div class="hint">保存账号基础字段（username、password、email、email_password、two_fa、api）。</div>
             </div>
             <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
               <button id="addBlankRecordBtn" class="primary">新增空白记录</button>
@@ -773,16 +773,16 @@
           </div>
           <div class="panel-card" style="margin-top:12px;background:#f8faff;">
             <h4 style="margin:0 0 8px;">账号文本批量导入</h4>
-            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持三种列格式：① 5 列 … api；② 6 列 … (忽略/空)、api；③ 7 列 … (忽略)、(忽略)、api。点击导入后会先弹出预览，可勾选记录并批量分配别名，确认后再写入账号记录表。</div>
+            <div class="hint" style="margin-bottom:8px;">一行一条，使用 TAB 或 ---- 分隔。支持仅 2FA（username----password----2FA）、邮箱、以及邮箱+2FA。2FA 为 Base32 密钥（常见 32 位）。点击导入后会先弹出预览，确认后再写入账号记录表。</div>
             <div class="field" style="max-width:280px;margin-bottom:8px;">
               <label>统一国家地区（必填）</label>
               <input id="accountBatchRegionInput" type="text" placeholder="例如：MX / US" required autocomplete="off" />
             </div>
             <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;color:#333;">
               <input id="accountBatchRejectEmptyToggle" type="checkbox" checked />
-              空值也允许导入（username、password、email、email_password、api）
+              空值也允许导入（username、password、email、email_password、two_fa、api）
             </label>
-            <textarea id="accountBatchInput" placeholder="5列：username[TAB]password[TAB]email[TAB]email_password[TAB]api  或 7列：username[TAB]password[TAB]email[TAB]email_password[TAB]ignore[TAB]ignore[TAB]api"></textarea>
+            <textarea id="accountBatchInput" placeholder="仅2FA：username----password----2FA&#10;邮箱：username[TAB]password[TAB]email[TAB]email_password[TAB]api&#10;邮箱+2FA：username----password----email----email_password----2FA"></textarea>
             <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
               <button id="importAccountBatchBtn" class="primary">批量导入账号</button>
             </div>
@@ -807,7 +807,7 @@
                 <input id="accountUnassignedOnlyToggle" type="checkbox" />
                 仅展示未分配别名
               </label>
-              <button id="accountRecordsToggleCredColsBtn" type="button" class="ghost" title="展开或收起 password / email / email_pwd / api 列，为其余列腾出空间">展开凭据列</button>
+              <button id="accountRecordsToggleCredColsBtn" type="button" class="ghost" title="展开或收起 password / email / email_pwd / 2FA / api 列，为其余列腾出空间">展开凭据列</button>
               <div class="hint">支持直接编辑、删除。</div>
             </div>
           </div>

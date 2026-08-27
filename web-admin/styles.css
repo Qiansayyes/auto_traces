@@ -1972,6 +1972,11 @@ button.danger {
   min-width: 88px;
 }
 
+.account-editor-table__cred-col--two-fa {
+  min-width: 120px;
+  max-width: 180px;
+}
+
 .account-editor-table__cred-col--api {
   min-width: 140px;
   max-width: 200px;

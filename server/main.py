@@ -197,6 +197,7 @@ BATCH_STREAM_HEADER_ALIASES: Dict[str, tuple[str, ...]] = {
     "password": ("password", "密码", "tiktok_password"),
     "email": ("email", "邮箱"),
     "email_password": ("email_password", "邮箱密码", "email password", "email_pwd"),
+    "two_fa": ("two_fa", "2fa", "2FA", "totp", "totp_secret", "otp_secret", "authenticator"),
     "api": ("api", "api_address", "api地址", "api_url", "api url"),
     "assigned_alias": ("分配别名", "assigned_alias", "别名", "alias", "device_alias"),
 }
@@ -685,6 +686,7 @@ def init_follow_db():
                 password TEXT NOT NULL DEFAULT '',
                 email TEXT NOT NULL DEFAULT '',
                 email_password TEXT NOT NULL DEFAULT '',
+                two_fa TEXT NOT NULL DEFAULT '',
                 api TEXT NOT NULL DEFAULT '',
                 is_login INTEGER NOT NULL DEFAULT 0,
                 login_time TEXT NOT NULL DEFAULT '',
@@ -768,6 +770,10 @@ def init_follow_db():
             conn.execute(
                 "ALTER TABLE account_editor_rows ADD COLUMN basic_profile_modified TEXT NOT NULL DEFAULT '否'"
             )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE account_editor_rows ADD COLUMN two_fa TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
 
@@ -4040,6 +4046,7 @@ class AccountEditorRowUpsertRequest(BaseModel):
     password: str = ""
     email: str = ""
     email_password: str = ""
+    two_fa: str = ""
     api: str = ""
     is_login: bool = False
     login_time: str = ""
@@ -11061,7 +11068,7 @@ def _fetch_device_assigned_account_row(conn: sqlite3.Connection, owner_username:
         return None
     acct = conn.execute(
         """
-        SELECT row_index, username, password, email, email_password, api, is_login, login_time,
+        SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time,
                basic_profile_modified
         FROM account_editor_rows
         WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
@@ -11093,6 +11100,7 @@ def _account_bundle_fields_for_username(
         "email": "",
         "password": "",
         "email_password": "",
+        "two_fa": "",
         "api": "",
         "is_login": False,
         "login_time": "",
@@ -11103,7 +11111,7 @@ def _account_bundle_fields_for_username(
         return empty
     acct = conn.execute(
         """
-        SELECT row_index, username, password, email, email_password, api, is_login, login_time,
+        SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time,
                basic_profile_modified, video_count, follower_count, follower_growth, heart_count,
                follower_growth_today, heart_growth_today,
                follower_growth_day_before, follower_growth_yesterday,
@@ -11133,6 +11141,7 @@ def _account_bundle_fields_for_username(
         "email": account_email,
         "password": str(row.get("password") or "").strip(),
         "email_password": str(row.get("email_password") or "").strip(),
+        "two_fa": str(row.get("two_fa") or "").strip(),
         "api": str(row.get("api") or "").strip(),
         "is_login": bool(int(row.get("is_login") or 0)),
         "login_time": str(row.get("login_time") or "").strip(),
@@ -11172,6 +11181,7 @@ def _fetch_device_alias_account_form_items(
             "password": str(row.get("password") or "").strip(),
             "email": str(row.get("email") or "").strip(),
             "email_password": str(row.get("email_password") or "").strip(),
+            "two_fa": str(row.get("two_fa") or "").strip(),
             "api": str(row.get("api") or "").strip(),
             "is_login": bool(int(row.get("is_login") or 0)),
             "login_time": str(row.get("login_time") or "").strip(),
@@ -11296,6 +11306,7 @@ def _fetch_device_assigned_accounts_list(
                 "email": str(fields.get("email") or "").strip(),
                 "password": str(fields.get("password") or "").strip(),
                 "email_password": str(fields.get("email_password") or "").strip(),
+                "two_fa": str(fields.get("two_fa") or "").strip(),
                 "api": str(fields.get("api") or "").strip(),
                 "is_login": bool(fields.get("is_login")),
                 "login_time": str(fields.get("login_time") or "").strip(),
@@ -13442,7 +13453,7 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
         _maybe_maintain_device_editor_on_read(conn, owner)
         rows = conn.execute(
             """
-            SELECT row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias,
+            SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias,
                    video_count, follower_count, follower_growth, heart_count,
                    follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
                    heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
@@ -13549,13 +13560,17 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
         conn.execute(
             """
             INSERT INTO account_editor_rows
-                (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, heart_count, follower_growth_day_before, follower_growth_yesterday, follower_growth_today, heart_growth_day_before, heart_growth_yesterday, heart_growth_today, basic_profile_modified, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
+                (owner_username, row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, heart_count, follower_growth_day_before, follower_growth_yesterday, follower_growth_today, heart_growth_day_before, heart_growth_yesterday, heart_growth_today, basic_profile_modified, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
             ON CONFLICT(owner_username, row_index) DO UPDATE SET
                 username = excluded.username,
                 password = excluded.password,
                 email = excluded.email,
                 email_password = excluded.email_password,
+                two_fa = CASE
+                    WHEN TRIM(excluded.two_fa) <> '' THEN excluded.two_fa
+                    ELSE account_editor_rows.two_fa
+                END,
                 api = CASE
                     WHEN TRIM(excluded.api) <> '' THEN excluded.api
                     ELSE account_editor_rows.api
@@ -13588,6 +13603,7 @@ def upsert_account_editor_row(payload: AccountEditorRowUpsertRequest, authorizat
                 payload.password.strip(),
                 payload.email.strip(),
                 payload.email_password.strip(),
+                payload.two_fa.strip(),
                 payload.api.strip(),
                 1 if payload.is_login else 0,
                 payload.login_time.strip(),
@@ -13683,13 +13699,17 @@ def _account_editor_batch_upsert_one_in_conn(
     conn.execute(
         """
         INSERT INTO account_editor_rows
-            (owner_username, row_index, username, password, email, email_password, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
+            (owner_username, row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), ?, ?)
         ON CONFLICT(owner_username, row_index) DO UPDATE SET
             username = excluded.username,
             password = excluded.password,
             email = excluded.email,
             email_password = excluded.email_password,
+            two_fa = CASE
+                WHEN TRIM(excluded.two_fa) <> '' THEN excluded.two_fa
+                ELSE account_editor_rows.two_fa
+            END,
             api = CASE
                 WHEN TRIM(excluded.api) <> '' THEN excluded.api
                 ELSE account_editor_rows.api
@@ -13715,6 +13735,7 @@ def _account_editor_batch_upsert_one_in_conn(
             payload.password.strip(),
             payload.email.strip(),
             payload.email_password.strip(),
+            payload.two_fa.strip(),
             payload.api.strip(),
             1 if payload.is_login else 0,
             payload.login_time.strip(),
@@ -14264,6 +14285,7 @@ BACKUP_ARCHIVE_XLSX_HEADERS: List[str] = [
     "account_password",
     "account_email",
     "account_email_password",
+    "account_two_fa",
     "account_api",
     "account_is_login",
     "account_login_time",
@@ -14315,7 +14337,7 @@ def _list_device_editor_rows_for_backup_export(
 def _account_editor_rows_by_username(conn: sqlite3.Connection, owner: str) -> Dict[str, dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT row_index, username, password, email, email_password, api, is_login, login_time, region,
+        SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region,
                assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified
         FROM account_editor_rows
         WHERE owner_username = ?
@@ -14355,6 +14377,7 @@ def _backup_archive_export_row(device_row: dict[str, Any], account_row: dict[str
         _xlsx_cell_str(acct.get("password")),
         _xlsx_cell_str(acct.get("email")),
         _xlsx_cell_str(acct.get("email_password")),
+        _xlsx_cell_str(acct.get("two_fa")),
         _xlsx_cell_str(acct.get("api")),
         "是" if int(acct.get("is_login") or 0) else "否",
         _xlsx_cell_str(acct.get("login_time")),
@@ -14586,6 +14609,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
             acct_password = _blank_if_none(row.get("account_password"))
             acct_email = _blank_if_none(row.get("account_email"))
             acct_email_password = _blank_if_none(row.get("account_email_password"))
+            acct_two_fa = _blank_if_none(row.get("account_two_fa"))
             acct_api = _blank_if_none(row.get("account_api"))
             acct_region = _blank_if_none(row.get("account_region")) or _blank_if_none(row.get("region"))
             acct_login_time = _blank_if_none(row.get("account_login_time"))
@@ -14604,14 +14628,15 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
             conn.execute(
                 """
                 INSERT INTO account_editor_rows
-                    (owner_username, row_index, username, password, email, email_password, api, is_login, login_time,
+                    (owner_username, row_index, username, password, email, email_password, two_fa, api, is_login, login_time,
                      region, assigned_alias, video_count, follower_count, follower_growth, basic_profile_modified, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner_username, row_index) DO UPDATE SET
                     username = excluded.username,
                     password = CASE WHEN TRIM(excluded.password) <> '' THEN excluded.password ELSE account_editor_rows.password END,
                     email = CASE WHEN TRIM(excluded.email) <> '' THEN excluded.email ELSE account_editor_rows.email END,
                     email_password = CASE WHEN TRIM(excluded.email_password) <> '' THEN excluded.email_password ELSE account_editor_rows.email_password END,
+                    two_fa = CASE WHEN TRIM(excluded.two_fa) <> '' THEN excluded.two_fa ELSE account_editor_rows.two_fa END,
                     api = CASE WHEN TRIM(excluded.api) <> '' THEN excluded.api ELSE account_editor_rows.api END,
                     is_login = excluded.is_login,
                     login_time = CASE WHEN TRIM(excluded.login_time) <> '' THEN excluded.login_time ELSE account_editor_rows.login_time END,
@@ -14634,6 +14659,7 @@ def _import_backup_archive_xlsx_rows(owner: str, parsed_rows: List[dict[str, str
                     acct_password,
                     acct_email,
                     acct_email_password,
+                    acct_two_fa,
                     acct_api,
                     acct_is_login,
                     acct_login_time,

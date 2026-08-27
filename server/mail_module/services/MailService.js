@@ -36,11 +36,13 @@ const use_graph_api = async (refresh_token, client_id, mailbox, email, socks5, h
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
         },
+        // Personal MSA tokens reject graph.microsoft.com/.default (AADSTS90023).
+        // Request explicit delegated mail scopes that refresh_token grants can redeem.
         body: new URLSearchParams({
             'client_id': client_id,
             'grant_type': 'refresh_token',
             'refresh_token': refresh_token,
-            'scope': 'https://graph.microsoft.com/.default'
+            'scope': 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access'
         }).toString()
     });
 
@@ -54,7 +56,8 @@ const use_graph_api = async (refresh_token, client_id, mailbox, email, socks5, h
     try {
 
         const data = JSON.parse(responseText);
-        const status = (data.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') != -1
+        // Mail.ReadWrite also contains the Mail.Read prefix substring.
+        const status = String(data.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1
 
         if (status) {
             await setRedisKey(redis_name, data.access_token, (data.expires_in || 3600) - 60)

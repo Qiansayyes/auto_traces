@@ -329,7 +329,7 @@ let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
 /** 账号记录批量删除勾选，键为数据库 row_index */
 const accountRecordsSelectedRowIndexes = new Set();
-/** 是否展开 password / email / email_pwd / api 四列（默认收起以留出可视空间） */
+/** 是否展开 password / email / email_pwd / 2FA / api 凭据列（默认收起以留出可视空间） */
 let accountRecordsCredColsExpanded = loadAccountRecordsCredColsExpanded();
 const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
 const ACCOUNT_RECORDS_BATCH_SET_BASIC_PROFILE_MAX = 100;
@@ -9134,6 +9134,7 @@ function accountRecordMatchesSearch(row = {}) {
     row.password,
     row.email,
     row.email_password,
+    row.two_fa,
     row.api,
     row.region,
     getEffectiveAccountAssignedAlias(row),
@@ -9453,7 +9454,75 @@ function hasMeaningfulAccountValue(value) {
   return !["ignore", "ignored", "null", "none", "n/a", "na", "-", "--", "_"].includes(normalized);
 }
 
-const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "api", "region"];
+const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "two_fa", "api", "region"];
+
+const ACCOUNT_BATCH_NOISE_VALUES = new Set([
+  "未售出",
+  "已售出",
+  "已卖出",
+  "卡号",
+  "卡密",
+  "状态",
+  "status",
+  "sold",
+  "unsold",
+]);
+
+function normalizeAccountTwoFaSecret(value) {
+  return String(value || "").trim().replace(/\s+/g, "").toUpperCase();
+}
+
+/** TOTP/2FA 密钥：Base32（A-Z2-7），常见 16/26/32/64 位；勿回调 looksLikeAccountApiValue（会循环） */
+function looksLikeTwoFaSecret(value) {
+  const text = normalizeAccountTwoFaSecret(value);
+  if (!hasMeaningfulAccountValue(text)) return false;
+  if (text.includes("@")) return false;
+  // 排除 UUID / URL / 含 0/1/8/9 的普通口令
+  if (/[0189_\-.:/\\]/.test(text)) return false;
+  return /^[A-Z2-7]{16,64}$/.test(text);
+}
+
+function isAccountBatchNoiseValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (ACCOUNT_BATCH_NOISE_VALUES.has(text)) return true;
+  if (ACCOUNT_BATCH_NOISE_VALUES.has(text.toLowerCase())) return true;
+  return false;
+}
+
+function isAccountBatchHeaderLine(cols) {
+  if (!cols || !cols.length) return true;
+  const first = String(cols[0] || "").trim().toLowerCase();
+  if (first === "username" || first === "user" || first === "卡号") return true;
+  const joined = cols.map((c) => String(c || "").trim()).join(" ");
+  return /卡号|卡密|状态/.test(joined) && cols.length <= 4 && !looksLikeTwoFaSecret(cols[2] || "");
+}
+
+/**
+ * 展开厂家「凭证----串 + TAB 状态」与标准 TAB/---- 列。
+ * 例：username----password----2FA\t\t未售出 → [username, password, 2FA]
+ */
+function splitAccountBatchColumns(rawLine) {
+  const raw = String(rawLine || "").trim();
+  if (!raw) return [];
+  const primaryParts = raw.includes("\t")
+    ? raw.split(/\t+/)
+    : (raw.includes("----") ? raw.split(/-{4,}/) : [raw]);
+  const cols = [];
+  primaryParts.forEach((part) => {
+    const text = String(part || "").trim();
+    if (!text) return;
+    if (text.includes("----")) {
+      text.split(/-{4,}/).forEach((piece) => {
+        const item = String(piece || "").trim();
+        if (item && !isAccountBatchNoiseValue(item)) cols.push(item);
+      });
+      return;
+    }
+    if (!isAccountBatchNoiseValue(text)) cols.push(text);
+  });
+  return cols;
+}
 
 function mergeAccountImportRow(existing, incoming) {
   const preservedAlias = getEffectiveAccountAssignedAlias(existing)
@@ -9473,22 +9542,62 @@ function mergeAccountImportRow(existing, incoming) {
 function looksLikeAccountApiValue(value) {
   const text = String(value || "").trim();
   if (!hasMeaningfulAccountValue(text)) return false;
+  if (looksLikeTwoFaSecret(text)) return false;
   return /^https?:\/\//i.test(text) || /\/api\b/i.test(text) || /pickup/i.test(text) || /^[\w.-]+:\d+\//.test(text);
 }
 
+function resolveAccountBatchTwoFa(normalizedCols) {
+  if (!normalizedCols.length) return "";
+  // 仅 2FA：username, password, two_fa
+  if (normalizedCols.length === 3 && looksLikeTwoFaSecret(normalizedCols[2])) {
+    return normalizeAccountTwoFaSecret(normalizedCols[2]);
+  }
+  if (normalizedCols.length === 4) {
+    // username, password, two_fa, api
+    if (looksLikeTwoFaSecret(normalizedCols[2])) {
+      return normalizeAccountTwoFaSecret(normalizedCols[2]);
+    }
+    // username, password, email, two_fa（无邮箱密码）
+    if (String(normalizedCols[2] || "").includes("@") && looksLikeTwoFaSecret(normalizedCols[3])) {
+      return normalizeAccountTwoFaSecret(normalizedCols[3]);
+    }
+  }
+  // 标准邮箱格式：从 email_password 之后的尾列识别 2FA
+  if (normalizedCols.length >= 5) {
+    for (let i = 4; i < normalizedCols.length; i += 1) {
+      if (looksLikeTwoFaSecret(normalizedCols[i])) {
+        return normalizeAccountTwoFaSecret(normalizedCols[i]);
+      }
+    }
+  }
+  return "";
+}
+
 function resolveAccountBatchApi(normalizedCols) {
+  if (normalizedCols.length <= 3) return "";
+  // 仅 2FA + api：username, password, two_fa, api
+  if (normalizedCols.length === 4 && looksLikeTwoFaSecret(normalizedCols[2])) {
+    const maybeApi = String(normalizedCols[3] || "").trim();
+    if (hasMeaningfulAccountValue(maybeApi) && !looksLikeTwoFaSecret(maybeApi)) return maybeApi;
+    return "";
+  }
   if (normalizedCols.length <= 4) return "";
-  const tailCols = normalizedCols.slice(4).map((item) => String(item || "").trim());
+  const tailCols = normalizedCols.slice(4).map((item) => String(item || "").trim())
+    .filter((item) => hasMeaningfulAccountValue(item) && !looksLikeTwoFaSecret(item));
   for (let i = tailCols.length - 1; i >= 0; i -= 1) {
     if (looksLikeAccountApiValue(tailCols[i])) return tailCols[i];
   }
   if (normalizedCols.length >= 7) {
     const stdApi = String(normalizedCols[6] || "").trim();
-    if (hasMeaningfulAccountValue(stdApi)) return stdApi;
+    if (hasMeaningfulAccountValue(stdApi) && !looksLikeTwoFaSecret(stdApi)) return stdApi;
   }
   if (normalizedCols.length === 5) {
     const compactApi = String(normalizedCols[4] || "").trim();
-    if (hasMeaningfulAccountValue(compactApi)) return compactApi;
+    if (hasMeaningfulAccountValue(compactApi) && !looksLikeTwoFaSecret(compactApi)) return compactApi;
+  }
+  if (normalizedCols.length === 6) {
+    const maybeApi = String(normalizedCols[5] || "").trim();
+    if (hasMeaningfulAccountValue(maybeApi) && !looksLikeTwoFaSecret(maybeApi)) return maybeApi;
   }
   const meaningfulTail = tailCols.filter(hasMeaningfulAccountValue);
   if (meaningfulTail.length === 1) return meaningfulTail[0];
@@ -9654,6 +9763,7 @@ function renderAccountBatchPreviewTable() {
       <td class="preview-cell-truncate" title="${escapeHtml(row.password || "")}">${escapeHtml(row.password || "")}</td>
       <td class="preview-cell-truncate" title="${escapeHtml(row.email || "")}">${escapeHtml(row.email || "")}</td>
       <td class="preview-cell-truncate" title="${escapeHtml(row.email_password || "")}">${escapeHtml(row.email_password || "")}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(row.two_fa || "")}">${escapeHtml(row.two_fa || "")}</td>
       <td class="preview-cell-truncate" title="${escapeHtml(row.api || "")}">${escapeHtml(row.api || "")}</td>
       <td>${escapeHtml(row.region || "")}</td>
       <td><select class="ui-select account-batch-preview-alias-select" data-preview-index="${index}" ${aliasDisabled}>${aliasHtml}</select></td>
@@ -9668,6 +9778,7 @@ function renderAccountBatchPreviewTable() {
         <th>password</th>
         <th>email</th>
         <th>email_pwd</th>
+        <th>2FA</th>
         <th>api</th>
         <th>地区</th>
         <th style="min-width:120px;">别名</th>
@@ -10091,32 +10202,51 @@ async function commitAccountBatchImportFromPreview() {
 function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const raw = String(line || "").trim();
   if (!raw) return null;
-  const cols = raw.includes("\t")
-    ? raw.split(/\t+/)
-    : (raw.includes("----") ? raw.split(/-{4,}/) : [raw]);
-  if (cols.length < 4) {
-    throw new Error(`格式错误：至少需要4列（username、password、email、email_password）。支持 TAB 或 ---- 分隔，实际 ${cols.length} 列`);
+  const normalizedCols = splitAccountBatchColumns(raw);
+  if (isAccountBatchHeaderLine(normalizedCols)) return null;
+  if (normalizedCols.length < 3) {
+    throw new Error(`格式错误：至少需要3列（username、password、two_fa）或4列（username、password、email、email_password）。支持 TAB 或 ---- 分隔，实际 ${normalizedCols.length} 列`);
   }
-  const normalizedCols = cols.map((item) => String(item || "").trim());
   const username = String(normalizedCols[0] || "").trim();
   if (!username) {
     throw new Error("格式错误：username 不能为空");
   }
   const password = String(normalizedCols[1] || "").trim();
-  const email = String(normalizedCols[2] || "").trim();
-  const emailPassword = String(normalizedCols[3] || "").trim();
-  // 支持三种格式：
-  // 1) 7列标准：username,password,email,email_password,ignore,ignore,api
-  // 2) 5列紧凑：username,password,email,email_password,api
-  // 3) 6列常见：username,password,email,email_password,(忽略/空),api
+  let email = "";
+  let emailPassword = "";
+  const twoFa = resolveAccountBatchTwoFa(normalizedCols);
+  // 支持格式：
+  // 1) 3列仅2FA：username,password,two_fa
+  // 2) 4列仅2FA+api：username,password,two_fa,api
+  // 3) 4列邮箱：username,password,email,email_password
+  // 4) 4列邮箱+2FA：username,password,email,two_fa
+  // 5) 5列：username,password,email,email_password,api 或 …,two_fa
+  // 6) 6列：…,two_fa,api 或旧版 …,(忽略),api
+  // 7) 7列：…,two_fa,(忽略),api 或旧版 …,(忽略),(忽略),api
+  const twoFaOnly = (
+    (normalizedCols.length === 3 && Boolean(twoFa))
+    || (normalizedCols.length === 4 && looksLikeTwoFaSecret(normalizedCols[2]))
+  );
+  if (!twoFaOnly) {
+    if (normalizedCols.length < 4) {
+      throw new Error("格式错误：无 2FA 时至少需要4列（username、password、email、email_password）");
+    }
+    email = String(normalizedCols[2] || "").trim();
+    const col3 = String(normalizedCols[3] || "").trim();
+    // 第4列为 2FA 时不要把它写进 email_password
+    emailPassword = (looksLikeTwoFaSecret(col3) && !looksLikeTwoFaSecret(normalizedCols[2]))
+      ? ""
+      : col3;
+  }
   const api = resolveAccountBatchApi(normalizedCols);
   if (rejectEmpty) {
     const missingFields = [];
     if (!hasMeaningfulAccountValue(username)) missingFields.push("username");
     if (!hasMeaningfulAccountValue(password)) missingFields.push("password");
-    if (!hasMeaningfulAccountValue(email)) missingFields.push("email");
-    if (!hasMeaningfulAccountValue(emailPassword)) missingFields.push("email_password");
-    if (!hasMeaningfulAccountValue(api)) missingFields.push("api");
+    const hasEmailCreds = hasMeaningfulAccountValue(email) && hasMeaningfulAccountValue(emailPassword);
+    const hasTwoFa = hasMeaningfulAccountValue(twoFa);
+    if (!hasEmailCreds && !hasTwoFa) missingFields.push("email/email_password 或 two_fa");
+    if (!hasMeaningfulAccountValue(api) && !hasTwoFa) missingFields.push("api");
     if (missingFields.length) {
       throw new Error(`存在空值字段：${missingFields.join("、")}`);
     }
@@ -10126,6 +10256,7 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
     password,
     email,
     email_password: emailPassword,
+    two_fa: twoFa,
     api,
     region: String(sharedRegion || "").trim(),
   });
@@ -10317,6 +10448,7 @@ function getAccountRowTemplate(source = {}) {
     password: source.password || "",
     email: source.email || "",
     email_password: source.email_password || "",
+    two_fa: source.two_fa || "",
     api: source.api || "",
     is_login: source.is_login ?? false,
     login_time: source.login_time || "",
@@ -10887,11 +11019,11 @@ function updateAccountRecordsCredColsToggleBtn() {
   if (accountRecordsCredColsExpanded) {
     accountRecordsToggleCredColsBtn.textContent = "收起凭据列";
     accountRecordsToggleCredColsBtn.title =
-      "收起 password / email / email_pwd / api 列，为登录、统计等列腾出空间";
+      "收起 password / email / email_pwd / 2FA / api 列，为登录、统计等列腾出空间";
   } else {
     accountRecordsToggleCredColsBtn.textContent = "展开凭据列";
     accountRecordsToggleCredColsBtn.title =
-      "展开 password / email / email_pwd / api 列（默认收起）";
+      "展开 password / email / email_pwd / 2FA / api 列（默认收起）";
   }
 }
 
@@ -10993,6 +11125,7 @@ function renderAccountEditorRows() {
         <td class="account-editor-table__cred-col account-editor-table__cred-col--password">${accountEditorCellInput(idx, "password", row.password)}</td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--email">${accountEditorCellInput(idx, "email", row.email)}</td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">${accountEditorCellInput(idx, "two_fa", row.two_fa)}</td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
         <td class="account-editor-table__login">${loginSelect}</td>
         <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
@@ -11020,6 +11153,7 @@ function renderAccountEditorRows() {
               <th class="account-editor-table__cred-col account-editor-table__cred-col--password">password</th>
               <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
               <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
+              <th class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">2FA</th>
               <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
               <th class="account-editor-table__login">登录</th>
               <th class="account-editor-table__login-time">登录时间</th>
@@ -11108,6 +11242,7 @@ function renderLinkedAccountInfo(row = {}) {
       <div><strong>password：</strong>${matched.password || "-"}</div>
       <div><strong>email：</strong>${matched.email || "-"}</div>
       <div><strong>email_password：</strong>${matched.email_password || "-"}</div>
+      <div><strong>2FA：</strong>${matched.two_fa || "-"}</div>
       <div><strong>api：</strong>${renderClickableValue(matched.api)}</div>
       <div><strong>is_login：</strong>${matched.is_login ? "是" : "否"}</div>
       <div><strong>login_time：</strong>${matched.login_time || "-"}</div>
