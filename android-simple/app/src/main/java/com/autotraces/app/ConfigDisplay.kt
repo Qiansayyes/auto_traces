@@ -80,9 +80,9 @@ object ConfigDisplay {
 
         appendSection("For You 预滑") {
             appendLine("预滑总时长 for_you_swipe_total_sec：${config.for_you_swipe_total_sec} 秒（0=关闭；手动按钮可另指定时长）")
-            appendLine("单条观看 for_you_watch：${formatRangeSec(config.for_you_watch_min_sec, config.for_you_watch_max_sec)}")
-            appendLine("互动：点赞/收藏/转发与涨粉共用 like_prob/favorite_prob/share_prob 及每日额度（无评论）")
-            appendLine("跳过互动：与涨粉共用 skip_post_click_prob（命中则本条仅观看翻页）")
+            appendLine("单条观看 for_you_watch：混合分布（秒滑70%/正常20%/长看8%/超长2%）；正常桶用 ${formatRangeSec(config.for_you_watch_min_sec, config.for_you_watch_max_sec)}")
+            appendLine("互动：仅正常/长看/超长桶；门控 25%/55%/80% 后再走 like/fav/share 概率与每日额度（秒滑不互动）")
+            appendLine("跳过互动：与涨粉共用 skip_post_click_prob（门控通过后命中则本条仅观看翻页）")
             appendLine("（兼容字段 for_you_like_prob=${formatProb(config.for_you_like_prob)}，预滑已不再单独使用）")
         }
 

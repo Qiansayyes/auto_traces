@@ -268,6 +268,7 @@ const accountBatchPreviewTableWrapEl = document.getElementById("accountBatchPrev
 const accountStatsQueryBtn = document.getElementById("accountStatsQueryBtn");
 const accountStatsQueryScheduleToggle = document.getElementById("accountStatsQueryScheduleToggle");
 const accountStatsQueryScheduleTime = document.getElementById("accountStatsQueryScheduleTime");
+const accountStatsQueryLogDownloadBtn = document.getElementById("accountStatsQueryLogDownloadBtn");
 const accountStatsQueryModalEl = document.getElementById("accountStatsQueryModal");
 const closeAccountStatsQueryModalBtn = document.getElementById("closeAccountStatsQueryModalBtn");
 const cancelAccountStatsQueryModalBtn = document.getElementById("cancelAccountStatsQueryModalBtn");
@@ -10046,6 +10047,38 @@ async function confirmAccountStatsQueryRun() {
   }
 }
 
+async function downloadAccountStatsQueryLogs() {
+  const url = await buildApiUrl("/api/admin/account_stats_query/logs/download");
+  const headers = {};
+  const token = authToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers, cache: "no-store" });
+  if (!response.ok) {
+    const text = await response.text();
+    let msg = text.slice(0, 200) || `下载失败 HTTP ${response.status}`;
+    try {
+      const data = JSON.parse(text);
+      if (data?.msg) msg = String(data.msg);
+    } catch {
+      /* 非 JSON 时沿用原始文本 */
+    }
+    throw new Error(msg);
+  }
+  const blob = await response.blob();
+  const cd = response.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(cd);
+  const day = new Date().toISOString().slice(0, 10);
+  const filename = match?.[1] || `account_stats_query_${day}.log`;
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 function buildAccountBatchPreviewItems(parsedRows, existingUsernameIndex) {
   const seenInBatch = new Set();
   const items = [];
@@ -11043,6 +11076,37 @@ function accountEditorCellInput(idx, field, value, extraAttrs = "", inputClass =
   return `<input class="${className}" type="text" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" value="${escapeHtml(value)}" title="${field}" ${extraAttrs} />`;
 }
 
+async function fetchAccountEditorTwoFaCode(index) {
+  const row = accountEditorRows?.[index];
+  const inputEl = accountEditorListEl?.querySelector(
+    `input[data-editor-scope="account"][data-editor-field="two_fa"][data-editor-index="${index}"]`,
+  );
+  const secretFromInput = inputEl instanceof HTMLInputElement ? String(inputEl.value || "").trim() : "";
+  const secret = secretFromInput || String(row?.two_fa || "").trim();
+  const username = String(row?.username || "").trim();
+  if (!secret) {
+    throw new Error("该行尚未填写 2FA 密钥");
+  }
+  // 取码前把输入框当前值写回内存行，避免刚改未触发保存时用到旧密钥
+  if (row && secretFromInput) row.two_fa = secretFromInput;
+  const data = await request("/api/admin/two_fa/code", {
+    method: "POST",
+    body: JSON.stringify({ secret, username }),
+  });
+  const code = String(data?.two_fa_code || "").trim();
+  const remaining = Number(data?.remaining_sec);
+  if (!/^\d{6,8}$/.test(code)) {
+    throw new Error("服务端未返回有效 2FA 验证码");
+  }
+  try {
+    await navigator.clipboard.writeText(code);
+  } catch (_) {
+    /* ignore clipboard failures */
+  }
+  const remText = Number.isFinite(remaining) ? `，剩余 ${remaining}s` : "";
+  setStatus(`${username || "账号"} 2FA：${code}${remText}（已复制）`, "success");
+}
+
 function accountEditorCellSelect(idx, field, innerHtml, cellClass = "") {
   const className = ["account-editor-table__input", cellClass].filter(Boolean).join(" ");
   return `<select class="${className}" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" title="${field}">${innerHtml}</select>`;
@@ -11125,7 +11189,12 @@ function renderAccountEditorRows() {
         <td class="account-editor-table__cred-col account-editor-table__cred-col--password">${accountEditorCellInput(idx, "password", row.password)}</td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--email">${accountEditorCellInput(idx, "email", row.email)}</td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">${accountEditorCellInput(idx, "two_fa", row.two_fa)}</td>
+        <td class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">
+          <div class="account-editor-two-fa-cell">
+            ${accountEditorCellInput(idx, "two_fa", row.two_fa)}
+            <button type="button" class="ghost account-editor-two-fa-code-btn" data-editor-index="${idx}" title="本地生成当前 TOTP">取码</button>
+          </div>
+        </td>
         <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
         <td class="account-editor-table__login">${loginSelect}</td>
         <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
@@ -12340,6 +12409,13 @@ if (accountStatsQueryBtn) {
     });
   });
 }
+if (accountStatsQueryLogDownloadBtn) {
+  accountStatsQueryLogDownloadBtn.addEventListener("click", () => {
+    downloadAccountStatsQueryLogs()
+      .then(() => setStatus("查询日志已下载", "success"))
+      .catch((error) => setStatus(error.message || "下载查询日志失败", "error"));
+  });
+}
 if (closeAccountStatsQueryModalBtn) {
   closeAccountStatsQueryModalBtn.addEventListener("click", closeAccountStatsQueryModal);
 }
@@ -12582,6 +12658,15 @@ if (accountEditorListEl) {
   accountEditorListEl.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const twoFaBtn = target.closest(".account-editor-two-fa-code-btn");
+    if (twoFaBtn) {
+      event.preventDefault();
+      const index = Number(twoFaBtn.getAttribute("data-editor-index"));
+      if (!Number.isNaN(index)) {
+        fetchAccountEditorTwoFaCode(index).catch((e) => setStatus(e.message || "2FA 取码失败", "error"));
+      }
+      return;
+    }
     const delBtn = target.closest("[data-editor-delete]");
     if (delBtn) {
       const scope = String(delBtn.getAttribute("data-editor-delete") || "account");

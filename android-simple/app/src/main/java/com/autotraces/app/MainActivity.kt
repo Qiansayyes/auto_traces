@@ -255,6 +255,7 @@ class MainActivity : AppCompatActivity() {
         binding.assignedApiInput.setText("")
         binding.assignedEmailInput.setText("")
         binding.assignedEmailPasswordInput.setText("")
+        binding.assignedTwoFaInput.setText("")
     }
 
     private fun applyAssignedAccount(account: DeviceAssignedAccountResponse?) {
@@ -267,10 +268,16 @@ class MainActivity : AppCompatActivity() {
         binding.assignedApiInput.setText(account.api.orEmpty())
         binding.assignedEmailInput.setText(account.email.orEmpty())
         binding.assignedEmailPasswordInput.setText(account.email_password.orEmpty())
+        binding.assignedTwoFaInput.setText(account.two_fa.orEmpty())
         val apiBlank = account.api.isNullOrBlank()
         val emailPresent = !account.email.isNullOrBlank()
         val mailModuleOk = account.mail_module_code_available == true
+        val twoFaPresent = !account.two_fa.isNullOrBlank()
         binding.assignedCopyStatusText.text = when {
+            twoFaPresent && apiBlank && emailPresent && mailModuleOk ->
+                "已加载：${account.username.orEmpty()}（邮箱模块 + 本地 2FA 可用）"
+            twoFaPresent ->
+                "已加载：${account.username.orEmpty()}（本地 2FA 可用）"
             apiBlank && emailPresent && !mailModuleOk ->
                 "已加载：${account.username.orEmpty()}（邮箱模块未配置该邮箱 OAuth，请在管理台「邮箱账户管理」导入）"
             apiBlank && emailPresent && mailModuleOk ->
@@ -305,6 +312,9 @@ class MainActivity : AppCompatActivity() {
         }
         binding.copyAssignedEmailPasswordButton.setOnClickListener {
             copy("Email Password", binding.assignedEmailPasswordInput.text?.toString().orEmpty())
+        }
+        binding.copyAssignedTwoFaButton.setOnClickListener {
+            copy("2FA", binding.assignedTwoFaInput.text?.toString().orEmpty())
         }
 
         binding.fetchTikTokCodeButton.setOnClickListener {
@@ -358,6 +368,47 @@ class MainActivity : AppCompatActivity() {
                 }
                 copy("TikTok Code", code)
                 binding.assignedCopyStatusText.text = "获取成功：$code（已复制）"
+            }
+        }
+
+        binding.fetchTikTokTwoFaCodeButton.setOnClickListener {
+            lifecycleScope.launch {
+                val secret = binding.assignedTwoFaInput.text?.toString().orEmpty().trim()
+                val username = binding.assignedUsernameInput.text?.toString().orEmpty().trim()
+                val deviceId = PrefsStore.getDeviceId().orEmpty()
+                val alias = PrefsStore.getAlias().orEmpty().trim()
+                if (secret.isBlank() && (deviceId.isBlank() || alias.isBlank())) {
+                    binding.assignedCopyStatusText.text = "2FA 密钥为空且设备未绑定：无法获取验证码"
+                    return@launch
+                }
+                binding.fetchTikTokTwoFaCodeButton.isEnabled = false
+                binding.assignedCopyStatusText.text = if (secret.isNotBlank()) {
+                    "正在本地计算 2FA 验证码…"
+                } else {
+                    "正在向服务端索取 2FA 验证码…"
+                }
+                val result = TikTokTwoFaCodeFetcher.fetchCode(
+                    deviceId = deviceId,
+                    alias = alias,
+                    secret = secret,
+                    username = username,
+                )
+                binding.fetchTikTokTwoFaCodeButton.isEnabled = true
+                val code = result.getOrNull()
+                if (code.isNullOrBlank()) {
+                    val msg = result.exceptionOrNull()?.message ?: "未生成 2FA 验证码"
+                    binding.assignedCopyStatusText.text = "2FA 获取失败：$msg"
+                    return@launch
+                }
+                copy("2FA Code", code)
+                val remaining = runCatching {
+                    if (secret.isNotBlank()) TotpCodeGenerator.generate(secret).remainingSec else null
+                }.getOrNull()
+                binding.assignedCopyStatusText.text = if (remaining != null) {
+                    "2FA 成功：$code（剩余 ${remaining}s，已复制）"
+                } else {
+                    "2FA 成功：$code（已复制）"
+                }
             }
         }
 
@@ -1237,29 +1288,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun bindManualAccountSpinner(list: List<ManualDeviceControl.AccountOption>) {
-        manualAccounts = list
+        manualAccounts = sortManualAccountsForSpinner(list)
         val active = ManualDeviceControl.activeManualUsername()
-        val labels = list.map { opt -> formatManualAccountSpinnerLabel(opt, active) }
+        val labels = manualAccounts.map { opt -> formatManualAccountSpinnerLabel(opt, active) }
         suppressingManualSpinnerCallback = true
         binding.manualAccountSelect.adapter =
             ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
         // 优先展示本机当前账号，否则用上次选中
         val preferred = ManualDeviceControl.activeManualUsername()
             .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
-        val idx = list.indexOfFirst { it.username.equals(preferred, ignoreCase = true) }
+        val idx = manualAccounts.indexOfFirst { it.username.equals(preferred, ignoreCase = true) }
             .takeIf { it >= 0 } ?: 0
-        if (list.isNotEmpty()) {
+        if (manualAccounts.isNotEmpty()) {
             binding.manualAccountSelect.setSelection(idx)
-            applyManualAccountFields(list[idx])
-            AppCoordinator.manualSelectAccount(list[idx].username)
+            applyManualAccountFields(manualAccounts[idx])
+            AppCoordinator.manualSelectAccount(manualAccounts[idx].username)
         }
         suppressingManualSpinnerCallback = false
         refreshManualAccountStatus()
     }
 
     /**
-     * 下拉项文案：全量账号；标注本机当前 / 待活跃队列位置 / 不参加自动切号。
-     * 不展示云端高亮/is_login（易误导）。
+     * 下拉排序：未入待活跃队列的在上，已入队的在下（队内按队列序号）。
+     */
+    private fun sortManualAccountsForSpinner(
+        list: List<ManualDeviceControl.AccountOption>,
+    ): List<ManualDeviceControl.AccountOption> {
+        return list.withIndex()
+            .sortedWith(
+                compareBy<IndexedValue<ManualDeviceControl.AccountOption>> {
+                    PrefsStore.pendingActivateQueueIndex(it.value.username) != null
+                }.thenBy {
+                    PrefsStore.pendingActivateQueueIndex(it.value.username) ?: Int.MAX_VALUE
+                }.thenBy { it.index },
+            )
+            .map { it.value }
+    }
+
+    /**
+     * 下拉项文案：仅标本机当前 / 待活跃队列位置。
+     * 「不切号」「推荐」归属待活跃页，不在此处展示。
      */
     private fun formatManualAccountSpinnerLabel(
         opt: ManualDeviceControl.AccountOption,
@@ -1273,22 +1341,19 @@ class MainActivity : AppCompatActivity() {
             PrefsStore.pendingActivateQueueIndex(opt.username)?.let { pos ->
                 append(" ·待活跃#$pos")
             }
-            if (opt.autoSwitchExcluded) {
-                append(" ·不切号")
-            }
-            if (PendingActivateRecommend.isRecommended(opt.username)) {
-                append(" ·推荐")
-            }
         }
     }
 
-    /** 切号完成后刷新「本机当前 / 待活跃」标记，保持下拉选中位置不变。 */
+    /** 切号/队列变更后刷新标记与排序，尽量保持原选中账号。 */
     private fun refreshManualAccountSpinnerLabels() {
         if (manualAccounts.isEmpty()) return
+        val selectedUser = selectedManualUsername()
+        manualAccounts = sortManualAccountsForSpinner(manualAccounts)
         val active = ManualDeviceControl.activeManualUsername()
         val labels = manualAccounts.map { formatManualAccountSpinnerLabel(it, active) }
-        val rawPos = binding.manualAccountSelect.selectedItemPosition
-        val selectedPos = if (rawPos in manualAccounts.indices) rawPos else 0
+        val selectedPos = manualAccounts.indexOfFirst {
+            it.username.equals(selectedUser, ignoreCase = true)
+        }.takeIf { it >= 0 } ?: 0
         suppressingManualSpinnerCallback = true
         binding.manualAccountSelect.adapter =
             ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)

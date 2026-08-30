@@ -58,6 +58,16 @@ data class TikTokEmailCodeResponse(
     val email_code: String? = null,
 )
 
+data class TikTokTwoFaCodeResponse(
+    val code: Int,
+    val msg: String,
+    val two_fa_code: String? = null,
+    val source: String? = null,
+    val period: Int? = null,
+    val remaining_sec: Int? = null,
+    val username: String? = null,
+)
+
 /** POST /api/device/tk_pending/acquire — 从待注册 TK 池领取并转入邮箱账户管理。 */
 data class DeviceTkPendingAcquireResponse(
     val code: Int,
@@ -436,6 +446,7 @@ data class DeviceAssignedAccountResponse(
     val email: String? = null,
     val password: String? = null,
     val email_password: String? = null,
+    val two_fa: String? = null,
     val api: String? = null,
     val is_login: Boolean? = null,
     val login_time: String? = null,
@@ -453,6 +464,7 @@ data class DeviceAssignedAccountItem(
     val email: String? = null,
     val password: String? = null,
     val email_password: String? = null,
+    val two_fa: String? = null,
     val api: String? = null,
     val is_login: Boolean? = null,
     val login_time: String? = null,

@@ -8,7 +8,7 @@
   <meta http-equiv="Expires" content="0" />
   <title>Auto Traces 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-size='28' font-family='Arial,Helvetica,sans-serif' fill='white'%3EAT%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=20260703-1" />
+  <link rel="stylesheet" href="styles.css?v=20260830-2" />
 </head>
 <body>
   <div class="auth-shell" id="authShell">
@@ -796,6 +796,7 @@
                 定时查询
               </label>
               <input id="accountStatsQueryScheduleTime" type="time" class="ui-input" value="09:00" style="width:110px;" title="北京时间，定时查询触发时间" />
+              <button id="accountStatsQueryLogDownloadBtn" type="button" class="ghost" title="下载查询执行日志（时间、username、结果、Cookie 是否启用）">下载查询日志</button>
               <select id="accountRecordsSearchFieldSelect" class="ui-select" style="min-width:108px;" title="选择搜索字段">
                 <option value="">全部</option>
                 <option value="alias">别名</option>
@@ -1291,7 +1292,7 @@
 
           <h4>4.7 延时与「用户资料主页」停留（Android <code>TraceExecutor.kt</code>，以当前代码为准）</h4>
           <p style="margin:0.5em 0;">下列为<strong>硬编码或可配置 delay</strong> 与 OCR 耗时叠加后的行为说明；OCR/截屏耗时随设备性能变化，文档不量化。</p>
-          <p style="margin:0.5em 0;"><strong>For You 预滑</strong>（<code>runForYouWarmupIfNeeded</code>）：仅当 <code>for_you_swipe_total_sec × 1000 ≥ 500</code> 时执行。总时长内循环：每段随机观看 <code>for_you_watch_min_sec</code>～<code>for_you_watch_max_sec</code>（换算为毫秒且各自下限钳制为 500ms），每段不超过剩余总时长；观看后按 <code>skip_post_click_prob</code> 独立判定是否跳过本条赞/藏/转（命中则仅翻页；未命中则按 <code>like_prob</code>/<code>favorite_prob</code>/<code>share_prob</code> 与每日额度执行互动）；段末执行上滑 <code>swipe</code>。</p>
+          <p style="margin:0.5em 0;"><strong>For You 预滑</strong>（<code>runForYouWarmupIfNeeded</code>）：仅当 <code>for_you_swipe_total_sec × 1000 ≥ 500</code> 时执行。总时长内循环：每段按混合分布抽样观看时长——秒滑 70%（0.8～2.5s）、正常 20%（<code>for_you_watch_min_sec</code>～<code>for_you_watch_max_sec</code>）、长看 8%（15～45s）、超长 2%（45～90s）；连续秒滑 3 次后下一条强制进入正常/长看/超长。互动仅在正常/长看/超长桶触发，且按桶门控（25%/55%/80%）后再按 <code>skip_post_click_prob</code> 与 <code>like_prob</code>/<code>favorite_prob</code>/<code>share_prob</code> 执行赞/藏/转；秒滑桶不互动。段末执行上滑 <code>swipe</code>。</p>
           <p style="margin:0.5em 0;"><strong>从 Users 列表进入「当前任务用户名」对应主页</strong>（根用户，三种模式共用一段）：列表行点击后 <code>delay(400)</code>（失败会再点一次）；随后 <code>delay(Random.nextLong(1200, 1800))</code>；再执行一次 <code>checkNoVideosAndGoBack</code>（无作品/私密则 <code>back</code> 并结束本任务）。此处<strong>没有</strong>调用 <code>checkNoVideosAndGoBackWithRetry</code>。</p>
           <ul>
             <li><strong>growth</strong>：通过后立即进入 <code>clickFollowersAndVerify</code>，不在主页额外插入随机停留。该函数每次点击 Followers 后：第 1 次 OCR 轮询前 <code>delay(2500)</code>，第 2～4 次轮询间隔 <code>Random.nextLong(500, 850)</code>；最多 4 次轮询、最多 3 轮点击尝试。通过后进入粉丝列表，再 <code>delay(Random.nextLong(1000, 2000))</code> 后执行 <code>processFollowersList</code>。</li>
@@ -1718,6 +1719,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260817-1"></script>
+  <script src="app.js?v=20260830-3"></script>
 </body>
 </html>

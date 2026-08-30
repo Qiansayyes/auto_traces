@@ -39,7 +39,7 @@ from tiktok_universal_snapshot import (
 
 from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 if sys.platform.startswith("win"):
@@ -4242,6 +4242,20 @@ class DeviceTikTokEmailCodeRequest(BaseModel):
     alias: str = Field(..., min_length=1, max_length=64)
     email: str = Field(default="", max_length=255)
     api_url: str = Field(default="", max_length=2048)
+
+
+class DeviceTikTokTwoFaCodeRequest(BaseModel):
+    """设备/管理台按账号 two_fa 密钥或显式 secret 生成本地 TOTP 验证码。"""
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    username: str = Field(default="", max_length=128)
+    secret: str = Field(default="", max_length=1024)
+
+
+class AdminTwoFaCodeRequest(BaseModel):
+    """管理台：直接用 Base32 密钥生成本地 TOTP（无需设备）。"""
+    secret: str = Field(..., min_length=1, max_length=1024)
+    username: str = Field(default="", max_length=128)
 
 
 class DeviceTkPendingAcquireRequest(DeviceAuthModel):
@@ -8738,11 +8752,75 @@ def _filter_out_private_usernames(usernames: List[str], scene: str = "") -> tupl
 
 
 def _account_stats_query_log(line: str) -> None:
+    text = (line or "").strip()
+    if not text:
+        return
     with store.lock:
         logs = store.task_logs.setdefault(ACCOUNT_STATS_QUERY_LOG_KEY, [])
-        logs.append(line)
+        logs.append(text)
         if len(logs) > 500:
             del logs[: len(logs) - 500]
+    try:
+        path = _task_log_file_path(ACCOUNT_STATS_QUERY_LOG_KEY)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+
+
+def _account_stats_query_cookie_probe_line() -> str:
+    try:
+        _, cookies_dict, debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
+        if cookies_dict:
+            return f"Cookie已启用 | 文件={cookie_path or '(未知)'} | 条数={len(cookies_dict)}"
+        reason = str((debug_lines or ["未加载 Cookie"])[0]).strip()
+        return f"Cookie未使用 | {reason}"
+    except Exception as exc:
+        return f"Cookie探测失败 | {exc}"
+
+
+def _account_stats_query_result_summary(result: dict) -> str:
+    debug = result.get("debug") if isinstance(result.get("debug"), dict) else {}
+    cookie_path = str(debug.get("cookie_file") or "").strip()
+    cookie_used = "是" if debug.get("cookies_sent") else "否"
+    http_status = debug.get("http_status", "?")
+    universal_ok = bool(debug.get("universal_data_present"))
+    extract = result.get("universal_extract") if isinstance(result.get("universal_extract"), dict) else {}
+    metrics = extract.get("to_publish_style_metrics") if isinstance(extract.get("to_publish_style_metrics"), dict) else {}
+    video = metrics.get("视频数", extract.get("video_count", "?"))
+    follower = metrics.get("粉丝量", extract.get("follower_count", "?"))
+    heart = metrics.get("总赞", extract.get("heart_count", "?"))
+    private = result.get("private_account_guess")
+    return (
+        f"cookie={cookie_used}"
+        f" | 文件={cookie_path or '-'}"
+        f" | http={http_status}"
+        f" | universal={universal_ok}"
+        f" | 视频={video} 粉丝={follower} 总赞={heart}"
+        f" | 私密={private}"
+    )
+
+
+def _read_account_stats_query_log_lines() -> List[str]:
+    lines: List[str] = []
+    path = _task_log_file_path(ACCOUNT_STATS_QUERY_LOG_KEY)
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+        except Exception:
+            lines = []
+    if not lines:
+        with store.lock:
+            lines = list(store.task_logs.get(ACCOUNT_STATS_QUERY_LOG_KEY, []))
+    return lines
+
+
+def _filter_account_stats_query_logs_for_owner(lines: List[str], owner: str, *, is_admin: bool) -> List[str]:
+    if is_admin:
+        return lines
+    owner_tag = f"owner={owner}"
+    return [line for line in lines if owner_tag in line]
 
 
 def _default_account_stats_query_config() -> dict[str, object]:
@@ -9142,6 +9220,7 @@ def _run_account_stats_query_job(owner: str, selected_aliases: list[str], *, sou
     _account_stats_query_log(
         f"[{now_text()}] owner={owner} | 开始查询 {total} 个账号 | 别名={','.join(selected_aliases)} | source={source}"
     )
+    _account_stats_query_log(f"[{now_text()}] owner={owner} | {_account_stats_query_cookie_probe_line()}")
     for idx, username in enumerate(usernames, start=1):
         try:
             result = fetch_tiktok_profile_stats(
@@ -9153,13 +9232,16 @@ def _run_account_stats_query_job(owner: str, selected_aliases: list[str], *, sou
             )
             if isinstance(result, dict) and int(result.get("code", 1)) == 0:
                 ok += 1
+                _account_stats_query_log(
+                    f"[{now_text()}] owner={owner} | 成功 @{username} | {_account_stats_query_result_summary(result)}"
+                )
             else:
                 fail += 1
                 msg = result.get("msg") if isinstance(result, dict) else "unknown"
-                _account_stats_query_log(f"[{now_text()}] 失败 @{username} | {msg}")
+                _account_stats_query_log(f"[{now_text()}] owner={owner} | 失败 @{username} | {msg}")
         except Exception as exc:
             fail += 1
-            _account_stats_query_log(f"[{now_text()}] 异常 @{username} | {exc}")
+            _account_stats_query_log(f"[{now_text()}] owner={owner} | 异常 @{username} | {exc}")
         if idx < total:
             time.sleep(ACCOUNT_STATS_QUERY_REQUEST_GAP_SEC)
     _account_stats_query_log(
@@ -9310,6 +9392,7 @@ def fetch_tiktok_profile_stats(
         "final_url": str(response.url),
         "html_length": len(html),
         "cookie_file": cookie_path,
+        "cookies_sent": bool(cookies_dict),
         "cookie_debug_lines": cookie_debug_lines,
         "universal_data_present": universal is not None,
         "user_detail_meta": (
@@ -11031,6 +11114,124 @@ def _tiktok_email_code_response(
         }
 
 
+def _normalize_totp_secret(secret: str) -> str:
+    from totp_util import normalize_totp_secret
+
+    return normalize_totp_secret(secret)
+
+
+def _decode_totp_secret_bytes(secret: str) -> bytes:
+    from totp_util import decode_totp_secret_bytes
+
+    return decode_totp_secret_bytes(secret)
+
+
+def _generate_totp_code(
+    secret: str,
+    *,
+    for_time: float | None = None,
+    digits: int = 6,
+    period: int = 30,
+) -> str:
+    from totp_util import generate_totp_code
+
+    return generate_totp_code(secret, for_time=for_time, digits=digits, period=period)
+
+
+def _totp_remaining_seconds(*, for_time: float | None = None, period: int = 30) -> int:
+    from totp_util import totp_remaining_seconds
+
+    return totp_remaining_seconds(for_time=for_time, period=period)
+
+
+def _resolve_account_two_fa_secret(
+    owner_username: str,
+    alias: str,
+    *,
+    username: str = "",
+    secret: str = "",
+) -> tuple[str, str]:
+    """返回 (secret, resolved_username)。优先显式 secret，其次按 username / 当前分配账号查库。"""
+    explicit = _normalize_totp_secret(secret)
+    uname = str(username or "").strip()
+    if explicit:
+        return explicit, uname
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return "", uname
+    conn = _get_db()
+    try:
+        if uname:
+            row = conn.execute(
+                """
+                SELECT username, two_fa
+                FROM account_editor_rows
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                LIMIT 1
+                """,
+                (owner, uname),
+            ).fetchone()
+            if row:
+                return _normalize_totp_secret(dict(row).get("two_fa")), str(dict(row).get("username") or uname).strip()
+            return "", uname
+        assigned = _fetch_device_assigned_account_row(conn, owner, alias)
+        if not assigned:
+            return "", ""
+        return (
+            _normalize_totp_secret(assigned.get("two_fa")),
+            str(assigned.get("username") or "").strip(),
+        )
+    finally:
+        conn.close()
+
+
+def _two_fa_code_response(
+    device_id: str,
+    alias: str,
+    *,
+    owner_username: str | None = None,
+    username: str = "",
+    secret: str = "",
+) -> dict:
+    """本地生成 TOTP；不向 2fa.run 等云端索取（密钥不出本机/本服务）。"""
+    owner = str(owner_username or "").strip()
+    try:
+        resolved_secret, resolved_username = _resolve_account_two_fa_secret(
+            owner,
+            alias,
+            username=username,
+            secret=secret,
+        )
+    except Exception as exc:
+        return {"code": 1, "msg": str(exc), "two_fa_code": None}
+    if not resolved_secret:
+        if not owner:
+            fail_msg = "设备未关联管理账号，无法解析 2FA 密钥"
+        elif str(username or "").strip():
+            fail_msg = "未找到该账号的 2FA 密钥"
+        else:
+            fail_msg = "当前分配账号未配置 2FA 密钥（two_fa 为空）"
+        return {"code": 1, "msg": fail_msg, "two_fa_code": None}
+    try:
+        code = _generate_totp_code(resolved_secret)
+        remaining = _totp_remaining_seconds()
+    except ValueError as exc:
+        return {"code": 1, "msg": str(exc), "two_fa_code": None}
+    print(
+        f"[{now_text()}] device_tiktok.two_fa_code | ok_local | device={device_id} "
+        f"alias={alias} username={resolved_username or '-'} remaining={remaining}s"
+    )
+    return {
+        "code": 0,
+        "msg": "ok",
+        "two_fa_code": code,
+        "source": "local",
+        "period": 30,
+        "remaining_sec": remaining,
+        "username": resolved_username or "",
+    }
+
+
 def _effective_device_editor_alias(row: dict[str, Any]) -> str:
     aa = str(row.get("assigned_alias") or "").strip()
     da = str(row.get("device_alias") or "").strip()
@@ -11444,12 +11645,13 @@ def _apply_device_auto_switch_enabled_for_device(
 def device_assigned_accounts(
     device_id: str,
     alias: str,
-    include_excluded: int = 0,
-    include_banned: int = 0,
+    include_excluded: int = 1,
+    include_banned: int = 1,
 ):
     """设备端：拉取当前别名桶下全部已分配账号（手动切号下拉 / 刷新账号信息）。
 
-    include_excluded=1 时包含「不参加自动切号」账号，并返回 auto_switch_excluded。
+    默认包含「不参加自动切号」与 banned 账号（手动/待活跃须见全量桶内账号）。
+    传 include_excluded=0 / include_banned=0 可恢复旧版仅参与、未封禁列表。
     """
     error, device = auth_or_error(device_id, alias)
     if error:
@@ -11461,6 +11663,10 @@ def device_assigned_accounts(
     want_banned = int(include_banned or 0) == 1
     conn = _get_db()
     try:
+        # 账号记录已分配别名但设备档案缺行时先补齐，避免管理台有两条、设备只拉到一条
+        synced = _sync_account_aliases_to_device_rows(conn, owner)
+        if synced:
+            conn.commit()
         items = _fetch_device_assigned_accounts_list(
             conn,
             owner,
@@ -11720,6 +11926,7 @@ def device_assigned_account(device_id: str, alias: str):
             "email": account_email,
             "password": str(row.get("password") or "").strip(),
             "email_password": str(row.get("email_password") or "").strip(),
+            "two_fa": str(row.get("two_fa") or "").strip(),
             "api": str(row.get("api") or "").strip(),
             "is_login": bool(int(row.get("is_login") or 0)),
             "login_time": str(row.get("login_time") or "").strip(),
@@ -12153,6 +12360,74 @@ def admin_device_tiktok_email_code(
         owner_username=owner,
         account_email=payload.email,
     )
+
+
+@app.post("/api/device/tiktok/two_fa_code")
+def device_tiktok_two_fa_code(payload: DeviceTikTokTwoFaCodeRequest):
+    """设备端：按账号 two_fa 或显式 secret 本地生成 TOTP 验证码。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    return _two_fa_code_response(
+        payload.device_id,
+        payload.alias,
+        owner_username=owner,
+        username=payload.username,
+        secret=payload.secret,
+    )
+
+
+@app.post("/api/admin/device_tiktok/two_fa_code")
+def admin_device_tiktok_two_fa_code(
+    payload: DeviceTikTokTwoFaCodeRequest,
+    authorization: str | None = Header(default=None),
+):
+    """管理台代设备生成本地 TOTP 验证码。"""
+    err, device = _require_login_and_owning_device(payload.device_id, payload.alias, authorization)
+    if err:
+        return err
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    return _two_fa_code_response(
+        payload.device_id,
+        payload.alias,
+        owner_username=owner,
+        username=payload.username,
+        secret=payload.secret,
+    )
+
+
+@app.post("/api/admin/two_fa/code")
+def admin_two_fa_code(
+    payload: AdminTwoFaCodeRequest,
+    authorization: str | None = Header(default=None),
+):
+    """管理台：直接用 Base32 密钥生成本地 TOTP（不依赖设备，也不请求 2fa.run）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    secret = _normalize_totp_secret(payload.secret)
+    if not secret:
+        return {"code": 1, "msg": "2FA 密钥为空", "two_fa_code": None}
+    try:
+        code = _generate_totp_code(secret)
+        remaining = _totp_remaining_seconds()
+    except ValueError as exc:
+        return {"code": 1, "msg": str(exc), "two_fa_code": None}
+    username = str(payload.username or "").strip()
+    print(
+        f"[{now_text()}] admin.two_fa_code | ok_local | user={session.get('username') if session else ''} "
+        f"username={username or '-'} remaining={remaining}s"
+    )
+    return {
+        "code": 0,
+        "msg": "ok",
+        "two_fa_code": code,
+        "source": "local",
+        "period": 30,
+        "remaining_sec": remaining,
+        "username": username,
+    }
 
 
 @app.post("/api/device/tk_pending/acquire")
@@ -17789,11 +18064,43 @@ def run_account_stats_query(
             return {"code": 1, "msg": "查询任务正在执行中，请稍后再试"}
     if not _start_account_stats_query_async(owner, selected, source="manual"):
         return {"code": 1, "msg": "查询任务正在执行中，请稍后再试"}
+    _account_stats_query_log(
+        f"[{now_text()}] owner={owner} | 手动提交查询任务 | 别名={','.join(selected)}"
+    )
     return {
         "code": 0,
         "msg": f"已提交查询任务，将查询 {len(_list_usernames_for_owner_by_aliases(owner, selected))} 个账号",
         "data": {"selected_aliases": selected},
     }
+
+
+@app.get("/api/admin/account_stats_query/logs/download")
+def download_account_stats_query_logs(
+    authorization: str | None = Header(default=None),
+):
+    """下载账号统计查询日志（执行时间、username、结果、Cookie 状态）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return JSONResponse(err, status_code=int(err.get("code") or 401))
+    owner = str(session["username"] or "").strip()
+    is_admin = session.get("role") == "admin"
+    lines = _read_account_stats_query_log_lines()
+    filtered = _filter_account_stats_query_logs_for_owner(lines, owner, is_admin=is_admin)
+    header = [
+        f"# 账号统计查询日志 | 导出时间={now_text()} | 当前用户={owner}",
+        f"# 当前 Cookie 状态：{_account_stats_query_cookie_probe_line()}",
+        f"# Cookie 查找顺序：项目根目录 / server / auto_upload (D:\\autoGroup\\auto_upload)",
+        "",
+    ]
+    body_lines = header + (filtered if filtered else ["(暂无查询日志，请先执行一次「全量查询并落库」或等待定时查询触发)"])
+    body = "\n".join(body_lines) + "\n"
+    safe_owner = re.sub(r"[^A-Za-z0-9_.-]+", "_", owner) or "user"
+    filename = f"account_stats_query_{safe_owner}_{_beijing_date_str()}.log"
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 AUTO_SWITCH_MANUAL_BLOCK_MSG = "该设备已开启自动切号，请先关闭后再执行手动操作"

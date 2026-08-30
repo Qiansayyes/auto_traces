@@ -1977,6 +1977,24 @@ button.danger {
   max-width: 180px;
 }
 
+.account-editor-two-fa-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.account-editor-two-fa-cell .account-editor-table__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.account-editor-two-fa-code-btn {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
 .account-editor-table__cred-col--api {
   min-width: 140px;
   max-width: 200px;

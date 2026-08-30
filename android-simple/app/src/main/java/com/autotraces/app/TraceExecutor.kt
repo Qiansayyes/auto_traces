@@ -1090,6 +1090,26 @@ class RealTraceExecutor(
         private const val FOR_YOU_WARMUP_LOGOUT_PROBE_PHASES = 3
         /** For You 预滑：配置总时长低于本值（毫秒）时不做掉登录 OCR 探测。 */
         private const val FOR_YOU_WARMUP_LOGOUT_PROBE_MIN_TOTAL_MS = 5 * 60 * 1000L
+        /** For You 预滑：连续秒滑达到该次数后，下一条强制进入正常/长看/超长桶。 */
+        private const val FOR_YOU_WARMUP_MAX_CONSECUTIVE_FAST_SKIPS = 3
+        /** For You 预滑观看桶：秒滑时长区间（毫秒）。 */
+        private const val FOR_YOU_WATCH_FAST_SKIP_MIN_MS = 800L
+        private const val FOR_YOU_WATCH_FAST_SKIP_MAX_MS = 2500L
+        /** For You 预滑观看桶：长看时长区间（毫秒）。 */
+        private const val FOR_YOU_WATCH_LONG_MIN_MS = 15_000L
+        private const val FOR_YOU_WATCH_LONG_MAX_MS = 45_000L
+        /** For You 预滑观看桶：超长时长区间（毫秒）。 */
+        private const val FOR_YOU_WATCH_EXTRA_LONG_MIN_MS = 45_000L
+        private const val FOR_YOU_WATCH_EXTRA_LONG_MAX_MS = 90_000L
+        /** For You 预滑观看桶抽样权重（合计 1.0）：秒滑 / 正常 / 长看 / 超长。 */
+        private const val FOR_YOU_WATCH_BUCKET_FAST_SKIP_RATIO = 0.70
+        private const val FOR_YOU_WATCH_BUCKET_NORMAL_RATIO = 0.20
+        private const val FOR_YOU_WATCH_BUCKET_LONG_RATIO = 0.08
+        private const val FOR_YOU_WATCH_BUCKET_EXTRA_LONG_RATIO = 0.02
+        /** For You 预滑：各观看桶触发赞/藏/转的门控概率（秒滑恒为 0，不互动）。 */
+        private const val FOR_YOU_WATCH_INTERACT_GATE_NORMAL = 0.25
+        private const val FOR_YOU_WATCH_INTERACT_GATE_LONG = 0.55
+        private const val FOR_YOU_WATCH_INTERACT_GATE_EXTRA_LONG = 0.80
         /** 页面错乱恢复：优先导航返回回首页的最多次数（每次返回后 OCR 验 Home+Profile）。 */
         private const val RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS = 10
         /** 回首页恢复：前 N 轮导航返回每次连按两次（跳过中间页/叠层）。 */
@@ -4691,6 +4711,73 @@ class RealTraceExecutor(
         val swipeMs: Int,
     )
 
+    /** For You 预滑：混合观看时长桶（方案一）。 */
+    private enum class ForYouWatchBucket(val logLabel: String) {
+        FAST_SKIP("秒滑"),
+        NORMAL("正常"),
+        LONG("长看"),
+        EXTRA_LONG("超长"),
+    }
+
+    private data class ForYouWatchPlan(
+        val bucket: ForYouWatchBucket,
+        val watchMs: Long,
+    )
+
+    private fun sampleForYouWatchBucket(): ForYouWatchBucket {
+        val r = Random.nextDouble()
+        val fastEnd = FOR_YOU_WATCH_BUCKET_FAST_SKIP_RATIO
+        val normalEnd = fastEnd + FOR_YOU_WATCH_BUCKET_NORMAL_RATIO
+        val longEnd = normalEnd + FOR_YOU_WATCH_BUCKET_LONG_RATIO
+        return when {
+            r < fastEnd -> ForYouWatchBucket.FAST_SKIP
+            r < normalEnd -> ForYouWatchBucket.NORMAL
+            r < longEnd -> ForYouWatchBucket.LONG
+            else -> ForYouWatchBucket.EXTRA_LONG
+        }
+    }
+
+    /** 连滑惩罚：连续秒滑后强制进入非秒滑桶（正常 70% / 长看 20% / 超长 10%）。 */
+    private fun sampleForcedNonFastForYouWatchBucket(): ForYouWatchBucket {
+        val r = Random.nextDouble()
+        return when {
+            r < 0.70 -> ForYouWatchBucket.NORMAL
+            r < 0.90 -> ForYouWatchBucket.LONG
+            else -> ForYouWatchBucket.EXTRA_LONG
+        }
+    }
+
+    private fun sampleForYouWatchPlan(
+        watchMinMs: Long,
+        watchMaxMs: Long,
+        consecutiveFastSkips: Int,
+    ): ForYouWatchPlan {
+        val bucket = if (consecutiveFastSkips >= FOR_YOU_WARMUP_MAX_CONSECUTIVE_FAST_SKIPS) {
+            sampleForcedNonFastForYouWatchBucket()
+        } else {
+            sampleForYouWatchBucket()
+        }
+        val watchMs = when (bucket) {
+            ForYouWatchBucket.FAST_SKIP ->
+                Random.nextLong(FOR_YOU_WATCH_FAST_SKIP_MIN_MS, FOR_YOU_WATCH_FAST_SKIP_MAX_MS + 1)
+            ForYouWatchBucket.NORMAL ->
+                if (watchMaxMs > watchMinMs) Random.nextLong(watchMinMs, watchMaxMs + 1) else watchMinMs
+            ForYouWatchBucket.LONG ->
+                Random.nextLong(FOR_YOU_WATCH_LONG_MIN_MS, FOR_YOU_WATCH_LONG_MAX_MS + 1)
+            ForYouWatchBucket.EXTRA_LONG ->
+                Random.nextLong(FOR_YOU_WATCH_EXTRA_LONG_MIN_MS, FOR_YOU_WATCH_EXTRA_LONG_MAX_MS + 1)
+        }
+        return ForYouWatchPlan(bucket, watchMs)
+    }
+
+    /** 仅正常/长看/超长桶可互动；长看、超长门控更高，正常更低。 */
+    private fun forYouWarmupInteractionAttemptProb(bucket: ForYouWatchBucket): Double = when (bucket) {
+        ForYouWatchBucket.FAST_SKIP -> 0.0
+        ForYouWatchBucket.NORMAL -> FOR_YOU_WATCH_INTERACT_GATE_NORMAL
+        ForYouWatchBucket.LONG -> FOR_YOU_WATCH_INTERACT_GATE_LONG
+        ForYouWatchBucket.EXTRA_LONG -> FOR_YOU_WATCH_INTERACT_GATE_EXTRA_LONG
+    }
+
     private fun computeForYouFeedSwipeGesture(w: Int, h: Int): HumanizedSwipeGesture {
         val baseXFrac = 0.46f + Random.nextFloat() * 0.10f
         val startYFrac = 0.74f + Random.nextFloat() * 0.08f
@@ -7508,8 +7595,10 @@ class RealTraceExecutor(
      *
      * 点赞/收藏/转发与涨粉共用 [AppConfig.like_prob]/[AppConfig.favorite_prob]/[AppConfig.share_prob]
      * 及对应每日额度；不做评论。
-     * 每条视频在互动前按 [AppConfig.skip_post_click_prob] 独立判定：命中则跳过本条赞/藏/转，仅观看后翻页
-     *（与涨粉「进入主页后跳过作品点击」同一配置、同一语义）。
+     * 观看时长按混合分布抽样（秒滑 70% / 正常 20% / 长看 8% / 超长 2%）；连续秒滑
+     * [FOR_YOU_WARMUP_MAX_CONSECUTIVE_FAST_SKIPS] 次后强制进入非秒滑桶。
+     * 互动仅在正常/长看/超长桶触发，且按桶门控（正常 25% / 长看 55% / 超长 80%）；
+     * 秒滑桶不互动。门控通过后再按 [AppConfig.skip_post_click_prob] 判定是否跳过本条赞/藏/转。
      */
     private suspend fun runForYouWarmupIfNeeded(
         service: Context,
@@ -7551,7 +7640,9 @@ class RealTraceExecutor(
             alias,
             buildString {
                 append("For You 预滑开始：总时长=${totalMs}ms")
-                append(" · 互动=赞/藏/转（与涨粉共用概率与额度，无评论）")
+                append(" · 观看=混合分布（秒滑70%/正常20%/长看8%/超长2%）")
+                append(" · 正常区间=${watchMinMs}~${watchMaxMs}ms")
+                append(" · 互动=赞/藏/转（仅正常/长看/超长桶；门控 25%/55%/80%）")
                 append(
                     " · 概率 like=${config.like_prob}/fav=${config.favorite_prob}/share=${config.share_prob}",
                 )
@@ -7574,6 +7665,7 @@ class RealTraceExecutor(
         }
         var logoutProbesDone = 0
         var swipeCount = 0
+        var consecutiveFastSkips = 0
         while (System.currentTimeMillis() - startedAt < totalMs) {
             if (growthYieldOrNull(alias, "For You 预滑")) return ForYouWarmupOutcome.Yielded
             if (mutualClickOrNull(alias, "For You 预滑")) return ForYouWarmupOutcome.Yielded
@@ -7595,25 +7687,43 @@ class RealTraceExecutor(
                 )
                 logoutProbesDone++
             }
-            val planWatchMs =
-                if (watchMaxMs > watchMinMs) Random.nextLong(watchMinMs, watchMaxMs + 1) else watchMinMs
+            val watchPlan = sampleForYouWatchPlan(watchMinMs, watchMaxMs, consecutiveFastSkips)
             val elapsed = System.currentTimeMillis() - startedAt
             val remain = (totalMs - elapsed).coerceAtLeast(0L)
-            val watchMs = minOf(planWatchMs, remain)
+            val watchMs = minOf(watchPlan.watchMs, remain)
             if (watchMs <= 0L) break
 
-            if (!growthDelay(alias, watchMs, "For You 预滑-观看")) return ForYouWarmupOutcome.Yielded
+            if (!growthDelay(alias, watchMs, "For You 预滑-观看(${watchPlan.bucket.logLabel})")) {
+                return ForYouWarmupOutcome.Yielded
+            }
+            if (watchPlan.bucket == ForYouWatchBucket.FAST_SKIP) {
+                consecutiveFastSkips++
+            } else {
+                consecutiveFastSkips = 0
+            }
             if (growthYieldOrNull(alias, "For You 预滑-互动前")) return ForYouWarmupOutcome.Yielded
             if (mutualClickOrNull(alias, "For You 预滑-互动前")) return ForYouWarmupOutcome.Yielded
             // 互动耗时不计入预滑预算；若剩余时间已不足一轮观看则不再互动，避免严重超时
             if (System.currentTimeMillis() - startedAt < totalMs) {
-                // 与涨粉「进入主页后跳过作品点击」共用 skip_post_click_prob：命中则本条不赞/藏/转
-                if (config.skip_post_click_prob > 0.0 &&
-                    Random.nextDouble() < config.skip_post_click_prob
-                ) {
-                    devOp(alias, "For You 预滑：命中跳过作品概率，本条仅观看翻页（不互动）")
-                } else {
-                    runForYouFeedInteractions(service, config)
+                val interactGate = forYouWarmupInteractionAttemptProb(watchPlan.bucket)
+                when {
+                    interactGate <= 0.0 -> {
+                        devOp(alias, "For You 预滑：${watchPlan.bucket.logLabel}段，跳过互动")
+                    }
+                    Random.nextDouble() >= interactGate -> {
+                        devOp(
+                            alias,
+                            "For You 预滑：${watchPlan.bucket.logLabel}段未命中互动门控" +
+                                "(${(interactGate * 100).toInt()}%)，跳过赞/藏/转",
+                        )
+                    }
+                    config.skip_post_click_prob > 0.0 &&
+                        Random.nextDouble() < config.skip_post_click_prob -> {
+                        devOp(alias, "For You 预滑：命中跳过作品概率，本条仅观看翻页（不互动）")
+                    }
+                    else -> {
+                        runForYouFeedInteractions(service, config)
+                    }
                 }
             }
             if (System.currentTimeMillis() - startedAt >= totalMs) break
