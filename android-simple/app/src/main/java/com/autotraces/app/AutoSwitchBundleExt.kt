@@ -265,7 +265,8 @@ fun AutoSwitchAccount.toAssignedAccountResponse(): DeviceAssignedAccountResponse
     if (user.isBlank()) {
         return DeviceAssignedAccountResponse(code = 1, msg = "bundle 账号缺少 username")
     }
-    val credsComplete = !email.isNullOrBlank() && !password.isNullOrBlank()
+    val credsComplete = !password.isNullOrBlank() &&
+        (!email.isNullOrBlank() || !two_fa.isNullOrBlank())
     return DeviceAssignedAccountResponse(
         code = if (credsComplete) 0 else 1,
         msg = if (credsComplete) "ok" else "bundle 账号凭证不完整",
@@ -274,6 +275,7 @@ fun AutoSwitchAccount.toAssignedAccountResponse(): DeviceAssignedAccountResponse
         email = email?.trim().orEmpty(),
         password = password?.trim().orEmpty(),
         email_password = email_password?.trim().orEmpty(),
+        two_fa = two_fa?.trim().orEmpty(),
         api = api?.trim().orEmpty(),
         is_login = is_login == true,
         login_time = login_time?.trim().orEmpty(),

@@ -250,6 +250,43 @@ object ApiService {
         throw lastError ?: IOException("云端代取失败")
     }
 
+    suspend fun getTikTokTwoFaCodeFromServer(
+        deviceId: String,
+        alias: String,
+        username: String = "",
+        secret: String = "",
+    ): TikTokTwoFaCodeResponse {
+        val body = mapOf(
+            "device_id" to deviceId,
+            "alias" to alias,
+            "username" to username,
+            "secret" to secret,
+        )
+        val paths = listOf(
+            "/api/device/tiktok/two_fa_code",
+            "/api/admin/device_tiktok/two_fa_code",
+        )
+        var lastError: Exception? = null
+        for (path in paths) {
+            try {
+                return postWithClient(
+                    longTimeoutClient,
+                    path = path,
+                    body = body,
+                    clazz = TikTokTwoFaCodeResponse::class.java,
+                    includeAuth = path.startsWith("/api/admin/"),
+                )
+            } catch (e: Exception) {
+                lastError = e
+                val http404 = e is IOException && e.message?.contains("HTTP 404") == true
+                if (!http404) {
+                    throw e
+                }
+            }
+        }
+        throw lastError ?: IOException("云端代取 2FA 失败")
+    }
+
     suspend fun pollDeviceOps(deviceId: String, alias: String): DeviceOpPollResponse = postWithClient(
         pollClient,
         path = "/api/device_ops/poll",

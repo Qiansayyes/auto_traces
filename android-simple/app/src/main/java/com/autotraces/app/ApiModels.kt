@@ -616,6 +616,8 @@ data class TikTokAutoLoginCredentials(
     val email: String,
     val password: String,
     val apiUrl: String,
+    /** Base32 TOTP 密钥；非空时走 Username→Password→Authenticator 登录链。 */
+    val twoFa: String = "",
 )
 
 data class RuntimeState(
@@ -787,6 +789,7 @@ data class AutoSwitchAccount(
     val email: String? = null,
     val password: String? = null,
     val email_password: String? = null,
+    val two_fa: String? = null,
     val api: String? = null,
     val is_login: Boolean? = null,
     val login_time: String? = null,

@@ -4957,12 +4957,17 @@ object AppCoordinator {
         val username = accountResp.username.orEmpty().trim()
         val email = accountResp.email.orEmpty().trim()
         val password = accountResp.password.orEmpty().trim()
+        val twoFa = accountResp.two_fa.orEmpty().trim()
         val api = accountResp.api.orEmpty().trim()
-        if (username.isBlank() || email.isBlank() || password.isBlank()) {
-            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（username/email/password）")
+        if (username.isBlank() || password.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（username/password）")
             return !strict
         }
-        if (api.isBlank()) {
+        if (twoFa.isBlank() && email.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（需 email 或 2FA 密钥）")
+            return !strict
+        }
+        if (twoFa.isBlank() && api.isBlank()) {
             LogCenter.op(
                 alias,
                 "[OP][$opId] 自动登录($reason)：api 为空，将尝试通过邮箱管理模块获取验证码",
@@ -5005,6 +5010,7 @@ object AppCoordinator {
                     email = email,
                     password = password,
                     apiUrl = api,
+                    twoFa = twoFa,
                 ),
                 resumeFromLoginEntryScreen = resumeFromLoginEntryScreen,
                 flowKind = flowKind,
@@ -5027,6 +5033,7 @@ object AppCoordinator {
                                 email = email,
                                 password = password,
                                 apiUrl = api,
+                                twoFa = twoFa,
                             ),
                             resumeFromLoginEntryScreen = true,
                             flowKind = flowKind,

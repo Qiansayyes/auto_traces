@@ -1816,6 +1816,19 @@ object AppCoordinator {
         }
     }
 
+    /** 旧本机缓存缺 two_fa 时，从账号列表补全并写回。 */
+    suspend fun manualEnrichTwoFaIfMissing(username: String): Boolean {
+        if (!ManualDeviceControl.ENABLED) return false
+        val user = username.trim().removePrefix("@")
+        if (user.isBlank()) return false
+        val cached = ManualDeviceControl.findCachedAccount(user) ?: return false
+        if (cached.twoFa.isNotBlank()) return false
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isBlank() || alias.isBlank()) return false
+        return resolveManualAccountTwoFa(alias, deviceId, user).isNotBlank()
+    }
+
     fun manualSelectAccount(username: String) {
         val u = username.trim().removePrefix("@")
         if (u.isBlank()) return
@@ -7066,6 +7079,9 @@ object AppCoordinator {
                 .ifBlank { ManualDeviceControl.selectedManualUsername() }
             if (prefer.isNotBlank()) {
                 ManualDeviceControl.findCachedAccount(prefer)?.let { opt ->
+                    val twoFa = opt.twoFa.ifBlank {
+                        resolveManualAccountTwoFa(alias, deviceId, opt.username)
+                    }
                     return DeviceAssignedAccountResponse(
                         code = 0,
                         msg = "ok",
@@ -7074,6 +7090,7 @@ object AppCoordinator {
                         email = opt.email,
                         password = opt.password,
                         email_password = opt.emailPassword,
+                        two_fa = twoFa,
                         api = opt.api,
                         is_login = if (PrefsStore.isManualFirstLoginDone(opt.username)) {
                             true
@@ -7107,6 +7124,31 @@ object AppCoordinator {
                 ApiService.getDeviceAssignedAccount(deviceId, alias)
             }
         }.getOrNull()
+
+    /** 手动模式旧缓存可能缺 two_fa：从账号列表补全并写回本机缓存。 */
+    private suspend fun resolveManualAccountTwoFa(
+        alias: String,
+        deviceId: String,
+        username: String,
+    ): String {
+        val resp = runCatching {
+            withContext(Dispatchers.IO) {
+                ApiService.getDeviceAssignedAccountsRoster(deviceId, alias)
+            }
+        }.getOrNull() ?: return ""
+        if (resp.code != 0) return ""
+        val twoFa = resp.items.orEmpty()
+            .firstOrNull {
+                it.username?.trim()?.removePrefix("@").equals(username, ignoreCase = true)
+            }
+            ?.two_fa
+            ?.trim()
+            .orEmpty()
+        if (twoFa.isNotBlank()) {
+            ManualDeviceControl.updateCachedAccountTwoFa(username, twoFa)
+        }
+        return twoFa
+    }
 
     /**
      * 涨粉拉取循环门禁（已登录前提下）：校验分配账号、执行一次性登录状态保障。
@@ -8093,12 +8135,17 @@ object AppCoordinator {
         val username = accountResp.username.orEmpty().trim()
         val email = accountResp.email.orEmpty().trim()
         val password = accountResp.password.orEmpty().trim()
+        val twoFa = accountResp.two_fa.orEmpty().trim()
         val api = accountResp.api.orEmpty().trim()
-        if (username.isBlank() || email.isBlank() || password.isBlank()) {
-            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（username/email/password）")
+        if (username.isBlank() || password.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（username/password）")
             return !strict
         }
-        if (api.isBlank()) {
+        if (twoFa.isBlank() && email.isBlank()) {
+            LogCenter.op(alias, "[OP][$opId] 自动登录($reason)：凭证不完整（需 email 或 2FA 密钥）")
+            return !strict
+        }
+        if (twoFa.isBlank() && api.isBlank()) {
             LogCenter.op(
                 alias,
                 "[OP][$opId] 自动登录($reason)：api 为空，将尝试通过邮箱管理模块获取验证码",
@@ -8141,6 +8188,7 @@ object AppCoordinator {
                     email = email,
                     password = password,
                     apiUrl = api,
+                    twoFa = twoFa,
                 ),
                 resumeFromLoginEntryScreen = resumeFromLoginEntryScreen,
                 flowKind = flowKind,
@@ -8164,6 +8212,7 @@ object AppCoordinator {
                                 email = email,
                                 password = password,
                                 apiUrl = api,
+                                twoFa = twoFa,
                             ),
                             resumeFromLoginEntryScreen = true,
                             flowKind = flowKind,

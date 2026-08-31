@@ -68,6 +68,27 @@ object ManualDeviceControl {
         return true
     }
 
+    /** 本机缓存同步云端 2FA 密钥（旧缓存缺字段时从列表补全）。 */
+    fun updateCachedAccountTwoFa(username: String, twoFa: String): Boolean {
+        val key = username.trim().removePrefix("@").lowercase()
+        if (key.isEmpty()) return false
+        val secret = twoFa.trim()
+        if (secret.isEmpty()) return false
+        val current = getCachedAccounts()
+        var changed = false
+        val next = current.map { opt ->
+            if (opt.username.trim().removePrefix("@").lowercase() != key) {
+                opt
+            } else {
+                changed = true
+                opt.copy(twoFa = secret)
+            }
+        }
+        if (!changed) return false
+        updateCachedAccounts(next)
+        return true
+    }
+
     /** 本机缓存同步云端邮箱字段（改邮后 update_email 成功回调）。 */
     fun updateCachedAccountEmail(
         username: String,
@@ -144,6 +165,7 @@ object ManualDeviceControl {
         val password: String = "",
         val email: String = "",
         val emailPassword: String = "",
+        val twoFa: String = "",
         val api: String = "",
         val backupPath: String = "",
         val backupName: String = "",
@@ -180,6 +202,7 @@ object ManualDeviceControl {
             password = item.password?.trim().orEmpty(),
             email = item.email?.trim().orEmpty(),
             emailPassword = item.email_password?.trim().orEmpty(),
+            twoFa = item.two_fa?.trim().orEmpty(),
             api = item.api?.trim().orEmpty(),
             backupPath = item.backup_path?.trim().orEmpty(),
             backupName = item.backup_name?.trim().orEmpty(),
@@ -201,6 +224,7 @@ object ManualDeviceControl {
             password = resp.password?.trim().orEmpty(),
             email = resp.email?.trim().orEmpty(),
             emailPassword = resp.email_password?.trim().orEmpty(),
+            twoFa = resp.two_fa?.trim().orEmpty(),
             api = resp.api?.trim().orEmpty(),
             rowIndex = resp.row_index,
             cloudIsLogin = resp.is_login,
@@ -220,6 +244,7 @@ object ManualDeviceControl {
                     put("password", a.password)
                     put("email", a.email)
                     put("emailPassword", a.emailPassword)
+                    put("twoFa", a.twoFa)
                     put("api", a.api)
                     put("backupPath", a.backupPath)
                     put("backupName", a.backupName)
@@ -249,6 +274,7 @@ object ManualDeviceControl {
                         password = o.optString("password"),
                         email = o.optString("email"),
                         emailPassword = o.optString("emailPassword"),
+                        twoFa = o.optString("twoFa"),
                         api = o.optString("api"),
                         backupPath = o.optString("backupPath"),
                         backupName = o.optString("backupName"),

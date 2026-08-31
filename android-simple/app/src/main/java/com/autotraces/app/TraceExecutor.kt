@@ -16864,6 +16864,287 @@ class RealTraceExecutor(
         return StrictLabelHit(Point(cx, midY), Rect(left, top.rect.bottom, right, bottom.rect.top))
     }
 
+    /** Enter password 页：标题或单 password 占位（排除布局 A/C/方式页）。 */
+    private fun visionHasEnterPasswordPage(vision: Text, screenH: Int = 0): Boolean {
+        if (findLabelHitContainingIgnoreCase(vision, "enter password") != null) return true
+        if (screenH > 0 && findSinglePasswordWithAccessThese(vision, screenH) != null) return false
+        if (findSinglePasswordAndNextHits(vision) != null) return false
+        if (visionHasPasswordAccessTheseMethod(vision)) return false
+        if (visionHasIdentityMethodSelectionPage(vision)) return false
+        return findAllPasswordLabelHits(vision).isNotEmpty()
+    }
+
+    /** Authenticator app 二步验证页。 */
+    private fun visionHasAuthenticatorAppPage(vision: Text): Boolean =
+        findLabelHitContainingIgnoreCase(vision, "authenticator app") != null ||
+            findLabelHitContainingIgnoreCase(vision, "2-step verification") != null ||
+            findLabelHitContainingIgnoreCase(vision, "2 step verification") != null
+
+    /**
+     * 布局 B：定位 password 输入区 → 输密 → 点 Continue。
+     * @param tapFieldBeforeInput false 时跳过点输入区（页面跳转后通常已聚焦）。
+     * @param tapTrustDevice 输密后、Continue 前是否尝试点 trust this device。
+     */
+    private suspend fun autoLoginEnterPasswordLayoutB(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        password: String,
+        tagPrefix: String,
+        tapFieldBeforeInput: Boolean = true,
+        tapTrustDevice: Boolean = false,
+    ): Boolean {
+        var passwordFieldReady = false
+        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+            if (hardStopOrNull(alias, "自动登录-布局B")) return false
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_layout_b_$pass") ?: continue
+            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局B定位", vision, h)
+            val field = findMiddlePasswordFieldHit(vision)
+            if (field != null) {
+                if (tapFieldBeforeInput) {
+                    val tap = autoLoginTapWithJitter(field.point, w, h)
+                    devOp(alias, "自动登录：布局 B 点输入区 (${tap.x},${tap.y})")
+                    runSuCommand("input tap ${tap.x} ${tap.y}")
+                    if (!autoLoginDelay(alias, 350L, "布局B-点输入区后")) return false
+                } else {
+                    devOp(alias, "自动登录：布局 B 跳过点输入区（默认已聚焦）")
+                }
+                passwordFieldReady = true
+                break
+            }
+            if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
+                autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "布局B")
+            }
+        }
+        if (!passwordFieldReady) {
+            devOp(alias, "自动登录：布局 B 密码输入区未定位")
+            return false
+        }
+        if (!autoLoginInputText(alias, password)) return false
+        if (!autoLoginDelay(alias, 400L, "布局B-输密码后")) return false
+        if (tapTrustDevice) {
+            var trustTapped = false
+            for (trustPass in 1..2) {
+                val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_trust_$trustPass") ?: continue
+                findLabelHitContainingIgnoreCase(vision, "trust this device")?.let { hit ->
+                    val tap = autoLoginTapWithJitter(hit.point, w, h)
+                    runSuCommand("input tap ${tap.x} ${tap.y}")
+                    trustTapped = true
+                    devOp(alias, "自动登录：布局 B 已点 trust this device")
+                }
+                if (trustTapped || trustPass == 2) break
+                autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "trust 补 OCR")
+            }
+        }
+        return autoLoginOcrTapByFinder(
+            ctx, alias, w, h, "${tagPrefix}_continue_layout_b", "Continue(布局B)",
+            findHit = { v ->
+                findStrictExactLabelHit(v, "Continue")
+                    ?: findStrictExactLabelHit(v, "continue")
+            },
+        ) == AutoLoginStepOutcome.Ok
+    }
+
+    /** Username 输入后：OCR 点 Continue 并等待 Enter password 页（最长 80s）。 */
+    private suspend fun autoLoginTapContinueAndWaitForEnterPasswordPage(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        tagPrefix: String,
+        timeoutMs: Long = AUTO_LOGIN_CUT_SWITCH_PAGE_TRANSITION_MS,
+    ): Boolean {
+        val startedAt = System.currentTimeMillis()
+        var pass = 0
+        var lastContinueTapAt = 0L
+        devOp(alias, "自动登录(2FA)：Username 后等待 Enter password 页（最长 ${timeoutMs / 1000}s）")
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            if (hardStopOrNull(alias, "自动登录-等待密码页")) return false
+            pass++
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass")
+            if (vision == null) {
+                if (!autoLoginDelay(alias, 1000L, "等待密码页")) return false
+                continue
+            }
+            if (visionHasEnterPasswordPage(vision, h)) {
+                devOp(alias, "自动登录(2FA)：已识别 Enter password 页（第 $pass 次 OCR）")
+                return true
+            }
+            val sawFacebook = findLabelHitContainingIgnoreCase(vision, "facebook") != null
+            val continueHit = findStrictExactLabelHit(vision, "Continue")
+                ?: findStrictExactLabelHit(vision, "continue")
+                ?: findLabelHitContainingIgnoreCase(vision, "continue")
+            val now = System.currentTimeMillis()
+            if (!sawFacebook &&
+                continueHit != null &&
+                now - lastContinueTapAt >= AUTO_LOGIN_EMAIL_CONTINUE_TAP_COOLDOWN_MS
+            ) {
+                val tap = autoLoginTapWithJitter(continueHit.point, w, h)
+                devOp(alias, "自动登录(2FA) Continue(Username后)：tap (${tap.x},${tap.y})")
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    lastContinueTapAt = now
+                    autoLoginDelay(alias, 600L, "Continue 点击后")
+                }
+            }
+            if (!autoLoginDelay(alias, 1000L, "等待密码页")) return false
+        }
+        devOp(alias, "自动登录(2FA)：Username→Continue 等待 Enter password 超时")
+        return false
+    }
+
+    /** 密码 Continue 后等待 Authenticator app 页（最长 80s）。 */
+    private suspend fun autoLoginWaitForAuthenticatorAppPage(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        tagPrefix: String,
+        timeoutMs: Long = AUTO_LOGIN_CUT_SWITCH_PAGE_TRANSITION_MS,
+    ): Boolean {
+        val startedAt = System.currentTimeMillis()
+        var pass = 0
+        var lastContinueTapAt = 0L
+        devOp(alias, "自动登录(2FA)：密码后等待 Authenticator 页（最长 ${timeoutMs / 1000}s）")
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            if (hardStopOrNull(alias, "自动登录-等待2FA页")) return false
+            pass++
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass")
+            if (vision == null) {
+                if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+                continue
+            }
+            if (visionHasAuthenticatorAppPage(vision)) {
+                devOp(alias, "自动登录(2FA)：已识别 Authenticator app 页（第 $pass 次 OCR）")
+                return true
+            }
+            val continueHit = findStrictExactLabelHit(vision, "Continue")
+                ?: findStrictExactLabelHit(vision, "continue")
+            val now = System.currentTimeMillis()
+            if (continueHit != null && now - lastContinueTapAt >= AUTO_LOGIN_EMAIL_CONTINUE_TAP_COOLDOWN_MS) {
+                val tap = autoLoginTapWithJitter(continueHit.point, w, h)
+                devOp(alias, "自动登录(2FA) Continue(密码后)：tap (${tap.x},${tap.y})")
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    lastContinueTapAt = now
+                    autoLoginDelay(alias, 600L, "Continue 点击后")
+                }
+            }
+            if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+        }
+        devOp(alias, "自动登录(2FA)：等待 Authenticator 页超时")
+        return false
+    }
+
+    /** Authenticator app：本地 TOTP → 输入 → Continue。 */
+    private suspend fun autoLoginEnterAuthenticatorAppCode(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        deviceId: String,
+        username: String,
+        twoFaSecret: String,
+        tagPrefix: String,
+    ): Boolean {
+        val codeResult = TikTokTwoFaCodeFetcher.fetchCode(
+            deviceId = deviceId,
+            alias = alias,
+            secret = twoFaSecret,
+            username = username,
+        )
+        val code = codeResult.getOrNull()?.trim().orEmpty()
+        if (code.isBlank()) {
+            devOp(alias, "自动登录(2FA)：获取 TOTP 失败：${codeResult.exceptionOrNull()?.message}")
+            return false
+        }
+        devOp(alias, "自动登录(2FA)：已获取 TOTP 验证码")
+        val focusVision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_focus")
+        autoLoginTapVerificationCodeField(ctx, alias, w, h, focusVision)
+        autoLoginClearFocusedInput(alias)
+        if (!autoLoginInputText(alias, code)) return false
+        if (!autoLoginDelay(alias, 400L, "2FA验证码输入后")) return false
+        if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "2FA")) return false
+        val continueOutcome = autoLoginOcrTapContinueOrNext(
+            ctx, alias, w, h,
+            "${tagPrefix}_continue",
+            "Continue(2FA)",
+            maxPasses = AUTO_LOGIN_OCR_MAX_PASSES,
+        )
+        if (continueOutcome == AutoLoginStepOutcome.Ok) return true
+        devOp(alias, "自动登录(2FA)：Continue 未命中，再试一次")
+        return autoLoginOcrTapContinueOrNext(
+            ctx, alias, w, h,
+            "${tagPrefix}_continue_retry",
+            "Continue(2FA-重试)",
+            maxPasses = 3,
+        ) == AutoLoginStepOutcome.Ok
+    }
+
+    /** 2FA 账号：Username → Password(布局B) → Authenticator → 兴趣页/Home。 */
+    private suspend fun runAutoLoginTwoFaUsernameChain(
+        ctx: Context,
+        alias: String,
+        deviceId: String,
+        w: Int,
+        h: Int,
+        username: String,
+        password: String,
+        twoFaSecret: String,
+        dontAllowHandledEarly: Boolean,
+    ): AutoLoginCutSwitchStepOutcome {
+        if (!autoLoginDelay(alias, 500L, "Username 输入前")) return AutoLoginCutSwitchStepOutcome.Failed
+        if (!autoLoginVerifyEmailFormReadyBeforeInput(ctx, alias)) {
+            devOp(alias, "自动登录(2FA)：Username 输入前未识别 address/username")
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        if (!autoLoginInputText(alias, username)) return AutoLoginCutSwitchStepOutcome.Failed
+        if (!autoLoginDelay(alias, 400L, "Username 输入后")) return AutoLoginCutSwitchStepOutcome.Failed
+        if (!autoLoginTapContinueAndWaitForEnterPasswordPage(
+                ctx, alias, w, h, "auto_login_2fa_wait_password",
+            )
+        ) {
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        if (!autoLoginEnterPasswordLayoutB(
+                ctx, alias, w, h, password, "auto_login_2fa_pwd",
+                tapFieldBeforeInput = false,
+            )
+        ) {
+            devOp(alias, "自动登录(2FA)：布局 B 输密码失败")
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        if (!autoLoginWaitForAuthenticatorAppPage(ctx, alias, w, h, "auto_login_2fa_wait_auth")) {
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        if (!autoLoginEnterAuthenticatorAppCode(
+                ctx, alias, w, h, deviceId, username, twoFaSecret, "auto_login_2fa_code",
+            )
+        ) {
+            devOp(alias, "自动登录(2FA)：输入 Authenticator 验证码失败")
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        var reachedInterest = false
+        var reachedHome = false
+        when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+            AutoLoginStepOutcome.ReachedInterest -> reachedInterest = true
+            AutoLoginStepOutcome.ReachedHome -> reachedHome = true
+            else -> {
+                devOp(alias, "自动登录(2FA)：2FA 提交后路由探测失败")
+                return AutoLoginCutSwitchStepOutcome.ChainRestart
+            }
+        }
+        return if (
+            autoLoginCutSwitchFinishLoginTail(
+                ctx, alias, w, h, reachedInterest, reachedHome, dontAllowHandledEarly,
+            )
+        ) {
+            devOp(alias, "自动登录(2FA)：全流程完成（Profile→Edit 终检通过）")
+            AutoLoginCutSwitchStepOutcome.Ok
+        } else {
+            AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+    }
+
     /** 新版密码页格局：同屏仅 1 个 password + 1 个 next。 */
     private fun findSinglePasswordAndNextHits(result: Text): Pair<StrictLabelHit, StrictLabelHit>? {
         val pw = findAllPasswordLabelHits(result)
@@ -19283,33 +19564,9 @@ class RealTraceExecutor(
             return true
         }
         devOp(alias, "自动登录(切号)：布局 A/C 未命中，转布局 B")
-        var passwordFieldReady = false
-        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
-            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_layout_b_$pass") ?: continue
-            autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "切号-布局B定位", vision, h)
-            val field = findMiddlePasswordFieldHit(vision)
-            if (field != null) {
-                val tap = autoLoginTapWithJitter(field.point, w, h)
-                runSuCommand("input tap ${tap.x} ${tap.y}")
-                passwordFieldReady = true
-                break
-            }
-            if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
-                autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "切号-布局B")
-            }
-        }
-        if (!passwordFieldReady) {
-            devOp(alias, "自动登录(切号)：布局 B 密码输入区未定位")
-            return false
-        }
-        if (!autoLoginInputText(alias, password)) return false
-        return autoLoginOcrTapByFinder(
-            ctx, alias, w, h, "${tagPrefix}_continue_layout_b", "Continue(切号-布局B)",
-            findHit = { v ->
-                findStrictExactLabelHit(v, "Continue")
-                    ?: findStrictExactLabelHit(v, "continue")
-            },
-        ) == AutoLoginStepOutcome.Ok
+        return autoLoginEnterPasswordLayoutB(
+            ctx, alias, w, h, password, tagPrefix, tapFieldBeforeInput = true,
+        )
     }
 
     private suspend fun autoLoginCutSwitchInboxPasswordPath(
@@ -20144,49 +20401,13 @@ class RealTraceExecutor(
                 passwordContinueDone = true
             } else {
                 devOp(alias, "自动登录：布局A/C 均未满足，转布局B")
-                var passwordFieldReady = false
-                for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
-                    val vision = autoLoginOcrOnce(ctx, alias, "auto_login_password_$pass") ?: continue
-                    autoLoginLogPasswordLayoutProbe(alias, pass, AUTO_LOGIN_OCR_MAX_PASSES, "布局B定位", vision, h)
-                    val field = findMiddlePasswordFieldHit(vision)
-                    if (field != null) {
-                        val tap = autoLoginTapWithJitter(field.point, w, h)
-                        runSuCommand("input tap ${tap.x} ${tap.y}")
-                        passwordFieldReady = true
-                        break
-                    }
-                    if (pass < AUTO_LOGIN_OCR_MAX_PASSES) {
-                        autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "Password 定位")
-                    }
-                }
-                if (!passwordFieldReady) {
+                if (!autoLoginEnterPasswordLayoutB(
+                        ctx, alias, w, h, password, "auto_login_pwd",
+                        tapFieldBeforeInput = true,
+                        tapTrustDevice = true,
+                    )
+                ) {
                     devOp(alias, "自动登录：Password 输入区未定位")
-                    return AutoLoginCutSwitchStepOutcome.Failed
-                }
-                if (!autoLoginInputText(alias, password)) return AutoLoginCutSwitchStepOutcome.Failed
-
-                var trustTapped = false
-                for (trustPass in 1..2) {
-                    val vision = autoLoginOcrOnce(ctx, alias, "auto_login_trust_$trustPass") ?: continue
-                    findLabelHitContainingIgnoreCase(vision, "trust this device")?.let { hit ->
-                        val tap = autoLoginTapWithJitter(hit.point, w, h)
-                        runSuCommand("input tap ${tap.x} ${tap.y}")
-                        trustTapped = true
-                        devOp(alias, "自动登录：已点 trust this device")
-                    }
-                    if (trustTapped || trustPass == 2) break
-                    autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "trust 补 OCR")
-                }
-
-                val continuePwd = autoLoginOcrTapByFinder(
-                    ctx, alias, w, h, "auto_login_continue_pwd", "Continue(密码页)",
-                    findHit = { v ->
-                        findStrictExactLabelHit(v, "Continue")
-                            ?: findStrictExactLabelHit(v, "continue")
-                    },
-                )
-                if (continuePwd != AutoLoginStepOutcome.Ok) {
-                    devOp(alias, "自动登录：密码页 Continue 未命中")
                     return AutoLoginCutSwitchStepOutcome.Failed
                 }
                 passwordContinueDone = true
@@ -20500,12 +20721,22 @@ class RealTraceExecutor(
     ): Boolean {
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "auto_login"
         val deviceId = PrefsStore.getDeviceId().orEmpty()
+        val username = credentials.username.trim()
         val email = credentials.email.trim()
         val password = credentials.password.trim()
+        val twoFa = credentials.twoFa.trim()
         val apiUrl = credentials.apiUrl.trim()
-        if (email.isBlank() || password.isBlank()) {
-            devOp(alias, "自动登录：Email 或 Password 为空，跳过")
-            return false
+        val useTwoFaUsernamePath = twoFa.isNotBlank()
+        when {
+            username.isBlank() || password.isBlank() -> {
+                devOp(alias, "自动登录：Username 或 Password 为空，跳过")
+                return false
+            }
+            useTwoFaUsernamePath -> Unit
+            email.isBlank() -> {
+                devOp(alias, "自动登录：Email 为空且无 2FA 密钥，跳过")
+                return false
+            }
         }
 
         val dm = ctx.resources.displayMetrics
@@ -20517,9 +20748,10 @@ class RealTraceExecutor(
             AutoLoginFlow.CutSwitchAfterRestore -> "未登录分流"
             AutoLoginFlow.Default -> "默认"
         }
+        val pathLabel = if (useTwoFaUsernamePath) "2FA用户名" else "邮箱"
         devOp(
             alias,
-            "自动登录：开始（账号=${credentials.username}，流程=$flowLabel，整链重来最多 $AUTO_LOGIN_MAX_CHAIN_RESTARTS 轮）",
+            "自动登录：开始（账号=${credentials.username}，路径=$pathLabel，流程=$flowLabel，整链重来最多 $AUTO_LOGIN_MAX_CHAIN_RESTARTS 轮）",
         )
 
         autoLoginChainInProgress = true
@@ -20681,6 +20913,34 @@ class RealTraceExecutor(
                     }
                 }
 
+            }
+
+            if (useTwoFaUsernamePath) {
+                when (
+                    runAutoLoginTwoFaUsernameChain(
+                        ctx = ctx,
+                        alias = alias,
+                        deviceId = deviceId,
+                        w = w,
+                        h = h,
+                        username = username,
+                        password = password,
+                        twoFaSecret = twoFa,
+                        dontAllowHandledEarly = dontAllowHandledEarly,
+                    )
+                ) {
+                    AutoLoginCutSwitchStepOutcome.Ok -> {
+                        if (accountStatusReloginInProgress) {
+                            clearAccountStatusReloginState()
+                        }
+                        return true
+                    }
+                    AutoLoginCutSwitchStepOutcome.ChainRestart -> {
+                        devOp(alias, "自动登录(2FA)：阶段失败，整链重来")
+                        continue
+                    }
+                    AutoLoginCutSwitchStepOutcome.Failed -> return false
+                }
             }
 
             if (!autoLoginDelay(alias, 500L, "Email 输入前")) return false

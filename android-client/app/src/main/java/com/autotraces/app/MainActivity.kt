@@ -237,7 +237,10 @@ class MainActivity : AppCompatActivity() {
         val apiBlank = account.api.isNullOrBlank()
         val emailPresent = !account.email.isNullOrBlank()
         val mailModuleOk = account.mail_module_code_available == true
+        val twoFaPresent = !account.two_fa.isNullOrBlank()
         binding.assignedCopyStatusText.text = when {
+            twoFaPresent ->
+                "已加载：${account.username.orEmpty()}（本地 2FA 可用，点下方按钮获取验证码）"
             apiBlank && emailPresent && !mailModuleOk ->
                 "已加载：${account.username.orEmpty()}（邮箱模块未配置该邮箱 OAuth，请在管理台「邮箱账户管理」导入）"
             apiBlank && emailPresent && mailModuleOk ->
@@ -276,10 +279,43 @@ class MainActivity : AppCompatActivity() {
 
         binding.fetchTikTokCodeButton.setOnClickListener {
             lifecycleScope.launch {
-                val apiUrl = binding.assignedApiInput.text?.toString().orEmpty().trim()
-                val accountEmail = binding.assignedEmailInput.text?.toString().orEmpty().trim()
+                val twoFaSecret = assignedAccount?.two_fa.orEmpty().trim()
+                val username = binding.assignedUsernameInput.text?.toString().orEmpty().trim()
                 val deviceId = PrefsStore.getDeviceId().orEmpty()
                 val alias = PrefsStore.getAlias().orEmpty().trim()
+
+                if (twoFaSecret.isNotBlank()) {
+                    binding.fetchTikTokCodeButton.isEnabled = false
+                    binding.assignedCopyStatusText.text = "正在本地计算 2FA 验证码…"
+                    val result = withContext(Dispatchers.IO) {
+                        TikTokTwoFaCodeFetcher.fetchCode(
+                            deviceId = deviceId,
+                            alias = alias,
+                            secret = twoFaSecret,
+                            username = username,
+                        )
+                    }
+                    binding.fetchTikTokCodeButton.isEnabled = true
+                    val code = result.getOrNull()
+                    if (code.isNullOrBlank()) {
+                        val msg = result.exceptionOrNull()?.message ?: "未生成 2FA 验证码"
+                        binding.assignedCopyStatusText.text = "2FA 获取失败：$msg"
+                        return@launch
+                    }
+                    copy("2FA Code", code)
+                    val remaining = runCatching {
+                        TotpCodeGenerator.generate(twoFaSecret).remainingSec
+                    }.getOrNull()
+                    binding.assignedCopyStatusText.text = if (remaining != null) {
+                        "2FA 成功：$code（剩余 ${remaining}s，已复制）"
+                    } else {
+                        "2FA 成功：$code（已复制）"
+                    }
+                    return@launch
+                }
+
+                val apiUrl = binding.assignedApiInput.text?.toString().orEmpty().trim()
+                val accountEmail = binding.assignedEmailInput.text?.toString().orEmpty().trim()
 
                 if (apiUrl.isBlank() && accountEmail.isBlank()) {
                     binding.assignedCopyStatusText.text = "邮箱为空且 API 为空：无法获取验证码"
@@ -324,7 +360,7 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
                 copy("TikTok Code", code)
-                binding.assignedCopyStatusText.text = "获取成功：$code（已复制）"
+                binding.assignedCopyStatusText.text = "邮箱验证码成功：$code（已复制）"
             }
         }
 

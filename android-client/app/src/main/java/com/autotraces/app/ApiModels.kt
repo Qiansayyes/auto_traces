@@ -58,6 +58,16 @@ data class TikTokEmailCodeResponse(
     val email_code: String? = null,
 )
 
+data class TikTokTwoFaCodeResponse(
+    val code: Int,
+    val msg: String,
+    val two_fa_code: String? = null,
+    val source: String? = null,
+    val period: Int? = null,
+    val remaining_sec: Int? = null,
+    val username: String? = null,
+)
+
 /** 与 web-admin `switchRunMode` / 服务端 `RunModeRequest` 一致，仅使用精确字面量比较，禁止 contains 模糊匹配。 */
 object ServerRunMode {
     const val GROWTH = "growth"
@@ -423,6 +433,7 @@ data class DeviceAssignedAccountResponse(
     val email: String? = null,
     val password: String? = null,
     val email_password: String? = null,
+    val two_fa: String? = null,
     val api: String? = null,
     val is_login: Boolean? = null,
     val login_time: String? = null,
@@ -457,6 +468,8 @@ data class TikTokAutoLoginCredentials(
     val email: String,
     val password: String,
     val apiUrl: String,
+    /** Base32 TOTP 密钥；非空时走 Username→Password→Authenticator 登录链。 */
+    val twoFa: String = "",
 )
 
 data class RuntimeState(
@@ -617,6 +630,7 @@ data class AutoSwitchAccount(
     val email: String? = null,
     val password: String? = null,
     val email_password: String? = null,
+    val two_fa: String? = null,
     val api: String? = null,
     val is_login: Boolean? = null,
     val login_time: String? = null,

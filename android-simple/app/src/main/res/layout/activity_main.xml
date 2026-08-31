@@ -734,7 +734,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="10dp"
-                    android:text="获取邮箱验证码并复制" />
+                    android:text="获取验证码并复制" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/fetchTikTokTwoFaCodeButton"
@@ -742,6 +742,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
+                    android:visibility="gone"
                     android:text="获取2FA验证码并复制" />
 
                 <TextView
