@@ -8,6 +8,7 @@ import com.autotraces.app.PendingActivateRecommend
 import com.autotraces.app.PrefsStore
 import com.autotraces.app.WorkerService
 import com.autotraces.app.WorkerServiceTracker
+import com.autotraces.app.ApiService
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -40,6 +41,8 @@ object SimpleRemoteControl {
             .put("bound", PrefsStore.isBound())
             .put("deviceId", PrefsStore.getDeviceId().orEmpty())
             .put("alias", PrefsStore.getAlias().orEmpty())
+            .put("cloudUsername", PrefsStore.getAuthUsername().orEmpty())
+            .put("cloudLoggedIn", !PrefsStore.getAuthToken().isNullOrBlank())
             .put("selectedUsername", selected)
             .put("activeUsername", active)
             .put("accountAligned", AppCoordinator.isManualAccountAligned())
@@ -105,6 +108,46 @@ object SimpleRemoteControl {
                 AppCoordinator.startIfNeeded()
                 AppCoordinator.refreshRuntimeSnapshot()
                 ok("已请求硬停（当前步骤结束后停下）")
+            }
+
+            "set_cloud_auth" -> {
+                val username = body.optString("cloud_username", "").trim()
+                    .ifBlank { body.optString("username", "").trim() }
+                val password = body.optString("cloud_password", "").trim()
+                    .ifBlank { body.optString("password", "") }
+                if (username.isBlank() || password.isBlank()) {
+                    return fail("credentials_required", "请提供 cloud_username 与 cloud_password")
+                }
+                val alias = PrefsStore.getAlias().orEmpty()
+                LogCenter.op(alias.ifBlank { null }, "PC USB：正在写入云端账号 @$username 并登录…")
+                val loginResult = kotlinx.coroutines.runBlocking {
+                    runCatching { ApiService.login(username, password) }
+                }
+                loginResult.fold(
+                    onSuccess = { resp ->
+                        if (resp.code == 0 && !resp.token.isNullOrBlank()) {
+                            PrefsStore.saveAuthToken(resp.token!!, resp.username ?: username)
+                            PrefsStore.saveAuthPassword(password)
+                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
+                            AppCoordinator.refreshRuntimeSnapshot()
+                            LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录成功 @$username")
+                            JSONObject()
+                                .put("success", true)
+                                .put("message", "云端账号已写入并登录成功")
+                                .put("cloudUsername", resp.username ?: username)
+                                .put("cloudLoggedIn", true)
+                        } else {
+                            val msg = resp.msg?.trim().orEmpty().ifBlank { "登录失败 code=${resp.code}" }
+                            LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录失败：$msg")
+                            fail("login_failed", msg)
+                        }
+                    },
+                    onFailure = { err ->
+                        val msg = err.message?.trim().orEmpty().ifBlank { "登录异常" }
+                        LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录异常：$msg")
+                        fail("login_error", msg)
+                    },
+                )
             }
 
             "refresh_accounts" -> {
