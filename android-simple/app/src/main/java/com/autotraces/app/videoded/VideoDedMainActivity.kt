@@ -330,10 +330,17 @@ class VideoDedMainActivity : ComponentActivity() {
     }
 
     private suspend fun applyRegistrationUi(result: VideoDedSettingsRegistrar.SaveAndRegisterResult, verbose: Boolean) {
+        if (CompanionApi.isUsbPcTunnelActive()) {
+            statusView.text = "状态：USB 已直连 PC（走 adb 隧道，无需 WiFi / 不用改上方地址）"
+            if (verbose) {
+                Toast.makeText(this@VideoDedMainActivity, "USB 已连接 PC，批量操作请直接在电脑网页执行", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
         if (result.error != null) {
             val reason = explainWindowsServiceFailure(result.error)
             Log.e(TAG, "registration failed reason=$reason", result.error)
-            statusView.text = "状态：无法连接 Windows 服务（$reason）"
+            statusView.text = "状态：未连上 PC（$reason）。USB 已插时请先在电脑打开 VideoDed 网页操作，会自动建隧道"
             if (verbose) {
                 Toast.makeText(this@VideoDedMainActivity, "注册失败：$reason", Toast.LENGTH_LONG).show()
             }

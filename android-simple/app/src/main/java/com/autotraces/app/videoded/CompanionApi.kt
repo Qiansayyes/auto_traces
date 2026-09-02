@@ -206,6 +206,9 @@ object CompanionApi {
         }
     }
 
+    /** USB 已 adb reverse 时，手机经 127.0.0.1:5088 可达 PC，无需 WiFi / 局域网地址。 */
+    fun isUsbPcTunnelActive(): Boolean = probeUsbLoopbackCompanion()
+
     private fun probeUsbLoopbackCompanion(): Boolean {
         return try {
             val client = OkHttpClient.Builder()

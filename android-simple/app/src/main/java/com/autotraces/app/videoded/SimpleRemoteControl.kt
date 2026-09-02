@@ -1,14 +1,16 @@
 package com.autotraces.app.videoded
 
 import android.content.Context
+import com.autotraces.app.ApiService
 import com.autotraces.app.AppCoordinator
+import com.autotraces.app.BindingRecovery
+import com.autotraces.app.DeviceFingerprint
 import com.autotraces.app.LogCenter
 import com.autotraces.app.ManualDeviceControl
 import com.autotraces.app.PendingActivateRecommend
 import com.autotraces.app.PrefsStore
 import com.autotraces.app.WorkerService
 import com.autotraces.app.WorkerServiceTracker
-import com.autotraces.app.ApiService
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -88,6 +90,10 @@ object SimpleRemoteControl {
         return when (action) {
             "status" -> buildStatus()
 
+            "ensure_usb_ready" -> kotlinx.coroutines.runBlocking {
+                ensureUsbReady(app, body)
+            }
+
             "start_service" -> {
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
                 WorkerService.startResumingAutomation(app)
@@ -119,35 +125,15 @@ object SimpleRemoteControl {
                     return fail("credentials_required", "请提供 cloud_username 与 cloud_password")
                 }
                 val alias = PrefsStore.getAlias().orEmpty()
-                LogCenter.op(alias.ifBlank { null }, "PC USB：正在写入云端账号 @$username 并登录…")
-                val loginResult = kotlinx.coroutines.runBlocking {
-                    runCatching { ApiService.login(username, password) }
-                }
-                loginResult.fold(
-                    onSuccess = { resp ->
-                        if (resp.code == 0 && !resp.token.isNullOrBlank()) {
-                            PrefsStore.saveAuthToken(resp.token!!, resp.username ?: username)
-                            PrefsStore.saveAuthPassword(password)
-                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
-                            AppCoordinator.refreshRuntimeSnapshot()
-                            LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录成功 @$username")
-                            JSONObject()
-                                .put("success", true)
-                                .put("message", "云端账号已写入并登录成功")
-                                .put("cloudUsername", resp.username ?: username)
-                                .put("cloudLoggedIn", true)
-                        } else {
-                            val msg = resp.msg?.trim().orEmpty().ifBlank { "登录失败 code=${resp.code}" }
-                            LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录失败：$msg")
-                            fail("login_failed", msg)
-                        }
-                    },
-                    onFailure = { err ->
-                        val msg = err.message?.trim().orEmpty().ifBlank { "登录异常" }
-                        LogCenter.op(alias.ifBlank { null }, "PC USB：云端登录异常：$msg")
-                        fail("login_error", msg)
-                    },
-                )
+                PrefsStore.saveAuthCredentials(username, password)
+                AppCoordinator.refreshRuntimeSnapshot()
+                LogCenter.op(alias.ifBlank { null }, "PC USB：已写入云端账号 @$username（待联网后登录）")
+                return JSONObject()
+                    .put("success", true)
+                    .put("message", "账号密码已写入手机，联网后请在设置中点「登录云端」")
+                    .put("cloudUsername", username)
+                    .put("cloudLoggedIn", false)
+                    .put("credentialsSaved", true)
             }
 
             "refresh_accounts" -> {
@@ -744,6 +730,71 @@ object SimpleRemoteControl {
         }
         return null
     }
+
+    private suspend fun ensureUsbReady(context: Context, body: JSONObject): JSONObject {
+        val aliasHint = body.optString("alias", "").trim()
+        BindingRecovery.tryRecoverFromCloud(context)
+        if (!PrefsStore.isBound()) {
+            if (PrefsStore.getAuthToken().isNullOrBlank()) {
+                return fail(
+                    "cloud_auth_required",
+                    "请先在网页「批量写入账号」，或在本机设置中登录云端",
+                )
+            }
+            val alias = resolveBindAlias(context, aliasHint)
+            val bindResp = runCatching {
+                ApiService.bindDevice(alias, DeviceFingerprint.fromContext(context))
+            }.getOrElse { err ->
+                return fail("bind_error", err.message ?: "绑定请求异常")
+            }
+            if (bindResp.code != 0 || bindResp.device_id.isNullOrBlank()) {
+                return fail(
+                    "bind_failed",
+                    bindResp.msg.ifBlank { "绑定失败 code=${bindResp.code}" },
+                )
+            }
+            PrefsStore.saveBinding(bindResp.device_id!!, alias)
+            PrefsStore.markBindingRefreshedNow()
+            LogCenter.op(alias, "PC USB：云端绑定成功 ${bindResp.device_id}")
+        }
+
+        val regResult = VideoDedSettingsRegistrar.saveAndRegister(
+            context,
+            VideoDedSettingsRegistrar.SaveInput(),
+            triggerWirelessIfNeeded = false,
+            retryRootAdbIfNeeded = false,
+            logSave = false,
+            logRegistration = false,
+        )
+        val regJson = regResult.registration
+        val regErr = regResult.error?.message?.trim().orEmpty()
+        return JSONObject()
+            .put("success", true)
+            .put("message", if (regErr.isEmpty()) "USB 就绪（已绑定并向 PC 注册）" else "已绑定；PC 注册：$regErr")
+            .put("bound", PrefsStore.isBound())
+            .put("deviceId", PrefsStore.getDeviceId().orEmpty())
+            .put("alias", PrefsStore.getAlias().orEmpty())
+            .put("pcRegistered", regJson != null)
+            .put("registration", regJson ?: JSONObject.NULL)
+    }
+
+    private fun resolveBindAlias(context: Context, hint: String): String {
+        val trimmed = hint.trim()
+        if (trimmed.isNotEmpty() && ALIAS_PATTERN.matches(trimmed)) return trimmed
+        val androidId = runCatching {
+            android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                android.provider.Settings.Secure.ANDROID_ID,
+            )
+        }.getOrNull().orEmpty()
+        val raw = (trimmed.ifEmpty { androidId })
+            .replace(Regex("[^A-Za-z0-9_]"), "_")
+            .take(20)
+            .ifBlank { "phone" }
+        return if (raw.first().isDigit()) "d_$raw".take(20) else raw
+    }
+
+    private val ALIAS_PATTERN = Regex("^[A-Za-z0-9_]{1,20}$")
 
     private fun ok(message: String): JSONObject =
         JSONObject().put("success", true).put("message", message)

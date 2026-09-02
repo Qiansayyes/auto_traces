@@ -84,6 +84,13 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        binding.cloudUsernameInput.setText(PrefsStore.getAuthUsername().orEmpty())
+        binding.cloudPasswordInput.setText(PrefsStore.getAuthPassword().orEmpty())
+        renderDeviceInfo()
+    }
+
     private fun renderDeviceInfo() {
         binding.deviceInfoText.text = buildString {
             appendLine("版本: ${AppInfo.versionLabel()}")
@@ -91,10 +98,11 @@ class SettingsActivity : AppCompatActivity() {
             appendLine("Device ID: ${PrefsStore.getDeviceId() ?: "-"}")
             appendLine("Local Status: ${PrefsStore.getLocalStatus()}")
             val au = PrefsStore.getAuthUsername()
-            if (!au.isNullOrBlank()) {
-                append("云端账号: $au（已登录）")
-            } else {
-                append("云端账号: 未登录")
+            val loggedIn = !PrefsStore.getAuthToken().isNullOrBlank()
+            when {
+                loggedIn && !au.isNullOrBlank() -> append("云端账号: $au（已登录）")
+                !au.isNullOrBlank() -> append("云端账号: $au（已填写，请点登录云端）")
+                else -> append("云端账号: 未登录")
             }
         }
     }

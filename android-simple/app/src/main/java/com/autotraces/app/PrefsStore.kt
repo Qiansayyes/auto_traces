@@ -264,6 +264,15 @@ object PrefsStore {
             .apply()
     }
 
+    /** 仅写入账号密码，不登录；连上网络后由用户在设置页点「登录云端」。 */
+    fun saveAuthCredentials(username: String, password: String) {
+        prefs.edit()
+            .putString(KEY_AUTH_USERNAME, username.trim())
+            .putString(KEY_AUTH_PASSWORD, password)
+            .remove(KEY_AUTH_TOKEN)
+            .apply()
+    }
+
     fun saveAuthPassword(password: String) {
         prefs.edit()
             .putString(KEY_AUTH_PASSWORD, password)
