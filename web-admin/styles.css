@@ -679,6 +679,60 @@ select.device-group-select.ui-select {
   font-size: 13px;
 }
 
+.import-preview-toolbar-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+.import-preview-smart-alias {
+  position: relative;
+}
+
+.import-preview-smart-alias-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 220px;
+  max-width: min(320px, 70vw);
+  max-height: 240px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+.import-preview-smart-alias-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.import-preview-smart-alias-list {
+  max-height: 180px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-preview-smart-alias-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.import-preview-smart-alias-item:hover {
+  background: #f3f5f9;
+}
+
 .import-preview-table-wrap {
   flex: 1 1 auto;
   min-height: 180px;

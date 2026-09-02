@@ -38,7 +38,7 @@
         <h3>批量导入预览</h3>
         <button id="closeAccountBatchPreviewBtn" type="button" class="modal-close" aria-label="关闭">×</button>
       </div>
-      <p class="modal-hint">解析结果如下。请勾选要导入的记录，可在上方填写批量别名（点「应用到选中」或确定导入时自动写入），确认后再写入账号记录表。</p>
+      <p class="modal-hint">解析结果如下。请勾选要导入的记录，可单个别名批量写入，或使用「智能分配」多选别名后平均分配给选中账号，确认后再写入账号记录表。</p>
       <div class="import-preview-toolbar">
         <label class="import-preview-select-all">
           <input id="accountBatchPreviewSelectAll" type="checkbox" checked />
@@ -48,6 +48,19 @@
         <input id="accountBatchPreviewBulkAlias" list="accountBatchPreviewBulkAliasList" class="ui-input ui-input--modal" type="text" placeholder="选择或输入别名" autocomplete="off" />
         <datalist id="accountBatchPreviewBulkAliasList"></datalist>
         <button id="accountBatchPreviewApplyAliasBtn" type="button" class="ghost">应用到选中</button>
+        <span class="import-preview-toolbar-divider" aria-hidden="true"></span>
+        <label class="toolbar-field-label">智能分配</label>
+        <div class="import-preview-smart-alias">
+          <button id="accountBatchPreviewSmartAliasToggleBtn" type="button" class="ghost">选择别名</button>
+          <div id="accountBatchPreviewSmartAliasPanel" class="import-preview-smart-alias-panel hidden">
+            <div class="import-preview-smart-alias-actions">
+              <button id="accountBatchPreviewSmartAliasSelectAllBtn" type="button" class="ghost">全选</button>
+              <button id="accountBatchPreviewSmartAliasClearBtn" type="button" class="ghost">清空</button>
+            </div>
+            <div id="accountBatchPreviewSmartAliasList" class="import-preview-smart-alias-list"></div>
+          </div>
+        </div>
+        <button id="accountBatchPreviewSmartDistributeBtn" type="button" class="ghost">平均分配</button>
         <span id="accountBatchPreviewSummary" class="hint"></span>
       </div>
       <div id="accountBatchPreviewTableWrap" class="import-preview-table-wrap"></div>
