@@ -78,10 +78,19 @@ object PrefsStore {
     private const val KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES = "manual_activate_for_you_minutes_json"
     /** 各账号最近一次加入待活跃队列时间（epoch ms）。 */
     private const val KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT = "manual_pending_activate_enqueue_at_json"
-    /** 待活跃未完成会话：username → 剩余秒数（中断后续跑，不切号）。 */
+    /** 待活跃未完成会话：username → 剩余秒数（中断后续跑不切号；下机休息后轮转再补）。 */
     private const val KEY_MANUAL_ACTIVATE_SESSION_REMAINING = "manual_activate_session_remaining_json"
     /** 与剩余秒数配套的 plannedMin；改「活跃时长」后不再沿用旧续跑。 */
     private const val KEY_MANUAL_ACTIVATE_SESSION_PLANNED_MIN = "manual_activate_session_planned_min_json"
+    /**
+     * 刚完成一段连续活跃并下机休息的账号。
+     * 自动活跃应切下一号，不要因剩余总时长立刻续跑本号。
+     */
+    private const val KEY_MANUAL_ACTIVATE_STINT_REST_SKIP = "manual_activate_stint_rest_skip_user"
+    /** 待活跃单次连续上机最短时长（秒）。 */
+    const val ACTIVATE_ONLINE_STINT_MIN_SEC: Int = 30 * 60
+    /** 待活跃单次连续上机最长时长（秒）。 */
+    const val ACTIVATE_ONLINE_STINT_MAX_SEC: Int = 58 * 60
     /** 三天总赞增长 ≤ 该阈值则推荐入待活跃队列。 */
     private const val KEY_PENDING_ACTIVATE_HEART_GROWTH_MAX = "pending_activate_heart_growth_max"
     const val DEFAULT_PENDING_ACTIVATE_HEART_GROWTH_MAX: Int = 10
@@ -1680,6 +1689,25 @@ object PrefsStore {
             return
         }
         setActivateSessionRemaining(username, 0, getManualActivateDurationMin())
+    }
+
+    fun markActivateStintRestSkip(username: String) {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return
+        prefs.edit().putString(KEY_MANUAL_ACTIVATE_STINT_REST_SKIP, u).apply()
+    }
+
+    fun getActivateStintRestSkipUsername(): String =
+        prefs.getString(KEY_MANUAL_ACTIVATE_STINT_REST_SKIP, "")?.trim().orEmpty()
+
+    fun clearActivateStintRestSkip() {
+        prefs.edit().remove(KEY_MANUAL_ACTIVATE_STINT_REST_SKIP).apply()
+    }
+
+    fun shouldSkipActivateResume(username: String): Boolean {
+        val skip = getActivateStintRestSkipUsername()
+        if (skip.isEmpty()) return false
+        return skip.equals(username.trim().removePrefix("@"), ignoreCase = true)
     }
 
     private fun getActivateSessionPlannedMinMap(): Map<String, Int> {

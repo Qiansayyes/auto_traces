@@ -2118,14 +2118,44 @@ object AppCoordinator {
         }
     }
 
-    /** 本机在队列中且仍有未完成活跃时长 → 优先续跑当前号。 */
+    /** 本机在队列中且仍有未完成活跃时长 → 优先续跑当前号（刚下机休息的号除外，应切下一号）。 */
     private fun resolveActivateResumeTarget(queue: List<String>, plannedMin: Int): String? {
         val active = ManualDeviceControl.activeManualUsername().trim().removePrefix("@")
         if (active.isBlank()) return null
+        if (PrefsStore.shouldSkipActivateResume(active)) return null
         val remaining = PrefsStore.getActivateSessionRemainingSec(active, plannedMin) ?: 0
         if (remaining <= 0) return null
         if (!queue.any { it.equals(active, ignoreCase = true) }) return null
         return active
+    }
+
+    private enum class ActivatePhaseResult {
+        /** 总计划时长已跑完。 */
+        PLANNED_DONE,
+        /** 本段连续活跃结束并下机，剩余总时长待轮转后再补。 */
+        STINT_REST,
+        /** 中断（硬停等），同号可续跑。 */
+        INCOMPLETE,
+    }
+
+    /** 待活跃：总剩余超过 58 分钟时，本段只随机跑 30–58 分钟。 */
+    private fun resolveActivateOnlineDurationSec(remainingTotalSec: Int, splitOnlineStint: Boolean): Int {
+        if (!splitOnlineStint) return remainingTotalSec
+        if (remainingTotalSec <= PrefsStore.ACTIVATE_ONLINE_STINT_MAX_SEC) return remainingTotalSec
+        return Random.nextInt(
+            PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC,
+            PrefsStore.ACTIVATE_ONLINE_STINT_MAX_SEC + 1,
+        )
+    }
+
+    private fun rotateQueueAfterActivateStint(target: String, restSkip: Boolean) {
+        if (target.equals(PrefsStore.peekPendingActivateUsername(), ignoreCase = true)) {
+            PrefsStore.rotatePendingActivateQueueFrontToBack()
+        }
+        if (restSkip) {
+            PrefsStore.markActivateStintRestSkip(target)
+        }
+        notifyManualAccountUi()
     }
 
     private fun formatActivateDurationLabel(minutes: Int): String {
@@ -2151,27 +2181,32 @@ object AppCoordinator {
 
     /**
      * 随机 For You 预滑 / 涨粉一段时间；成功后累加账号活跃总时长。
+     * [splitOnlineStint] 为 true 时：总剩余超过 58 分钟则本段只连续跑 30–58 分钟，然后下机把剩余留给后续补时。
      * 中断时保存剩余秒数，下次同号在队列内可直接续跑而不切号。
-     * @return 是否完整跑完计划时长（true=可切下一号）。
      */
     private suspend fun runRandomActivatePhase(
         target: String,
         minutes: Int,
         logTag: String,
-    ): Boolean {
+        splitOnlineStint: Boolean = false,
+    ): ActivatePhaseResult {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         val plannedSec = minutes * 60
-        val durationSec = PrefsStore.getActivateSessionRemainingSec(target, minutes)?.takeIf { it > 0 }
+        val remainingTotalSec = PrefsStore.getActivateSessionRemainingSec(target, minutes)?.takeIf { it > 0 }
             ?: plannedSec
-        val resuming = durationSec < plannedSec
+        val durationSec = resolveActivateOnlineDurationSec(remainingTotalSec, splitOnlineStint)
+        val resuming = remainingTotalSec < plannedSec
+        val stintRestPlanned = splitOnlineStint && durationSec < remainingTotalSec
         PrefsStore.setLogContextUsername(target)
         val useForYou = Random.nextBoolean()
         val modeLabel = if (useForYou) "For You 预滑" else "涨粉"
         val durationLabel = formatActivateRemainingLabel(durationSec)
+        val remainTotalLabel = formatActivateRemainingLabel(remainingTotalSec)
         LogCenter.op(
             alias,
             "$logTag：@$target 随机 → $modeLabel（" +
-                (if (resuming) "续跑 $durationLabel" else durationLabel) +
+                (if (resuming) "续跑本段 $durationLabel" else "本段 $durationLabel") +
+                (if (stintRestPlanned) "，总剩余 $remainTotalLabel，满段后下机补时" else "") +
                 "）",
         )
         PrefsStore.saveLocalStatus("running")
@@ -2230,31 +2265,41 @@ object AppCoordinator {
 
         val elapsedSec = ((SystemClock.elapsedRealtime() - startedAt) / 1000)
             .toInt().coerceIn(0, durationSec)
-        val completedFully = !interrupted && elapsedSec >= durationSec - 2
+        val completedStint = !interrupted && elapsedSec >= durationSec - 2
+        val leftoverSec = (remainingTotalSec - elapsedSec).coerceAtLeast(0)
 
         creditActivateMinutes(target, elapsedSec, modeLabel)
         notifyManualAccountUi()
 
-        if (completedFully) {
+        if (completedStint && leftoverSec <= 2) {
             PrefsStore.clearActivateSession(target)
             LogCenter.op(
                 alias,
                 "$logTag：@$target 完成（$modeLabel · $durationLabel，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟）",
             )
-            return true
+            return ActivatePhaseResult.PLANNED_DONE
         }
 
-        val remaining = (durationSec - elapsedSec).coerceAtLeast(0)
-        if (remaining > 0 && isAccountInPendingActivateQueue(target)) {
-            PrefsStore.setActivateSessionRemaining(target, remaining, minutes)
+        if (completedStint && leftoverSec > 2 && isAccountInPendingActivateQueue(target)) {
+            PrefsStore.setActivateSessionRemaining(target, leftoverSec, minutes)
             LogCenter.op(
                 alias,
-                "$logTag：@$target 未完成（剩余 ${formatActivateRemainingLabel(remaining)}，已跳过切号等待续跑）",
+                "$logTag：@$target 本段结束，关闭 TikTok 下机休息（已连续 ${formatActivateRemainingLabel(elapsedSec)}，" +
+                    "剩余 ${formatActivateRemainingLabel(leftoverSec)} 待后续补时）",
+            )
+            return ActivatePhaseResult.STINT_REST
+        }
+
+        if (leftoverSec > 0 && isAccountInPendingActivateQueue(target)) {
+            PrefsStore.setActivateSessionRemaining(target, leftoverSec, minutes)
+            LogCenter.op(
+                alias,
+                "$logTag：@$target 未完成（剩余 ${formatActivateRemainingLabel(leftoverSec)}，已跳过切号等待续跑）",
             )
         } else {
             PrefsStore.clearActivateSession(target)
         }
-        return false
+        return ActivatePhaseResult.INCOMPLETE
     }
 
     /**
@@ -2313,8 +2358,8 @@ object AppCoordinator {
     }
 
     /**
-     * 活跃下个账号：队首（或本机未完成续跑）→ 满时长活跃 → 完成后队首轮转。
-     * 本机已在队列中且活跃时长未满时不切号，直接续跑。
+     * 活跃下个账号：队首（或本机中断续跑）→ 本段连续活跃 30–58 分钟（总计划更长则下机补时）→ 完成后队首轮转。
+     * 硬停中断且时长未满时不切号，直接续跑；刚下机休息的号会切下一号。
      */
     fun manualActivateNextAccount(durationMin: Int = PrefsStore.getManualActivateDurationMin()) {
         if (!ManualDeviceControl.ENABLED) return
@@ -2349,6 +2394,7 @@ object AppCoordinator {
             LogCenter.op(alias, "活跃下个账号：队列为空")
             return
         }
+        PrefsStore.clearActivateStintRestSkip()
         notifyManualAccountUi()
         manualDispatchJob?.cancel()
         activateNextJob = scope.launch {
@@ -2387,19 +2433,31 @@ object AppCoordinator {
                     return@launch
                 }
 
-                val completed = runRandomActivatePhase(target, minutes, "活跃下个账号")
-                finishedOk = completed
-                if (completed && target.equals(PrefsStore.peekPendingActivateUsername(), ignoreCase = true)) {
-                    PrefsStore.rotatePendingActivateQueueFrontToBack()
-                    notifyManualAccountUi()
+                val completed = runRandomActivatePhase(
+                    target,
+                    minutes,
+                    "活跃下个账号",
+                    splitOnlineStint = true,
+                )
+                finishedOk = completed != ActivatePhaseResult.INCOMPLETE
+                if (completed == ActivatePhaseResult.PLANNED_DONE ||
+                    completed == ActivatePhaseResult.STINT_REST
+                ) {
+                    rotateQueueAfterActivateStint(
+                        target,
+                        restSkip = completed == ActivatePhaseResult.STINT_REST,
+                    )
                 }
                 PrefsStore.saveLocalStatus("online")
                 updateRuntime(
                     localStatus = "online",
-                    lastMessage = if (completed) {
-                        "活跃完成：@$target · ${formatActivateDurationLabel(minutes)}"
-                    } else {
-                        "活跃未完成：@$target 已保存剩余时长，下轮续跑不切号"
+                    lastMessage = when (completed) {
+                        ActivatePhaseResult.PLANNED_DONE ->
+                            "活跃完成：@$target · ${formatActivateDurationLabel(minutes)}"
+                        ActivatePhaseResult.STINT_REST ->
+                            "已下机休息：@$target 本段结束，剩余时长待后续补时"
+                        ActivatePhaseResult.INCOMPLETE ->
+                            "活跃未完成：@$target 已保存剩余时长，下轮续跑不切号"
                     },
                 )
                 if (detectActiveManualTaskKind() == null ||
@@ -2429,7 +2487,8 @@ object AppCoordinator {
 
     /**
      * 自动活跃：按队列顺序轮流活跃；一轮结束后从头循环（不 pop 队列）。
-     * 仅当单号满时长后才切下一号；本机在队列且时长未满则不切号直接续跑。
+     * 单号连续活跃 30–58 分钟后关 TikTok 下机并切下一号；总计划未满则轮转回来再补。
+     * 硬停中断才同号续跑不切号。
      */
     fun manualStartAutoActive(
         usernames: List<String>? = null,
@@ -2484,7 +2543,8 @@ object AppCoordinator {
                 val scheme = PrefsStore.getManualCutSwitchScheme()
                 LogCenter.op(
                     alias,
-                    "自动活跃：开始（每号 ${formatActivateDurationLabel(minutes)}，队列 ${PrefsStore.getPendingActivateUsernames().size}，切号=$scheme）",
+                    "自动活跃：开始（每号 ${formatActivateDurationLabel(minutes)}，" +
+                        "连续上机 30–58 分钟后下机切下一号，队列 ${PrefsStore.getPendingActivateUsernames().size}，切号=$scheme）",
                 )
                 PrefsStore.saveLocalStatus("running")
 
@@ -2497,6 +2557,7 @@ object AppCoordinator {
                     val target = resolveActivateResumeTarget(queue, minutes)
                         ?: PrefsStore.peekPendingActivateUsername()
                         ?: break
+                    PrefsStore.clearActivateStintRestSkip()
                     notifyManualAccountUi()
                     PrefsStore.saveLocalStatus("running")
                     updateRuntime(
@@ -2514,17 +2575,29 @@ object AppCoordinator {
                         )
                         break
                     }
-                    val completed = runRandomActivatePhase(target, minutes, "自动活跃")
+                    val completed = runRandomActivatePhase(
+                        target,
+                        minutes,
+                        "自动活跃",
+                        splitOnlineStint = true,
+                    )
                     processed++
-                    if (completed) {
+                    if (completed == ActivatePhaseResult.PLANNED_DONE ||
+                        completed == ActivatePhaseResult.STINT_REST
+                    ) {
+                        val leftover = PrefsStore.getActivateSessionRemainingSec(target, minutes) ?: 0
                         updateRuntime(
                             localStatus = "running",
-                            lastMessage = "自动活跃完成：@$target（第 $processed 次，队列 ${queue.size} 轮转）",
+                            lastMessage = if (completed == ActivatePhaseResult.STINT_REST) {
+                                "自动活跃下机：@$target（本段结束，剩余 ${formatActivateRemainingLabel(leftover)} 待补）"
+                            } else {
+                                "自动活跃完成：@$target（第 $processed 次，队列 ${queue.size} 轮转）"
+                            },
                         )
-                        if (target.equals(PrefsStore.peekPendingActivateUsername(), ignoreCase = true)) {
-                            PrefsStore.rotatePendingActivateQueueFrontToBack()
-                            notifyManualAccountUi()
-                        }
+                        rotateQueueAfterActivateStint(
+                            target,
+                            restSkip = completed == ActivatePhaseResult.STINT_REST,
+                        )
                         forceStopTikTokForExclusiveEnqueue("自动活跃单号结束")
                         continue
                     }
@@ -2721,11 +2794,18 @@ object AppCoordinator {
                     if (!publishOk) {
                         LogCenter.op(alias, "批量发作品：@$target 发作品未完全成功，仍继续发后活跃")
                     }
-                    val modeLabel = runRandomActivatePhase(target, afterMin, "批量发作品·发后活跃")
+                    val phase = runRandomActivatePhase(
+                        target,
+                        afterMin,
+                        "批量发作品·发后活跃",
+                        splitOnlineStint = false,
+                    )
                     processed++
                     updateRuntime(
                         localStatus = "running",
-                        lastMessage = "批量发作品完成：@$target · 发后$modeLabel（$processed/${targets.size}）",
+                        lastMessage = "批量发作品完成：@$target · 发后活跃" +
+                            (if (phase == ActivatePhaseResult.PLANNED_DONE) "完成" else "未完成") +
+                            "（$processed/${targets.size}）",
                     )
                     forceStopTikTokForExclusiveEnqueue("批量发作品单号结束")
                 }

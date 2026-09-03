@@ -12756,6 +12756,8 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "发作品素材拉取")) return false
         val app = service.applicationContext
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
+        val fetchStartedAtMs = System.currentTimeMillis()
+        fun fetchElapsedMs(): Long = System.currentTimeMillis() - fetchStartedAtMs
         devOp(
             alias,
             "发作品：本机 POST /api/v1/tasks/request（count=$count，targetPath=$targetPath）→ PC tasks/create（异步轮询就绪），开始拉取…",
@@ -12763,7 +12765,11 @@ class RealTraceExecutor(
         return try {
             val task = CompanionApi.createTaskAndWaitReady(app, count, targetPath)
             if (task.files.isEmpty()) {
-                devOp(alias, "发作品：PC 返回任务无文件（taskId=${task.taskId}），素材拉取失败")
+                devOp(
+                    alias,
+                    "发作品：PC 返回任务无文件（taskId=${task.taskId}，请求数=$count，实际拉取=0），素材拉取失败",
+                    fetchElapsedMs(),
+                )
                 return false
             }
             TaskStore.saveTaskSnapshot(
@@ -12789,10 +12795,12 @@ class RealTraceExecutor(
                 adbPushed = task.adbPushed == true,
             )
             val stats = publishPostResolveGalleryMaterialStats()
+            val elapsedMs = fetchElapsedMs()
             devOp(
                 alias,
-                "发作品：素材拉取完成 taskId=${task.taskId} files=${task.files.size}；" +
+                "发作品：素材拉取完成 taskId=${task.taskId} 请求数=$count 实际拉取=${task.files.size} 耗时=${elapsedMs}ms；" +
                     "图库统计 图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} 合计=${stats.resolvedCount}",
+                elapsedMs,
             )
             if (stats.resolvedCount > 0) {
                 PrefsStore.setPublishPostMaterialReady(true)
@@ -12813,8 +12821,13 @@ class RealTraceExecutor(
                             "PC=${CompanionApi.windowsBaseUrl(app)}）"
                     else -> ""
                 }
+            val elapsedMs = fetchElapsedMs()
             lastPublishPostEntryFailureReason = "素材拉取失败${t.message?.let { m -> "：$m" }.orEmpty()}"
-            devOp(alias, "发作品：素材拉取异常 ${t.message ?: t.javaClass.simpleName}$hint")
+            devOp(
+                alias,
+                "发作品：素材拉取异常（请求数=$count 耗时=${elapsedMs}ms） ${t.message ?: t.javaClass.simpleName}$hint",
+                elapsedMs,
+            )
             false
         }
     }
