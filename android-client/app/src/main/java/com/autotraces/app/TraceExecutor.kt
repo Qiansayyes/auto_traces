@@ -637,7 +637,10 @@ class RealTraceExecutor(
     private var lastContinueEditingPostPopupDismissAtMs: Long = 0L
     private var lastSecurityCheckupPopupDismissAtMs: Long = 0L
     private var lastVerifyToContinuePopupDismissAtMs: Long = 0L
+    private var lastMetaFacebookTikTokRecoverAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
+    @Volatile
+    private var metaFacebookTikTokRecoverInProgress: Boolean = false
     @Volatile
     private var inlineIdentityVerificationInProgress: Boolean = false
     /** Check your inbox 分支：验证码页默认已聚焦，无需再点输入区。 */
@@ -831,7 +834,9 @@ class RealTraceExecutor(
                 }
             }
             if (!inlineIdentityVerificationInProgress) {
-                handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
+                val interrupt = handleOcrVisionInlineInterruptions(ctx, vision, fileTag, "截图OCR顺手")
+                // Meta/Facebook 拉回或弹窗已处理：本帧 vision 已过期，等下一轮 OCR
+                if (interrupt != null) return
             }
             // Account status 须优先于 Log in（弹窗文案 “please log in again” 不能先当登录入口）。
             if (isLogoutProbeContextActive() || accountStatusReloginInProgress) {
@@ -1135,6 +1140,18 @@ class RealTraceExecutor(
         private const val VERIFY_TO_CONTINUE_DISMISS_X_FRACTION = 0.85f
         /** 「Verify to continue」关闭钮：Y = 屏高 × 本比例（距顶 32%）。 */
         private const val VERIFY_TO_CONTINUE_DISMISS_Y_FRACTION = 0.32f
+        /** 整屏 OCR 见 Meta/Facebook：拉回 TikTok 的冷却，避免连环重入。 */
+        private const val INLINE_META_FACEBOOK_TIKTOK_RECOVER_COOLDOWN_MS = 5_000L
+        /** Meta/Facebook 常见包名（拉不起时一并强停）。 */
+        private val META_FACEBOOK_PACKAGE_CANDIDATES = listOf(
+            "com.facebook.katana",
+            "com.facebook.lite",
+            "com.facebook.orca",
+            "com.facebook.mlite",
+            "com.facebook.wakizashi",
+            "com.meta.horizon",
+            "com.meta.apps",
+        )
         /** 系统 ANR「isn't responding」：点 Close app 后等待再强停的缓冲。 */
         private const val TIKTOK_ANR_CLOSE_APP_SETTLE_MS = 600L
         /** 通用 OCR 顺手消 Swipe up 提示：单次最多上滑次数。 */
@@ -1269,6 +1286,93 @@ class RealTraceExecutor(
         return runSuCommand("monkey -p $hostPkg -c android.intent.category.LAUNCHER 1")
     }
 
+    /** OCR 确认屏上为 TikTok 界面（主 Feed / 登录链 / 兴趣页 / 应用内弹窗等）。 */
+    private fun ocrConfirmsTikTokVisibleUi(vision: Text, screenH: Int): Boolean {
+        if (autoLoginSeesMainFeedBottomNav(vision, screenH)) return true
+        if (hasBottomHomeOrProfile(vision, screenH)) return true
+        if (autoLoginSeesInterestPicker(vision)) return true
+        if (safeguardVisionNeedsAutoLogin(vision, screenH)) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "send you notifications") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向你发送通知") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向您发送通知") != null) return true
+        return false
+    }
+
+    /**
+     * dumpsys 报 TikTok 在前台，但 OCR 见本应用/Meta 等 → 屏上实际不是 TikTok。
+     * 不用 Don't allow / Allow 做否定：TikTok 应用内弹窗也有这些按钮，应交给后续点弹窗，不能判拉起失败。
+     * @return 非 null 为矛盾原因（用于日志）。
+     */
+    private fun ocrContradictsTikTokForeground(vision: Text, screenH: Int): String? {
+        if (ocrConfirmsTikTokVisibleUi(vision, screenH)) return null
+        if (isHostAppInForeground()) return "本应用AutoTraces在前台(dumpsys)"
+        val hostUiNeedles = listOf(
+            "待活跃",
+            "涨粉",
+            "自动登录",
+            "AutoTraces",
+            "活跃下个",
+            "停涨粉",
+            "批量发作品",
+            "待活跃队列",
+        )
+        for (needle in hostUiNeedles) {
+            if (findLabelHitContainingIgnoreCase(vision, needle) != null) {
+                return "本应用界面($needle)"
+            }
+        }
+        if (visionShowsMetaOrFacebookOverlay(vision)) return "Meta/Facebook界面"
+        return null
+    }
+
+    /**
+     * dumpsys 已通过时，用 OCR 交叉校验：见 TikTok 界面才认成功；见其它 App/弹窗则判假前台。
+     */
+    private suspend fun confirmTikTokForegroundWithOcrCrossCheck(
+        ctx: Context,
+        alias: String,
+        tag: String,
+    ): Boolean {
+        if (isHostAppInForeground()) {
+            devOp(alias, "$tag：dumpsys 与本应用前台矛盾，不视为 TikTok 在前台")
+            return false
+        }
+        if (isSystemPermissionGrantDialogForeground()) {
+            devOp(alias, "$tag：dumpsys 焦点在系统权限授权页，不视为 TikTok 在前台")
+            return false
+        }
+        val h = ctx.resources.displayMetrics.heightPixels
+        repeat(2) { i ->
+            if (i > 0) delay(900)
+            val (vision, err) = mlKitRecognizeFullScreenCore(ctx, "launch_fg_${tag}_$i")
+            if (vision == null) {
+                if (!err.isNullOrBlank()) {
+                    devOp(alias, "$tag：界面OCR失败 ${err.take(80)}")
+                }
+                continue
+            }
+            val preview = buildProfileEditOcrPreview(vision).ifBlank { vision.text.trim() }.take(160)
+            ocrContradictsTikTokForeground(vision, h)?.let { reason ->
+                devOp(
+                    alias,
+                    "$tag：OCR见${reason}，屏上非TikTok（第${i + 1}/2轮，勿信 dumpsys 焦点包）预览=${preview.ifBlank { "无" }}",
+                )
+                return false
+            }
+            if (ocrConfirmsTikTokVisibleUi(vision, h)) {
+                if (i > 0) {
+                    devOp(alias, "$tag：OCR确认TikTok界面（第${i + 1}轮）预览=${preview.take(80)}")
+                }
+                return true
+            }
+            devOp(
+                alias,
+                "$tag：dumpsys报TikTok但OCR未见TikTok界面（第${i + 1}/2轮）预览=${preview.ifBlank { "无识别" }}",
+            )
+        }
+        return false
+    }
+
     /**
      * 拉起 TikTok：启动命令 → 等待 [launchWaitMs] → dumpsys 前台校验 →
      * **仅在前台已确认时** OCR 处理 Don't allow（非 TikTok 前台时 OCR 无意义）。
@@ -1289,12 +1393,15 @@ class RealTraceExecutor(
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()) {
-            devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
-            logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
-            if (!skipDontAllowOcr) {
-                dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
+            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·已前台")) {
+                devOp(alias, "$tag：TikTok 已在前台（dumpsys+界面OCR），跳过重复拉起")
+                logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
+                if (!skipDontAllowOcr) {
+                    dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
+                }
+                return true
             }
-            return true
+            devOp(alias, "$tag：dumpsys 报已在前台但OCR未见TikTok界面，不跳过拉起")
         }
         val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         if (forceStopBeforeLaunch) {
@@ -1320,8 +1427,7 @@ class RealTraceExecutor(
 
         var didLaunchCommand = false
         if (tiktokAlreadyForeground) {
-            devOp(alias, "$tag：TikTok 已在前台（严格 dumpsys），跳过重复拉起")
-            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已前台跳过启动命令")
+            devOp(alias, "$tag：dumpsys 报 TikTok 已在前台，跳过启动命令（待 OCR 交叉校验）")
             didLaunchCommand = true
         } else {
             // 本应用/悬浮层在前台时 startActivity 常无法切到 TikTok，优先 root 拉起
@@ -1380,7 +1486,32 @@ class RealTraceExecutor(
         }
 
         val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
-        devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}）")
+        var ocrConfirmed = confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, tag)
+        // dumpsys 已通过后权限页才弹出时，交叉校验会直接失败；先点掉再复检，避免假失败。
+        if (!ocrConfirmed && !skipDontAllowOcr && isSystemPermissionGrantDialogForeground()) {
+            devOp(alias, "$tag：OCR交叉校验见系统权限页，先点 Don't allow 再复检")
+            if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·OCR交叉后权限")) {
+                invalidateForegroundProbeCache()
+                ocrConfirmed =
+                    confirmStrictForeground() &&
+                        confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限后")
+            }
+        }
+        if (!ocrConfirmed) {
+            logForegroundProbeFailure(alias, tag, pkg)
+            logTikTokForegroundCheck(
+                alias,
+                tag,
+                passed = false,
+                detail = "dumpsys焦点=${fgPkg ?: "未知"} 但OCR屏上非TikTok",
+            )
+            devOp(
+                alias,
+                "$tag：拉起 TikTok 失败（dumpsys 报 ${fgPkg ?: pkg} 在前台，但OCR屏上非TikTok，不视为拉起成功）",
+            )
+            return false
+        }
+        devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}，界面OCR已见内容）")
         logTikTokForegroundCheck(alias, tag, passed = true)
 
         val dismissedDontAllow =
@@ -1404,6 +1535,11 @@ class RealTraceExecutor(
             if (!confirmStrictForeground()) {
                 logForegroundProbeFailure(alias, tag, pkg)
                 devOp(alias, "$tag：权限叠层恢复后 TikTok 仍非前台，拉起失败")
+                return false
+            }
+            if (!confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限叠层后")) {
+                logForegroundProbeFailure(alias, tag, pkg)
+                devOp(alias, "$tag：权限叠层恢复后 OCR 未见 TikTok 界面，拉起失败")
                 return false
             }
         }
@@ -1492,12 +1628,17 @@ class RealTraceExecutor(
                 devOp(alias, "$tag：拉起回报成功但严格前台复检未通过，不视为冷启成功")
                 return false
             }
+            if (!confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·复检")) {
+                logForegroundProbeFailure(alias, tag, pkg)
+                devOp(alias, "$tag：拉起回报成功但OCR屏上非TikTok，不视为冷启成功")
+                return false
+            }
             val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
             logTikTokForegroundCheck(
                 alias,
                 tag,
                 passed = true,
-                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"}",
+                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"} 界面OCR已见",
             )
             return true
         }
@@ -1533,8 +1674,8 @@ class RealTraceExecutor(
 
     /**
      * 优先 [navBack] 回首页；底栏 Home+Profile 同见 = 已回首页：只连续点 Home 确认干净 For You，**绝不因此强关**。
-     * 每次按返回前若 dumpsys 判定 TikTok 非前台，不再空按返回，优先重新打开 TikTok（不强停）；
-     * 连续返回 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS] 次后再次校验（返回可能已退出应用）；
+     * 每按一次返回前都 dumpsys 校验当前最前是否 TikTok；非前台则不再空按，优先重新打开 TikTok（不强停）；
+     * 双返两下之间也会再校验（第一下可能已退出应用）；
      * 重开失败再 fallback 强关重启。
      * 超过 [RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS] 次仍未回首页则 fallback 强关重启。
      *
@@ -1681,7 +1822,6 @@ class RealTraceExecutor(
         }
 
         val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
-        val pkg = Config.TIKTOK_PACKAGE_NAME
 
         suspend fun evaluateRecoverHomeOcr(tagSuffix: String, passLabel: String): RecoverHomeOcrOutcome {
             if (hardStopOrNull(alias, reason)) return RecoverHomeOcrOutcome.HardStop
@@ -1702,9 +1842,9 @@ class RealTraceExecutor(
         }
 
         /**
-         * TikTok 非前台时不再按返回（对桌面/其它 App 按返回无意义），改为重新打开（不强停）。
+         * TikTok 非最前时不再按返回（对桌面/其它 App 按返回无意义），改为重新打开（不强停）。
          * @param requireMinBacks 为 true 时：须已连续返回达到 [RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS]
-         *   才校验（避免首轮 dumpsys 抖动误判）；为 false 时：每次返回前强制校验。
+         *   才校验（兼容旧调用）；为 false 时：立即校验当前最前是否 TikTok。
          * @return null 仍在前台或已重开但未命中首页，可继续返回；非 null 为结束本恢复流程的结果。
          */
         suspend fun reopenTikTokIfNotForegroundDuringRecover(
@@ -1716,14 +1856,28 @@ class RealTraceExecutor(
                 return null
             }
             invalidateForegroundProbeCache()
-            if (isPackageVisible(pkg)) return null
+            if (isTikTokForeground()) {
+                logTikTokForegroundCheck(
+                    alias,
+                    "$reason·$passLabel",
+                    passed = true,
+                    detail = "当前最前是 TikTok，可继续返回",
+                )
+                return null
+            }
 
             val why =
                 if (backsCompleted > 0) {
-                    "已连续返回 $backsCompleted 次且 TikTok 非前台（返回可能已退出应用）"
+                    "已连续返回 $backsCompleted 次且当前最前不是 TikTok（返回可能已退出应用）"
                 } else {
-                    "TikTok 非前台（再按返回无意义）"
+                    "当前最前不是 TikTok（再按返回无意义）"
                 }
+            logTikTokForegroundCheck(
+                alias,
+                "$reason·$passLabel",
+                passed = false,
+                detail = why,
+            )
             devOp(alias, "$reason：$passLabel $why，跳过返回，尝试重新打开 TikTok")
             val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
             if (
@@ -1776,7 +1930,7 @@ class RealTraceExecutor(
         var backsCompleted = 0
         for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
             if (hardStopOrNull(alias, reason)) return false
-            // 每次按返回前先确认仍在 TikTok：已退出则重开，避免对桌面空按返回
+            // 每次按返回前先确认仍在 TikTok 最前：已退出则重开，避免对桌面/其它 App 空按返回
             reopenTikTokIfNotForegroundDuringRecover(
                 "第 $pass 次返回前",
                 backsCompleted,
@@ -1791,11 +1945,21 @@ class RealTraceExecutor(
                     RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS,
                     allowInitialDoubleBack,
                 ) ?: return false
+            if (backsThisPass <= 0) {
+                // 本轮因非前台未按下返回：立刻重开，勿空转继续下一轮盲按
+                reopenTikTokIfNotForegroundDuringRecover(
+                    "第 $pass 次返回未执行(最前非TikTok)",
+                    backsCompleted,
+                    requireMinBacks = false,
+                )?.let { return it }
+                continue
+            }
             backsCompleted += backsThisPass
+            // 每轮返回后都校验（含双返只完成 1 下的情况），勿等满 MIN_BACKS 才查
             reopenTikTokIfNotForegroundDuringRecover(
                 "第 $pass 次返回后",
                 backsCompleted,
-                requireMinBacks = true,
+                requireMinBacks = false,
             )?.let { return it }
             when (val outcome = evaluateRecoverHomeOcr("back_$pass", "第 $pass 次返回")) {
                 RecoverHomeOcrOutcome.OnMainFeed -> {
@@ -2865,7 +3029,7 @@ class RealTraceExecutor(
                     )
                 }
             }
-            // 任意整屏 OCR：顺手关 Viewer history / Save login / Continue editing this post / Security checkup / Verify to continue 弹窗，并令调用方重试 OCR。
+            // 任意整屏 OCR：顺手关 Meta/Facebook 抢前台、Viewer history / Save login / Continue editing this post / Security checkup / Verify to continue 弹窗，并令调用方重试 OCR。
             // auto_login_* / login_safeguard_* 由 [autoLoginTryDismissInlineOverlaysFromVision] 处理。
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag)?.let { interruptTag ->
@@ -3032,7 +3196,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 任意 OCR vision 上顺手处理弹窗/验证（Save login、Viewer history、Continue editing this post、Security checkup、Verify to continue、Before you continue 身份验证等）。
+     * 任意 OCR vision 上顺手处理弹窗/验证（Meta/Facebook 抢前台拉回 TikTok、Save login、Viewer history、Continue editing this post、Security checkup、Verify to continue、Before you continue 身份验证等）。
      * @return 非 null 表示已处理中断，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun handleOcrVisionInlineInterruptions(
@@ -3043,11 +3207,13 @@ class RealTraceExecutor(
     ): String? {
         // ANR 不受 auto_login / login_safeguard 跳过限制（系统层遮罩）
         probeAndHandleTikTokAnrFromVision(ctx, vision, phaseLog)
+        // 自动登录主流程自行处理；登录页本身常见 Facebook 入口，禁止把「见 Facebook」当成 TikTok 不在前台。
         if (fileTag != null &&
             (fileTag.startsWith("auto_login_") || fileTag.startsWith("login_safeguard_"))
         ) {
             return null
         }
+        recoverTikTokForegroundIfMetaOrFacebookVisible(ctx, vision, fileTag, phaseLog)?.let { return it }
         dismissFullScreenInlinePopupsIfPresent(ctx, vision, fileTag, phaseLog)?.let { return it }
         if (visionIdentityVerificationBlocking(vision)) {
             val ok = runInlineIdentityVerificationFlow(
@@ -3059,6 +3225,193 @@ class RealTraceExecutor(
             return if (ok) "identity_verification_handled" else "identity_verification_failed"
         }
         return null
+    }
+
+    /**
+     * 整屏 OCR 顺手：见 Meta/Facebook 则拉回 TikTok。
+     * 登录链页面本身常有 Facebook 入口，禁止在此误判。
+     */
+    private fun shouldRecoverTikTokFromMetaOrFacebook(fileTag: String?): Boolean {
+        if (fileTag != null) {
+            if (fileTag.startsWith("auto_login_")) return false
+            if (fileTag.startsWith("login_safeguard_")) return false
+            if (fileTag.startsWith("cut_switch_")) return false
+            // 拉回过程中的二次 OCR 用 core，一般不会进这里；兜底防重入。
+            if (fileTag.startsWith("meta_fb_recover_")) return false
+        }
+        return true
+    }
+
+    /** element/line 文案 trim 后整词等于 [exact]（忽略大小写）。 */
+    private fun findStrictExactLabelHitIgnoreCase(result: Text, exact: String): StrictLabelHit? {
+        val needle = exact.trim()
+        if (needle.isEmpty()) return null
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    if (el.text.trim().equals(needle, ignoreCase = true)) {
+                        val b = el.boundingBox ?: continue
+                        return StrictLabelHit(Point(b.centerX(), b.centerY()), b)
+                    }
+                }
+                if (line.text.trim().equals(needle, ignoreCase = true)) {
+                    val b = line.boundingBox ?: continue
+                    return StrictLabelHit(Point(b.centerX(), b.centerY()), b)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * OCR 见 Meta（整词忽略大小写）或 Facebook（包含、忽略大小写）→ 判定 TikTok 不在最上层。
+     * Meta 用整词，避免误伤 metadata 等英文词。
+     */
+    private fun visionShowsMetaOrFacebookOverlay(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCase(vision, "facebook") != null) return true
+        if (findStrictExactLabelHitIgnoreCase(vision, "meta") != null) return true
+        return false
+    }
+
+    /**
+     * 整屏 OCR：见 Meta/Facebook → 立刻拉起 TikTok 到最上层；
+     * 拉起后旧文案仍在 → 强停 TikTok 与无关前台/Meta 应用后再拉起。
+     * @return 非 null 表示已处理，调用方应重新 OCR。
+     */
+    private suspend fun recoverTikTokForegroundIfMetaOrFacebookVisible(
+        ctx: Context,
+        vision: Text,
+        fileTag: String?,
+        phaseLog: String,
+    ): String? {
+        if (metaFacebookTikTokRecoverInProgress) return null
+        if (!shouldRecoverTikTokFromMetaOrFacebook(fileTag)) return null
+        if (!visionShowsMetaOrFacebookOverlay(vision)) return null
+        // TikTok 已在最上层时，信息流/评论也可能出现 Facebook、Meta 字样，不得误杀。
+        if (isTikTokForeground()) return null
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastMetaFacebookTikTokRecoverAtMs < INLINE_META_FACEBOOK_TIKTOK_RECOVER_COOLDOWN_MS) {
+            return null
+        }
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        if (hardStopOrNull(alias, "$phaseLog-Meta/Facebook拉回TikTok")) {
+            return "hard_stop"
+        }
+        metaFacebookTikTokRecoverInProgress = true
+        lastMetaFacebookTikTokRecoverAtMs = now
+        try {
+            val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+            devOp(
+                alias,
+                "$phaseLog：OCR 见 Meta/Facebook，判定 TikTok 不在最上层，立刻拉起 TikTok",
+            )
+            launchTikTokOnceWithCheck(
+                ctx = ctx,
+                alias = alias,
+                tag = "$phaseLog·Meta/Facebook软拉起",
+                launchWaitMs = launchWaitMs,
+                forceStopBeforeLaunch = false,
+                skipDontAllowOcr = true,
+                allowSkipIfAlreadyForeground = false,
+            )
+            delay(450L)
+            if (isHardStopActive()) return "hard_stop"
+            val (afterSoft, softErr) = mlKitRecognizeFullScreenCore(ctx, "meta_fb_recover_after_soft")
+            if (afterSoft != null && !visionShowsMetaOrFacebookOverlay(afterSoft)) {
+                devOp(alias, "$phaseLog：软拉起后 Meta/Facebook 文案已消失，TikTok 应已回到前台")
+                return "meta_facebook_tiktok_relaunched"
+            }
+            // 软拉起后 dumpsys 已确认 TikTok 在最上层：即使 OCR 仍扫到字样（信息流误读），也不再强停。
+            if (isTikTokForeground()) {
+                devOp(
+                    alias,
+                    "$phaseLog：软拉起后 dumpsys 已确认 TikTok 在最上层，跳过强停重拉",
+                )
+                return "meta_facebook_tiktok_relaunched"
+            }
+            if (afterSoft == null) {
+                devOp(
+                    alias,
+                    "$phaseLog：软拉起后二次 OCR 失败（$softErr），且 TikTok 仍非前台，强停后重拉",
+                )
+            } else {
+                devOp(
+                    alias,
+                    "$phaseLog：软拉起后仍见 Meta/Facebook 且 TikTok 非前台，强停后重拉",
+                )
+            }
+            forceStopTikTokAndUnrelatedAppsForMetaFacebookRecover(ctx, alias, phaseLog)
+            delay(lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L))
+            if (isHardStopActive()) return "hard_stop"
+            launchTikTokOnceWithCheck(
+                ctx = ctx,
+                alias = alias,
+                tag = "$phaseLog·Meta/Facebook强停后拉起",
+                launchWaitMs = launchWaitMs,
+                forceStopBeforeLaunch = true,
+                skipDontAllowOcr = false,
+                allowSkipIfAlreadyForeground = false,
+            )
+            return "meta_facebook_tiktok_force_relaunched"
+        } finally {
+            metaFacebookTikTokRecoverInProgress = false
+            lastMetaFacebookTikTokRecoverAtMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    /** 强停 TikTok、当前无关前台包、以及常见 Meta/Facebook 包。保留本应用与系统/桌面。 */
+    private fun forceStopTikTokAndUnrelatedAppsForMetaFacebookRecover(
+        ctx: Context,
+        alias: String,
+        phaseLog: String,
+    ) {
+        val hostPkg = ctx.packageName.trim()
+        invalidateForegroundProbeCache()
+        val probe = collectForegroundProbeTexts()
+        val fg = resolveStrictForegroundPackage(probe)
+        val top = extractTopActivityPackage(probe)
+        val keep = buildSet {
+            if (hostPkg.isNotEmpty()) add(hostPkg.lowercase(Locale.US))
+            add("android")
+            add("com.android.systemui")
+            add("com.android.settings")
+        }
+        fun isProtected(pkg: String): Boolean {
+            val low = pkg.lowercase(Locale.US)
+            if (low in keep) return true
+            if (isLauncherLikePackage(low)) return true
+            if (low.startsWith("com.android.")) return true
+            if (low.startsWith("com.google.android.permissioncontroller")) return true
+            if (low.startsWith("com.google.android.packageinstaller")) return true
+            if (low.contains("permissioncontroller")) return true
+            return false
+        }
+        val toStop = linkedSetOf<String>()
+        Config.TIKTOK_PACKAGE_CANDIDATES.forEach { toStop.add(it) }
+        META_FACEBOOK_PACKAGE_CANDIDATES.forEach { toStop.add(it) }
+        listOfNotNull(fg, top).forEach { pkg ->
+            if (!isProtected(pkg) &&
+                Config.TIKTOK_PACKAGE_CANDIDATES.none { it.equals(pkg, ignoreCase = true) }
+            ) {
+                // 非本应用/系统的当前前台也一并清掉（Meta 壳层、浏览器等）
+                toStop.add(pkg)
+            }
+        }
+        // TikTok 也要清后台再冷启
+        Config.TIKTOK_PACKAGE_CANDIDATES.forEach { toStop.add(it) }
+        val stopped = mutableListOf<String>()
+        for (pkg in toStop) {
+            if (isProtected(pkg)) continue
+            if (runSuCommand("am force-stop $pkg")) {
+                stopped += pkg
+            }
+        }
+        invalidateForegroundProbeCache()
+        devOp(
+            alias,
+            "$phaseLog：已强停 ${stopped.size} 个包（含 TikTok/无关前台/Meta·Facebook）：" +
+                stopped.joinToString(",").ifBlank { "无" },
+        )
     }
 
     /**
@@ -7094,6 +7447,7 @@ class RealTraceExecutor(
     /**
      * 回首页恢复流程中的导航返回：前 [RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES] 轮每次连按两次；
      * 其后发作品期间若 OCR 同时见 POST+CREATE（创作相机底栏），亦连续执行两次返回。
+     * 每按一次返回前都校验 TikTok 是否仍在最前；非前台则不再空按，返回已实际按下的次数（可为 0）。
      */
     private suspend fun navBackRecoverHomeWithPublishPostCameraDoubleIfNeeded(
         service: Context,
@@ -7128,17 +7482,44 @@ class RealTraceExecutor(
             }
         }
         val passLabel = "（$pass/$maxAttempts）"
-        val backsThisPass = if (doubleBack) 2 else 1
+        invalidateForegroundProbeCache()
+        if (!isTikTokForeground()) {
+            logTikTokForegroundCheck(
+                alias,
+                "$reason·返回前",
+                passed = false,
+                detail = "当前最前不是 TikTok，跳过本轮返回",
+            )
+            return 0
+        }
         if (doubleBack) {
             val doubleTag = if (pass <= RECOVER_TO_HOME_DOUBLE_BACK_FIRST_PASSES) "双返" else "创作相机双返"
             navBack(alias, "$reason 回首页·${doubleTag} 1/2$passLabel")
             if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return null
+            invalidateForegroundProbeCache()
+            if (!isTikTokForeground()) {
+                logTikTokForegroundCheck(
+                    alias,
+                    "$reason·双返第2下前",
+                    passed = false,
+                    detail = "第一下后最前已不是 TikTok，跳过第二下返回",
+                )
+                return if (growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) {
+                    1
+                } else {
+                    null
+                }
+            }
             navBack(alias, "$reason 回首页·${doubleTag} 2/2$passLabel")
-        } else {
-            navBack(alias, "$reason 回首页$passLabel")
+            return if (growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) {
+                2
+            } else {
+                null
+            }
         }
+        navBack(alias, "$reason 回首页$passLabel")
         return if (growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·返回后")) {
-            backsThisPass
+            1
         } else {
             null
         }
@@ -7151,19 +7532,38 @@ class RealTraceExecutor(
      *
      * TikTok 在后台但 dumpsys 仍显示非前台时，第 1 步可能无效，第 2 步更可靠。
      */
+    private fun isPermissionControllerOrInstallerPackage(pkg: String): Boolean {
+        val low = pkg.lowercase(Locale.US)
+        return low.contains("permissioncontroller") || low.contains("packageinstaller")
+    }
+
     /**
-     * TikTok 已启动但系统权限授权页盖在最前（焦点在 permissioncontroller，TikTok 进程常在后台）。
+     * 系统权限授权页盖在最前（permissioncontroller / GrantPermissionsActivity）。
+     * 只认当前焦点包 + 窗口焦点行；不扫 mResumedActivity 残留，避免 TikTok 已在前台时误伤。
+     * TikTok 应用内 Don't allow（通知权限等）焦点包仍是 musically，这里不会命中。
      */
     private fun isSystemPermissionGrantDialogForeground(): Boolean {
         val probe = collectForegroundProbeTexts()
         resolveStrictForegroundPackage(probe)?.let { fg ->
-            if (fg.contains("permissioncontroller", ignoreCase = true)) return true
-            if (fg.contains("packageinstaller", ignoreCase = true)) return true
+            if (isPermissionControllerOrInstallerPackage(fg)) return true
         }
-        return filterDumpsysFocusLines(probe).any { line ->
-            line.contains("GrantPermissionsActivity", ignoreCase = true) ||
-                line.contains("permissioncontroller", ignoreCase = true)
+        for (line in filterDumpsysFocusLines(probe)) {
+            val lower = line.lowercase(Locale.US)
+            if (!lower.contains("mcurrentfocus") &&
+                !lower.contains("mfocusedwindow") &&
+                !lower.contains("mfocusedapp") &&
+                !lower.contains("focusedapp")
+            ) {
+                continue
+            }
+            if (lower.contains("grantpermissionsactivity") ||
+                lower.contains("permissioncontroller") ||
+                lower.contains("packageinstaller")
+            ) {
+                return true
+            }
         }
+        return false
     }
 
     /** 权限页在前台时：整屏 OCR 点 Don't allow → 拉起 TikTok → dumpsys 严格校验前台。 */
@@ -7242,14 +7642,21 @@ class RealTraceExecutor(
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {
-            devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
-            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已可见跳过拉起")
-            return true
+            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·已可见")) {
+                devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
+                logTikTokForegroundCheck(alias, tag, passed = true, detail = "已可见且界面OCR有内容")
+                return true
+            }
+            devOp(alias, "$tag：dumpsys 报 TikTok 前台但OCR未见TikTok界面，不跳过拉起")
+            logTikTokForegroundCheck(alias, tag, passed = false, detail = "dumpsys可见但OCR非TikTok")
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·权限页")) {
-            devOp(alias, "$tag：权限授权页已处理，TikTok 前台已恢复，继续任务")
-            return true
+            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限页后")) {
+                devOp(alias, "$tag：权限授权页已处理，TikTok 前台已恢复，继续任务")
+                return true
+            }
+            devOp(alias, "$tag：权限页处理后 dumpsys/OCR 仍未确认 TikTok 界面，继续拉起")
         }
 
         val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
@@ -7261,8 +7668,11 @@ class RealTraceExecutor(
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·切前台后权限")) {
-            devOp(alias, "$tag：切前台失败后经权限页恢复，TikTok 前台已确认，继续任务")
-            return true
+            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·切前台后权限OCR")) {
+                devOp(alias, "$tag：切前台失败后经权限页恢复，TikTok 前台已确认，继续任务")
+                return true
+            }
+            devOp(alias, "$tag：切前台后权限页处理完仍未见 TikTok 界面，继续强停重拉")
         }
 
         devOp(alias, "$tag：切前台后仍非 TikTok 前台（可能在后台或拉起无效），强停后完整重拉")
@@ -7277,8 +7687,11 @@ class RealTraceExecutor(
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·重拉后权限")) {
-            devOp(alias, "$tag：强停重拉失败后经权限页恢复，TikTok 前台已确认，继续任务")
-            return true
+            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·重拉后权限OCR")) {
+                devOp(alias, "$tag：强停重拉失败后经权限页恢复，TikTok 前台已确认，继续任务")
+                return true
+            }
+            devOp(alias, "$tag：重拉后权限页处理完仍未见 TikTok 界面")
         }
 
         logForegroundProbeFailure(alias, tag, pkg)
@@ -13104,20 +13517,10 @@ class RealTraceExecutor(
     }
 
     private fun isTikTokForeground(): Boolean {
+        if (isSystemPermissionGrantDialogForeground()) return false
         val probe = collectForegroundProbeTexts()
         resolveStrictForegroundPackage(probe)?.let { fg ->
-            if (fg.contains("permissioncontroller", ignoreCase = true) ||
-                fg.contains("packageinstaller", ignoreCase = true)
-            ) {
-                return false
-            }
             if (Config.TIKTOK_PACKAGE_CANDIDATES.any { it.equals(fg, ignoreCase = true) }) return true
-        }
-        if (filterDumpsysFocusLines(probe).any { line ->
-            line.contains("GrantPermissionsActivity", ignoreCase = true) ||
-                line.contains("permissioncontroller", ignoreCase = true)
-        }) {
-            return false
         }
         // WM 焦点仍在桌面但 dumpsys activity top 已是 TikTok（用户可见、脚本误报 launcher 焦点）
         extractTopActivityPackage(probe)?.let { top ->
@@ -16205,7 +16608,6 @@ class RealTraceExecutor(
     private suspend fun recoverUsersListMissToHomeUnlocked(service: Context, reason: String): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val ctx = service.applicationContext
-        val pkg = Config.TIKTOK_PACKAGE_NAME
         if (hardStopOrNull(alias, reason)) return false
         if (!ensureTikTokInForeground(ctx, alias, "$reason·回首页", allowForceRestart = false)) {
             devOp(alias, "$reason：TikTok 非前台，无法导航返回回首页（不进行强关重启）")
@@ -16229,12 +16631,25 @@ class RealTraceExecutor(
 
         /** @return null 可继续；非 null 为本恢复流程结束结果。 */
         suspend fun reopenIfBackClosedApp(passLabel: String): Boolean? {
-            if (backsCompleted < RECOVER_TO_HOME_FOREGROUND_CHECK_MIN_BACKS) return null
             invalidateForegroundProbeCache()
-            if (isPackageVisible(pkg)) return null
+            if (isTikTokForeground()) {
+                logTikTokForegroundCheck(
+                    alias,
+                    "$reason·$passLabel",
+                    passed = true,
+                    detail = "当前最前是 TikTok，可继续返回",
+                )
+                return null
+            }
+            logTikTokForegroundCheck(
+                alias,
+                "$reason·$passLabel",
+                passed = false,
+                detail = "已连续返回 $backsCompleted 次且当前最前不是 TikTok",
+            )
             devOp(
                 alias,
-                "$reason：$passLabel 已连续返回 $backsCompleted 次且 TikTok 非前台，尝试重新打开（不强关）",
+                "$reason：$passLabel 当前最前不是 TikTok，尝试重新打开（不强关）",
             )
             val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
             if (
@@ -16262,13 +16677,36 @@ class RealTraceExecutor(
             }
         }
 
+        suspend fun navBackIfTikTokForeground(label: String): Boolean {
+            invalidateForegroundProbeCache()
+            if (!isTikTokForeground()) {
+                logTikTokForegroundCheck(
+                    alias,
+                    "$reason·$label",
+                    passed = false,
+                    detail = "当前最前不是 TikTok，跳过本次返回",
+                )
+                return false
+            }
+            navBack(alias, label)
+            return true
+        }
+
         // 一次返回两次（双返），然后立刻 OCR —— 不要固定再无条件单返以免过冲退 App
         devOp(alias, "$reason：一次双返（连按两次）")
-        navBack(alias, "$reason·双返 1/2")
+        if (!navBackIfTikTokForeground("$reason·双返 1/2")) {
+            reopenIfBackClosedApp("双返第1下前")?.let { return it }
+            return false
+        }
         if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返间隔")) return false
-        navBack(alias, "$reason·双返 2/2")
+        backsCompleted += 1
+        if (!navBackIfTikTokForeground("$reason·双返 2/2")) {
+            reopenIfBackClosedApp("双返第2下前")?.let { return it }
+            // 第一下已按下；若重开后未结束，按已返回 1 次继续 OCR
+        } else {
+            backsCompleted += 1
+        }
         if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·双返后")) return false
-        backsCompleted += 2
         reopenIfBackClosedApp("双返后")?.let { return it }
         when (val afterDouble = ocrOnMainFeed("after_double")) {
             null -> return false
@@ -16280,9 +16718,12 @@ class RealTraceExecutor(
         }
 
         // 双返未见主 Feed：后续接上返回一次，再 OCR
-        navBack(alias, "$reason·单返")
-        if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·单返后")) return false
-        backsCompleted += 1
+        if (!navBackIfTikTokForeground("$reason·单返")) {
+            reopenIfBackClosedApp("单返前")?.let { return it }
+        } else {
+            backsCompleted += 1
+            if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·单返后")) return false
+        }
         reopenIfBackClosedApp("单返后")?.let { return it }
         when (val afterSingle = ocrOnMainFeed("after_double_single")) {
             null -> return false
@@ -16295,7 +16736,10 @@ class RealTraceExecutor(
 
         for (pass in 1..RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS) {
             if (hardStopOrNull(alias, reason)) return false
-            navBack(alias, "$reason·续单返（$pass/$RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS）")
+            if (!navBackIfTikTokForeground("$reason·续单返（$pass/$RECOVER_TO_HOME_VIA_BACK_MAX_ATTEMPTS）")) {
+                reopenIfBackClosedApp("续单返 $pass 前")?.let { return it }
+                continue
+            }
             if (!growthDelay(alias, RECOVER_TO_HOME_VIA_BACK_DELAY_MS, "$reason·续单返后")) return false
             backsCompleted += 1
             reopenIfBackClosedApp("续单返 $pass 后")?.let { return it }

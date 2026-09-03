@@ -2138,13 +2138,47 @@ object AppCoordinator {
         INCOMPLETE,
     }
 
-    /** 待活跃：总剩余超过 58 分钟时，本段只随机跑 30–58 分钟。 */
-    private fun resolveActivateOnlineDurationSec(remainingTotalSec: Int, splitOnlineStint: Boolean): Int {
-        if (!splitOnlineStint) return remainingTotalSec
-        if (remainingTotalSec <= PrefsStore.ACTIVATE_ONLINE_STINT_MAX_SEC) return remainingTotalSec
-        return Random.nextInt(
-            PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC,
-            PrefsStore.ACTIVATE_ONLINE_STINT_MAX_SEC + 1,
+    /**
+     * 待活跃连续上机切段：
+     * - 剩余 < 30 分钟：向上取整随机抽 30–58 分钟，作为最后一段跑完；
+     * - 剩余 ≤ 58 分钟：本段直接跑完；
+     * - 剩余 > 58 分钟：随机抽 30–58，且保证切后剩余为 0 或 ≥ 30；无法满足则改为末段 30–58 跑完。
+     */
+    private data class ActivateOnlineStintPlan(
+        val durationSec: Int,
+        /** 本段跑完即视为总计划完成（含剩余 <30 向上取整为 30–58 的末段）。 */
+        val finalStint: Boolean,
+    )
+
+    private fun resolveActivateOnlineStintPlan(
+        remainingTotalSec: Int,
+        splitOnlineStint: Boolean,
+    ): ActivateOnlineStintPlan {
+        if (!splitOnlineStint) {
+            return ActivateOnlineStintPlan(remainingTotalSec, finalStint = true)
+        }
+        val minSec = PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC
+        val maxSec = PrefsStore.ACTIVATE_ONLINE_STINT_MAX_SEC
+        if (remainingTotalSec < minSec) {
+            return ActivateOnlineStintPlan(
+                durationSec = Random.nextInt(minSec, maxSec + 1),
+                finalStint = true,
+            )
+        }
+        if (remainingTotalSec <= maxSec) {
+            return ActivateOnlineStintPlan(remainingTotalSec, finalStint = true)
+        }
+        // 切后剩余须 ≥ 30：本段最长 = min(58, remaining-30)
+        val maxStintKeepingValidLeftover = (remainingTotalSec - minSec).coerceAtMost(maxSec)
+        if (maxStintKeepingValidLeftover < minSec) {
+            return ActivateOnlineStintPlan(
+                durationSec = Random.nextInt(minSec, maxSec + 1),
+                finalStint = true,
+            )
+        }
+        return ActivateOnlineStintPlan(
+            durationSec = Random.nextInt(minSec, maxStintKeepingValidLeftover + 1),
+            finalStint = false,
         )
     }
 
@@ -2181,7 +2215,7 @@ object AppCoordinator {
 
     /**
      * 随机 For You 预滑 / 涨粉一段时间；成功后累加账号活跃总时长。
-     * [splitOnlineStint] 为 true 时：总剩余超过 58 分钟则本段只连续跑 30–58 分钟，然后下机把剩余留给后续补时。
+     * [splitOnlineStint] 为 true 时：按 30–58 分钟切段上机；切后剩余 <30 则向上取整抽 30–58 作为末段跑完。
      * 中断时保存剩余秒数，下次同号在队列内可直接续跑而不切号。
      */
     private suspend fun runRandomActivatePhase(
@@ -2194,9 +2228,13 @@ object AppCoordinator {
         val plannedSec = minutes * 60
         val remainingTotalSec = PrefsStore.getActivateSessionRemainingSec(target, minutes)?.takeIf { it > 0 }
             ?: plannedSec
-        val durationSec = resolveActivateOnlineDurationSec(remainingTotalSec, splitOnlineStint)
+        val stintPlan = resolveActivateOnlineStintPlan(remainingTotalSec, splitOnlineStint)
+        val durationSec = stintPlan.durationSec
         val resuming = remainingTotalSec < plannedSec
-        val stintRestPlanned = splitOnlineStint && durationSec < remainingTotalSec
+        val roundUpFinal = splitOnlineStint &&
+            stintPlan.finalStint &&
+            remainingTotalSec < PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC
+        val stintRestPlanned = splitOnlineStint && !stintPlan.finalStint
         PrefsStore.setLogContextUsername(target)
         val useForYou = Random.nextBoolean()
         val modeLabel = if (useForYou) "For You 预滑" else "涨粉"
@@ -2206,7 +2244,15 @@ object AppCoordinator {
             alias,
             "$logTag：@$target 随机 → $modeLabel（" +
                 (if (resuming) "续跑本段 $durationLabel" else "本段 $durationLabel") +
-                (if (stintRestPlanned) "，总剩余 $remainTotalLabel，满段后下机补时" else "") +
+                (when {
+                    roundUpFinal ->
+                        "，总剩余 $remainTotalLabel <30分钟，向上取整为末段"
+                    stintRestPlanned ->
+                        "，总剩余 $remainTotalLabel，满段后下机补时"
+                    stintPlan.finalStint && splitOnlineStint ->
+                        "，末段跑完"
+                    else -> ""
+                }) +
                 "）",
         )
         PrefsStore.saveLocalStatus("running")
@@ -2267,15 +2313,26 @@ object AppCoordinator {
             .toInt().coerceIn(0, durationSec)
         val completedStint = !interrupted && elapsedSec >= durationSec - 2
         val leftoverSec = (remainingTotalSec - elapsedSec).coerceAtLeast(0)
+        // 末段（含剩余 <30 向上取整）：跑完即清零，不再留下不足 30 分钟的尾巴。
+        val treatAsPlannedDone = completedStint && (
+            stintPlan.finalStint ||
+                leftoverSec <= 2 ||
+                leftoverSec < PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC
+            )
 
         creditActivateMinutes(target, elapsedSec, modeLabel)
         notifyManualAccountUi()
 
-        if (completedStint && leftoverSec <= 2) {
+        if (treatAsPlannedDone) {
             PrefsStore.clearActivateSession(target)
             LogCenter.op(
                 alias,
-                "$logTag：@$target 完成（$modeLabel · $durationLabel，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟）",
+                "$logTag：@$target 完成（$modeLabel · $durationLabel，累计活跃 ${PrefsStore.getActivateTotalMinutes(target)} 分钟）" +
+                    (if (roundUpFinal || (leftoverSec in 3 until PrefsStore.ACTIVATE_ONLINE_STINT_MIN_SEC)) {
+                        "（末段已覆盖原剩余 ${formatActivateRemainingLabel(remainingTotalSec)}）"
+                    } else {
+                        ""
+                    }),
             )
             return ActivatePhaseResult.PLANNED_DONE
         }

@@ -447,7 +447,7 @@ class PendingActivateActivity : AppCompatActivity() {
                 .setMessage(
                     "待活跃队列已有 ${queued.size} 个账号。\n" +
                         "每号 ${formatSessionDurationLabel(readDurationMinutes())}，随机 For You/涨粉。\n" +
-                        "连续活跃 30–58 分钟后关闭 TikTok 下机，切下一号；总时长不够会轮转回来再补。",
+                        "连续活跃 30–58 分钟后关闭 TikTok 下机，切下一号；切后剩余不足 30 分钟则向上取整抽 30–58 分钟作为末段跑完。",
                 )
                 .setPositiveButton("用当前队列开始") { _, _ ->
                     val minutes = readDurationMinutes()
