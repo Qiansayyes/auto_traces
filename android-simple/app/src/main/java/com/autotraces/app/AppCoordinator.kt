@@ -3905,6 +3905,7 @@ object AppCoordinator {
         val autoSwitchExcluded: Boolean,
         val looksBanned: Boolean,
         val cloudIsLogin: Boolean?,
+        val assigned: DeviceAssignedAccountItem,
     ) {
         val participating: Boolean get() = !autoSwitchExcluded && !looksBanned
     }
@@ -3921,7 +3922,8 @@ object AppCoordinator {
             if (resp.code != 0) {
                 throw IllegalStateException(resp.msg?.trim().orEmpty().ifBlank { "拉取账号失败" })
             }
-            resp.items.orEmpty().mapNotNull { item ->
+            val items = resp.items.orEmpty()
+            items.mapNotNull { item ->
                 val username = item.username?.trim()?.removePrefix("@").orEmpty()
                 if (username.isEmpty()) return@mapNotNull null
                 AutoSwitchParticipationAccount(
@@ -3933,6 +3935,7 @@ object AppCoordinator {
                         ManualDeviceControl.isBannedMarker(item.email) ||
                         ManualDeviceControl.isBannedMarker(item.email_password),
                     cloudIsLogin = item.is_login,
+                    assigned = item,
                 )
             }
         }

@@ -12,13 +12,18 @@ import androidx.lifecycle.lifecycleScope
 import com.autotraces.app.databinding.ActivityControlModeBinding
 import com.autotraces.app.videoded.VideoDedMainActivity
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /** 运行模式：本机手动 / 云端 client，与设置、操作、PC传输、日志同级入口。 */
 class ControlModeActivity : AppCompatActivity() {
     private lateinit var binding: ActivityControlModeBinding
     private var participationRoster: List<AppCoordinator.AutoSwitchParticipationAccount> = emptyList()
     private val participationChecked = linkedMapOf<String, Boolean>()
+    private val expandedUsernames = mutableSetOf<String>()
     private var participationBusy = false
+    private val dateFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -111,7 +116,7 @@ class ControlModeActivity : AppCompatActivity() {
                 participationChecked[acc.username] = when {
                     acc.looksBanned -> false
                     prev != null -> prev
-                    else -> acc.participating
+                    else -> true
                 }
             }
             renderParticipationAccountList()
@@ -145,16 +150,45 @@ class ControlModeActivity : AppCompatActivity() {
         for (acc in participationRoster) {
             val row = inflater.inflate(R.layout.item_auto_switch_participation, container, false)
             val check = row.findViewById<com.google.android.material.checkbox.MaterialCheckBox>(R.id.participationCheck)
+            val usernameText = row.findViewById<TextView>(R.id.participationUsernameText)
+            val growthText = row.findViewById<TextView>(R.id.participationGrowthText)
+            val localText = row.findViewById<TextView>(R.id.participationLocalText)
+            val expandBtn = row.findViewById<TextView>(R.id.participationExpandButton)
+            val expandPanel = row.findViewById<View>(R.id.participationExpandPanel)
             val status = row.findViewById<TextView>(R.id.participationStatusText)
             val toggle = row.findViewById<com.google.android.material.button.MaterialButton>(R.id.participationToggleButton)
 
+            usernameText.text = buildString {
+                append("@${acc.username}")
+                if (acc.looksBanned) {
+                    append(" · 已封禁")
+                } else if (participationChecked[acc.username] != true) {
+                    append(" · 未勾选")
+                }
+            }
+            growthText.text = formatGrowthLine(acc)
+            localText.text = formatLocalLine(acc.username)
+
+            val expanded = acc.username in expandedUsernames
+            expandPanel.visibility = if (expanded) View.VISIBLE else View.GONE
+            expandBtn.text = if (expanded) "收起" else "展开"
+            val toggleExpand = View.OnClickListener {
+                if (acc.username in expandedUsernames) {
+                    expandedUsernames.remove(acc.username)
+                } else {
+                    expandedUsernames.add(acc.username)
+                }
+                renderParticipationAccountList()
+            }
+            expandBtn.setOnClickListener(toggleExpand)
+            row.findViewById<View>(R.id.participationHeader).setOnClickListener(toggleExpand)
+
             val cloudLabel = when {
-                acc.looksBanned -> "云端：已封禁"
+                acc.looksBanned -> "云端：已封禁（不可参与）"
                 acc.autoSwitchExcluded -> "云端：不参与"
                 else -> "云端：参与"
             }
             status.text = cloudLabel
-            check.text = "@${acc.username}"
             check.isEnabled = !acc.looksBanned && !participationBusy
             check.setOnCheckedChangeListener(null)
             check.isChecked = participationChecked[acc.username] == true && !acc.looksBanned
@@ -171,7 +205,7 @@ class ControlModeActivity : AppCompatActivity() {
                 }
                 acc.autoSwitchExcluded -> {
                     toggle.isEnabled = !participationBusy
-                    toggle.text = "切换为参与"
+                    toggle.text = "设为参与"
                     toggle.setOnClickListener {
                         lifecycleScope.launch {
                             setSingleParticipation(acc.username, participating = true)
@@ -180,7 +214,7 @@ class ControlModeActivity : AppCompatActivity() {
                 }
                 else -> {
                     toggle.isEnabled = !participationBusy
-                    toggle.text = "切换为不参与"
+                    toggle.text = "排除"
                     toggle.setOnClickListener {
                         lifecycleScope.launch {
                             setSingleParticipation(acc.username, participating = false)
@@ -191,6 +225,26 @@ class ControlModeActivity : AppCompatActivity() {
             container.addView(row)
         }
         updateParticipationSummary()
+    }
+
+    private fun formatGrowthLine(acc: AppCoordinator.AutoSwitchParticipationAccount): String {
+        val item = acc.assigned
+        val growth3d = PendingActivateRecommend.heartGrowth3d(item)
+        val dayBefore = PendingActivateRecommend.parseGrowth(item.heart_growth_day_before)
+        val yesterday = PendingActivateRecommend.parseGrowth(item.heart_growth_yesterday)
+        val today = PendingActivateRecommend.parseGrowth(item.heart_growth_today)
+        return "粉丝 ${item.follower_count.orEmpty().ifBlank { "—" }}（+${item.follower_growth.orEmpty().ifBlank { "0" }}）" +
+            " · 总赞 ${item.heart_count.orEmpty().ifBlank { "—" }}" +
+            "（三天+$growth3d 前$dayBefore/昨$yesterday/今$today）"
+    }
+
+    private fun formatLocalLine(username: String): String {
+        val enqueueAt = PrefsStore.getPendingActivateEnqueueAt(username)
+        val enqueueLabel = enqueueAt?.let { dateFmt.format(Date(it)) } ?: "—"
+        val total = PrefsStore.getActivateTotalMinutes(username)
+        val growth = PrefsStore.getActivateGrowthMinutes(username)
+        val forYou = PrefsStore.getActivateForYouMinutes(username)
+        return "上次入队 $enqueueLabel · 累计活跃 ${total}分（涨粉${growth} / ForYou${forYou}）"
     }
 
     private fun updateParticipationSummary() {

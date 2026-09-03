@@ -272,7 +272,6 @@ class PendingActivateActivity : AppCompatActivity() {
                 append("@$username")
                 if (excluded) append(" · 不切号")
                 if (banned) append(" · 已封禁")
-                if (!banned && PendingActivateRecommend.isRecommended(username)) append(" · 推荐")
             }
 
             val pos = queuePosition(username)

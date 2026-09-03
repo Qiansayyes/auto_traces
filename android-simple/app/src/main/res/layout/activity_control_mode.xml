@@ -103,7 +103,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="本机手动时忽略云端任务指令，由本机按钮驱动。切到云端前先挑选参与自动切号的账号；未勾选的会同步为「不参与」。也可对单个账号点按钮立即改云端状态。"
+            android:text="本机手动时忽略云端任务指令，由本机按钮驱动。账号默认全选参与；要排除请点「展开」后取消勾选或点排除。切到云端后听管理台，与 android-client 同一套调度。"
             android:textColor="@android:color/darker_gray"
             android:textSize="12sp" />
 
