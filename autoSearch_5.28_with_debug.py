@@ -81,17 +81,31 @@ def _parse_cookie_header_string(value: str) -> Dict[str, str]:
 
 def _resolve_tiktok_cookie_file_path() -> Optional[str]:
     """
-    优先环境变量 TIKTOK_COOKIES_FILE（可为相对/绝对路径，由加载阶段检查是否存在）；
-    未设置时在本脚本同目录查找 tiktok_cookies.json，再 tiktok_cookies.txt。
+    优先环境变量 TIKTOK_COOKIES_FILE；
+    未设置时按顺序查找：脚本同目录 → 项目旁 auto_upload → D:\\autoGroup\\auto_upload。
+    （与 tiktok_auto_publish_fast.py 对齐，避免服务端 cwd 不同导致找不到 Cookie。）
     """
     env = (os.environ.get("TIKTOK_COOKIES_FILE") or "").strip()
     if env:
         return env
-    base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("tiktok_cookies.json", "tiktok_cookies.txt"):
-        p = os.path.join(base, name)
-        if os.path.isfile(p):
-            return p
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [
+        script_dir,
+        os.path.join(os.path.dirname(script_dir), "auto_upload"),
+        r"D:\autoGroup\auto_upload",
+        os.path.dirname(script_dir),
+    ]
+    seen: set[str] = set()
+    for base in search_dirs:
+        ab = os.path.abspath(base)
+        if ab in seen or not os.path.isdir(ab):
+            continue
+        seen.add(ab)
+        for name in ("tiktok_cookies.json", "tiktok_cookies.txt"):
+            p = os.path.join(ab, name)
+            if os.path.isfile(p):
+                return p
     return None
 
 

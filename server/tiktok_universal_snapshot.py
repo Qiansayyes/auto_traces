@@ -34,18 +34,25 @@ def _autosearch_script_path() -> Path:
 
 
 def _ensure_tiktok_cookies_env() -> None:
-    """未显式配置时，自动在项目根 / server 等目录查找 Cookie 文件。"""
+    """未显式配置时，自动在项目根 / server / auto_upload 等目录查找 Cookie 文件。"""
     if (os.environ.get("TIKTOK_COOKIES_FILE") or "").strip():
         return
-    search_dirs = (
+    search_dirs: list[Path] = [
         _PROJECT_ROOT,
         _SERVER_DIR,
-        _autosearch_script_path().parent,
         Path(r"D:\autoGroup\auto_upload"),
-    )
+        _PROJECT_ROOT.parent / "auto_upload",
+    ]
+    try:
+        search_dirs.append(_autosearch_script_path().parent)
+    except Exception:
+        pass
     seen: set[str] = set()
     for base in search_dirs:
-        key = str(base.resolve())
+        try:
+            key = str(base.resolve())
+        except Exception:
+            continue
         if key in seen:
             continue
         seen.add(key)

@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from threading import Event, Lock, RLock, Thread
-from typing import Any, Dict, Iterable, List, Literal
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import requests
 
@@ -36,6 +36,47 @@ from tiktok_universal_snapshot import (
     prepare_tiktok_profile_request_headers_and_cookies,
     tiktok_universal_extract_to_json_dict,
 )
+
+_AUTO_UPLOAD_DIR = Path(r"D:\autoGroup\auto_upload")
+_AUTO_UPLOAD_SCRAPE_MOD = None
+
+
+def _load_auto_upload_scrape_module():
+    """直接复用 tiktok_auto_publish_fast.py 的查询实现，避免两套解析逻辑漂移。"""
+    global _AUTO_UPLOAD_SCRAPE_MOD
+    if _AUTO_UPLOAD_SCRAPE_MOD is not None:
+        return _AUTO_UPLOAD_SCRAPE_MOD
+    script = _AUTO_UPLOAD_DIR / "tiktok_auto_publish_fast.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"未找到 {script}")
+    upload_dir = str(_AUTO_UPLOAD_DIR.resolve())
+    if upload_dir not in sys.path:
+        sys.path.insert(0, upload_dir)
+    # 强制与发布工具同一 Cookie 文件
+    cookie_json = _AUTO_UPLOAD_DIR / "tiktok_cookies.json"
+    if cookie_json.is_file():
+        os.environ["TIKTOK_COOKIES_FILE"] = str(cookie_json.resolve())
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("tiktok_auto_publish_fast_runtime", script)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {script}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _AUTO_UPLOAD_SCRAPE_MOD = mod
+    return mod
+
+
+def _scrape_profile_via_auto_upload_fast(username: str) -> tuple[Optional[dict], str, Optional[str], bool]:
+    """
+    返回 (metrics_dict_or_None, cookie_debug, cookie_path, cookies_sent)。
+    metrics 字段与 scrape_tiktok_profile_by_username / to_query_result 一致。
+    """
+    mod = _load_auto_upload_scrape_module()
+    cookies, cookie_log = mod.load_tiktok_cookies_for_scrape()
+    cookie_path = mod._resolve_tiktok_cookie_file_path()
+    metrics = mod.scrape_tiktok_profile_by_username(username, cookies=cookies)
+    return metrics, str(cookie_log or ""), cookie_path, bool(cookies)
 
 from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -8770,11 +8811,26 @@ def _account_stats_query_log(line: str) -> None:
 
 def _account_stats_query_cookie_probe_line() -> str:
     try:
-        _, cookies_dict, debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
-        if cookies_dict:
-            return f"Cookie已启用 | 文件={cookie_path or '(未知)'} | 条数={len(cookies_dict)}"
-        reason = str((debug_lines or ["未加载 Cookie"])[0]).strip()
-        return f"Cookie未使用 | {reason}"
+        # 优先与发布工具同一 Cookie / 同一加载逻辑
+        try:
+            mod = _load_auto_upload_scrape_module()
+            cookies, cookie_log = mod.load_tiktok_cookies_for_scrape()
+            cookie_path = mod._resolve_tiktok_cookie_file_path()
+            if cookies:
+                return f"Cookie已启用(auto_upload) | 文件={cookie_path or '(未知)'} | 条数={len(cookies)}"
+            return f"Cookie未使用(auto_upload) | {cookie_log}"
+        except Exception as upload_exc:
+            from tiktok_universal_snapshot import _ensure_tiktok_cookies_env
+
+            _ensure_tiktok_cookies_env()
+            _, cookies_dict, debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
+            if cookies_dict:
+                return (
+                    f"Cookie已启用(fallback) | 文件={cookie_path or '(未知)'} | 条数={len(cookies_dict)} "
+                    f"| auto_upload加载失败: {upload_exc}"
+                )
+            reason = str((debug_lines or ["未加载 Cookie"])[0]).strip()
+            return f"Cookie未使用 | {reason} | auto_upload加载失败: {upload_exc}"
     except Exception as exc:
         return f"Cookie探测失败 | {exc}"
 
@@ -9334,6 +9390,65 @@ def _start_account_stats_query_worker() -> None:
     ).start()
 
 
+def _html_regex_tiktok_profile_metrics(html: str) -> dict[str, int]:
+    """与 tiktok_auto_publish_fast.py 一致：Universal 解析失败时从 HTML 正则回退。"""
+    text = html or ""
+
+    def _extract_num(pattern: str) -> int:
+        match = re.search(pattern, text)
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "follower_count": _extract_num(r'"followerCount"\s*:\s*"?(\d+)"?'),
+        "following_count": _extract_num(r'"followingCount"\s*:\s*"?(\d+)"?'),
+        "heart_count": max(
+            _extract_num(r'"heartCount"\s*:\s*"?(\d+)"?'),
+            _extract_num(r'"heart"\s*:\s*"?(\d+)"?'),
+        ),
+        "video_count": _extract_num(r'"videoCount"\s*:\s*"?(\d+)"?'),
+    }
+
+
+def _extract_dict_from_auto_upload_metrics(metrics: dict, username: str) -> dict:
+    """把发布工具 to_query_result 转成 write_back / 日志用的 extract_dict。"""
+    follower = int(metrics.get("follower_count") or 0)
+    following = int(metrics.get("following_count") or 0)
+    heart = int(metrics.get("heart_count") or 0)
+    video = int(metrics.get("video_count") or 0)
+    return {
+        "page_username": username,
+        "user_detail_status_code": metrics.get("user_detail_status_code"),
+        "user_detail_status_msg": str(metrics.get("user_detail_status_msg") or ""),
+        "profile_uid": str(metrics.get("profile_uid") or ""),
+        "profile_sec_uid": str(metrics.get("profile_sec_uid") or ""),
+        "profile_unique_id": str(metrics.get("profile_unique_id") or ""),
+        "profile_nickname": str(metrics.get("profile_nickname") or ""),
+        "profile_private_account": metrics.get("profile_private_account"),
+        "profile_secret": metrics.get("profile_secret"),
+        "profile_following_visibility": metrics.get("profile_following_visibility"),
+        "following_list_hidden_guess": metrics.get("following_list_hidden_guess"),
+        "follower_count": follower,
+        "following_count": following,
+        "heart_count": heart,
+        "video_count": video,
+        "session_is_private_account": metrics.get("session_is_private_account"),
+        "session_show_private_banner": metrics.get("session_show_private_banner"),
+        "session_region": str(metrics.get("session_region") or ""),
+        "to_publish_style_metrics": {
+            "粉丝量": str(follower),
+            "关注数": str(following),
+            "总赞": str(heart),
+            "视频数": str(video),
+            "点赞量": str(heart),
+        },
+    }
+
+
 def fetch_tiktok_profile_stats(
     username: str,
     include_raw: bool = False,
@@ -9343,7 +9458,7 @@ def fetch_tiktok_profile_stats(
     query_total: int | None = None,
     owner_username: str = "",
 ):
-    """抓取 TikTok 主页并解析 __UNIVERSAL_DATA_FOR_REHYDRATION__，返回结构与 autoSearch extract 一致。"""
+    """抓取 TikTok 主页统计：优先直接调用 tiktok_auto_publish_fast.py 同款逻辑。"""
     username = username.strip().lstrip("@")
     if not username:
         return {
@@ -9351,15 +9466,70 @@ def fetch_tiktok_profile_stats(
             "msg": "用户名不能为空",
         }
 
+    progress_prefix = ""
+    if query_index is not None:
+        total = int(query_total or 0)
+        remain = max(total - int(query_index), 0) if total > 0 else 0
+        progress_prefix = f"正在全量查询第 {int(query_index)} 个，还剩 {remain} 个 | "
+
+    # 1) 优先：与发布工具完全同一套 scrape
+    upload_err = ""
+    try:
+        metrics, cookie_log, cookie_path, cookies_sent = _scrape_profile_via_auto_upload_fast(username)
+        if isinstance(metrics, dict) and (
+            metrics.get("profile_unique_id")
+            or int(metrics.get("follower_count") or 0)
+            or int(metrics.get("heart_count") or 0)
+            or int(metrics.get("video_count") or 0)
+        ):
+            extract_dict = _extract_dict_from_auto_upload_metrics(metrics, username)
+            is_private_guess = bool(metrics.get("profile_private_account") or metrics.get("profile_secret"))
+            debug_payload = {
+                "http_status": 200,
+                "cookie_file": cookie_path,
+                "cookies_sent": cookies_sent,
+                "cookie_debug_lines": [cookie_log],
+                "universal_data_present": True,
+                "has_metrics": True,
+                "scrape_source": "tiktok_auto_publish_fast",
+            }
+            print(
+                f"[{now_text()}] {progress_prefix}TikTok stats(auto_upload) | username={username} | "
+                f"followers={extract_dict.get('follower_count')} hearts={extract_dict.get('heart_count')} "
+                f"videos={extract_dict.get('video_count')} | cookies_sent={cookies_sent}"
+            )
+            if write_back:
+                _apply_profile_stats_write_back(
+                    username,
+                    extract_dict,
+                    owner_username=owner_username,
+                )
+            return {
+                "code": 0,
+                "msg": "ok",
+                "username": username,
+                "universal_extract": extract_dict,
+                "private_account_guess": is_private_guess,
+                "private_account_reason": "",
+                "profile_following_visibility": metrics.get("profile_following_visibility"),
+                "following_list_hidden_guess": metrics.get("following_list_hidden_guess"),
+                "following_list_hidden_reason": "",
+                "debug": debug_payload,
+            }
+        upload_err = f"auto_upload无有效指标 | {cookie_log}"
+    except Exception as exc:
+        upload_err = f"auto_upload调用失败: {exc}"
+
+    # 2) 回退：原 server 抓取路径
     url = f"https://www.tiktok.com/@{username}"
     headers, cookies_dict, cookie_debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
 
     try:
-        response = requests.get(url, headers=headers, cookies=cookies_dict, timeout=10)
+        response = requests.get(url, headers=headers, cookies=cookies_dict, timeout=15)
     except Exception as exc:
         return {
             "code": 1,
-            "msg": f"请求 TikTok 页面失败: {exc}",
+            "msg": f"请求 TikTok 页面失败: {exc} | {upload_err}",
         }
 
     html = response.text or ""
@@ -9368,6 +9538,21 @@ def fetch_tiktok_profile_stats(
     universal = _get_universal_data(html)
     snap = extract_tiktok_universal_profile_snapshot(universal, username)
     apply_following_visibility_html_fallback(snap, html)
+
+    # Universal 缺失或全 0 时，对齐 auto_upload：再走一遍 HTML 正则回退
+    if not (
+        snap.profile_unique_id
+        or snap.follower_count
+        or snap.heart_count
+        or snap.video_count
+    ):
+        fallback = _html_regex_tiktok_profile_metrics(html)
+        if any(fallback.values()):
+            snap.follower_count = int(fallback.get("follower_count") or 0)
+            snap.following_count = int(fallback.get("following_count") or 0)
+            snap.heart_count = int(fallback.get("heart_count") or 0)
+            snap.video_count = int(fallback.get("video_count") or 0)
+
     extract_dict = tiktok_universal_extract_to_json_dict(snap)
     user_detail_meta = _webapp_user_detail_meta(universal)
 
@@ -9387,14 +9572,24 @@ def fetch_tiktok_profile_stats(
             f"universal_matched_user_flags:followingVisibility={snap.profile_following_visibility}"
         )
 
+    has_metrics = bool(
+        snap.profile_unique_id
+        or snap.follower_count
+        or snap.heart_count
+        or snap.video_count
+        or snap.following_count
+    )
+
     debug_payload = {
         "http_status": response.status_code,
         "final_url": str(response.url),
         "html_length": len(html),
         "cookie_file": cookie_path,
         "cookies_sent": bool(cookies_dict),
-        "cookie_debug_lines": cookie_debug_lines,
+        "cookie_debug_lines": list(cookie_debug_lines or []) + ([upload_err] if upload_err else []),
         "universal_data_present": universal is not None,
+        "has_metrics": has_metrics,
+        "scrape_source": "server_fallback",
         "user_detail_meta": (
             {"status_code": user_detail_meta[0], "status_msg": user_detail_meta[1]}
             if user_detail_meta
@@ -9403,18 +9598,30 @@ def fetch_tiktok_profile_stats(
         "__universal_script_marker_in_html": "__UNIVERSAL_DATA_FOR_REHYDRATION__" in html,
     }
 
-    progress_prefix = ""
-    if query_index is not None:
-        total = int(query_total or 0)
-        remain = max(total - int(query_index), 0) if total > 0 else 0
-        progress_prefix = f"正在全量查询第 {int(query_index)} 个，还剩 {remain} 个 | "
-
     print(
         f"[{now_text()}] {progress_prefix}TikTok stats | username={username} | universal_extract={extract_dict} | "
         f"private_guess={is_private_guess} | reason={private_reason or '-'} | "
         f"following_hidden={following_list_hidden_guess} | "
-        f"followingVisibility={snap.profile_following_visibility}"
+        f"followingVisibility={snap.profile_following_visibility} | "
+        f"cookies_sent={bool(cookies_dict)} | has_metrics={has_metrics} | {upload_err}"
     )
+
+    if not has_metrics:
+        cookie_hint = (
+            f"cookie_file={cookie_path}" if cookies_dict else "未发送 Cookie（请确认 tiktok_cookies.json 可读）"
+        )
+        return {
+            "code": 1,
+            "msg": f"未解析到主页数据（可能遇 WAF / Cookie 失效）。{cookie_hint} | {upload_err}",
+            "username": username,
+            "universal_extract": extract_dict,
+            "private_account_guess": is_private_guess,
+            "private_account_reason": private_reason,
+            "profile_following_visibility": snap.profile_following_visibility,
+            "following_list_hidden_guess": following_list_hidden_guess,
+            "following_list_hidden_reason": following_list_hidden_reason,
+            "debug": debug_payload,
+        }
 
     if write_back:
         _apply_profile_stats_write_back(
