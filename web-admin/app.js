@@ -263,8 +263,6 @@ const confirmAccountBatchPreviewBtn = document.getElementById("confirmAccountBat
 const accountBatchPreviewSelectAllEl = document.getElementById("accountBatchPreviewSelectAll");
 const accountBatchPreviewBulkAliasEl = document.getElementById("accountBatchPreviewBulkAlias");
 const accountBatchPreviewApplyAliasBtn = document.getElementById("accountBatchPreviewApplyAliasBtn");
-const accountBatchPreviewSmartAliasToggleBtn = document.getElementById("accountBatchPreviewSmartAliasToggleBtn");
-const accountBatchPreviewSmartAliasPanelEl = document.getElementById("accountBatchPreviewSmartAliasPanel");
 const accountBatchPreviewSmartAliasListEl = document.getElementById("accountBatchPreviewSmartAliasList");
 const accountBatchPreviewSmartAliasSelectAllBtn = document.getElementById("accountBatchPreviewSmartAliasSelectAllBtn");
 const accountBatchPreviewSmartAliasClearBtn = document.getElementById("accountBatchPreviewSmartAliasClearBtn");
@@ -9719,18 +9717,13 @@ function buildAccountBatchPreviewAliasOptionsHtml(currentValue = "") {
 
 function refreshAccountBatchPreviewBulkAliasOptions() {
   const datalistEl = document.getElementById("accountBatchPreviewBulkAliasList");
-  if (!accountBatchPreviewBulkAliasEl || !datalistEl) return;
-  const previous = normalizeAliasValue(accountBatchPreviewBulkAliasEl.value);
-  const aliases = collectAssignableAliases(previous);
-  datalistEl.innerHTML = aliases.map((alias) => `<option value="${escapeHtml(alias)}"></option>`).join("");
-  if (previous) accountBatchPreviewBulkAliasEl.value = previous;
+  if (accountBatchPreviewBulkAliasEl && datalistEl) {
+    const previous = normalizeAliasValue(accountBatchPreviewBulkAliasEl.value);
+    const aliases = collectAssignableAliases(previous);
+    datalistEl.innerHTML = aliases.map((alias) => `<option value="${escapeHtml(alias)}"></option>`).join("");
+    if (previous) accountBatchPreviewBulkAliasEl.value = previous;
+  }
   refreshAccountBatchPreviewSmartAliasList();
-}
-
-function updateAccountBatchPreviewSmartAliasToggleLabel() {
-  if (!accountBatchPreviewSmartAliasToggleBtn) return;
-  const count = accountBatchPreviewSmartAliases.size;
-  accountBatchPreviewSmartAliasToggleBtn.textContent = count ? `已选 ${count} 个别名` : "选择别名";
 }
 
 function refreshAccountBatchPreviewSmartAliasList() {
@@ -9741,23 +9734,21 @@ function refreshAccountBatchPreviewSmartAliasList() {
     Array.from(accountBatchPreviewSmartAliases).filter((alias) => valid.has(alias)),
   );
   if (!aliases.length) {
-    accountBatchPreviewSmartAliasListEl.innerHTML = '<div class="hint" style="padding:4px 6px;">暂无可用别名</div>';
-    updateAccountBatchPreviewSmartAliasToggleLabel();
+    accountBatchPreviewSmartAliasListEl.innerHTML = '<div class="hint" style="padding:8px;">暂无可用别名</div>';
     return;
   }
-  accountBatchPreviewSmartAliasListEl.innerHTML = aliases.map((alias) => {
-    const checked = accountBatchPreviewSmartAliases.has(alias);
-    return `<label class="import-preview-smart-alias-item">
-      <input type="checkbox" class="account-batch-preview-smart-alias-check" value="${escapeHtml(alias)}"${checked ? " checked" : ""} />
-      <span>${escapeHtml(alias)}</span>
-    </label>`;
-  }).join("");
-  updateAccountBatchPreviewSmartAliasToggleLabel();
-}
-
-function setAccountBatchPreviewSmartAliasPanelOpen(open) {
-  if (!accountBatchPreviewSmartAliasPanelEl) return;
-  accountBatchPreviewSmartAliasPanelEl.classList.toggle("hidden", !open);
+  const selectedCount = accountBatchPreviewSmartAliases.size;
+  accountBatchPreviewSmartAliasListEl.innerHTML = `
+    <div class="import-preview-smart-alias-meta hint">已勾选 ${selectedCount} / ${aliases.length} 个别名（可多选）</div>
+    <div class="import-preview-smart-alias-grid">
+      ${aliases.map((alias) => {
+        const checked = accountBatchPreviewSmartAliases.has(alias);
+        return `<label class="import-preview-smart-alias-item">
+          <input type="checkbox" class="account-batch-preview-smart-alias-check" value="${escapeHtml(alias)}"${checked ? " checked" : ""} />
+          <span>${escapeHtml(alias)}</span>
+        </label>`;
+      }).join("")}
+    </div>`;
 }
 
 function collectAccountBatchPreviewAliasTargets() {
@@ -9777,7 +9768,7 @@ function applyAccountBatchPreviewSmartDistribution() {
   syncAccountBatchPreviewItemsFromDom();
   const aliases = Array.from(accountBatchPreviewSmartAliases).sort((a, b) => a.localeCompare(b));
   if (!aliases.length) {
-    setStatus("请先选择至少一个别名", "warning");
+    setStatus("请先勾选至少一个别名", "warning");
     return;
   }
   const targets = collectAccountBatchPreviewAliasTargets();
@@ -9908,7 +9899,6 @@ function openAccountBatchPreviewModal(items) {
   if (!accountBatchPreviewModalEl) return;
   accountBatchPreviewItems = items;
   accountBatchPreviewSmartAliases = new Set();
-  setAccountBatchPreviewSmartAliasPanelOpen(false);
   refreshAccountBatchPreviewBulkAliasOptions();
   renderAccountBatchPreviewTable();
   accountBatchPreviewModalEl.classList.remove("hidden");
@@ -9921,7 +9911,6 @@ function closeAccountBatchPreviewModal() {
   accountBatchPreviewModalEl.setAttribute("aria-hidden", "true");
   if (accountBatchPreviewBulkAliasEl) accountBatchPreviewBulkAliasEl.value = "";
   accountBatchPreviewSmartAliases = new Set();
-  setAccountBatchPreviewSmartAliasPanelOpen(false);
   accountBatchPreviewItems = [];
 }
 
@@ -12422,20 +12411,7 @@ if (cancelAccountBatchPreviewBtn) {
 }
 if (accountBatchPreviewModalEl) {
   accountBatchPreviewModalEl.addEventListener("click", (event) => {
-    if (event.target === accountBatchPreviewModalEl) {
-      closeAccountBatchPreviewModal();
-      return;
-    }
-    if (accountBatchPreviewSmartAliasPanelEl && !accountBatchPreviewSmartAliasPanelEl.classList.contains("hidden")) {
-      const target = event.target;
-      if (
-        target instanceof Node
-        && !accountBatchPreviewSmartAliasPanelEl.contains(target)
-        && target !== accountBatchPreviewSmartAliasToggleBtn
-      ) {
-        setAccountBatchPreviewSmartAliasPanelOpen(false);
-      }
-    }
+    if (event.target === accountBatchPreviewModalEl) closeAccountBatchPreviewModal();
   });
 }
 if (accountBatchPreviewSelectAllEl) {
@@ -12498,14 +12474,6 @@ if (accountBatchPreviewApplyAliasBtn) {
     setStatus(`已为 ${applied} 条选中记录分配别名「${alias}」`, "success");
   });
 }
-if (accountBatchPreviewSmartAliasToggleBtn) {
-  accountBatchPreviewSmartAliasToggleBtn.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const willOpen = accountBatchPreviewSmartAliasPanelEl?.classList.contains("hidden");
-    setAccountBatchPreviewSmartAliasPanelOpen(willOpen);
-    if (willOpen) refreshAccountBatchPreviewSmartAliasList();
-  });
-}
 if (accountBatchPreviewSmartAliasListEl) {
   accountBatchPreviewSmartAliasListEl.addEventListener("change", (event) => {
     const target = event.target;
@@ -12514,7 +12482,11 @@ if (accountBatchPreviewSmartAliasListEl) {
     if (!alias) return;
     if (target.checked) accountBatchPreviewSmartAliases.add(alias);
     else accountBatchPreviewSmartAliases.delete(alias);
-    updateAccountBatchPreviewSmartAliasToggleLabel();
+    const metaEl = accountBatchPreviewSmartAliasListEl.querySelector(".import-preview-smart-alias-meta");
+    if (metaEl) {
+      const total = accountBatchPreviewSmartAliasListEl.querySelectorAll(".account-batch-preview-smart-alias-check").length;
+      metaEl.textContent = `已勾选 ${accountBatchPreviewSmartAliases.size} / ${total} 个别名（可多选）`;
+    }
   });
 }
 if (accountBatchPreviewSmartAliasSelectAllBtn) {

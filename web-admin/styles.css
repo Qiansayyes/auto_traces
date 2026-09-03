@@ -679,58 +679,82 @@ select.device-group-select.ui-select {
   font-size: 13px;
 }
 
-.import-preview-toolbar-divider {
-  width: 1px;
-  height: 22px;
-  background: var(--border);
-  margin: 0 2px;
-}
-
-.import-preview-smart-alias {
-  position: relative;
-}
-
-.import-preview-smart-alias-panel {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 20;
-  min-width: 220px;
-  max-width: min(320px, 70vw);
-  max-height: 240px;
-  padding: 8px;
+.import-preview-smart-block {
+  margin-bottom: 12px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: #fff;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  background: #f7f8fb;
+}
+
+.import-preview-smart-block-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.import-preview-smart-block-head strong {
+  font-size: 13px;
 }
 
 .import-preview-smart-alias-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  margin-bottom: 8px;
+  align-items: center;
 }
 
 .import-preview-smart-alias-list {
-  max-height: 180px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  max-height: 160px;
   overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  padding: 6px;
+}
+
+.import-preview-smart-alias-meta {
+  padding: 2px 4px 8px;
+}
+
+.import-preview-smart-alias-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 2px 8px;
 }
 
 .import-preview-smart-alias-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   padding: 4px 6px;
   border-radius: 6px;
   font-size: 13px;
   cursor: pointer;
+  min-width: 0;
+}
+
+.import-preview-smart-alias-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .import-preview-smart-alias-item:hover {
-  background: #f3f5f9;
+  background: #eef2f8;
+}
+
+.import-preview-smart-block-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
 }
 
 .import-preview-table-wrap {
