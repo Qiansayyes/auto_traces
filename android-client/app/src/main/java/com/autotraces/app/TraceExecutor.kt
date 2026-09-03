@@ -1342,7 +1342,7 @@ class RealTraceExecutor(
             return false
         }
         val h = ctx.resources.displayMetrics.heightPixels
-        repeat(2) { i ->
+        for (i in 0 until 2) {
             if (i > 0) delay(900)
             val (vision, err) = mlKitRecognizeFullScreenCore(ctx, "launch_fg_${tag}_$i")
             if (vision == null) {
