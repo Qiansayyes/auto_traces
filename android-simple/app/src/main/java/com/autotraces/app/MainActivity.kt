@@ -1111,6 +1111,67 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        binding.manualDailyIncubateDurationMinInput.setText(
+            PrefsStore.getDailyIncubateDurationMin().toString(),
+        )
+        binding.manualDailyIncubateStartButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val minutesRaw = binding.manualDailyIncubateDurationMinInput.text?.toString()?.toIntOrNull()
+                ?: PrefsStore.getDailyIncubateDurationMin()
+            val minutes = minutesRaw.coerceIn(
+                PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
+                PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+            )
+            PrefsStore.setDailyIncubateDurationMin(minutes)
+            binding.manualDailyIncubateDurationMinInput.setText(minutes.toString())
+            lifecycleScope.launch {
+                binding.manualDailyIncubateStartButton.isEnabled = false
+                binding.manualTaskStatusText.text = "日常孵化：正在同步非待活跃账号…"
+                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
+                bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
+                if (refresh.isFailure) {
+                    binding.manualTaskStatusText.text =
+                        "日常孵化：拉取账号失败：${refresh.exceptionOrNull()?.message}"
+                    Toast.makeText(
+                        this@MainActivity,
+                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    setManualTaskButtonsEnabled(true)
+                    return@launch
+                }
+                val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
+                if (queueSize <= 0) {
+                    binding.manualTaskStatusText.text = "日常孵化：无非待活跃账号"
+                    Toast.makeText(this@MainActivity, "无非待活跃账号可养号", Toast.LENGTH_SHORT).show()
+                    setManualTaskButtonsEnabled(true)
+                    return@launch
+                }
+                AppCoordinator.manualStartDailyIncubate(minutes)
+                binding.manualTaskStatusText.text =
+                    "已请求日常孵化（约 $queueSize 个 · 每号 ${minutes} 分钟）"
+                Toast.makeText(
+                    this@MainActivity,
+                    "已开始排队养号（$queueSize 个账号）",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                setManualTaskButtonsEnabled(true)
+            }
+        }
+        binding.manualDailyIncubateStopButton.setOnClickListener {
+            AppCoordinator.manualStopDailyIncubate()
+            binding.manualTaskStatusText.text = "已停止日常孵化"
+            setManualTaskButtonsEnabled(true)
+        }
+
         binding.manualProfileEditButton.setOnClickListener {
             if (!guardManualTaskReady("修改基本资料")) return@setOnClickListener
             binding.manualTaskStatusText.text = "已请求修改基本资料"
@@ -1218,6 +1279,9 @@ class MainActivity : AppCompatActivity() {
         binding.manualBatchPublishButton.isEnabled = !blocked
         binding.manualBatchPublishNonPendingButton.isEnabled = !blocked
         binding.manualBatchPublishAfterMinInput.isEnabled = !blocked
+        binding.manualDailyIncubateDurationMinInput.isEnabled = !blocked
+        binding.manualDailyIncubateStartButton.isEnabled = !blocked
+        binding.manualDailyIncubateStopButton.isEnabled = true
         binding.manualProfileEditButton.isEnabled = aligned
         // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
         val statusUser = selectedManualUsername()

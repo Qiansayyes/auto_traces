@@ -1,6 +1,9 @@
 package com.autotraces.app
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.Manifest
@@ -9,6 +12,7 @@ import android.os.Environment
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -180,6 +184,8 @@ object AppCoordinator {
     private var batchPublishJob: Job? = null
     /** 自动活跃：对待活跃队列整队轮流切号并活跃。 */
     private var autoActiveJob: Job? = null
+    /** 日常孵化：对非待活跃账号排队养号。 */
+    private var dailyIncubateJob: Job? = null
     private val _manualSwitchBusy = MutableStateFlow(false)
     /** 手动下拉切号进行中：UI 应禁用任务按钮，直至切号完成。 */
     val manualSwitchBusy = _manualSwitchBusy.asStateFlow()
@@ -237,6 +243,7 @@ object AppCoordinator {
         ACTIVATE_NEXT("活跃下个账号"),
         BATCH_PUBLISH("批量发作品"),
         AUTO_ACTIVE("自动活跃"),
+        DAILY_INCUBATE("日常孵化"),
         BACKUP("备份"),
     }
 
@@ -676,7 +683,11 @@ object AppCoordinator {
 
     /** crash / 强杀后 prefs 可能仍留 preempt=是，但进程内已无 OP：清掉并按 plan 续跑。 */
     private suspend fun recoverStaleAutoSwitchExclusiveState(reason: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        // 手动模式同样会因抢占取消遗留 preempt；无真实独占时一并清掉
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) {
+            releaseStaleManualExclusivePreemptIfIdle(reason)
+            return
+        }
         autoSwitchLocalScheduler.recoverAllStaleInflightOnStart()
         if (isAutoSwitchExclusiveWorkActuallyActive()) return
         var cleared = false
@@ -1487,6 +1498,7 @@ object AppCoordinator {
     fun init(application: android.content.Context) {
         appContext = application.applicationContext
         PublishPostGrowthGate.installEnterHandler { alias -> enterPublishPostExclusivePhase(alias) }
+        registerDailyIncubateScreenReceiver()
         ProcessDiagnostics.registerSnapshotProvider {
             buildString {
                 append("worker=${WorkerServiceTracker.isRunning}")
@@ -1604,10 +1616,29 @@ object AppCoordinator {
                     updateRuntime(localStatus = "online", lastMessage = "在线，等待管理台启动")
                 }
                 startCheckLoop()
+                maybeResumeDailyIncubateAfterProcessStart()
             }
             return
         }
         ensureLoopsRunning()
+        maybeResumeDailyIncubateAfterProcessStart()
+    }
+
+    private fun maybeResumeDailyIncubateAfterProcessStart() {
+        if (!ManualDeviceControl.ENABLED) return
+        if (dailyIncubateJob?.isActive == true) return
+        val sess = PrefsStore.getDailyIncubateSession() ?: return
+        if (!sess.enabled) return
+        if (sess.pausedByScreenOff) {
+            val interactive = runCatching {
+                val pm = appContext.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                pm?.isInteractive == true
+            }.getOrDefault(true)
+            if (!interactive) return
+        }
+        LogCenter.op(PrefsStore.getAlias(), "日常孵化：进程恢复后自动续跑")
+        PrefsStore.saveDailyIncubateSession(sess.copy(pausedByScreenOff = false))
+        manualStartDailyIncubate(sess.plannedMin, resumeFromPause = true)
     }
 
     fun forceStartRunningNow(reason: String = "设备端启动后台服务") {
@@ -1772,6 +1803,10 @@ object AppCoordinator {
                     .filter { it.isNotEmpty() }
                     .toSet()
                 ManualDeviceControl.updateCachedAccounts(options)
+                PrefsStore.noteDailyIncubateAccountsSeen(
+                    options.map { it.username },
+                    grandfatherExisting = true,
+                )
                 val activeKey = PrefsStore.getManualActiveUsername()?.trim()?.removePrefix("@").orEmpty()
                 val selectedKey = PrefsStore.getManualSelectedUsername()?.trim()?.removePrefix("@").orEmpty()
                     .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
@@ -1849,11 +1884,14 @@ object AppCoordinator {
 
     fun isActivateNextBusy(): Boolean = activateNextJob?.isActive == true
 
-    /** 任一多账号会话占用中（活跃下个 / 批量发作品 / 自动活跃）。 */
+    /** 任一多账号会话占用中（活跃下个 / 批量发作品 / 自动活跃 / 日常孵化）。 */
     fun isBatchAccountSessionBusy(): Boolean =
         activateNextJob?.isActive == true ||
             batchPublishJob?.isActive == true ||
-            autoActiveJob?.isActive == true
+            autoActiveJob?.isActive == true ||
+            dailyIncubateJob?.isActive == true
+
+    fun isDailyIncubateBusy(): Boolean = dailyIncubateJob?.isActive == true
 
     private fun notifyManualAccountUi() {
         _manualAccountUiEpoch.value = _manualAccountUiEpoch.value + 1
@@ -1900,11 +1938,164 @@ object AppCoordinator {
         autoActiveJob = null
     }
 
+    private fun cancelDailyIncubateIfRunning(reason: String) {
+        val job = dailyIncubateJob ?: return
+        if (!job.isActive) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "取消日常孵化：$reason")
+        }
+        job.cancel()
+        dailyIncubateJob = null
+    }
+
+    @Volatile
+    private var dailyIncubatePauseReason: String? = null
+
+    private var dailyIncubateScreenReceiver: BroadcastReceiver? = null
+
+    private fun registerDailyIncubateScreenReceiver() {
+        if (dailyIncubateScreenReceiver != null) return
+        if (!::appContext.isInitialized) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        manualPauseDailyIncubateForSleep("熄屏暂停")
+                        manualPausePendingActivateForSleep("熄屏暂停")
+                    }
+                    Intent.ACTION_SCREEN_ON -> {
+                        manualResumeDailyIncubateAfterScreenOn()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        runCatching {
+            ContextCompat.registerReceiver(
+                appContext,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            dailyIncubateScreenReceiver = receiver
+        }.onFailure {
+            LogCenter.op(PrefsStore.getAlias(), "日常孵化：注册熄屏监听失败：${it.message}")
+        }
+    }
+
+    /**
+     * 熄屏 / PC「退出 TikTok 并熄屏」：暂停待活跃会话（活跃下个 / 自动活跃），
+     * 按已跑时长记账并写入剩余秒数，队列与账号不丢；再次点「自动活跃」会同号续跑。
+     */
+    data class PausePendingActivateResult(
+        val paused: Boolean,
+        val hadSession: Boolean,
+        val username: String,
+        val remainingSec: Int,
+        val message: String,
+    )
+
+    @Volatile
+    private var pendingActivatePauseReason: String? = null
+
+    fun manualPausePendingActivateForSleep(reason: String = "熄屏暂停"): PausePendingActivateResult {
+        if (!ManualDeviceControl.ENABLED) {
+            return PausePendingActivateResult(
+                paused = false,
+                hadSession = false,
+                username = "",
+                remainingSec = 0,
+                message = "非手动模式",
+            )
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val activeUser = ManualDeviceControl.activeManualUsername().trim().removePrefix("@")
+        val autoJob = autoActiveJob?.takeIf { it.isActive }
+        val nextJob = activateNextJob?.takeIf { it.isActive }
+        val hadSession = autoJob != null || nextJob != null
+        if (!hadSession) {
+            val planned = PrefsStore.getManualActivateDurationMin()
+            val remain = if (activeUser.isNotBlank()) {
+                PrefsStore.getActivateSessionRemainingSec(activeUser, planned) ?: 0
+            } else {
+                0
+            }
+            val msg = if (remain > 0 && activeUser.isNotBlank()) {
+                "无进行中的待活跃任务（@$activeUser 已有剩余 ${formatActivateRemainingLabel(remain)}）"
+            } else {
+                "无进行中的待活跃任务"
+            }
+            if (alias.isNotBlank()) LogCenter.op(alias, "待活跃暂停：$msg")
+            return PausePendingActivateResult(
+                paused = false,
+                hadSession = false,
+                username = activeUser,
+                remainingSec = remain,
+                message = msg,
+            )
+        }
+
+        pendingActivatePauseReason = reason
+        val jobs = listOfNotNull(autoJob, nextJob)
+        jobs.forEach { it.cancel(CancellationException(reason)) }
+        // 等协程在 CancellationException 路径落盘剩余时长后再返回（避免嵌套 runBlocking）
+        val latch = java.util.concurrent.CountDownLatch(jobs.size)
+        jobs.forEach { job ->
+            job.invokeOnCompletion { latch.countDown() }
+        }
+        latch.await(8, java.util.concurrent.TimeUnit.SECONDS)
+        if (autoActiveJob === autoJob) autoActiveJob = null
+        if (activateNextJob === nextJob) activateNextJob = null
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        forYouSwipeJob?.cancel()
+        forYouSwipeJob = null
+        pendingActivatePauseReason = null
+
+        val planned = PrefsStore.getManualActivateDurationMin()
+        val remainUser = activeUser.ifBlank {
+            PrefsStore.getPendingActivateUsernames().firstOrNull().orEmpty()
+        }
+        val remain = if (remainUser.isNotBlank()) {
+            PrefsStore.getActivateSessionRemainingSec(remainUser, planned) ?: 0
+        } else {
+            0
+        }
+        val msg = buildString {
+            append("待活跃已暂停")
+            if (remainUser.isNotBlank()) {
+                append("：@$remainUser")
+                if (remain > 0) {
+                    append(" 剩余 ${formatActivateRemainingLabel(remain)}")
+                } else {
+                    append("（本段已记入，无剩余）")
+                }
+            }
+            append(" · $reason")
+        }
+        PrefsStore.saveLocalStatus("online")
+        updateRuntime(localStatus = "online", lastMessage = msg)
+        notifyManualAccountUi()
+        if (alias.isNotBlank()) LogCenter.op(alias, msg)
+        return PausePendingActivateResult(
+            paused = true,
+            hadSession = true,
+            username = remainUser,
+            remainingSec = remain,
+            message = msg,
+        )
+    }
+
     private fun cancelMultiAccountSessionsIfForeign(reason: String) {
         if (activateNextOwnsSwitch) return
         cancelActivateNextIfRunning(reason)
         cancelBatchPublishIfRunning(reason)
         cancelAutoActiveIfRunning(reason)
+        cancelDailyIncubateIfRunning(reason)
     }
 
     /** 将当前下拉账号加入待活跃队列（须用户明确点选加入）。 */
@@ -2099,6 +2290,8 @@ object AppCoordinator {
             PrefsStore.setHardStopRequested(false)
         }
         manuallyPaused = false
+        // 发作品/手动抢占取消后可能遗留 preempt，不清除则拉号空转
+        releaseStaleManualExclusivePreemptIfIdle("手动活跃涨粉·$reason")
         if (!started.get()) started.set(true)
         growthModeLoginSafeguardPending = true
         PrefsStore.saveLocalStatus("running")
@@ -2303,12 +2496,63 @@ object AppCoordinator {
             currentCoroutineContext().ensureActive()
         } catch (t: Throwable) {
             if (t is CancellationException) {
-                interrupted = true
+                // 取消（含熄屏暂停）也必须按已跑时长落盘，否则进度丢失且计时像「空跑」。
+                withContext(NonCancellable) {
+                    pullLoopJob?.cancel()
+                    pullLoopJob = null
+                    persistActivatePhaseProgress(
+                        target = target,
+                        minutes = minutes,
+                        remainingTotalSec = remainingTotalSec,
+                        durationSec = durationSec,
+                        startedAt = startedAt,
+                        modeLabel = modeLabel,
+                        durationLabel = durationLabel,
+                        logTag = logTag,
+                        alias = alias,
+                        stintPlan = stintPlan,
+                        roundUpFinal = roundUpFinal,
+                        interrupted = true,
+                        pauseReason = pendingActivatePauseReason,
+                    )
+                }
                 throw t
             }
             throw t
         }
 
+        return persistActivatePhaseProgress(
+            target = target,
+            minutes = minutes,
+            remainingTotalSec = remainingTotalSec,
+            durationSec = durationSec,
+            startedAt = startedAt,
+            modeLabel = modeLabel,
+            durationLabel = durationLabel,
+            logTag = logTag,
+            alias = alias,
+            stintPlan = stintPlan,
+            roundUpFinal = roundUpFinal,
+            interrupted = interrupted,
+            pauseReason = null,
+        )
+    }
+
+    private fun persistActivatePhaseProgress(
+        target: String,
+        minutes: Int,
+        remainingTotalSec: Int,
+        durationSec: Int,
+        startedAt: Long,
+        modeLabel: String,
+        durationLabel: String,
+        logTag: String,
+        alias: String,
+        stintPlan: ActivateOnlineStintPlan,
+        roundUpFinal: Boolean,
+        interrupted: Boolean,
+        pauseReason: String?,
+    ): ActivatePhaseResult {
         val elapsedSec = ((SystemClock.elapsedRealtime() - startedAt) / 1000)
             .toInt().coerceIn(0, durationSec)
         val completedStint = !interrupted && elapsedSec >= durationSec - 2
@@ -2349,12 +2593,24 @@ object AppCoordinator {
 
         if (leftoverSec > 0 && isAccountInPendingActivateQueue(target)) {
             PrefsStore.setActivateSessionRemaining(target, leftoverSec, minutes)
+            val statusWord = if (!pauseReason.isNullOrBlank()) {
+                "已暂停（$pauseReason）"
+            } else {
+                "未完成"
+            }
             LogCenter.op(
                 alias,
-                "$logTag：@$target 未完成（剩余 ${formatActivateRemainingLabel(leftoverSec)}，已跳过切号等待续跑）",
+                "$logTag：@$target $statusWord（剩余 ${formatActivateRemainingLabel(leftoverSec)}，" +
+                    "已跑 ${formatActivateRemainingLabel(elapsedSec)}，下轮续跑不切号）",
             )
         } else {
             PrefsStore.clearActivateSession(target)
+            if (interrupted && !pauseReason.isNullOrBlank()) {
+                LogCenter.op(
+                    alias,
+                    "$logTag：@$target 已暂停（$pauseReason · 本段已记入，无剩余）",
+                )
+            }
         }
         return ActivatePhaseResult.INCOMPLETE
     }
@@ -2363,14 +2619,23 @@ object AppCoordinator {
      * 启动发作品并等待结束；批量会话内抑制「完成后自动涨粉」。
      * @return 是否至少成功发出目标条数（或 outcome.success）。
      */
-    private suspend fun awaitManualPublishPost(count: Int): Boolean {
+    /**
+     * @param updatePreferredCount 为 true 时同步写入界面「手动发作品条数」偏好；
+     * 过渡期强制发 1 条等一次性覆盖应传 false，避免把用户偏好冲成 1。
+     */
+    private suspend fun awaitManualPublishPost(
+        count: Int,
+        updatePreferredCount: Boolean = true,
+    ): Boolean {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         val sessionId = "batch-pub-${System.currentTimeMillis()}"
         beginManualPublishSession(sessionId)
         // 批量会话自己会做发后活跃，禁止单号发完后自动涨粉抢占
         suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 24L * 60L * 60L * 1000L
         activateNextOwnsSwitch = true
-        PrefsStore.setManualPublishCount(count)
+        if (updatePreferredCount) {
+            PrefsStore.setManualPublishCount(count)
+        }
         PrefsStore.setPublishPostPackageName(com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME)
         PrefsStore.setPublishPostTargetCount(count)
         PrefsStore.setPublishPostRequested(true)
@@ -2395,6 +2660,9 @@ object AppCoordinator {
             delay(500)
             gateWait++
         }
+        // 只清遗留独占；勿缩短 24h 抑制窗口（批量发作品依赖它挡住 completion 自动涨粉）
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
         currentCoroutineContext().ensureActive()
         val outcome = lastManualPublishOutcome
         val ok = outcome?.sessionId == sessionId && outcome.success
@@ -2524,8 +2792,14 @@ object AppCoordinator {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) {
-                    LogCenter.op(alias, "活跃下个账号：已取消 → @$target")
-                    updateRuntime(localStatus = "online", lastMessage = "活跃下个账号已取消")
+                    val pause = pendingActivatePauseReason
+                    if (!pause.isNullOrBlank()) {
+                        LogCenter.op(alias, "活跃下个账号：已暂停（$pause）→ @$target")
+                        updateRuntime(localStatus = "online", lastMessage = "活跃下个账号已暂停（已保存进度）")
+                    } else {
+                        LogCenter.op(alias, "活跃下个账号：已取消 → @$target")
+                        updateRuntime(localStatus = "online", lastMessage = "活跃下个账号已取消")
+                    }
                     throw t
                 }
                 notifyManualAccountUi()
@@ -2680,8 +2954,14 @@ object AppCoordinator {
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) {
-                    updateRuntime(localStatus = "online", lastMessage = "自动活跃已取消")
-                    LogCenter.op(alias, "自动活跃：已取消（已处理 $processed）")
+                    val pause = pendingActivatePauseReason
+                    if (!pause.isNullOrBlank()) {
+                        updateRuntime(localStatus = "online", lastMessage = "自动活跃已暂停（已保存进度）")
+                        LogCenter.op(alias, "自动活跃：已暂停 · $pause（已处理 $processed）")
+                    } else {
+                        updateRuntime(localStatus = "online", lastMessage = "自动活跃已取消")
+                        LogCenter.op(alias, "自动活跃：已取消（已处理 $processed）")
+                    }
                     throw t
                 }
                 PrefsStore.saveLocalStatus("online")
@@ -2695,6 +2975,620 @@ object AppCoordinator {
                 notifyManualAccountUi()
             }
         }
+    }
+
+    private enum class DailyIncubateAction(val key: String, val label: String) {
+        GROWTH("growth", "涨粉"),
+        FOR_YOU("foryou", "For You 预滑"),
+        MUTUAL("mutual", "引流互点"),
+        ;
+
+        companion object {
+            fun fromKey(raw: String?): DailyIncubateAction? = when (raw?.trim()?.lowercase()) {
+                GROWTH.key -> GROWTH
+                FOR_YOU.key, "for_you", "foryou_swipe" -> FOR_YOU
+                MUTUAL.key, "mutual_click" -> MUTUAL
+                else -> null
+            }
+        }
+    }
+
+    private enum class DailyIncubatePhaseResult {
+        COMPLETED,
+        INCOMPLETE,
+        FAILED,
+    }
+
+    /**
+     * 日常孵化：非待活跃账号排队养号。
+     * 切号 → 发作品 → 加权随机动作；涨粉/预滑受分配时长；互点达云端上限即完成。
+     * 新号过渡期（完整会话 <3）：第 1–2 次不发作品，第 3 次发 1 条；全程禁止互点。
+     * 熄屏暂停计时与任务，亮屏自动续跑。
+     */
+    fun manualStartDailyIncubate(
+        durationMin: Int = PrefsStore.getDailyIncubateDurationMin(),
+        resumeFromPause: Boolean = false,
+    ) {
+        if (!ManualDeviceControl.ENABLED) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        if (alias.isBlank() || deviceId.isBlank()) {
+            LogCenter.op(alias.ifBlank { null }, "日常孵化：设备未绑定")
+            return
+        }
+        if (dailyIncubateJob?.isActive == true) {
+            LogCenter.op(alias, "日常孵化：已在进行中，忽略重复点击")
+            return
+        }
+        if (isBatchAccountSessionBusy()) {
+            LogCenter.op(alias, "日常孵化：多账号会话进行中，忽略")
+            return
+        }
+        if (isManualSwitchBusy()) {
+            LogCenter.op(alias, "日常孵化：切号进行中，请稍候")
+            return
+        }
+        val minutes = durationMin.coerceIn(
+            PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
+            PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+        )
+        PrefsStore.setDailyIncubateDurationMin(minutes)
+
+        val available = listBoundDeviceNonPendingActivateUsernames(excludeBanned = true)
+        PrefsStore.noteDailyIncubateAccountsSeen(available, grandfatherExisting = true)
+        val queue = PrefsStore.syncDailyIncubateQueue(available)
+        if (queue.isEmpty()) {
+            LogCenter.op(alias, "日常孵化：队列为空（非待活跃账号无可用）")
+            updateRuntime(lastMessage = "日常孵化：队列为空")
+            return
+        }
+
+        val existing = PrefsStore.getDailyIncubateSession()
+        PrefsStore.saveDailyIncubateSession(
+            (existing ?: PrefsStore.DailyIncubateSession()).copy(
+                enabled = true,
+                pausedByScreenOff = false,
+                plannedMin = minutes,
+            ),
+        )
+
+        manualDispatchJob?.cancel()
+        dailyIncubateJob = scope.launch {
+            var processed = 0
+            try {
+                if (!prepareManualTaskTakeover(ManualTaskKind.DAILY_INCUBATE, "日常孵化")) {
+                    return@launch
+                }
+                PrefsStore.setTransientPausedForDestructiveOp(false)
+                PrefsStore.setHardStopRequested(false)
+                manuallyPaused = false
+                if (!started.get()) started.set(true)
+                activateNextOwnsSwitch = true
+                val scheme = PrefsStore.getManualCutSwitchScheme()
+                LogCenter.op(
+                    alias,
+                    "日常孵化：${if (resumeFromPause) "亮屏续跑" else "开始"}" +
+                        "（每号 ${minutes} 分钟，队列 ${queue.size}，切号=$scheme）",
+                )
+                PrefsStore.saveLocalStatus("running")
+
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    if (PrefsStore.isHardStopRequested()) break
+
+                    val liveAvail = listBoundDeviceNonPendingActivateUsernames(excludeBanned = true)
+                    PrefsStore.noteDailyIncubateAccountsSeen(liveAvail, grandfatherExisting = false)
+                    val liveQueue = PrefsStore.syncDailyIncubateQueue(liveAvail)
+                    if (liveQueue.isEmpty()) {
+                        LogCenter.op(alias, "日常孵化：队列已空，结束")
+                        break
+                    }
+
+                    val session = PrefsStore.getDailyIncubateSession()
+                    val resumeUser = session?.username?.takeIf { it.isNotBlank() }
+                        ?.takeIf { u -> liveQueue.any { it.equals(u, ignoreCase = true) } }
+                        ?.takeIf { (session.elapsedSec > 0 || session.publishDone || session.action.isNotBlank()) }
+                    val target = resumeUser ?: PrefsStore.peekDailyIncubateUsername() ?: break
+                    PrefsStore.noteDailyIncubateAccountsSeen(listOf(target), grandfatherExisting = false)
+
+                    notifyManualAccountUi()
+                    PrefsStore.saveLocalStatus("running")
+                    updateRuntime(
+                        localStatus = "running",
+                        lastMessage = "日常孵化：准备 @$target",
+                    )
+                    val switchedOk = switchToAccountForActivateIfNeeded(target, "日常孵化")
+                    if (!switchedOk) {
+                        LogCenter.op(alias, "日常孵化：@$target 切号未就绪，已停止")
+                        updateRuntime(
+                            localStatus = "online",
+                            lastMessage = "日常孵化：@$target 切号失败，已停止",
+                        )
+                        break
+                    }
+
+                    val result = runDailyIncubateAccountSession(target, minutes)
+                    processed++
+                    when (result) {
+                        DailyIncubatePhaseResult.COMPLETED -> {
+                            if (target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)) {
+                                PrefsStore.rotateDailyIncubateQueueFrontToBack()
+                            }
+                            PrefsStore.clearDailyIncubateSessionProgress()
+                            val enabled = PrefsStore.getDailyIncubateSession()?.enabled == true
+                            PrefsStore.saveDailyIncubateSession(
+                                PrefsStore.DailyIncubateSession(
+                                    enabled = enabled,
+                                    plannedMin = minutes,
+                                ),
+                            )
+                            updateRuntime(
+                                localStatus = "running",
+                                lastMessage = "日常孵化完成：@$target（第 $processed 次，队列 ${PrefsStore.getDailyIncubateUsernames().size}）",
+                            )
+                            forceStopTikTokForExclusiveEnqueue("日常孵化单号结束")
+                            continue
+                        }
+                        DailyIncubatePhaseResult.INCOMPLETE -> {
+                            updateRuntime(
+                                localStatus = "online",
+                                lastMessage = "日常孵化已暂停/中断：@$target（已保存进度）",
+                            )
+                            PrefsStore.saveLocalStatus("online")
+                            forceStopTikTokForExclusiveEnqueue("日常孵化中断")
+                            break
+                        }
+                        DailyIncubatePhaseResult.FAILED -> {
+                            if (target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)) {
+                                PrefsStore.rotateDailyIncubateQueueFrontToBack()
+                            }
+                            PrefsStore.clearDailyIncubateSessionProgress()
+                            PrefsStore.saveDailyIncubateSession(
+                                PrefsStore.DailyIncubateSession(
+                                    enabled = PrefsStore.getDailyIncubateSession()?.enabled == true,
+                                    plannedMin = minutes,
+                                ),
+                            )
+                            forceStopTikTokForExclusiveEnqueue("日常孵化单号失败")
+                            continue
+                        }
+                    }
+                }
+
+                PrefsStore.saveLocalStatus("online")
+                val sessEnd = PrefsStore.getDailyIncubateSession()
+                val keepForResume = sessEnd?.enabled == true && (
+                    sessEnd.pausedByScreenOff ||
+                        (
+                            sessEnd.username.isNotBlank() &&
+                                (sessEnd.elapsedSec > 0 || sessEnd.publishDone || sessEnd.action.isNotBlank())
+                            )
+                    )
+                if (!keepForResume) {
+                    PrefsStore.saveDailyIncubateSession(
+                        PrefsStore.DailyIncubateSession(
+                            enabled = false,
+                            plannedMin = minutes,
+                        ),
+                    )
+                }
+                updateRuntime(
+                    localStatus = "online",
+                    lastMessage = when {
+                        sessEnd?.pausedByScreenOff == true -> "日常孵化已熄屏暂停（已保存进度）"
+                        keepForResume -> "日常孵化已中断（已保存进度，可续跑）"
+                        else -> "日常孵化结束：共完成 $processed 次单号"
+                    },
+                )
+                LogCenter.op(alias, "日常孵化结束：共 $processed 次单号")
+                if (detectActiveManualTaskKind() == null ||
+                    detectActiveManualTaskKind() == ManualTaskKind.DAILY_INCUBATE
+                ) {
+                    forceStopTikTokForExclusiveEnqueue("日常孵化结束")
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    val pause = dailyIncubatePauseReason
+                    if (!pause.isNullOrBlank()) {
+                        updateRuntime(localStatus = "online", lastMessage = "日常孵化已暂停（已保存进度）")
+                        LogCenter.op(alias, "日常孵化：已暂停 · $pause（已处理 $processed）")
+                    } else {
+                        updateRuntime(localStatus = "online", lastMessage = "日常孵化已取消")
+                        LogCenter.op(alias, "日常孵化：已取消（已处理 $processed）")
+                        PrefsStore.saveDailyIncubateSession(
+                            PrefsStore.getDailyIncubateSession()?.copy(enabled = false, pausedByScreenOff = false),
+                        )
+                    }
+                    throw t
+                }
+                PrefsStore.saveLocalStatus("online")
+                updateRuntime(localStatus = "online", lastMessage = "日常孵化失败：${t.message}")
+                LogCenter.op(alias, "日常孵化失败：${t.message}")
+            } finally {
+                activateNextOwnsSwitch = false
+                if (dailyIncubateJob === currentCoroutineContext()[Job]) {
+                    dailyIncubateJob = null
+                }
+                notifyManualAccountUi()
+            }
+        }
+    }
+
+    fun manualPauseDailyIncubateForSleep(reason: String = "熄屏暂停"): Boolean {
+        if (!ManualDeviceControl.ENABLED) return false
+        val job = dailyIncubateJob?.takeIf { it.isActive } ?: run {
+            val sess = PrefsStore.getDailyIncubateSession()
+            if (sess?.enabled == true) {
+                PrefsStore.saveDailyIncubateSession(sess.copy(pausedByScreenOff = true))
+            }
+            return false
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        dailyIncubatePauseReason = reason
+        val sess = PrefsStore.getDailyIncubateSession()
+        if (sess != null) {
+            PrefsStore.saveDailyIncubateSession(
+                sess.copy(enabled = true, pausedByScreenOff = true),
+            )
+        }
+        job.cancel(CancellationException(reason))
+        runCatching {
+            kotlinx.coroutines.runBlocking {
+                runCatching { withTimeout(8_000L) { job.join() } }
+            }
+        }
+        if (dailyIncubateJob === job) dailyIncubateJob = null
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        forYouSwipeJob?.cancel()
+        forYouSwipeJob = null
+        if (isMutualSwitchActive()) {
+            clearMutualClickStateForInterrupt(reason)
+        }
+        dailyIncubatePauseReason = null
+        // 暂停/取消日常孵化时一并清遗留独占，避免后续涨粉永久空转
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        PrefsStore.saveLocalStatus("online")
+        val remain = PrefsStore.getDailyIncubateSession()?.remainingSec() ?: 0
+        val user = PrefsStore.getDailyIncubateSession()?.username.orEmpty()
+        val msg = buildString {
+            append("日常孵化已暂停")
+            if (user.isNotBlank()) {
+                append("：@$user")
+                if (remain > 0) append(" 剩余约 ${remain / 60} 分")
+            }
+            append(" · $reason")
+        }
+        updateRuntime(localStatus = "online", lastMessage = msg)
+        if (alias.isNotBlank()) LogCenter.op(alias, msg)
+        notifyManualAccountUi()
+        return true
+    }
+
+    fun manualResumeDailyIncubateAfterScreenOn() {
+        if (!ManualDeviceControl.ENABLED) return
+        if (dailyIncubateJob?.isActive == true) return
+        val sess = PrefsStore.getDailyIncubateSession() ?: return
+        if (!sess.enabled || !sess.pausedByScreenOff) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        LogCenter.op(alias.ifBlank { null }, "日常孵化：亮屏，自动继续")
+        PrefsStore.saveDailyIncubateSession(sess.copy(pausedByScreenOff = false))
+        manualStartDailyIncubate(sess.plannedMin, resumeFromPause = true)
+    }
+
+    fun manualStopDailyIncubate(reason: String = "手动停止日常孵化") {
+        if (!ManualDeviceControl.ENABLED) return
+        PrefsStore.saveDailyIncubateSession(
+            PrefsStore.getDailyIncubateSession()?.copy(enabled = false, pausedByScreenOff = false)
+                ?: PrefsStore.DailyIncubateSession(enabled = false),
+        )
+        cancelDailyIncubateIfRunning(reason)
+        PrefsStore.clearDailyIncubateSessionProgress()
+        PrefsStore.saveDailyIncubateSession(PrefsStore.DailyIncubateSession(enabled = false))
+        updateRuntime(localStatus = "online", lastMessage = reason)
+        LogCenter.op(PrefsStore.getAlias(), reason)
+        notifyManualAccountUi()
+    }
+
+    /** 正常：涨粉50 / 预滑30 / 互点20；过渡期：涨粉50:预滑30 归一化。 */
+    private fun pickDailyIncubateAction(inTransition: Boolean): DailyIncubateAction {
+        if (inTransition) {
+            // 50:30 → 62.5% / 37.5%
+            return if (Random.nextDouble() < 50.0 / 80.0) {
+                DailyIncubateAction.GROWTH
+            } else {
+                DailyIncubateAction.FOR_YOU
+            }
+        }
+        val r = Random.nextDouble()
+        return when {
+            r < 0.50 -> DailyIncubateAction.GROWTH
+            r < 0.80 -> DailyIncubateAction.FOR_YOU
+            else -> DailyIncubateAction.MUTUAL
+        }
+    }
+
+    private suspend fun awaitManualMutualClick(): Boolean {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 24L * 60L * 60L * 1000L
+        activateNextOwnsSwitch = true
+        PrefsStore.setMutualCommentOnlySession(false)
+        PrefsStore.setMutualFollowOnlySession(false)
+        PrefsStore.setMutualClickRequested(true)
+        PrefsStore.setMutualClickPending(true)
+        if (!isMutualSwitchActive()) {
+            triggerMutualSwitchNow(alias)
+        }
+        var waitStart = 0
+        while (mutualSwitchJob == null && waitStart < 40) {
+            delay(250)
+            waitStart++
+        }
+        mutualSwitchJob?.join()
+        currentCoroutineContext().ensureActive()
+        val stillPending = PrefsStore.isMutualClickRequested() || PrefsStore.isMutualClickPending()
+        LogCenter.op(
+            alias,
+            "日常孵化互点等待结束：pending=$stillPending active=${isMutualSwitchActive()}",
+        )
+        return !stillPending && !PrefsStore.isHardStopRequested()
+    }
+
+    private suspend fun runDailyIncubateAccountSession(
+        target: String,
+        minutes: Int,
+    ): DailyIncubatePhaseResult {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val plannedSec = minutes * 60
+        var session = PrefsStore.getDailyIncubateSession()?.takeIf {
+            it.username.equals(target, ignoreCase = true)
+        } ?: PrefsStore.DailyIncubateSession(
+            enabled = true,
+            username = target,
+            plannedMin = minutes,
+            inTransition = PrefsStore.isDailyIncubateInTransition(target),
+        )
+        // 首次见到已写入；以当前过渡状态为准
+        val inTransition = PrefsStore.isDailyIncubateInTransition(target)
+        session = session.copy(
+            enabled = true,
+            username = target,
+            plannedMin = minutes,
+            inTransition = inTransition,
+            pausedByScreenOff = false,
+        )
+        PrefsStore.saveDailyIncubateSession(session)
+        PrefsStore.setLogContextUsername(target)
+
+        var action = DailyIncubateAction.fromKey(session.action)
+        if (action == null) {
+            action = pickDailyIncubateAction(inTransition)
+            session = session.copy(action = action.key)
+            PrefsStore.saveDailyIncubateSession(session)
+        } else if (inTransition && action == DailyIncubateAction.MUTUAL) {
+            // 过渡期禁止互点：若旧进度误存互点则重抽
+            action = pickDailyIncubateAction(inTransition = true)
+            session = session.copy(action = action.key)
+            PrefsStore.saveDailyIncubateSession(session)
+        }
+
+        val transitionOrdinal = if (inTransition) {
+            PrefsStore.dailyIncubateTransitionSessionOrdinal(target)
+        } else {
+            null
+        }
+        val transitionPubCount = if (inTransition) {
+            PrefsStore.dailyIncubateTransitionPublishCount(target)
+        } else {
+            null
+        }
+        LogCenter.op(
+            alias,
+            "日常孵化：@$target → ${action.label}" +
+                (if (inTransition) {
+                    val ord = transitionOrdinal ?: 0
+                    val pubHint = when (transitionPubCount) {
+                        null, 0 -> "跳过发作品"
+                        else -> "本会话发 ${transitionPubCount} 条"
+                    }
+                    "（新号过渡 第${ord}/${PrefsStore.DAILY_INCUBATE_TRANSITION_NEED} 次，$pubHint、禁止互点）"
+                } else {
+                    ""
+                }) +
+                "，已计时 ${session.elapsedSec}s / ${plannedSec}s",
+        )
+
+        val wallStartedAt = SystemClock.elapsedRealtime()
+        var segmentStartedAt = wallStartedAt
+        var interrupted = false
+        try {
+            // 1) 发作品：毕业后按手动条数；过渡期仅第 3 次发 1 条；续跑已完成则跳过
+            val pubCount = when {
+                session.publishDone -> 0
+                inTransition -> (transitionPubCount ?: 0).coerceAtLeast(0)
+                else -> PrefsStore.getManualPublishCount()
+            }
+            if (pubCount > 0) {
+                updateRuntime(
+                    localStatus = "running",
+                    lastMessage = "日常孵化：@$target · 发作品（${pubCount}条）",
+                )
+                segmentStartedAt = SystemClock.elapsedRealtime()
+                // 过渡期强制条数勿回写手动偏好；毕业后按当前偏好发则可同步
+                val ok = awaitManualPublishPost(
+                    pubCount,
+                    updatePreferredCount = !inTransition,
+                )
+                LogCenter.op(
+                    alias,
+                    "日常孵化：@$target 发作品${if (ok) "完成" else "未完全成功"}" +
+                        "（目标${pubCount}条${if (inTransition) "·过渡期第${transitionOrdinal}次" else ""}），继续后续动作",
+                )
+                val publishElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000).toInt()
+                    .coerceAtLeast(0)
+                session = session.copy(
+                    publishDone = true,
+                    elapsedSec = (session.elapsedSec + publishElapsed).coerceAtMost(plannedSec),
+                )
+                PrefsStore.saveDailyIncubateSession(session)
+            } else if (inTransition && !session.publishDone) {
+                // 过渡期第 1–2 次：明确记为已处理发作品阶段，避免续跑误判
+                session = session.copy(publishDone = true)
+                PrefsStore.saveDailyIncubateSession(session)
+            }
+
+            currentCoroutineContext().ensureActive()
+            if (PrefsStore.isHardStopRequested()) {
+                interrupted = true
+            } else {
+                segmentStartedAt = SystemClock.elapsedRealtime()
+                when (action) {
+                    DailyIncubateAction.MUTUAL -> {
+                        updateRuntime(
+                            localStatus = "running",
+                            lastMessage = "日常孵化：@$target · 引流互点（达云端上限即完成）",
+                        )
+                        fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL, logToUser = false)
+                        awaitManualMutualClick()
+                        val mutualElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                            .toInt().coerceAtLeast(0)
+                        session = session.copy(
+                            elapsedSec = (session.elapsedSec + mutualElapsed).coerceAtLeast(0),
+                        )
+                        PrefsStore.saveDailyIncubateSession(session)
+                    }
+                    DailyIncubateAction.FOR_YOU, DailyIncubateAction.GROWTH -> {
+                        val remainSec = (plannedSec - session.elapsedSec).coerceAtLeast(0)
+                        if (remainSec <= 2) {
+                            // 发作品已耗尽分配时长，视为本号完成
+                        } else {
+                            val modeLabel = action.label
+                            updateRuntime(
+                                localStatus = "running",
+                                lastMessage = "日常孵化：@$target · $modeLabel · 剩余约 ${remainSec / 60} 分",
+                            )
+                            fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+                            if (action == DailyIncubateAction.FOR_YOU) {
+                                ExecutionScope.enter()
+                                forYouSwipeJob = currentCoroutineContext()[Job]
+                                try {
+                                    executor.runForYouSwipe(remainSec, _config.value)
+                                    currentCoroutineContext().ensureActive()
+                                } catch (t: Throwable) {
+                                    if (t is CancellationException) throw t
+                                    LogCenter.op(alias, "日常孵化 For You 异常：${t.message}")
+                                } finally {
+                                    if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                                        forYouSwipeJob = null
+                                    }
+                                    ExecutionScope.exit()
+                                }
+                            } else {
+                                ensureManualActivateGrowthPullRunning(
+                                    "日常孵化：@$target · $modeLabel",
+                                )
+                                if (pullLoopJob?.isActive != true) {
+                                    error("日常孵化涨粉未能启动拉取循环")
+                                }
+                                val endAt = segmentStartedAt + remainSec * 1000L
+                                while (SystemClock.elapsedRealtime() < endAt) {
+                                    if (PrefsStore.isHardStopRequested()) {
+                                        interrupted = true
+                                        break
+                                    }
+                                    currentCoroutineContext().ensureActive()
+                                    delay(5_000)
+                                }
+                                pullLoopJob?.cancel()
+                                pullLoopJob = null
+                            }
+                            val actionElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                                .toInt().coerceIn(0, remainSec)
+                            session = session.copy(
+                                elapsedSec = (session.elapsedSec + actionElapsed).coerceAtMost(plannedSec),
+                            )
+                            PrefsStore.saveDailyIncubateSession(session)
+                            creditActivateMinutes(target, actionElapsed, modeLabel)
+                        }
+                    }
+                }
+            }
+            currentCoroutineContext().ensureActive()
+        } catch (t: Throwable) {
+            if (t is CancellationException) {
+                withContext(NonCancellable) {
+                    pullLoopJob?.cancel()
+                    pullLoopJob = null
+                    val partial = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                        .toInt().coerceAtLeast(0)
+                    val base = PrefsStore.getDailyIncubateSession()?.elapsedSec
+                        ?.coerceAtLeast(session.elapsedSec)
+                        ?: session.elapsedSec
+                    // 若当前段尚未写入 session，把 partial 补上（避免与已写入重复：仅当 base==session 起点段）
+                    val alreadyCommitted = PrefsStore.getDailyIncubateSession()?.elapsedSec ?: session.elapsedSec
+                    val elapsed = if (alreadyCommitted > session.elapsedSec) {
+                        alreadyCommitted
+                    } else {
+                        (session.elapsedSec + partial).coerceAtMost(plannedSec)
+                    }
+                    PrefsStore.saveDailyIncubateSession(
+                        session.copy(
+                            enabled = true,
+                            pausedByScreenOff = dailyIncubatePauseReason != null,
+                            username = target,
+                            action = action.key,
+                            plannedMin = minutes,
+                            inTransition = inTransition,
+                            elapsedSec = elapsed,
+                        ),
+                    )
+                    LogCenter.op(
+                        alias,
+                        "日常孵化：@$target 中断保存进度 elapsed=${elapsed}s action=${action.key}",
+                    )
+                }
+                throw t
+            }
+            LogCenter.op(alias, "日常孵化：@$target 失败：${t.message}")
+            return DailyIncubatePhaseResult.FAILED
+        }
+
+        if (interrupted || PrefsStore.isHardStopRequested()) {
+            PrefsStore.saveDailyIncubateSession(
+                session.copy(enabled = true, pausedByScreenOff = false),
+            )
+            return DailyIncubatePhaseResult.INCOMPLETE
+        }
+
+        // 完成判定
+        val done = when (action) {
+            DailyIncubateAction.MUTUAL -> true
+            DailyIncubateAction.GROWTH, DailyIncubateAction.FOR_YOU ->
+                session.elapsedSec >= plannedSec - 2
+        }
+        if (!done) {
+            PrefsStore.saveDailyIncubateSession(session.copy(enabled = true))
+            return DailyIncubatePhaseResult.INCOMPLETE
+        }
+
+        if (inTransition) {
+            val n = PrefsStore.incrementDailyIncubateTransitionCount(target)
+            LogCenter.op(
+                alias,
+                "日常孵化：@$target 过渡期完整会话 +1 → $n/${PrefsStore.DAILY_INCUBATE_TRANSITION_NEED}" +
+                    if (n >= PrefsStore.DAILY_INCUBATE_TRANSITION_NEED) {
+                        "（过渡期完成，下次按手动条数发作品并可互点）"
+                    } else if (n + 1 == PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION) {
+                        "（下次为第 ${PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION} 次，将发 " +
+                            "${PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_COUNT} 条）"
+                    } else {
+                        ""
+                    },
+            )
+        }
+        LogCenter.op(alias, "日常孵化：@$target 本号养号任务完成（${action.label}）")
+        return DailyIncubatePhaseResult.COMPLETED
     }
 
     /**
@@ -3002,6 +3896,7 @@ object AppCoordinator {
         cancelActivateNextIfRunning("手动涨粉")
         cancelBatchPublishIfRunning("手动涨粉")
         cancelAutoActiveIfRunning("手动涨粉")
+        cancelDailyIncubateIfRunning("手动涨粉")
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank()) {
             LogCenter.op(PrefsStore.getAlias(), "手动涨粉：请先选择账号")
@@ -3038,6 +3933,7 @@ object AppCoordinator {
         cancelActivateNextIfRunning("手动停止涨粉")
         cancelBatchPublishIfRunning("手动停止涨粉")
         cancelAutoActiveIfRunning("手动停止涨粉")
+        cancelDailyIncubateIfRunning("手动停止涨粉")
         scope.launch {
             // 停止涨粉：同样尽快打断当前 TikTok 步骤，但不启动新任务
             PrefsStore.setAutoSwitchExclusivePreempt(true)
@@ -3067,6 +3963,7 @@ object AppCoordinator {
         cancelActivateNextIfRunning("手动 For You 预滑")
         cancelBatchPublishIfRunning("手动 For You 预滑")
         cancelAutoActiveIfRunning("手动 For You 预滑")
+        cancelDailyIncubateIfRunning("手动 For You 预滑")
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank()) {
             LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：请先选择账号")
@@ -3482,6 +4379,7 @@ object AppCoordinator {
             cancelActivateNextIfRunning("手动切号")
             cancelBatchPublishIfRunning("手动切号")
             cancelAutoActiveIfRunning("手动切号")
+            cancelDailyIncubateIfRunning("手动切号")
         }
         val target = targetUsername.trim().removePrefix("@")
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -3785,6 +4683,7 @@ object AppCoordinator {
     }
 
     private fun detectActiveManualTaskKind(): ManualTaskKind? = when {
+        dailyIncubateJob?.isActive == true -> ManualTaskKind.DAILY_INCUBATE
         batchPublishJob?.isActive == true -> ManualTaskKind.BATCH_PUBLISH
         autoActiveJob?.isActive == true -> ManualTaskKind.AUTO_ACTIVE
         activateNextJob?.isActive == true -> ManualTaskKind.ACTIVATE_NEXT
@@ -3821,16 +4720,19 @@ object AppCoordinator {
                 active == ManualTaskKind.BATCH_PUBLISH && batchPublishJob === selfJob
             ManualTaskKind.AUTO_ACTIVE ->
                 active == ManualTaskKind.AUTO_ACTIVE && autoActiveJob === selfJob
+            ManualTaskKind.DAILY_INCUBATE ->
+                active == ManualTaskKind.DAILY_INCUBATE && dailyIncubateJob === selfJob
             else -> false
         }
-        // 多账号会话内部切号：父会话仍占 ACTIVATE_NEXT / BATCH_PUBLISH / AUTO_ACTIVE，允许子步骤继续
+        // 多账号会话内部切号：父会话仍占 ACTIVATE_NEXT / BATCH_PUBLISH / AUTO_ACTIVE / DAILY_INCUBATE，允许子步骤继续
         val multiAccountChildStep =
             activateNextOwnsSwitch &&
                 target == ManualTaskKind.SWITCH_ACCOUNT &&
                 (
                     active == ManualTaskKind.ACTIVATE_NEXT ||
                         active == ManualTaskKind.BATCH_PUBLISH ||
-                        active == ManualTaskKind.AUTO_ACTIVE
+                        active == ManualTaskKind.AUTO_ACTIVE ||
+                        active == ManualTaskKind.DAILY_INCUBATE
                     )
         if (active == target && !activeIsSelf) {
             if (alias.isNotBlank()) {
@@ -3860,12 +4762,17 @@ object AppCoordinator {
             (target != ManualTaskKind.ACTIVATE_NEXT && activateNextJob?.isActive == true) ||
             (target != ManualTaskKind.BATCH_PUBLISH && batchPublishJob?.isActive == true) ||
             (target != ManualTaskKind.AUTO_ACTIVE && autoActiveJob?.isActive == true) ||
+            (target != ManualTaskKind.DAILY_INCUBATE && dailyIncubateJob?.isActive == true) ||
             (target != ManualTaskKind.PUBLISH_POST && PublishPostGrowthGate.isBlockingGrowth()) ||
             ExecutionScope.isActive() ||
             stickyForeignPublish ||
             stickyForeignMutual
 
-        if (!busy) return true
+        if (!busy) {
+            // 空闲接管也清掉 crash/取消遗留的独占标志，避免涨粉 pull 永久空转
+            releaseStaleManualExclusivePreemptIfIdle("手动接管空闲·$reason")
+            return true
+        }
 
         if (alias.isNotBlank()) {
             LogCenter.op(
@@ -3875,94 +4782,122 @@ object AppCoordinator {
         }
 
         // 让涨粉/互点长步骤尽快协作退出（勿用硬停：硬停会挡住随后的新任务）
+        // 必须 finally 清 preempt：否则协程被取消会永久卡死涨粉（9_br26 现场）
         PrefsStore.setAutoSwitchExclusivePreempt(true)
         PrefsStore.setHardStopRequested(false)
         PrefsStore.setTransientPausedForDestructiveOp(false)
         manuallyPaused = false
 
-        var cancelledExclusiveThatAutoGrows = false
-        // 注意：BATCH_PUBLISH 仅在会话中段自己 trigger 发作品，prepare 只在会话开头调用一次，
-        // 此处必须清掉「外来」发作品，否则会与批量发作品并行冲突。
-        if (target != ManualTaskKind.PUBLISH_POST) {
-            if (isPublishPostSwitchActive()) {
-                publishPostSwitchJob?.cancel()
-                publishPostSwitchJob = null
+        try {
+            var cancelledExclusiveThatAutoGrows = false
+            // 注意：BATCH_PUBLISH 仅在会话中段自己 trigger 发作品，prepare 只在会话开头调用一次，
+            // 此处必须清掉「外来」发作品，否则会与批量发作品并行冲突。
+            if (target != ManualTaskKind.PUBLISH_POST) {
+                if (isPublishPostSwitchActive()) {
+                    publishPostSwitchJob?.cancel()
+                    publishPostSwitchJob = null
+                    cancelledExclusiveThatAutoGrows = true
+                }
+                PrefsStore.clearPublishPostState()
+                PrefsStore.clearPublishPostTaskScope()
+                PublishPostGrowthGate.exitExclusivePublishPhase()
+            }
+            if (target != ManualTaskKind.MUTUAL_CLICK) {
+                val hadMutual =
+                    PrefsStore.isMutualClickRequested() ||
+                        PrefsStore.isMutualClickPending() ||
+                        isMutualSwitchActive()
+                if (hadMutual) cancelledExclusiveThatAutoGrows = true
+                clearMutualClickStateForInterrupt("手动抢占→${target.label}")
+            }
+            if (target != ManualTaskKind.FOR_YOU_SWIPE) {
+                forYouSwipeJob?.takeIf { it !== selfJob }?.cancel()
+                if (forYouSwipeJob !== selfJob) forYouSwipeJob = null
+            }
+            if (target != ManualTaskKind.GROWTH) {
+                pullLoopJob?.takeIf { it !== selfJob }?.cancel()
+                if (pullLoopJob !== selfJob) {
+                    pullLoopJob = null
+                    pendingUsernames.clear()
+                }
+            }
+            if (target != ManualTaskKind.SWITCH_ACCOUNT) {
+                manualSwitchJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+            }
+            // 外部任务可打断多账号会话；仅「会话内部切号」跳过，避免切号 prepare 把自己掐死
+            val skipCancelMultiAccount =
+                activateNextOwnsSwitch && target == ManualTaskKind.SWITCH_ACCOUNT
+            if (!skipCancelMultiAccount) {
+                if (target != ManualTaskKind.ACTIVATE_NEXT) {
+                    activateNextJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+                    if (activateNextJob !== selfJob) activateNextJob = null
+                }
+                if (target != ManualTaskKind.BATCH_PUBLISH) {
+                    batchPublishJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+                    if (batchPublishJob !== selfJob) batchPublishJob = null
+                }
+                if (target != ManualTaskKind.AUTO_ACTIVE) {
+                    autoActiveJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+                    if (autoActiveJob !== selfJob) autoActiveJob = null
+                }
+                if (target != ManualTaskKind.DAILY_INCUBATE) {
+                    dailyIncubateJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+                    if (dailyIncubateJob !== selfJob) dailyIncubateJob = null
+                }
+            }
+            if (target != ManualTaskKind.EDIT_PROFILE && basicProfileEditRunning) {
                 cancelledExclusiveThatAutoGrows = true
             }
-            PrefsStore.clearPublishPostState()
-            PrefsStore.clearPublishPostTaskScope()
-            PublishPostGrowthGate.exitExclusivePublishPhase()
-        }
-        if (target != ManualTaskKind.MUTUAL_CLICK) {
-            val hadMutual =
-                PrefsStore.isMutualClickRequested() ||
-                    PrefsStore.isMutualClickPending() ||
-                    isMutualSwitchActive()
-            if (hadMutual) cancelledExclusiveThatAutoGrows = true
-            clearMutualClickStateForInterrupt("手动抢占→${target.label}")
-        }
-        if (target != ManualTaskKind.FOR_YOU_SWIPE) {
-            forYouSwipeJob?.takeIf { it !== selfJob }?.cancel()
-            if (forYouSwipeJob !== selfJob) forYouSwipeJob = null
-        }
-        if (target != ManualTaskKind.GROWTH) {
-            pullLoopJob?.takeIf { it !== selfJob }?.cancel()
-            if (pullLoopJob !== selfJob) {
-                pullLoopJob = null
-                pendingUsernames.clear()
-            }
-        }
-        if (target != ManualTaskKind.SWITCH_ACCOUNT) {
-            manualSwitchJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
-        }
-        // 外部任务可打断多账号会话；仅「会话内部切号」跳过，避免切号 prepare 把自己掐死
-        val skipCancelMultiAccount =
-            activateNextOwnsSwitch && target == ManualTaskKind.SWITCH_ACCOUNT
-        if (!skipCancelMultiAccount) {
-            if (target != ManualTaskKind.ACTIVATE_NEXT) {
-                activateNextJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
-                if (activateNextJob !== selfJob) activateNextJob = null
-            }
-            if (target != ManualTaskKind.BATCH_PUBLISH) {
-                batchPublishJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
-                if (batchPublishJob !== selfJob) batchPublishJob = null
-            }
-            if (target != ManualTaskKind.AUTO_ACTIVE) {
-                autoActiveJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
-                if (autoActiveJob !== selfJob) autoActiveJob = null
-            }
-        }
-        if (target != ManualTaskKind.EDIT_PROFILE && basicProfileEditRunning) {
-            cancelledExclusiveThatAutoGrows = true
-        }
-        liveVisitSwitchJob?.cancel()
-        liveVisitSwitchJob = null
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
 
-        // 仅当确实打断了「结束后会自动涨粉」的独占任务时，短暂抑制 completion 回调
-        if (cancelledExclusiveThatAutoGrows) {
-            suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 3_000L
-        }
+            // 仅当确实打断了「结束后会自动涨粉」的独占任务时，短暂抑制 completion 回调
+            if (cancelledExclusiveThatAutoGrows) {
+                suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 3_000L
+            }
 
-        // 尽快打断 OCR/点击：强停 TikTok（发作品独占标记已在上面清掉）
-        forceStopTikTokForExclusiveEnqueue("手动抢占→${target.label}")
+            // 尽快打断 OCR/点击：强停 TikTok（发作品独占标记已在上面清掉）
+            forceStopTikTokForExclusiveEnqueue("手动抢占→${target.label}")
 
-        val deadline = SystemClock.elapsedRealtime() + 2_500L
-        while (
-            (ExecutionScope.isActive() ||
-                (target != ManualTaskKind.PUBLISH_POST && isPublishPostSwitchActive()) ||
-                (target != ManualTaskKind.MUTUAL_CLICK && isMutualSwitchActive()) ||
-                (target != ManualTaskKind.GROWTH && pullLoopJob?.isActive == true) ||
-                (target != ManualTaskKind.FOR_YOU_SWIPE && forYouSwipeJob?.isActive == true)) &&
-            SystemClock.elapsedRealtime() < deadline
-        ) {
-            delay(40)
+            val deadline = SystemClock.elapsedRealtime() + 2_500L
+            while (
+                (ExecutionScope.isActive() ||
+                    (target != ManualTaskKind.PUBLISH_POST && isPublishPostSwitchActive()) ||
+                    (target != ManualTaskKind.MUTUAL_CLICK && isMutualSwitchActive()) ||
+                    (target != ManualTaskKind.GROWTH && pullLoopJob?.isActive == true) ||
+                    (target != ManualTaskKind.FOR_YOU_SWIPE && forYouSwipeJob?.isActive == true)) &&
+                SystemClock.elapsedRealtime() < deadline
+            ) {
+                delay(40)
+            }
+            if (ExecutionScope.isActive()) {
+                ExecutionScope.forceClearIfStuck("手动抢占→${target.label}")
+            }
+        } finally {
+            PrefsStore.setAutoSwitchExclusivePreempt(false)
         }
-        if (ExecutionScope.isActive()) {
-            ExecutionScope.forceClearIfStuck("手动抢占→${target.label}")
-        }
-
-        PrefsStore.setAutoSwitchExclusivePreempt(false)
         return true
+    }
+
+    /**
+     * 手动模式下：无真实独占任务时清掉遗留 [PrefsStore.isAutoSwitchExclusivePreempt]。
+     * 典型场景：手动抢占中途协程被取消，preempt=true 永久挡住涨粉拉号。
+     */
+    private fun releaseStaleManualExclusivePreemptIfIdle(reason: String) {
+        if (!ManualDeviceControl.ENABLED) return
+        if (!PrefsStore.isAutoSwitchExclusivePreempt()) return
+        if (PrefsStore.isAutoSwitchAutonomousMode() && isAutoSwitchExclusiveWorkActuallyActive()) return
+        if (PublishPostGrowthGate.isBlockingGrowth()) return
+        if (isPublishPostSwitchActive() || isMutualSwitchActive() || isLiveVisitSwitchActive()) return
+        if (basicProfileEditRunning) return
+        // 抢占 takeover / 涨粉步骤仍在收尾时不要清，避免中途放行拉号
+        if (ExecutionScope.isActive()) return
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "已清除遗留独占抢占标志（$reason），允许涨粉继续")
+        }
     }
 
     private fun enqueueManualTaskOp(
@@ -5078,6 +6013,8 @@ object AppCoordinator {
 
 
     private fun startPullLoop() {
+        // 即使 pull 已在跑也要清遗留 preempt（否则会空转 abort，永远不拉号）
+        releaseStaleManualExclusivePreemptIfIdle("启动涨粉拉取循环")
         if (pullLoopJob?.isActive == true) {
             return
         }
@@ -11822,6 +12759,11 @@ object AppCoordinator {
             } finally {
                 ExecutionScope.exit()
                 PublishPostGrowthGate.exitExclusivePublishPhase()
+                // 手动发作品结束：无论成败都清独占，防止涨粉被 preempt 永久挡住
+                if (ManualDeviceControl.ENABLED) {
+                    PrefsStore.setAutoSwitchExclusivePreempt(false)
+                    PrefsStore.setTransientPausedForDestructiveOp(false)
+                }
                 cleanupOrphanedAutoSwitchPublishState(alias)
                 if (ManualDeviceControl.ENABLED && !PrefsStore.isAutoSwitchPublishTask()) {
                     val accountKey = PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }

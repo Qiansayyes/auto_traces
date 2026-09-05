@@ -59,33 +59,41 @@
                 android:text="刷新账号" />
         </LinearLayout>
 
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="三天总赞增长≤X则推荐">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/pendingRecommendHeartGrowthMaxInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:gravity="center_vertical"
             android:orientation="horizontal">
-
-            <com.google.android.material.textfield.TextInputLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:hint="三天总赞增长≤X则推荐">
-
-                <com.google.android.material.textfield.TextInputEditText
-                    android:id="@+id/pendingRecommendHeartGrowthMaxInput"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:inputType="number"
-                    android:maxLines="1" />
-            </com.google.android.material.textfield.TextInputLayout>
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/pendingEnqueueRecommendedButton"
-                android:layout_width="wrap_content"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="一键加入推荐" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/pendingRemoveAllButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
-                android:text="一键加入推荐" />
+                android:layout_weight="1"
+                android:text="全部移出" />
         </LinearLayout>
 
         <TextView
@@ -109,20 +117,6 @@
             android:layout_marginTop="16dp"
             android:text="队列操作"
             android:textStyle="bold" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:orientation="horizontal">
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/pendingClearQueueButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="清空待活跃队列" />
-        </LinearLayout>
 
         <LinearLayout
             android:layout_width="match_parent"

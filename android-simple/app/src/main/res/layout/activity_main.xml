@@ -504,6 +504,52 @@
                 android:textColor="@android:color/darker_gray"
                 android:textSize="11sp" />
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="养号时长(分钟)">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/manualDailyIncubateDurationMinInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:maxLines="1" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualDailyIncubateStartButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="开始排队养号" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateStopButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="停止日常孵化" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="日常孵化：未在待活跃队列的账号。切号→发作品→涨粉50%/预滑30%/互点20%。新号前2次不发作品，第3次发1条；过渡期禁止互点。毕业后按界面条数（默认3）。熄屏暂停，亮屏自动续跑。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="11sp" />
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualProfileEditButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"

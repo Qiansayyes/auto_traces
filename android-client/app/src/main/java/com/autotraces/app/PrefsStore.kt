@@ -14,6 +14,14 @@ object PrefsStore {
     /** 最近一次成功同步到云端的 status；与 [KEY_LOCAL_STATUS] 区分，避免重复 POST /api/sync_status。 */
     private const val KEY_LAST_SYNCED_CLOUD_STATUS = "last_synced_cloud_status"
     private const val KEY_SERVER_BASE_URL = "server_base_url"
+    /**
+     * 页面错乱恢复方案（本机）：
+     * [PAGE_DISORDER_RECOVERY_FORCE_RESTART]=原方案直接强关重启（默认）；
+     * [PAGE_DISORDER_RECOVERY_BACK_HOME]=当前方案优先导航返回回首页。
+     */
+    private const val KEY_PAGE_DISORDER_RECOVERY_SCHEME = "page_disorder_recovery_scheme"
+    const val PAGE_DISORDER_RECOVERY_FORCE_RESTART = "force_restart"
+    const val PAGE_DISORDER_RECOVERY_BACK_HOME = "back_home"
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
     private const val KEY_BATCH_COMPLETED = "batch_completed"
@@ -743,6 +751,28 @@ object PrefsStore {
     }
 
     fun getServerBaseUrl(): String? = prefs.getString(KEY_SERVER_BASE_URL, null)?.trim()
+
+    /** 页面错乱恢复方案；缺省或非法值一律视为原方案直接强关。 */
+    fun getPageDisorderRecoveryScheme(): String {
+        val raw = prefs.getString(KEY_PAGE_DISORDER_RECOVERY_SCHEME, PAGE_DISORDER_RECOVERY_FORCE_RESTART)
+            ?.trim()
+            .orEmpty()
+        return when (raw) {
+            PAGE_DISORDER_RECOVERY_BACK_HOME -> PAGE_DISORDER_RECOVERY_BACK_HOME
+            else -> PAGE_DISORDER_RECOVERY_FORCE_RESTART
+        }
+    }
+
+    fun isPageDisorderRecoverForceRestart(): Boolean =
+        getPageDisorderRecoveryScheme() == PAGE_DISORDER_RECOVERY_FORCE_RESTART
+
+    fun setPageDisorderRecoveryScheme(scheme: String) {
+        val v = when (scheme.trim()) {
+            PAGE_DISORDER_RECOVERY_BACK_HOME -> PAGE_DISORDER_RECOVERY_BACK_HOME
+            else -> PAGE_DISORDER_RECOVERY_FORCE_RESTART
+        }
+        prefs.edit().putString(KEY_PAGE_DISORDER_RECOVERY_SCHEME, v).apply()
+    }
 
     /** @param intervalMs 距上次刷新不足该间隔则跳过静默刷新（手动绑定不受限）。 */
     fun shouldRefreshBindingSilently(intervalMs: Long): Boolean {

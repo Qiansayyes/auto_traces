@@ -45,6 +45,12 @@ object SimpleRemoteControl {
             .put("alias", PrefsStore.getAlias().orEmpty())
             .put("cloudUsername", PrefsStore.getAuthUsername().orEmpty())
             .put("cloudLoggedIn", !PrefsStore.getAuthToken().isNullOrBlank())
+            .put(
+                "serverBaseUrl",
+                PrefsStore.getServerBaseUrl().orEmpty().ifBlank {
+                    runCatching { ApiService.getBaseUrl() }.getOrDefault("")
+                },
+            )
             .put("selectedUsername", selected)
             .put("activeUsername", active)
             .put("accountAligned", AppCoordinator.isManualAccountAligned())
@@ -73,6 +79,8 @@ object SimpleRemoteControl {
             .put("recommendCacheLabel", PendingActivateRecommend.cacheAgeLabel())
             .put("batchSessionBusy", AppCoordinator.isBatchAccountSessionBusy())
             .put("activateNextBusy", AppCoordinator.isActivateNextBusy())
+            .put("dailyIncubateBusy", AppCoordinator.isDailyIncubateBusy())
+            .put("dailyIncubateDurationMin", PrefsStore.getDailyIncubateDurationMin())
             .put("pendingActivateQueue", buildPendingActivateQueueJson())
             .put(
                 "nonPendingActivateCount",
@@ -526,6 +534,18 @@ object SimpleRemoteControl {
                     .put("queueSize", queueSize)
             }
 
+            "pause_pending_activate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                val reason = body.optString("reason", "").trim().ifBlank { "熄屏暂停" }
+                val result = AppCoordinator.manualPausePendingActivateForSleep(reason)
+                ok(result.message)
+                    .put("paused", result.paused)
+                    .put("hadSession", result.hadSession)
+                    .put("username", result.username)
+                    .put("remainingSec", result.remainingSec)
+                    .put("pendingActivateQueue", buildPendingActivateQueueJson())
+            }
+
             "batch_publish_non_pending" -> {
                 if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
@@ -590,6 +610,70 @@ object SimpleRemoteControl {
                             .put("accountCount", ManualDeviceControl.getCachedAccounts().size)
                     },
                 )
+            }
+
+            "daily_incubate", "start_daily_incubate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    return fail("switch_busy", "切号进行中，请稍候")
+                }
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                val minutesRaw = if (body.has("minutes")) {
+                    body.optInt("minutes")
+                } else {
+                    PrefsStore.getDailyIncubateDurationMin()
+                }
+                val minutes = minutesRaw.coerceIn(
+                    PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
+                    PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+                )
+                PrefsStore.setDailyIncubateDurationMin(minutes)
+                ensureWorkerForManualTask(app)
+                val refresh = kotlinx.coroutines.runBlocking {
+                    AppCoordinator.manualRefreshAssignedAccounts()
+                }
+                if (refresh.isFailure) {
+                    return fail(
+                        "refresh_failed",
+                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
+                    )
+                }
+                val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
+                if (queueSize <= 0) {
+                    return fail("queue_empty", "无非待活跃账号可养号")
+                        .put("queueSize", 0)
+                        .put("dailyIncubateDurationMin", minutes)
+                }
+                // 再次确认：刷新期间可能被其它多账号会话抢占
+                if (AppCoordinator.isManualSwitchBusy()) {
+                    return fail("switch_busy", "切号进行中，请稍候")
+                }
+                if (AppCoordinator.isBatchAccountSessionBusy()) {
+                    return fail("session_busy", "多账号会话进行中，请稍候")
+                }
+                AppCoordinator.manualStartDailyIncubate(minutes)
+                if (!AppCoordinator.isDailyIncubateBusy()) {
+                    val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
+                    return fail(
+                        "start_failed",
+                        if (tip.contains("日常孵化")) tip else "日常孵化未能启动（队列冲突或已被抢占）",
+                    )
+                        .put("queueSize", queueSize)
+                        .put("dailyIncubateDurationMin", minutes)
+                }
+                ok("已请求日常孵化（约 $queueSize 个 · 每号 ${minutes} 分钟）")
+                    .put("minutes", minutes)
+                    .put("queueSize", queueSize)
+                    .put("dailyIncubateDurationMin", minutes)
+            }
+
+            "stop_daily_incubate" -> {
+                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
+                AppCoordinator.manualStopDailyIncubate("PC 遥控停止日常孵化")
+                ok("已停止日常孵化")
             }
 
             else -> fail("unknown_action", "未知 action：$action")

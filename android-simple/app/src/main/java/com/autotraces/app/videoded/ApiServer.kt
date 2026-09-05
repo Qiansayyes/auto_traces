@@ -383,7 +383,7 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_ADB_TCPIP_PORT, clamped).apply()
     }
 
-    /** 用户手填的局域网 IPv4，用于展示 / 复制 `adb connect`；留空则仅用系统自动检测。 */
+    /** 已缓存的局域网 IPv4（可能过期）；展示/连接时应优先 [probeLiveLanIpv4] / [getEffectiveMirrorLanIpv4]。 */
     fun getMirrorIpOverride(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MIRROR_IP_OVERRIDE, null)
             ?.trim()
@@ -399,14 +399,26 @@ object ApiSettings {
         editor.apply()
     }
 
-    /** 手填合法 IPv4 优先，否则与 [RootWifiAdbHelper.getWifiLanIpv4OrNull] 一致。 */
+    /** 实时探测本机局域网 IPv4（仅 Wi‑Fi 链路，避免误取 VPN/其它网卡）；失败返回 null。 */
+    fun probeLiveLanIpv4(context: Context): String? {
+        val raw = RootWifiAdbHelper.getWifiLanIpv4OrNull(context) ?: return null
+        if (!isPlausibleLanIpv4(raw)) return null
+        return runCatching { (InetAddress.getByName(raw.trim()) as Inet4Address).hostAddress }.getOrNull()
+            ?: raw.trim()
+    }
+
+    /**
+     * 有效投屏/ADB 局域网 IPv4：能探测到则用实时 Wi‑Fi 地址；
+     * 否则回退已存覆盖值，再回退 [WifiUtils.getWifiIp]（仅作兜底展示，不写缓存）。
+     */
     fun getEffectiveMirrorLanIpv4(context: Context): String? {
-        val o = getMirrorIpOverride(context) ?: return RootWifiAdbHelper.getWifiLanIpv4OrNull(context)
-        return if (isPlausibleLanIpv4(o)) {
-            runCatching { (InetAddress.getByName(o) as Inet4Address).hostAddress }.getOrNull() ?: o
-        } else {
-            RootWifiAdbHelper.getWifiLanIpv4OrNull(context)
+        probeLiveLanIpv4(context)?.let { return it }
+        val o = getMirrorIpOverride(context)
+        if (o != null && isPlausibleLanIpv4(o)) {
+            return runCatching { (InetAddress.getByName(o) as Inet4Address).hostAddress }.getOrNull() ?: o
         }
+        val fallback = WifiUtils.getWifiIp(context)?.trim().orEmpty()
+        return fallback.takeIf { it.isNotEmpty() && isPlausibleLanIpv4(it) }
     }
 
     /** 非空且可解析为 IPv4（含校验用例）则视为有效；保存前应在 UI 再提示一次。 */

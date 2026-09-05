@@ -544,7 +544,26 @@ object AppCoordinator {
 
     /** crash / 强杀后 prefs 可能仍留 preempt=是，但进程内已无 OP：清掉并按 plan 续跑。 */
     private suspend fun recoverStaleAutoSwitchExclusiveState(reason: String) {
-        if (!PrefsStore.isAutoSwitchAutonomousMode()) return
+        if (!PrefsStore.isAutoSwitchAutonomousMode()) {
+            // 非自治也会因中断遗留 preempt，无真实独占时清掉，避免涨粉空转
+            if (
+                PrefsStore.isAutoSwitchExclusivePreempt() &&
+                !PublishPostGrowthGate.isBlockingGrowth() &&
+                !isPublishPostSwitchActive() &&
+                !isMutualSwitchActive() &&
+                !isLiveVisitSwitchActive() &&
+                !basicProfileEditRunning &&
+                !ExecutionScope.isActive()
+            ) {
+                PrefsStore.setAutoSwitchExclusivePreempt(false)
+                PrefsStore.setTransientPausedForDestructiveOp(false)
+                val alias = PrefsStore.getAlias()?.trim().orEmpty()
+                if (alias.isNotBlank()) {
+                    LogCenter.op(alias, "已清除遗留独占抢占标志（$reason），允许涨粉继续")
+                }
+            }
+            return
+        }
         autoSwitchLocalScheduler.recoverAllStaleInflightOnStart()
         if (isAutoSwitchExclusiveWorkActuallyActive()) return
         var cleared = false

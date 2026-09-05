@@ -84,14 +84,13 @@ class VideoDedMainActivity : ComponentActivity() {
         Log.d(TAG, "onResume")
         if (::nameHint.isInitialized) refreshDeviceNameLabels()
         refreshApiSection()
-        if (::mirrorIpOverrideInput.isInitialized && mirrorIpOverrideInput.text.isNullOrBlank()) {
-            val wifiIp = WifiUtils.getWifiIp(this).orEmpty()
-            Log.d(TAG, "auto fill mirrorIpOverrideInput=$wifiIp")
-            mirrorIpOverrideInput.setText(wifiIp)
-            lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
-        } else if (::statusView.isInitialized && statusView.text?.contains("初始化") == true) {
-            // 从通知/后台回到本页时，若仍停在初始化文案则补一次注册刷新
-            lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
+        if (::mirrorIpOverrideInput.isInitialized) {
+            val ipChanged = syncMirrorIpInputFromLive()
+            val needRegister = ipChanged ||
+                (::statusView.isInitialized && statusView.text?.contains("初始化") == true)
+            if (needRegister) {
+                lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
+            }
         }
         if (::mirrorAddrView.isInitialized) {
             refreshMirrorAddrLine()
@@ -150,8 +149,9 @@ class VideoDedMainActivity : ComponentActivity() {
             setPadding(0, 8, 0, 4)
         }
         mirrorIpOverrideInput = editText(
-            "本机 IPv4（自动获取后可直接保存）",
-            ApiSettings.getMirrorIpOverride(this).orEmpty().ifBlank { WifiUtils.getWifiIp(this).orEmpty() },
+            "本机 IPv4（保存/回前台时自动重探）",
+            ApiSettings.probeLiveLanIpv4(this)
+                ?: ApiSettings.getMirrorIpOverride(this).orEmpty(),
             inputType = InputType.TYPE_CLASS_TEXT,
         )
         mirrorAddrView = TextView(this).apply {
@@ -298,9 +298,23 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
+    /** 用实时 Wi‑Fi IPv4 覆盖输入框；有变化返回 true。 */
+    private fun syncMirrorIpInputFromLive(): Boolean {
+        if (!::mirrorIpOverrideInput.isInitialized) return false
+        val live = ApiSettings.probeLiveLanIpv4(this) ?: return false
+        val current = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
+        if (current == live) return false
+        Log.d(TAG, "mirror IP updated $current -> $live")
+        mirrorIpOverrideInput.setText(live)
+        return true
+    }
+
     private suspend fun autoSaveSettingsAndRegister(verbose: Boolean) {
         val port = adbTcpPortInput.text?.toString()?.toIntOrNull() ?: 5555
+        // 保存时强制重新探测，避免输入框里的过期 IP 被再次写入
+        syncMirrorIpInputFromLive()
         val rawIp = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
+            .ifEmpty { ApiSettings.probeLiveLanIpv4(this).orEmpty() }
         val windowsUrl = windowsUrlInput.text?.toString().orEmpty().trim()
         Log.d(TAG, "autoSaveSettingsAndRegister port=$port rawIp=$rawIp windowsUrl=$windowsUrl verbose=$verbose")
         if (rawIp.isNotEmpty() && !ApiSettings.isPlausibleLanIpv4(rawIp)) {
@@ -324,6 +338,7 @@ class VideoDedMainActivity : ComponentActivity() {
             logRegistration = true,
         )
         windowsUrlInput.hint = "PC 服务地址"
+        syncMirrorIpInputFromLive()
         refreshMirrorAddrLine()
         refreshDeviceNameLabels()
         applyRegistrationUi(result, verbose)

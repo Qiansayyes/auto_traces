@@ -85,6 +85,23 @@ class SettingsActivity : AppCompatActivity() {
             LogCenter.op(PrefsStore.getAlias(), "已保存服务器地址")
         }
 
+        renderPageDisorderRecoveryScheme()
+        binding.pageDisorderRecoveryGroup.setOnCheckedChangeListener { _, checkedId ->
+            val scheme = when (checkedId) {
+                binding.pageDisorderBackHomeRadio.id -> PrefsStore.PAGE_DISORDER_RECOVERY_BACK_HOME
+                else -> PrefsStore.PAGE_DISORDER_RECOVERY_FORCE_RESTART
+            }
+            if (scheme == PrefsStore.getPageDisorderRecoveryScheme()) return@setOnCheckedChangeListener
+            PrefsStore.setPageDisorderRecoveryScheme(scheme)
+            val label = if (scheme == PrefsStore.PAGE_DISORDER_RECOVERY_BACK_HOME) {
+                "优先导航返回回首页"
+            } else {
+                "直接强关重启"
+            }
+            binding.statusText.text = "页面错乱恢复方案已切换：$label"
+            LogCenter.op(PrefsStore.getAlias(), "页面错乱恢复方案：$label")
+        }
+
         binding.clearBindingButton.setOnClickListener {
             WorkerService.stop(this)
             PrefsStore.clearBinding()
@@ -112,5 +129,13 @@ class SettingsActivity : AppCompatActivity() {
                 append("云端账号: 未登录")
             }
         }
+    }
+
+    private fun renderPageDisorderRecoveryScheme() {
+        val force = PrefsStore.isPageDisorderRecoverForceRestart()
+        binding.pageDisorderRecoveryGroup.check(
+            if (force) binding.pageDisorderForceRestartRadio.id
+            else binding.pageDisorderBackHomeRadio.id,
+        )
     }
 }

@@ -199,6 +199,40 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@id/serverUrlLayout" />
 
+        <TextView
+            android:id="@+id/pageDisorderRecoveryTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="页面错乱恢复方案（本机）"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/saveServerButton" />
+
+        <RadioGroup
+            android:id="@+id/pageDisorderRecoveryGroup"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="vertical"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/pageDisorderRecoveryTitle">
+
+            <RadioButton
+                android:id="@+id/pageDisorderForceRestartRadio"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="原方案：直接强关重启 TikTok（默认）" />
+
+            <RadioButton
+                android:id="@+id/pageDisorderBackHomeRadio"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="当前方案：优先导航返回回首页" />
+        </RadioGroup>
+
         <com.google.android.material.button.MaterialButton
             android:id="@+id/clearBindingButton"
             style="@style/Widget.MaterialComponents.Button.OutlinedButton"
@@ -208,7 +242,7 @@
             android:text="@string/action_clear_binding"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/saveServerButton" />
+            app:layout_constraintTop_toBottomOf="@id/pageDisorderRecoveryGroup" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/openConfigParamsButton"

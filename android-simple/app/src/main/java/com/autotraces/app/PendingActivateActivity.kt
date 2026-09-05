@@ -55,7 +55,7 @@ class PendingActivateActivity : AppCompatActivity() {
                 renderAccountList()
             }
         }
-        binding.pendingClearQueueButton.setOnClickListener { clearQueue() }
+        binding.pendingRemoveAllButton.setOnClickListener { clearQueue() }
         binding.pendingActivateNextButton.setOnClickListener { activateNext() }
         binding.pendingAutoActiveButton.setOnClickListener { startAutoActive() }
         binding.pendingSortByMinutesButton.setOnClickListener { sortByMinutes() }
@@ -161,7 +161,7 @@ class PendingActivateActivity : AppCompatActivity() {
     private fun disableManualControls() {
         listOf(
             binding.pendingRefreshAccountsButton,
-            binding.pendingClearQueueButton,
+            binding.pendingRemoveAllButton,
             binding.pendingActivateNextButton,
             binding.pendingAutoActiveButton,
             binding.pendingSortByMinutesButton,
@@ -367,7 +367,7 @@ class PendingActivateActivity : AppCompatActivity() {
 
     private fun updateButtonsEnabled() {
         val blocked = AppCoordinator.isManualSwitchBusy() || AppCoordinator.isBatchAccountSessionBusy()
-        binding.pendingClearQueueButton.isEnabled = !blocked && ManualDeviceControl.ENABLED
+        binding.pendingRemoveAllButton.isEnabled = !blocked && ManualDeviceControl.ENABLED
         binding.pendingActivateNextButton.isEnabled = !blocked && ManualDeviceControl.ENABLED
         binding.pendingAutoActiveButton.isEnabled = !blocked && ManualDeviceControl.ENABLED
         binding.pendingSortByMinutesButton.isEnabled = !blocked && ManualDeviceControl.ENABLED
@@ -401,10 +401,23 @@ class PendingActivateActivity : AppCompatActivity() {
             Toast.makeText(this, "多账号会话进行中，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
-        AppCoordinator.manualClearPendingActivateQueue()
-        refreshQueueSummary()
-        renderAccountList()
-        binding.pendingTaskStatusText.text = "已清空待活跃队列"
+        val count = PrefsStore.getPendingActivateUsernames().size
+        if (count <= 0) {
+            Toast.makeText(this, "待活跃队列已空", Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("全部移出")
+            .setMessage("将把队列中的 $count 个账号全部移出待活跃队列，是否继续？")
+            .setPositiveButton("移出全部") { _, _ ->
+                AppCoordinator.manualClearPendingActivateQueue()
+                refreshQueueSummary()
+                renderAccountList()
+                binding.pendingTaskStatusText.text = "已将全部账号移出待活跃队列"
+                updateButtonsEnabled()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun activateNext() {

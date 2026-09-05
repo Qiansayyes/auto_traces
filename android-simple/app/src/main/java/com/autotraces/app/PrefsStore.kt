@@ -14,6 +14,14 @@ object PrefsStore {
     /** 最近一次成功同步到云端的 status；与 [KEY_LOCAL_STATUS] 区分，避免重复 POST /api/sync_status。 */
     private const val KEY_LAST_SYNCED_CLOUD_STATUS = "last_synced_cloud_status"
     private const val KEY_SERVER_BASE_URL = "server_base_url"
+    /**
+     * 页面错乱恢复方案（本机）：
+     * [PAGE_DISORDER_RECOVERY_FORCE_RESTART]=原方案直接强关重启（默认）；
+     * [PAGE_DISORDER_RECOVERY_BACK_HOME]=当前方案优先导航返回回首页。
+     */
+    private const val KEY_PAGE_DISORDER_RECOVERY_SCHEME = "page_disorder_recovery_scheme"
+    const val PAGE_DISORDER_RECOVERY_FORCE_RESTART = "force_restart"
+    const val PAGE_DISORDER_RECOVERY_BACK_HOME = "back_home"
     private const val KEY_DAILY_PREFIX = "daily_action_"
     private const val KEY_BATCH_USERNAMES = "batch_usernames"
     private const val KEY_BATCH_COMPLETED = "batch_completed"
@@ -99,6 +107,31 @@ object PrefsStore {
     /** 推荐计算结果缓存（8 小时内复用）。 */
     private const val KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON = "pending_activate_recommend_cache_json"
     const val PENDING_ACTIVATE_RECOMMEND_CACHE_TTL_MS: Long = 8L * 60L * 60L * 1000L
+    /** 日常孵化：全局分配时长（分钟），整队共用。 */
+    private const val KEY_DAILY_INCUBATE_DURATION_MIN = "daily_incubate_duration_min"
+    const val DEFAULT_DAILY_INCUBATE_DURATION_MIN: Int = 30
+    const val MIN_DAILY_INCUBATE_DURATION_MIN: Int = 1
+    const val MAX_DAILY_INCUBATE_DURATION_MIN: Int = 1440
+    /** 日常孵化队列（有序 JSON 数组；成员=非待活跃账号）。 */
+    private const val KEY_DAILY_INCUBATE_QUEUE = "daily_incubate_queue_json"
+    /**
+     * 已见过的云端分配用户名 → 过渡期已完成完整养号会话次数（0..[DAILY_INCUBATE_TRANSITION_NEED]）。
+     * 首次见到写入；未记录过视为新号。
+     */
+    private const val KEY_DAILY_INCUBATE_SEEN_TRANSITIONS = "daily_incubate_seen_transitions_json"
+    /** 是否已对安装时存量账号做过「过渡期已完成」灌入（避免存量号被当成新号）。 */
+    private const val KEY_DAILY_INCUBATE_SEEN_SEEDED = "daily_incubate_seen_seeded"
+    /** 新号过渡期需完成的完整养号会话次数。 */
+    const val DAILY_INCUBATE_TRANSITION_NEED: Int = 3
+    /** 过渡期内在第几次完整会话发作品（1-based；第 1–2 次跳过）。 */
+    const val DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION: Int = 3
+    /** 过渡期该次会话固定发作品条数。 */
+    const val DAILY_INCUBATE_TRANSITION_PUBLISH_COUNT: Int = 1
+    /**
+     * 日常孵化进行中会话进度（熄屏暂停 / 中断续跑）。
+     * JSON: enabled, pausedByScreenOff, username, action, publishDone, elapsedSec, plannedMin, inTransition
+     */
+    private const val KEY_DAILY_INCUBATE_SESSION = "daily_incubate_session_json"
     /** 手动模式：发作品目标条数（1–5）。 */
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
     /**
@@ -109,7 +142,7 @@ object PrefsStore {
     /** 最近一次从「待注册TK账号」领取并转入邮箱账户管理的邮箱。 */
     private const val KEY_ISSUED_TK_PENDING_EMAIL = "issued_tk_pending_email"
     private const val KEY_ISSUED_TK_PENDING_EMAIL_PASSWORD = "issued_tk_pending_email_password"
-    const val DEFAULT_MANUAL_PUBLISH_COUNT: Int = 1
+    const val DEFAULT_MANUAL_PUBLISH_COUNT: Int = 3
     const val MIN_MANUAL_PUBLISH_COUNT: Int = 1
     const val MAX_MANUAL_PUBLISH_COUNT: Int = 5
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
@@ -838,6 +871,28 @@ object PrefsStore {
     }
 
     fun getServerBaseUrl(): String? = prefs.getString(KEY_SERVER_BASE_URL, null)?.trim()
+
+    /** 页面错乱恢复方案；缺省或非法值一律视为原方案直接强关。 */
+    fun getPageDisorderRecoveryScheme(): String {
+        val raw = prefs.getString(KEY_PAGE_DISORDER_RECOVERY_SCHEME, PAGE_DISORDER_RECOVERY_FORCE_RESTART)
+            ?.trim()
+            .orEmpty()
+        return when (raw) {
+            PAGE_DISORDER_RECOVERY_BACK_HOME -> PAGE_DISORDER_RECOVERY_BACK_HOME
+            else -> PAGE_DISORDER_RECOVERY_FORCE_RESTART
+        }
+    }
+
+    fun isPageDisorderRecoverForceRestart(): Boolean =
+        getPageDisorderRecoveryScheme() == PAGE_DISORDER_RECOVERY_FORCE_RESTART
+
+    fun setPageDisorderRecoveryScheme(scheme: String) {
+        val v = when (scheme.trim()) {
+            PAGE_DISORDER_RECOVERY_BACK_HOME -> PAGE_DISORDER_RECOVERY_BACK_HOME
+            else -> PAGE_DISORDER_RECOVERY_FORCE_RESTART
+        }
+        prefs.edit().putString(KEY_PAGE_DISORDER_RECOVERY_SCHEME, v).apply()
+    }
 
     /** @param intervalMs 距上次刷新不足该间隔则跳过静默刷新（手动绑定不受限）。 */
     fun shouldRefreshBindingSilently(intervalMs: Long): Boolean {
@@ -1898,5 +1953,252 @@ object PrefsStore {
         val key = username.trim().removePrefix("@").lowercase(Locale.US)
         if (key.isEmpty()) return
         prefs.edit().putBoolean(KEY_MANUAL_FIRST_LOGIN_DONE_PREFIX + key, done).apply()
+    }
+
+    // ─── 日常孵化队列 ─────────────────────────────────────────────
+
+    fun getDailyIncubateDurationMin(): Int =
+        prefs.getInt(KEY_DAILY_INCUBATE_DURATION_MIN, DEFAULT_DAILY_INCUBATE_DURATION_MIN)
+            .coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN)
+
+    fun setDailyIncubateDurationMin(minutes: Int) {
+        prefs.edit()
+            .putInt(
+                KEY_DAILY_INCUBATE_DURATION_MIN,
+                minutes.coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
+            )
+            .apply()
+    }
+
+    fun getDailyIncubateUsernames(): List<String> {
+        val raw = prefs.getString(KEY_DAILY_INCUBATE_QUEUE, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptyList()
+        return runCatching {
+            val arr = org.json.JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val u = arr.optString(i, "").trim().removePrefix("@")
+                    if (u.isNotEmpty()) add(u)
+                }
+            }.distinctBy { it.lowercase(Locale.US) }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveDailyIncubateUsernames(usernames: List<String>) {
+        val normalized = usernames.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.US) }
+        if (normalized.isEmpty()) {
+            prefs.edit().remove(KEY_DAILY_INCUBATE_QUEUE).apply()
+            return
+        }
+        val arr = org.json.JSONArray()
+        normalized.forEach { arr.put(it) }
+        prefs.edit().putString(KEY_DAILY_INCUBATE_QUEUE, arr.toString()).apply()
+    }
+
+    fun peekDailyIncubateUsername(): String? = getDailyIncubateUsernames().firstOrNull()
+
+    fun rotateDailyIncubateQueueFrontToBack() {
+        val cur = getDailyIncubateUsernames()
+        if (cur.size <= 1) return
+        saveDailyIncubateUsernames(cur.drop(1) + cur.first())
+    }
+
+    /**
+     * 用「非待活跃」账号同步孵化队列：保留原有相对顺序，移除已不在集合的，新号追加队尾。
+     */
+    fun syncDailyIncubateQueue(available: List<String>): List<String> {
+        val avail = available.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.US) }
+        val availLower = avail.map { it.lowercase(Locale.US) }.toSet()
+        val old = getDailyIncubateUsernames()
+        val kept = old.filter { it.lowercase(Locale.US) in availLower }
+        val keptLower = kept.map { it.lowercase(Locale.US) }.toSet()
+        val added = avail.filter { it.lowercase(Locale.US) !in keptLower }
+        val next = kept + added
+        saveDailyIncubateUsernames(next)
+        return next
+    }
+
+    private fun readDailyIncubateSeenTransitions(): MutableMap<String, Int> {
+        val raw = prefs.getString(KEY_DAILY_INCUBATE_SEEN_TRANSITIONS, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return linkedMapOf()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            val out = linkedMapOf<String, Int>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next().trim().removePrefix("@")
+                if (k.isEmpty()) continue
+                out[k] = obj.optInt(k, 0).coerceIn(0, DAILY_INCUBATE_TRANSITION_NEED)
+            }
+            out
+        }.getOrDefault(linkedMapOf())
+    }
+
+    private fun saveDailyIncubateSeenTransitions(map: Map<String, Int>) {
+        if (map.isEmpty()) {
+            prefs.edit().remove(KEY_DAILY_INCUBATE_SEEN_TRANSITIONS).apply()
+            return
+        }
+        val obj = org.json.JSONObject()
+        map.forEach { (k, v) ->
+            val key = k.trim().removePrefix("@")
+            if (key.isNotEmpty()) {
+                obj.put(key, v.coerceIn(0, DAILY_INCUBATE_TRANSITION_NEED))
+            }
+        }
+        prefs.edit().putString(KEY_DAILY_INCUBATE_SEEN_TRANSITIONS, obj.toString()).apply()
+    }
+
+    /**
+     * 记录云端分配用户名。没有记录过 = 新号（过渡次数 0）。
+     * 首次灌入且 [grandfatherExisting]=true 时，将当前名单标为过渡已完成，避免存量号被当新号。
+     */
+    fun noteDailyIncubateAccountsSeen(
+        usernames: List<String>,
+        grandfatherExisting: Boolean = false,
+    ) {
+        val map = readDailyIncubateSeenTransitions()
+        val seeded = prefs.getBoolean(KEY_DAILY_INCUBATE_SEEN_SEEDED, false)
+        val doGrandfather = grandfatherExisting && !seeded && map.isEmpty()
+        var changed = false
+        usernames.forEach { raw ->
+            val u = raw.trim().removePrefix("@")
+            if (u.isEmpty()) return@forEach
+            val existing = map.entries.firstOrNull { it.key.equals(u, ignoreCase = true) }
+            if (existing == null) {
+                map[u] = if (doGrandfather) DAILY_INCUBATE_TRANSITION_NEED else 0
+                changed = true
+            }
+        }
+        if (doGrandfather) {
+            prefs.edit().putBoolean(KEY_DAILY_INCUBATE_SEEN_SEEDED, true).apply()
+            changed = true
+        } else if (!seeded && map.isNotEmpty()) {
+            prefs.edit().putBoolean(KEY_DAILY_INCUBATE_SEEN_SEEDED, true).apply()
+        }
+        if (changed) saveDailyIncubateSeenTransitions(map)
+    }
+
+    fun hasDailyIncubateSeen(username: String): Boolean {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return false
+        return readDailyIncubateSeenTransitions().keys.any { it.equals(u, ignoreCase = true) }
+    }
+
+    fun getDailyIncubateTransitionCount(username: String): Int {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return 0
+        return readDailyIncubateSeenTransitions().entries
+            .firstOrNull { it.key.equals(u, ignoreCase = true) }
+            ?.value ?: 0
+    }
+
+    /** 是否仍处新号过渡期（已见过且完整会话次数 < 3）。未见过也视为过渡期。 */
+    fun isDailyIncubateInTransition(username: String): Boolean {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return true
+        if (!hasDailyIncubateSeen(u)) return true
+        return getDailyIncubateTransitionCount(u) < DAILY_INCUBATE_TRANSITION_NEED
+    }
+
+    /**
+     * 过渡期内当前是第几次完整会话（1-based）。
+     * 已毕业返回 null；未见过或 count=0 时为第 1 次。
+     */
+    fun dailyIncubateTransitionSessionOrdinal(username: String): Int? {
+        if (!isDailyIncubateInTransition(username)) return null
+        return (getDailyIncubateTransitionCount(username) + 1)
+            .coerceIn(1, DAILY_INCUBATE_TRANSITION_NEED)
+    }
+
+    /** 过渡期内本会话应发的作品条数；null=非过渡期（走手动条数）；0=本会话不发。 */
+    fun dailyIncubateTransitionPublishCount(username: String): Int? {
+        val ordinal = dailyIncubateTransitionSessionOrdinal(username) ?: return null
+        return if (ordinal == DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION) {
+            DAILY_INCUBATE_TRANSITION_PUBLISH_COUNT
+        } else {
+            0
+        }
+    }
+
+    fun incrementDailyIncubateTransitionCount(username: String): Int {
+        val u = username.trim().removePrefix("@")
+        if (u.isEmpty()) return 0
+        noteDailyIncubateAccountsSeen(listOf(u), grandfatherExisting = false)
+        val map = readDailyIncubateSeenTransitions()
+        val key = map.keys.firstOrNull { it.equals(u, ignoreCase = true) } ?: u
+        val next = ((map[key] ?: 0) + 1).coerceAtMost(DAILY_INCUBATE_TRANSITION_NEED)
+        map[key] = next
+        saveDailyIncubateSeenTransitions(map)
+        return next
+    }
+
+    data class DailyIncubateSession(
+        val enabled: Boolean = false,
+        val pausedByScreenOff: Boolean = false,
+        val username: String = "",
+        /** growth / foryou / mutual；空=尚未抽取 */
+        val action: String = "",
+        val publishDone: Boolean = false,
+        val elapsedSec: Int = 0,
+        val plannedMin: Int = DEFAULT_DAILY_INCUBATE_DURATION_MIN,
+        val inTransition: Boolean = false,
+    ) {
+        fun remainingSec(): Int = (plannedMin * 60 - elapsedSec).coerceAtLeast(0)
+    }
+
+    fun getDailyIncubateSession(): DailyIncubateSession? {
+        val raw = prefs.getString(KEY_DAILY_INCUBATE_SESSION, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        return runCatching {
+            val o = org.json.JSONObject(raw)
+            DailyIncubateSession(
+                enabled = o.optBoolean("enabled", false),
+                pausedByScreenOff = o.optBoolean("pausedByScreenOff", false),
+                username = o.optString("username", "").trim().removePrefix("@"),
+                action = o.optString("action", "").trim().lowercase(Locale.US),
+                publishDone = o.optBoolean("publishDone", false),
+                elapsedSec = o.optInt("elapsedSec", 0).coerceAtLeast(0),
+                plannedMin = o.optInt("plannedMin", DEFAULT_DAILY_INCUBATE_DURATION_MIN)
+                    .coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
+                inTransition = o.optBoolean("inTransition", false),
+            )
+        }.getOrNull()
+    }
+
+    fun saveDailyIncubateSession(session: DailyIncubateSession?) {
+        if (session == null) {
+            prefs.edit().remove(KEY_DAILY_INCUBATE_SESSION).apply()
+            return
+        }
+        val o = org.json.JSONObject()
+            .put("enabled", session.enabled)
+            .put("pausedByScreenOff", session.pausedByScreenOff)
+            .put("username", session.username.trim().removePrefix("@"))
+            .put("action", session.action.trim().lowercase(Locale.US))
+            .put("publishDone", session.publishDone)
+            .put("elapsedSec", session.elapsedSec.coerceAtLeast(0))
+            .put(
+                "plannedMin",
+                session.plannedMin.coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
+            )
+            .put("inTransition", session.inTransition)
+        prefs.edit().putString(KEY_DAILY_INCUBATE_SESSION, o.toString()).apply()
+    }
+
+    fun clearDailyIncubateSessionProgress() {
+        val cur = getDailyIncubateSession() ?: return
+        saveDailyIncubateSession(
+            cur.copy(
+                username = "",
+                action = "",
+                publishDone = false,
+                elapsedSec = 0,
+                inTransition = false,
+                pausedByScreenOff = false,
+            ),
+        )
     }
 }

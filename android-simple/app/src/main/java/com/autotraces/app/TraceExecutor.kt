@@ -332,12 +332,29 @@ class RealTraceExecutor(
                 if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
                     return PublishPostEntryRecoveryResult.AlreadyReady
                 }
-                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：已是主 Feed 但未能点到 Home，改走回首页恢复")
+                if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：已是主 Feed 但未能点到 Home，将按原方案强关重启")
+                } else {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：已是主 Feed 但未能点到 Home，改走回首页恢复")
+                }
             } else if (vision == null) {
-                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：主 Feed 预检 OCR 失败：$err，先尝试导航返回恢复")
+                if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：主 Feed 预检 OCR 失败：$err，将按原方案强关重启")
+                } else {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：主 Feed 预检 OCR 失败：$err，先尝试导航返回恢复")
+                }
             } else {
-                devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前前台但未确认主 Feed，先尝试导航返回恢复")
+                if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前前台但未确认主 Feed，将按原方案强关重启")
+                } else {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前前台但未确认主 Feed，先尝试导航返回恢复")
+                }
             }
+        }
+        // 本机原方案：跳过「回首页优先」，直接强关（避免 recover 内已强关后再叠一次）
+        if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+            devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：本机配置为原方案直接强关重启")
+            return recoverPublishPostEntryByForceRestart(service, alias, reason)
         }
         val backOk = recoverToHomeViaBackOrRestart(ctx, "$reason·回首页优先", skipDontAllowOcr = true)
         if (backOk) {
@@ -364,8 +381,16 @@ class RealTraceExecutor(
             }
         }
         devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：导航返回回首页未成功且未见底栏，改按原方案强关重启")
+        return recoverPublishPostEntryByForceRestart(service, alias, reason)
+    }
+
+    /** 发作品入口恢复：直接调用 [restartTikTokForRecovery]（不改其实现），冷启后须点到 Home。 */
+    private suspend fun recoverPublishPostEntryByForceRestart(
+        service: Context,
+        alias: String,
+        reason: String,
+    ): PublishPostEntryRecoveryResult {
         return if (restartTikTokForRecovery(skipDontAllowOcr = true)) {
-            // 冷启成功后再验：必须点到 Home，否则不视为恢复成功（避免桌面空转假成功）
             if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
                 val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
                 val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-after-restart")
@@ -649,6 +674,8 @@ class RealTraceExecutor(
     private var lastContinueEditingPostPopupDismissAtMs: Long = 0L
     private var lastSecurityCheckupPopupDismissAtMs: Long = 0L
     private var lastVerifyToContinuePopupDismissAtMs: Long = 0L
+    private var lastRepostIntroPopupDismissAtMs: Long = 0L
+    private var lastUpdateYourAppPopupDismissAtMs: Long = 0L
     private var lastTikTokNotificationsPopupDismissAtMs: Long = 0L
     private var lastMetaFacebookTikTokRecoverAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
@@ -1217,6 +1244,13 @@ class RealTraceExecutor(
         private const val VERIFY_TO_CONTINUE_DISMISS_X_FRACTION = 0.85f
         /** 「Verify to continue」关闭钮：Y = 屏高 × 本比例（距顶 32%）。 */
         private const val VERIFY_TO_CONTINUE_DISMISS_Y_FRACTION = 0.32f
+        /** 首次 Repost 介绍弹窗（Introduce this post… / OK）：点 OK 的冷却。 */
+        private const val INLINE_REPOST_INTRO_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 点 Repost 后探测介绍弹窗的 OCR 次数（弹窗可能晚于 sheet 关闭出现）。 */
+        private const val REPOST_INTRO_OCR_MAX_ATTEMPTS = 3
+        private const val REPOST_INTRO_OCR_RETRY_DELAY_MS = 500L
+        /** 「Update your app」升级弹窗：点 Not now 的冷却。 */
+        private const val INLINE_UPDATE_YOUR_APP_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 「Allow TikTok to send you notifications?」弹窗：点 Don't allow 的冷却。 */
         private const val INLINE_TIKTOK_NOTIFICATIONS_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 整屏 OCR 见 Meta/Facebook：拉回 TikTok 的冷却，避免连环重入。 */
@@ -1864,7 +1898,9 @@ class RealTraceExecutor(
     }
 
     /**
-     * 优先 navBack 回首页；失败则强关重启。
+     * 页面错乱恢复入口。
+     * 本机 [PrefsStore.isPageDisorderRecoverForceRestart] 为 true（默认）时走原方案：直接 [restartTikTokForRecovery]；
+     * 否则优先 [navBack] 回首页，失败再强关重启。
      * 与 [reopenSearchAndEnterUsersTab] 共用 [recoverHomeMutex]：后来者直接失败。
      */
     private suspend fun recoverToHomeViaBackOrRestart(
@@ -1898,6 +1934,29 @@ class RealTraceExecutor(
         if (growthYieldOrNull(alias, reason)) return false
         val ctx = service.applicationContext
         val blockForceRestart = PrefsStore.peekGrowthContinueFromPublishHome()
+
+        // 原方案：直接强关重启（不改动 restartTikTokForRecovery 实现，仅在此分流）
+        // 若已在主 Feed，只连点 Home，避免无意义冷启（与回首页方案的 precheck 一致）
+        if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+            if (hardStopOrNull(alias, reason)) return false
+            if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
+                val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+                val (vision, _) = mlKitRecognizeFullScreen(service, "recover_home_force_precheck")
+                if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                    devOp(alias, "$reason：原方案下已见主 Feed，连点 Home 确认（跳过强关）")
+                    return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason, vision)
+                }
+            }
+            if (blockForceRestart) {
+                devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启（原方案）")
+                return false
+            }
+            devOp(alias, "$reason：本机配置为原方案直接强关重启")
+            val restarted = restartTikTokForRecovery(skipDontAllowOcr)
+            if (!restarted) return false
+            return confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)
+        }
+
         if (!ensureTikTokInForeground(ctx, alias, "$reason·回首页", allowForceRestart = !blockForceRestart)) {
             // ensure 在允许强关时内部已尝试过 restartTikTokForRecovery；此处禁止再叠一次强关
             if (blockForceRestart) {
@@ -3204,11 +3263,13 @@ class RealTraceExecutor(
         return true
     }
 
+    /** 「Viewer history」/「Viewer history turned on」等标题或开关文案。 */
     private fun visionHasViewerHistoryLabel(vision: Text): Boolean =
         findStrictExactLabelHit(vision, "Viewer history") != null
             || findStrictExactAcrossAdjacentLines(vision, "Viewer history") != null
+            || findLabelHitContainingIgnoreCase(vision, "viewer history") != null
 
-    /** 同屏同时见 Viewer history 与 Save 时视为弹窗，点最上方 Save 关闭。 */
+    /** 同屏同时见 Viewer history 与 Save 时视为弹窗，点 Save 关闭。 */
     private suspend fun tryDismissViewerHistoryPopupFromVision(
         ctx: Context,
         alias: String?,
@@ -3217,12 +3278,16 @@ class RealTraceExecutor(
         tapWithJitter: Boolean,
     ): Boolean {
         if (!visionHasViewerHistoryLabel(vision)) return false
-        val saveHit = findTopmostStrictExactLabelHit(vision, "Save") ?: run {
-            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
-                devOp(safeAlias, "$phaseLog：见 Viewer history 但未同屏命中 Save，跳过弹窗处理")
+        // 弹窗红钮在卡片底部；优先最靠下的 Save，避免误点其它页顶栏 Save
+        val saveHit = findBottommostStrictExactLabelHit(vision, "Save")
+            ?: findTopmostStrictExactLabelHit(vision, "Save")
+            ?: findStrictExactLabelHitIgnoreCase(vision, "Save")
+            ?: run {
+                alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                    devOp(safeAlias, "$phaseLog：见 Viewer history 但未同屏命中 Save，跳过弹窗处理")
+                }
+                return false
             }
-            return false
-        }
         val now = SystemClock.elapsedRealtime()
         if (now - lastViewerHistoryPopupDismissAtMs < INLINE_VIEWER_HISTORY_POPUP_DISMISS_COOLDOWN_MS) {
             return false
@@ -3552,7 +3617,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 后顺手关弹窗（通知权限 Don't allow / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue 等）。
+     * 整屏 OCR 后顺手关弹窗（通知权限 Don't allow / Update your app Not now / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue / Repost 介绍 OK 等）。
      * @return 非 null 表示已点击关弹窗，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun dismissFullScreenInlinePopupsIfPresent(
@@ -3577,18 +3642,27 @@ class RealTraceExecutor(
             )
         }.getOrDefault(false)
         if (notificationsDismissed) return "tiktok_notifications_popup_dismissed"
-        if (fileTag != null && fileTag.startsWith("profile_edit_")) {
-            val viewerDismissed = runCatching {
-                tryDismissViewerHistoryPopupFromVision(
-                    ctx = ctx,
-                    alias = alias,
-                    vision = vision,
-                    phaseLog = "「修改基本资料」$phaseLog",
-                    tapWithJitter = false,
-                )
-            }.getOrDefault(false)
-            if (viewerDismissed) return "viewer_history_popup_dismissed"
-        }
+        val updateYourAppDismissed = runCatching {
+            tryDismissUpdateYourAppPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (updateYourAppDismissed) return "update_your_app_popup_dismissed"
+        // 任意整屏 OCR：同屏见 Viewer history + Save 即认定为弹窗并点 Save（不限 profile_edit_）
+        val viewerDismissed = runCatching {
+            tryDismissViewerHistoryPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (viewerDismissed) return "viewer_history_popup_dismissed"
         val saveLoginDismissed = runCatching {
             tryDismissSaveLoginForNextTimePopupFromVision(
                 ctx = ctx,
@@ -3629,7 +3703,74 @@ class RealTraceExecutor(
             )
         }.getOrDefault(false)
         if (verifyToContinueDismissed) return "verify_to_continue_popup_dismissed"
+        val repostIntroDismissed = runCatching {
+            tryDismissRepostIntroPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (repostIntroDismissed) return "repost_intro_popup_dismissed"
         return null
+    }
+
+    /**
+     * 「Update your app」升级弹窗：先确认标题，再点 Not now（勿点红色 Update）。
+     */
+    private fun visionHasUpdateYourAppPopup(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "update your app") != null) return true
+        if (findStrictExactLabelHit(vision, "Update your app") != null) return true
+        val full = vision.text.lowercase(Locale.US)
+        if (full.contains("update your app")) return true
+        if (full.contains("a new version of tiktok is available") &&
+            (findStrictExactLabelHit(vision, "Not now") != null ||
+                findLabelHitContainingIgnoreCaseRelaxed(vision, "not now") != null)
+        ) {
+            return true
+        }
+        return false
+    }
+
+    private fun findUpdateYourAppNotNowHit(vision: Text): StrictLabelHit? =
+        findBottommostStrictExactLabelHit(vision, "Not now")
+            ?: findStrictExactLabelHit(vision, "Not now")
+            ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "not now")
+
+    private suspend fun tryDismissUpdateYourAppPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasUpdateYourAppPopup(vision)) return false
+        val notNowHit = findUpdateYourAppNotNowHit(vision) ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见 Update your app 但未同屏命中 Not now，跳过")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastUpdateYourAppPopupDismissAtMs < INLINE_UPDATE_YOUR_APP_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(notNowHit.point, w, h)
+        } else {
+            coerceTapToScreen(notNowHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Update your app 弹窗，点 Not now (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastUpdateYourAppPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(400L)
+        return true
     }
 
     /** 「Allow TikTok to send you notifications?」应用内弹窗：先确认标题再点 Don't allow。 */
@@ -3779,6 +3920,144 @@ class RealTraceExecutor(
         lastVerifyToContinuePopupDismissAtMs = SystemClock.elapsedRealtime()
         delay(350L)
         return true
+    }
+
+    /**
+     * 首次点击 Repost 后可能出现的介绍弹窗：
+     * 「Introduce this post to others by reposting」/「It will appear on your profile」+ 粉钮 OK。
+     */
+    private fun visionHasRepostIntroPopup(vision: Text): Boolean {
+        // 标题最稳；副文案单独出现时要求同屏已有 OK，降低误判后点到其它弹窗 OK 的风险
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "introduce this post to others by reposting") != null) {
+            return true
+        }
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "introduce this post") != null &&
+            findLabelHitContainingIgnoreCaseRelaxed(vision, "by reposting") != null
+        ) {
+            return true
+        }
+        val full = vision.text.lowercase(Locale.US)
+        if (full.contains("introduce this post") && full.contains("repost")) return true
+        val hasProfileCue =
+            findLabelHitContainingIgnoreCaseRelaxed(vision, "it will appear on your profile") != null ||
+                (full.contains("appear on your profile") && full.contains("repost"))
+        if (hasProfileCue && findRepostIntroOkButtonHit(vision) != null) return true
+        return false
+    }
+
+    private fun findRepostIntroOkButtonHit(vision: Text): StrictLabelHit? =
+        findBottommostStrictExactLabelHit(vision, "OK")
+            ?: findBottommostStrictExactLabelHit(vision, "Ok")
+            ?: findStrictExactLabelHit(vision, "OK")
+
+    /** 整屏 OCR 已命中 Repost 介绍弹窗时，点 OK 关闭。 */
+    private suspend fun tryDismissRepostIntroPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasRepostIntroPopup(vision)) return false
+        val okHit = findRepostIntroOkButtonHit(vision) ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见 Repost 介绍弹窗但未同屏命中 OK，跳过")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRepostIntroPopupDismissAtMs < INLINE_REPOST_INTRO_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(okHit.point, w, h)
+        } else {
+            coerceTapToScreen(okHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Repost 介绍弹窗，点 OK (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastRepostIntroPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(400L)
+        return true
+    }
+
+    /**
+     * 点完 Repost 后专用：截屏 OCR 探测首次介绍弹窗并点 OK；未出现则跳过（非首次）。
+     * 弹窗可能晚于 Share sheet 关闭：连续 2 次未见文案即放弃；见文案但未点到 OK 则继续重试。
+     * 本路径直接点 OK，不走 inline 冷却（避免「已点但未关掉」时重试被 cooldown 静默吃掉）。
+     */
+    private suspend fun dismissRepostIntroOkIfPresent(service: Context) {
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val dm = service.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        var consecutiveMiss = 0
+        repeat(REPOST_INTRO_OCR_MAX_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(REPOST_INTRO_OCR_RETRY_DELAY_MS)
+            val screenshotFile = File(service.cacheDir, "repost_intro_ocr.png")
+            if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) {
+                consecutiveMiss++
+                if (consecutiveMiss >= 2) {
+                    devOp(alias, "未出现 Repost 介绍弹窗，跳过")
+                    return
+                }
+                return@repeat
+            }
+            val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
+                screenshotFile.delete()
+                consecutiveMiss++
+                if (consecutiveMiss >= 2) {
+                    devOp(alias, "未出现 Repost 介绍弹窗，跳过")
+                    return
+                }
+                return@repeat
+            }
+            val vision = try {
+                MlKitOcrGate.recognize(InputImage.fromBitmap(bitmap, 0))
+            } catch (_: Exception) {
+                null
+            } finally {
+                bitmap.recycle()
+                screenshotFile.delete()
+            }
+            if (vision == null) {
+                consecutiveMiss++
+                if (consecutiveMiss >= 2) {
+                    devOp(alias, "未出现 Repost 介绍弹窗，跳过")
+                    return
+                }
+                return@repeat
+            }
+
+            if (!visionHasRepostIntroPopup(vision)) {
+                consecutiveMiss++
+                if (consecutiveMiss >= 2) {
+                    devOp(alias, "未出现 Repost 介绍弹窗，跳过")
+                    return
+                }
+                return@repeat
+            }
+            consecutiveMiss = 0
+            val okHit = findRepostIntroOkButtonHit(vision)
+            if (okHit == null) {
+                devOp(alias, "见 Repost 介绍弹窗但未命中 OK，重试 ${attempt + 1}/$REPOST_INTRO_OCR_MAX_ATTEMPTS")
+                return@repeat
+            }
+            val tap = coerceTapToScreen(okHit.point, w, h)
+            devOp(alias, "转发：Repost 介绍弹窗，点 OK (${tap.x},${tap.y})")
+            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                devOp(alias, "点 OK 指令失败，重试 ${attempt + 1}/$REPOST_INTRO_OCR_MAX_ATTEMPTS")
+                return@repeat
+            }
+            lastRepostIntroPopupDismissAtMs = SystemClock.elapsedRealtime()
+            delay(400L)
+            return
+        }
     }
 
     private fun visionHasContinueEditingPostPopup(vision: Text): Boolean {
@@ -15966,6 +16245,8 @@ class RealTraceExecutor(
             devOp(alias, "点击 Repost（固定坐标）")
             runSuCommand("input tap $repostTapX $repostTapY")
             delay(Random.nextLong(800, 1200))
+            // 首次 Repost 可能弹出介绍页；OCR 确认文案后点 OK，未出现则跳过
+            dismissRepostIntroOkIfPresent(service)
             devOp(alias, "转发流程结束", System.currentTimeMillis() - t0)
             return
         }
@@ -15974,10 +16255,12 @@ class RealTraceExecutor(
         if (repostPoint != null) {
             devOp(alias, "点击 Repost（OCR）")
             runSuCommand("input tap ${repostPoint.x} ${repostPoint.y}")
+            delay(Random.nextLong(800, 1200))
+            dismissRepostIntroOkIfPresent(service)
         } else {
             devOp(alias, "未 OCR 到 Repost，跳过二次点击")
+            delay(Random.nextLong(800, 1200))
         }
-        delay(Random.nextLong(800, 1200))
         devOp(alias, "转发流程结束", System.currentTimeMillis() - t0)
     }
 
@@ -16926,9 +17209,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * Users 列表未匹配恢复：不杀 TikTok。
-     * 一次双返 → OCR；未见主 Feed 再单返 → OCR（命中后不再额外返回）；
-     * 仍未见则续单返+OCR。返回可能退 App 时仅重开 TikTok（不强关），成功后重新搜索并进 Users。
+     * Users 列表未匹配恢复。
+     * 本机原方案（默认）：直接强关重启后重搜；当前方案：不杀 TikTok，双返/单返回首页后重搜。
      */
     private suspend fun recoverUsersListMissToHomeThenReopenSearch(
         service: Context,
@@ -16939,6 +17221,28 @@ class RealTraceExecutor(
         val reason = "Users列表未匹配回首页"
         if (!tryAcquireRecoverHomeExclusive(alias, reason)) return false
         try {
+            if (PrefsStore.isPageDisorderRecoverForceRestart()) {
+                if (PrefsStore.peekGrowthContinueFromPublishHome()) {
+                    devOp(alias, "$reason：发作品刚完成于 Home，短期内跳过硬关重启（原方案）")
+                    return false
+                }
+                if (hardStopOrNull(alias, reason)) return false
+                if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
+                    val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+                    val (vision, _) = mlKitRecognizeFullScreen(service, "users_miss_force_precheck")
+                    if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+                        devOp(alias, "$reason：原方案下已见主 Feed，连点 Home 后重搜（跳过强关）")
+                        if (!confirmRecoverHomeByTappingHomeOrFail(service, alias, reason, vision)) {
+                            return false
+                        }
+                        return reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)
+                    }
+                }
+                devOp(alias, "$reason：本机配置为原方案直接强关重启")
+                if (!restartTikTokForRecovery()) return false
+                if (!confirmRecoverHomeByTappingHomeOrFail(service, alias, reason)) return false
+                return reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)
+            }
             if (!recoverUsersListMissToHomeUnlocked(service, reason)) return false
             return reopenSearchAndEnterUsersTabUnlocked(service, username, isLiveModeForUsersCheck)
         } finally {
@@ -17807,6 +18111,20 @@ class RealTraceExecutor(
         ) {
             autoLoginDontAllowHandledInThisChain = true
             autoLoginDelay(alias, 450L, "通知权限 Don't allow 后")
+            return true
+        }
+
+        // 2b) 「Update your app」升级弹窗：点 Not now（挡全屏，优先关掉）
+        if (
+            tryDismissUpdateYourAppPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Update your app 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Update your app Not now 后")
             return true
         }
 
