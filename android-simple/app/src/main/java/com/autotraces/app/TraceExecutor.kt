@@ -1396,93 +1396,6 @@ class RealTraceExecutor(
         return runSuCommand("monkey -p $hostPkg -c android.intent.category.LAUNCHER 1")
     }
 
-    /** OCR 确认屏上为 TikTok 界面（主 Feed / 登录链 / 兴趣页 / 应用内弹窗等）。 */
-    private fun ocrConfirmsTikTokVisibleUi(vision: Text, screenH: Int): Boolean {
-        if (autoLoginSeesMainFeedBottomNav(vision, screenH)) return true
-        if (hasBottomHomeOrProfile(vision, screenH)) return true
-        if (autoLoginSeesInterestPicker(vision)) return true
-        if (safeguardVisionNeedsAutoLogin(vision, screenH)) return true
-        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "send you notifications") != null) return true
-        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向你发送通知") != null) return true
-        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向您发送通知") != null) return true
-        return false
-    }
-
-    /**
-     * dumpsys 报 TikTok 在前台，但 OCR 见本应用/Meta 等 → 屏上实际不是 TikTok。
-     * 不用 Don't allow / Allow 做否定：TikTok 应用内弹窗也有这些按钮，应交给后续点弹窗，不能判拉起失败。
-     * @return 非 null 为矛盾原因（用于日志）。
-     */
-    private fun ocrContradictsTikTokForeground(vision: Text, screenH: Int): String? {
-        if (ocrConfirmsTikTokVisibleUi(vision, screenH)) return null
-        if (isHostAppInForeground()) return "本应用AutoTraces在前台(dumpsys)"
-        val hostUiNeedles = listOf(
-            "待活跃",
-            "涨粉",
-            "自动登录",
-            "AutoTraces",
-            "活跃下个",
-            "停涨粉",
-            "批量发作品",
-            "待活跃队列",
-        )
-        for (needle in hostUiNeedles) {
-            if (findLabelHitContainingIgnoreCase(vision, needle) != null) {
-                return "本应用界面($needle)"
-            }
-        }
-        if (visionShowsMetaOrFacebookOverlay(vision)) return "Meta/Facebook界面"
-        return null
-    }
-
-    /**
-     * dumpsys 已通过时，用 OCR 交叉校验：见 TikTok 界面才认成功；见其它 App/弹窗则判假前台。
-     */
-    private suspend fun confirmTikTokForegroundWithOcrCrossCheck(
-        ctx: Context,
-        alias: String,
-        tag: String,
-    ): Boolean {
-        if (isHostAppInForeground()) {
-            devOp(alias, "$tag：dumpsys 与本应用前台矛盾，不视为 TikTok 在前台")
-            return false
-        }
-        if (isSystemPermissionGrantDialogForeground()) {
-            devOp(alias, "$tag：dumpsys 焦点在系统权限授权页，不视为 TikTok 在前台")
-            return false
-        }
-        val h = ctx.resources.displayMetrics.heightPixels
-        for (i in 0 until 2) {
-            if (i > 0) delay(900)
-            val (vision, err) = mlKitRecognizeFullScreenCore(ctx, "launch_fg_${tag}_$i")
-            if (vision == null) {
-                if (!err.isNullOrBlank()) {
-                    devOp(alias, "$tag：界面OCR失败 ${err.take(80)}")
-                }
-                continue
-            }
-            val preview = buildProfileEditOcrPreview(vision).ifBlank { vision.text.trim() }.take(160)
-            ocrContradictsTikTokForeground(vision, h)?.let { reason ->
-                devOp(
-                    alias,
-                    "$tag：OCR见${reason}，屏上非TikTok（第${i + 1}/2轮，勿信 dumpsys 焦点包）预览=${preview.ifBlank { "无" }}",
-                )
-                return false
-            }
-            if (ocrConfirmsTikTokVisibleUi(vision, h)) {
-                if (i > 0) {
-                    devOp(alias, "$tag：OCR确认TikTok界面（第${i + 1}轮）预览=${preview.take(80)}")
-                }
-                return true
-            }
-            devOp(
-                alias,
-                "$tag：dumpsys报TikTok但OCR未见TikTok界面（第${i + 1}/2轮）预览=${preview.ifBlank { "无识别" }}",
-            )
-        }
-        return false
-    }
-
     /**
      * 拉起 TikTok：启动命令 → 等待 [launchWaitMs] → dumpsys 前台校验 →
      * **仅在前台已确认时** OCR 处理 Don't allow（非 TikTok 前台时 OCR 无意义）。
@@ -1503,15 +1416,12 @@ class RealTraceExecutor(
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()) {
-            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·已前台")) {
-                devOp(alias, "$tag：TikTok 已在前台（dumpsys+界面OCR），跳过重复拉起")
-                logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
-                if (!skipDontAllowOcr) {
-                    dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
-                }
-                return true
+            devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "捷径已前台跳过拉起")
+            if (!skipDontAllowOcr) {
+                dismissDontAllowAfterTikTokLaunch(ctx, alias, tag)
             }
-            devOp(alias, "$tag：dumpsys 报已在前台但OCR未见TikTok界面，不跳过拉起")
+            return true
         }
         val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
         if (forceStopBeforeLaunch) {
@@ -1548,7 +1458,8 @@ class RealTraceExecutor(
 
         var didLaunchCommand = false
         if (tiktokAlreadyForeground) {
-            devOp(alias, "$tag：dumpsys 报 TikTok 已在前台，跳过启动命令（待 OCR 交叉校验）")
+            devOp(alias, "$tag：TikTok 已在前台（严格 dumpsys），跳过重复拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已前台跳过启动命令")
             didLaunchCommand = true
         } else {
             // 本应用/悬浮层在前台时 startActivity 常无法切到 TikTok，优先 root 拉起
@@ -1607,32 +1518,7 @@ class RealTraceExecutor(
         }
 
         val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
-        var ocrConfirmed = confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, tag)
-        // dumpsys 已通过后权限页才弹出时，交叉校验会直接失败；先点掉再复检，避免假失败。
-        if (!ocrConfirmed && !skipDontAllowOcr && isSystemPermissionGrantDialogForeground()) {
-            devOp(alias, "$tag：OCR交叉校验见系统权限页，先点 Don't allow 再复检")
-            if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·OCR交叉后权限")) {
-                invalidateForegroundProbeCache()
-                ocrConfirmed =
-                    confirmStrictForeground() &&
-                        confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限后")
-            }
-        }
-        if (!ocrConfirmed) {
-            logForegroundProbeFailure(alias, tag, pkg)
-            logTikTokForegroundCheck(
-                alias,
-                tag,
-                passed = false,
-                detail = "dumpsys焦点=${fgPkg ?: "未知"} 但OCR屏上非TikTok",
-            )
-            devOp(
-                alias,
-                "$tag：拉起 TikTok 失败（dumpsys 报 ${fgPkg ?: pkg} 在前台，但OCR屏上非TikTok，不视为拉起成功）",
-            )
-            return false
-        }
-        devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}，界面OCR已见内容）")
+        devOp(alias, "$tag：严格前台校验通过（焦点包=${fgPkg ?: "未知"}）")
         logTikTokForegroundCheck(alias, tag, passed = true)
 
         val dismissedDontAllow =
@@ -1656,11 +1542,6 @@ class RealTraceExecutor(
             if (!confirmStrictForeground()) {
                 logForegroundProbeFailure(alias, tag, pkg)
                 devOp(alias, "$tag：权限叠层恢复后 TikTok 仍非前台，拉起失败")
-                return false
-            }
-            if (!confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限叠层后")) {
-                logForegroundProbeFailure(alias, tag, pkg)
-                devOp(alias, "$tag：权限叠层恢复后 OCR 未见 TikTok 界面，拉起失败")
                 return false
             }
         }
@@ -1749,17 +1630,12 @@ class RealTraceExecutor(
                 devOp(alias, "$tag：拉起回报成功但严格前台复检未通过，不视为冷启成功")
                 return false
             }
-            if (!confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·复检")) {
-                logForegroundProbeFailure(alias, tag, pkg)
-                devOp(alias, "$tag：拉起回报成功但OCR屏上非TikTok，不视为冷启成功")
-                return false
-            }
             val fgPkg = resolveStrictForegroundPackage(collectForegroundProbeTexts())
             logTikTokForegroundCheck(
                 alias,
                 tag,
                 passed = true,
-                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"} 界面OCR已见",
+                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"}",
             )
             return true
         }
@@ -8259,21 +8135,14 @@ class RealTraceExecutor(
     ): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {
-            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·已可见")) {
-                devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
-                logTikTokForegroundCheck(alias, tag, passed = true, detail = "已可见且界面OCR有内容")
-                return true
-            }
-            devOp(alias, "$tag：dumpsys 报 TikTok 前台但OCR未见TikTok界面，不跳过拉起")
-            logTikTokForegroundCheck(alias, tag, passed = false, detail = "dumpsys可见但OCR非TikTok")
+            devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
+            logTikTokForegroundCheck(alias, tag, passed = true, detail = "已可见跳过拉起")
+            return true
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·权限页")) {
-            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·权限页后")) {
-                devOp(alias, "$tag：权限授权页已处理，TikTok 前台已恢复，继续任务")
-                return true
-            }
-            devOp(alias, "$tag：权限页处理后 dumpsys/OCR 仍未确认 TikTok 界面，继续拉起")
+            devOp(alias, "$tag：权限授权页已处理，TikTok 前台已恢复，继续任务")
+            return true
         }
 
         val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
@@ -8285,11 +8154,8 @@ class RealTraceExecutor(
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·切前台后权限")) {
-            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·切前台后权限OCR")) {
-                devOp(alias, "$tag：切前台失败后经权限页恢复，TikTok 前台已确认，继续任务")
-                return true
-            }
-            devOp(alias, "$tag：切前台后权限页处理完仍未见 TikTok 界面，继续强停重拉")
+            devOp(alias, "$tag：切前台失败后经权限页恢复，TikTok 前台已确认，继续任务")
+            return true
         }
 
         devOp(alias, "$tag：切前台后仍非 TikTok 前台（可能在后台或拉起无效），强停后完整重拉")
@@ -8304,11 +8170,8 @@ class RealTraceExecutor(
         }
 
         if (dismissSystemPermissionDialogAndRestoreTikTok(ctx, alias, "$tag·重拉后权限")) {
-            if (confirmTikTokForegroundWithOcrCrossCheck(ctx, alias, "$tag·重拉后权限OCR")) {
-                devOp(alias, "$tag：强停重拉失败后经权限页恢复，TikTok 前台已确认，继续任务")
-                return true
-            }
-            devOp(alias, "$tag：重拉后权限页处理完仍未见 TikTok 界面")
+            devOp(alias, "$tag：强停重拉失败后经权限页恢复，TikTok 前台已确认，继续任务")
+            return true
         }
 
         logForegroundProbeFailure(alias, tag, pkg)
