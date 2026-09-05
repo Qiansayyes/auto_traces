@@ -136,7 +136,7 @@ object PrefsStore {
     private const val KEY_MANUAL_PUBLISH_COUNT = "manual_publish_count"
     /**
      * 运行模式：true=本机手动（simple）；false=云端 client。
-     * 默认本机手动，与 android-simple 历史行为一致。
+     * 新装默认云端；已绑定且从未写过该 key 的旧设备落盘为手动，避免升级静默翻到云端。
      */
     private const val KEY_MANUAL_CONTROL_MODE = "manual_control_mode_enabled"
     /** 最近一次从「待注册TK账号」领取并转入邮箱账户管理的邮箱。 */
@@ -1283,12 +1283,56 @@ object PrefsStore {
         prefs.edit().putBoolean(KEY_MANUAL_LOCAL_AUTO_SWITCH, enabled).apply()
     }
 
-    /** true=本机手动模式；false=云端 client 模式。 */
-    fun isManualControlMode(): Boolean =
-        prefs.getBoolean(KEY_MANUAL_CONTROL_MODE, true)
+    /** true=本机手动模式；false=云端 client 模式。新装默认云端。 */
+    fun isManualControlMode(): Boolean {
+        if (!prefs.contains(KEY_MANUAL_CONTROL_MODE)) {
+            // 升级兼容：已绑定设备历史上默认本机手动且可能从未写过 key，落盘保留手动。
+            // 新装未绑定：默认云端。
+            val legacyManual = isBound()
+            prefs.edit().putBoolean(KEY_MANUAL_CONTROL_MODE, legacyManual).apply()
+            return legacyManual
+        }
+        return prefs.getBoolean(KEY_MANUAL_CONTROL_MODE, false)
+    }
 
     fun setManualControlMode(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MANUAL_CONTROL_MODE, enabled).apply()
+    }
+
+    /**
+     * 运行模式切换时清掉本机任务进度 / 活跃账号标记，避免旧模式账本污染新模式。
+     * 不含 TikTok 应用数据（由协调器 pm clear）。
+     */
+    fun clearControlModeTaskProgress() {
+        clearActivateSession(null)
+        clearActivateTotalMinutes()
+        clearActivateStintRestSkip()
+        clearPendingActivateUsernames()
+        clearPublishPostState()
+        clearMutualClickState()
+        clearDailyIncubateSessionProgress()
+        clearAutoSwitchSessionContext()
+        clearAutoSwitchLedgerPersisted()
+        setManualLocalAutoSwitchEnabled(false)
+        setManualActiveUsername(null)
+        setManualSelectedUsername(null)
+        setLogContextUsername(null)
+        setGrowthContinueFromPublishHome(false)
+        prefs.edit()
+            .remove(KEY_MANUAL_ACTIVATE_GROWTH_MINUTES)
+            .remove(KEY_MANUAL_ACTIVATE_FOR_YOU_MINUTES)
+            .remove(KEY_MANUAL_PENDING_ACTIVATE_ENQUEUE_AT)
+            .remove(KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON)
+            .remove(KEY_BATCH_USERNAMES)
+            .remove(KEY_BATCH_COMPLETED)
+            .remove(KEY_BATCH_PROCESSED)
+            .apply()
+        // 清掉「首次登录已完成」标记：pm clear 后需重新走登录/还原链
+        val editor = prefs.edit()
+        prefs.all.keys
+            .filter { it.startsWith(KEY_MANUAL_FIRST_LOGIN_DONE_PREFIX) }
+            .forEach { editor.remove(it) }
+        editor.apply()
     }
 
     fun getManualAutoSwitchSlotMinutes(): Int =

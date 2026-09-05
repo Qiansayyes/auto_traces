@@ -43,11 +43,13 @@ class ControlModeActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             val selected = participationChecked.filter { it.value }.keys.toList()
+            val wipeNote =
+                "\n\n注意：切换时会清空 TikTok 应用数据（pm clear），并清除本机旧模式任务进度；切完需重新登录/还原账号。"
             val summary = if (selected.isEmpty()) {
-                "未勾选任何账号：别名桶内全部账号将同步为「不参与自动切号」，并切换到云端模式。"
+                "未勾选任何账号：别名桶内全部账号将同步为「不参与自动切号」，并切换到云端模式。" + wipeNote
             } else {
                 "将把以下 ${selected.size} 个账号同步为「参与自动切号」，其余同步为「不参与」，并切换到云端模式：\n" +
-                    selected.joinToString("\n") { "@$it" }
+                    selected.joinToString("\n") { "@$it" } + wipeNote
             }
             AlertDialog.Builder(this)
                 .setTitle("确认切换到云端模式")
@@ -66,7 +68,10 @@ class ControlModeActivity : AppCompatActivity() {
             }
             AlertDialog.Builder(this)
                 .setTitle("确认切回本机手动")
-                .setMessage("将关闭本设备云端自动切号，并恢复本机手动任务面板。账号参与/不参与标记会保留。")
+                .setMessage(
+                    "将关闭本设备云端自动切号，并恢复本机手动任务面板。账号参与/不参与标记会保留。\n\n" +
+                        "注意：切换时会清空 TikTok 应用数据（pm clear），并清除本机旧模式任务进度；切完需重新登录/还原账号。",
+                )
                 .setNegativeButton("取消", null)
                 .setPositiveButton("确认切回") { _, _ ->
                     lifecycleScope.launch { performSwitchToManualMode() }
@@ -285,7 +290,7 @@ class ControlModeActivity : AppCompatActivity() {
         if (participationBusy) return
         participationBusy = true
         applyControlModeUi()
-        binding.participationSummaryText.text = "正在同步参与名单并切换到云端模式…"
+        binding.participationSummaryText.text = "正在清空 TikTok/旧进度并切换到云端模式…"
         val result = AppCoordinator.switchToCloudClientMode(selected)
         participationBusy = false
         result.onSuccess { tip ->
@@ -303,7 +308,7 @@ class ControlModeActivity : AppCompatActivity() {
         if (participationBusy) return
         participationBusy = true
         applyControlModeUi()
-        binding.participationSummaryText.text = "正在关闭云端自动切号并切回本机手动…"
+        binding.participationSummaryText.text = "正在清空 TikTok/旧进度并切回本机手动…"
         val result = AppCoordinator.switchToManualControlMode()
         participationBusy = false
         result.onSuccess { tip ->

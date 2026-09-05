@@ -103,7 +103,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="本机手动时忽略云端任务指令，由本机按钮驱动。账号默认全选参与；要排除请点「展开」后取消勾选或点排除。切到云端后听管理台，与 android-client 同一套调度。"
+            android:text="默认云端模式。本机手动时忽略云端任务指令，由本机按钮驱动。账号默认全选参与；要排除请点「展开」后取消勾选或点排除。模式切换会清空 TikTok 数据并清除旧模式任务进度（因无法感知手机当前登录号）。"
             android:textColor="@android:color/darker_gray"
             android:textSize="12sp" />
 

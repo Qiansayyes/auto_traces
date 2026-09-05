@@ -5047,8 +5047,92 @@ object AppCoordinator {
     }
 
     /**
-     * 切换到云端 client：先按挑选名单同步账号参与状态并开启本设备云端自动切号，
-     * 再关闭本机手动模式 / 本机自治。
+     * 运行模式切换公共收尾：停本机任务、强停并 pm clear 一次 TikTok，成功后再清旧模式进度账本。
+     * 因模式切换无法感知手机当前登录号，用清空数据避免串号/脏进度。
+     * @return true 表示 TikTok 数据已清空且本机旧进度已清；false 表示 pm clear 失败（本机进度保留，模式不变）。
+     */
+    private suspend fun prepareControlModeSwitch(reason: String): Boolean {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        PrefsStore.setHardStopRequested(false)
+        manuallyPaused = false
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+
+        // 停本机进行中的任务协程，避免与 pm clear 打架（此时尚不清账本，失败可回退）
+        cancelAutoSwitchBundleRetry()
+        pullLoopJob?.cancel()
+        pullLoopJob = null
+        forYouSwipeJob?.cancel()
+        forYouSwipeJob = null
+        manualSwitchJob?.cancel()
+        manualSwitchJob = null
+        activateNextJob?.cancel()
+        activateNextJob = null
+        batchPublishJob?.cancel()
+        batchPublishJob = null
+        autoActiveJob?.cancel()
+        autoActiveJob = null
+        dailyIncubateJob?.cancel()
+        dailyIncubateJob = null
+        manualDispatchJob?.cancel()
+        manualDispatchJob = null
+        autoSwitchLoginRecoveryJob?.cancel()
+        autoSwitchLoginRecoveryJob = null
+        clearMutualClickStateForInterrupt(reason)
+        if (isPublishPostSwitchActive()) {
+            publishPostSwitchJob?.cancel()
+            publishPostSwitchJob = null
+        }
+        if (isLiveVisitSwitchActive()) {
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
+        }
+        if (isBatchStreamActive()) {
+            batchStreamJob?.cancel()
+            batchStreamJob = null
+        }
+        // 停掉本机自动切号调度器，但先不清 plan 文件：pm clear 失败时仍可续跑旧计划
+        PrefsStore.setManualLocalAutoSwitchEnabled(false)
+        autoSwitchLocalScheduler.stop(clearState = false)
+
+        val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "运行模式切换（$reason）：开始清空 TikTok 数据（成功后再清旧进度）")
+        }
+        PrefsStore.setTransientPausedForDestructiveOp(true)
+        forceStopTikTokPackageAndVerify(
+            packageName = pkg,
+            alias = alias,
+            phaseLabel = "模式切换清空",
+            aggressiveForCutSwitch = true,
+        )
+        val clearOk = runExecutorSu("pm clear $pkg")
+        delay(1_200L)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        if (!clearOk) {
+            if (alias.isNotBlank()) {
+                LogCenter.op(alias, "运行模式切换（$reason）：pm clear 失败，已中止切换（本机进度保留）")
+            }
+            updateRuntime(lastMessage = "模式切换失败：清空 TikTok 失败")
+            return false
+        }
+
+        // pm clear 成功后才不可逆地清旧模式账本
+        autoSwitchLocalScheduler.stop(clearState = true)
+        AutoSwitchLedger.clear()
+        AutoSwitchAccountActivityTracker.reset()
+        AutoSwitchBundleHolder.clear()
+        PrefsStore.clearControlModeTaskProgress()
+        ManualDeviceControl.updateCachedAccounts(emptyList())
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "运行模式切换（$reason）：TikTok 数据已清空，旧模式任务进度已清除")
+        }
+        updateRuntime(lastMessage = "模式切换：已清空 TikTok 与旧进度")
+        return true
+    }
+
+    /**
+     * 切换到云端 client：先清空旧模式进度 + TikTok 数据，再按挑选名单同步参与状态并开启本设备云端自动切号，
+     * 最后关闭本机手动模式 / 本机自治。
      */
     suspend fun switchToCloudClientMode(participateUsernames: List<String>): Result<String> {
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
@@ -5065,17 +5149,9 @@ object AppCoordinator {
             .distinctBy { it.lowercase() }
 
         return runCatching {
-            if (PrefsStore.isManualLocalAutoSwitchEnabled()) {
-                PrefsStore.setManualLocalAutoSwitchEnabled(false)
-                clearOrphanedAutoSwitchAfterManualDisable("切换云端模式")
+            if (!prepareControlModeSwitch("切换云端模式")) {
+                throw IllegalStateException("清空 TikTok 数据失败（需 root），已中止切换到云端模式")
             }
-            // 轻量收尾：停本机拉号/任务，但不走硬停 opt_out（避免切到云端后无法自动开启）
-            clearMutualClickStateForInterrupt("切换云端模式")
-            pullLoopJob?.cancel()
-            pullLoopJob = null
-            PrefsStore.setHardStopRequested(false)
-            manuallyPaused = false
-            PrefsStore.setTransientPausedForDestructiveOp(false)
             started.set(true)
 
             // 必须先切出手动模式，再开启云端自动切号 / 投递 enter。
@@ -5090,17 +5166,20 @@ object AppCoordinator {
                 enableDeviceAutoSwitch = participate.isNotEmpty(),
             )
             if (sync.code != 0) {
-                // 同步失败则回滚模式，避免卡在「本地已是云端、云端未开」的半状态
+                // TikTok/进度已清，无法完整回滚；仅恢复手动标记，避免卡在「本地云端、云端未开」
                 PrefsStore.setManualControlMode(true)
-                throw IllegalStateException(sync.msg?.trim().orEmpty().ifBlank { "同步参与名单失败" })
+                throw IllegalStateException(
+                    (sync.msg?.trim().orEmpty().ifBlank { "同步参与名单失败" }) +
+                        "（TikTok 与旧进度已清空，请重试切换或手动拉账号）",
+                )
             }
             val tip = when {
                 participate.isEmpty() ->
-                    "已切换到云端模式；未挑选参与账号（桶内均已标为不参与），设备云端自动切号未开启"
+                    "已切换到云端模式（已清空 TikTok/旧进度）；未挑选参与账号，设备云端自动切号未开启"
                 participate.size < 2 ->
-                    "已切换到云端模式；参与 ${participate.size} 个账号（云端计划通常需 ≥2 个才续跑自动切号）"
+                    "已切换到云端模式（已清空 TikTok/旧进度）；参与 ${participate.size} 个账号（云端计划通常需 ≥2 个才续跑自动切号）"
                 else ->
-                    "已切换到云端模式；参与自动切号 ${participate.size} 个账号"
+                    "已切换到云端模式（已清空 TikTok/旧进度）；参与自动切号 ${participate.size} 个账号"
             }
             LogCenter.op(
                 alias,
@@ -5122,7 +5201,7 @@ object AppCoordinator {
         }
     }
 
-    /** 切回本机手动：关闭本设备云端自动切号，保留账号参与标记，打开手动模式。 */
+    /** 切回本机手动：先清空旧模式进度 + TikTok，再关本设备云端自动切号，打开手动模式。 */
     suspend fun switchToManualControlMode(): Result<String> {
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -5130,6 +5209,9 @@ object AppCoordinator {
             return Result.failure(IllegalStateException("请先绑定设备"))
         }
         return runCatching {
+            if (!prepareControlModeSwitch("切回本机手动")) {
+                throw IllegalStateException("清空 TikTok 数据失败（需 root），已中止切回本机手动")
+            }
             // participate_usernames=null：只关设备开关，绝不改账号参与标记（避免拉名单失败时把全部标成不参与）
             val sync = ApiService.syncDeviceAssignedAccountsAutoSwitchParticipation(
                 deviceId = deviceId,
@@ -5138,17 +5220,17 @@ object AppCoordinator {
                 enableDeviceAutoSwitch = false,
             )
             if (sync.code != 0) {
-                throw IllegalStateException(sync.msg?.trim().orEmpty().ifBlank { "关闭云端自动切号失败" })
-            }
-            if (PrefsStore.isAutoSwitchAutonomousMode()) {
-                clearOrphanedAutoSwitchAfterManualDisable("切回本机手动")
+                throw IllegalStateException(
+                    (sync.msg?.trim().orEmpty().ifBlank { "关闭云端自动切号失败" }) +
+                        "（TikTok 与旧进度已清空，请重试切回手动）",
+                )
             }
             PrefsStore.setManualControlMode(true)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
-            LogCenter.op(alias, "已切回本机手动模式（云端自动切号已关；账号参与标记保留）")
+            LogCenter.op(alias, "已切回本机手动模式（已清空 TikTok/旧进度；云端自动切号已关；账号参与标记保留）")
             updateRuntime(lastMessage = "已切回本机手动模式")
-            "已切回本机手动模式"
+            "已切回本机手动模式（已清空 TikTok/旧进度）"
         }
     }
 

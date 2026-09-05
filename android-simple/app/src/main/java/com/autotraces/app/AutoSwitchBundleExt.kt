@@ -31,6 +31,15 @@ object AutoSwitchBundleHolder {
         }
     }
 
+    /** 模式切换等场景：清内存 + 磁盘缓存，避免旧模式 bundle 被误恢复。 */
+    fun clear() {
+        bundle = null
+        val file = cacheFile
+        if (file != null && file.isFile) {
+            runCatching { file.delete() }
+        }
+    }
+
     fun getBundle(): AutoSwitchBundle? = bundle
 
     fun loadCachedBundle(): AutoSwitchBundle? {
