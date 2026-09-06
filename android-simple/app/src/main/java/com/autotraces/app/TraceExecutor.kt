@@ -1095,6 +1095,22 @@ class RealTraceExecutor(
          */
         private const val PUBLISH_POST_RECENTS_OCR_MAX_PASSES = 5
         private const val PUBLISH_POST_RECENTS_OCR_RETRY_DELAY_MS = 1000L
+        /**
+         * 点布局入口后首次出现 Recents：在标题右下方适距上滑一次，催页面完整加载。
+         * 仅布局后第一次命中时滑；滑完必须重新 OCR 定位 Recents，禁止用滑前坐标点击。
+         * 外层重试 / Pictures 流程内补点 Recents 不再滑。
+         */
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_BELOW_MIN_FRAC = 0.045f
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_BELOW_MAX_FRAC = 0.085f
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_RIGHT_MIN_FRAC = 0.06f
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_RIGHT_MAX_FRAC = 0.14f
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_SPAN_MIN_FRAC = 0.12f
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_SPAN_MAX_FRAC = 0.22f
+        /** 布局后上滑完成后等待再 OCR 重定位 Recents。 */
+        private const val PUBLISH_POST_RECENTS_LAYOUT_SWIPE_AFTER_DELAY_MS = 1000L
+        /** 上滑后重定位 Recents：首次未命中时再 OCR 的次数（含首次共 2 次）。 */
+        private const val PUBLISH_POST_RECENTS_AFTER_SWIPE_RELOCATE_MAX_OCR = 2
+        private const val PUBLISH_POST_RECENTS_AFTER_SWIPE_RELOCATE_RETRY_DELAY_MS = 1000L
         /** 点 Pictures 后：校验「原 Recents 位已变为 Pictures」/ 补点 Pictures / 补点 Recents 的轮数。 */
         private const val PUBLISH_POST_PICTURES_JUMP_VERIFY_MAX_PASSES = 5
         private const val PUBLISH_POST_PICTURES_JUMP_VERIFY_DELAY_MS = 800L
@@ -11465,23 +11481,28 @@ class RealTraceExecutor(
         hardStopLabel: String,
         clickRecents: Boolean = false,
         clickPictures: Boolean = false,
+        /** 点布局后首次命中 Recents 时上滑一次并重新 OCR；后续 pass 不再滑。 */
+        swipeOnceAfterLayout: Boolean = false,
     ): Boolean {
         if (clickPictures) {
             if (!publishPostTryDismissDontAllowBeforeGallery(service, alias, "Recents→Pictures")) {
                 return false
             }
         }
+        var needLayoutSwipe = swipeOnceAfterLayout
         for (pass in 1..PUBLISH_POST_RECENTS_OCR_MAX_PASSES) {
             if (hardStopOrNull(alias, hardStopLabel)) return false
             if (pass > 1) delay(PUBLISH_POST_RECENTS_OCR_RETRY_DELAY_MS)
-            val ok = publishPostProbeRecentsOnScreen(
+            val outcome = publishPostProbeRecentsOnScreen(
                 service = service,
                 alias = alias,
                 ocrTag = "${tagPrefix}_$pass",
                 clickRecents = clickRecents,
                 clickPictures = clickPictures,
+                swipeOnceAfterLayout = needLayoutSwipe,
             )
-            if (ok) return true
+            if (outcome.didLayoutSwipe) needLayoutSwipe = false
+            if (outcome.ok) return true
         }
         return false
     }
@@ -11503,6 +11524,7 @@ class RealTraceExecutor(
                 "发作品 Recents OCR",
                 clickRecents = true,
                 clickPictures = true,
+                swipeOnceAfterLayout = true,
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.A
@@ -11524,6 +11546,7 @@ class RealTraceExecutor(
                 "发作品 Recents 布局B后 OCR",
                 clickRecents = true,
                 clickPictures = true,
+                swipeOnceAfterLayout = true,
             )
         ) {
             publishPostEntryLayout = PublishPostEntryLayout.B
@@ -11658,13 +11681,70 @@ class RealTraceExecutor(
         return !publishPostHitNearRecentsSlot(picturesHit, recentsRect, screenH)
     }
 
+    /**
+     * 点布局后催加载：在 Recents 右下方适距向上滑一次（仅布局后首次命中时调用）。
+     */
+    private fun publishPostSwipeUpBelowRecents(
+        alias: String,
+        recentsRect: Rect,
+        w: Int,
+        h: Int,
+    ): Boolean {
+        val gesture = computePublishPostRecentsBelowUpSwipe(recentsRect, w, h)
+        devOp(
+            alias,
+            "发作品 布局后 Recents 上滑催加载：swipe (${gesture.startX},${gesture.startY})→" +
+                "(${gesture.endX},${gesture.endY}) ${gesture.swipeMs}ms",
+        )
+        return runSuCommand(
+            "input swipe ${gesture.startX} ${gesture.startY} ${gesture.endX} ${gesture.endY} ${gesture.swipeMs}",
+        )
+    }
+
+    /** 计算「Recents 右下方 → 上滑」手势（下方/偏右适距 + 轻微横向漂移）。 */
+    private fun computePublishPostRecentsBelowUpSwipe(
+        recentsRect: Rect,
+        w: Int,
+        h: Int,
+    ): HumanizedSwipeGesture {
+        val belowMin =
+            (h * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_BELOW_MIN_FRAC).toInt().coerceAtLeast(36)
+        val belowMax =
+            (h * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_BELOW_MAX_FRAC).toInt().coerceAtLeast(belowMin + 1)
+        val rightMin =
+            (w * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_RIGHT_MIN_FRAC).toInt().coerceAtLeast(24)
+        val rightMax =
+            (w * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_RIGHT_MAX_FRAC).toInt().coerceAtLeast(rightMin + 1)
+        val belowGapPx = Random.nextInt(belowMin, belowMax + 1)
+        val rightBiasPx = Random.nextInt(rightMin, rightMax + 1)
+        val startX = (recentsRect.centerX() + rightBiasPx).coerceIn(1, (w - 1).coerceAtLeast(1))
+        val startY = (recentsRect.bottom + belowGapPx).coerceIn(1, (h - 1).coerceAtLeast(1))
+        val spanMin =
+            (h * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_SPAN_MIN_FRAC).toInt().coerceAtLeast(80)
+        val spanMax =
+            (h * PUBLISH_POST_RECENTS_LAYOUT_SWIPE_SPAN_MAX_FRAC).toInt().coerceAtLeast(spanMin + 1)
+        val spanPx = Random.nextInt(spanMin, spanMax + 1)
+        val rawEndY = (startY - spanPx).coerceIn(1, (h - 1).coerceAtLeast(1))
+        val endY = if (rawEndY < startY) rawEndY else (startY - 1).coerceAtLeast(1)
+        val endX = (startX + Random.nextInt(-18, 19)).coerceIn(1, (w - 1).coerceAtLeast(1))
+        val swipeMs = Random.nextInt(380, 561)
+        return HumanizedSwipeGesture(startX, startY, endX, endY, swipeMs)
+    }
+
+    private data class PublishPostRecentsProbeOutcome(
+        val ok: Boolean,
+        /** 本轮已执行过布局后上滑（无论后续点击是否成功），外层应关掉再滑标志。 */
+        val didLayoutSwipe: Boolean = false,
+    )
+
     private suspend fun publishPostProbeRecentsOnScreen(
         service: Context,
         alias: String,
         ocrTag: String,
         clickRecents: Boolean = false,
         clickPictures: Boolean = false,
-    ): Boolean {
+        swipeOnceAfterLayout: Boolean = false,
+    ): PublishPostRecentsProbeOutcome {
         val dm = service.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
@@ -11672,7 +11752,7 @@ class RealTraceExecutor(
         if (vision == null) {
             devOp(alias, "发作品：Recents 探测 OCR 失败：$errTag [$ocrTag]")
             if (isMlKitHardStopError(errTag)) hardStopOrNull(alias, "发作品 Recents 探测")
-            return false
+            return PublishPostRecentsProbeOutcome(ok = false)
         }
         val recentsPreview = buildProfileEditOcrPreview(vision)
         devOp(
@@ -11680,7 +11760,7 @@ class RealTraceExecutor(
             "发作品：Recents 探测 OCR 文案=$recentsPreview [$ocrTag]",
         )
         // 含「Recents v」；取最上方标题，避免下拉已开时点到列表第一项
-        val recentsHit = findPublishPostRecentsHit(vision, topmost = true)
+        var recentsHit = findPublishPostRecentsHit(vision, topmost = true)
         if (recentsHit == null) {
             // 已在 Pictures 槽：原 Recents 位已是 Pictures（上轮已跳转成功，或续跑）
             if (clickPictures) {
@@ -11691,32 +11771,95 @@ class RealTraceExecutor(
                         alias,
                         "发作品：未见 Recents 但已见 Pictures，视为相册已切到 Pictures [$ocrTag]",
                     )
-                    return true
+                    return PublishPostRecentsProbeOutcome(ok = true)
                 }
             }
             devOp(
                 alias,
                 "发作品：Recents 探测未命中（Recents / Recents v）OCR文案=$recentsPreview 相关候选=${buildPublishPostGalleryOcrCandidates(vision)} [$ocrTag]",
             )
-            return false
+            return PublishPostRecentsProbeOutcome(ok = false)
         }
         if (!clickRecents) {
             devOp(alias, "发作品：已探测到 Recents（仅记录，不点击） [$ocrTag]")
-            return true
+            return PublishPostRecentsProbeOutcome(ok = true)
         }
+
+        var didLayoutSwipe = false
+        // 仅「点布局后首次命中 Recents」上滑催加载；滑完等 1s 再 OCR 重定位，禁止用滑前坐标点
+        if (swipeOnceAfterLayout) {
+            if (!publishPostSwipeUpBelowRecents(alias, Rect(recentsHit.rect), w, h)) {
+                devOp(alias, "发作品：布局后 Recents 上滑失败 [$ocrTag]")
+                // su 未真正滑出：允许后续 pass 再试一次上滑
+                return PublishPostRecentsProbeOutcome(ok = false, didLayoutSwipe = false)
+            }
+            didLayoutSwipe = true
+            delay(PUBLISH_POST_RECENTS_LAYOUT_SWIPE_AFTER_DELAY_MS)
+            var relocated: StrictLabelHit? = null
+            var lastAfterPreview = "-"
+            for (relocPass in 1..PUBLISH_POST_RECENTS_AFTER_SWIPE_RELOCATE_MAX_OCR) {
+                if (hardStopOrNull(alias, "发作品 Recents 上滑后重定位")) {
+                    return PublishPostRecentsProbeOutcome(ok = false, didLayoutSwipe = true)
+                }
+                if (relocPass > 1) {
+                    delay(PUBLISH_POST_RECENTS_AFTER_SWIPE_RELOCATE_RETRY_DELAY_MS)
+                    devOp(alias, "发作品：布局后上滑后首次未定位到 Recents，重新 OCR 第 $relocPass 次 [$ocrTag]")
+                }
+                val (afterVision, afterErr) =
+                    mlKitRecognizeFullScreen(service, "${ocrTag}_after_layout_swipe_$relocPass")
+                if (afterVision == null) {
+                    devOp(
+                        alias,
+                        "发作品：布局后上滑后重新 OCR Recents 第 $relocPass 次失败：$afterErr [$ocrTag]",
+                    )
+                    if (isMlKitHardStopError(afterErr)) {
+                        hardStopOrNull(alias, "发作品 Recents 上滑后重定位")
+                        return PublishPostRecentsProbeOutcome(ok = false, didLayoutSwipe = true)
+                    }
+                    continue
+                }
+                lastAfterPreview = buildProfileEditOcrPreview(afterVision)
+                relocated = findPublishPostRecentsHit(afterVision, topmost = true)
+                if (relocated != null) break
+                if (clickPictures) {
+                    val anyPictures = findStrictExactLabelHit(afterVision, "Pictures")
+                    if (anyPictures != null) {
+                        devOp(
+                            alias,
+                            "发作品：布局后上滑后未见 Recents 但已见 Pictures，视为相册已切到 Pictures [$ocrTag]",
+                        )
+                        return PublishPostRecentsProbeOutcome(ok = true, didLayoutSwipe = true)
+                    }
+                }
+                devOp(
+                    alias,
+                    "发作品：布局后上滑后重新定位 Recents 第 $relocPass 次未命中 OCR文案=$lastAfterPreview " +
+                        "相关候选=${buildPublishPostGalleryOcrCandidates(afterVision)} [$ocrTag]",
+                )
+            }
+            if (relocated == null) {
+                return PublishPostRecentsProbeOutcome(ok = false, didLayoutSwipe = true)
+            }
+            recentsHit = relocated
+            devOp(
+                alias,
+                "发作品：布局后上滑后已重新定位 Recents (${relocated.point.x},${relocated.point.y}) [$ocrTag]",
+            )
+        }
+
         val recentsRect = Rect(recentsHit.rect)
         val tap = coerceTapToScreen(recentsHit.point, w, h)
         devOp(alias, "发作品：已探测到 Recents，执行点击 (${tap.x},${tap.y}) [$ocrTag]")
         if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
             devOp(alias, "发作品：Recents 点击失败 [$ocrTag]")
-            return false
+            return PublishPostRecentsProbeOutcome(ok = false, didLayoutSwipe = didLayoutSwipe)
         }
         if (!clickPictures) {
             delay(700)
-            return true
+            return PublishPostRecentsProbeOutcome(ok = true, didLayoutSwipe = didLayoutSwipe)
         }
         delay(PUBLISH_POST_PICTURES_JUMP_VERIFY_DELAY_MS)
-        return publishPostSelectPicturesUntilRecentsSlotSwitched(
+        val picturesOk = publishPostSelectPicturesUntilRecentsSlotSwitched(
             service = service,
             alias = alias,
             ocrTag = ocrTag,
@@ -11725,6 +11868,7 @@ class RealTraceExecutor(
             recentsRect = recentsRect,
             initialRecentsTap = tap,
         )
+        return PublishPostRecentsProbeOutcome(ok = picturesOk, didLayoutSwipe = didLayoutSwipe)
     }
 
     /**
@@ -12080,6 +12224,7 @@ class RealTraceExecutor(
                     hardStopLabel = "发作品 Recents 布局A已确认 OCR",
                     clickRecents = true,
                     clickPictures = true,
+                    swipeOnceAfterLayout = true,
                 )
             }
             PublishPostEntryLayout.B -> {
@@ -12092,6 +12237,7 @@ class RealTraceExecutor(
                     hardStopLabel = "发作品 Recents 布局B已确认 OCR",
                     clickRecents = true,
                     clickPictures = true,
+                    swipeOnceAfterLayout = true,
                 )
             }
             PublishPostEntryLayout.UNKNOWN ->
@@ -14033,8 +14179,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTaskAndWaitReady` → 下载校验 → 写入 Pictures。
-     * 同步等待完成，供发作品流程在清理图库后拉取新素材。
+     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTask`（强制 username）→ 下载/USB校验 → 写入 Pictures。
+     * PC 素材文件夹按 **TikTok 用户名** 绑定，不得传设备 alias。
      */
     private suspend fun publishPostFetchMaterialsFromPc(
         service: Context,
@@ -14044,14 +14190,26 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "发作品素材拉取")) return false
         val app = service.applicationContext
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
+        // PC 素材库按 TikTok 用户名绑文件夹；绝不回退到设备 alias（并清掉历史脏缓存）。
+        val username = CompanionApi.resolveMaterialUsername(
+            app,
+            preferred = PrefsStore.getLogContextUsername(),
+            rejectEquals = alias,
+        )
         val fetchStartedAtMs = System.currentTimeMillis()
         fun fetchElapsedMs(): Long = System.currentTimeMillis() - fetchStartedAtMs
+        if (username.isEmpty()) {
+            lastPublishPostEntryFailureReason = "素材拉取失败：username_required"
+            devOp(alias, "发作品：缺少 TikTok 用户名，无法向 PC 拉取素材（勿用设备 alias 代替）")
+            return false
+        }
+        CompanionApi.setMaterialUsername(app, username)
         devOp(
             alias,
-            "发作品：本机 POST /api/v1/tasks/request（count=$count，targetPath=$targetPath）→ PC tasks/create（异步轮询就绪），开始拉取…",
+            "发作品：本机 POST /api/v1/tasks/request（count=$count，username=$username，targetPath=$targetPath）→ PC tasks/create，开始拉取…",
         )
         return try {
-            val task = CompanionApi.createTaskAndWaitReady(app, count, targetPath)
+            val task = CompanionApi.createTask(app, count, targetPath, username)
             if (task.files.isEmpty()) {
                 devOp(
                     alias,
@@ -14070,18 +14228,27 @@ class RealTraceExecutor(
                     targetPath = targetPath,
                     originalTaskId = null,
                     retryOfTaskId = null,
+                    username = username,
                     files = task.files.map {
                         TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null)
                     },
                 ),
             )
-            TaskDownloadWorkflow.downloadVerifyAndAck(
-                app,
-                task.taskId,
-                task.files,
-                targetPath,
-                adbPushed = task.adbPushed == true,
-            )
+            if (task.adbPushed == true) {
+                TaskDownloadWorkflow.verifyUsbPushedAndAck(
+                    app,
+                    task.taskId,
+                    task.files,
+                    targetPath,
+                )
+            } else {
+                TaskDownloadWorkflow.downloadVerifyAndAck(
+                    app,
+                    task.taskId,
+                    task.files,
+                    targetPath,
+                )
+            }
             val stats = publishPostResolveGalleryMaterialStats()
             val elapsedMs = fetchElapsedMs()
             devOp(

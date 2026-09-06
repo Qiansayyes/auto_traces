@@ -664,6 +664,7 @@ class RealTraceExecutor(
     private var lastVerifyToContinuePopupDismissAtMs: Long = 0L
     private var lastRepostIntroPopupDismissAtMs: Long = 0L
     private var lastUpdateYourAppPopupDismissAtMs: Long = 0L
+    private var lastTikTokNotificationsPopupDismissAtMs: Long = 0L
     private var lastMetaFacebookTikTokRecoverAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
     @Volatile
@@ -1198,6 +1199,7 @@ class RealTraceExecutor(
         private const val REPOST_INTRO_OCR_RETRY_DELAY_MS = 500L
         /** 「Update your app」升级弹窗：点 Not now 的冷却。 */
         private const val INLINE_UPDATE_YOUR_APP_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        private const val INLINE_TIKTOK_NOTIFICATIONS_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 整屏 OCR 见 Meta/Facebook：拉回 TikTok 的冷却，避免连环重入。 */
         private const val INLINE_META_FACEBOOK_TIKTOK_RECOVER_COOLDOWN_MS = 5_000L
         /** Meta/Facebook 常见包名（拉不起时一并强停）。 */
@@ -3062,9 +3064,12 @@ class RealTraceExecutor(
             }
             // 通用兜底：任意 OCR 后若同屏出现 Don't allow，顺手点击并继续原流程。
             // 发作品（publish_post_*）、修改基本资料（profile_edit_*）不在此顺手点。
+            // 通知权限弹窗（Allow TikTok to send you notifications?）留给后面的专用顺手处理，
+            // 点完必须重 OCR；若这里先点，冷却会挡住专用路径，调用方会继续用遮罩后的旧 vision。
             if (!fileTag.contains("dont_allow", ignoreCase = true) &&
                 !fileTag.startsWith("publish_post_") &&
-                !fileTag.startsWith("profile_edit_")
+                !fileTag.startsWith("profile_edit_") &&
+                !visionHasTikTokSendNotificationsPopup(vision)
             ) {
                 runCatching {
                     tapDontAllowFromVisionIfPresent(
@@ -3077,7 +3082,7 @@ class RealTraceExecutor(
                     )
                 }
             }
-            // 任意整屏 OCR：顺手关 Meta/Facebook 抢前台、Viewer history / Save login / Continue editing this post / Security checkup / Verify to continue 弹窗，并令调用方重试 OCR。
+            // 任意整屏 OCR：顺手关 Meta/Facebook 抢前台、通知权限 Don't allow / Viewer history / Save login / Continue editing this post / Security checkup / Verify to continue 弹窗，并令调用方重试 OCR。
             // auto_login_* / login_safeguard_* 由 [autoLoginTryDismissInlineOverlaysFromVision] 处理。
             if (!inlineIdentityVerificationInProgress) {
                 handleOcrVisionInlineInterruptions(ctx, vision, fileTag)?.let { interruptTag ->
@@ -3484,6 +3489,16 @@ class RealTraceExecutor(
             return null
         }
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        val notificationsDismissed = runCatching {
+            tryDismissTikTokSendNotificationsPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (notificationsDismissed) return "tiktok_notifications_popup_dismissed"
         val updateYourAppDismissed = runCatching {
             tryDismissUpdateYourAppPopupFromVision(
                 ctx = ctx,
@@ -3612,6 +3627,67 @@ class RealTraceExecutor(
         if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
         lastUpdateYourAppPopupDismissAtMs = SystemClock.elapsedRealtime()
         delay(400L)
+        return true
+    }
+
+    /** 「Allow TikTok to send you notifications?」应用内弹窗：先确认标题再点 Don't allow。 */
+    private fun visionHasTikTokSendNotificationsPopup(vision: Text): Boolean {
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "send you notifications") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "allow tiktok to send you notifications") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向你发送通知") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "向您发送通知") != null) return true
+        return false
+    }
+
+    private fun findNotificationsPopupDontAllowHit(vision: Text): StrictLabelHit? {
+        findBottommostStrictExactLabelHit(vision, "Don't allow")?.let { return it }
+        findBottommostStrictExactLabelHit(vision, "Don’t allow")?.let { return it }
+        findBottommostStrictExactLabelHit(vision, "Dont allow")?.let { return it }
+        findBottommostStrictExactLabelHit(vision, "Don't Allow")?.let { return it }
+        findStrictExactAcrossAdjacentLines(vision, "Don't allow")?.let { return it }
+        findDontAllowLabelHit(vision)?.let { return it }
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "don't allow")?.let { return it }
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "dont allow")?.let { return it }
+        findStrictExactLabelHit(vision, "不允许")?.let { return it }
+        return null
+    }
+
+    private suspend fun tryDismissTikTokSendNotificationsPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasTikTokSendNotificationsPopup(vision)) return false
+        val denyHit = findNotificationsPopupDontAllowHit(vision) ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见通知权限弹窗但未同屏命中 Don't allow，跳过")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTikTokNotificationsPopupDismissAtMs < INLINE_TIKTOK_NOTIFICATIONS_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        if (now - lastInlineDontAllowTapAtMs < INLINE_DONT_ALLOW_TAP_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(denyHit.point, w, h)
+        } else {
+            coerceTapToScreen(denyHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：通知权限弹窗，点 Don't allow (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastTikTokNotificationsPopupDismissAtMs = SystemClock.elapsedRealtime()
+        lastInlineDontAllowTapAtMs = lastTikTokNotificationsPopupDismissAtMs
+        delay(350L)
         return true
     }
 
@@ -13795,8 +13871,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTaskAndWaitReady` → 下载校验 → 写入 Pictures。
-     * 同步等待完成，供发作品流程在清理图库后拉取新素材。
+     * 等价本机 `POST /api/v1/tasks/request`：`CompanionApi.createTask`（强制 username）→ 下载/USB校验 → 写入 Pictures。
+     * PC 素材文件夹按 **TikTok 用户名** 绑定，不得传设备 alias。
      */
     private suspend fun publishPostFetchMaterialsFromPc(
         service: Context,
@@ -13806,14 +13882,26 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "发作品素材拉取")) return false
         val app = service.applicationContext
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
+        // PC 素材库按 TikTok 用户名绑文件夹；绝不回退到设备 alias（并清掉历史脏缓存）。
+        val username = CompanionApi.resolveMaterialUsername(
+            app,
+            preferred = PrefsStore.getLogContextUsername(),
+            rejectEquals = alias,
+        )
         val fetchStartedAtMs = System.currentTimeMillis()
         fun fetchElapsedMs(): Long = System.currentTimeMillis() - fetchStartedAtMs
+        if (username.isEmpty()) {
+            lastPublishPostEntryFailureReason = "素材拉取失败：username_required"
+            devOp(alias, "发作品：缺少 TikTok 用户名，无法向 PC 拉取素材（勿用设备 alias 代替）")
+            return false
+        }
+        CompanionApi.setMaterialUsername(app, username)
         devOp(
             alias,
-            "发作品：本机 POST /api/v1/tasks/request（count=$count，targetPath=$targetPath）→ PC tasks/create（异步轮询就绪），开始拉取…",
+            "发作品：本机 POST /api/v1/tasks/request（count=$count，username=$username，targetPath=$targetPath）→ PC tasks/create，开始拉取…",
         )
         return try {
-            val task = CompanionApi.createTaskAndWaitReady(app, count, targetPath)
+            val task = CompanionApi.createTask(app, count, targetPath, username)
             if (task.files.isEmpty()) {
                 devOp(
                     alias,
@@ -13832,18 +13920,27 @@ class RealTraceExecutor(
                     targetPath = targetPath,
                     originalTaskId = null,
                     retryOfTaskId = null,
+                    username = username,
                     files = task.files.map {
                         TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null)
                     },
                 ),
             )
-            TaskDownloadWorkflow.downloadVerifyAndAck(
-                app,
-                task.taskId,
-                task.files,
-                targetPath,
-                adbPushed = task.adbPushed == true,
-            )
+            if (task.adbPushed == true) {
+                TaskDownloadWorkflow.verifyUsbPushedAndAck(
+                    app,
+                    task.taskId,
+                    task.files,
+                    targetPath,
+                )
+            } else {
+                TaskDownloadWorkflow.downloadVerifyAndAck(
+                    app,
+                    task.taskId,
+                    task.files,
+                    targetPath,
+                )
+            }
             val stats = publishPostResolveGalleryMaterialStats()
             val elapsedMs = fetchElapsedMs()
             devOp(
@@ -18111,6 +18208,21 @@ class RealTraceExecutor(
             )
         ) {
             autoLoginDelay(alias, 450L, "Update your app Not now 后")
+            return true
+        }
+
+        // 1c) 「Allow TikTok to send you notifications?」：确认标题后点 Don't allow
+        if (
+            tryDismissTikTokSendNotificationsPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) 通知权限弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDontAllowHandledInThisChain = true
+            autoLoginDelay(alias, 450L, "通知权限 Don't allow 后")
             return true
         }
 
