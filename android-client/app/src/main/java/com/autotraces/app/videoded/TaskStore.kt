@@ -5,7 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object TaskStore {
-    private const val PREFS = "video_ded_embedded"
+    private const val PREFS = "video_ded"
     private const val KEY_HISTORY = "task_history_json"
 
     fun saveTaskSnapshot(context: Context, snapshot: TaskSnapshot) {
@@ -86,6 +86,7 @@ data class TaskSnapshot(
     val targetPath: String?,
     val originalTaskId: String? = null,
     val retryOfTaskId: String? = null,
+    val username: String? = null,
     val files: List<TaskFileSnapshot>,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
@@ -96,6 +97,7 @@ data class TaskSnapshot(
         put("targetPath", targetPath)
         put("originalTaskId", originalTaskId)
         put("retryOfTaskId", retryOfTaskId)
+        if (!username.isNullOrBlank()) put("username", username)
         put("files", JSONArray(files.map { it.toJson() }))
     }
 
@@ -108,6 +110,7 @@ data class TaskSnapshot(
             targetPath = obj.optString("targetPath", null),
             originalTaskId = obj.optString("originalTaskId", null),
             retryOfTaskId = obj.optString("retryOfTaskId", null),
+            username = obj.optString("username", null)?.takeIf { it.isNotBlank() },
             files = buildList {
                 val arr = obj.optJSONArray("files") ?: JSONArray()
                 for (i in 0 until arr.length()) add(TaskFileSnapshot.fromJson(arr.getJSONObject(i)))

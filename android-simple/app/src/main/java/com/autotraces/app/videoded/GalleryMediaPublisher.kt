@@ -1,4 +1,4 @@
-﻿package com.autotraces.app.videoded
+package com.autotraces.app.videoded
 
 import android.content.ContentValues
 import android.content.Context
@@ -56,6 +56,21 @@ object GalleryMediaPublisher {
         }
         taskDir.deleteRecursively()
         uris
+    }
+
+    /** 文件已在公共目录（USB push 落点），触发媒体库扫描即可。 */
+    suspend fun scanExistingFiles(context: Context, root: File, fileNames: List<String>) {
+        if (fileNames.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            val paths = fileNames.map { File(root, it).absolutePath }.filter { File(it).isFile }.toTypedArray()
+            if (paths.isEmpty()) return@withContext
+            val mimes = fileNames.map { mimeForFileName(it) }.toTypedArray()
+            suspendCancellableCoroutine { cont ->
+                MediaScannerConnection.scanFile(context, paths, mimes) { _, _ ->
+                    cont.resume(Unit)
+                }
+            }
+        }
     }
 
     private fun insertMediaStoreQPlus(context: Context, source: File, displayName: String): Uri {

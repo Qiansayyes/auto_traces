@@ -25,8 +25,8 @@ data class CreateTaskRequest(
     val deviceId: String,
     val count: Int,
     val targetPath: String? = null,
-    /** 与 PC 配对页「手动下发」一致：指定 deviceId + count + targetPath。 */
-    val manualAssign: Boolean = true,
+    /** TikTok / publish username; PC only serves material from the folder bound to this account. */
+    val username: String,
 )
 
 data class TaskAckRequest(
@@ -47,11 +47,9 @@ data class CreateTaskResponse(
     val files: List<TaskFileInfo> = emptyList(),
     /** PC 是否已成功调用本机 follow-pc；为 false 时需本机 fallback 入队。 */
     val companionPullNotified: Boolean? = null,
-    /** 素材传输通道：`adb_usb` / `adb_usb_http` / `http`。 */
-    val deliveryChannel: String? = null,
-    /** PC 是否已通过 USB `adb push` 把本任务文件推到 targetPath。 */
+    /** PC 是否已通过 USB adb push 把文件推到手机；为 true 时禁止再走 HTTP 下载。 */
     val adbPushed: Boolean? = null,
-    /** 本次绑定的 USB ADB 序列号（多机隔离用）。 */
+    val deliveryChannel: String? = null,
     val usbSerial: String? = null,
 )
 

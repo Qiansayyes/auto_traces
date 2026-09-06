@@ -27,11 +27,9 @@ class VideoDedDeviceService : Service() {
     private var apiServer: ApiServer? = null
     private var adbTcpipScheduleJob: Job? = null
     private var lastAdbTcpipRunAt = 0L
+    private var lastPcMirrorTriggerAt = 0L
     /** 与「已注册」合并展示，避免轮询把无线 ADB 提示刷掉 */
     private var lastAdbMirrorSummary: String? = null
-    /** 最近一次注册时 PC 端 ADB 状态；device 表示已可投屏，不再触发无线流水线 */
-    @Volatile
-    private var lastPcAdbState: String = ""
 
     private val wifiNetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -42,11 +40,11 @@ class VideoDedDeviceService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Starting..."))
+        startForeground(1, buildNotification("Starting..."))
         try {
             apiServer = ApiServer(applicationContext).apply { startAndRememberPort(SOCKET_READ_TIMEOUT, false) }
         } catch (t: Throwable) {
-            Log.e("DeviceService", "local HTTP API failed to start", t)
+            Log.e("VideoDedDeviceService", "local HTTP API failed to start", t)
             updateNotification("本地 API 未启动：${t.message}")
         }
         registerWifiAdbCallback()
@@ -55,13 +53,14 @@ class VideoDedDeviceService : Service() {
             tryOneShotBootAdbTcpip()
         }
         scope.launch {
-            val ok = runSaveSettingsAndRegister(logSave = true, logRegistration = true)
-            updateNotification(registrationNotifyText(ok = ok))
-        }
-        scope.launch {
             while (true) {
-                val ok = runSaveSettingsAndRegister(logSave = false, logRegistration = false)
-                updateNotification(registrationNotifyText(ok = ok))
+                try {
+                    val reg = CompanionApi.ensureRegistered(applicationContext)
+                    maybeRequestPcWirelessPipeline(reg)
+                    updateNotification(registrationNotifyText(ok = true))
+                } catch (_: Throwable) {
+                    updateNotification(registrationNotifyText(ok = false))
+                }
                 delay(15_000)
             }
         }
@@ -79,11 +78,6 @@ class VideoDedDeviceService : Service() {
         when (intent?.action) {
             ACTION_TRY_ROOT_ADB_TCPIP -> {
                 scope.launch {
-                    val port = ApiSettings.getAdbTcpipPort(applicationContext)
-                    if (!VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) {
-                        updateNotification("无线 ADB 已在 $port 监听，跳过重启 adbd")
-                        return@launch
-                    }
                     val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                     val n = cm.activeNetwork
                     if (n != null && RootWifiAdbHelper.isWifiNetwork(applicationContext, n)) {
@@ -96,13 +90,13 @@ class VideoDedDeviceService : Service() {
             ACTION_PULL_VIDEOS -> {
                 val count = intent.getIntExtra(EXTRA_COUNT, 1)
                 val targetPath = intent.getStringExtra(EXTRA_TARGET_PATH)
-                scope.launch { pullVideos(count, targetPath) }
+                val username = intent.getStringExtra(EXTRA_USERNAME)
+                scope.launch { pullVideos(count, targetPath, username) }
             }
             ACTION_DOWNLOAD_TASK -> {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID) ?: return START_STICKY
                 val targetPath = intent.getStringExtra(EXTRA_TARGET_PATH)
                 val filesJson = intent.getStringExtra(EXTRA_FILES_JSON) ?: return START_STICKY
-                val adbPushed = intent.getBooleanExtra(EXTRA_ADB_PUSHED, false)
                 val files = runCatching { TaskDownloadWorkflow.parseFilesJson(filesJson) }.getOrElse { emptyList() }
                 if (files.isEmpty()) return START_STICKY
                 scope.launch {
@@ -112,7 +106,31 @@ class VideoDedDeviceService : Service() {
                             taskId,
                             files,
                             targetPath,
-                            adbPushed = adbPushed,
+                        ) { msg ->
+                            updateNotification(msg)
+                            StatusLogBuffer.append(msg)
+                        }
+                    }
+                    if (result.isSuccess) {
+                        updateNotification(registrationNotifyText(ok = true))
+                    } else {
+                        updateNotification(registrationNotifyText(ok = false))
+                    }
+                }
+            }
+            ACTION_USB_PUSHED_VERIFY -> {
+                val taskId = intent.getStringExtra(EXTRA_TASK_ID) ?: return START_STICKY
+                val targetPath = intent.getStringExtra(EXTRA_TARGET_PATH)
+                val filesJson = intent.getStringExtra(EXTRA_FILES_JSON) ?: return START_STICKY
+                val files = runCatching { TaskDownloadWorkflow.parseFilesJson(filesJson) }.getOrElse { emptyList() }
+                if (files.isEmpty()) return START_STICKY
+                scope.launch {
+                    val result = runCatching {
+                        TaskDownloadWorkflow.verifyUsbPushedAndAck(
+                            applicationContext,
+                            taskId,
+                            files,
+                            targetPath,
                         ) { msg ->
                             updateNotification(msg)
                             StatusLogBuffer.append(msg)
@@ -129,11 +147,11 @@ class VideoDedDeviceService : Service() {
         return START_STICKY
     }
 
-    private suspend fun pullVideos(count: Int, targetPath: String?) {
+    private suspend fun pullVideos(count: Int, targetPath: String?, username: String?) {
         val resolvedTarget = CompanionApi.resolvedTargetPath(targetPath)
         val task =
             try {
-                CompanionApi.createTaskAndWaitReady(applicationContext, count, resolvedTarget)
+                CompanionApi.createTask(applicationContext, count, resolvedTarget, username)
             } catch (t: Throwable) {
                 StatusLogBuffer.append("创建任务失败：${t.message}")
                 updateNotification("下载失败：${t.message}")
@@ -150,24 +168,13 @@ class VideoDedDeviceService : Service() {
                     targetPath = resolvedTarget,
                     originalTaskId = null,
                     retryOfTaskId = null,
+                    username = CompanionApi.normalizeUsername(username).ifEmpty { CompanionApi.getMaterialUsername(applicationContext) },
                     files = task.files.map { TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null) },
                 ),
             )
-            if (task.adbPushed == true || task.companionPullNotified != true) {
-                enqueueDownloadTask(
-                    applicationContext,
-                    task.taskId,
-                    task.files,
-                    resolvedTarget,
-                    adbPushed = task.adbPushed == true,
-                )
-                StatusLogBuffer.append(
-                    if (task.adbPushed == true) {
-                        "任务 ${task.taskId} 已创建（USB 已推送，本机校验入队）"
-                    } else {
-                        "任务 ${task.taskId} 已创建（PC 未通知，本机已入队下载）"
-                    },
-                )
+            if (task.companionPullNotified != true) {
+                enqueueDownloadTask(applicationContext, task.taskId, task.files, resolvedTarget)
+                StatusLogBuffer.append("任务 ${task.taskId} 已创建（PC 未通知，本机已入队下载）")
             } else {
                 StatusLogBuffer.append("任务 ${task.taskId} 已创建，PC 已触发下载")
             }
@@ -186,16 +193,10 @@ class VideoDedDeviceService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        // 必须打开「视频传输/投屏」页，不能走 LAUNCHER（MainActivity），否则用户会回到主流程「初始化」态。
-        val openIntent = Intent(this, VideoDedMainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
         val open = PendingIntent.getActivity(
             this,
             0,
-            openIntent,
+            packageManager.getLaunchIntentForPackage(packageName),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -209,7 +210,7 @@ class VideoDedDeviceService : Service() {
 
     private fun updateNotification(text: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIFICATION_ID, buildNotification(text))
+        nm.notify(1, buildNotification(text))
     }
 
     private fun registerWifiAdbCallback() {
@@ -235,7 +236,6 @@ class VideoDedDeviceService : Service() {
         adbTcpipScheduleJob = scope.launch {
             delay(4000)
             if (!RootWifiAdbHelper.isWifiNetwork(applicationContext, network)) return@launch
-            runSaveSettingsAndRegister(logSave = false, logRegistration = false)
             runEnableAdbTcpipForNetwork(network, force = false)
         }
     }
@@ -244,8 +244,6 @@ class VideoDedDeviceService : Service() {
         if (!ApiSettings.isRootAdbTcpipEnabled(applicationContext)) return
         scope.launch {
             delay(2000)
-            val port = ApiSettings.getAdbTcpipPort(applicationContext)
-            if (!VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) return@launch
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val n = cm.activeNetwork ?: return@launch
             if (!RootWifiAdbHelper.isWifiNetwork(applicationContext, n)) return@launch
@@ -253,29 +251,7 @@ class VideoDedDeviceService : Service() {
         }
     }
 
-    private suspend fun runSaveSettingsAndRegister(logSave: Boolean, logRegistration: Boolean): Boolean {
-        val result = VideoDedSettingsRegistrar.saveAndRegister(
-            applicationContext,
-            triggerWirelessIfNeeded = lastPcAdbState != "device",
-            retryRootAdbIfNeeded = lastPcAdbState != "device",
-            logSave = logSave,
-            logRegistration = logRegistration,
-        )
-        lastPcAdbState = result.pcAdbState
-        if (result.error != null) {
-            Log.w("DeviceService", "PC registration failed: ${result.error.message}")
-        }
-        return result.error == null
-    }
-
     private fun runEnableAdbTcpipForNetwork(network: Network, force: Boolean) {
-        val port = ApiSettings.getAdbTcpipPort(applicationContext)
-        if (!force && !VideoDedSettingsRegistrar.shouldEnableAdbTcpip(applicationContext, port)) {
-            val ip = RootWifiAdbHelper.getLanIpv4ForNetwork(applicationContext, network)
-                ?: ApiSettings.getEffectiveMirrorLanIpv4(applicationContext)
-            if (ip != null) lastAdbMirrorSummary = "$ip:$port"
-            return
-        }
         if (!force) {
             synchronized(this) {
                 val now = System.currentTimeMillis()
@@ -285,6 +261,7 @@ class VideoDedDeviceService : Service() {
         } else {
             synchronized(this) { lastAdbTcpipRunAt = System.currentTimeMillis() }
         }
+        val port = ApiSettings.getAdbTcpipPort(applicationContext)
         val err = RootWifiAdbHelper.enableAdbTcpip(port)
         val ip = RootWifiAdbHelper.getLanIpv4ForNetwork(applicationContext, network)
             ?: ApiSettings.getEffectiveMirrorLanIpv4(applicationContext)
@@ -298,6 +275,20 @@ class VideoDedDeviceService : Service() {
         updateNotification(line)
     }
 
+    private fun maybeRequestPcWirelessPipeline(reg: org.json.JSONObject? = null) {
+        if (reg != null && reg.optString("pcAdbState", "").trim() == "device") return
+        if (MirrorStateProbe.currentMirrorStatus(applicationContext) == "offline") return
+        val now = System.currentTimeMillis()
+        synchronized(this) {
+            if (now - lastPcMirrorTriggerAt < 90_000) return
+            lastPcMirrorTriggerAt = now
+        }
+        scope.launch {
+            runCatching {
+                CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false, connectAll = true)
+            }.onFailure { Log.w("VideoDedDeviceService", "PC wireless pipeline failed", it) }
+        }
+    }
 
     private fun registrationNotifyText(ok: Boolean): String {
         val base = if (ok) "Registered and online" else "Waiting for Windows service"
@@ -310,28 +301,22 @@ class VideoDedDeviceService : Service() {
     }
 
     companion object {
-        private const val NOTIFICATION_ID = 88088
         const val CHANNEL_ID = "video_ded_channel"
         const val ACTION_TRY_ROOT_ADB_TCPIP = "com.autotraces.app.videoded.TRY_ROOT_ADB_TCPIP"
         const val ACTION_PULL_VIDEOS = "com.autotraces.app.videoded.PULL_VIDEOS"
         const val ACTION_DOWNLOAD_TASK = "com.autotraces.app.videoded.DOWNLOAD_TASK"
+        const val ACTION_USB_PUSHED_VERIFY = "com.autotraces.app.videoded.USB_PUSHED_VERIFY"
         const val EXTRA_COUNT = "count"
         const val EXTRA_TARGET_PATH = "targetPath"
+        const val EXTRA_USERNAME = "username"
         const val EXTRA_TASK_ID = "taskId"
         const val EXTRA_FILES_JSON = "filesJson"
-        const val EXTRA_ADB_PUSHED = "adbPushed"
         private const val SOCKET_READ_TIMEOUT = 0
 
         /** @return 是否已入队（false 表示同 taskId 已在下载或入队被跳过） */
-        fun enqueueDownloadTask(
-            context: Context,
-            taskId: String,
-            files: List<TaskFileInfo>,
-            targetPath: String?,
-            adbPushed: Boolean = false,
-        ): Boolean {
+        fun enqueueDownloadTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
-                Log.d("DeviceService", "enqueueDownloadTask skipped duplicate taskId=$taskId")
+                Log.d("VideoDedDeviceService", "enqueueDownloadTask skipped duplicate taskId=$taskId")
                 return false
             }
             val intent = Intent(context, VideoDedDeviceService::class.java).apply {
@@ -339,7 +324,21 @@ class VideoDedDeviceService : Service() {
                 putExtra(EXTRA_TASK_ID, taskId)
                 putExtra(EXTRA_TARGET_PATH, targetPath)
                 putExtra(EXTRA_FILES_JSON, TaskDownloadWorkflow.toFilesJson(files))
-                putExtra(EXTRA_ADB_PUSHED, adbPushed)
+            }
+            ContextCompat.startForegroundService(context, intent)
+            return true
+        }
+
+        fun enqueueUsbPushedVerifyTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
+            if (TaskDownloadCoordinator.isActive(taskId)) {
+                Log.d("VideoDedDeviceService", "enqueueUsbPushedVerifyTask skipped duplicate taskId=$taskId")
+                return false
+            }
+            val intent = Intent(context, VideoDedDeviceService::class.java).apply {
+                action = ACTION_USB_PUSHED_VERIFY
+                putExtra(EXTRA_TASK_ID, taskId)
+                putExtra(EXTRA_TARGET_PATH, targetPath)
+                putExtra(EXTRA_FILES_JSON, TaskDownloadWorkflow.toFilesJson(files))
             }
             ContextCompat.startForegroundService(context, intent)
             return true

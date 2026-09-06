@@ -16,7 +16,12 @@ object TaskRetryManager {
     suspend fun retryFailedFilesInPlace(context: Context, task: TaskSnapshot, failedFiles: List<TaskFileSnapshot>) {
         if (failedFiles.isEmpty()) return
 
-        val refreshedTask = CompanionApi.createTaskAndWaitReady(context, failedFiles.size, task.targetPath)
+        val refreshedTask = CompanionApi.createTask(
+            context,
+            failedFiles.size,
+            task.targetPath,
+            task.username ?: CompanionApi.getMaterialUsername(context),
+        )
         val mergedFiles = task.files.toMutableList()
         val newFiles = refreshedTask.files.associateBy { it.fileName }
 

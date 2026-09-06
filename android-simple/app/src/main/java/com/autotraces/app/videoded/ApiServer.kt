@@ -30,7 +30,7 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
             }
 
             when {
-                session.method == Method.GET && session.uri == "/health" -> jsonResponse(200, JSONObject().put("ok", true).put("service", "video_ded_autotraces"))
+                session.method == Method.GET && session.uri == "/health" -> jsonResponse(200, JSONObject().put("ok", true).put("service", "video_ded_android"))
                 session.method == Method.PUT && session.uri == "/api/v1/settings/callback-package" -> handleCallbackPackage(session)
                 session.method == Method.GET && session.uri == "/api/v1/settings/callback-package" -> jsonResponse(
                     200,
@@ -38,17 +38,19 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                         put("packageName", ApiSettings.getCallbackPackage(context) ?: JSONObject.NULL)
                     },
                 )
+                session.method == Method.PUT && session.uri == "/api/v1/settings/pc-mirror" -> handlePcMirror(session)
+                session.method == Method.GET && session.uri == "/api/v1/simple/status" ->
+                    jsonResponse(200, SimpleRemoteControl.buildStatus())
+                session.method == Method.POST && session.uri == "/api/v1/simple/action" ->
+                    jsonResponse(200, SimpleRemoteControl.handleAction(context, JSONObject(readBody(session))))
+                session.method == Method.GET && session.uri == "/api/v1/system/memory" -> handleSystemMemory(session)
+                session.method == Method.POST && session.uri == "/api/v1/worker/start" -> handleWorkerStart(session)
                 session.method == Method.POST && session.uri == "/api/v1/tasks/request" -> handleRequestVideos(session)
                 session.method == Method.POST && session.uri == "/api/v1/tasks/follow-pc" -> handleFollowPcTask(session)
                 session.method == Method.GET && session.uri == "/api/v1/tasks" -> handleListTasks()
                 session.method == Method.GET && session.uri.startsWith("/api/v1/tasks/") -> handleGetTask(session)
                 session.method == Method.POST && session.uri.startsWith("/api/v1/tasks/") && session.uri.endsWith("/retry") -> handleRetry(session)
                 session.method == Method.POST && session.uri == "/api/v1/adb/prepare" -> handleAdbPrepare(session)
-                session.method == Method.GET && session.uri == "/api/v1/system/memory" -> handleSystemMemory(session)
-                session.method == Method.GET && session.uri == "/api/v1/simple/status" ->
-                    jsonResponse(200, SimpleRemoteControl.buildStatus())
-                session.method == Method.POST && session.uri == "/api/v1/simple/action" -> handleSimpleAction(session)
-                session.method == Method.POST && session.uri == "/api/v1/worker/start" -> handleWorkerStart(session)
                 else -> jsonResponse(404, errorJson("not_found"))
             }
         } catch (t: Throwable) {
@@ -74,6 +76,79 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         )
     }
 
+    /** PC `CompanionApiClient.TryPutPcMirror`：写入投屏地址并可选向 Windows 注册。 */
+    private fun handlePcMirror(session: IHTTPSession): Response {
+        val body = JSONObject(readBody(session))
+        val windowsUrl = body.optString("windowsUrl", "").trim().takeIf { it.isNotEmpty() }
+        val mirrorIp =
+            if (body.has("mirrorIp") && !body.isNull("mirrorIp")) {
+                body.optString("mirrorIp", "").trim()
+            } else {
+                null
+            }
+        val adbPort = if (body.has("adbPort")) body.optInt("adbPort").takeIf { it in 1024..65535 } else null
+        val register = body.optBoolean("register", true)
+        val input = VideoDedSettingsRegistrar.SaveInput(
+            windowsUrl = windowsUrl,
+            mirrorIp = mirrorIp,
+            adbPort = adbPort,
+        )
+        return if (register) {
+            runBlockingApi {
+                val result = VideoDedSettingsRegistrar.saveAndRegister(
+                    context,
+                    input,
+                    triggerWirelessIfNeeded = true,
+                    retryRootAdbIfNeeded = true,
+                    logSave = true,
+                    logRegistration = true,
+                )
+                if (!result.settingsSaved) {
+                    return@runBlockingApi jsonResponse(400, errorJson("invalid_settings", result.error?.message))
+                }
+                jsonResponse(
+                    200,
+                    JSONObject().apply {
+                        put("success", true)
+                        put("registered", result.registration != null)
+                        put("mirrorReadyOnPc", result.mirrorReadyOnPc)
+                        put("pcAdbState", result.pcAdbState)
+                        result.error?.message?.let { put("registrationError", it) }
+                    },
+                )
+            }
+        } else {
+            val ok = VideoDedSettingsRegistrar.persistSettings(context, input)
+            if (!ok) return jsonResponse(400, errorJson("invalid_settings"))
+            jsonResponse(200, JSONObject().put("success", true).put("registered", false))
+        }
+    }
+
+    /** PC RAM 门控 / 诊断：`GET /api/v1/system/memory?limit=&minPssKb=` */
+    private fun handleSystemMemory(session: IHTTPSession): Response {
+        val params = session.parms
+        val limit = params["limit"]?.toIntOrNull()?.coerceIn(1, 200) ?: 8
+        val minPssKb = params["minPssKb"]?.toIntOrNull()?.coerceAtLeast(0) ?: 2048
+        val snapshot = RuntimeMemoryProbe.capture(context, processLimit = limit, minPssKb = minPssKb)
+        return jsonResponse(200, RuntimeMemoryProbe.toJson(snapshot))
+    }
+
+    /** PC 批量 `worker/start`：拉起前台服务并解除硬停。 */
+    private fun handleWorkerStart(session: IHTTPSession): Response {
+        val body = JSONObject(readBody(session))
+        val reason = body.optString("reason", "PC 批量启动后台服务").trim().ifEmpty {
+            "PC 批量启动后台服务"
+        }
+        com.autotraces.app.WorkerService.startResumingAutomation(context.applicationContext)
+        return jsonResponse(
+            200,
+            JSONObject()
+                .put("success", true)
+                .put("message", reason)
+                .put("service", "worker"),
+        )
+    }
+
     private fun handleFollowPcTask(session: IHTTPSession): Response {
         val body = JSONObject(readBody(session))
         val taskId = body.optString("taskId", "").trim().ifEmpty { body.optString("task_id", "").trim() }
@@ -83,43 +158,18 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         return runBlockingApi {
             val mine = CompanionApi.deviceId(context.applicationContext)
             val detail =
-                runCatching { CompanionApi.pollTaskUntilReady(context.applicationContext, taskId) }
-                    .getOrElse { t ->
-                        val msg = t.message.orEmpty()
-                        if (msg.contains("task_prepare_failed")) {
-                            return@runBlockingApi jsonResponse(
-                                409,
-                                JSONObject().apply {
-                                    put("success", false)
-                                    put("error", "task_terminal")
-                                    put("detail", msg)
-                                },
+                CompanionApi.fetchTaskDetail(context.applicationContext, taskId)
+                    ?: return@runBlockingApi jsonResponse(
+                        502,
+                        JSONObject().apply {
+                            put("success", false)
+                            put("error", "pc_task_fetch_failed")
+                            put(
+                                "detail",
+                                "无法在 Windows ${CompanionApi.windowsBaseUrl(context.applicationContext)} 读取任务详情，请核对手机「Windows 地址」与网络.",
                             )
-                        }
-                        if (msg.contains("task_prepare_timeout")) {
-                            return@runBlockingApi jsonResponse(
-                                504,
-                                JSONObject().apply {
-                                    put("success", false)
-                                    put("error", "task_prepare_timeout")
-                                    put("detail", msg)
-                                },
-                            )
-                        }
-                        return@runBlockingApi jsonResponse(
-                            502,
-                            JSONObject().apply {
-                                put("success", false)
-                                put("error", "pc_task_fetch_failed")
-                                put(
-                                    "detail",
-                                    msg.ifEmpty {
-                                        "无法在 Windows ${CompanionApi.windowsBaseUrl(context.applicationContext)} 读取任务详情，请核对手机「Windows 地址」与网络."
-                                    },
-                                )
-                            },
-                        )
-                    }
+                        },
+                    )
 
             val owner = detail.deviceId?.trim()?.takeIf { it.isNotEmpty() }
             if (owner != null && !owner.equals(mine, ignoreCase = true)) {
@@ -145,9 +195,22 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                     )
             }
 
-            val files = detail.files.orEmpty()
+            val files =
+                detail.files.orEmpty().filter { it.fileName.isNotBlank() && it.md5.isNotBlank() && it.sizeBytes >= 0L }
+            if (files.isEmpty()) {
+                return@runBlockingApi jsonResponse(
+                    400,
+                    JSONObject().apply {
+                        put("success", false)
+                        put("error", "no_files_in_task")
+                        put("detail", "PC 任务中无可用文件条目.")
+                    },
+                )
+            }
 
             val targetPath = CompanionApi.resolvedTargetPath(detail.targetPath)
+            val adbPushed = body.optBoolean("adbPushed", false)
+                || body.optString("deliveryChannel", "").equals("adb_usb", ignoreCase = true)
             TaskStore.saveTaskSnapshot(
                 context.applicationContext,
                 TaskSnapshot(
@@ -160,18 +223,28 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                     retryOfTaskId = null,
                     files =
                         files.map {
-                            TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null)
+                            TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, if (adbPushed) "downloaded" else "pending", null)
                         },
                 ),
             )
-            VideoDedDeviceService.enqueueDownloadTask(context.applicationContext, detail.taskId, files, targetPath)
+            if (adbPushed) {
+                VideoDedDeviceService.enqueueUsbPushedVerifyTask(
+                    context.applicationContext,
+                    detail.taskId,
+                    files,
+                    targetPath,
+                )
+            } else {
+                VideoDedDeviceService.enqueueDownloadTask(context.applicationContext, detail.taskId, files, targetPath)
+            }
             jsonResponse(
                 200,
                 JSONObject()
                     .put("success", true)
                     .put("taskId", detail.taskId)
                     .put("status", detail.status)
-                    .put("message", "download_enqueued"),
+                    .put("adbPushed", adbPushed)
+                    .put("message", if (adbPushed) "usb_push_verify_enqueued" else "download_enqueued"),
             )
         }
     }
@@ -179,10 +252,16 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
     private fun handleRequestVideos(session: IHTTPSession): Response {
         val body = JSONObject(readBody(session))
         val count = body.optInt("count", 1)
+        val username = CompanionApi.normalizeUsername(
+            body.optString("username", "").ifEmpty { body.optString("userName", "") },
+        )
+        if (username.isEmpty()) {
+            return jsonResponse(400, errorJson("username_required"))
+        }
         val targetPath = CompanionApi.resolvedTargetPath(
             body.optString("targetPath", null).takeIf { body.has("targetPath") && !body.isNull("targetPath") },
         )
-        val task = runBlockingApi { CompanionApi.createTaskAndWaitReady(context, count, targetPath) }
+        val task = runBlockingApi { CompanionApi.createTask(context, count, targetPath, username) }
         TaskStore.saveTaskSnapshot(
             context,
             TaskSnapshot(
@@ -193,6 +272,7 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                 targetPath = targetPath,
                 originalTaskId = null,
                 retryOfTaskId = null,
+                username = username,
                 files = task.files.map { TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null) }
             )
         )
@@ -229,14 +309,6 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
         return jsonResponse(200, task.toJson())
     }
 
-    private fun handleSystemMemory(session: IHTTPSession): Response {
-        val params = session.parms
-        val limit = params["limit"]?.toIntOrNull()?.coerceIn(1, 200) ?: 40
-        val minPssKb = params["minPssKb"]?.toIntOrNull()?.coerceAtLeast(0) ?: 1_024
-        val snapshot = RuntimeMemoryProbe.capture(context.applicationContext, limit, minPssKb)
-        return jsonResponse(200, RuntimeMemoryProbe.toJson(snapshot))
-    }
-
     private fun handleAdbPrepare(session: IHTTPSession): Response {
         val body = JSONObject(readBody(session))
         val publicKey = body.optString("publicKey", "").trim().ifEmpty { null }
@@ -254,23 +326,6 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                 .put("tcpEnabled", result.tcpEnabled)
                 .put("detail", result.detail),
         )
-    }
-
-    private fun handleSimpleAction(session: IHTTPSession): Response {
-        val body = JSONObject(readBody(session))
-        // 业务成败看 JSON success；HTTP 恒为 200，便于 PC 经 USB forward 解析 message。
-        return jsonResponse(200, SimpleRemoteControl.handleAction(context.applicationContext, body))
-    }
-
-    /** 兼容 video_ded 批量「启动后台服务」：转发到 simple 遥控 start_service。 */
-    private fun handleWorkerStart(session: IHTTPSession): Response {
-        val body = JSONObject(readBody(session))
-        val reason = body.optString("reason", "").trim().ifEmpty { "PC 批量启动后台服务" }
-        val result = SimpleRemoteControl.handleAction(
-            context.applicationContext,
-            JSONObject().put("action", "start_service").put("reason", reason),
-        )
-        return jsonResponse(200, result)
     }
 
     private fun handleRetry(session: IHTTPSession): Response {
@@ -311,11 +366,12 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
 }
 
 object ApiSettings {
-    private const val PREFS = "video_ded_embedded"
+    private const val PREFS = "video_ded"
     private const val KEY_API_ENABLED = "api_enabled"
     private const val KEY_API_TOKEN = "api_token"
     private const val KEY_API_LISTEN_PORT = "api_listen_port"
     private const val KEY_CALLBACK_PACKAGE = "callback_target_package"
+    private const val KEY_ROOT_ADB_TCPIP = "root_adb_tcpip_enabled"
     private const val KEY_ADB_TCPIP_PORT = "adb_tcpip_port"
     private const val KEY_MIRROR_IP_OVERRIDE = "mirror_ip_override"
 
@@ -323,9 +379,8 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_API_LISTEN_PORT, port).apply()
     }
 
-    /** 本地 HTTP API 常开，供 PC / Companion 轮询内存等诊断接口。 */
-    @Suppress("UNUSED_PARAMETER")
-    fun isApiEnabled(context: Context): Boolean = true
+    fun isApiEnabled(context: Context): Boolean = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getBoolean(KEY_API_ENABLED, true)
 
     /** 未写入前默认为 [CompanionBridge.API_PORT]（与 HTTP 监听一致）。 */
     fun getListenPort(context: Context): Int {
@@ -349,9 +404,8 @@ object ApiSettings {
         editor.apply()
     }
 
-    @Suppress("UNUSED_PARAMETER")
     fun setApiEnabled(context: Context, enabled: Boolean) {
-        // 常开：忽略历史偏好与外部写入
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_API_ENABLED, enabled).apply()
     }
 
     fun getToken(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -364,13 +418,12 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_API_TOKEN, token).apply()
     }
 
-    /** Root + su：在已连 Wi‑Fi 时由前台服务尝试 `setprop` + 重启 adbd，固定 TCP 端口供 `adb connect`（常开，不可关闭）。 */
-    @Suppress("UNUSED_PARAMETER")
-    fun isRootAdbTcpipEnabled(context: Context): Boolean = true
+    /** Root + su：在已连 Wi‑Fi 时由前台服务尝试 `setprop` + 重启 adbd，固定 TCP 端口供 `adb connect`。 */
+    fun isRootAdbTcpipEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ROOT_ADB_TCPIP, false)
 
-    @Suppress("UNUSED_PARAMETER")
     fun setRootAdbTcpipEnabled(context: Context, enabled: Boolean) {
-        // 常开：忽略历史偏好与外部写入
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ROOT_ADB_TCPIP, enabled).apply()
     }
 
     fun getAdbTcpipPort(context: Context): Int {
@@ -383,7 +436,7 @@ object ApiSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_ADB_TCPIP_PORT, clamped).apply()
     }
 
-    /** 已缓存的局域网 IPv4（可能过期）；展示/连接时应优先 [probeLiveLanIpv4] / [getEffectiveMirrorLanIpv4]。 */
+    /** 用户手填的局域网 IPv4，用于展示 / 复制 `adb connect`；留空则仅用系统自动检测。 */
     fun getMirrorIpOverride(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MIRROR_IP_OVERRIDE, null)
             ?.trim()
@@ -399,26 +452,14 @@ object ApiSettings {
         editor.apply()
     }
 
-    /** 实时探测本机局域网 IPv4（仅 Wi‑Fi 链路，避免误取 VPN/其它网卡）；失败返回 null。 */
-    fun probeLiveLanIpv4(context: Context): String? {
-        val raw = RootWifiAdbHelper.getWifiLanIpv4OrNull(context) ?: return null
-        if (!isPlausibleLanIpv4(raw)) return null
-        return runCatching { (InetAddress.getByName(raw.trim()) as Inet4Address).hostAddress }.getOrNull()
-            ?: raw.trim()
-    }
-
-    /**
-     * 有效投屏/ADB 局域网 IPv4：能探测到则用实时 Wi‑Fi 地址；
-     * 否则回退已存覆盖值，再回退 [WifiUtils.getWifiIp]（仅作兜底展示，不写缓存）。
-     */
+    /** 手填合法 IPv4 优先，否则与 [RootWifiAdbHelper.getWifiLanIpv4OrNull] 一致。 */
     fun getEffectiveMirrorLanIpv4(context: Context): String? {
-        probeLiveLanIpv4(context)?.let { return it }
-        val o = getMirrorIpOverride(context)
-        if (o != null && isPlausibleLanIpv4(o)) {
-            return runCatching { (InetAddress.getByName(o) as Inet4Address).hostAddress }.getOrNull() ?: o
+        val o = getMirrorIpOverride(context) ?: return RootWifiAdbHelper.getWifiLanIpv4OrNull(context)
+        return if (isPlausibleLanIpv4(o)) {
+            runCatching { (InetAddress.getByName(o) as Inet4Address).hostAddress }.getOrNull() ?: o
+        } else {
+            RootWifiAdbHelper.getWifiLanIpv4OrNull(context)
         }
-        val fallback = WifiUtils.getWifiIp(context)?.trim().orEmpty()
-        return fallback.takeIf { it.isNotEmpty() && isPlausibleLanIpv4(it) }
     }
 
     /** 非空且可解析为 IPv4（含校验用例）则视为有效；保存前应在 UI 再提示一次。 */
@@ -432,6 +473,13 @@ object ApiSettings {
             false
         }
     }
+
+    /**
+     * 实时探测当前 Wi‑Fi 局域网 IPv4（不含缓存/手填覆盖）。
+     * 供 [VideoDedSettingsRegistrar] 在能联通时覆盖过期 IP。
+     */
+    fun probeLiveLanIpv4(context: Context): String? =
+        RootWifiAdbHelper.getWifiLanIpv4OrNull(context)?.trim()?.takeIf { isPlausibleLanIpv4(it) }
 
 }
 

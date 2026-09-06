@@ -22,15 +22,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class VideoDedMainActivity : ComponentActivity() {
-    companion object {
+    private companion object {
         private const val TAG = "VideoDedMainActivity"
-        const val EXTRA_AUTO_REQUEST_COUNT = "autoRequestCount"
     }
 
     private lateinit var statusView: TextView
     private lateinit var nameHint: TextView
     private lateinit var windowsUrlInput: EditText
     private lateinit var countInput: EditText
+    private lateinit var usernameInput: EditText
     private lateinit var currentTaskView: TextView
     private lateinit var lastResultView: TextView
     private lateinit var historySummaryView: TextView
@@ -38,12 +38,14 @@ class VideoDedMainActivity : ComponentActivity() {
     private lateinit var apiLocalUrlView: TextView
     private lateinit var apiToggleView: TextView
     private lateinit var historyButton: Button
+    private lateinit var apiToggleButton: Button
     private lateinit var copyTokenButton: Button
     private lateinit var mirrorAddrView: TextView
     private lateinit var adbTcpPortInput: EditText
-    private lateinit var rootAdbStatusView: TextView
+    private lateinit var rootAdbToggleButton: Button
     private lateinit var copyMirrorAddrButton: Button
     private lateinit var mirrorIpOverrideInput: EditText
+    private lateinit var deviceNameLabel: TextView
     private var pollJob: Job? = null
     private var currentTaskId: String? = null
     /** 轮询 PC / 本地任务状态去重，避免每 10 秒刷同样一行 */
@@ -65,35 +67,25 @@ class VideoDedMainActivity : ComponentActivity() {
         Log.d(TAG, "onCreate start")
         startForegroundService(Intent(this, VideoDedDeviceService::class.java))
         buildUi()
-        lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
+        lifecycleScope.launch { refreshRegistration() }
         refreshHistorySummary()
         refreshApiSection()
         startPollingCurrentTask()
-        val autoRequestCount = intent.getIntExtra(EXTRA_AUTO_REQUEST_COUNT, 0)
-        if (autoRequestCount > 0) {
-            val normalizedCount = autoRequestCount.coerceIn(1, 20)
-            countInput.setText(normalizedCount.toString())
-            appendLog("临时入口触发：自动请求视频 $normalizedCount 条")
-            lifecycleScope.launch { requestVideos(normalizedCount) }
-        }
         Log.d(TAG, "onCreate done")
     }
 
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume")
-        if (::nameHint.isInitialized) refreshDeviceNameLabels()
         refreshApiSection()
-        if (::mirrorIpOverrideInput.isInitialized) {
-            val ipChanged = syncMirrorIpInputFromLive()
-            val needRegister = ipChanged ||
-                (::statusView.isInitialized && statusView.text?.contains("初始化") == true)
-            if (needRegister) {
-                lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = false) }
-            }
+        if (::mirrorIpOverrideInput.isInitialized && mirrorIpOverrideInput.text.isNullOrBlank()) {
+            val wifiIp = WifiUtils.getWifiIp(this).orEmpty()
+            Log.d(TAG, "auto fill mirrorIpOverrideInput=$wifiIp")
+            mirrorIpOverrideInput.setText(wifiIp)
         }
         if (::mirrorAddrView.isInitialized) {
             refreshMirrorAddrLine()
+            refreshRootAdbToggleLabel()
         }
     }
 
@@ -136,31 +128,58 @@ class VideoDedMainActivity : ComponentActivity() {
     private fun buildSettingsSection(): View {
         val section = sectionContainer("PC 服务 / 投屏地址")
         windowsUrlInput = editText("PC 服务地址", CompanionApi.windowsBaseUrl(this))
+        deviceNameLabel = TextView(this).apply {
+            text = CompanionApi.formatDeviceNameLine(this@VideoDedMainActivity)
+            setPadding(0, 8, 0, 4)
+        }
+        val defaultName = WifiUtils.getWifiIp(this)
+            ?.substringAfterLast('.')
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "设备-$it" }
+            ?: CompanionApi.getDeviceName(this@VideoDedMainActivity)
+        val deviceNameInput = editText(
+            "设备名称（默认 IPv4 最后一段）",
+            defaultName,
+        )
+        val deviceNameSaveButton = Button(this).apply {
+            text = "保存设备名称"
+            setOnClickListener {
+                CompanionApi.setDeviceName(this@VideoDedMainActivity, deviceNameInput.text?.toString().orEmpty())
+                refreshDeviceNameLabels()
+                lifecycleScope.launch { refreshRegistration() }
+            }
+        }
         section.addView(windowsUrlInput)
         val saveSettingsButton = Button(this).apply {
             text = "保存设置并重新注册"
             setOnClickListener {
-                lifecycleScope.launch { autoSaveSettingsAndRegister(verbose = true) }
+                lifecycleScope.launch { saveAllSettingsAndRegister() }
             }
         }
         section.addView(saveSettingsButton)
+        section.addView(deviceNameLabel)
+        section.addView(deviceNameInput)
+        section.addView(deviceNameSaveButton)
         val mirrorIpTitle = TextView(this).apply {
             text = "设备 IPv4"
             setPadding(0, 8, 0, 4)
         }
         mirrorIpOverrideInput = editText(
-            "本机 IPv4（保存/回前台时自动重探）",
-            ApiSettings.probeLiveLanIpv4(this)
-                ?: ApiSettings.getMirrorIpOverride(this).orEmpty(),
+            "本机 IPv4（自动获取后可直接保存）",
+            ApiSettings.getMirrorIpOverride(this).orEmpty().ifBlank { WifiUtils.getWifiIp(this).orEmpty() },
             inputType = InputType.TYPE_CLASS_TEXT,
         )
         mirrorAddrView = TextView(this).apply {
             setPadding(0, 12, 0, 4)
         }
         adbTcpPortInput = editText("ADB 无线端口", ApiSettings.getAdbTcpipPort(this).toString(), inputType = InputType.TYPE_CLASS_NUMBER)
-        rootAdbStatusView = TextView(this).apply {
-            text = "Root：Wi‑Fi 后自动尝试无线 ADB（常开）"
-            setPadding(0, 8, 0, 8)
+        rootAdbToggleButton = Button(this).apply {
+            setOnClickListener {
+                val next = !ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)
+                ApiSettings.setRootAdbTcpipEnabled(this@VideoDedMainActivity, next)
+                refreshRootAdbToggleLabel()
+                if (next) VideoDedDeviceService.enqueueTryRootAdbTcpip(this@VideoDedMainActivity)
+            }
         }
         copyMirrorAddrButton = Button(this).apply {
             text = "复制 PC 无线 ADB 地址"
@@ -170,15 +189,17 @@ class VideoDedMainActivity : ComponentActivity() {
         section.addView(mirrorIpOverrideInput)
         section.addView(mirrorAddrView)
         section.addView(adbTcpPortInput)
-        section.addView(rootAdbStatusView)
+        section.addView(rootAdbToggleButton)
         section.addView(copyMirrorAddrButton)
         refreshMirrorAddrLine()
+        refreshRootAdbToggleLabel()
         return section
     }
 
     private fun refreshDeviceNameLabels() {
         val line = CompanionApi.formatDeviceNameLine(this)
         if (::nameHint.isInitialized) nameHint.text = line
+        if (::deviceNameLabel.isInitialized) deviceNameLabel.text = line
     }
 
     private fun buildApiSection(): View {
@@ -195,6 +216,15 @@ class VideoDedMainActivity : ComponentActivity() {
             text = "本地 Base URL："
             setPadding(0, 0, 0, 8)
         }
+        apiToggleButton = Button(this).apply {
+            text = "切换 API 开关"
+            setOnClickListener {
+                val next = !ApiSettings.isApiEnabled(this@VideoDedMainActivity)
+                Log.d(TAG, "toggle api enabled -> $next")
+                ApiSettings.setApiEnabled(this@VideoDedMainActivity, next)
+                refreshApiSection()
+            }
+        }
         copyTokenButton = Button(this).apply {
             text = "刷新并显示 Token"
             setOnClickListener {
@@ -204,20 +234,28 @@ class VideoDedMainActivity : ComponentActivity() {
         section.addView(apiToggleView)
         section.addView(apiTokenView)
         section.addView(apiLocalUrlView)
+        section.addView(apiToggleButton)
         section.addView(copyTokenButton)
         return section
     }
 
     private fun buildRequestSection(): View {
         val section = sectionContainer("请求页")
+        usernameInput = editText("发布用户名（必填）", CompanionApi.getMaterialUsername(this))
         countInput = editText("请求视频数量", "1", inputType = InputType.TYPE_CLASS_NUMBER)
         val requestButton = Button(this).apply {
             text = "请求并下载视频"
             setOnClickListener {
+                val username = CompanionApi.normalizeUsername(usernameInput.text?.toString())
+                if (username.isEmpty()) {
+                    Toast.makeText(this@VideoDedMainActivity, "请先填写发布用户名", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                CompanionApi.setMaterialUsername(this@VideoDedMainActivity, username)
                 val count = countInput.text?.toString()?.toIntOrNull() ?: 1
-                Log.d(TAG, "request button clicked count=$count targetPath=${CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH}")
+                Log.d(TAG, "request button clicked count=$count username=$username targetPath=${CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH}")
                 lifecycleScope.launch {
-                    requestVideos(count)
+                    requestVideos(count, username)
                 }
             }
         }
@@ -225,6 +263,7 @@ class VideoDedMainActivity : ComponentActivity() {
             text = "最近结果：无"
             setPadding(0, 8, 0, 8)
         }
+        section.addView(usernameInput)
         section.addView(countInput)
         section.addView(requestButton)
         section.addView(lastResultView)
@@ -271,7 +310,7 @@ class VideoDedMainActivity : ComponentActivity() {
     }
 
     private fun refreshApiSection() {
-        apiToggleView.text = "API：已启用（常开）"
+        apiToggleView.text = "API：${if (ApiSettings.isApiEnabled(this)) "已启用" else "已关闭"}"
         apiTokenView.text = "Token：${ApiSettings.getToken(this)}"
         val p = ApiSettings.getListenPort(this)
         apiLocalUrlView.text =
@@ -298,92 +337,85 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
-    /** 用实时 Wi‑Fi IPv4 覆盖输入框；有变化返回 true。 */
-    private fun syncMirrorIpInputFromLive(): Boolean {
-        if (!::mirrorIpOverrideInput.isInitialized) return false
-        val live = ApiSettings.probeLiveLanIpv4(this) ?: return false
-        val current = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
-        if (current == live) return false
-        Log.d(TAG, "mirror IP updated $current -> $live")
-        mirrorIpOverrideInput.setText(live)
-        return true
-    }
-
-    private suspend fun autoSaveSettingsAndRegister(verbose: Boolean) {
+    private suspend fun saveAllSettingsAndRegister() {
         val port = adbTcpPortInput.text?.toString()?.toIntOrNull() ?: 5555
-        // 保存时强制重新探测，避免输入框里的过期 IP 被再次写入
-        syncMirrorIpInputFromLive()
         val rawIp = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
-            .ifEmpty { ApiSettings.probeLiveLanIpv4(this).orEmpty() }
         val windowsUrl = windowsUrlInput.text?.toString().orEmpty().trim()
-        Log.d(TAG, "autoSaveSettingsAndRegister port=$port rawIp=$rawIp windowsUrl=$windowsUrl verbose=$verbose")
+        Log.d(TAG, "save settings clicked port=$port rawIp=$rawIp windowsUrl=$windowsUrl")
+        appendLog("保存设置：PC=$windowsUrl · IP=${rawIp.ifEmpty { "自动" }} · ADB端口=$port")
         if (rawIp.isNotEmpty() && !ApiSettings.isPlausibleLanIpv4(rawIp)) {
             Log.w(TAG, "invalid mirror ip: $rawIp")
-            if (verbose) {
-                Toast.makeText(this@VideoDedMainActivity, "本机 IPv4 格式不正确，请检查或留空", Toast.LENGTH_LONG).show()
-            }
+            Toast.makeText(this@VideoDedMainActivity, "本机 IPv4 格式不正确，请检查或留空", Toast.LENGTH_LONG).show()
             appendLog("保存中止：IPv4 格式不正确")
             return
         }
-        val result = VideoDedSettingsRegistrar.saveAndRegister(
-            applicationContext,
-            input = VideoDedSettingsRegistrar.SaveInput(
-                windowsUrl = windowsUrl.ifEmpty { null },
-                mirrorIp = rawIp.ifEmpty { null },
-                adbPort = port,
-            ),
-            triggerWirelessIfNeeded = true,
-            retryRootAdbIfNeeded = true,
-            logSave = true,
-            logRegistration = true,
-        )
+        ApiSettings.setAdbTcpipPort(this@VideoDedMainActivity, port)
+        ApiSettings.setMirrorIpOverride(this@VideoDedMainActivity, rawIp.ifEmpty { null })
+        CompanionApi.setWindowsBaseUrl(this@VideoDedMainActivity, windowsUrl)
         windowsUrlInput.hint = "PC 服务地址"
-        syncMirrorIpInputFromLive()
         refreshMirrorAddrLine()
-        refreshDeviceNameLabels()
-        applyRegistrationUi(result, verbose)
+        appendLog("正在向 PC 重新注册…")
+        refreshRegistration(verbose = true)
     }
 
-    private suspend fun applyRegistrationUi(result: VideoDedSettingsRegistrar.SaveAndRegisterResult, verbose: Boolean) {
-        if (CompanionApi.isUsbPcTunnelActive()) {
-            statusView.text = "状态：USB 已直连 PC（走 adb 隧道，无需 WiFi / 不用改上方地址）"
-            if (verbose) {
-                Toast.makeText(this@VideoDedMainActivity, "USB 已连接 PC，批量操作请直接在电脑网页执行", Toast.LENGTH_LONG).show()
+    private suspend fun refreshRegistration(verbose: Boolean = false) {
+        try {
+            Log.d(TAG, "refreshRegistration start")
+            val reg = CompanionApi.ensureRegistered(applicationContext)
+            refreshDeviceNameLabels()
+            statusView.text = "状态：已连接 Windows 服务"
+            val mirrorStatus = MirrorStateProbe.currentMirrorStatus(this)
+            val mirrorHint = MirrorStateProbe.currentMirrorMessage(this)
+            val suOk = RootWifiAdbHelper.hasSu()
+            val port = ApiSettings.getAdbTcpipPort(this)
+            val tcpOpen = AdbRuntimeProbe.isAdbTcpPortOpen(this, port)
+            val pcAdbState = reg.optString("pcAdbState", "").trim()
+            val pcSerial = reg.optString("pcAdbSerial", "").trim()
+            appendLog(
+                "设备注册成功（本机：$mirrorStatus · 本机${port}=${if (tcpOpen) "已监听" else "未监听"} · PC端=${pcAdbState.ifEmpty { "—" }}）",
+            )
+            if (pcAdbState == "device") {
+                appendLog("PC 已无线连接${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}，可投屏；本机若仍写未监听，以 PC 为准")
+            } else {
+                mirrorHint?.let { appendLog("投屏说明：${mirrorHintForStatusLog(it)}") }
             }
-            return
-        }
-        if (result.error != null) {
-            val reason = explainWindowsServiceFailure(result.error)
-            Log.e(TAG, "registration failed reason=$reason", result.error)
-            statusView.text = "状态：未连上 PC（$reason）。USB 已插时请先在电脑打开 VideoDed 网页操作，会自动建隧道"
+            if (mirrorStatus != "ready" && pcAdbState != "device") {
+                if (ApiSettings.isRootAdbTcpipEnabled(this) && suOk && !tcpOpen) {
+                    appendLog("正在重试开启无线 ADB…")
+                    VideoDedDeviceService.enqueueTryRootAdbTcpip(this)
+                }
+                appendLog("正在请求 PC 无线授权流水线…")
+                runCatching {
+                    CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false, connectAll = true)
+                }.onSuccess { appendLog("PC 已执行无线准备/连接") }
+                    .onFailure { appendLog("PC 流水线失败：${it.message}") }
+            }
+            if (verbose) {
+                val toast = when {
+                    mirrorStatus == "ready" || pcAdbState == "device" ->
+                        "注册成功，PC 已可投屏${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}"
+                    else -> buildString {
+                        append("注册成功，但投屏未就绪（$mirrorStatus）")
+                        if (!suOk && ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)) {
+                            append("\n请检查无线 ADB 辅助权限是否可用")
+                        } else if (!tcpOpen) {
+                            append("\n本机 $port 仍未监听，请看通知栏错误码")
+                        }
+                        mirrorHint?.let { append("\n${mirrorHintForStatusLog(it)}") }
+                    }
+                }
+                Toast.makeText(this@VideoDedMainActivity, toast, Toast.LENGTH_LONG).show()
+            }
+            Log.d(TAG, "refreshRegistration success")
+        } catch (t: Throwable) {
+            val reason = explainWindowsServiceFailure(t)
+            Log.e(TAG, "refreshRegistration failed reason=$reason", t)
+            statusView.text = "状态：无法连接 Windows 服务（$reason）"
+            appendLog("注册失败：$reason")
             if (verbose) {
                 Toast.makeText(this@VideoDedMainActivity, "注册失败：$reason", Toast.LENGTH_LONG).show()
             }
-            return
         }
-        statusView.text = "状态：已连接 Windows 服务"
-        if (!verbose) return
-        val reg = result.registration ?: return
-        val mirrorStatus = MirrorStateProbe.currentMirrorStatus(this)
-        val mirrorHint = MirrorStateProbe.currentMirrorMessage(this)
-        val port = ApiSettings.getAdbTcpipPort(this)
-        val tcpOpen = AdbRuntimeProbe.isAdbTcpPortOpen(this, port)
-        val pcAdbState = reg.optString("pcAdbState", "").trim()
-        val pcSerial = reg.optString("pcAdbSerial", "").trim()
-        val toast = when {
-            mirrorStatus == "ready" || pcAdbState == "device" ->
-                "注册成功，PC 已可投屏${if (pcSerial.isNotEmpty()) "（$pcSerial）" else ""}"
-            else -> buildString {
-                append("注册成功，但投屏未就绪（$mirrorStatus）")
-                if (!RootWifiAdbHelper.hasSu() && ApiSettings.isRootAdbTcpipEnabled(this@VideoDedMainActivity)) {
-                    append("\n请检查无线 ADB 辅助权限是否可用")
-                } else if (!tcpOpen) {
-                    append("\n本机 $port 仍未监听，请看通知栏错误码")
-                }
-                mirrorHint?.let { append("\n${mirrorHintForStatusLog(it)}") }
-            }
-        }
-        Toast.makeText(this@VideoDedMainActivity, toast, Toast.LENGTH_LONG).show()
     }
 
     private fun explainWindowsServiceFailure(t: Throwable): String {
@@ -413,11 +445,11 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun requestVideos(count: Int) {
+    private suspend fun requestVideos(count: Int, username: String) {
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
         try {
-            Log.d(TAG, "requestVideos start count=$count targetPath=$targetPath")
-            val task = CompanionApi.createTaskAndWaitReady(applicationContext, count, targetPath)
+            Log.d(TAG, "requestVideos start count=$count username=$username targetPath=$targetPath")
+            val task = CompanionApi.createTask(applicationContext, count, targetPath, username)
             Log.d(TAG, "requestVideos task=${task.taskId} status=${task.status} files=${task.files.size}")
             currentTaskId = task.taskId
             currentTaskView.text = "当前任务：${task.taskId} (${task.status})"
@@ -429,17 +461,26 @@ class VideoDedMainActivity : ComponentActivity() {
                     error = null,
                     createdAtMs = System.currentTimeMillis(),
                     targetPath = targetPath,
+                    username = username,
                     files = task.files.map {
                         TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null)
                     }
                 )
             )
             refreshHistorySummary()
-            appendLog("创建任务：${task.taskId} channel=${task.deliveryChannel ?: "http"} pushed=${task.adbPushed == true}")
-            if (task.adbPushed == true || task.companionPullNotified != true) {
-                downloadTask(task.taskId, task.files, targetPath, adbPushed = task.adbPushed == true)
-            } else {
+            appendLog("创建任务：${task.taskId}")
+            if (task.adbPushed == true) {
+                appendLog("PC 已通过 USB 推送素材，本机仅校验不下载")
+                VideoDedDeviceService.enqueueUsbPushedVerifyTask(
+                    applicationContext,
+                    task.taskId,
+                    task.files,
+                    targetPath,
+                )
+            } else if (task.companionPullNotified == true) {
                 appendLog("PC 已触发下载（follow-pc），本界面不重复执行")
+            } else {
+                downloadTask(task.taskId, task.files, targetPath)
             }
         } catch (t: Throwable) {
             Log.e(TAG, "requestVideos failed", t)
@@ -448,20 +489,14 @@ class VideoDedMainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun downloadTask(
-        taskId: String,
-        files: List<TaskFileInfo>,
-        targetPath: String?,
-        adbPushed: Boolean = false,
-    ) {
+    private suspend fun downloadTask(taskId: String, files: List<TaskFileInfo>, targetPath: String?) {
         try {
-            Log.d(TAG, "downloadTask start taskId=$taskId files=${files.size} targetPath=$targetPath adbPushed=$adbPushed")
+            Log.d(TAG, "downloadTask start taskId=$taskId files=${files.size} targetPath=$targetPath")
             TaskDownloadWorkflow.downloadVerifyAndAck(
                 applicationContext,
                 taskId,
                 files,
                 targetPath,
-                adbPushed = adbPushed,
             ) { msg ->
                 Log.d(TAG, "downloadTask progress taskId=$taskId msg=$msg")
                 appendLog(msg)
@@ -556,6 +591,14 @@ class VideoDedMainActivity : ComponentActivity() {
             "无线 ADB 地址：adb connect <本机 IPv4>:$port"
         } else {
             "无线 ADB 地址：adb connect $ip:$port"
+        }
+    }
+
+    private fun refreshRootAdbToggleLabel() {
+        rootAdbToggleButton.text = if (ApiSettings.isRootAdbTcpipEnabled(this)) {
+            "Root：已开「Wi‑Fi 后自动尝试无线 ADB」（再点此关闭）"
+        } else {
+            "Root：点此开启「Wi‑Fi 后自动尝试无线 ADB」"
         }
     }
 
