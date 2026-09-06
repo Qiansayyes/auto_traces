@@ -1046,6 +1046,14 @@ class RealTraceExecutor(
         private const val USERS_TAB_OCR_FAST_FALLBACK_DELAY_MS = 2_000L
         /** 涨粉搜索页：Users 标签 OCR 轮与轮之间的等待（遮挡/未命中后重试） */
         private const val USERS_TAB_OCR_RETRY_DELAY_MS = 3_000L
+        /** 点放大镜后等待再 OCR 确认 Search（毫秒）。 */
+        private const val AFTER_MAGNIFIER_WAIT_MS = 1500L
+        /** 点放大镜后 OCR 未见 Search 时，微调坐标重试上限（每轮仍先等 [AFTER_MAGNIFIER_WAIT_MS]）。 */
+        private const val MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS = 24
+        /** 发作品收尾点 Home 后：先 For You 预滑再涨粉的固定时长（秒）。 */
+        private const val PUBLISH_TO_GROWTH_FOR_YOU_WARMUP_SEC = 180
+        /** 已在主 Feed 时，点放大镜前再点 Home 次数（确保可点到放大镜）。 */
+        private const val MAGNIFIER_PREP_EXTRA_HOME_TAPS = 2
         /** 评论区列表上滑约 40% 屏高（换批） */
         private const val MUTUAL_FOLLOW_ONLY_COMMENT_SWIPE_HEIGHT_RATIO = 0.40f
         /** 引流互点：作品页评论入口固定坐标（与 [tapMutualTrafficCommentEntryFixedPoint] 一致）。 */
@@ -1604,10 +1612,34 @@ class RealTraceExecutor(
         val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
         didRestartTikTokInCurrentRun = true
         val t0 = System.currentTimeMillis()
-        devOp(alias, "强关重启：正在关闭 TikTok")
+        // 成功标准：冷启后 OCR 见底栏 Home。见不到 = 失败，清弹窗后强杀重拉（最多 3 轮）。
+        val maxKillRelaunchRounds = 3
+        val homeConfirmPassesPerRound = 5
+
+        suspend fun hardKillTikTokBackground(roundTag: String) {
+            devOp(alias, "强关重启：$roundTag 强制关闭 TikTok 后台（force-stop / am kill）")
+            runSuCommand("am force-stop $pkg")
+            runSuCommand("am kill $pkg")
+            // 部分 ROM force-stop 后进程仍短暂残留：再补一次 force-stop
+            delay((forceStopWaitMs / 2).coerceAtLeast(100L))
+            runSuCommand("am force-stop $pkg")
+            delay(forceStopWaitMs)
+            invalidateForegroundProbeCache()
+            if (isTikTokForeground() || isPackageVisible(pkg)) {
+                delay(400)
+                invalidateForegroundProbeCache()
+                if (isTikTokForeground() || isPackageVisible(pkg)) {
+                    devOp(alias, "强关重启：$roundTag 关闭后仍见残留，再强制 force-stop 一次")
+                    runSuCommand("am force-stop $pkg")
+                    delay(forceStopWaitMs)
+                    invalidateForegroundProbeCache()
+                }
+            }
+        }
 
         /**
          * 强关后必须真实冷启 + 严格前台复检；禁止「已在前台跳过」与「短等后 dumpsys 残留」假成功。
+         * 本步仅确认进程在前台，最终成功仍以底栏 Home OCR 为准。
          */
         suspend fun launchOnceStrict(tag: String): Boolean {
             invalidateForegroundProbeCache()
@@ -1635,38 +1667,103 @@ class RealTraceExecutor(
                 alias,
                 tag,
                 passed = true,
-                detail = "强关冷启复检通过 焦点包=${fgPkg ?: "未知"}",
+                detail = "强关冷启前台复检通过 焦点包=${fgPkg ?: "未知"}（尚须 OCR 见底栏 Home）",
             )
             return true
         }
 
-        runSuCommand("am force-stop $pkg")
-        delay(forceStopWaitMs)
-        invalidateForegroundProbeCache()
-        if (isTikTokForeground()) {
-            delay(450)
-            invalidateForegroundProbeCache()
-            if (isTikTokForeground()) {
-                devOp(alias, "强关后 dumpsys 仍报 TikTok 前台，忽略残留并强制冷启拉起")
+        fun visionSeesBottomHome(vision: Text, screenH: Int): Boolean {
+            return findBottomBandHomeTabHit(vision, screenH) != null ||
+                findBottomBandExactLabelHit(vision, screenH, "Home") != null ||
+                findBottomBandLabelContaining(vision, screenH, "home") != null
+        }
+
+        /**
+         * 冷启后：等一下 → OCR 找底栏 Home；没有则尝试关弹窗（Don't allow / 返回消加载）再验。
+         * 仍不见 Home 返回 false，由外层再强杀重拉。
+         */
+        suspend fun confirmBottomHomeVisibleAfterLaunch(round: Int, roundTag: String): Boolean {
+            val screenH = ctx.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+            for (pass in 1..homeConfirmPassesPerRound) {
+                if (hardStopOrNull(alias, "重启后确认Home")) return false
+                if (pass > 1) delay(700)
+                val (vision, err) = mlKitRecognizeFullScreenCore(ctx, "restart_home_confirm_r${round}_p$pass")
+                if (vision == null) {
+                    devOp(alias, "强关重启：$roundTag 确认 Home OCR 失败（第 $pass/$homeConfirmPassesPerRound）：$err")
+                    continue
+                }
+                if (visionSeesBottomHome(vision, screenH)) {
+                    devOp(
+                        alias,
+                        "强关重启：$roundTag 成功——OCR 已见底栏 Home（第 $pass/$homeConfirmPassesPerRound 次）",
+                        System.currentTimeMillis() - t0,
+                    )
+                    return true
+                }
+                val preview = buildProfileEditOcrPreview(vision).take(120)
+                devOp(
+                    alias,
+                    "强关重启：$roundTag 未见底栏 Home（第 $pass/$homeConfirmPassesPerRound），" +
+                        "尝试处理弹窗后重验；OCR=$preview",
+                )
+                // Don't allow 等权限弹窗：与 launch 的 skipDontAllowOcr 无关——
+                // 不见 Home 时必须尝试关掉，否则发作品 recover(skipDontAllow=true) 会被弹窗卡死。
+                tryDismissDontAllowOcr(
+                    ctx = ctx,
+                    alias = alias,
+                    phaseLog = "强关重启后弹窗",
+                    logSuffix = "restart_home_r${round}_p$pass",
+                    maxPasses = 2,
+                    retryDelayMs = 400L,
+                    compactLog = true,
+                    useSideEffectFreeOcr = true,
+                )
+                // ANR：点 Close app（不在此抛异常重入整段；本轮结束后外层会再强杀）
+                if (visionShowsTikTokAnrDialog(vision)) {
+                    val dm = ctx.resources.displayMetrics
+                    tapTikTokAnrCloseApp(
+                        alias,
+                        vision,
+                        dm.widthPixels.coerceAtLeast(1),
+                        dm.heightPixels.coerceAtLeast(1),
+                    )
+                    delay(TIKTOK_ANR_CLOSE_APP_SETTLE_MS)
+                    continue
+                }
+                // 加载类遮罩：返回一次常可关掉；无弹窗时首页返回通常不改页
+                if (pass in 2..3) {
+                    runSuCommand("input keyevent 4")
+                    delay(500)
+                }
             }
+            devOp(alias, "强关重启：$roundTag 连续 $homeConfirmPassesPerRound 次未见底栏 Home，本轮失败")
+            return false
         }
 
-        val firstOk = launchOnceStrict("首次启动")
-        if (firstOk) {
-            devOp(alias, "强关重启 TikTok 成功（首次冷启）", System.currentTimeMillis() - t0)
-            return true
+        for (round in 1..maxKillRelaunchRounds) {
+            if (hardStopOrNull(alias, "重启 TikTok 恢复")) return false
+            val roundTag = when (round) {
+                1 -> "第1轮"
+                2 -> "第2轮"
+                else -> "第${round}轮"
+            }
+            hardKillTikTokBackground(roundTag)
+            val launchTag = if (round == 1) "首次启动" else "第${round}次启动"
+            if (!launchOnceStrict(launchTag)) {
+                devOp(alias, "强关重启：$roundTag 拉起前台失败，继续下一轮强杀重拉")
+                continue
+            }
+            if (confirmBottomHomeVisibleAfterLaunch(round, roundTag)) {
+                return true
+            }
+            devOp(alias, "强关重启：$roundTag 未见 Home，视为重启失败，继续强杀 TikTok 后台并重拉")
         }
-
-        runSuCommand("am force-stop $pkg")
-        delay(forceStopWaitMs)
-        invalidateForegroundProbeCache()
-        val secondOk = launchOnceStrict("二次启动")
         devOp(
             alias,
-            "强关重启 TikTok ${if (secondOk) "成功（二次冷启）" else "失败（二次冷启）"}",
+            "强关重启 TikTok 失败：连续 $maxKillRelaunchRounds 轮强杀重拉后仍未见底栏 Home",
             System.currentTimeMillis() - t0,
         )
-        return secondOk
+        return false
     }
 
     /**
@@ -7683,6 +7780,7 @@ class RealTraceExecutor(
     /**
      * 连续处理多个主用户名时，上一轮如果已回退到「搜索结果/Users 选择界面」，
      * 下一轮可以跳过再次点放大镜与重新启动 app，仅需清空搜索框并输入下一个主用户名。
+     * 置 true 必须走 [markEndedAtUsersSelectionForNext]：本轮强关过则禁止复用。
      */
     private var lastEndedAtUsersSelection: Boolean = false
     /** 上一名 [recoverToHomeViaBackOrRestart] 已成功回到主 Feed，下一名涨粉跳过 For You 预滑。 */
@@ -7691,6 +7789,34 @@ class RealTraceExecutor(
     /** 最近一次点击的作品位：growth 为 left/middle/right；live/direct 为 left_first */
     private var lastClickedPostSlot: String = ""
     private var currentRootUsernameForLogs: String = ""
+
+    /**
+     * 尝试标记「下一名可复用 Users」。
+     * 本轮已强关过则禁止复用，改为 [restartFromMagnifierForGrowth]。
+     * @return true=已允许复用；false=已禁止并改从放大镜。
+     */
+    private fun markEndedAtUsersSelectionForNext(alias: String, why: String): Boolean {
+        if (didRestartTikTokInCurrentRun) {
+            lastEndedAtUsersSelection = false
+            restartFromMagnifierForGrowth = true
+            devOp(alias, "$why：本轮已强关过 TikTok，禁止复用 Users，下一名从放大镜重搜")
+            return false
+        }
+        lastEndedAtUsersSelection = true
+        return true
+    }
+
+    /**
+     * 本轮中途若已强关，提前失败 return 前必须调用：清掉可能残留的「复用 Users」标记。
+     * （[didRestartTikTokInCurrentRun] 在下一名入口会被清零，不能靠它跨用户名传递。）
+     */
+    private fun clearUsersReuseIfRestartedThisRun(alias: String, why: String) {
+        if (!didRestartTikTokInCurrentRun) return
+        if (!lastEndedAtUsersSelection && restartFromMagnifierForGrowth) return
+        lastEndedAtUsersSelection = false
+        restartFromMagnifierForGrowth = true
+        devOp(alias, "$why：本轮已强关过 TikTok，清除 Users 复用标记，下一名从放大镜重搜")
+    }
 
     private data class DevOpTapCoalesce(
         val actionPrefix: String,
@@ -8572,22 +8698,48 @@ class RealTraceExecutor(
         } else if (lastEndedAtUsersSelection) {
             devOp(alias, "复用 Users 选择界面，跳过重启 TikTok")
             if (!ensureTikTokInForeground(ctx, alias, "复用 Users")) {
+                clearUsersReuseIfRestartedThisRun(alias, "复用Users切前台失败")
                 return "TikTok 恢复拉起失败，无法复用 Users 界面，无法执行 $username"
             }
-            focusSearchInput(service)
-            clearSearchInputText()
-            delay(Random.nextLong(400, 700))
-        } else if (PrefsStore.consumeGrowthContinueFromPublishHome()) {
-            devOp(alias, "涨粉：发作品刚收尾于 Home，跳过重启与 For You 预热，直接点放大镜")
+            // 复用路径里 ensure 也可能强关：界面已不是 Users，禁止继续按复用清框盲输
+            if (didRestartTikTokInCurrentRun) {
+                clearUsersReuseIfRestartedThisRun(alias, "复用Users中途强关")
+                if (!ensureMainFeedBeforeRestartFromMagnifier(service, alias)) {
+                    return "未能确认主 Feed / 回首页，无法从放大镜重新搜索 $username"
+                }
+                if (!clickMagnifier(service)) {
+                    return "TikTok 恢复拉起失败，无法点击放大镜，无法执行 $username"
+                }
+            } else {
+                focusSearchInput(service)
+                clearSearchInputText()
+                delay(Random.nextLong(400, 700))
+            }
+        } else if (PrefsStore.peekGrowthContinueFromPublishHome()) {
+            // 标志保持到放大镜成功：期间 recover 见 peek 会跳过硬关，避免发作品后乱重启
+            devOp(
+                alias,
+                "涨粉：发作品刚收尾于 Home，先 For You 预滑 ${PUBLISH_TO_GROWTH_FOR_YOU_WARMUP_SEC}s，" +
+                    "再点放大镜（期间禁止强关）",
+            )
             if (!isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
-                if (!ensureTikTokInForeground(ctx, alias, "发作品转涨粉")) {
+                if (!ensureTikTokInForeground(ctx, alias, "发作品转涨粉", allowForceRestart = false)) {
+                    PrefsStore.consumeGrowthContinueFromPublishHome()
                     return "TikTok 恢复拉起失败，无法执行 $username"
                 }
             }
             delay(300)
+            runForYouWarmupIfNeeded(
+                service,
+                alias,
+                config,
+                totalSecOverride = PUBLISH_TO_GROWTH_FOR_YOU_WARMUP_SEC.toDouble(),
+            )
             if (!clickMagnifier(service)) {
-                return "无法点击放大镜，无法执行 $username"
+                PrefsStore.consumeGrowthContinueFromPublishHome()
+                return "无法点击放大镜（或 OCR 未确认 Search），无法执行 $username"
             }
+            PrefsStore.consumeGrowthContinueFromPublishHome()
         } else {
             if (growthYieldOrNull(alias, "打开 TikTok")) {
                 return growthYieldSkipMessage(username)
@@ -8607,20 +8759,14 @@ class RealTraceExecutor(
             }
         }
 
-        if (!ensureTikTokInForeground(ctx, alias, "输入搜索词前")) {
-            return "TikTok 恢复拉起失败，无法输入搜索词，无法执行 $username"
+        // 4. 聚焦输入框 → 输入用户名 → 再点 Search（中途禁止强停冲掉输入）
+        if (!focusAndTypeSearchQuery(service, username, "涨粉搜索")) {
+            clearUsersReuseIfRestartedThisRun(alias, "涨粉搜索输入失败收尾")
+            return "输入用户名失败，未执行 Search，无法执行 $username"
         }
-        val safeUsername = shellEscape(username)
-        val inputResult = runSuCommand("input text $safeUsername")
-        if (!inputResult) {
-            devOp(alias, "输入搜索词失败")
-            return "输入用户名失败，未执行 Search"
-        }
-        delay(Random.nextLong(800, 1500))
-
-        // 4. 通过坐标点击 Search 按钮（root input tap）
         if (!clickSearchButtonAndWait(service)) {
-            return "TikTok 恢复拉起失败，无法点击 Search，无法执行 $username"
+            clearUsersReuseIfRestartedThisRun(alias, "涨粉点击Search失败收尾")
+            return "无法点击 Search（或前台未确认且禁止强停以免冲掉已输入），无法执行 $username"
         }
 
         // 5. 搜索结果页：点击 Users。未命中则先返回首页或强关，再重新搜索；仍失败则中止，不进入列表匹配。
@@ -8644,10 +8790,11 @@ class RealTraceExecutor(
                 lastEndedAtUsersSelection = false
                 return "失败：Users 列表 OCR 未找到目标用户 $username（回首页重搜失败，下一名从放大镜）"
             }
-            // 仍在搜索/Users 页：清框后下一名复用界面，避免误走 For You 预滑。
-            lastEndedAtUsersSelection = true
-            focusSearchInput(service)
-            clearSearchInputText()
+            // 仍在搜索/Users 页才允许复用；本轮强关过则禁止，下一名从放大镜。
+            if (markEndedAtUsersSelectionForNext(alias, "Users列表未匹配收尾")) {
+                focusSearchInput(service)
+                clearSearchInputText()
+            }
             return "失败：Users 列表 OCR 未找到目标用户 $username"
         }
         var tapped = runSuCommand("input tap ${ocrPoint.x} ${ocrPoint.y}")
@@ -8660,7 +8807,7 @@ class RealTraceExecutor(
         // 已禁用 waitForRootNode 调试日志
         if (noVideosOrPrivate) {
             devOp(alias, "检测到无作品或私密账号，跳过当前用户")
-            lastEndedAtUsersSelection = true
+            markEndedAtUsersSelectionForNext(alias, "无作品/私密跳过收尾")
             return "失败：目标用户无作品或私密，已跳过 $username"
         }
         
@@ -8715,24 +8862,174 @@ class RealTraceExecutor(
         }
     }
 
-    /** @return 是否已恢复前台并完成放大镜点击 */
+    /**
+     * 点放大镜成功条件：
+     * 1) 仅在主 Feed（或冷启后已回主 Feed）上点；已在首页则再点 [MAGNIFIER_PREP_EXTRA_HOME_TAPS] 次 Home；
+     * 2) 点击后固定等 [AFTER_MAGNIFIER_WAIT_MS]，OCR 顶栏见到 Search 才算成功；
+     * 3) 未见 Search 则上下左右微调坐标继续点+OCR（受 [MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS] 上限）。
+     */
     private suspend fun clickMagnifier(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         return withTikTokGuard(alias, "点击放大镜") {
             if (!ensureTikTokInForeground(service, alias, "点击放大镜")) return@withTikTokGuard false
+            if (!ensureReadyForMagnifierClick(service, alias)) return@withTikTokGuard false
             devOp(alias, "点击放大镜前：开始 Don't allow OCR（无副作用整屏）")
             tryDismissDontAllowBeforeMagnifier(service, alias)
             val metrics = service.resources.displayMetrics
-            val width = metrics.widthPixels
-            val height = metrics.heightPixels
-            val ratioX = 0.92f
-            val ratioY = 0.09f
-            val clickX = width * ratioX
-            val clickY = height * ratioY
-            runSuCommand("input tap ${clickX.toInt()} ${clickY.toInt()}")
-            delay(Random.nextLong(800, 1200))
-            true
+            val width = metrics.widthPixels.coerceAtLeast(1)
+            val height = metrics.heightPixels.coerceAtLeast(1)
+            val baseX = (width * 0.92f).toInt()
+            val baseY = (height * 0.09f).toInt()
+            val stepX = (width * 0.02f).toInt().coerceIn(12, 48)
+            val stepY = (height * 0.015f).toInt().coerceIn(10, 40)
+            val offsets = listOf(
+                0 to 0,
+                0 to -stepY,
+                0 to stepY,
+                -stepX to 0,
+                stepX to 0,
+                -stepX to -stepY,
+                stepX to -stepY,
+                -stepX to stepY,
+                stepX to stepY,
+                0 to -2 * stepY,
+                0 to 2 * stepY,
+                -2 * stepX to 0,
+                2 * stepX to 0,
+            )
+            for (attempt in 1..MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS) {
+                if (hardStopOrNull(alias, "点击放大镜·确认Search")) return@withTikTokGuard false
+                if (growthYieldOrNull(alias, "点击放大镜·确认Search")) return@withTikTokGuard false
+                val ring = 1 + (attempt - 1) / offsets.size
+                val (ox0, oy0) = offsets[(attempt - 1) % offsets.size]
+                val ox = ox0 * ring
+                val oy = oy0 * ring
+                val tapX = (baseX + ox).coerceIn(1, width - 1)
+                val tapY = (baseY + oy).coerceIn(1, height - 1)
+                runSuCommand("input tap $tapX $tapY")
+                delay(AFTER_MAGNIFIER_WAIT_MS)
+                val (vision, err) = mlKitRecognizeFullScreenCore(service, "magnifier_search_confirm_$attempt")
+                if (vision == null) {
+                    devOp(
+                        alias,
+                        "点击放大镜后：等 ${AFTER_MAGNIFIER_WAIT_MS}ms 后 OCR 失败" +
+                            "（第 $attempt/$MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS）：$err，微调重试",
+                    )
+                    continue
+                }
+                if (ocrVisionSeesSearchAfterMagnifier(vision, height)) {
+                    if (attempt == 1 && ox == 0 && oy == 0) {
+                        devOp(alias, "点击放大镜成功：OCR 已见 Search")
+                    } else {
+                        devOp(
+                            alias,
+                            "点击放大镜成功：OCR 已见 Search（第 $attempt 次，偏移 ${ox},${oy}）",
+                        )
+                    }
+                    return@withTikTokGuard true
+                }
+                val preview = buildProfileEditOcrPreview(vision).take(100)
+                devOp(
+                    alias,
+                    "点击放大镜后：未见 Search（第 $attempt/$MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS，" +
+                        "点 ($tapX,$tapY)），微调坐标再试；OCR=$preview",
+                )
+            }
+            devOp(alias, "点击放大镜失败：连续 $MAGNIFIER_SEARCH_CONFIRM_MAX_ATTEMPTS 次 OCR 未见 Search")
+            false
         } == true
+    }
+
+    /** 顶栏附近出现 Search（严格或包含），视为放大镜已打开搜索页。 */
+    private fun ocrVisionSeesSearchAfterMagnifier(vision: Text, screenH: Int): Boolean {
+        val topLimit = (screenH * 0.42f).toInt().coerceAtLeast(1)
+        fun inTop(hit: StrictLabelHit?): Boolean {
+            val box = hit?.rect ?: return false
+            return box.centerY() <= topLimit
+        }
+        if (inTop(findStrictExactLabelHit(vision, "Search"))) return true
+        if (inTop(findLabelHitContainingIgnoreCase(vision, "Search"))) return true
+        return false
+    }
+
+    /**
+     * 点放大镜前必须在主 Feed：判定方式与回首页成功一致（底栏 Home+Profile）。
+     * 已在首页 → 再点 [MAGNIFIER_PREP_EXTRA_HOME_TAPS] 次 Home；
+     * 不在 → [recoverToHomeViaBackOrRestart]（发作品刚收尾 peek 标志为真时不会硬关）。
+     */
+    private suspend fun ensureReadyForMagnifierClick(service: Context, alias: String): Boolean {
+        if (hardStopOrNull(alias, "点击放大镜前确认主Feed")) return false
+        if (growthYieldOrNull(alias, "点击放大镜前确认主Feed")) return false
+        val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        val (vision, err) = mlKitRecognizeFullScreenCore(service, "magnifier_pre_main_feed")
+        if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
+            devOp(
+                alias,
+                "点击放大镜前：已在主 Feed，再点 ${MAGNIFIER_PREP_EXTRA_HOME_TAPS} 次 Home 确保可点放大镜",
+            )
+            tapHomeTimesForMagnifierPrep(
+                service,
+                alias,
+                MAGNIFIER_PREP_EXTRA_HOME_TAPS,
+                vision,
+            )
+            return true
+        }
+        if (vision == null) {
+            devOp(alias, "点击放大镜前：主 Feed OCR 失败：$err，改为回首页/冷启后再点")
+        } else {
+            devOp(alias, "点击放大镜前：未确认主 Feed，改为回首页/冷启后再点")
+        }
+        val ok = recoverToHomeViaBackOrRestart(service, "点击放大镜前确认主Feed")
+        if (!ok) {
+            if (PrefsStore.peekGrowthContinueFromPublishHome()) {
+                devOp(alias, "点击放大镜前：发作品收尾窗口内回首页失败且禁止硬关，放弃点放大镜")
+            } else {
+                devOp(alias, "点击放大镜前：回首页/冷启失败，放弃点放大镜")
+            }
+            return false
+        }
+        return true
+    }
+
+    private suspend fun tapHomeTimesForMagnifierPrep(
+        service: Context,
+        alias: String,
+        times: Int,
+        initialVision: Text?,
+    ) {
+        val dm = service.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        var vision = initialVision
+        for (i in 1..times) {
+            if (hardStopOrNull(alias, "放大镜前连点Home")) return
+            if (i > 1) delay(RECOVER_HOME_CONFIRM_HOME_TAP_DELAY_MS)
+            if (vision == null) {
+                val (next, err) = mlKitRecognizeFullScreen(service, "magnifier_prep_home_$i")
+                if (next == null) {
+                    devOp(alias, "放大镜前连点 Home 第 $i/$times 次 OCR 失败：$err")
+                    continue
+                }
+                vision = next
+            }
+            val hit =
+                findBottomBandHomeTabHit(vision, h)
+                    ?: findBottomBandExactLabelHit(vision, h, "Home")
+                    ?: findBottomBandLabelContaining(vision, h, "home")
+            if (hit == null) {
+                devOp(alias, "放大镜前连点 Home 第 $i/$times 次未命中底栏 Home")
+                vision = null
+                continue
+            }
+            val tap = coerceTapToScreen(hit.point, w, h)
+            if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                devOp(alias, "放大镜前连点 Home 第 $i/$times 次已点 (${tap.x},${tap.y})")
+            } else {
+                devOp(alias, "放大镜前连点 Home 第 $i/$times 次点击失败")
+            }
+            vision = null
+        }
     }
 
     /**
@@ -10019,7 +10316,6 @@ class RealTraceExecutor(
     ): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val mutualSearchText = pickMutualTikTokSearchKeyword(config)
-        val safeSearchText = shellEscape(mutualSearchText)
 
         if (forceStopBeforeLaunch) {
             // 关开 TikTok 须走 launchTikTokWithForegroundVerification（强停→拉起→等待→dumpsys 校验→日志），
@@ -10062,10 +10358,12 @@ class RealTraceExecutor(
         delay(500)
         runSuCommand("input keyevent 67")
         runSuCommand("input keyevent 67")
-        runSuCommand("input text $safeSearchText")
-        delay(800)
+        if (!focusAndTypeSearchQuery(service, mutualSearchText, "互点搜索·$launchCheckTag")) {
+            devOp(alias, "互点：输入失败，未点 Search（$launchCheckTag）")
+            return false
+        }
         if (!clickSearchButtonAndWait(service)) {
-            devOp(alias, "互点：TikTok 恢复拉起失败，无法点击 Search（$launchCheckTag）")
+            devOp(alias, "互点：无法点击 Search（禁止强停冲输入）（$launchCheckTag）")
             return false
         }
         devOp(alias, "互点：已完成放大镜点击并搜索「$mutualSearchText」（$launchCheckTag）")
@@ -12690,11 +12988,17 @@ class RealTraceExecutor(
         }
     }
 
-    /** @return 是否已恢复前台并完成 Search 点击 */
+    /**
+     * 点击搜索页右上角 Search。
+     * **禁止**在此路径强停/重拉 TikTok：否则会冲掉刚输入的用户名，变成「空搜/错页点 Search」。
+     */
     private suspend fun clickSearchButtonAndWait(service: Context): Boolean {
         val alias = PrefsStore.getAlias() ?: "unknown"
         return withTikTokGuard(alias, "点击 Search") {
-            if (!ensureTikTokInForeground(service, alias, "点击 Search")) return@withTikTokGuard false
+            if (!ensureTikTokInForeground(service, alias, "点击 Search", allowForceRestart = false)) {
+                devOp(alias, "点击 Search：前台未确认且禁止强停（避免冲掉已输入用户名）")
+                return@withTikTokGuard false
+            }
             val metrics = service.resources.displayMetrics
             val width = metrics.widthPixels
             val height = metrics.heightPixels
@@ -12703,9 +13007,44 @@ class RealTraceExecutor(
             val searchX = width * searchRatioX
             val searchY = height * searchRatioY
             runSuCommand("input tap ${searchX.toInt()} ${searchY.toInt()}")
-            delay(2500)
+            delay(1500)
             true
         } == true
+    }
+
+    /**
+     * 涨粉/重搜/互点共用：聚焦搜索框 → 输入文案。
+     * 点放大镜后的加载确认在 [clickMagnifier]（等 [AFTER_MAGNIFIER_WAIT_MS] + OCR Search），此处只聚焦输入。
+     * 不在此点 Search；调用方在输入成功后再 [clickSearchButtonAndWait]。
+     */
+    private suspend fun focusAndTypeSearchQuery(
+        service: Context,
+        query: String,
+        tag: String,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        val text = query.trim()
+        if (text.isEmpty()) {
+            devOp(alias, "$tag：搜索文案为空，跳过输入")
+            return false
+        }
+        if (!ensureTikTokInForeground(service, alias, "$tag·输入前", allowForceRestart = false)) {
+            devOp(alias, "$tag：输入前前台未确认且禁止强停（避免在错页盲输）")
+            return false
+        }
+        focusSearchInput(service)
+        delay(Random.nextLong(250, 450))
+        // 再点一次输入区，确保焦点在框内（键盘弹起后仍可能丢焦）
+        focusSearchInput(service)
+        delay(Random.nextLong(200, 400))
+        val ok = runSuCommand("input text ${shellEscape(text)}")
+        if (!ok) {
+            devOp(alias, "$tag：input text 失败：$text")
+            return false
+        }
+        delay(Random.nextLong(800, 1500))
+        devOp(alias, "$tag：已在搜索框输入「$text」")
+        return true
     }
 
     private suspend fun ensureUsersTabClicked(service: Context): Boolean {
@@ -15617,7 +15956,7 @@ class RealTraceExecutor(
         }
         // 无论是到底还是中断：都回退到 Users 选择界面，便于继续下一个主用户名
         backToUsersSelectionFromFollowersList(service)
-        lastEndedAtUsersSelection = true
+        markEndedAtUsersSelectionForNext(alias, "粉丝列表收尾回Users")
     }
 
     private suspend fun backToUsersSelectionFromFollowersList(service: Context) {
@@ -16939,20 +17278,12 @@ class RealTraceExecutor(
             devOp(alias, "Users 标签恢复：无法点击放大镜")
             return false
         }
-        val safeUsername = shellEscape(username)
-        devOp(alias, "Users 标签恢复：输入搜索用户名：$username")
-        if (!ensureTikTokInForeground(service, alias, "Users 标签恢复输入")) {
-            devOp(alias, "Users 标签恢复：TikTok 非前台，无法输入搜索词")
+        if (!focusAndTypeSearchQuery(service, username, "Users标签恢复")) {
+            devOp(alias, "Users 标签恢复：输入失败，未点 Search")
             return false
         }
-        val inputResult = runSuCommand("input text $safeUsername")
-        if (!inputResult) {
-            devOp(alias, "Users 标签恢复：输入搜索词失败")
-            return false
-        }
-        delay(Random.nextLong(800, 1500))
         if (!clickSearchButtonAndWait(service)) {
-            devOp(alias, "Users 标签恢复：无法点击 Search")
+            devOp(alias, "Users 标签恢复：无法点击 Search（禁止强停冲输入）")
             return false
         }
         if (!ensureUsersTabClicked(service)) {
