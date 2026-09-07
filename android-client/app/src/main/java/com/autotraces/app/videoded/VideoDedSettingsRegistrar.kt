@@ -84,17 +84,21 @@ object VideoDedSettingsRegistrar {
     /**
      * 是否请求 PC 无线流水线。
      * @param forceReconnect IP 刚变更时即使 PC 仍报 device 也要重连（旧串口/旧 IP 已失效）。
+     * @param bypassThrottle 用户手动保存/重试时绕过 120s 节流，但仍尊重「已是 device」短路。
      */
     fun shouldTriggerWirelessPipeline(
         context: Context,
         reg: JSONObject?,
         forceReconnect: Boolean = false,
+        bypassThrottle: Boolean = false,
     ): Boolean {
         if (!forceReconnect && reg != null && reg.optString("pcAdbState", "").trim() == "device") return false
         if (MirrorStateProbe.currentMirrorStatus(context) == "offline") return false
         if (forceReconnect) return true
-        val now = System.currentTimeMillis()
-        if (now - lastWirelessPipelineAtMs < WIRELESS_PIPELINE_MIN_INTERVAL_MS) return false
+        if (!bypassThrottle) {
+            val now = System.currentTimeMillis()
+            if (now - lastWirelessPipelineAtMs < WIRELESS_PIPELINE_MIN_INTERVAL_MS) return false
+        }
         return true
     }
 
@@ -111,6 +115,8 @@ object VideoDedSettingsRegistrar {
         retryRootAdbIfNeeded: Boolean = true,
         logSave: Boolean = true,
         logRegistration: Boolean = true,
+        /** 用户手动保存/重试：绕过 120s 节流，但不在已是 device 时强行重连。 */
+        bypassWirelessThrottle: Boolean = false,
     ): SaveAndRegisterResult {
         val app = context.applicationContext
         val persist = persistSettingsDetailed(app, input)
@@ -134,6 +140,7 @@ object VideoDedSettingsRegistrar {
                 retryRootAdbIfNeeded = retryRootAdbIfNeeded || persist.mirrorIpChanged,
                 triggerWirelessIfNeeded = triggerWirelessIfNeeded || persist.mirrorIpChanged,
                 forceWirelessReconnect = persist.mirrorIpChanged,
+                bypassWirelessThrottle = bypassWirelessThrottle,
                 logRegistration = logRegistration,
             )
             SaveAndRegisterResult(true, reg, null, mirrorIpChanged = persist.mirrorIpChanged)
@@ -150,6 +157,7 @@ object VideoDedSettingsRegistrar {
         retryRootAdbIfNeeded: Boolean,
         triggerWirelessIfNeeded: Boolean,
         forceWirelessReconnect: Boolean,
+        bypassWirelessThrottle: Boolean,
         logRegistration: Boolean,
     ) {
         val port = ApiSettings.getAdbTcpipPort(context)
@@ -184,7 +192,14 @@ object VideoDedSettingsRegistrar {
             if (logRegistration) StatusLogBuffer.append("正在重试开启无线 ADB…")
             VideoDedDeviceService.enqueueTryRootAdbTcpip(context)
         }
-        if (triggerWirelessIfNeeded && shouldTriggerWirelessPipeline(context, reg, forceReconnect = forceWirelessReconnect)) {
+        if (triggerWirelessIfNeeded &&
+            shouldTriggerWirelessPipeline(
+                context,
+                reg,
+                forceReconnect = forceWirelessReconnect,
+                bypassThrottle = bypassWirelessThrottle,
+            )
+        ) {
             if (logRegistration) StatusLogBuffer.append("正在请求 PC 无线授权流水线…")
             lastWirelessPipelineAtMs = System.currentTimeMillis()
             runCatching {

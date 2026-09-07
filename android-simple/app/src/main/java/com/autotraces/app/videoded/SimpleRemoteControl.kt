@@ -125,6 +125,7 @@ object SimpleRemoteControl {
             }
 
             "set_cloud_auth" -> {
+                // 云端登录名：只 trim，不去掉 @（与素材/TikTok 用户名分流）
                 val username = body.optString("cloud_username", "").trim()
                     .ifBlank { body.optString("username", "").trim() }
                 val password = body.optString("cloud_password", "").trim()
@@ -176,8 +177,8 @@ object SimpleRemoteControl {
             "select_account", "switch_account" -> {
                 if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
-                val username = body.optString("username", "").trim().removePrefix("@")
-                if (username.isBlank()) return fail("username_required", "请提供 username")
+                val username = tiktokUsernameFromBody(body)
+                if (username.isEmpty()) return fail("username_required", "请提供 username")
                 if (AppCoordinator.isManualSwitchBusy()) {
                     return fail("switch_busy", "切号进行中，请稍候")
                 }
@@ -199,9 +200,8 @@ object SimpleRemoteControl {
                 if (AppCoordinator.isManualSwitchBusy()) {
                     return fail("switch_busy", "切号进行中，请稍候")
                 }
-                val username = body.optString("username", "").trim().removePrefix("@")
-                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                if (username.isBlank()) return fail("username_required", "请先选择账号")
+                val username = tiktokUsernameFromBody(body, ManualDeviceControl.selectedManualUsername())
+                if (username.isEmpty()) return fail("username_required", "请先选择账号")
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
                 AppCoordinator.manualSelectAccount(username)
                 AppCoordinator.manualConfirmSwitchDone()
@@ -341,16 +341,9 @@ object SimpleRemoteControl {
 
             "switch_to_cloud_mode" -> {
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
-                val names = mutableListOf<String>()
-                val arr = body.optJSONArray("participateUsernames")
-                if (arr != null) {
-                    for (i in 0 until arr.length()) {
-                        val u = arr.optString(i, "").trim().removePrefix("@")
-                        if (u.isNotEmpty()) names.add(u)
-                    }
-                } else {
-                    ManualDeviceControl.getCachedAccounts().forEach { names.add(it.username) }
-                }
+                val names = body.optJSONArray("participateUsernames")
+                    ?.let { parseUsernameArray(it) }
+                    ?: ManualDeviceControl.getCachedAccounts().map { it.username }
                 val result = kotlinx.coroutines.runBlocking {
                     AppCoordinator.switchToCloudClientMode(names)
                 }
@@ -366,9 +359,8 @@ object SimpleRemoteControl {
                 if (AppCoordinator.isBatchAccountSessionBusy()) {
                     return fail("session_busy", "多账号会话进行中，请稍候")
                 }
-                val username = body.optString("username", "").trim().removePrefix("@")
-                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                if (username.isBlank()) return fail("username_required", "请选择账号")
+                val username = tiktokUsernameFromBody(body, ManualDeviceControl.selectedManualUsername())
+                if (username.isEmpty()) return fail("username_required", "请选择账号")
                 val added = AppCoordinator.manualEnqueuePendingActivate(username)
                 ok(
                     if (added) "已加入待活跃队列：@$username" else "@$username 已在队列中",
@@ -433,9 +425,8 @@ object SimpleRemoteControl {
                 if (AppCoordinator.isBatchAccountSessionBusy()) {
                     return fail("session_busy", "多账号会话进行中，请稍候")
                 }
-                val username = body.optString("username", "").trim().removePrefix("@")
-                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                if (username.isBlank()) return fail("username_required", "请选择账号")
+                val username = tiktokUsernameFromBody(body, ManualDeviceControl.selectedManualUsername())
+                if (username.isEmpty()) return fail("username_required", "请选择账号")
                 val removed = AppCoordinator.manualRemovePendingActivate(username)
                 ok(
                     if (removed) "已移出待活跃队列：@$username" else "@$username 不在队列中",
@@ -739,19 +730,27 @@ object SimpleRemoteControl {
         return arr
     }
 
-    private fun parseUsernamesFromBody(body: JSONObject): List<String> {
+    /** TikTok / 素材账号：与 [CompanionApi.normalizeUsername] 对齐（trim + 去前导 @）。 */
+    private fun tiktokUsernameFromBody(body: JSONObject, fallback: String = ""): String =
+        CompanionApi.normalizeUsername(body.optString("username", ""))
+            .ifEmpty { CompanionApi.normalizeUsername(fallback) }
+
+    private fun parseUsernameArray(arr: JSONArray): List<String> {
         val names = mutableListOf<String>()
-        val arr = body.optJSONArray("usernames")
-            ?: body.optJSONArray("pendingUsernames")
-        if (arr != null) {
-            for (i in 0 until arr.length()) {
-                val u = arr.optString(i, "").trim().removePrefix("@")
-                if (u.isNotEmpty() && names.none { it.equals(u, ignoreCase = true) }) {
-                    names.add(u)
-                }
+        for (i in 0 until arr.length()) {
+            val u = CompanionApi.normalizeUsername(arr.optString(i, ""))
+            if (u.isNotEmpty() && names.none { it.equals(u, ignoreCase = true) }) {
+                names.add(u)
             }
         }
         return names
+    }
+
+    private fun parseUsernamesFromBody(body: JSONObject): List<String> {
+        val arr = body.optJSONArray("usernames")
+            ?: body.optJSONArray("pendingUsernames")
+            ?: return emptyList()
+        return parseUsernameArray(arr)
     }
 
     private fun resolveActivateMinutes(body: JSONObject): Int {

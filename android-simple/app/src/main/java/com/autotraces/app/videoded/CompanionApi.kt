@@ -30,19 +30,22 @@ object CompanionApi {
     private const val KEY_DEVICE_NAME = "device_name"
     private const val KEY_BACKEND_GROUP = "backend_group_name"
     private const val KEY_MATERIAL_USERNAME = "material_username"
+    private const val KEY_WINDOWS_BASE_URL = "windows_base_url"
+    private const val DEFAULT_WINDOWS_BASE_URL = "http://192.168.1.10:5088"
     private val gson = Gson()
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun normalizeUsername(raw: String?): String =
         raw?.trim()?.trimStart('@').orEmpty()
 
     fun getMaterialUsername(context: Context): String =
-        normalizeUsername(
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MATERIAL_USERNAME, null),
-        )
+        normalizeUsername(prefs(context).getString(KEY_MATERIAL_USERNAME, null))
 
     fun setMaterialUsername(context: Context, username: String?) {
         val normalized = normalizeUsername(username)
-        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        val editor = prefs(context).edit()
         if (normalized.isEmpty()) editor.remove(KEY_MATERIAL_USERNAME) else editor.putString(KEY_MATERIAL_USERNAME, normalized)
         editor.apply()
     }
@@ -176,20 +179,13 @@ object CompanionApi {
         return normalizeGroupName(reg.optString("groupName", ""))
     }
 
-    fun windowsBaseUrl(context: Context): String {
-        val prefs = context.getSharedPreferences("video_ded", Context.MODE_PRIVATE)
-        val url = prefs.getString("windows_base_url", "http://192.168.1.10:5088")!!
-        Log.d(TAG, "windowsBaseUrl=$url")
-        return url
-    }
+    fun windowsBaseUrl(context: Context): String =
+        prefs(context).getString(KEY_WINDOWS_BASE_URL, DEFAULT_WINDOWS_BASE_URL)!!
 
     fun setWindowsBaseUrl(context: Context, value: String) {
         val normalized = value.trim().trimEnd('/')
         Log.d(TAG, "setWindowsBaseUrl=$normalized")
-        context.getSharedPreferences("video_ded", Context.MODE_PRIVATE)
-            .edit()
-            .putString("windows_base_url", normalized)
-            .apply()
+        prefs(context).edit().putString(KEY_WINDOWS_BASE_URL, normalized).apply()
     }
 
     private fun deviceFolder(context: Context): File {

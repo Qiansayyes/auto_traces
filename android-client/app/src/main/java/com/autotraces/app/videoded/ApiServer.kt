@@ -248,9 +248,22 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
     private fun handleRequestVideos(session: IHTTPSession): Response {
         val body = JSONObject(readBody(session))
         val count = body.optInt("count", 1)
-        val username = CompanionApi.normalizeUsername(
-            body.optString("username", "").ifEmpty { body.optString("userName", "") },
-        )
+        val preferred = body.optString("username", "").ifEmpty { body.optString("userName", "") }
+        val alias = com.autotraces.app.PrefsStore.getAlias()
+        val preferredN = CompanionApi.normalizeUsername(preferred)
+        val username = when {
+            preferredN.isNotEmpty() &&
+                alias != null &&
+                preferredN.equals(CompanionApi.normalizeUsername(alias), ignoreCase = true) -> {
+                return jsonResponse(400, errorJson("username_is_device_alias"))
+            }
+            preferredN.isNotEmpty() -> preferredN
+            else -> CompanionApi.resolveMaterialUsername(
+                context,
+                preferred = null,
+                rejectEquals = alias,
+            )
+        }
         if (username.isEmpty()) {
             return jsonResponse(400, errorJson("username_required"))
         }

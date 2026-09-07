@@ -178,6 +178,7 @@ interface TraceExecutor {
      * OCR 在同一屏分别找「Change photo」「Name」「Bio」三词坐标并写日志（不点击）→
      * 同屏再严格找「Change photo」并首击（若无则整屏专段 OCR）→
      * 整屏「Upload photo」或「Select from Gallery」→「Allow all」（未命中但已见 Recents 则跳过 Allow）→OCR「Recents」稳定（6×0.5s，仅探测）→
+     * 首次命中后 Recents 右下方上滑一次催加载（等 1s，不因滑后重定位失败而判失败）→
      * 左上固定点→OCR「Next」×2（间隔 0.5s）→「Post this photo to Story」（至多 3 次，未命中跳过）→「Save」→
      * OCR 等待头像上传（含 uploading 则每 1s 轮询至消失；已见 Change photo 则跳过等待；逾时 360s 强停并重拉 TikTok）→
      * 最多 7 次 OCR 校验「Change photo」→Name→Bio 前 OCR 定位「TikTok」文案并点击复制（至多 3 次）→
@@ -1259,7 +1260,10 @@ class RealTraceExecutor(
         /** 修改基本资料：OCR「Post this photo to Story」最多次数（未命中仅跳过，不阻断后续 Save 等步骤）。 */
         private const val PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES = 3
 
-        /** Upload photo / Select from Gallery / Allow all 之后：OCR 确认「Recents」可见（相册界面稳定），仅探测不点击。 */
+        /**
+         * Upload photo / Select from Gallery / Allow all 之后：OCR 确认「Recents」可见（相册界面稳定），仅探测不点击。
+         * 首次命中后复用发作品手势上滑一次催加载，等 [PUBLISH_POST_RECENTS_LAYOUT_SWIPE_AFTER_DELAY_MS] 后直接左上选图（不重定位、不因滑失败判失败）。
+         */
         private const val PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES = 6
         private const val PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS = 500L
 
@@ -5681,7 +5685,8 @@ class RealTraceExecutor(
     }
 
     /**
-     * Upload photo / Allow all 之后：整屏 OCR 等待出现「Recents」（仅探测不点击），确认相册界面已稳定。
+     * Upload photo / Allow all 之后：整屏 OCR 等待出现「Recents」（仅探测不点击），确认相册界面已稳定；
+     * 首次命中后在 Recents 右下方上滑一次催加载，等 1s 后返回（不重定位 OCR，滑失败也不阻断，随后左上选图）。
      */
     private suspend fun profileEditWaitRecentsStable(
         ctx: Context,
@@ -5692,7 +5697,7 @@ class RealTraceExecutor(
         devOp(
             logAlias,
             "「修改基本资料」等待相册界面稳定：OCR「Recents」（最多 ${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES} 次，" +
-                "间隔 ${PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS}ms；命中后进入左上选图）",
+                "间隔 ${PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS}ms；命中后上滑催加载再左上选图）",
         )
         for (pass in 1..PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES) {
             if (hardStopOrNull(logAlias, "修改基本资料-Recents稳定")) return false
@@ -5720,10 +5725,22 @@ class RealTraceExecutor(
                 continue
             }
             profileEditLogStrictHit(logAlias, "Recents", "Recents", hit, w, h)
+            // 2B：仅上滑催加载；不点 Recents、不切 Pictures、滑后不重 OCR；su 滑失败也不判失败
+            val gesture = computePublishPostRecentsBelowUpSwipe(Rect(hit.rect), w, h)
             devOp(
                 logAlias,
-                "「修改基本资料」相册界面已稳定（已见 Recents，${pass}/${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES}）",
+                "「修改基本资料」相册已稳定（已见 Recents，${pass}/${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES}）；" +
+                    "上滑催加载 swipe (${gesture.startX},${gesture.startY})→(${gesture.endX},${gesture.endY}) ${gesture.swipeMs}ms",
             )
+            if (!runSuCommand(
+                    "input swipe ${gesture.startX} ${gesture.startY} ${gesture.endX} ${gesture.endY} ${gesture.swipeMs}",
+                )
+            ) {
+                devOp(logAlias, "「修改基本资料」Recents 稳定后上滑未成功（su），仍继续左上选图")
+            }
+            if (!profileEditDelay(logAlias, PUBLISH_POST_RECENTS_LAYOUT_SWIPE_AFTER_DELAY_MS, "Recents上滑后")) {
+                return false
+            }
             return true
         }
         devOp(
@@ -6495,7 +6512,7 @@ class RealTraceExecutor(
                 "OCR 分别记录「Change photo」「Name」「Bio」三词坐标（不点）→" +
                 "同屏严格「Change photo」首击（若无则专段整屏 OCR）→" +
                 "整屏「Upload photo」或「Select from Gallery」（OCR 最多 3 次）→「Allow all」（最多 ${PROFILE_EDIT_ALLOW_ALL_OCR_MAX_PASSES} 次；未见 Allow 但已见 Recents 则跳过）→" +
-                "OCR「Recents」稳定（${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES}×${PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS}ms）→" +
+                "OCR「Recents」稳定（${PROFILE_EDIT_RECENTS_STABLE_OCR_MAX_PASSES}×${PROFILE_EDIT_RECENTS_STABLE_OCR_DELAY_MS}ms）→上滑催加载(1s)→" +
                 "左上固定点→Next×2（间隔 0.5s）→Post this photo to Story(≤${PROFILE_EDIT_POST_STORY_OCR_MAX_PASSES}，未命中跳过)→Save→" +
                 "uploading 轮询(1s,≤60s,超时强停重拉)→OCR「Change photo」校验至多 7 次→Name→" +
                 "Bio 前 OCR 点 TikTok 文案(≤3)→Bio(模板+剪贴板比对)→" +
