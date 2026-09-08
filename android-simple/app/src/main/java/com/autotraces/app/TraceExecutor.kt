@@ -13326,11 +13326,11 @@ class RealTraceExecutor(
         suspend fun settleAfterUsersTabClick(): Boolean {
             if (isLiveModeForUsersCheck) {
                 ensureUsersTabReadyForLiveMode(service)
-            } else {
-                // 非主播模式：剥离无障碍后仅靠坐标+OCR，Users 列表需更充分渲染后再截屏
-                delay(2800)
+                return true
             }
-            return true
+            // 非主播模式：等 Users 标签下方到屏幕中部出现文案，再进入列表匹配
+            // false 仅表示硬停/让出；超时也会返回 true 并继续
+            return waitUsersListContentReady(service)
         }
 
         if (ensureUsersTabClicked(service)) {
@@ -17476,15 +17476,98 @@ class RealTraceExecutor(
         }
         if (isLiveModeForUsersCheck) {
             ensureUsersTabReadyForLiveMode(service)
-        } else {
-            delay(2800)
+            return true
         }
+        // false 仅硬停/让出；超时也返回 true，由后续匹配自行处理空白页
+        return waitUsersListContentReady(service)
+    }
+
+    /**
+     * 点击 Users 后：标签下方到屏幕中部是否已有文案。
+     * 无文案 = 列表仍在加载；有文案 = 已出结果区，可开始匹配 username。
+     */
+    private suspend fun probeUsersListContentBelowTab(service: Context): Boolean {
+        val screenshotFile = File(service.cacheDir, "users_list_content_probe.png")
+        if (!runSuCommand("screencap -p ${screenshotFile.absolutePath}")) return false
+        val bitmap = BitmapFactory.decodeFile(screenshotFile.absolutePath) ?: run {
+            screenshotFile.delete()
+            return false
+        }
+        observeAccountStatusOnScreenshot(service, bitmap, "users_list_content_probe")
+        val height = bitmap.height
+        val width = bitmap.width
+        // 标签行大约在顶部 12%~18%；探测「标签下方 → 屏幕中部」
+        val cropTop = (height * 0.18f).toInt().coerceAtLeast(0)
+        val cropBottom = (height * 0.50f).toInt().coerceAtMost(height)
+        val cropHeight = (cropBottom - cropTop).coerceAtLeast(1)
+        val cropped = Bitmap.createBitmap(bitmap, 0, cropTop, width, cropHeight)
+        val image = InputImage.fromBitmap(cropped, 0)
+        return try {
+            val result = MlKitOcrGate.recognize(image)
+            val texts = result.textBlocks
+                .flatMap { it.lines }
+                .map { it.text.trim() }
+                .filter { it.isNotEmpty() }
+            fun isTabNoise(t: String): Boolean {
+                val w = t.trim()
+                return w.equals("Top", ignoreCase = true) ||
+                    w.equals("Users", ignoreCase = true) ||
+                    w.equals("User", ignoreCase = true) ||
+                    w.equals("Videos", ignoreCase = true) ||
+                    w.equals("Photos", ignoreCase = true) ||
+                    w.equals("Shop", ignoreCase = true) ||
+                    w.equals("Sounds", ignoreCase = true) ||
+                    w.equals("Ask", ignoreCase = true) ||
+                    w.equals("用户", ignoreCase = true)
+            }
+            texts.any { !isTabNoise(it) }
+        } catch (ex: Exception) {
+            rethrowTaskLogoutIfNeeded(ex)
+            false
+        } finally {
+            bitmap.recycle()
+            cropped.recycle()
+            screenshotFile.delete()
+        }
+    }
+
+    /**
+     * 等 Users 列表内容区出现文案后再匹配用户名。
+     * @return false 仅硬停/让出应中止；已加载或超时均返回 true（超时仍继续尝试匹配）。
+     */
+    private suspend fun waitUsersListContentReady(
+        service: Context,
+        timeoutMs: Long = 8000L,
+        pollMs: Long = 600L,
+    ): Boolean {
+        val alias = PrefsStore.getAlias() ?: "unknown"
+        if (hardStopOrNull(alias, "Users列表加载等待")) return false
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(0L)
+        var attempt = 0
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (hardStopOrNull(alias, "Users列表加载等待")) return false
+            if (growthYieldOrNull(alias, "Users列表加载等待")) return false
+            attempt++
+            if (probeUsersListContentBelowTab(service)) {
+                devOp(alias, "Users 列表内容已加载（标签下方到中部有文案，探测第 ${attempt} 次）")
+                return true
+            }
+            if (attempt == 1 || attempt % 3 == 0) {
+                devOp(alias, "Users 列表加载中：标签下方到屏幕中部无文案，继续等待（第 ${attempt} 次）")
+            }
+            val left = deadline - SystemClock.elapsedRealtime()
+            if (left <= 0L) break
+            if (!growthDelay(alias, minOf(pollMs, left), "Users列表加载等待")) return false
+        }
+        devOp(alias, "Users 列表加载等待超时（标签下方到中部仍无文案），仍按当前画面尝试匹配")
         return true
     }
 
     /**
      * 在 Users 列表区域用 OCR 查找包含目标用户名的行，返回该行点击点（屏幕坐标，偏左）。
      * 每一段（首次进入列表，或「回首页后重新打开搜索」后）最多 **3 次** OCR。
+     * 点击 Users / 重进列表后先等「标签下方到中部」出现文案，再匹配 username：
+     * 无文案视为加载中（不计入「未匹配」连续失败）；有文案但找不到目标才算未匹配。
      * 连续 3 次未匹配：先 OCR 重找 Users 标签并点击，再额外做 2 次列表匹配；
      * **第一段**仍失败则导航返回回首页（一次双返→OCR；未见再单返→OCR；退 App 则重开不强关），
      * 再重新进入搜索与 Users 列表，开启**第二段**（仍先 Users 重试，再列表 OCR）；
@@ -17503,15 +17586,17 @@ class RealTraceExecutor(
             return null
         }
 
-        val firstWaitMs = 3500L
         val betweenRetryMs = 3000L
         val maxAttemptsPerSegment = 3
+        val maxEmptyLoadSoftRetries = 4
 
         var lastHadText = false
         var lastPreview = ""
         var consecutiveFailures = 0
-        var needLongSettleBeforeOcr = true
+        var needContentReadyBeforeOcr = true
+        var skipBetweenRetryDelay = false
         var ocrInSegment = 0
+        var emptyLoadSoftRetries = 0
         var didRecoverHomeAfterTripleMiss = false
         var didUsersTabOcrRetryBeforeRecover = false
 
@@ -17521,13 +17606,20 @@ class RealTraceExecutor(
                     didUsersTabOcrRetryBeforeRecover = true
                     devOp(alias, "Users 列表 OCR 连续 3 次未匹配，OCR 重新定位 Users 标签并点击后再试 2 次列表匹配")
                     if (ensureUsersTabClicked(service)) {
-                        delay(betweenRetryMs)
-                        repeat(2) {
+                        if (!waitUsersListContentReady(service)) return null
+                        repeat(2) { retryIdx ->
                             val retryResult = runUserListOcrSingleAttempt(service, username)
                             lastHadText = retryResult.hadRecognizedText
                             lastPreview = retryResult.preview
                             if (retryResult.point != null) {
                                 return retryResult.point
+                            }
+                            if (retryIdx >= 1) return@repeat
+                            // 补试阶段：无文案仍先等内容，避免把加载中当成未匹配
+                            if (!retryResult.hadRecognizedText) {
+                                if (!waitUsersListContentReady(service, timeoutMs = 5000L)) return null
+                            } else if (!growthDelay(alias, betweenRetryMs, "Users列表补试间隔")) {
+                                return null
                             }
                         }
                     } else {
@@ -17555,8 +17647,10 @@ class RealTraceExecutor(
                 didRecoverHomeAfterTripleMiss = true
                 consecutiveFailures = 0
                 ocrInSegment = 0
+                emptyLoadSoftRetries = 0
                 didUsersTabOcrRetryBeforeRecover = false
-                needLongSettleBeforeOcr = true
+                needContentReadyBeforeOcr = true
+                skipBetweenRetryDelay = false
                 continue
             }
 
@@ -17564,24 +17658,49 @@ class RealTraceExecutor(
                 break
             }
 
-            if (needLongSettleBeforeOcr) {
-                delay(firstWaitMs)
-                needLongSettleBeforeOcr = false
-            } else {
-                delay(betweenRetryMs)
+            if (needContentReadyBeforeOcr) {
+                if (!waitUsersListContentReady(service)) return null
+                needContentReadyBeforeOcr = false
+                skipBetweenRetryDelay = false
+            } else if (skipBetweenRetryDelay) {
+                skipBetweenRetryDelay = false
+            } else if (!growthDelay(alias, betweenRetryMs, "Users列表OCR重试间隔")) {
+                return null
             }
             val result = runUserListOcrSingleAttempt(service, username)
             lastHadText = result.hadRecognizedText
             lastPreview = result.preview
-            ocrInSegment++
             if (result.point != null) {
                 return result.point
             }
+            if (!result.hadRecognizedText) {
+                // 加载中：不计入「未匹配」连续失败，继续等内容后再探
+                emptyLoadSoftRetries++
+                devOp(
+                    alias,
+                    "Users 列表 OCR 未见文案，判定为加载中（软重试 $emptyLoadSoftRetries/$maxEmptyLoadSoftRetries）",
+                )
+                if (emptyLoadSoftRetries >= maxEmptyLoadSoftRetries) {
+                    ocrInSegment++
+                    consecutiveFailures++
+                    emptyLoadSoftRetries = 0
+                    needContentReadyBeforeOcr = true
+                    skipBetweenRetryDelay = false
+                } else {
+                    if (!waitUsersListContentReady(service, timeoutMs = 5000L)) return null
+                    // 刚等内容结束，下一轮不要再叠一层 betweenRetryMs
+                    skipBetweenRetryDelay = true
+                }
+                continue
+            }
+            emptyLoadSoftRetries = 0
+            ocrInSegment++
             consecutiveFailures++
         }
         devOp(
             alias,
-            if (!lastHadText) "Users 列表多次 OCR 仍无文字，匹配失败" else "Users 列表有文字但未匹配到用户名",
+            if (!lastHadText) "Users 列表多次 OCR 仍无文字（加载超时/空白），匹配失败"
+            else "Users 列表有文字但未匹配到用户名",
         )
         return null
     }
