@@ -40,8 +40,13 @@ def _ensure_tiktok_cookies_env() -> None:
     search_dirs: list[Path] = [
         _PROJECT_ROOT,
         _SERVER_DIR,
+        Path(os.environ.get("AUTO_UPLOAD_DIR") or "").expanduser()
+        if (os.environ.get("AUTO_UPLOAD_DIR") or "").strip()
+        else _SERVER_DIR,
+        Path("/opt/auto_traces/auto_upload"),
         Path(r"D:\autoGroup\auto_upload"),
         _PROJECT_ROOT.parent / "auto_upload",
+        _PROJECT_ROOT / "auto_upload",
     ]
     try:
         search_dirs.append(_autosearch_script_path().parent)

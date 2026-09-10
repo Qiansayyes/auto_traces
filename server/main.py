@@ -37,34 +37,102 @@ from tiktok_universal_snapshot import (
     tiktok_universal_extract_to_json_dict,
 )
 
-_AUTO_UPLOAD_DIR = Path(r"D:\autoGroup\auto_upload")
 _AUTO_UPLOAD_SCRAPE_MOD = None
 
 
+def _auto_upload_candidate_dirs() -> list[Path]:
+    """Windows 本机 / Linux VPS / 环境变量均可解析到 auto_upload。"""
+    dirs: list[Path] = []
+    env_dir = (os.environ.get("AUTO_UPLOAD_DIR") or "").strip()
+    if env_dir:
+        dirs.append(Path(env_dir))
+    project_root = Path(__file__).resolve().parents[1]
+    dirs.extend(
+        [
+            project_root.parent / "auto_upload",
+            Path("/opt/auto_traces/auto_upload"),
+            Path(r"D:\autoGroup\auto_upload"),
+            project_root / "auto_upload",
+        ]
+    )
+    seen: set[str] = set()
+    out: list[Path] = []
+    for base in dirs:
+        try:
+            key = str(base.resolve())
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(base)
+    return out
+
+
+def _ensure_scrape_cookie_env() -> None:
+    """未显式配置时，把可找到的 tiktok_cookies.* 注入 TIKTOK_COOKIES_FILE。"""
+    if (os.environ.get("TIKTOK_COOKIES_FILE") or "").strip():
+        return
+    search_dirs = [Path(__file__).resolve().parents[1], Path(__file__).resolve().parent]
+    search_dirs.extend(_auto_upload_candidate_dirs())
+    seen: set[str] = set()
+    for base in search_dirs:
+        try:
+            key = str(base.resolve())
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        for name in ("tiktok_cookies.json", "tiktok_cookies.txt"):
+            candidate = base / name
+            if candidate.is_file():
+                os.environ["TIKTOK_COOKIES_FILE"] = str(candidate.resolve())
+                return
+
+
 def _load_auto_upload_scrape_module():
-    """直接复用 tiktok_auto_publish_fast.py 的查询实现，避免两套解析逻辑漂移。"""
+    """
+    优先复用 tiktok_auto_publish_fast.py；
+    VPS 上没有该文件时，回退到同目录自包含模块 tiktok_profile_scrape.py。
+    """
     global _AUTO_UPLOAD_SCRAPE_MOD
     if _AUTO_UPLOAD_SCRAPE_MOD is not None:
         return _AUTO_UPLOAD_SCRAPE_MOD
-    script = _AUTO_UPLOAD_DIR / "tiktok_auto_publish_fast.py"
-    if not script.is_file():
-        raise FileNotFoundError(f"未找到 {script}")
-    upload_dir = str(_AUTO_UPLOAD_DIR.resolve())
-    if upload_dir not in sys.path:
-        sys.path.insert(0, upload_dir)
-    # 强制与发布工具同一 Cookie 文件
-    cookie_json = _AUTO_UPLOAD_DIR / "tiktok_cookies.json"
-    if cookie_json.is_file():
-        os.environ["TIKTOK_COOKIES_FILE"] = str(cookie_json.resolve())
+
+    _ensure_scrape_cookie_env()
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("tiktok_auto_publish_fast_runtime", script)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载 {script}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _AUTO_UPLOAD_SCRAPE_MOD = mod
-    return mod
+    tried: list[str] = []
+    candidates: list[Path] = []
+    for upload_dir in _auto_upload_candidate_dirs():
+        candidates.append(upload_dir / "tiktok_auto_publish_fast.py")
+    candidates.append(Path(__file__).resolve().parent / "tiktok_profile_scrape.py")
+
+    for script in candidates:
+        tried.append(str(script))
+        if not script.is_file():
+            continue
+        upload_dir = str(script.parent.resolve())
+        if upload_dir not in sys.path:
+            sys.path.insert(0, upload_dir)
+        cookie_json = script.parent / "tiktok_cookies.json"
+        if cookie_json.is_file() and not (os.environ.get("TIKTOK_COOKIES_FILE") or "").strip():
+            os.environ["TIKTOK_COOKIES_FILE"] = str(cookie_json.resolve())
+        spec = importlib.util.spec_from_file_location("tiktok_auto_publish_fast_runtime", script)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not hasattr(mod, "scrape_tiktok_profile_by_username"):
+            continue
+        _AUTO_UPLOAD_SCRAPE_MOD = mod
+        return mod
+
+    raise FileNotFoundError(
+        "未找到可用的 TikTok 查询实现（tiktok_auto_publish_fast.py / tiktok_profile_scrape.py）。"
+        f" 已尝试: {tried}"
+    )
 
 
 def _scrape_profile_via_auto_upload_fast(username: str) -> tuple[Optional[dict], str, Optional[str], bool]:
@@ -18296,7 +18364,7 @@ def download_account_stats_query_logs(
     header = [
         f"# 账号统计查询日志 | 导出时间={now_text()} | 当前用户={owner}",
         f"# 当前 Cookie 状态：{_account_stats_query_cookie_probe_line()}",
-        f"# Cookie 查找顺序：项目根目录 / server / auto_upload (D:\\autoGroup\\auto_upload)",
+        f"# Cookie 查找顺序：TIKTOK_COOKIES_FILE / 项目根 / server / AUTO_UPLOAD_DIR /opt/auto_traces/auto_upload / D:\\\\autoGroup\\\\auto_upload",
         "",
     ]
     body_lines = header + (filtered if filtered else ["(暂无查询日志，请先执行一次「全量查询并落库」或等待定时查询触发)"])
