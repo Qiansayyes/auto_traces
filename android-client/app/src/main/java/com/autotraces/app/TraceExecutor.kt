@@ -1308,17 +1308,99 @@ class RealTraceExecutor(
         return if (pm.resolveActivity(fallbackIntent, 0) != null) fallbackIntent else null
     }
 
+    /**
+     * 部分 ROM（如 Lineage/MI6）上 `am start ... -p pkg` 会打印
+     * `Error: Activity not started, unable to resolve Intent`，但进程仍 exit=0。
+     * 因此不能只看 exit code，必须解析输出判断是否真的拉起成功。
+     */
+    private fun isRootLaunchOutputSuccessful(command: String, output: String): Boolean {
+        val text = output.trim()
+        if (text.isEmpty()) return false
+        val lower = text.lowercase()
+        // 热启动常见：目标已在栈顶。文案含 "Activity not started"，但是成功，不是 Error。
+        if (
+            lower.contains("currently running top-most") ||
+            lower.contains("intent has been delivered to currently running")
+        ) {
+            return true
+        }
+        if (
+            lower.contains("error:") ||
+            lower.contains("unable to resolve") ||
+            lower.contains("activity not started") ||
+            lower.contains("does not exist") ||
+            lower.contains("permission denial") ||
+            lower.contains("security exception") ||
+            lower.contains("no activities found") ||
+            lower.contains("aborted")
+        ) {
+            return false
+        }
+        return when {
+            command.startsWith("monkey ") ->
+                lower.contains("events injected")
+            command.startsWith("am start") ->
+                lower.contains("status: ok") ||
+                    (lower.contains("starting:") && lower.contains("complete")) ||
+                    (lower.contains("starting:") && !lower.contains("error"))
+            else -> true
+        }
+    }
+
+    private fun runRootLaunchCommandChecked(command: String): Boolean {
+        val out = runSuCommandWithOutputMerged(command) ?: return false
+        return isRootLaunchOutputSuccessful(command, out)
+    }
+
+    /** 用 cmd package 解析 MAIN/LAUNCHER 组件（比 am start -p 更稳）。 */
+    private fun resolveLauncherComponent(pkg: String): String? {
+        val out = runSuCommandWithOutputMerged(
+            "cmd package resolve-activity --brief " +
+                "-a android.intent.action.MAIN " +
+                "-c android.intent.category.LAUNCHER $pkg",
+        ) ?: return null
+        return out.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { line ->
+                line.startsWith(pkg) && line.contains('/') && !line.contains('=') && !line.contains(' ')
+            }
+    }
+
+    private fun knownTikTokLaunchComponents(pkg: String): List<String> =
+        listOf(
+            "$pkg/com.ss.android.ugc.aweme.splash.SplashActivity",
+            "$pkg/com.ss.android.ugc.aweme.main.MainActivity",
+        )
+
+    /**
+     * 通用 root 拉起：显式组件 → monkey → 隐式 am start -p。
+     * 每条命令按输出判成败，避免「exit=0 但未真正启动」。
+     */
+    private fun runPackageRootLaunchCommands(
+        pkg: String,
+        knownComponents: List<String> = emptyList(),
+    ): Boolean {
+        val commands = LinkedHashSet<String>()
+        resolveLauncherComponent(pkg)?.let { comp ->
+            commands += "am start -W -n $comp"
+        }
+        commands += "monkey -p $pkg -c android.intent.category.LAUNCHER 1"
+        knownComponents.forEach { comp ->
+            commands += "am start -W -n $comp"
+        }
+        commands +=
+            "am start -W -a android.intent.action.MAIN " +
+                "-c android.intent.category.LAUNCHER -p $pkg"
+        for (command in commands) {
+            if (runRootLaunchCommandChecked(command)) return true
+        }
+        return false
+    }
+
     /** 仅执行 root 拉起命令（不含等待与前台校验）；强停由调用方按需处理。 */
     private fun runTikTokRootLaunchCommands(): Boolean {
         val pkg = Config.TIKTOK_PACKAGE_NAME
-        val commands = listOf(
-            "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $pkg",
-            "monkey -p $pkg -c android.intent.category.LAUNCHER 1",
-        )
-        for (command in commands) {
-            if (runSuCommand(command)) return true
-        }
-        return false
+        return runPackageRootLaunchCommands(pkg, knownTikTokLaunchComponents(pkg))
     }
 
     private fun isHostAppInForeground(): Boolean =
@@ -1341,13 +1423,7 @@ class RealTraceExecutor(
         }
         runCatching { ctx.startActivity(intent) }
 
-        if (runSuCommand(
-                "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $hostPkg",
-            )
-        ) {
-            return true
-        }
-        return runSuCommand("monkey -p $hostPkg -c android.intent.category.LAUNCHER 1")
+        return runPackageRootLaunchCommands(hostPkg)
     }
 
     /**
@@ -11055,8 +11131,10 @@ class RealTraceExecutor(
                 false
             }
         }.getOrDefault(false) ||
-            runSuCommand("am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $pkg") ||
-            runSuCommand("monkey -p $pkg -c android.intent.category.LAUNCHER 1")
+            runPackageRootLaunchCommands(
+                pkg,
+                if (pkg == Config.TIKTOK_PACKAGE_NAME) knownTikTokLaunchComponents(pkg) else emptyList(),
+            )
         if (!launchOk) {
             devOp(alias, "发作品：拉起失败（包名=$pkg）")
             return false
