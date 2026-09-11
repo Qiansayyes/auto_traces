@@ -644,6 +644,12 @@ class RealTraceExecutor(
 
     /** 最近一次 [runPublishPostEntryFlow] 失败原因（供 [executeForUsername] 返回与 ledger 对账）。 */
     private var lastPublishPostEntryFailureReason: String? = null
+    /**
+     * TikTok 选图页 OCR 见到空相册文案（No photos / No media）。
+     * 磁盘/MediaStore 仍可能有 shell 幽灵文件，复检会误判「有素材」从而死循环强关重启。
+     */
+    @Volatile
+    private var lastPublishPostTikTokGalleryEmptyHint: Boolean = false
 
     /** 引流：作者区 + Followers 列表 Follow 累计计数（本会话，共用上限）。 */
     private var mutualSessionFollowTapCount: Int = 0
@@ -8383,6 +8389,7 @@ class RealTraceExecutor(
                 val accountKeyForResume =
                     PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
                 lastPublishPostEntryFailureReason = null
+                lastPublishPostTikTokGalleryEmptyHint = false
                 val ok = runPublishPostEntryFlow(service, pkg, config)
                 if (ok) {
                     PrefsStore.clearPublishPostResumeProgress(accountKeyForResume)
@@ -11390,6 +11397,15 @@ class RealTraceExecutor(
         }
     }
 
+    /** TikTok 选图页空态：磁盘有文件也不可见（IS_PENDING/shell 幽灵或权限）。 */
+    private fun publishPostOcrIndicatesEmptyTikTokGallery(ocrPreview: String): Boolean {
+        val s = ocrPreview.lowercase(Locale.US)
+        return s.contains("no photos or videos available") ||
+            s.contains("no media") ||
+            s.contains("no photos") ||
+            s.contains("no videos available")
+    }
+
     /** 找相册 Recents（含 Recents v）；点标题时取最上方，避免点到下拉列表第一项。 */
     private fun findPublishPostRecentsHit(result: Text, topmost: Boolean = true): StrictLabelHit? {
         var best: StrictLabelHit? = null
@@ -11542,6 +11558,14 @@ class RealTraceExecutor(
             return PublishPostRecentsProbeOutcome(ok = false)
         }
         val recentsPreview = buildProfileEditOcrPreview(vision)
+        if (publishPostOcrIndicatesEmptyTikTokGallery(recentsPreview)) {
+            lastPublishPostTikTokGalleryEmptyHint = true
+            lastPublishPostEntryFailureReason = "TikTok选图页无可见素材（OCR: No photos/No media）"
+            devOp(
+                alias,
+                "发作品：TikTok 选图页判定为空相册（$recentsPreview），将按素材不可见处理，禁止仅凭磁盘计数空转重启 [$ocrTag]",
+            )
+        }
         devOp(
             alias,
             "发作品：Recents 探测 OCR 文案=$recentsPreview [$ocrTag]",
@@ -12502,6 +12526,7 @@ class RealTraceExecutor(
         withAccountStatusOcrWatch {
         val alias = PrefsStore.getAlias() ?: "unknown"
         lastPublishPostEntryFailureReason = null
+        lastPublishPostTikTokGalleryEmptyHint = false
         val accountKey =
             PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() } ?: alias
         val resumeStartIdx = PrefsStore.getPublishPostResumeNextIndex(accountKey)
@@ -12724,13 +12749,35 @@ class RealTraceExecutor(
                                 )
                             }
                         }
-                        val emptyAfterEntry = publishPostResolveGalleryMaterialStats().resolvedCount <= 0
-                        if (emptyAfterEntry) {
-                            lastPublishPostEntryFailureReason = "图库无可用素材（入口失败后复检）"
+                        val diskEmpty = publishPostResolveGalleryMaterialStats().resolvedCount <= 0
+                        val tiktokEmpty = lastPublishPostTikTokGalleryEmptyHint
+                        if (diskEmpty || tiktokEmpty) {
+                            lastPublishPostEntryFailureReason =
+                                if (tiktokEmpty && !diskEmpty) {
+                                    "TikTok选图页无可见素材（磁盘有文件但不可见，强制清库重拉）"
+                                } else {
+                                    "图库无可用素材（入口失败后复检）"
+                                }
+                            lastPublishPostTikTokGalleryEmptyHint = false
                             devOp(
                                 alias,
-                                "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败，复检判定为无视频/无素材导致，准备补拉后重试",
+                                "发作品 第 ${videoIndex + 1}/$publishRounds 条：资料入口阶段失败，" +
+                                    if (tiktokEmpty && !diskEmpty) {
+                                        "TikTok 选图页空但磁盘仍有文件（多为 IS_PENDING/shell 幽灵），强制清库补拉后重试"
+                                    } else {
+                                        "复检判定为无视频/无素材导致，准备补拉后重试"
+                                    },
                             )
+                            if (tiktokEmpty && !diskEmpty) {
+                                // 磁盘幽灵会让「仅缺则补」短路；先清再拉
+                                runCatching {
+                                    deleteAllPicturesOnDevice(
+                                        alias,
+                                        "发作品 TikTok空相册强制清库",
+                                        includeDcimCameraAlbum = true,
+                                    )
+                                }
+                            }
                             if (
                                 !publishPostRefillMaterialsOnRetryIfMissing(
                                     service = service,
@@ -13698,6 +13745,7 @@ class RealTraceExecutor(
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.RELATIVE_PATH,
             MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.IS_PENDING,
         )
         var count = 0
         for (collection in picturesMediaStoreCollections()) {
@@ -13705,7 +13753,10 @@ class RealTraceExecutor(
                 val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
                 val relCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
                 val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+                val pendingCol = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
                 while (cursor.moveToNext()) {
+                    // IS_PENDING=1 对第三方（TikTok）不可见，不能算作可用素材
+                    if (pendingCol >= 0 && cursor.getInt(pendingCol) != 0) continue
                     val rel = cursor.getString(relCol)
                     val data = cursor.getString(dataCol)
                     if (excludeAutoTraces && publishPostIsAutoTracesMediaPath(rel, data)) continue

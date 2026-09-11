@@ -58,25 +58,55 @@ object GalleryMediaPublisher {
         uris
     }
 
-    /** 文件已在公共目录（USB push 落点），触发媒体库扫描即可。 */
+    /**
+     * 文件已在公共目录（USB `adb push` 落点）。
+     * 不能只 `MediaScannerConnection.scanFile`：shell/root push 的文件常被标成
+     * `IS_PENDING`/owner=shell，系统相册可见但 TikTok 选图页看不到。
+     * 改为经本 App MediaStore 正式写入（IS_PENDING 1→写流→0），再删掉 push 原文件。
+     */
     suspend fun scanExistingFiles(context: Context, root: File, fileNames: List<String>) {
         if (fileNames.isEmpty()) return
         withContext(Dispatchers.IO) {
-            val paths = fileNames.map { File(root, it).absolutePath }.filter { File(it).isFile }.toTypedArray()
-            if (paths.isEmpty()) return@withContext
-            val mimes = fileNames.map { mimeForFileName(it) }.toTypedArray()
-            suspendCancellableCoroutine { cont ->
-                MediaScannerConnection.scanFile(context, paths, mimes) { _, _ ->
-                    cont.resume(Unit)
+            val app = context.applicationContext
+            for (name in fileNames) {
+                val src = File(root, name)
+                if (!src.isFile) continue
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // 必须先拷到私有缓存：purge MediaStore 常会级联删掉 Pictures 下的 push 原文件
+                    val staging = File(app.cacheDir, "usb_repub_${System.nanoTime()}_$name")
+                    try {
+                        src.copyTo(staging, overwrite = true)
+                        purgePicturesVideoByDisplayName(app, name)
+                        runCatching { if (src.exists()) src.delete() }
+                        insertMediaStoreQPlus(app, staging, name)
+                    } finally {
+                        runCatching { staging.delete() }
+                    }
+                } else {
+                    insertLegacyPublicCopy(app, src, name)
                 }
             }
         }
+    }
+
+    /** 删除 Pictures 下同名视频的 MediaStore 行（会级联删文件时仅删索引行对应项）。 */
+    private fun purgePicturesVideoByDisplayName(context: Context, displayName: String) {
+        val resolver = context.contentResolver
+        val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val selection =
+            "${MediaStore.Video.Media.DISPLAY_NAME}=? AND (" +
+                "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR " +
+                "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?" +
+                ")"
+        val args = arrayOf(displayName, "Pictures/", "Pictures/%")
+        runCatching { resolver.delete(collection, selection, args) }
     }
 
     private fun insertMediaStoreQPlus(context: Context, source: File, displayName: String): Uri {
         val resolver = context.contentResolver
         val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val mime = mimeForFileName(displayName)
+        // IS_PENDING=1 是 Android Q+ 正规两步写：占位→写字节→清 0。绝不能停在 1。
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Video.Media.MIME_TYPE, mime)
@@ -84,11 +114,17 @@ object GalleryMediaPublisher {
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
         val uri = resolver.insert(collection, values) ?: error("mediastore_insert_failed")
-        resolver.openOutputStream(uri)?.use { out ->
-            FileInputStream(source).use { input -> input.copyTo(out) }
-        } ?: error("mediastore_open_output_failed")
-        val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-        resolver.update(uri, done, null, null)
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                FileInputStream(source).use { input -> input.copyTo(out) }
+            } ?: error("mediastore_open_output_failed")
+            val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+            val updated = resolver.update(uri, done, null, null)
+            if (updated <= 0) error("mediastore_clear_pending_failed")
+        } catch (t: Throwable) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw t
+        }
         return uri
     }
 
