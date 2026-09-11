@@ -9092,11 +9092,11 @@ object AppCoordinator {
 
     private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
         clearMutualClickStateForInterrupt("掉登录($source)")
-        LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录（来源=$source）")
+        LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录并接回原步骤（来源=$source）")
         executor.setAccountStatusReloginInProgress(true)
         val opId = "acct_status_${System.currentTimeMillis()}"
         return try {
-            ensureAccountLoggedIn(
+            val ok = ensureAccountLoggedIn(
                 alias = alias,
                 deviceId = deviceId,
                 opId = opId,
@@ -9104,6 +9104,14 @@ object AppCoordinator {
                 strict = true,
                 forceRelogin = true,
             )
+            // 无 OK 路径会 pm clear 并清掉 firstLoginDone；重登成功须重新标就绪，否则手动涨粉/独占任务被卡住
+            if (ok && ManualDeviceControl.ENABLED) {
+                val u = ManualDeviceControl.activeManualUsername()
+                    .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                    .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
+                if (u.isNotBlank()) markManualAccountReady(u, "掉登录恢复自动登录($source)")
+            }
+            ok
         } catch (banned: AccountBannedException) {
             handleAccountBanned(alias, deviceId, banned.username, "掉登录恢复($source)")
             false
@@ -9225,7 +9233,8 @@ object AppCoordinator {
     }
 
     /**
-     * Account status 弹窗路径会先点 OK 并冷启；Add another account / 登录状态保障路径则直接从当前登录入口续接。
+     * Account status：有 OK 则点 OK 并冷启；无 OK 则强停 + pm clear 后冷启。
+     * 随后走完整自动登录；Add another account / 登录状态保障路径则直接从当前登录入口续接。
      */
     private suspend fun recoverFromSafeguardStyleLogout(alias: String, deviceId: String, source: String): Boolean {
         LogCenter.op(
@@ -13804,7 +13813,15 @@ object AppCoordinator {
                     reason = "掉登录后",
                     forceRelogin = true,
                 )
-                if (!recovered) {
+                if (recovered) {
+                    // 无 OK 清数据会清 firstLoginDone；重登成功后标就绪，避免后续手动任务被闸门挡住
+                    if (ManualDeviceControl.ENABLED) {
+                        val u = username.trim().removePrefix("@")
+                            .ifBlank { ManualDeviceControl.activeManualUsername() }
+                            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+                        if (u.isNotBlank()) markManualAccountReady(u, "涨粉掉登录后自动登录")
+                    }
+                } else {
                     pauseGrowthAfterLoginFailure(alias, deviceId, "Account status 掉登录后自动登录未恢复，已保留 $username 等待重登")
                 }
                 return

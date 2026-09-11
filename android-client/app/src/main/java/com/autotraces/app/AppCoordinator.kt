@@ -4898,7 +4898,7 @@ object AppCoordinator {
     }
 
     private suspend fun recoverFromAccountStatusLogout(alias: String, deviceId: String, source: String): Boolean {
-        LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录（来源=$source）")
+        LogCenter.op(alias, "掉登录恢复：终止当前步骤，重新自动登录并接回原步骤（来源=$source）")
         executor.setAccountStatusReloginInProgress(true)
         val opId = "acct_status_${System.currentTimeMillis()}"
         return ensureAccountLoggedIn(
@@ -4912,7 +4912,8 @@ object AppCoordinator {
     }
 
     /**
-     * Account status 弹窗路径会先点 OK 并冷启；Add another account / 登录状态保障路径则直接从当前登录入口续接。
+     * Account status：有 OK 则点 OK 并冷启；无 OK 则强停 + pm clear 后冷启。
+     * 随后走完整自动登录；Add another account / 登录状态保障路径则直接从当前登录入口续接。
      */
     private suspend fun recoverFromSafeguardStyleLogout(alias: String, deviceId: String, source: String): Boolean {
         LogCenter.op(

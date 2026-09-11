@@ -43,7 +43,10 @@ class GrowthFlowRestartRequired(message: String) : RuntimeException(message)
 /** 互点/发作品等路径在登录状态保障阶段需自动登录时返回此常量，由协调器触发登录。 */
 const val SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE = "__SAFEGUARD_REQUIRES_AUTO_LOGIN__"
 
-/** TikTok「Account status / 已登出」弹窗：已在设备端点 OK、强停并冷启，需中止当前步骤并重新自动登录。 */
+/**
+ * TikTok「Account status / 已登出」弹窗：已在设备端处理（有 OK 则点 OK 后强停冷启；
+ * 无 OK 则强停 + pm clear 后冷启），需中止当前步骤并重新自动登录，再接回原步骤。
+ */
 class AccountStatusLoggedOutException(message: String) : RuntimeException(message)
 
 /**
@@ -3096,22 +3099,67 @@ class RealTraceExecutor(
         findBottommostStrictExactLabelHit(vision, "OK")
             ?: findBottommostStrictExactLabelHit(vision, "Ok")
 
+    /** @return true 已点到 OCR 识别的 OK；无 OK 时不盲点，返回 false。 */
     private fun tapAccountStatusOk(alias: String, vision: Text, w: Int, h: Int): Boolean {
-        val okHit = findAccountStatusOkButtonHit(vision)
-        if (okHit != null) {
-            val tap = coerceTapToScreen(okHit.point, w, h)
-            devOp(alias, "掉登录：点 OK (${tap.x},${tap.y})")
-            return runSuCommand("input tap ${tap.x} ${tap.y}")
+        val okHit = findAccountStatusOkButtonHit(vision) ?: run {
+            devOp(alias, "掉登录：未 OCR 到 OK 按钮，跳过点击")
+            return false
         }
-        val fx = (w * 0.72f).toInt().coerceIn(1, w - 1)
-        val fy = (h * 0.52f).toInt().coerceIn(1, h - 1)
-        devOp(alias, "掉登录：未 OCR 到 OK，比例点 (${fx},${fy})")
-        return runSuCommand("input tap $fx $fy")
+        val tap = coerceTapToScreen(okHit.point, w, h)
+        devOp(alias, "掉登录：点 OK (${tap.x},${tap.y})")
+        return runSuCommand("input tap ${tap.x} ${tap.y}")
     }
 
     /**
-     * 掉登录弹窗（首遇）：点 OK → 强停 TikTok → 冷启；进入重登期后抛出 [AccountStatusLoggedOutException]。
-     * 重登期内见弹窗走 [dismissAccountStatusInline]，不在此强停冷启。
+     * 无 OK 的 Account status：强停 → pm clear 一次 → 冷启，供后续走完整自动登录。
+     * @return pm clear 是否成功（失败仍会尝试冷启）。
+     */
+    private suspend fun forceStopClearAndRelaunchTikTokForAccountStatusNoOk(
+        ctx: Context,
+        alias: String,
+    ): Boolean {
+        val pkg = Config.TIKTOK_PACKAGE_NAME
+        devOp(alias, "掉登录：Account status 无 OK，强停 TikTok 后台")
+        runSuCommand("am force-stop $pkg")
+        val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
+        delay(forceStopWaitMs)
+        devOp(alias, "掉登录：Account status 无 OK，执行一次 pm clear 清除 TikTok 数据")
+        val clearOk = runSuCommand("pm clear $pkg")
+        // pm clear 后需重新走登录链；清掉本机「首次登录已完成」以免误跳过
+        val user = ManualDeviceControl.activeManualUsername()
+            .ifBlank { ManualDeviceControl.selectedManualUsername() }
+            .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
+        if (user.isNotBlank()) {
+            PrefsStore.setManualFirstLoginDone(user, false)
+        }
+        if (clearOk) {
+            delay(800L)
+            devOp(alias, "掉登录：pm clear 成功，准备重新打开 TikTok")
+        } else {
+            delay(500L)
+            devOp(alias, "掉登录：pm clear 失败（需 root），仍尝试重新打开 TikTok")
+        }
+        val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+        val launched = launchTikTokOnceWithCheck(
+            ctx = ctx,
+            alias = alias,
+            tag = "掉登录恢复·无OK清数据",
+            launchWaitMs = launchWaitMs,
+            forceStopBeforeLaunch = false,
+        )
+        devOp(
+            alias,
+            "掉登录：无 OK 清数据后重新打开 TikTok ${if (launched) "成功" else "失败"}，待完整自动登录",
+        )
+        return clearOk
+    }
+
+    /**
+     * 掉登录弹窗（首遇）：
+     * - 有 OK：点 OK → 强停 TikTok → 冷启；
+     * - 无 OK：不强点比例位，直接强停 → pm clear 一次 → 冷启；
+     * 进入重登期后抛出 [AccountStatusLoggedOutException]，由协调器走正常登录并接回原步骤。
+     * 重登期内见弹窗走 [dismissAccountStatusInline]；若重登期仍无 OK 则升级为本路径清数据。
      */
     private suspend fun performAccountStatusLogoutRecovery(
         ctx: Context,
@@ -3130,21 +3178,26 @@ class RealTraceExecutor(
             val dm = ctx.resources.displayMetrics
             val w = dm.widthPixels.coerceAtLeast(1)
             val h = dm.heightPixels.coerceAtLeast(1)
-            tapAccountStatusOk(alias, vision, w, h)
-            val pkg = Config.TIKTOK_PACKAGE_NAME
-            devOp(alias, "掉登录：强停 TikTok 后台")
-            runSuCommand("am force-stop $pkg")
-            val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
-            delay(forceStopWaitMs)
-            val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-            val launched = launchTikTokOnceWithCheck(
-                ctx = ctx,
-                alias = alias,
-                tag = "掉登录恢复",
-                launchWaitMs = launchWaitMs,
-                forceStopBeforeLaunch = false,
-            )
-            devOp(alias, "掉登录：重新打开 TikTok ${if (launched) "成功" else "失败"}，待重新自动登录")
+            val hasOk = findAccountStatusOkButtonHit(vision) != null
+            if (hasOk) {
+                tapAccountStatusOk(alias, vision, w, h)
+                val pkg = Config.TIKTOK_PACKAGE_NAME
+                devOp(alias, "掉登录：强停 TikTok 后台")
+                runSuCommand("am force-stop $pkg")
+                val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
+                delay(forceStopWaitMs)
+                val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+                val launched = launchTikTokOnceWithCheck(
+                    ctx = ctx,
+                    alias = alias,
+                    tag = "掉登录恢复",
+                    launchWaitMs = launchWaitMs,
+                    forceStopBeforeLaunch = false,
+                )
+                devOp(alias, "掉登录：重新打开 TikTok ${if (launched) "成功" else "失败"}，待重新自动登录")
+            } else {
+                forceStopClearAndRelaunchTikTokForAccountStatusNoOk(ctx, alias)
+            }
         } finally {
             accountStatusRecoveryInProgress = false
         }
@@ -3152,7 +3205,11 @@ class RealTraceExecutor(
         throw AccountStatusLoggedOutException("Account status 掉登录已处理，需重新自动登录")
     }
 
-    /** 重登期内：仅点 OK 关 Account status 弹窗，继续自动登录。 @return 是否已点击 OK */
+    /**
+     * 重登期内：仅点 OK 关 Account status 弹窗，继续自动登录。
+     * 若无 OK（弹窗残缺），升级为清数据冷启并抛出 [AccountStatusLoggedOutException]。
+     * @return 是否已点击 OK
+     */
     private suspend fun dismissAccountStatusInline(
         ctx: Context,
         alias: String,
@@ -3161,6 +3218,10 @@ class RealTraceExecutor(
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
+        if (findAccountStatusOkButtonHit(vision) == null) {
+            devOp(alias, "掉登录重登期：Account status 无 OK，升级为强停+清数据+冷启")
+            performAccountStatusLogoutRecovery(ctx, alias, vision)
+        }
         if (!tapAccountStatusOk(alias, vision, w, h)) return false
         accountStatusInlineOkTapCount++
         devOp(
