@@ -137,6 +137,31 @@
     </div>
   </div>
 
+  <div id="backupAliasPickModal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-card modal-card--wide modal-card--import-preview">
+      <div class="modal-header">
+        <h3>按别名多选设备</h3>
+        <button id="closeBackupAliasPickModalBtn" type="button" class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-hint">列出当前账号下全部已绑定别名设备；勾选后可直接执行批量操作，或「应用到列表勾选」后继续使用本页其它按钮（导出已选等）。</p>
+      <div class="import-preview-toolbar" style="flex-wrap:wrap;gap:10px;">
+        <label class="import-preview-select-all">
+          <input id="backupAliasPickSelectAll" type="checkbox" />
+          全选
+        </label>
+        <input id="backupAliasPickSearchInput" type="search" class="ui-input" placeholder="搜索别名 / device_id…" style="min-width:200px;max-width:280px;" autocomplete="off" />
+        <span id="backupAliasPickSummary" class="hint"></span>
+      </div>
+      <div id="backupAliasPickList" class="import-preview-table-wrap"></div>
+      <div class="modal-actions" style="flex-wrap:wrap;gap:8px;">
+        <button id="cancelBackupAliasPickModalBtn" type="button" class="ghost">取消</button>
+        <button id="backupAliasPickEnableAutoSwitchBtn" type="button" class="ghost" title="为勾选别名对应设备开启自动切号">开启自动切号</button>
+        <button id="backupAliasPickDisableAutoSwitchBtn" type="button" class="ghost" title="关闭勾选别名对应设备的自动切号">关闭自动切号</button>
+        <button id="backupAliasPickApplySelectionBtn" type="button" class="primary" title="将勾选别名同步为备份档案列表勾选，以便使用导出等按钮">应用到列表勾选</button>
+      </div>
+    </div>
+  </div>
+
   <div class="app hidden" id="appShell">
     <aside class="sidebar">
       <div class="brand">
@@ -837,7 +862,7 @@
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
             <button id="accountRecordsNextPageBtn" type="button" class="ghost">下一页</button>
             <label class="pager-size-label" for="accountRecordsPageSizeInput">每页</label>
-            <input id="accountRecordsPageSizeInput" type="number" class="pager-size-input" min="1" max="200" value="50" title="单页账号记录条数" />
+            <input id="accountRecordsPageSizeInput" type="number" class="pager-size-input" min="1" max="200" value="50" title="单页账号记录条数（列表按别名分组折叠）" />
           </div>
           <div id="accountEditorList" style="margin-top:14px;"></div>
         </div>
@@ -911,6 +936,7 @@
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>
               <button id="backupArchiveSelectAllPageBtn" type="button" class="ghost" title="勾选当前页全部备份记录">全选本页</button>
               <button id="backupArchiveClearSelectionBtn" type="button" class="ghost" title="取消全部勾选">取消选择</button>
+              <button id="backupAliasPickBtn" type="button" class="ghost" title="弹出全部别名设备，多选后可开启/关闭自动切号，或同步到列表勾选">按别名多选设备</button>
               <button id="exportBackupArchiveSelectedXlsxBtn" type="button" class="ghost" title="将表格中已勾选的备份档案导出为 xlsx（一行一条）">导出已选 xlsx</button>
               <button id="exportBackupArchiveXlsxBtn" type="button" class="ghost" title="将全部备份档案导出为 xlsx（一行一条，含关联账号字段）">导出全部 xlsx</button>
               <button id="importBackupArchiveXlsxBtn" type="button" class="ghost" title="从 xlsx 批量导入；库内已有 username 会补全空备份字段，仅跳过文件内重复行">导入 xlsx</button>

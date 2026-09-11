@@ -37,11 +37,25 @@ const exportBackupArchiveXlsxBtn = document.getElementById("exportBackupArchiveX
 const exportBackupArchiveSelectedXlsxBtn = document.getElementById("exportBackupArchiveSelectedXlsxBtn");
 const backupArchiveSelectAllPageBtn = document.getElementById("backupArchiveSelectAllPageBtn");
 const backupArchiveClearSelectionBtn = document.getElementById("backupArchiveClearSelectionBtn");
+const backupAliasPickBtn = document.getElementById("backupAliasPickBtn");
+const backupAliasPickModalEl = document.getElementById("backupAliasPickModal");
+const closeBackupAliasPickModalBtn = document.getElementById("closeBackupAliasPickModalBtn");
+const cancelBackupAliasPickModalBtn = document.getElementById("cancelBackupAliasPickModalBtn");
+const backupAliasPickSelectAllEl = document.getElementById("backupAliasPickSelectAll");
+const backupAliasPickSearchInput = document.getElementById("backupAliasPickSearchInput");
+const backupAliasPickSummaryEl = document.getElementById("backupAliasPickSummary");
+const backupAliasPickListEl = document.getElementById("backupAliasPickList");
+const backupAliasPickEnableAutoSwitchBtn = document.getElementById("backupAliasPickEnableAutoSwitchBtn");
+const backupAliasPickDisableAutoSwitchBtn = document.getElementById("backupAliasPickDisableAutoSwitchBtn");
+const backupAliasPickApplySelectionBtn = document.getElementById("backupAliasPickApplySelectionBtn");
 const backupArchiveSelectionHintEl = document.getElementById("backupArchiveSelectionHint");
 const backupArchiveSelectedCountEl = document.getElementById("backupArchiveSelectedCount");
 const importBackupArchiveXlsxBtn = document.getElementById("importBackupArchiveXlsxBtn");
 const backupArchiveImportFileInput = document.getElementById("backupArchiveImportFileInput");
 const backupArchiveSelectedRowIndices = new Set();
+const backupAliasPickSelectedAliases = new Set();
+let backupAliasPickSearchQuery = "";
+let backupAliasPickApplyBusy = false;
 let backupArchiveXlsxBusy = false;
 const groupMoveModalEl = document.getElementById("groupMoveModal");
 const groupMoveSelectedAliasesEl = document.getElementById("groupMoveSelectedAliases");
@@ -2868,7 +2882,7 @@ function clearAccountRecordsSelection() {
   updateAccountRecordsBatchDeleteBtn();
 }
 
-function getVisibleAccountRecordPageRows() {
+function getFilteredAccountEditorIndexedRows() {
   const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
   let visibleRows = accountFilterUnassignedOnly
     ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
@@ -2876,27 +2890,70 @@ function getVisibleAccountRecordPageRows() {
   if (accountRecordsSearchQuery) {
     visibleRows = visibleRows.filter(({ row }) => accountRecordMatchesSearch(row));
   }
+  return visibleRows;
+}
+
+/** 按有效别名分组（空别名归入 __EMPTY_ALIAS__），组间自然排序 */
+function buildAccountEditorAliasGroups(indexedRows = []) {
+  const groups = new Map();
+  (indexedRows || []).forEach((item) => {
+    const alias = normalizeAliasValue(getEffectiveAccountAssignedAlias(item?.row));
+    const key = alias || "__EMPTY_ALIAS__";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  return Array.from(groups.entries()).sort((a, b) => {
+    if (a[0] === "__EMPTY_ALIAS__") return 1;
+    if (b[0] === "__EMPTY_ALIAS__") return -1;
+    return compareAliasNatural(a[0], b[0]);
+  });
+}
+
+function flattenAccountEditorAliasGroups(groups = []) {
+  return groups.flatMap(([, items]) => items);
+}
+
+function getVisibleAccountRecordPageRows() {
+  const groups = buildAccountEditorAliasGroups(getFilteredAccountEditorIndexedRows());
+  const flatRows = flattenAccountEditorAliasGroups(groups);
   const pageSize = getAccountRecordsPageSize();
   const start = (currentAccountRecordsPage - 1) * pageSize;
-  return visibleRows.slice(start, start + pageSize);
+  return flatRows.slice(start, start + pageSize);
+}
+
+function collectOpenAccountAliasGroups() {
+  const open = new Set();
+  if (!accountEditorListEl) return open;
+  accountEditorListEl.querySelectorAll("details.account-alias-group[data-account-alias]").forEach((el) => {
+    if (el instanceof HTMLDetailsElement && el.open) {
+      open.add(String(el.getAttribute("data-account-alias") || ""));
+    }
+  });
+  return open;
+}
+
+function accountAliasGroupFoldKey(aliasKey) {
+  return aliasKey === "__EMPTY_ALIAS__" ? "" : String(aliasKey || "");
 }
 
 function syncAccountRecordsPageSelectAllCheckbox() {
   if (!accountEditorListEl) return;
-  const selectAllEl = accountEditorListEl.querySelector(".account-records-select-all");
-  if (!(selectAllEl instanceof HTMLInputElement)) return;
-  const pageRows = getVisibleAccountRecordPageRows();
-  if (!pageRows.length) {
-    selectAllEl.checked = false;
-    selectAllEl.indeterminate = false;
-    return;
-  }
-  const selectedOnPage = pageRows.filter(({ row, idx }) => {
-    const ri = resolveAccountRowIndex(row, idx);
-    return accountRecordsSelectedRowIndexes.has(ri);
-  }).length;
-  selectAllEl.checked = selectedOnPage === pageRows.length;
-  selectAllEl.indeterminate = selectedOnPage > 0 && selectedOnPage < pageRows.length;
+  accountEditorListEl.querySelectorAll(".account-records-select-all").forEach((selectAllEl) => {
+    if (!(selectAllEl instanceof HTMLInputElement)) return;
+    const groupEl = selectAllEl.closest("details.account-alias-group");
+    const rowChecks = groupEl
+      ? groupEl.querySelectorAll(".account-records-row-select")
+      : accountEditorListEl.querySelectorAll(".account-records-row-select");
+    const rows = Array.from(rowChecks).filter((el) => el instanceof HTMLInputElement);
+    if (!rows.length) {
+      selectAllEl.checked = false;
+      selectAllEl.indeterminate = false;
+      return;
+    }
+    const selectedCount = rows.filter((el) => el.checked).length;
+    selectAllEl.checked = selectedCount === rows.length;
+    selectAllEl.indeterminate = selectedCount > 0 && selectedCount < rows.length;
+  });
 }
 
 function buildAccountRecordDeletePayload(row, arrayIndex) {
@@ -3156,7 +3213,7 @@ function updateAccountRecordsPagerUi() {
   if (currentAccountRecordsPage > totalPages) currentAccountRecordsPage = totalPages;
   if (currentAccountRecordsPage < 1) currentAccountRecordsPage = 1;
   if (accountRecordsPagerEl) {
-    accountRecordsPagerEl.textContent = `第 ${currentAccountRecordsPage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${accountRecordsFilteredTotal} 条`;
+    accountRecordsPagerEl.textContent = `第 ${currentAccountRecordsPage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${accountRecordsFilteredTotal} 条（按别名折叠）`;
   }
   if (accountRecordsPrevPageBtn) accountRecordsPrevPageBtn.disabled = currentAccountRecordsPage <= 1;
   if (accountRecordsNextPageBtn) accountRecordsNextPageBtn.disabled = currentAccountRecordsPage >= totalPages;
@@ -5322,9 +5379,15 @@ function countVisibleAutoSwitchSelectedGroups() {
   return count;
 }
 
-/** 收集待开启/关闭自动切号的 device_id（勾选记录 / 本组全选 / 程序化全选）。 */
+/** 收集待开启/关闭自动切号的 device_id（勾选记录 / 本组全选 / 按别名多选 / 程序化全选）。 */
 function collectAutoSwitchTargetDeviceIds() {
   const ids = new Set();
+  if (autoSwitchPickDeviceIds instanceof Set) {
+    autoSwitchPickDeviceIds.forEach((did) => {
+      const id = String(did || "").trim();
+      if (id) ids.add(id);
+    });
+  }
   if (backupArchiveSelectedRowIndices.size && Array.isArray(backupArchivePageItems)) {
     backupArchivePageItems.forEach((row) => {
       const idx = resolveBackupArchiveExportRowIndex(row);
@@ -5539,6 +5602,9 @@ async function loadAutoSwitchConfig(options = {}) {
     applyAutoSwitchManualOpsUi();
     populateAutoSwitchSessionSummariesAliasOptions();
     await loadAutoSwitchSessionSummaries();
+    if (backupAliasPickModalEl && !backupAliasPickModalEl.classList.contains("hidden")) {
+      renderBackupAliasPickList();
+    }
     if (refreshArchive && deviceAliasGroupsEl) {
       void loadBackupArchiveRecords();
     }
@@ -8430,6 +8496,99 @@ if (backupArchiveClearSelectionBtn) {
     setStatus("已取消全部勾选", "info");
   });
 }
+if (backupAliasPickBtn) {
+  backupAliasPickBtn.addEventListener("click", () => {
+    openBackupAliasPickModal().catch((e) => setStatus(e?.message || "打开别名选择失败", "error"));
+  });
+}
+if (closeBackupAliasPickModalBtn) {
+  closeBackupAliasPickModalBtn.addEventListener("click", () => closeBackupAliasPickModal());
+}
+if (cancelBackupAliasPickModalBtn) {
+  cancelBackupAliasPickModalBtn.addEventListener("click", () => closeBackupAliasPickModal());
+}
+if (backupAliasPickModalEl) {
+  backupAliasPickModalEl.addEventListener("click", (event) => {
+    if (event.target === backupAliasPickModalEl) closeBackupAliasPickModal();
+  });
+}
+if (backupAliasPickSelectAllEl) {
+  backupAliasPickSelectAllEl.addEventListener("change", () => {
+    const checked = Boolean(backupAliasPickSelectAllEl.checked);
+    getBackupAliasPickVisiblePairs().forEach((item) => {
+      const alias = normalizeAliasValue(item.device_alias);
+      if (!alias) return;
+      if (checked) backupAliasPickSelectedAliases.add(alias);
+      else backupAliasPickSelectedAliases.delete(alias);
+    });
+    renderBackupAliasPickList();
+  });
+}
+if (backupAliasPickSearchInput) {
+  backupAliasPickSearchInput.addEventListener("input", () => {
+    backupAliasPickSearchQuery = String(backupAliasPickSearchInput.value || "").trim();
+    renderBackupAliasPickList();
+  });
+}
+if (backupAliasPickListEl) {
+  backupAliasPickListEl.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.classList.contains("backup-alias-pick-group-select")) {
+      const groupKey = String(target.dataset.group || "").trim();
+      const checked = Boolean(target.checked);
+      getBackupAliasPickVisiblePairs().forEach((item) => {
+        const autoOn = isAutoSwitchEnabledForDeviceId(item?.device_id);
+        if (groupKey === "on" && !autoOn) return;
+        if (groupKey === "off" && autoOn) return;
+        const alias = normalizeAliasValue(item.device_alias);
+        if (!alias) return;
+        if (checked) backupAliasPickSelectedAliases.add(alias);
+        else backupAliasPickSelectedAliases.delete(alias);
+      });
+      renderBackupAliasPickList();
+      return;
+    }
+    if (!target.classList.contains("backup-alias-pick-check")) return;
+    const alias = normalizeAliasValue(target.dataset.alias);
+    if (!alias) return;
+    if (target.checked) backupAliasPickSelectedAliases.add(alias);
+    else backupAliasPickSelectedAliases.delete(alias);
+    updateBackupAliasPickSummary();
+    syncBackupAliasPickSelectAllState();
+    // 同步分组标题勾选状态（不整表重绘，避免滚动跳动）
+    ["on", "off"].forEach((groupKey) => {
+      const groupCb = backupAliasPickListEl.querySelector(`.backup-alias-pick-group-select[data-group="${groupKey}"]`);
+      if (!(groupCb instanceof HTMLInputElement)) return;
+      const groupPairs = getBackupAliasPickVisiblePairs().filter((item) => {
+        const autoOn = isAutoSwitchEnabledForDeviceId(item?.device_id);
+        return groupKey === "on" ? autoOn : !autoOn;
+      });
+      const selectedInGroup = groupPairs.filter((item) =>
+        backupAliasPickSelectedAliases.has(normalizeAliasValue(item.device_alias)),
+      ).length;
+      groupCb.checked = groupPairs.length > 0 && selectedInGroup === groupPairs.length;
+      groupCb.indeterminate = selectedInGroup > 0 && selectedInGroup < groupPairs.length;
+      const countEl = groupCb.closest(".import-preview-toolbar")?.querySelector(".hint");
+      if (countEl) countEl.textContent = `${selectedInGroup}/${groupPairs.length}`;
+    });
+  });
+}
+if (backupAliasPickEnableAutoSwitchBtn) {
+  backupAliasPickEnableAutoSwitchBtn.addEventListener("click", () => {
+    saveAutoSwitchFromAliasPick(true).catch((e) => setStatus(e?.message || "开启失败", "error"));
+  });
+}
+if (backupAliasPickDisableAutoSwitchBtn) {
+  backupAliasPickDisableAutoSwitchBtn.addEventListener("click", () => {
+    saveAutoSwitchFromAliasPick(false).catch((e) => setStatus(e?.message || "关闭失败", "error"));
+  });
+}
+if (backupAliasPickApplySelectionBtn) {
+  backupAliasPickApplySelectionBtn.addEventListener("click", () => {
+    applyBackupAliasPickToArchiveSelection().catch((e) => setStatus(e?.message || "应用失败", "error"));
+  });
+}
 updateBackupArchiveSelectionUi();
 if (importBackupArchiveXlsxBtn && backupArchiveImportFileInput) {
   importBackupArchiveXlsxBtn.addEventListener("click", () => backupArchiveImportFileInput.click());
@@ -9190,7 +9349,7 @@ function collectAssignableAliases(currentValue = "") {
     const alias = normalizeAliasValue(item?.device_alias);
     if (alias) aliasCandidates.add(alias);
   });
-  const aliases = Array.from(aliasCandidates).sort((a, b) => a.localeCompare(b));
+  const aliases = Array.from(aliasCandidates).sort(compareAliasNatural);
   if (current && !aliases.includes(current)) return [current, ...aliases];
   return aliases;
 }
@@ -9766,7 +9925,7 @@ function collectAccountBatchPreviewAliasTargets() {
 
 function applyAccountBatchPreviewSmartDistribution() {
   syncAccountBatchPreviewItemsFromDom();
-  const aliases = Array.from(accountBatchPreviewSmartAliases).sort((a, b) => a.localeCompare(b));
+  const aliases = Array.from(accountBatchPreviewSmartAliases).sort(compareAliasNatural);
   if (!aliases.length) {
     setStatus("请先勾选至少一个别名", "warning");
     return;
@@ -10434,6 +10593,33 @@ function normalizeAliasValue(value) {
 
 function normalizeAliasKey(value) {
   return normalizeAliasValue(value).toLowerCase();
+}
+
+/** 别名自然排序：按段比较，阿拉伯数字按数值（如 9_Ma11 先比 9 再比 11；BR9 < BR11） */
+function compareAliasNatural(a, b) {
+  const aStr = String(a || "");
+  const bStr = String(b || "");
+  const re = /(\d+)|(\D+)/g;
+  const aParts = aStr.match(re) || [];
+  const bParts = bStr.match(re) || [];
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i += 1) {
+    const ap = aParts[i];
+    const bp = bParts[i];
+    if (ap == null) return -1;
+    if (bp == null) return 1;
+    const aIsNum = /^\d+$/.test(ap);
+    const bIsNum = /^\d+$/.test(bp);
+    if (aIsNum && bIsNum) {
+      const diff = Number(ap) - Number(bp);
+      if (diff !== 0) return diff;
+      continue;
+    }
+    if (aIsNum !== bIsNum) return aIsNum ? -1 : 1;
+    const cmp = ap.localeCompare(bp, undefined, { sensitivity: "base" });
+    if (cmp !== 0) return cmp;
+  }
+  return aStr.localeCompare(bStr, undefined, { sensitivity: "base" });
 }
 
 function normalizeAutoSwitchPlansByAlias(rawPlans = {}) {
@@ -11205,6 +11391,55 @@ function formatAccountGrowthTriple(row = {}, prefix = "follower") {
   return `<div class="account-growth-triple" title="${prefix === "follower" ? "粉丝" : "总赞"}增长（前天/昨天/今天）">${fmt("前", dayBefore)}${fmt("昨", yesterday)}${fmt("今", today)}</div>`;
 }
 
+function renderAccountEditorTableRow({ row, idx }, displayNum) {
+  const aliasLocked = isAccountAliasLocked(row);
+  const aliasCell = aliasLocked
+    ? `<span class="account-editor-table__alias-locked" title="已分配别名不可改；删除记录将同步删除备份档案">${escapeHtml(getEffectiveAccountAssignedAlias(row))}</span>`
+    : accountEditorCellSelect(idx, "assigned_alias", getAssignableAliasOptions(getEffectiveAccountAssignedAlias(row)), "account-editor-table__alias-select");
+  const loginSelect = accountEditorCellSelect(
+    idx,
+    "is_login",
+    `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`,
+    "account-editor-table__login-select",
+  );
+  const profileSelect = accountEditorCellSelect(
+    idx,
+    "basic_profile_modified",
+    `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`,
+    "account-editor-table__profile-select",
+  );
+  const dbRowIndex = resolveAccountRowIndex(row, idx);
+  const rowChecked = accountRecordsSelectedRowIndexes.has(dbRowIndex);
+  return `<tr>
+    <td class="account-editor-table__select">
+      <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量操作"${rowChecked ? " checked" : ""} />
+    </td>
+    <td class="account-editor-table__num">${displayNum}</td>
+    <td class="account-editor-table__username">${accountEditorCellInput(idx, "username", row.username)}</td>
+    <td class="account-editor-table__cred-col account-editor-table__cred-col--password">${accountEditorCellInput(idx, "password", row.password)}</td>
+    <td class="account-editor-table__cred-col account-editor-table__cred-col--email">${accountEditorCellInput(idx, "email", row.email)}</td>
+    <td class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
+    <td class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">
+      <div class="account-editor-two-fa-cell">
+        ${accountEditorCellInput(idx, "two_fa", row.two_fa)}
+        <button type="button" class="ghost account-editor-two-fa-code-btn" data-editor-index="${idx}" title="本地生成当前 TOTP">取码</button>
+      </div>
+    </td>
+    <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
+    <td class="account-editor-table__login">${loginSelect}</td>
+    <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
+    <td class="account-editor-table__region">${accountEditorCellInput(idx, "region", row.region)}</td>
+    <td class="account-editor-table__alias">${aliasCell}</td>
+    <td class="account-editor-table__stat">${accountEditorCellInput(idx, "video_count", row.video_count, 'inputmode="numeric"')}</td>
+    <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_count", row.follower_count, 'inputmode="numeric"')}</td>
+    <td class="account-editor-table__stat">${accountEditorCellInput(idx, "heart_count", row.heart_count, 'inputmode="numeric"')}</td>
+    <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
+    <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
+    <td class="account-editor-table__profile">${profileSelect}</td>
+    <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
+  </tr>`;
+}
+
 function renderAccountEditorRows() {
   if (!accountEditorListEl) return;
   const existingRowIndexes = new Set(
@@ -11214,20 +11449,16 @@ function renderAccountEditorRows() {
     if (!existingRowIndexes.has(ri)) accountRecordsSelectedRowIndexes.delete(ri);
   });
   updateAccountRecordsBatchDeleteBtn();
-  const indexedRows = (accountEditorRows || []).map((row, idx) => ({ row, idx }));
-  let visibleRows = accountFilterUnassignedOnly
-    ? indexedRows.filter(({ row }) => isAccountAliasUnassigned(row))
-    : indexedRows;
-  if (accountRecordsSearchQuery) {
-    visibleRows = visibleRows.filter(({ row }) => accountRecordMatchesSearch(row));
-  }
-  accountRecordsFilteredTotal = visibleRows.length;
+  const visibleRows = getFilteredAccountEditorIndexedRows();
+  const aliasGroups = buildAccountEditorAliasGroups(visibleRows);
+  const flatRows = flattenAccountEditorAliasGroups(aliasGroups);
+  accountRecordsFilteredTotal = flatRows.length;
   updateAccountRecordsPagerUi();
   const pageSize = getAccountRecordsPageSize();
-  const totalPages = Math.max(1, Math.ceil(accountRecordsFilteredTotal / pageSize));
   const start = (currentAccountRecordsPage - 1) * pageSize;
-  const pageRows = visibleRows.slice(start, start + pageSize);
-  if (!visibleRows.length) {
+  const pageRows = flatRows.slice(start, start + pageSize);
+  const pageGroups = buildAccountEditorAliasGroups(pageRows);
+  if (!flatRows.length) {
     const emptyHint = accountRecordsSearchQuery
       ? formatAccountRecordsSearchHint(accountRecordsSearchQuery, accountRecordsSearchField)
       : "暂无记录，点击“新增空白记录”开始";
@@ -11236,89 +11467,73 @@ function renderAccountEditorRows() {
   }
   try {
     const credExpanded = accountRecordsCredColsExpanded;
+    const wrapClass = `account-editor-table-wrap${credExpanded ? "" : " account-editor-table-wrap--creds-collapsed"}`;
     const tableClass = credExpanded
       ? "account-editor-table"
       : "account-editor-table account-editor-table--creds-collapsed";
-    const bodyHtml = pageRows.map(({ row, idx }, localIdx) => {
-      const aliasLocked = isAccountAliasLocked(row);
-      const aliasCell = aliasLocked
-        ? `<span class="account-editor-table__alias-locked" title="已分配别名不可改；删除记录将同步删除备份档案">${escapeHtml(getEffectiveAccountAssignedAlias(row))}</span>`
-        : accountEditorCellSelect(idx, "assigned_alias", getAssignableAliasOptions(getEffectiveAccountAssignedAlias(row)), "account-editor-table__alias-select");
-      const loginSelect = accountEditorCellSelect(
-        idx,
-        "is_login",
-        `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`,
-        "account-editor-table__login-select",
-      );
-      const profileSelect = accountEditorCellSelect(
-        idx,
-        "basic_profile_modified",
-        `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`,
-        "account-editor-table__profile-select",
-      );
-      const displayNum = start + localIdx + 1;
-      const dbRowIndex = resolveAccountRowIndex(row, idx);
-      const rowChecked = accountRecordsSelectedRowIndexes.has(dbRowIndex);
-      return `<tr>
-        <td class="account-editor-table__select">
-          <input type="checkbox" class="account-records-row-select" data-account-row-index="${dbRowIndex}" title="勾选以批量操作"${rowChecked ? " checked" : ""} />
-        </td>
-        <td class="account-editor-table__num">${displayNum}</td>
-        <td class="account-editor-table__username">${accountEditorCellInput(idx, "username", row.username)}</td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--password">${accountEditorCellInput(idx, "password", row.password)}</td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--email">${accountEditorCellInput(idx, "email", row.email)}</td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">${accountEditorCellInput(idx, "email_password", row.email_password)}</td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">
-          <div class="account-editor-two-fa-cell">
-            ${accountEditorCellInput(idx, "two_fa", row.two_fa)}
-            <button type="button" class="ghost account-editor-two-fa-code-btn" data-editor-index="${idx}" title="本地生成当前 TOTP">取码</button>
+    const openGroups = collectOpenAccountAliasGroups();
+    const pageFoldKeys = pageGroups.map(([aliasKey]) => accountAliasGroupFoldKey(aliasKey));
+    const anyCurrentPageOpen = pageFoldKeys.some((key) => openGroups.has(key));
+    // 翻页/筛选后当前页没有已展开组时，重新默认展开前两组；否则保留本页展开状态
+    const useSavedOpenState = anyCurrentPageOpen;
+    const aliasTotalByKey = new Map(aliasGroups.map(([aliasKey, items]) => [aliasKey, items.length]));
+    let displayCursor = start;
+    const groupsHtml = pageGroups.map(([aliasKey, items], groupIdx) => {
+      const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未分配别名" : aliasKey;
+      const foldKey = accountAliasGroupFoldKey(aliasKey);
+      const totalForAlias = aliasTotalByKey.get(aliasKey) || items.length;
+      const countLabel = totalForAlias === items.length
+        ? `${items.length} 条`
+        : `本页 ${items.length} / 共 ${totalForAlias} 条`;
+      const bodyHtml = items.map((item) => {
+        displayCursor += 1;
+        return renderAccountEditorTableRow(item, displayCursor);
+      }).join("");
+      const shouldOpen = useSavedOpenState
+        ? openGroups.has(foldKey)
+        : groupIdx < 2;
+      return `
+        <details class="account-alias-group" data-account-alias="${escapeHtml(foldKey)}"${shouldOpen ? " open" : ""}>
+          <summary class="account-alias-group__summary">
+            <span class="account-alias-group__title">
+              <strong>${escapeHtml(aliasLabel)}</strong>
+              <span class="hint">(${escapeHtml(countLabel)})</span>
+            </span>
+            <span class="hint">点击展开/收起</span>
+          </summary>
+          <div class="${wrapClass}" style="margin-top:10px;">
+            <table class="${tableClass}">
+              <thead>
+                <tr>
+                  <th class="account-editor-table__select">
+                    <input type="checkbox" class="account-records-select-all" title="全选本组" />
+                  </th>
+                  <th class="account-editor-table__num">#</th>
+                  <th class="account-editor-table__username">username</th>
+                  <th class="account-editor-table__cred-col account-editor-table__cred-col--password">password</th>
+                  <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
+                  <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
+                  <th class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">2FA</th>
+                  <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
+                  <th class="account-editor-table__login">登录</th>
+                  <th class="account-editor-table__login-time">登录时间</th>
+                  <th class="account-editor-table__region">地区</th>
+                  <th class="account-editor-table__alias">别名</th>
+                  <th class="account-editor-table__stat">视频</th>
+                  <th class="account-editor-table__stat">粉丝</th>
+                  <th class="account-editor-table__stat">总赞</th>
+                  <th class="account-editor-table__growth">粉丝增长</th>
+                  <th class="account-editor-table__growth">总赞增长</th>
+                  <th class="account-editor-table__profile">资料</th>
+                  <th class="account-editor-table__actions"></th>
+                </tr>
+              </thead>
+              <tbody>${bodyHtml}</tbody>
+            </table>
           </div>
-        </td>
-        <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
-        <td class="account-editor-table__login">${loginSelect}</td>
-        <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
-        <td class="account-editor-table__region">${accountEditorCellInput(idx, "region", row.region)}</td>
-        <td class="account-editor-table__alias">${aliasCell}</td>
-        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "video_count", row.video_count, 'inputmode="numeric"')}</td>
-        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "follower_count", row.follower_count, 'inputmode="numeric"')}</td>
-        <td class="account-editor-table__stat">${accountEditorCellInput(idx, "heart_count", row.heart_count, 'inputmode="numeric"')}</td>
-        <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
-        <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
-        <td class="account-editor-table__profile">${profileSelect}</td>
-        <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
-      </tr>`;
+        </details>`;
     }).join("");
-    accountEditorListEl.innerHTML = `
-      <div class="account-editor-table-wrap${credExpanded ? "" : " account-editor-table-wrap--creds-collapsed"}">
-        <table class="${tableClass}">
-          <thead>
-            <tr>
-              <th class="account-editor-table__select">
-                <input type="checkbox" class="account-records-select-all" title="全选本页" />
-              </th>
-              <th class="account-editor-table__num">#</th>
-              <th class="account-editor-table__username">username</th>
-              <th class="account-editor-table__cred-col account-editor-table__cred-col--password">password</th>
-              <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
-              <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
-              <th class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">2FA</th>
-              <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
-              <th class="account-editor-table__login">登录</th>
-              <th class="account-editor-table__login-time">登录时间</th>
-              <th class="account-editor-table__region">地区</th>
-              <th class="account-editor-table__alias">别名</th>
-              <th class="account-editor-table__stat">视频</th>
-              <th class="account-editor-table__stat">粉丝</th>
-              <th class="account-editor-table__stat">总赞</th>
-              <th class="account-editor-table__growth">粉丝增长</th>
-              <th class="account-editor-table__growth">总赞增长</th>
-              <th class="account-editor-table__profile">资料</th>
-              <th class="account-editor-table__actions"></th>
-            </tr>
-          </thead>
-          <tbody>${bodyHtml}</tbody>
-        </table>
-      </div>`;
+    accountEditorListEl.innerHTML = `<div class="account-alias-group-list">${groupsHtml}</div>`;
     updateAccountRecordsCredColsToggleBtn();
     syncAccountRecordsPageSelectAllCheckbox();
   } catch (error) {
@@ -12157,6 +12372,264 @@ function clearBackupArchiveSelection() {
   updateBackupArchiveSelectionUi();
 }
 
+function getBackupAliasPickVisiblePairs() {
+  const pairs = buildAliasDevicePairs();
+  const q = String(backupAliasPickSearchQuery || "").trim().toLowerCase();
+  if (!q) return pairs;
+  return pairs.filter((item) => {
+    const alias = String(item?.device_alias || "").toLowerCase();
+    const did = String(item?.device_id || "").toLowerCase();
+    return alias.includes(q) || did.includes(q);
+  });
+}
+
+function updateBackupAliasPickSummary() {
+  if (!backupAliasPickSummaryEl) return;
+  const all = buildAliasDevicePairs();
+  const total = all.length;
+  const selected = backupAliasPickSelectedAliases.size;
+  const visible = getBackupAliasPickVisiblePairs();
+  let onCount = 0;
+  let offCount = 0;
+  visible.forEach((item) => {
+    if (isAutoSwitchEnabledForDeviceId(item?.device_id)) onCount += 1;
+    else offCount += 1;
+  });
+  const parts = [`已选 ${selected}/${total} 个别名设备`, `开 ${onCount}`, `关 ${offCount}`];
+  if (backupAliasPickSearchQuery && visible.length !== total) {
+    parts.push(`当前筛选 ${visible.length} 个`);
+  }
+  backupAliasPickSummaryEl.textContent = parts.join(" · ");
+}
+
+function syncBackupAliasPickSelectAllState() {
+  if (!backupAliasPickSelectAllEl) return;
+  const visible = getBackupAliasPickVisiblePairs();
+  const selectedVisible = visible.filter((item) =>
+    backupAliasPickSelectedAliases.has(normalizeAliasValue(item.device_alias)),
+  ).length;
+  backupAliasPickSelectAllEl.checked = visible.length > 0 && selectedVisible === visible.length;
+  backupAliasPickSelectAllEl.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+}
+
+function renderBackupAliasPickRow(item) {
+  const alias = normalizeAliasValue(item.device_alias);
+  const deviceId = String(item.device_id || "").trim();
+  const checked = alias && backupAliasPickSelectedAliases.has(alias);
+  const autoOn = isAutoSwitchEnabledForDeviceId(deviceId);
+  const statusBadge = autoOn
+    ? '<span class="badge badge--ok">自动切号·开</span>'
+    : '<span class="hint">自动切号·关</span>';
+  return `<tr>
+      <td style="width:40px;text-align:center;">
+        <input type="checkbox" class="backup-alias-pick-check" data-alias="${escapeHtml(alias)}"${checked ? " checked" : ""} />
+      </td>
+      <td><strong>${escapeHtml(alias)}</strong></td>
+      <td class="preview-cell-truncate" title="${escapeHtml(deviceId)}">${escapeHtml(deviceId || "—")}</td>
+      <td>${statusBadge}</td>
+    </tr>`;
+}
+
+function renderBackupAliasPickGroupSection(title, pairs, groupKey) {
+  if (!pairs.length) return "";
+  const selectedInGroup = pairs.filter((item) =>
+    backupAliasPickSelectedAliases.has(normalizeAliasValue(item.device_alias)),
+  ).length;
+  const allSelected = selectedInGroup === pairs.length;
+  const rowsHtml = pairs.map((item) => renderBackupAliasPickRow(item)).join("");
+  return `<div class="backup-alias-pick-group" data-group="${escapeHtml(groupKey)}" style="margin-bottom:14px;">
+    <div class="import-preview-toolbar" style="margin-bottom:6px;padding:6px 8px;background:rgba(0,0,0,.03);border-radius:8px;">
+      <label class="import-preview-select-all" style="margin:0;">
+        <input type="checkbox" class="backup-alias-pick-group-select" data-group="${escapeHtml(groupKey)}"${allSelected ? " checked" : ""}${selectedInGroup > 0 && !allSelected ? ' data-indeterminate="1"' : ""} />
+        <strong>${escapeHtml(title)}</strong>
+      </label>
+      <span class="hint">${selectedInGroup}/${pairs.length}</span>
+    </div>
+    <table class="import-preview-table">
+      <thead><tr><th></th><th>别名</th><th>device_id</th><th>状态</th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+  </div>`;
+}
+
+function renderBackupAliasPickList() {
+  if (!backupAliasPickListEl) return;
+  const pairs = getBackupAliasPickVisiblePairs();
+  if (!pairs.length) {
+    const emptyHint = backupAliasPickSearchQuery
+      ? `未找到匹配「${escapeHtml(backupAliasPickSearchQuery)}」的别名设备`
+      : "暂无已绑定别名的设备，请先在设备总览完成客户端绑定";
+    backupAliasPickListEl.innerHTML = `<div class="hint" style="padding:16px;">${emptyHint}</div>`;
+    updateBackupAliasPickSummary();
+    syncBackupAliasPickSelectAllState();
+    return;
+  }
+  const onPairs = [];
+  const offPairs = [];
+  pairs.forEach((item) => {
+    if (isAutoSwitchEnabledForDeviceId(item?.device_id)) onPairs.push(item);
+    else offPairs.push(item);
+  });
+  const sections = [
+    renderBackupAliasPickGroupSection(`自动切号·开（${onPairs.length}）`, onPairs, "on"),
+    renderBackupAliasPickGroupSection(`自动切号·关（${offPairs.length}）`, offPairs, "off"),
+  ].filter(Boolean);
+  backupAliasPickListEl.innerHTML = sections.join("") || '<div class="hint" style="padding:16px;">暂无别名设备</div>';
+  backupAliasPickListEl.querySelectorAll(".backup-alias-pick-group-select[data-indeterminate='1']").forEach((el) => {
+    if (el instanceof HTMLInputElement) el.indeterminate = true;
+  });
+  updateBackupAliasPickSummary();
+  syncBackupAliasPickSelectAllState();
+}
+
+function collectBackupAliasPickDeviceIds() {
+  const selected = backupAliasPickSelectedAliases;
+  if (!selected.size) return [];
+  const ids = [];
+  buildAliasDevicePairs().forEach((item) => {
+    const alias = normalizeAliasValue(item.device_alias);
+    if (!alias || !selected.has(alias)) return;
+    const did = String(item.device_id || "").trim();
+    if (did) ids.push(did);
+  });
+  return filterAutoSwitchDeviceIds(ids);
+}
+
+async function openBackupAliasPickModal() {
+  if (!backupAliasPickModalEl) return;
+  try {
+    await Promise.all([
+      loadBoundDeviceAliases(),
+      loadAutoSwitchConfig({ refreshArchive: false }),
+    ]);
+  } catch (error) {
+    setStatus(error.message || "加载别名设备失败", "error");
+    return;
+  }
+  // 打开时按当前列表勾选预填（若有）
+  if (!backupAliasPickSelectedAliases.size && autoSwitchPickDeviceIds instanceof Set && autoSwitchPickDeviceIds.size) {
+    const idSet = autoSwitchPickDeviceIds;
+    buildAliasDevicePairs().forEach((item) => {
+      const did = String(item.device_id || "").trim();
+      if (did && idSet.has(did)) {
+        const alias = normalizeAliasValue(item.device_alias);
+        if (alias) backupAliasPickSelectedAliases.add(alias);
+      }
+    });
+  }
+  renderBackupAliasPickList();
+  backupAliasPickModalEl.classList.remove("hidden");
+  backupAliasPickModalEl.setAttribute("aria-hidden", "false");
+  if (backupAliasPickSearchInput) backupAliasPickSearchInput.focus();
+}
+
+function closeBackupAliasPickModal() {
+  if (!backupAliasPickModalEl) return;
+  backupAliasPickModalEl.classList.add("hidden");
+  backupAliasPickModalEl.setAttribute("aria-hidden", "true");
+}
+
+async function saveAutoSwitchFromAliasPick(enabled) {
+  const deviceIds = collectBackupAliasPickDeviceIds();
+  if (!deviceIds.length) {
+    setStatus("请至少勾选一个已绑定 device_id 的别名设备", "warning");
+    return;
+  }
+  // 保留打开弹窗前的列表勾选设备，避免弹窗内直接开/关后污染页面按钮目标
+  const previousPick = new Set(autoSwitchPickDeviceIds);
+  await saveAutoSwitchConfig({ enabled: !!enabled, deviceIds });
+  if (backupArchiveSelectedRowIndices.size) {
+    autoSwitchPickDeviceIds = previousPick;
+  } else {
+    autoSwitchPickDeviceIds.clear();
+  }
+  renderBackupAliasPickList();
+}
+
+async function collectBackupArchiveRowIndicesForAliases(aliases) {
+  const aliasSet = new Set(
+    Array.from(aliases || [])
+      .map((a) => normalizeAliasValue(a))
+      .filter(Boolean),
+  );
+  if (!aliasSet.size) return [];
+  const indices = [];
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(MAX_BACKUP_ARCHIVE_PAGE_SIZE),
+    });
+    const data = await request(`/api/admin/editor/device_rows?${params.toString()}`);
+    const rows = Array.isArray(data.items) ? data.items : [];
+    rows.forEach((row) => {
+      const alias = resolveBackupArchiveDisplayAlias(row);
+      if (!alias || !aliasSet.has(alias)) return;
+      const idx = resolveBackupArchiveExportRowIndex(row);
+      if (idx != null) indices.push(idx);
+    });
+    const total = Number(data?.total ?? 0) || 0;
+    const effectivePageSize = Number(data?.page_size ?? MAX_BACKUP_ARCHIVE_PAGE_SIZE) || MAX_BACKUP_ARCHIVE_PAGE_SIZE;
+    totalPages = Math.max(1, Math.ceil(total / effectivePageSize));
+    page += 1;
+  } while (page <= totalPages);
+  return indices;
+}
+
+async function applyBackupAliasPickToArchiveSelection() {
+  if (backupAliasPickApplyBusy) return;
+  const aliases = Array.from(backupAliasPickSelectedAliases);
+  if (!aliases.length) {
+    setStatus("请至少勾选一个别名设备", "warning");
+    return;
+  }
+  const deviceIds = collectBackupAliasPickDeviceIds();
+  backupAliasPickApplyBusy = true;
+  if (backupAliasPickApplySelectionBtn) {
+    backupAliasPickApplySelectionBtn.disabled = true;
+    backupAliasPickApplySelectionBtn.textContent = "应用中…";
+  }
+  try {
+    setStatus("正在按别名同步列表勾选…", "info");
+    const indices = await collectBackupArchiveRowIndicesForAliases(aliases);
+    backupArchiveSelectedRowIndices.clear();
+    indices.forEach((idx) => backupArchiveSelectedRowIndices.add(idx));
+    autoSwitchPickDeviceIds = new Set(deviceIds);
+    syncBackupArchiveExportCheckboxes();
+    if (deviceAliasGroupsEl) {
+      deviceAliasGroupsEl.querySelectorAll("details.panel-card[data-archive-alias]").forEach((details) => {
+        if (!(details instanceof HTMLElement)) return;
+        const groupCb = details.querySelector(".backup-archive-group-select-all");
+        if (!(groupCb instanceof HTMLInputElement)) return;
+        const groupIndices = String(groupCb.dataset.groupRowIndices || "")
+          .split(",")
+          .map((s) => Number(s.trim()))
+          .filter((n) => Number.isFinite(n) && n >= 0);
+        const allSelected = groupIndices.length > 0 && groupIndices.every((n) => backupArchiveSelectedRowIndices.has(n));
+        groupCb.checked = allSelected;
+        syncAutoSwitchPickForAliasGroup(details, allSelected || groupIndices.some((n) => backupArchiveSelectedRowIndices.has(n)));
+      });
+    }
+    updateBackupArchiveSelectionUi();
+    closeBackupAliasPickModal();
+    setStatus(
+      `已按 ${aliases.length} 个别名勾选 ${indices.length} 条备份记录` +
+        (deviceIds.length ? `（${deviceIds.length} 台设备可操作自动切号）` : "") +
+        "，可继续使用本页开启/关闭自动切号、导出已选等按钮",
+      "success",
+    );
+  } catch (error) {
+    setStatus(error.message || "同步列表勾选失败", "error");
+  } finally {
+    backupAliasPickApplyBusy = false;
+    if (backupAliasPickApplySelectionBtn) {
+      backupAliasPickApplySelectionBtn.disabled = false;
+      backupAliasPickApplySelectionBtn.textContent = "应用到列表勾选";
+    }
+  }
+}
+
 function setBackupArchiveXlsxButtonsBusy(busy) {
   backupArchiveXlsxBusy = Boolean(busy);
   if (exportBackupArchiveXlsxBtn) {
@@ -12738,13 +13211,17 @@ if (accountEditorListEl) {
     if (target.classList.contains("account-records-select-all")) {
       event.stopPropagation();
       const checked = target.checked;
-      getVisibleAccountRecordPageRows().forEach(({ row, idx }) => {
-        setAccountRecordRowSelected(resolveAccountRowIndex(row, idx), checked);
-      });
-      accountEditorListEl.querySelectorAll(".account-records-row-select").forEach((el) => {
-        if (el instanceof HTMLInputElement) el.checked = checked;
+      const groupEl = target.closest("details.account-alias-group");
+      const rowChecks = groupEl
+        ? groupEl.querySelectorAll(".account-records-row-select")
+        : accountEditorListEl.querySelectorAll(".account-records-row-select");
+      rowChecks.forEach((el) => {
+        if (!(el instanceof HTMLInputElement)) return;
+        el.checked = checked;
+        setAccountRecordRowSelected(el.dataset.accountRowIndex, checked);
       });
       target.indeterminate = false;
+      syncAccountRecordsPageSelectAllCheckbox();
       return;
     }
   });
