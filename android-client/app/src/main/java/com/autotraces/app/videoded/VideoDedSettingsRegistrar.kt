@@ -200,14 +200,18 @@ object VideoDedSettingsRegistrar {
                 bypassThrottle = bypassWirelessThrottle,
             )
         ) {
-            if (logRegistration) StatusLogBuffer.append("正在请求 PC 无线授权流水线…")
-            lastWirelessPipelineAtMs = System.currentTimeMillis()
-            runCatching {
-                CompanionApi.requestPcWirelessPipeline(context, launchMirror = false)
-            }.onSuccess {
-                if (logRegistration) StatusLogBuffer.append("PC 已执行无线准备/连接")
-            }.onFailure {
-                if (logRegistration) StatusLogBuffer.append("PC 流水线失败：${it.message}")
+            if (ApiSettings.getEffectiveMirrorLanIpv4(context) == null) {
+                if (logRegistration) StatusLogBuffer.append("本机暂无 Wi‑Fi IPv4，跳过 PC 无线流水线（避免误连其它机）")
+            } else {
+                if (logRegistration) StatusLogBuffer.append("正在请求 PC 无线授权流水线…")
+                lastWirelessPipelineAtMs = System.currentTimeMillis()
+                runCatching {
+                    CompanionApi.requestPcWirelessPipeline(context, launchMirror = false)
+                }.onSuccess {
+                    if (logRegistration) StatusLogBuffer.append("PC 已执行无线准备/连接")
+                }.onFailure {
+                    if (logRegistration) StatusLogBuffer.append("PC 流水线失败：${it.message}")
+                }
             }
         }
     }

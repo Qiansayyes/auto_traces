@@ -278,6 +278,7 @@ class VideoDedDeviceService : Service() {
     private fun maybeRequestPcWirelessPipeline(reg: org.json.JSONObject? = null) {
         if (reg != null && reg.optString("pcAdbState", "").trim() == "device") return
         if (MirrorStateProbe.currentMirrorStatus(applicationContext) == "offline") return
+        if (ApiSettings.getEffectiveMirrorLanIpv4(applicationContext) == null) return
         val now = System.currentTimeMillis()
         synchronized(this) {
             if (now - lastPcMirrorTriggerAt < 90_000) return
@@ -285,7 +286,8 @@ class VideoDedDeviceService : Service() {
         }
         scope.launch {
             runCatching {
-                CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false, connectAll = true)
+                // 只请求连本机，禁止 connectAll：多机同时心跳会把 PC 拖进全集群重连风暴
+                CompanionApi.requestPcWirelessPipeline(applicationContext, launchMirror = false)
             }.onFailure { Log.w("VideoDedDeviceService", "PC wireless pipeline failed", it) }
         }
     }

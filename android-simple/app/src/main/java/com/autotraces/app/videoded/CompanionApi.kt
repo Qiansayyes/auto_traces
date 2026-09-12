@@ -271,6 +271,11 @@ object CompanionApi {
         val resolvedTarget = target?.trim().orEmpty().ifEmpty {
             if (ip != null) "$ip:$port" else ""
         }
+        // 无本机目标且未显式 connectAll 时不要打 PC：服务端会误选「最近一台」别的设备
+        if (!connectAll && resolvedTarget.isEmpty()) {
+            Log.w(TAG, "requestPcWirelessPipeline skipped: no local Wi‑Fi target")
+            return@withContext """{"ok":false,"error":"no_local_wifi_target"}"""
+        }
         val url = "${windowsBaseUrl(context)}/api/mirror/start"
         val req = mutableMapOf<String, Any>(
             "autoConnectOnly" to true,
@@ -279,7 +284,7 @@ object CompanionApi {
         )
         if (connectAll) {
             req["connectAll"] = true
-        } else if (resolvedTarget.isNotEmpty()) {
+        } else {
             req["target"] = resolvedTarget
         }
         Log.d(TAG, "requestPcWirelessPipeline -> $url req=$req")
