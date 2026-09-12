@@ -42,18 +42,29 @@ object TaskDownloadWorkflow {
 
         try {
             val root = java.io.File(CompanionApi.resolvedTargetPath(targetPath))
+            val receivedDir = CompanionApi.receivedTaskDir(app, taskId)
             report("USB 已推送，正在校验 ${files.size} 个文件…")
             val completedFiles = mutableListOf<TaskFileAck>()
             for (file in files) {
-                val local = java.io.File(root, file.fileName)
-                report("校验：${file.fileName}")
+                val pushed = java.io.File(root, file.fileName)
+                // shell/root push 的 Pictures 文件对本 App 常 EACCES；先中转到私有 received 再验 MD5
+                val local = java.io.File(receivedDir, file.fileName)
+                report("中转并校验：${file.fileName}")
+                GalleryMediaPublisher.copyToAppReadable(app, pushed, local)
                 CompanionApi.verifyLocalFile(local, file)
                 completedFiles.add(TaskFileAck(file.fileName, file.sizeBytes, file.md5))
                 TaskStore.updateFileProgress(app, taskId, file.fileName, "downloaded")
+                // 私有副本已就绪：删掉公共目录 push 原件，避免 shell 幽灵索引
+                GalleryMediaPublisher.tryDeletePublicFile(pushed)
             }
 
-            GalleryMediaPublisher.scanExistingFiles(app, root, files.map { it.fileName })
-            report("校验通过，向 PC 确认完成")
+            // 从私有 received 正规 MediaStore 入库（本包 owner + IS_PENDING 收尾），再清临时目录
+            val galleryUris = GalleryMediaPublisher.publishAndDeleteReceived(
+                app,
+                taskId,
+                files.map { it.fileName },
+            )
+            report("校验通过，已写入相册，向 PC 确认完成")
 
             CompanionApi.ackTask(app, taskId, true, "usb_push_complete", completedFiles)
             TaskStore.saveTaskSnapshot(
@@ -74,7 +85,7 @@ object TaskDownloadWorkflow {
                 targetPath = targetPath,
                 error = null,
                 receivedDir = null,
-                galleryContentUriStrings = emptyList(),
+                galleryContentUriStrings = galleryUris,
             )
             report("USB 传输任务完成：$taskId")
         } catch (t: Throwable) {
