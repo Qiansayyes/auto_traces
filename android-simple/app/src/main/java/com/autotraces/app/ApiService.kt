@@ -264,6 +264,16 @@ object ApiService {
         clazz = DeviceAssignedAccountMarkBannedResponse::class.java,
     )
 
+    suspend fun markDeviceAssignedAccountMaxLogin(
+        deviceId: String,
+        alias: String,
+        username: String,
+    ): DeviceAssignedAccountMarkBannedResponse = post(
+        path = "/api/device/assigned_account/mark_max_login",
+        body = DeviceAssignedAccountMarkMaxLoginRequest(deviceId, alias, username),
+        clazz = DeviceAssignedAccountMarkBannedResponse::class.java,
+    )
+
     suspend fun updateDeviceAssignedAccountUsername(
         deviceId: String,
         alias: String,

@@ -218,6 +218,16 @@ class PendingActivateActivity : AppCompatActivity() {
             ManualDeviceControl.isBannedMarker(item.email_password)
     }
 
+    private fun itemLooksMaxLogin(item: DeviceAssignedAccountItem): Boolean {
+        if (item.looks_max_login == true) return true
+        return ManualDeviceControl.isMaxLoginMarker(item.password) ||
+            ManualDeviceControl.isMaxLoginMarker(item.email) ||
+            ManualDeviceControl.isMaxLoginMarker(item.email_password)
+    }
+
+    private fun itemLooksCredBlocked(item: DeviceAssignedAccountItem): Boolean =
+        itemLooksBanned(item) || itemLooksMaxLogin(item)
+
     private fun sortedAccountsForDisplay(): List<DeviceAssignedAccountItem> {
         val queue = PrefsStore.getPendingActivateUsernames()
         val queueIndex = queue.mapIndexed { index, u ->
@@ -267,27 +277,46 @@ class PendingActivateActivity : AppCompatActivity() {
             val localText = row.findViewById<TextView>(R.id.accountRowLocalText)
 
             val banned = itemLooksBanned(item)
+            val maxLogin = itemLooksMaxLogin(item)
+            val blocked = banned || maxLogin
             val excluded = item.auto_switch_excluded == true
             usernameText.text = buildString {
                 append("@$username")
                 if (excluded) append(" · 不切号")
-                if (banned) append(" · 已封禁")
+                when {
+                    banned -> append(" · 已封禁")
+                    maxLogin -> append(" · 登录次数上限")
+                }
             }
 
             val pos = queuePosition(username)
-            val recommended = !banned && PendingActivateRecommend.isRecommended(username)
-            if (pos != null) {
-                statusText.text = "队列 #$pos"
-                statusText.setTextColor(ContextCompat.getColor(this, R.color.pending_activate_in_queue))
-                toggleBtn.text = "退出"
-            } else if (recommended) {
-                statusText.text = "推荐入队"
-                statusText.setTextColor(ContextCompat.getColor(this, R.color.pending_activate_recommend))
-                toggleBtn.text = "加入"
-            } else {
-                statusText.text = "未入队"
-                statusText.setTextColor(ContextCompat.getColor(this, android.R.color.darker_gray))
-                toggleBtn.text = "加入"
+            val recommended = !blocked && PendingActivateRecommend.isRecommended(username)
+            when {
+                banned -> {
+                    statusText.text = "已封禁"
+                    statusText.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
+                    toggleBtn.text = "不可用"
+                }
+                maxLogin -> {
+                    statusText.text = "登录次数上限"
+                    statusText.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
+                    toggleBtn.text = "不可用"
+                }
+                pos != null -> {
+                    statusText.text = "队列 #$pos"
+                    statusText.setTextColor(ContextCompat.getColor(this, R.color.pending_activate_in_queue))
+                    toggleBtn.text = "退出"
+                }
+                recommended -> {
+                    statusText.text = "推荐入队"
+                    statusText.setTextColor(ContextCompat.getColor(this, R.color.pending_activate_recommend))
+                    toggleBtn.text = "加入"
+                }
+                else -> {
+                    statusText.text = "未入队"
+                    statusText.setTextColor(ContextCompat.getColor(this, android.R.color.darker_gray))
+                    toggleBtn.text = "加入"
+                }
             }
 
             val snap = PendingActivateRecommend.snapshot(username)
@@ -307,7 +336,7 @@ class PendingActivateActivity : AppCompatActivity() {
             localText.text =
                 "上次入队 $enqueueLabel · 累计活跃 ${total}分（涨粉${growth} / ForYou${forYou}）"
 
-            val canToggle = ManualDeviceControl.ENABLED && !blocked && !banned
+            val canToggle = ManualDeviceControl.ENABLED && !blocked
             toggleBtn.isEnabled = canToggle
             toggleBtn.setOnClickListener {
                 if (pos != null) {
@@ -544,7 +573,7 @@ class PendingActivateActivity : AppCompatActivity() {
             Toast.makeText(this, "请先刷新账号列表", Toast.LENGTH_SHORT).show()
             return
         }
-        val eligible = accounts.filterNot { itemLooksBanned(it) }
+        val eligible = accounts.filterNot { itemLooksCredBlocked(it) }
         val labels = eligible.mapNotNull { item ->
             val u = item.username?.trim()?.removePrefix("@").orEmpty()
             if (u.isEmpty()) null else {

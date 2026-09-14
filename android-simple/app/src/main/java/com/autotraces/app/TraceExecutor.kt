@@ -50,13 +50,30 @@ const val SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE = "__SAFEGUARD_REQUIRES_AUTO_LOG
 class AccountStatusLoggedOutException(message: String) : RuntimeException(message)
 
 /**
- * OCR 见账号封禁（如 Your account has been banned）：携带被封用户名，
- * 由协调器移出计划并上报云端，不重登。
+ * 凭据侧需移出计划（封禁 / 登录次数上限），不上抛重登。
+ */
+open class AccountPlanBlockedException(
+    val username: String,
+    val blockKind: String,
+    message: String,
+) : RuntimeException(message)
+
+/**
+ * OCR 见账号封禁（弹窗 Your account has been banned，或登录顺手见 suspended）：
+ * 携带被封用户名，由协调器移出计划并上报云端，不重登。
  */
 class AccountBannedException(
-    val username: String,
+    username: String,
     message: String = "account banned: @${username.trim().removePrefix("@")}",
-) : RuntimeException(message)
+) : AccountPlanBlockedException(username, "banned", message)
+
+/**
+ * OCR 见 Maximum number of attempts reached：与封禁同款链路，后缀 ----Maximum login。
+ */
+class AccountMaxLoginException(
+    username: String,
+    message: String = "account max login: @${username.trim().removePrefix("@")}",
+) : AccountPlanBlockedException(username, "max_login", message)
 
 /**
  * 系统 ANR「TikTok isn't responding」：已点 Close app、强停并冷启，需中止当前步骤由调度重试。
@@ -746,6 +763,7 @@ class RealTraceExecutor(
         when (ex) {
             is AccountStatusLoggedOutException,
             is AccountBannedException,
+            is AccountMaxLoginException,
             is LoginSafeguardRequiresAutoLoginException,
             is TikTokAnrRecoveredException,
             -> throw ex
@@ -876,6 +894,7 @@ class RealTraceExecutor(
     ): Boolean {
         // 封禁优先于掉登录 / 登录入口：Verify email 等页也可能叠封禁弹窗。
         probeAndHandleAccountBannedFromVision(vision, "OCR顺手(封禁)")
+        probeAndHandleMaxLoginAttemptsFromVision(vision, "OCR顺手(登录次数上限)")
         // Account status 须优先于 Log in 探测：弹窗正文含 “please log in again”，会误判为登录入口且永不点 OK。
         if (accountStatusRecoveryInProgress) return false
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
@@ -903,6 +922,7 @@ class RealTraceExecutor(
             probeAndHandleTikTokAnrFromVision(ctx, result, "截图OCR顺手")
             // 封禁弹窗：任意截图 OCR 顺手上报并中止（含裁切路径）
             probeAndHandleAccountBannedFromVision(result, "截图OCR顺手(封禁)")
+            probeAndHandleMaxLoginAttemptsFromVision(result, "截图OCR顺手(登录次数上限)")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "截图OCR顺手")
             } else {
@@ -920,6 +940,7 @@ class RealTraceExecutor(
                     if (redo != null) {
                         vision = redo
                         probeAndHandleAccountBannedFromVision(vision, "截图OCR顺手(封禁-重扫)")
+                        probeAndHandleMaxLoginAttemptsFromVision(vision, "截图OCR顺手(登录次数上限-重扫)")
                     } else if (err == "hard_stop") {
                         return
                     }
@@ -937,6 +958,8 @@ class RealTraceExecutor(
             probeLoginEntryLogoutFromOcrVision(ctx, vision, fileTag)
             probeAddAnotherAccountLogoutFromOcrVision(ctx, vision, fileTag)
         } catch (ex: AccountBannedException) {
+            throw ex
+        } catch (ex: AccountMaxLoginException) {
             throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
@@ -1527,6 +1550,8 @@ class RealTraceExecutor(
         /** 强关冷启后必须禁止「已在前台跳过拉起」，否则 dumpsys 残留会假成功停在桌面。 */
         allowSkipIfAlreadyForeground: Boolean = true,
     ): Boolean {
+        // 国内出口禁止拉起：循环日志直至代理到非 CN。
+        EgressIpGate.awaitUntilNotChina(alias, "$tag·出口IP")
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()) {
             devOp(alias, "$tag：TikTok 已在前台（dumpsys），跳过重复拉起")
@@ -2975,18 +3000,54 @@ class RealTraceExecutor(
 
     /**
      * TikTok 账号封禁弹窗：Your account has been banned / Appeal / Download your data。
+     * OCR 常把标题折成两行（been / banned），须先归一空白再匹配，否则会漏检空转。
      * 与 Account status 掉登录区分：封禁不上抛重登，由协调器 mark_banned 并移出计划。
+     * 密码页行内 suspended 不走此函数，见 [visionShowsAccountSuspendedInline]。
      */
     private fun visionShowsAccountBannedDialog(vision: Text): Boolean {
-        val text = vision.text.lowercase(Locale.US)
+        // 折行/多空格：Your account has been\nbanned → 压成单空格
+        val text = vision.text.lowercase(Locale.US).replace(Regex("\\s+"), " ")
         if (text.contains("your account has been banned")) return true
         if (text.contains("account has been banned")) return true
-        // 标题漏识时：banned + 申诉/下载数据同屏
         if (text.contains("has been banned") &&
             (text.contains("appeal") || text.contains("download your data") || text.contains("submit an appeal"))
         ) {
             return true
         }
+        // 标题再碎（漏 been 等）：banned + your account + 申诉/下载数据（勿用 dismiss，通用按钮易误判）
+        if (text.contains("banned") &&
+            text.contains("your account") &&
+            (text.contains("appeal") || text.contains("download your data") || text.contains("submit an appeal"))
+        ) {
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 登录页行内：Account is currently suspended（Enter password 下红字，非封禁弹窗）。
+     * 仅登录顺手处理调用；命中后与封禁同抛 [AccountBannedException]。
+     */
+    private fun visionShowsAccountSuspendedInline(vision: Text): Boolean {
+        val text = vision.text.lowercase(Locale.US).replace(Regex("\\s+"), " ")
+        if (text.contains("account is currently suspended")) return true
+        if (text.contains("currently suspended")) return true
+        // 折行/漏词兜底：suspended + account
+        if (text.contains("suspended") && text.contains("account")) return true
+        return false
+    }
+
+    /**
+     * 登录次数上限：Maximum number of attempts reached / Try again later + attempts。
+     * 时机：邮箱/Username Continue 之后优先查；密码提交后也查；验证码等登录 OCR 顺带查。
+     */
+    private fun visionShowsMaxLoginAttempts(vision: Text): Boolean {
+        // 与封禁同理：折行后压空白，避免 Maximum number of\nattempts 漏检
+        val text = vision.text.lowercase(Locale.US).replace(Regex("\\s+"), " ")
+        if (text.contains("maximum number of attempts")) return true
+        if (text.contains("attempts reached")) return true
+        // OCR 折行：一面 attempts / Maximum，一面 Try again later
+        if (text.contains("try again later") && text.contains("attempts")) return true
         return false
     }
 
@@ -2997,7 +3058,7 @@ class RealTraceExecutor(
 
     /**
      * OCR 顺手：见封禁弹窗则立即抛 [AccountBannedException]，由协调器上报云端并剔除本机计划。
-     * 任意 OCR 路径均应调用（含自动登录 Verify email）。
+     * 任意 OCR 路径均应调用（含自动登录 Verify email）。密码页 suspended 不在此处理。
      */
     private fun probeAndHandleAccountBannedFromVision(vision: Text, phaseLog: String) {
         if (!visionShowsAccountBannedDialog(vision)) return
@@ -3009,6 +3070,39 @@ class RealTraceExecutor(
                 "username=${username.ifBlank { "-" }}，中止当前步骤上报云端并移出计划",
         )
         throw AccountBannedException(username)
+    }
+
+    /**
+     * 登录顺手：OCR 见 Account is currently suspended 则按封禁上报并移出计划。
+     * 仅 [autoLoginTryDismissInlineOverlaysFromVision] 调用，非登录流程不查。
+     */
+    private fun probeAndHandleAccountSuspendedFromVision(vision: Text, phaseLog: String) {
+        if (!visionShowsAccountSuspendedInline(vision)) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val username = resolveUsernameForAccountBannedReport()
+        devOp(
+            alias,
+            "$phaseLog：OCR 见 Account is currently suspended，" +
+                "username=${username.ifBlank { "-" }}，中止当前步骤上报云端并移出计划",
+        )
+        throw AccountBannedException(username)
+    }
+
+    /**
+     * OCR 顺手：见登录次数上限则打日志并抛 [AccountMaxLoginException]（与封禁同款移出计划）。
+     * 所有登录相关 OCR 均应调用。
+     */
+    private fun probeAndHandleMaxLoginAttemptsFromVision(vision: Text, phaseLog: String) {
+        if (!visionShowsMaxLoginAttempts(vision)) return
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        val username = resolveUsernameForAccountBannedReport()
+        // 固定文案便于日后 grep 定位
+        devOp(
+            alias,
+            "$phaseLog：OCR 见 Maximum number of attempts reached，" +
+                "username=${username.ifBlank { "-" }}，标 ----Maximum login 并移出计划",
+        )
+        throw AccountMaxLoginException(username)
     }
 
     /**
@@ -3311,6 +3405,7 @@ class RealTraceExecutor(
             probeAndHandleTikTokAnrFromVision(ctx, result, "OCR顺手处理")
             // 封禁弹窗：任意整屏 OCR 顺手（含自动登录 Verify email）
             probeAndHandleAccountBannedFromVision(result, "OCR顺手(封禁)")
+            probeAndHandleMaxLoginAttemptsFromVision(result, "OCR顺手(登录次数上限)")
             var vision = if (!inlineIdentityVerificationInProgress) {
                 dismissSwipeUpPromptUntilGone(ctx, result, fileTag, "OCR顺手处理")
             } else {
@@ -3363,6 +3458,8 @@ class RealTraceExecutor(
             }
             vision to "ok"
         } catch (ex: AccountBannedException) {
+            throw ex
+        } catch (ex: AccountMaxLoginException) {
             throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
@@ -4481,28 +4578,17 @@ class RealTraceExecutor(
     /**
      * 验证码页可重试错误（处理方案相同：清码 → 等 Resend 倒计时结束 → 点 Resend → 拉新码且须 ≠ 旧码）：
      * - Verification code is expired or incorrect
-     * - Maximum number of attempts reached. Try again later.
+     * 「Maximum number of attempts reached」已改走 [AccountMaxLoginException] 移出计划，不再当可重试。
      */
     private fun visionHasVerificationCodeRetryableError(vision: Text): Boolean {
+        if (visionShowsMaxLoginAttempts(vision)) return false
         if (findLabelHitContainingIgnoreCase(vision, "expired") != null) return true
         if (findLabelHitContainingIgnoreCase(vision, "incorrect") != null) return true
-        if (findLabelHitContainingIgnoreCase(vision, "maximum number of attempts") != null) return true
-        if (findLabelHitContainingIgnoreCase(vision, "attempts reached") != null) return true
-        // OCR 折行：一面 attempts / Maximum，一面 Try again later
-        val hasTryAgainLater = findLabelHitContainingIgnoreCase(vision, "try again later") != null
-        val hasAttempts = findLabelHitContainingIgnoreCase(vision, "attempts") != null
-        return hasTryAgainLater && hasAttempts
+        return false
     }
 
     private fun autoLoginDescribeVerificationCodeRetryableError(vision: Text): String {
         return when {
-            findLabelHitContainingIgnoreCase(vision, "maximum number of attempts") != null ||
-                findLabelHitContainingIgnoreCase(vision, "attempts reached") != null ||
-                (
-                    findLabelHitContainingIgnoreCase(vision, "try again later") != null &&
-                        findLabelHitContainingIgnoreCase(vision, "attempts") != null
-                    ) ->
-                "Maximum number of attempts reached"
             findLabelHitContainingIgnoreCase(vision, "expired") != null ||
                 findLabelHitContainingIgnoreCase(vision, "incorrect") != null ->
                 "expired/incorrect"
@@ -8435,6 +8521,8 @@ class RealTraceExecutor(
         tag: String,
         allowForceRestart: Boolean = true,
     ): Boolean {
+        // 「已在前台跳过拉起」也会绕过 launchTikTokOnceWithCheck，这里同样先过出口门阀。
+        EgressIpGate.awaitUntilNotChina(alias, "$tag·出口IP")
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {
             devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")
@@ -9248,10 +9336,13 @@ class RealTraceExecutor(
         // 系统 ANR 优先（本路径走无副作用 OCR，不会进 mlKitRecognizeFullScreen 顺手处理）
         probeAndHandleTikTokAnrFromVision(service, vision, "点击放大镜前")
         probeAndHandleAccountBannedFromVision(vision, "点击放大镜前(封禁)")
+        probeAndHandleMaxLoginAttemptsFromVision(vision, "点击放大镜前(登录次数上限)")
         // 涨粉等 withAccountStatusOcrWatch 上下文：顺带探测掉登录（Account status 优先，避免 please log in again 误判）
         try {
             observeAccountStatusOnOcrText(service, vision, "magnifier_before_dont_allow")
         } catch (ex: AccountBannedException) {
+            throw ex
+        } catch (ex: AccountMaxLoginException) {
             throw ex
         } catch (ex: AccountStatusLoggedOutException) {
             throw ex
@@ -18505,6 +18596,8 @@ class RealTraceExecutor(
                 if (!autoLoginDelay(alias, 1000L, "等待密码页")) return false
                 continue
             }
+            // Username Continue 后：优先查 Maximum（顺手 OCR 已查；此处再标阶段便于日志）
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(Username后)Maximum")
             if (visionHasEnterPasswordPage(vision, h)) {
                 devOp(alias, "自动登录(2FA)：已识别 Enter password 页（第 $pass 次 OCR）")
                 return true
@@ -18552,6 +18645,8 @@ class RealTraceExecutor(
                 if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
                 continue
             }
+            // 密码 Continue 后等 Authenticator：仍可能停在密码页报 Maximum
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(密码后等2FA)Maximum")
             if (visionHasAuthenticatorAppPage(vision)) {
                 devOp(alias, "自动登录(2FA)：已识别 Authenticator app 页（第 $pass 次 OCR）")
                 return true
@@ -18746,6 +18841,8 @@ class RealTraceExecutor(
                 autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
             } catch (ex: AccountBannedException) {
                 throw ex
+            } catch (ex: AccountMaxLoginException) {
+                throw ex
             } catch (ex: TikTokAnrRecoveredException) {
                 throw ex
             } catch (ex: AccountStatusLoggedOutException) {
@@ -18771,8 +18868,11 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, "自动登录-OCR顺带处理")) return false
         // ANR 优先：点 Close app → 强停冷启 → 抛出异常中止（外层自动登录可重试）
         probeAndHandleTikTokAnrFromVision(ctx, vision, "自动登录(顺带) ANR")
-        // 封禁：Verify email 等页叠封禁弹窗时立即上报，不继续等验证码
-        probeAndHandleAccountBannedFromVision(vision, "自动登录(顺带)封禁")
+        // 封禁弹窗：任意登录 OCR 顺手上报（与全局弹窗探测一致）
+        probeAndHandleAccountBannedFromVision(vision, "自动登录(顺带)封禁弹窗")
+        // suspended：仅登录顺手文案，OCR 命中即按封禁处理
+        probeAndHandleAccountSuspendedFromVision(vision, "自动登录(顺带)suspended")
+        probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(顺带)登录次数上限")
         val dm = ctx.resources.displayMetrics
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
@@ -20355,6 +20455,9 @@ class RealTraceExecutor(
                 continue
             }
 
+            // 邮箱/Username Continue 后：定位 Maximum number of attempts
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(邮箱/Username后)Maximum")
+
             // Password/Email + access these 方式页：切勿等成「命中 Verify」空等 Resend
             if (visionHasPasswordAccessTheseMethod(vision) ||
                 visionHasEmailAccessTheseMethod(vision) ||
@@ -20555,6 +20658,8 @@ class RealTraceExecutor(
                 return AutoLoginStepOutcome.Failed
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_post_password_$ocrPass") ?: continue
+            // 密码提交后：再标阶段查 Maximum（suspended 由登录顺手处理）
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(密码后)Maximum")
             val screenKind = autoLoginClassifyRouteScreen(vision, h)
             val preview = buildProfileEditOcrPreview(vision).take(300)
             when (screenKind) {
@@ -20952,6 +21057,8 @@ class RealTraceExecutor(
             if (phaseLog.contains("验证码") || allowPasswordLayoutSuccess) {
                 autoLoginLogPostCodePageOcr(alias, "切号-$phaseLog", pass, vision, h)
             }
+            // 邮箱/Username 后与密码后：再标阶段查 Maximum（suspended 仅登录顺手）
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(切号-$phaseLog)Maximum")
             // 验证码提交后仍停在本页且见 expired / maximum attempts → 立刻结束等待，交给 Resend 恢复
             if (phaseLog.contains("验证码") && visionHasVerificationCodeRetryableError(vision)) {
                 val errKind = autoLoginDescribeVerificationCodeRetryableError(vision)
@@ -21030,6 +21137,8 @@ class RealTraceExecutor(
                 if (!autoLoginDelay(alias, 1000L, "Email分流")) return null
                 continue
             }
+            // 切号 Email/Username Continue 后：定位 Maximum
+            probeAndHandleMaxLoginAttemptsFromVision(vision, "自动登录(切号-邮箱后)Maximum")
             val branch = autoLoginCutSwitchClassifyPostEmailBranch(vision, h)
             if (branch != AutoLoginCutSwitchPostEmailBranch.StillOnEmail &&
                 branch != AutoLoginCutSwitchPostEmailBranch.Unknown
@@ -22366,6 +22475,7 @@ class RealTraceExecutor(
                 }.onFailure { ex ->
                     when (ex) {
                         is AccountBannedException,
+                        is AccountMaxLoginException,
                         is AccountStatusLoggedOutException,
                         is TikTokAnrRecoveredException,
                         is LoginSafeguardRequiresAutoLoginException,

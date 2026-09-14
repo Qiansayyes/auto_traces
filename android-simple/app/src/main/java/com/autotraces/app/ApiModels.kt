@@ -478,8 +478,10 @@ data class DeviceAssignedAccountItem(
     val env_status: String? = null,
     /** true=不参加自动切号；false/null=参加。 */
     val auto_switch_excluded: Boolean? = null,
-    /** 云端 password/email/email_password 标 banned。 */
+    /** 云端 password/email/email_password 标封禁（banned / ----banned）。 */
     val looks_banned: Boolean? = null,
+    /** 云端标登录次数上限（----Maximum login）。 */
+    val looks_max_login: Boolean? = null,
     val video_count: String? = null,
     val follower_count: String? = null,
     /** 今日粉丝增长（优先 follower_growth_today）。 */
@@ -564,6 +566,9 @@ data class DeviceAssignedAccountMarkBannedResponse(
     val code: Int,
     val msg: String? = null,
     val username: String? = null,
+    val kind: String? = null,
+    val suffix: String? = null,
+    val already_blocked: Boolean? = null,
     val password: String? = null,
     val email: String? = null,
     val email_password: String? = null,
@@ -572,6 +577,12 @@ data class DeviceAssignedAccountMarkBannedResponse(
     val plan_regenerated_aliases: Int? = null,
     val devices_notified: Int? = null,
     val cloud_synced: Boolean? = null,
+)
+
+data class DeviceAssignedAccountMarkMaxLoginRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
 )
 
 data class DeviceAssignedAccountUpdateUsernameRequest(

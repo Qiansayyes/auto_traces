@@ -119,7 +119,7 @@ class ControlModeActivity : AppCompatActivity() {
             list.forEach { acc ->
                 val prev = previous[acc.username.lowercase()]
                 participationChecked[acc.username] = when {
-                    acc.looksBanned -> false
+                    acc.looksCredBlocked -> false
                     prev != null -> prev
                     else -> true
                 }
@@ -165,10 +165,10 @@ class ControlModeActivity : AppCompatActivity() {
 
             usernameText.text = buildString {
                 append("@${acc.username}")
-                if (acc.looksBanned) {
-                    append(" · 已封禁")
-                } else if (participationChecked[acc.username] != true) {
-                    append(" · 未勾选")
+                when {
+                    acc.looksBanned -> append(" · 已封禁")
+                    acc.looksMaxLogin -> append(" · 登录次数上限")
+                    participationChecked[acc.username] != true -> append(" · 未勾选")
                 }
             }
             growthText.text = formatGrowthLine(acc)
@@ -190,15 +190,16 @@ class ControlModeActivity : AppCompatActivity() {
 
             val cloudLabel = when {
                 acc.looksBanned -> "云端：已封禁（不可参与）"
+                acc.looksMaxLogin -> "云端：登录次数上限（不可参与）"
                 acc.autoSwitchExcluded -> "云端：不参与"
                 else -> "云端：参与"
             }
             status.text = cloudLabel
-            check.isEnabled = !acc.looksBanned && !participationBusy
+            check.isEnabled = !acc.looksCredBlocked && !participationBusy
             check.setOnCheckedChangeListener(null)
-            check.isChecked = participationChecked[acc.username] == true && !acc.looksBanned
+            check.isChecked = participationChecked[acc.username] == true && !acc.looksCredBlocked
             check.setOnCheckedChangeListener { _, checked ->
-                if (acc.looksBanned) return@setOnCheckedChangeListener
+                if (acc.looksCredBlocked) return@setOnCheckedChangeListener
                 participationChecked[acc.username] = checked
                 updateParticipationSummary()
             }
@@ -207,6 +208,10 @@ class ControlModeActivity : AppCompatActivity() {
                 acc.looksBanned -> {
                     toggle.isEnabled = false
                     toggle.text = "封禁不可参与"
+                }
+                acc.looksMaxLogin -> {
+                    toggle.isEnabled = false
+                    toggle.text = "次数上限不可参与"
                 }
                 acc.autoSwitchExcluded -> {
                     toggle.isEnabled = !participationBusy
@@ -253,14 +258,15 @@ class ControlModeActivity : AppCompatActivity() {
     }
 
     private fun updateParticipationSummary() {
-        val total = participationRoster.count { !it.looksBanned }
+        val total = participationRoster.count { !it.looksCredBlocked }
         val selected = participationChecked.filter { it.value }.keys
-            .count { name -> participationRoster.any { it.username.equals(name, true) && !it.looksBanned } }
+            .count { name -> participationRoster.any { it.username.equals(name, true) && !it.looksCredBlocked } }
         val cloudParticipate = participationRoster.count { it.participating }
-        val cloudExclude = participationRoster.count { !it.looksBanned && it.autoSwitchExcluded }
+        val cloudExclude = participationRoster.count { !it.looksCredBlocked && it.autoSwitchExcluded }
         val banned = participationRoster.count { it.looksBanned }
+        val maxLogin = participationRoster.count { it.looksMaxLogin }
         binding.participationSummaryText.text =
-            "云端现状：参与 $cloudParticipate / 不参与 $cloudExclude / 封禁 $banned；" +
+            "云端现状：参与 $cloudParticipate / 不参与 $cloudExclude / 封禁 $banned / 次数上限 $maxLogin；" +
                 "切换后勾选：$selected / $total"
     }
 

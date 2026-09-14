@@ -3604,7 +3604,7 @@ object AppCoordinator {
             .toSet()
         return ManualDeviceControl.getCachedAccounts()
             .asSequence()
-            .filter { !excludeBanned || !ManualDeviceControl.accountLooksBanned(it) }
+            .filter { !excludeBanned || !ManualDeviceControl.accountLooksCredBlocked(it) }
             .map { it.username.trim().removePrefix("@") }
             .filter { it.isNotEmpty() }
             .filter { it.lowercase(java.util.Locale.US) !in pending }
@@ -4976,10 +4976,12 @@ object AppCoordinator {
         val rowIndex: Int?,
         val autoSwitchExcluded: Boolean,
         val looksBanned: Boolean,
+        val looksMaxLogin: Boolean,
         val cloudIsLogin: Boolean?,
         val assigned: DeviceAssignedAccountItem,
     ) {
-        val participating: Boolean get() = !autoSwitchExcluded && !looksBanned
+        val looksCredBlocked: Boolean get() = looksBanned || looksMaxLogin
+        val participating: Boolean get() = !autoSwitchExcluded && !looksCredBlocked
     }
 
     /** 拉取别名桶账号（含不参与 / banned），供切换云端模式前展示。 */
@@ -5006,6 +5008,10 @@ object AppCoordinator {
                         ManualDeviceControl.isBannedMarker(item.password) ||
                         ManualDeviceControl.isBannedMarker(item.email) ||
                         ManualDeviceControl.isBannedMarker(item.email_password),
+                    looksMaxLogin = item.looks_max_login == true ||
+                        ManualDeviceControl.isMaxLoginMarker(item.password) ||
+                        ManualDeviceControl.isMaxLoginMarker(item.email) ||
+                        ManualDeviceControl.isMaxLoginMarker(item.email_password),
                     cloudIsLogin = item.is_login,
                     assigned = item,
                 )
@@ -5360,7 +5366,7 @@ object AppCoordinator {
         if (!PrefsStore.isManualLocalAutoSwitchEnabled()) return false
         if (shouldHonorUserHardStop()) return false
         val accounts = ManualDeviceControl.getCachedAccounts()
-            .filterNot { ManualDeviceControl.accountLooksBanned(it) || it.autoSwitchExcluded }
+            .filterNot { ManualDeviceControl.accountLooksCredBlocked(it) || it.autoSwitchExcluded }
         if (accounts.isEmpty()) {
             LogCenter.op(alias, "本机自动切号失败：请先拉取云端账号列表（或列表中账号均已封禁）")
             return false
@@ -8496,8 +8502,8 @@ object AppCoordinator {
                     resumeFromLoginEntryScreen = nextResumeFromEntry,
                     preferredUsername = expected,
                 )
-            } catch (banned: AccountBannedException) {
-                handleAccountBanned(alias, deviceId, banned.username.ifBlank { expected.orEmpty() }, reason)
+            } catch (banned: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(alias, deviceId, banned, reason)
                 return AccountLoginRetryOutcome.Aborted
             }
             if (loginOk) {
@@ -8934,12 +8940,12 @@ object AppCoordinator {
                     if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
                 }
                 ok
-            } catch (banned: AccountBannedException) {
-                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+            } catch (banned: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
                 false
             }
-        } catch (banned: AccountBannedException) {
-            handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+        } catch (banned: AccountPlanBlockedException) {
+            handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
             false
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
@@ -8960,8 +8966,8 @@ object AppCoordinator {
                     if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
                 }
                 ok
-            } catch (banned: AccountBannedException) {
-                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($source)")
+            } catch (banned: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
                 false
             }
         }
@@ -9000,8 +9006,8 @@ object AppCoordinator {
                     forceRelogin = true,
                     resumeFromLoginEntryScreen = true,
                 )
-            } catch (banned: AccountBannedException) {
-                handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($safeguardSource)")
+            } catch (banned: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($safeguardSource)")
                 false
             }
         }
@@ -9076,8 +9082,8 @@ object AppCoordinator {
                             forceRelogin = true,
                             resumeFromLoginEntryScreen = true,
                         )
-                    } catch (banned: AccountBannedException) {
-                        handleAccountBanned(alias, deviceId, banned.username, "登录状态保障($safeguardSource)")
+                    } catch (banned: AccountPlanBlockedException) {
+                        handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($safeguardSource)")
                         false
                     }
                 }
@@ -9112,56 +9118,66 @@ object AppCoordinator {
                 if (u.isNotBlank()) markManualAccountReady(u, "掉登录恢复自动登录($source)")
             }
             ok
-        } catch (banned: AccountBannedException) {
-            handleAccountBanned(alias, deviceId, banned.username, "掉登录恢复($source)")
+        } catch (banned: AccountPlanBlockedException) {
+            handleAccountPlanBlocked(alias, deviceId, banned, "掉登录恢复($source)")
             false
         }
     }
 
     /**
-     * OCR 见「Your account has been banned」：
-     * 上报云端（password/email/email_password=banned + 移出自动切号计划），本机缓存剔除并重建计划，不重登。
+     * OCR 见账号封禁 / 登录次数上限：上报云端追加凭据后缀并移出自动切号计划，本机缓存剔除并重建计划，不重登。
+     * kind=banned → ----banned；kind=max_login → ----Maximum login（兼容旧整字段 banned）。
      */
-    private suspend fun handleAccountBanned(
+    private suspend fun handleAccountCredBlocked(
         alias: String,
         deviceId: String,
-        bannedUsername: String,
+        blockedUsername: String,
+        kind: String,
         source: String,
     ) {
-        val username = bannedUsername.trim().removePrefix("@").ifBlank {
+        val isMaxLogin = kind.equals("max_login", ignoreCase = true)
+        val suffix = if (isMaxLogin) "----Maximum login" else "----banned"
+        val label = if (isMaxLogin) "登录次数上限" else "封禁"
+        val opType = if (isMaxLogin) "account_max_login" else "account_banned"
+        val apiName = if (isMaxLogin) "mark_max_login" else "mark_banned"
+        val username = blockedUsername.trim().removePrefix("@").ifBlank {
             ManualDeviceControl.activeManualUsername()
                 .ifBlank { ManualDeviceControl.selectedManualUsername() }
                 .ifBlank { PrefsStore.getLogContextUsername()?.trim()?.removePrefix("@").orEmpty() }
         }
         LogCenter.op(
             alias,
-            "封禁处理：OCR 见账号封禁（来源=$source username=${username.ifBlank { "-" }}），" +
-                "移出计划并将 password/email/email_password 标 banned，上报云端",
+            "${label}处理：OCR 命中（来源=$source username=${username.ifBlank { "-" }}），" +
+                "移出计划并将 password/email/email_password 追加 $suffix，上报云端",
         )
-        updateRuntime(lastMessage = "账号封禁：@$username 移出计划")
+        updateRuntime(lastMessage = "账号$label：@$username 移出计划")
         executor.clearAccountStatusReloginState()
 
         var cloudOk = false
         var cloudMsg = ""
         if (deviceId.isNotBlank() && username.isNotBlank()) {
             val resp = runCatching {
-                ApiService.markDeviceAssignedAccountBanned(deviceId, alias, username)
+                if (isMaxLogin) {
+                    ApiService.markDeviceAssignedAccountMaxLogin(deviceId, alias, username)
+                } else {
+                    ApiService.markDeviceAssignedAccountBanned(deviceId, alias, username)
+                }
             }.onFailure { err ->
                 cloudMsg = err.message ?: "unknown"
-                LogCenter.op(alias, "封禁处理：云端 mark_banned 异常：${err.message}")
+                LogCenter.op(alias, "${label}处理：云端 $apiName 异常：${err.message}")
             }.getOrNull()
             if (resp != null) {
                 cloudOk = resp.code == 0
                 cloudMsg = resp.msg.orEmpty().ifBlank { if (cloudOk) "ok" else "failed" }
                 LogCenter.op(
                     alias,
-                    "封禁处理：云端 mark_banned code=${resp.code} msg=${resp.msg} " +
+                    "${label}处理：云端 $apiName code=${resp.code} msg=${resp.msg} " +
                         "excluded=${resp.device_excluded_rows} notified=${resp.devices_notified}",
                 )
             }
         } else {
             cloudMsg = "缺少 deviceId/username"
-            LogCenter.op(alias, "封禁处理：缺少 deviceId 或 username，跳过云端上报")
+            LogCenter.op(alias, "${label}处理：缺少 deviceId 或 username，跳过云端上报")
         }
 
         if (username.isNotBlank()) {
@@ -9170,7 +9186,7 @@ object AppCoordinator {
             val active = ManualDeviceControl.activeManualUsername()
             if (selected.equals(username, ignoreCase = true) || active.equals(username, ignoreCase = true)) {
                 val next = ManualDeviceControl.getCachedAccounts()
-                    .filterNot { ManualDeviceControl.accountLooksBanned(it) }
+                    .filterNot { ManualDeviceControl.accountLooksCredBlocked(it) }
                     .firstOrNull()?.username.orEmpty()
                 if (next.isNotBlank()) {
                     PrefsStore.setManualSelectedUsername(next)
@@ -9184,19 +9200,18 @@ object AppCoordinator {
             }
         }
 
-        val opId = "account_banned_${System.currentTimeMillis()}"
+        val opId = "${opType}_${System.currentTimeMillis()}"
         reportDeviceOpToCloud(
             deviceId = deviceId,
             alias = alias,
             opId = opId,
             status = if (cloudOk) "success" else "failed",
-            message = "账号封禁 @$username：移出计划，password/email/email_password=banned（$cloudMsg）",
+            message = "账号$label @$username：移出计划，凭据追加 $suffix（$cloudMsg）",
             data = mapOf(
-                "op_type" to "account_banned",
+                "op_type" to opType,
                 "username" to username,
-                "password" to "banned",
-                "email" to "banned",
-                "email_password" to "banned",
+                "kind" to kind,
+                "suffix" to suffix,
                 "source" to source,
                 "cloud_synced" to cloudOk,
                 "cloud_msg" to cloudMsg,
@@ -9204,33 +9219,54 @@ object AppCoordinator {
         )
 
         // 本机自动切号开启时：剔除后重建计划并立刻切号，切勿走「登录失败 hold」——
-        // 否则会周期性重登已封禁账号，并挡住 requestImmediateTick。
+        // 否则会周期性重登已阻断账号，并挡住 requestImmediateTick。
         if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled() && deviceId.isNotBlank()) {
             PrefsStore.clearAutoSwitchTikTokLoginHold()
             val ok = rebuildAndStartManualLocalAutoSwitch(
                 alias = alias,
                 deviceId = deviceId,
                 slotMinutes = PrefsStore.getManualAutoSwitchSlotMinutes(),
-                reason = "账号封禁移出计划",
+                reason = "账号${label}移出计划",
             )
             if (ok) {
                 autoSwitchLocalScheduler.requestImmediateTick()
-                updateRuntime(lastMessage = "账号 @$username 已封禁并移出计划，将切到其他账号")
+                updateRuntime(lastMessage = "账号 @$username 已${label}并移出计划，将切到其他账号")
             } else {
                 pauseGrowthAfterLoginFailure(
                     alias,
                     deviceId,
-                    "账号 @$username 已封禁；本机计划重建失败，请手动切号",
+                    "账号 @$username 已$label；本机计划重建失败，请手动切号",
                 )
             }
         } else {
             pauseGrowthAfterLoginFailure(
                 alias,
                 deviceId,
-                "账号 @$username 已封禁并移出计划，请切到其他账号",
+                "账号 @$username 已${label}并移出计划，请切到其他账号",
             )
         }
     }
+
+    private suspend fun handleAccountBanned(
+        alias: String,
+        deviceId: String,
+        bannedUsername: String,
+        source: String,
+    ) = handleAccountCredBlocked(alias, deviceId, bannedUsername, "banned", source)
+
+    private suspend fun handleAccountMaxLogin(
+        alias: String,
+        deviceId: String,
+        username: String,
+        source: String,
+    ) = handleAccountCredBlocked(alias, deviceId, username, "max_login", source)
+
+    private suspend fun handleAccountPlanBlocked(
+        alias: String,
+        deviceId: String,
+        ex: AccountPlanBlockedException,
+        source: String,
+    ) = handleAccountCredBlocked(alias, deviceId, ex.username, ex.blockKind, source)
 
     /**
      * Account status：有 OK 则点 OK 并冷启；无 OK 则强停 + pm clear 后冷启。
@@ -9252,8 +9288,8 @@ object AppCoordinator {
                 forceRelogin = true,
                 resumeFromLoginEntryScreen = true,
             )
-        } catch (banned: AccountBannedException) {
-            handleAccountBanned(alias, deviceId, banned.username, "掉登录恢复($source)")
+        } catch (banned: AccountPlanBlockedException) {
+            handleAccountPlanBlocked(alias, deviceId, banned, "掉登录恢复($source)")
             false
         }
     }
@@ -9362,7 +9398,7 @@ object AppCoordinator {
                 flowKind = flowKind,
             )
         }.recoverCatching { err ->
-            if (err is AccountBannedException) throw err
+            if (err is AccountPlanBlockedException) throw err
             // 自动登录链内 OCR 误把 Welcome back/Add another 当掉登录上抛时：从当前登录入口续接，勿直接判失败。
             if (err is LoginSafeguardRequiresAutoLoginException) {
                 LogCenter.op(
@@ -9386,7 +9422,7 @@ object AppCoordinator {
                             flowKind = flowKind,
                         )
                     }.getOrElse { resumeErr ->
-                        if (resumeErr is AccountBannedException) throw resumeErr
+                        if (resumeErr is AccountPlanBlockedException) throw resumeErr
                         if (resumeErr is LoginSafeguardRequiresAutoLoginException) {
                             LogCenter.op(
                                 alias,
@@ -9402,7 +9438,7 @@ object AppCoordinator {
             }
             throw err
         }.getOrElse { err ->
-            if (err is AccountBannedException) throw err
+            if (err is AccountPlanBlockedException) throw err
             LogCenter.op(alias, "[OP][$opId] 自动登录($reason)异常：${err.message}")
             false
         }
@@ -10973,13 +11009,17 @@ object AppCoordinator {
                     }
                     val chain = try {
                         executor.profileEditRunOcrChain(appContext, _config.value)
-                    } catch (e: AccountBannedException) {
-                        opLog("修改基本资料：账号封禁 ${e.message}")
-                        handleAccountBanned(alias, deviceId, e.username, "修改基本资料")
+                    } catch (e: AccountPlanBlockedException) {
+                        val kindStep =
+                            if (e.blockKind.equals("max_login", true)) "account_max_login" else "account_banned"
+                        val kindLabel =
+                            if (e.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁"
+                        opLog("修改基本资料：$kindLabel ${e.message}")
+                        handleAccountPlanBlocked(alias, deviceId, e, "修改基本资料")
                         ProfileEditChainResult(
                             success = false,
-                            failureStep = "account_banned",
-                            editOcrPreviews = listOf(e.message ?: "account_banned"),
+                            failureStep = kindStep,
+                            editOcrPreviews = listOf(e.message ?: kindStep),
                         )
                     } catch (e: AccountStatusLoggedOutException) {
                         opLog("修改基本资料：掉登录 ${e.message}")
@@ -12200,11 +12240,13 @@ object AppCoordinator {
                                     "失败：需要自动登录"
                                 }
                             }
-                            is AccountBannedException -> {
+                            is AccountPlanBlockedException -> {
                                 if (deviceId.isNotBlank()) {
-                                    handleAccountBanned(alias, deviceId, err.username, "主播访问")
+                                    handleAccountPlanBlocked(alias, deviceId, err, "主播访问")
                                 }
-                                "失败：账号封禁 ${err.message ?: "banned"}"
+                                val kindLabel =
+                                    if (err.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁"
+                                "失败：$kindLabel ${err.message ?: err.blockKind}"
                             }
                             is AccountStatusLoggedOutException -> {
                                 if (deviceId.isNotBlank()) {
@@ -12337,11 +12379,11 @@ object AppCoordinator {
                 }.getOrElse { err ->
                     when (err) {
                         is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
-                        is AccountBannedException -> {
+                        is AccountPlanBlockedException -> {
                             if (deviceIdForMutual.isNotBlank()) {
-                                handleAccountBanned(alias, deviceIdForMutual, err.username, "互点切换")
+                                handleAccountPlanBlocked(alias, deviceIdForMutual, err, "互点切换")
                             }
-                            "互点流程账号封禁：${err.message ?: "banned"}"
+                            "互点流程" + (if (err.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁") + "：${err.message ?: err.blockKind}"
                         }
                         is AccountStatusLoggedOutException -> {
                             if (deviceIdForMutual.isNotBlank()) {
@@ -12367,9 +12409,9 @@ object AppCoordinator {
                                 executor.executeForUsername("__mutual_switch__", _config.value)
                             }.getOrElse { err ->
                                 when (err) {
-                                    is AccountBannedException -> {
-                                        handleAccountBanned(alias, deviceIdForMutual, err.username, "互点切换")
-                                        "互点流程账号封禁：${err.message ?: "banned"}"
+                                    is AccountPlanBlockedException -> {
+                                        handleAccountPlanBlocked(alias, deviceIdForMutual, err, "互点切换")
+                                        "互点流程" + (if (err.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁") + "：${err.message ?: err.blockKind}"
                                     }
                                     is AccountStatusLoggedOutException -> {
                                         recoverFromAccountStatusLogout(alias, deviceIdForMutual, "互点切换")
@@ -12673,11 +12715,11 @@ object AppCoordinator {
             }.getOrElse { err ->
                 when (err) {
                     is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
-                    is AccountBannedException -> {
+                    is AccountPlanBlockedException -> {
                         if (deviceIdForPublish.isNotBlank()) {
-                            handleAccountBanned(alias, deviceIdForPublish, err.username, "发作品")
+                            handleAccountPlanBlocked(alias, deviceIdForPublish, err, "发作品")
                         }
-                        "发作品账号封禁：${err.message ?: "banned"}"
+                        "发作品" + (if (err.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁") + "：${err.message ?: err.blockKind}"
                     }
                     is AccountStatusLoggedOutException -> {
                         if (deviceIdForPublish.isNotBlank()) {
@@ -12708,11 +12750,11 @@ object AppCoordinator {
                         }.getOrElse { err ->
                             when (err) {
                                 is LoginSafeguardRequiresAutoLoginException -> SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE
-                                is AccountBannedException -> {
+                                is AccountPlanBlockedException -> {
                                     if (deviceIdForPublish.isNotBlank()) {
-                                        handleAccountBanned(alias, deviceIdForPublish, err.username, "发作品")
+                                        handleAccountPlanBlocked(alias, deviceIdForPublish, err, "发作品")
                                     }
-                                    "发作品账号封禁：${err.message ?: "banned"}"
+                                    "发作品" + (if (err.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁") + "：${err.message ?: err.blockKind}"
                                 }
                                 is AccountStatusLoggedOutException -> {
                                     if (deviceIdForPublish.isNotBlank()) {
@@ -13230,13 +13272,17 @@ object AppCoordinator {
             suspend fun runProfileEditChainOnce(): ProfileEditChainResult =
                 try {
                     executor.profileEditRunOcrChain(appContext, _config.value)
-                } catch (e: AccountBannedException) {
-                    opLog("账号封禁 ${e.message}")
-                    handleAccountBanned(alias, deviceId, e.username, "切号后修改基本资料")
+                } catch (e: AccountPlanBlockedException) {
+                    val kindStep =
+                        if (e.blockKind.equals("max_login", true)) "account_max_login" else "account_banned"
+                    val kindLabel =
+                        if (e.blockKind.equals("max_login", true)) "登录次数上限" else "账号封禁"
+                    opLog("$kindLabel ${e.message}")
+                    handleAccountPlanBlocked(alias, deviceId, e, "切号后修改基本资料")
                     ProfileEditChainResult(
                         success = false,
-                        failureStep = "account_banned",
-                        editOcrPreviews = listOf(e.message ?: "account_banned"),
+                        failureStep = kindStep,
+                        editOcrPreviews = listOf(e.message ?: kindStep),
                     )
                 } catch (e: AccountStatusLoggedOutException) {
                     opLog("掉登录 ${e.message}")
@@ -13793,11 +13839,11 @@ object AppCoordinator {
                 }
                 return
             }
-            if (errThrowable is AccountBannedException) {
-                handleAccountBanned(
+            if (errThrowable is AccountPlanBlockedException) {
+                handleAccountPlanBlocked(
                     alias,
                     deviceId,
-                    errThrowable.username.ifBlank { username },
+                    errThrowable,
                     "涨粉",
                 )
                 return

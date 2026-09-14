@@ -187,12 +187,27 @@ object ManualDeviceControl {
         val message: String,
     )
 
-    /** password / email / email_password 任一为 banned（忽略大小写）视为云端已标封禁。 */
+    /** password / email / email_password 任一为封禁标记（旧整字段 banned 或后缀 ----banned）。 */
     fun accountLooksBanned(opt: AccountOption): Boolean =
         isBannedMarker(opt.password) || isBannedMarker(opt.emailPassword) || isBannedMarker(opt.email)
 
-    fun isBannedMarker(value: String?): Boolean =
-        value?.trim()?.equals("banned", ignoreCase = true) == true
+    /** 登录次数上限标记（后缀 ----Maximum login）。 */
+    fun accountLooksMaxLogin(opt: AccountOption): Boolean =
+        isMaxLoginMarker(opt.password) || isMaxLoginMarker(opt.emailPassword) || isMaxLoginMarker(opt.email)
+
+    fun accountLooksCredBlocked(opt: AccountOption): Boolean =
+        accountLooksBanned(opt) || accountLooksMaxLogin(opt)
+
+    fun isBannedMarker(value: String?): Boolean {
+        val s = value?.trim().orEmpty()
+        if (s.equals("banned", ignoreCase = true)) return true
+        return s.contains("----banned", ignoreCase = true)
+    }
+
+    fun isMaxLoginMarker(value: String?): Boolean {
+        val s = value?.trim().orEmpty()
+        return s.contains("----Maximum login", ignoreCase = true)
+    }
 
     fun fromAssignedItem(item: DeviceAssignedAccountItem): AccountOption? {
         val username = item.username?.trim()?.removePrefix("@").orEmpty()
@@ -231,7 +246,7 @@ object ManualDeviceControl {
             basicProfileModified = resp.basic_profile_modified?.trim().orEmpty().ifBlank { "否" },
             mailModuleCodeAvailable = resp.mail_module_code_available == true,
         )
-        if (accountLooksBanned(opt)) return null
+        if (accountLooksCredBlocked(opt)) return null
         return opt
     }
 
@@ -288,7 +303,7 @@ object ManualDeviceControl {
                         switchHighlight = o.optString("switchHighlight").ifBlank { "否" },
                         autoSwitchExcluded = o.optBoolean("autoSwitchExcluded"),
                     )
-                    if (accountLooksBanned(opt)) continue
+                    if (accountLooksCredBlocked(opt)) continue
                     add(opt)
                 }
             }

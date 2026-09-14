@@ -4388,6 +4388,13 @@ class DeviceAssignedAccountMarkBannedRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
 
 
+class DeviceAssignedAccountMarkMaxLoginRequest(BaseModel):
+    """设备端 OCR 见 Maximum number of attempts reached：与 mark_banned 同款链路。"""
+    device_id: str = Field(..., min_length=1, max_length=64)
+    alias: str = Field(..., min_length=1, max_length=64)
+    username: str = Field(..., min_length=1, max_length=128)
+
+
 class DeviceAssignedAccountAutoSwitchExcludedRequest(DeviceAuthModel):
     """设备端：按 username 设置是否「不参加自动切号」(auto_switch_excluded)。"""
     username: str = Field(..., min_length=1, max_length=128)
@@ -5681,8 +5688,40 @@ def _auto_switch_row_dict(row: sqlite3.Row | tuple | dict) -> dict[str, Any]:
     }
 
 
+# 凭据字段标记：兼容旧值整字段 "banned"；新值在原内容后追加后缀（无空格）。
+ACCOUNT_CRED_LEGACY_BANNED = "banned"
+ACCOUNT_CRED_SUFFIX_BANNED = "----banned"
+ACCOUNT_CRED_SUFFIX_MAX_LOGIN = "----Maximum login"
+
+
+def _account_cred_text(value: Any) -> str:
+    return str(value or "")
+
+
 def _account_cred_is_banned_marker(value: Any) -> bool:
-    return str(value or "").strip().lower() == "banned"
+    """旧：整字段 banned；新：含 ----banned。"""
+    s = _account_cred_text(value)
+    if s.strip().lower() == ACCOUNT_CRED_LEGACY_BANNED:
+        return True
+    return ACCOUNT_CRED_SUFFIX_BANNED.lower() in s.lower()
+
+
+def _account_cred_is_max_login_marker(value: Any) -> bool:
+    """登录次数上限：含 ----Maximum login。"""
+    s = _account_cred_text(value)
+    return ACCOUNT_CRED_SUFFIX_MAX_LOGIN.lower() in s.lower()
+
+
+def _account_cred_already_blocked(value: Any) -> bool:
+    return _account_cred_is_banned_marker(value) or _account_cred_is_max_login_marker(value)
+
+
+def _append_account_cred_suffix(value: Any, suffix: str) -> str:
+    """原内容追加后缀；已带 banned/max-login 任一标记则原样返回（防重复）。"""
+    s = _account_cred_text(value)
+    if _account_cred_already_blocked(s):
+        return s
+    return f"{s}{suffix}"
 
 
 def _account_row_looks_banned(
@@ -5690,7 +5729,7 @@ def _account_row_looks_banned(
     email: Any = "",
     email_password: Any = "",
 ) -> bool:
-    """账号表 password / email / email_password 任一为 banned 即视为封禁。"""
+    """账号表 password / email / email_password 任一为封禁标记。"""
     return (
         _account_cred_is_banned_marker(password)
         or _account_cred_is_banned_marker(email_password)
@@ -5698,7 +5737,32 @@ def _account_row_looks_banned(
     )
 
 
+def _account_row_looks_max_login(
+    password: Any = "",
+    email: Any = "",
+    email_password: Any = "",
+) -> bool:
+    """账号表 password / email / email_password 任一为登录次数上限标记。"""
+    return (
+        _account_cred_is_max_login_marker(password)
+        or _account_cred_is_max_login_marker(email_password)
+        or _account_cred_is_max_login_marker(email)
+    )
+
+
+def _account_row_looks_cred_blocked(
+    password: Any = "",
+    email: Any = "",
+    email_password: Any = "",
+) -> bool:
+    """封禁或登录次数上限：均移出周计划 / 默认不下发。"""
+    return _account_row_looks_banned(password, email, email_password) or _account_row_looks_max_login(
+        password, email, email_password
+    )
+
+
 def _banned_usernames_for_owner(conn: sqlite3.Connection, owner_username: str) -> set[str]:
+    """含封禁与登录次数上限（均不进周计划）。"""
     owner = str(owner_username or "").strip()
     if not owner:
         return set()
@@ -5712,7 +5776,7 @@ def _banned_usernames_for_owner(conn: sqlite3.Connection, owner_username: str) -
     ).fetchall()
     out: set[str] = set()
     for r in rows or []:
-        if _account_row_looks_banned(
+        if _account_row_looks_cred_blocked(
             r["password"] if hasattr(r, "keys") else r[1],
             r["email"] if hasattr(r, "keys") else r[2],
             r["email_password"] if hasattr(r, "keys") else r[3],
@@ -11771,8 +11835,13 @@ def _fetch_device_assigned_accounts_list(
             fields.get("email"),
             fields.get("email_password"),
         )
-        # password/email/email_password=banned：默认不下发（与周计划排除一致）
-        if looks_banned and not include_banned:
+        looks_max_login = _account_row_looks_max_login(
+            fields.get("password"),
+            fields.get("email"),
+            fields.get("email_password"),
+        )
+        # 封禁 / 登录次数上限：默认不下发（与周计划排除一致）
+        if (looks_banned or looks_max_login) and not include_banned:
             continue
         items.append(
             {
@@ -11796,6 +11865,7 @@ def _fetch_device_assigned_accounts_list(
                 "env_status": str(pick.get("env_status") or "").strip(),
                 "auto_switch_excluded": bool(int(pick.get("auto_switch_excluded") or 0)),
                 "looks_banned": bool(looks_banned),
+                "looks_max_login": bool(looks_max_login),
                 "video_count": str(fields.get("video_count") or "").strip(),
                 "follower_count": str(fields.get("follower_count") or "").strip(),
                 "follower_growth": str(fields.get("follower_growth") or "").strip(),
@@ -12248,25 +12318,81 @@ def device_assigned_account_mark_login(payload: DeviceAssignedAccountMarkLoginRe
 @app.post("/api/device/assigned_account/mark_banned")
 def device_assigned_account_mark_banned(payload: DeviceAssignedAccountMarkBannedRequest):
     """设备端 OCR 检测到「Your account has been banned」：
-    1) 账号表 password / email / email_password 写为 banned，is_login=0（便于用户识别被封）
+    1) 账号表 password / email / email_password 追加 ----banned（兼容旧整字段 banned），is_login=0
     2) 设备表对应行 auto_switch_excluded=1（移出自动切号计划）
-    3) 刷新该别名计划并重同步设备（周计划按 password=banned 与 excluded 双重排除）
+    3) 刷新该别名计划并重同步设备
     """
-    error, device = auth_or_error(payload.device_id, payload.alias)
+    return _device_assigned_account_mark_cred_block(
+        device_id=payload.device_id,
+        alias=payload.alias,
+        username=payload.username,
+        suffix=ACCOUNT_CRED_SUFFIX_BANNED,
+        kind="banned",
+        log_label="账号封禁",
+        ok_msg="已标记封禁并移出计划",
+    )
+
+
+@app.post("/api/device/assigned_account/mark_max_login")
+def device_assigned_account_mark_max_login(payload: DeviceAssignedAccountMarkMaxLoginRequest):
+    """设备端 OCR 检测到「Maximum number of attempts reached」：与 mark_banned 同款链路，后缀 ----Maximum login。"""
+    return _device_assigned_account_mark_cred_block(
+        device_id=payload.device_id,
+        alias=payload.alias,
+        username=payload.username,
+        suffix=ACCOUNT_CRED_SUFFIX_MAX_LOGIN,
+        kind="max_login",
+        log_label="登录次数上限",
+        ok_msg="已标记登录次数上限并移出计划",
+    )
+
+
+def _device_assigned_account_mark_cred_block(
+    *,
+    device_id: str,
+    alias: str,
+    username: str,
+    suffix: str,
+    kind: str,
+    log_label: str,
+    ok_msg: str,
+):
+    error, device = auth_or_error(device_id, alias)
     if error:
         return error
     owner = str(getattr(device, "owner_username", "") or "").strip()
-    username = str(payload.username or "").strip().lstrip("@")
-    alias_key = _normalize_alias_key(payload.alias)
+    username = str(username or "").strip().lstrip("@")
+    alias_key = _normalize_alias_key(alias)
     if not owner or not username:
         return {"code": 1, "msg": "参数无效"}
     now = now_text()
-    banned_marker = "banned"
     account_updated = 0
     device_updated = 0
     affected_aliases: set[str] = set()
+    new_password = ""
+    new_email = ""
+    new_email_password = ""
+    already_blocked = False
     conn = _get_db()
     try:
+        row = conn.execute(
+            """
+            SELECT password, email, email_password
+            FROM account_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            LIMIT 1
+            """,
+            (owner, username),
+        ).fetchone()
+        if not row:
+            return {"code": 1, "msg": "未找到对应账号记录"}
+        cur_password = row["password"] if hasattr(row, "keys") else row[0]
+        cur_email = row["email"] if hasattr(row, "keys") else row[1]
+        cur_email_password = row["email_password"] if hasattr(row, "keys") else row[2]
+        already_blocked = _account_row_looks_cred_blocked(cur_password, cur_email, cur_email_password)
+        new_password = _append_account_cred_suffix(cur_password, suffix)
+        new_email = _append_account_cred_suffix(cur_email, suffix)
+        new_email_password = _append_account_cred_suffix(cur_email_password, suffix)
         acct_cur = conn.execute(
             """
             UPDATE account_editor_rows
@@ -12277,7 +12403,7 @@ def device_assigned_account_mark_banned(payload: DeviceAssignedAccountMarkBanned
                 updated_at = ?
             WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
             """,
-            (banned_marker, banned_marker, banned_marker, now, owner, username),
+            (new_password, new_email, new_email_password, now, owner, username),
         )
         account_updated = int(acct_cur.rowcount or 0)
         if account_updated < 1:
@@ -12313,7 +12439,6 @@ def device_assigned_account_mark_banned(payload: DeviceAssignedAccountMarkBanned
             )
             if int(cur.rowcount or 0) > 0:
                 device_updated += 1
-        # 即便设备表无行，也刷新当前别名计划，便于本机尽快拿到新资料
         if not affected_aliases and alias_key:
             affected_aliases.add(alias_key)
         conn.commit()
@@ -12346,17 +12471,21 @@ def device_assigned_account_mark_banned(payload: DeviceAssignedAccountMarkBanned
         _reset_device_editor_read_maintain_schedule(owner)
 
     _append_device_log(
-        payload.device_id,
-        f"[{now}] 账号封禁 | username={username} password/email/email_password=banned "
+        device_id,
+        f"[{now}] {log_label} | username={username} kind={kind} suffix={suffix} "
+        f"already_blocked={1 if already_blocked else 0} "
         f"excluded_rows={device_updated} plan_regen={plan_regenerated} notified={devices_notified}",
     )
     return {
         "code": 0,
-        "msg": "已标记封禁并移出计划",
+        "msg": ok_msg,
         "username": username,
-        "password": banned_marker,
-        "email": banned_marker,
-        "email_password": banned_marker,
+        "kind": kind,
+        "suffix": suffix,
+        "already_blocked": bool(already_blocked),
+        "password": new_password,
+        "email": new_email,
+        "email_password": new_email_password,
         "account_updated": account_updated,
         "device_excluded_rows": device_updated,
         "plan_regenerated_aliases": plan_regenerated,

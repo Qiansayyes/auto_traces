@@ -44,9 +44,13 @@ object PendingActivateRecommend {
         val username = item.username?.trim()?.removePrefix("@").orEmpty()
         if (username.isEmpty()) return null
         val banned = item.looks_banned == true ||
+            item.looks_max_login == true ||
             ManualDeviceControl.isBannedMarker(item.password) ||
             ManualDeviceControl.isBannedMarker(item.email) ||
-            ManualDeviceControl.isBannedMarker(item.email_password)
+            ManualDeviceControl.isBannedMarker(item.email_password) ||
+            ManualDeviceControl.isMaxLoginMarker(item.password) ||
+            ManualDeviceControl.isMaxLoginMarker(item.email) ||
+            ManualDeviceControl.isMaxLoginMarker(item.email_password)
         return Snapshot(
             username = username,
             heartGrowth3d = heartGrowth3d(item),
