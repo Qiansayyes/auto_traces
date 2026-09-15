@@ -4,8 +4,36 @@ const database = require('../services/DatabaseService')
 const logger = require('../utils/logger')
 const { addMailLinksToCollection } = require('../utils/mailLinks')
 const { withOwnerOptions } = require('../utils/requestOwner')
+const { classifyTokenError } = require('../utils/tokenError')
 
 const ownerCtx = (ctx, extra = {}) => withOwnerOptions(ctx, extra)
+
+const isTokenRelatedError = (err) => {
+  if (err?.tokenClassification) return true
+  const message = String(err?.message || err || '')
+  return /invalid_grant|AADSTS\d+|oauth2\/v2\.0\/token|refresh_token|access_token|Bearer/i.test(message)
+}
+
+const recordMailTokenFailure = (ctx, email, err) => {
+  if (!email || !isTokenRelatedError(err)) return
+  const classification = classifyTokenError(err)
+  database.recordTokenCheckResult(ownerCtx(ctx, {
+    email,
+    tokenStatus: classification.tokenStatus,
+    lastTokenError: classification.lastTokenError,
+  }))
+}
+
+const recordMailTokenSuccess = (ctx, email, tokenHints = {}) => {
+  if (!email) return
+  database.recordTokenCheckResult(ownerCtx(ctx, {
+    email,
+    tokenStatus: 'valid',
+    lastTokenError: '',
+    expiresInSeconds: tokenHints.expiresInSeconds,
+    refreshToken: tokenHints.refreshToken,
+  }))
+}
 
 const extractFetchedEmails = (data) => {
   if (Array.isArray(data)) return data
@@ -194,8 +222,10 @@ const controller = {
         source: 'mail_all',
         requestedTop,
       }))
+      recordMailTokenSuccess(ctx, email)
       ctx.body = { code: "200", data }
     } catch (err) {
+      recordMailTokenFailure(ctx, email, err)
       database.recordFetchFailure({
         accountEmail: email,
         mailbox: normalizedMailbox,
@@ -231,8 +261,10 @@ const controller = {
         source: 'mail_new',
         requestedTop,
       }))
+      recordMailTokenSuccess(ctx, email)
       ctx.body = { code: "200", data }
     } catch (err) {
+      recordMailTokenFailure(ctx, email, err)
       database.recordFetchFailure({
         accountEmail: email,
         mailbox: normalizedMailbox,
@@ -288,8 +320,10 @@ const controller = {
         source: 'mail_one',
         requestedTop: 1,
       }))
+      recordMailTokenSuccess(ctx, email)
       ctx.body = { code: "200", data }
     } catch (err) {
+      recordMailTokenFailure(ctx, email, err)
       database.recordFetchFailure({
           accountEmail: email,
           mailbox: normalizedMailbox,
@@ -303,11 +337,14 @@ const controller = {
   },
 
   async process_mailbox(ctx) {
+    const params = ctx.method === "GET" ? ctx.query : ctx.request.body;
+    const { refresh_token, client_id, email, mailbox, socks5, http } = params;
     try {
-      const { refresh_token, client_id, email, mailbox, socks5, http } = ctx.method === "GET" ? ctx.query : ctx.request.body;
       const data = await service.process_mailbox(refresh_token, client_id, email, mailbox, socks5, http)
+      recordMailTokenSuccess(ctx, email)
       ctx.body = { code: "200", data }
     } catch (err) {
+      recordMailTokenFailure(ctx, email, err)
       logger.error('Failed to process_mailbox', err)
       ctx.throw(500, 'Failed to process_mailbox')
     }
@@ -451,6 +488,8 @@ const controller = {
         projectUsageFilter,
         projectStatus,
         projectStatusFilter,
+        tokenStatus,
+        tokenStatusFilter,
       } = ctx.method === "GET" ? ctx.query : ctx.request.body;
       ctx.body = {
         code: "200",
@@ -472,11 +511,47 @@ const controller = {
           projectUsageFilter,
           projectStatus,
           projectStatusFilter,
+          tokenStatus,
+          tokenStatusFilter,
         }))
       }
     } catch (err) {
       logger.error('Failed to list accounts', err)
       ctx.throw(500, 'Failed to list accounts')
+    }
+  },
+
+  async token_mailboxes_list(ctx) {
+    try {
+      const body = ctx.method === "GET" ? ctx.query : (ctx.request.body || {});
+      const {
+        page,
+        pageSize,
+        search,
+        tokenStatus,
+        tokenStatusFilter,
+        onlyInAccountRecords,
+        priorityEmails,
+      } = body;
+      let emails = priorityEmails;
+      if (typeof emails === "string") {
+        emails = emails.split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean);
+      }
+      ctx.body = {
+        code: "200",
+        data: database.listTokenMailboxes(ownerCtx(ctx, {
+          page,
+          pageSize,
+          search,
+          tokenStatus,
+          tokenStatusFilter,
+          onlyInAccountRecords,
+          priorityEmails: Array.isArray(emails) ? emails : [],
+        })),
+      };
+    } catch (err) {
+      logger.error("Failed to list token mailboxes", err);
+      ctx.throw(500, "Failed to list token mailboxes");
     }
   },
 
@@ -782,8 +857,10 @@ const controller = {
           source: 'project_mail',
           requestedTop,
         }))
+        recordMailTokenSuccess(ctx, account.email)
         return { mailbox, ok: true, fetched: emails.length, savedSenderReceipts: saved.saved_count, emails }
       } catch (err) {
+        recordMailTokenFailure(ctx, account.email, err)
         database.recordFetchFailure({
           accountEmail: account.email,
           mailbox,

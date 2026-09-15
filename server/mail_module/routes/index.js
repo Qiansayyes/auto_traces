@@ -30,6 +30,7 @@ router.all("/api/sender_options", ...withOwner, controller.sender_options);
 
 router.post("/api/accounts/import", ...withOwner, controller.accounts_import);
 router.post("/api/accounts/list", ...withOwner, controller.accounts_list);
+router.all("/api/accounts/token-mailboxes/list", ...withOwner, controller.token_mailboxes_list);
 router.post("/api/accounts/delete", ...withOwner, controller.accounts_delete);
 router.post("/api/tk-pending/accounts/import", ...withOwner, controller.tk_pending_import);
 router.all("/api/tk-pending/accounts/list", ...withOwner, controller.tk_pending_list);

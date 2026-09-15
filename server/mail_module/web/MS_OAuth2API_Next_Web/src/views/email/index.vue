@@ -50,6 +50,19 @@
                                 <el-option label="未做项目" value="not_done" />
                             </el-select>
                         </el-form-item>
+                        <el-form-item class="toolbar-form-item token-status-item" label="令牌状态" label-width="72px">
+                            <el-select
+                                v-model="toolForm.tokenStatus"
+                                placeholder="令牌状态"
+                                @change="handleAccountFilterChange"
+                            >
+                                <el-option label="全部" value="all" />
+                                <el-option label="正常" value="valid" />
+                                <el-option label="失效" value="invalid" />
+                                <el-option label="未检测" value="unknown" />
+                                <el-option label="临时失败" value="transient" />
+                            </el-select>
+                        </el-form-item>
                         <el-form-item class="toolbar-form-item sender-filter-item" label="项目分类" label-width="72px">
                             <el-select
                                 v-model="toolForm.excludeDoneSenderIdentity"
@@ -164,6 +177,29 @@
                             <el-button size="small" type="primary" @click.stop="copyText(scope.row.email, '邮箱已复制')">
                                 复制
                             </el-button>
+                        </div>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="令牌状态" width="120">
+                    <template #default="scope">
+                        <div class="token-status-cell">
+                            <el-tag :type="getTokenStatusTagType(scope.row.token_status)" size="small">
+                                {{ formatTokenStatus(scope.row.token_status) }}
+                            </el-tag>
+                            <span
+                                v-if="scope.row.last_token_checked_at"
+                                class="token-status-hint"
+                            >
+                                {{ formatTokenCheckedAt(scope.row.last_token_checked_at) }}
+                            </span>
+                            <span
+                                v-if="scope.row.token_status === 'invalid' && scope.row.last_token_error"
+                                class="token-status-error"
+                                :title="scope.row.last_token_error"
+                            >
+                                {{ formatTokenError(scope.row.last_token_error) }}
+                            </span>
                         </div>
                     </template>
                 </el-table-column>
@@ -596,7 +632,8 @@ const toolForm = ref({
     apiPassword: localStorage.getItem('apiPassword') || '',
     excludeDoneSenderIdentity: localStorage.getItem('emailExcludeDoneSenderIdentity') || localStorage.getItem('emailExcludeDoneProject') || '',
     emailSearch: localStorage.getItem('emailSearch') || '',
-    projectUsage: localStorage.getItem('emailProjectUsage') || 'all'
+    projectUsage: localStorage.getItem('emailProjectUsage') || 'all',
+    tokenStatus: localStorage.getItem('emailTokenStatus') || 'all',
 })
 
 watch(
@@ -617,6 +654,10 @@ interface Email {
     password: string
     client_id: string
     refresh_token: string
+    token_status?: string
+    last_token_error?: string
+    last_token_checked_at?: string
+    token_access_expires_at?: string
 }
 
 interface SenderOption {
@@ -684,7 +725,44 @@ const handleMobileRowClick = (row: Email) => {
 }
 
 const getMailboxRowClassName = ({ row }: { row: Email }) => {
-    return isSameEmailRow(row, activeMobileEmail.value) ? 'active-mobile-mail-row' : ''
+    const classes = []
+    if (isSameEmailRow(row, activeMobileEmail.value)) {
+        classes.push('active-mobile-mail-row')
+    }
+    if (String(row.token_status || '').toLowerCase() === 'invalid') {
+        classes.push('token-invalid-row')
+    }
+    return classes.join(' ')
+}
+
+const formatTokenStatus = (value?: string) => {
+    const status = String(value || 'unknown').trim().toLowerCase()
+    if (status === 'valid') return '正常'
+    if (status === 'invalid') return '失效'
+    if (status === 'transient') return '临时失败'
+    return '未检测'
+}
+
+const getTokenStatusTagType = (value?: string) => {
+    const status = String(value || 'unknown').trim().toLowerCase()
+    if (status === 'valid') return 'success'
+    if (status === 'invalid') return 'danger'
+    if (status === 'transient') return 'warning'
+    return 'info'
+}
+
+const formatTokenCheckedAt = (value?: string) => {
+    const raw = String(value || '').trim()
+    if (!raw) return ''
+    const time = Date.parse(raw)
+    if (Number.isNaN(time)) return raw
+    return new Date(time).toLocaleString()
+}
+
+const formatTokenError = (value?: string) => {
+    const text = String(value || '').trim()
+    if (!text) return ''
+    return text.length > 48 ? `${text.slice(0, 48)}...` : text
 }
 
 const getCurrentPageRowIndex = (row: Email) => {
@@ -925,6 +1003,7 @@ const loadAccountsPage = async (showMessage = false) => {
                 pageSize: tablePagination.value.pageSize,
                 search: toolForm.value.emailSearch.trim(),
                 projectUsage: toolForm.value.projectUsage || 'all',
+                tokenStatus: toolForm.value.tokenStatus || 'all',
                 excludeSenderCompanyIdentity: toolForm.value.excludeDoneSenderIdentity || ''
             })
         })
@@ -952,10 +1031,14 @@ const loadAccountsPage = async (showMessage = false) => {
             ElMessage.warning(error.message)
             return
         }
-        if (toolForm.value.excludeDoneSenderIdentity || toolForm.value.projectUsage !== 'all') {
+        if (
+            toolForm.value.excludeDoneSenderIdentity
+            || toolForm.value.projectUsage !== 'all'
+            || toolForm.value.tokenStatus !== 'all'
+        ) {
             mailList.value = []
             tablePagination.value.total = 0
-            ElMessage.warning('项目筛选需要服务器接口可用，已停止本地回退列表')
+            ElMessage.warning('项目/令牌筛选需要服务器接口可用，已停止本地回退列表')
             return
         }
         const search = toolForm.value.emailSearch.trim().toLowerCase()
@@ -1013,6 +1096,7 @@ const handleSenderUnusedFilterChange = async () => {
 const handleAccountFilterChange = async () => {
     localStorage.setItem('emailSearch', toolForm.value.emailSearch.trim())
     localStorage.setItem('emailProjectUsage', toolForm.value.projectUsage || 'all')
+    localStorage.setItem('emailTokenStatus', toolForm.value.tokenStatus || 'all')
     localStorage.setItem('emailExcludeDoneSenderIdentity', toolForm.value.excludeDoneSenderIdentity || '')
     localStorage.removeItem('emailExcludeDoneProject')
     tablePagination.value.currentPage = 1
@@ -2691,6 +2775,29 @@ const clearPosts = (email: string, password: string, client_id: string, refresh_
 
 .mail-table :deep(.el-table__body td.el-table__cell) {
     padding: 8px 0;
+}
+
+.token-status-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
+.token-status-hint,
+.token-status-error {
+    color: #909399;
+    font-size: 11px;
+    line-height: 1.3;
+    word-break: break-word;
+}
+
+.token-status-error {
+    color: #f56c6c;
+}
+
+.mail-table :deep(.token-invalid-row > td) {
+    background: #fef0f0 !important;
 }
 
 .mail-table :deep(.cell) {

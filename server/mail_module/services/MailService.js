@@ -2,6 +2,104 @@ const Imap = require('node-imap');
 const simpleParser = require("mailparser").simpleParser;
 const { setRedisKey, getRedisKey } = require('./RedisService');
 const { autoAgent } = require('./ProxyService');
+const { classifyOAuthResponse } = require('../utils/tokenError');
+
+const MICROSOFT_TOKEN_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
+const GRAPH_MAIL_SCOPE = 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access';
+
+const requestMicrosoftAccessToken = async ({
+    refresh_token,
+    client_id,
+    email,
+    socks5,
+    http,
+    scope = '',
+    redisKeyPrefix,
+    forceRefresh = false,
+}) => {
+    const redis_name = `${redisKeyPrefix}_${email}_access_token`;
+
+    if (!forceRefresh) {
+        const redis_result = await getRedisKey(redis_name);
+        if (redis_result) {
+            return {
+                access_token: redis_result,
+                fromCache: true,
+            };
+        }
+    }
+
+    const agentOptions = autoAgent(socks5, http);
+    const bodyParams = {
+        client_id,
+        grant_type: 'refresh_token',
+        refresh_token,
+    };
+    if (scope) {
+        bodyParams.scope = scope;
+    }
+
+    const response = await agentOptions.fetch(MICROSOFT_TOKEN_URL, {
+        method: 'POST',
+        ...agentOptions.proxy,
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(bodyParams).toString(),
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+        const classification = classifyOAuthResponse(responseText, response.status);
+        const err = new Error(`HTTP error! status: ${response.status}, response: ${responseText}`);
+        err.tokenClassification = classification;
+        throw err;
+    }
+
+    let data;
+    try {
+        data = JSON.parse(responseText);
+    } catch (parseError) {
+        const err = new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
+        err.tokenClassification = classifyOAuthResponse(responseText, response.status);
+        throw err;
+    }
+
+    if (!data.access_token) {
+        const err = new Error(`No access_token in token response: ${responseText}`);
+        err.tokenClassification = classifyOAuthResponse(responseText, response.status);
+        throw err;
+    }
+
+    await setRedisKey(redis_name, data.access_token, (data.expires_in || 3600) - 60);
+
+    return {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || '',
+        expires_in: data.expires_in || 3600,
+        scope: data.scope || '',
+        fromCache: false,
+    };
+};
+
+const refreshAccessToken = async (refresh_token, client_id, email, socks5, http, options = {}) => {
+    const result = await requestMicrosoftAccessToken({
+        refresh_token,
+        client_id,
+        email,
+        socks5,
+        http,
+        scope: GRAPH_MAIL_SCOPE,
+        redisKeyPrefix: 'graph_api_result',
+        forceRefresh: options.forceRefresh === true,
+    });
+
+    return {
+        ...result,
+        status: String(result.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1,
+    };
+};
 
 // IMAP 文件夹名 → Graph API well-known folder 名
 const MAILBOX_MAP = {
@@ -14,63 +112,24 @@ const MAILBOX_MAP = {
 };
 
 const use_graph_api = async (refresh_token, client_id, mailbox, email, socks5, http) => {
-
     const temp_mailbox = MAILBOX_MAP[mailbox] || 'inbox';
-
-    const redis_name = 'graph_api_result_' + email + '_access_token'
-    const redis_result = await getRedisKey(redis_name)
-
-    if (redis_result) {
-        return {
-            access_token: redis_result,
-            status: true,
-            mailbox: temp_mailbox
-        }
-    }
-
-    const agentOptions = autoAgent(socks5, http);
-
-    const response = await agentOptions.fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
-        method: 'POST',
-        ...agentOptions.proxy,
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        // Personal MSA tokens reject graph.microsoft.com/.default (AADSTS90023).
-        // Request explicit delegated mail scopes that refresh_token grants can redeem.
-        body: new URLSearchParams({
-            'client_id': client_id,
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token,
-            'scope': 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access'
-        }).toString()
+    const tokenResult = await requestMicrosoftAccessToken({
+        refresh_token,
+        client_id,
+        email,
+        socks5,
+        http,
+        scope: GRAPH_MAIL_SCOPE,
+        redisKeyPrefix: 'graph_api_result',
     });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
-    }
-
-    const responseText = await response.text();
-
-    try {
-
-        const data = JSON.parse(responseText);
-        // Mail.ReadWrite also contains the Mail.Read prefix substring.
-        const status = String(data.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1
-
-        if (status) {
-            await setRedisKey(redis_name, data.access_token, (data.expires_in || 3600) - 60)
-        }
-
-        return {
-            access_token: data.access_token,
-            status: status,
-            mailbox: temp_mailbox
-        }
-    } catch (parseError) {
-        throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
-    }
+    return {
+        access_token: tokenResult.access_token,
+        status: String(tokenResult.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1,
+        mailbox: temp_mailbox,
+        refresh_token: tokenResult.refresh_token || '',
+        expires_in: tokenResult.expires_in || 3600,
+    };
 }
 
 const resolveMailTop = (top) => {
@@ -192,50 +251,20 @@ const use_get_graph_email_by_id = async (graph_api_result, messageId, email, soc
 }
 
 const use_imap_api = async (refresh_token, client_id, email, socks5, http) => {
-
-    const redis_name = 'imap_api_result_' + email + '_access_token'
-    const redis_result = await getRedisKey(redis_name)
-
-    if (redis_result) {
-        return {
-            access_token: redis_result,
-        }
-    }
-
-    const agentOptions = autoAgent(socks5, http);
-
-    const response = await agentOptions.fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
-        method: 'POST',
-        ...agentOptions.proxy,
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: new URLSearchParams({
-            'client_id': client_id,
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }).toString()
+    const tokenResult = await requestMicrosoftAccessToken({
+        refresh_token,
+        client_id,
+        email,
+        socks5,
+        http,
+        redisKeyPrefix: 'imap_api_result',
     });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error! status: ${response.status}, response: ${errorText}`);
-    }
-
-    const responseText = await response.text();
-
-    try {
-        const data = JSON.parse(responseText);
-        if (!data.access_token) {
-            throw new Error('No access_token in IMAP token response');
-        }
-        await setRedisKey(redis_name, data.access_token, (data.expires_in || 3600) - 60)
-        return {
-            access_token: data.access_token,
-        };
-    } catch (parseError) {
-        throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
-    }
+    return {
+        access_token: tokenResult.access_token,
+        refresh_token: tokenResult.refresh_token || '',
+        expires_in: tokenResult.expires_in || 3600,
+    };
 }
 
 const generateAuthString = (email, accessToken) => {
@@ -648,6 +677,8 @@ const use_delete_graph_emails = async (graph_api_result, id, socks5, http) => {
 
 
 module.exports = {
+    requestMicrosoftAccessToken,
+    refreshAccessToken,
     use_graph_api,
     use_get_graph_emails,
     use_get_graph_email_by_id,

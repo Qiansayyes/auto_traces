@@ -134,7 +134,19 @@ def get_mail_account_record(owner_username: str, email: str) -> dict[str, Any] |
         try:
             row = conn.execute(
                 """
-                SELECT record_key, email, password, client_id, refresh_token, status, owner_username, updated_at
+                SELECT
+                  record_key,
+                  email,
+                  password,
+                  client_id,
+                  refresh_token,
+                  status,
+                  owner_username,
+                  updated_at,
+                  token_status,
+                  last_token_error,
+                  last_token_checked_at,
+                  token_access_expires_at
                 FROM account_records
                 WHERE lower(email) = lower(?)
                   AND status = 'active'
@@ -158,6 +170,9 @@ def mail_account_has_valid_token(record: dict[str, Any] | None) -> bool:
     if not record:
         return False
     if str(record.get("status") or "").strip().lower() != "active":
+        return False
+    token_status = str(record.get("token_status") or "").strip().lower()
+    if token_status == "invalid":
         return False
     client_id = str(record.get("client_id") or "").strip()
     refresh_token = str(record.get("refresh_token") or "").strip()

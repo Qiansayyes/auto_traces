@@ -17,6 +17,11 @@ const router = createRouter({
           component: () => import('@/views/email/index.vue'),
         },
         {
+          path: '/token-mailboxes',
+          name: 'token-mailboxes',
+          component: () => import('@/views/token-mailboxes/index.vue'),
+        },
+        {
           path: '/sender-groups',
           name: 'sender-groups',
           component: () => import('@/views/sender-groups/index.vue'),

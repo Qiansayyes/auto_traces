@@ -67,6 +67,7 @@ import {
   Collection,
   Connection,
   Document,
+  Key,
   Link,
   Menu as MenuIcon,
   Message,
@@ -88,6 +89,7 @@ interface MenuItem {
 
 const menuItems = ref<MenuItem[]>([
   { index: '1', title: '邮箱管理', routeName: 'email', icon: Message },
+  { index: '8', title: '令牌邮箱管理', routeName: 'token-mailboxes', icon: Key },
   { index: '7', title: '待注册TK账号', routeName: 'tk-pending', icon: User },
   { index: '2', title: '发件人分类', routeName: 'sender-groups', icon: Connection },
   { index: '3', title: '模板管理', routeName: 'template-manager', icon: Tickets },

@@ -26,6 +26,10 @@ def _create_accounts_db(path: Path, owner: str, email: str, *, with_token: bool 
                 raw_line TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
+                token_status TEXT NOT NULL DEFAULT 'unknown',
+                last_token_error TEXT NOT NULL DEFAULT '',
+                last_token_checked_at TEXT NOT NULL DEFAULT '',
+                token_access_expires_at TEXT NOT NULL DEFAULT '',
                 imported_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 owner_username TEXT NOT NULL DEFAULT ''
@@ -64,6 +68,22 @@ def test_mail_account_lookup_and_token_check():
 
             missing = mi.get_mail_account_record("bob", "user@outlook.com")
             assert missing is None
+
+
+def test_mail_account_invalid_token_status_blocks_fetch():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "accounts.sqlite"
+        _create_accounts_db(db_path, "alice", "user@outlook.com", with_token=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE account_records SET token_status = 'invalid' WHERE email = ?", ("user@outlook.com",))
+        conn.commit()
+        conn.close()
+        with patch.object(mi, "MAIL_ACCOUNTS_DB_PATH", db_path), patch.object(mi, "is_mail_module_ready", return_value=True):
+            record = mi.get_mail_account_record("alice", "user@outlook.com")
+            assert record is not None
+            assert record.get("token_status") == "invalid"
+            assert not mi.mail_account_has_valid_token(record)
+            assert not mi.mail_module_can_fetch_code("alice", "user@outlook.com")
 
 
 def test_mail_account_lookup_legacy_empty_owner():

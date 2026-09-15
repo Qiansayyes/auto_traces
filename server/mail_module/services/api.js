@@ -90,6 +90,18 @@ const findMatchingMessage = (emails = [], identifiers = {}) => {
   return textMatches[0]?.mail || null
 }
 
+// Keep tokenClassification so controllers can persist invalid/transient token status.
+const rethrowServiceError = (message, err) => {
+  const wrapped = new Error(message)
+  if (err?.tokenClassification) {
+    wrapped.tokenClassification = err.tokenClassification
+  }
+  if (err?.message) {
+    wrapped.cause = err
+  }
+  throw wrapped
+}
+
 const service = {
   async mail_all(refresh_token, client_id, email, mailbox, socks5, http, top = 0, options = {}) {
     try {
@@ -108,7 +120,7 @@ const service = {
       return imap_emails
     } catch (err) {
       logger.error('Service error when mail_all', err)
-      throw new Error('Failed to retrieve mail_all')
+      rethrowServiceError('Failed to retrieve mail_all', err)
     }
   },
 
@@ -139,7 +151,7 @@ const service = {
       return emails
     } catch (err) {
       logger.error('Service error when mail_new', err)
-      throw new Error('Failed to retrieve mail_new')
+      rethrowServiceError('Failed to retrieve mail_new', err)
     }
   },
 
@@ -179,7 +191,7 @@ const service = {
       return matchedImapEmail ? [matchedImapEmail] : []
     } catch (err) {
       logger.error('Service error when mail_one', err)
-      throw new Error('Failed to retrieve mail_one')
+      rethrowServiceError('Failed to retrieve mail_one', err)
     }
   },
 
@@ -205,7 +217,7 @@ const service = {
       return { message: '邮件正在清空中... 请稍后查看邮件' }
     } catch (err) {
       logger.error('Service error when process_mailbox', err)
-      throw new Error('Failed to process_mailbox')
+      rethrowServiceError('Failed to process_mailbox', err)
     }
   },
 

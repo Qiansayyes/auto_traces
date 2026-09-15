@@ -299,9 +299,35 @@ const ensureColumn = (db, table, column, definition) => {
 };
 
 ensureColumn(accountsDb, 'account_records', 'owner_username', "TEXT NOT NULL DEFAULT ''");
+ensureColumn(accountsDb, 'account_records', 'token_status', "TEXT NOT NULL DEFAULT 'unknown'");
+ensureColumn(accountsDb, 'account_records', 'last_token_error', "TEXT NOT NULL DEFAULT ''");
+ensureColumn(accountsDb, 'account_records', 'last_token_checked_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn(accountsDb, 'account_records', 'token_access_expires_at', "TEXT NOT NULL DEFAULT ''");
 ensureColumn(accountsDb, 'account_import_batches', 'owner_username', "TEXT NOT NULL DEFAULT ''");
 ensureColumn(mailDb, 'mail_fetch_runs', 'owner_username', "TEXT NOT NULL DEFAULT ''");
 ensureColumn(mailDb, 'project_records', 'owner_username', "TEXT NOT NULL DEFAULT ''");
+
+accountsDb.exec(`
+  CREATE INDEX IF NOT EXISTS idx_account_records_token_status ON account_records(token_status);
+  CREATE INDEX IF NOT EXISTS idx_account_records_token_checked ON account_records(last_token_checked_at);
+`);
+
+const normalizeTokenStatus = (value = '') => {
+  const status = String(value || '').trim().toLowerCase();
+  if (['valid', 'invalid', 'transient', 'unknown'].includes(status)) return status;
+  return 'unknown';
+};
+
+const decorateAccountTokenFields = (row) => {
+  if (!row) return row;
+  return {
+    ...row,
+    token_status: normalizeTokenStatus(row.token_status),
+    last_token_error: row.last_token_error || '',
+    last_token_checked_at: row.last_token_checked_at || '',
+    token_access_expires_at: row.token_access_expires_at || '',
+  };
+};
 
 const decorateProjectRecord = (row) => {
   if (!row) return null;
@@ -448,9 +474,11 @@ const importAccounts = (records, options = {}) => {
   const timestamp = nowIso();
   const upsert = accountsDb.prepare(`
     INSERT INTO account_records (
-      record_key, email, password, client_id, refresh_token, raw_line, source, status, imported_at, updated_at, owner_username
+      record_key, email, password, client_id, refresh_token, raw_line, source, status,
+      token_status, last_token_error, last_token_checked_at, token_access_expires_at,
+      imported_at, updated_at, owner_username
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'unknown', '', '', '', ?, ?, ?)
     ON CONFLICT(record_key) DO UPDATE SET
       email = excluded.email,
       password = excluded.password,
@@ -459,6 +487,10 @@ const importAccounts = (records, options = {}) => {
       raw_line = excluded.raw_line,
       source = excluded.source,
       status = 'active',
+      token_status = 'unknown',
+      last_token_error = '',
+      last_token_checked_at = '',
+      token_access_expires_at = '',
       imported_at = excluded.imported_at,
       updated_at = excluded.updated_at,
       owner_username = excluded.owner_username
@@ -532,9 +564,11 @@ const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => 
   removeDuplicateAccountRecords(ownerUsername, email, recordKey);
   accountsDb.prepare(`
     INSERT INTO account_records (
-      record_key, email, password, client_id, refresh_token, raw_line, source, status, imported_at, updated_at, owner_username
+      record_key, email, password, client_id, refresh_token, raw_line, source, status,
+      token_status, last_token_error, last_token_checked_at, token_access_expires_at,
+      imported_at, updated_at, owner_username
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'unknown', '', '', '', ?, ?, ?)
     ON CONFLICT(record_key) DO UPDATE SET
       email = excluded.email,
       password = excluded.password,
@@ -543,6 +577,10 @@ const upsertMainAccountFromPending = (ownerUsername, row, source, timestamp) => 
       raw_line = excluded.raw_line,
       source = excluded.source,
       status = 'active',
+      token_status = 'unknown',
+      last_token_error = '',
+      last_token_checked_at = '',
+      token_access_expires_at = '',
       imported_at = excluded.imported_at,
       updated_at = excluded.updated_at,
       owner_username = excluded.owner_username
@@ -1037,12 +1075,67 @@ const normalizeAccountProjectUsage = (value = '', fallback = 'all') => {
   return fallback;
 };
 
+const recordTokenCheckResult = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const email = normalizeEmail(options.email);
+  if (!email) {
+    return { updated: 0 };
+  }
+
+  const tokenStatus = normalizeTokenStatus(options.tokenStatus);
+  const lastTokenError = dbText(options.lastTokenError || '');
+  const checkedAt = nowIso();
+  const sets = [
+    'token_status = ?',
+    'last_token_error = ?',
+    'last_token_checked_at = ?',
+    'updated_at = ?',
+  ];
+  const params = [tokenStatus, lastTokenError, checkedAt, checkedAt];
+
+  const expiresInSeconds = Number(options.expiresInSeconds);
+  if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
+    sets.push('token_access_expires_at = ?');
+    params.push(new Date(Date.now() + expiresInSeconds * 1000).toISOString());
+  } else if (dbText(options.tokenAccessExpiresAt)) {
+    sets.push('token_access_expires_at = ?');
+    params.push(normalizeDateText(options.tokenAccessExpiresAt));
+  } else if (tokenStatus !== 'valid') {
+    sets.push("token_access_expires_at = ''");
+  }
+
+  const refreshToken = dbText(options.refreshToken || '');
+  if (refreshToken) {
+    sets.push('refresh_token = ?');
+    params.push(refreshToken);
+  }
+
+  params.push(ownerUsername, email);
+  const result = accountsDb.prepare(`
+    UPDATE account_records
+    SET ${sets.join(', ')}
+    WHERE owner_username = ? AND lower(email) = lower(?)
+  `).run(...params);
+
+  return {
+    updated: result.changes || 0,
+    email,
+    tokenStatus,
+    checkedAt,
+  };
+};
+
 const listAccounts = (options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
   const page = Math.max(1, Number(options.page) || 1);
   const pageSize = Math.min(500, Math.max(1, Number(options.pageSize) || 50));
   const offset = (page - 1) * pageSize;
   const search = String(options.search || '').trim().toLowerCase();
+  const tokenStatusFilter = String(
+    options.tokenStatus
+    || options.tokenStatusFilter
+    || '',
+  ).trim().toLowerCase();
   const rawProjectUsage = String(
     options.projectUsage
     || options.projectUsageFilter
@@ -1097,6 +1190,15 @@ const listAccounts = (options = {}) => {
   if (search) {
     whereParts.push(`lower(ar.email) LIKE ?`);
     params.push(`%${search}%`);
+  }
+
+  if (tokenStatusFilter && tokenStatusFilter !== 'all') {
+    if (tokenStatusFilter === 'unchecked' || tokenStatusFilter === 'unknown') {
+      whereParts.push(`(ar.token_status IS NULL OR ar.token_status = '' OR ar.token_status = 'unknown')`);
+    } else {
+      whereParts.push(`ar.token_status = ?`);
+      params.push(tokenStatusFilter);
+    }
   }
 
   const scopedProjectMarkExistsSql = projectMarkKeys.length > 0
@@ -1168,6 +1270,10 @@ const listAccounts = (options = {}) => {
         ar.refresh_token,
         ar.source,
         ar.updated_at,
+        ar.token_status,
+        ar.last_token_error,
+        ar.last_token_checked_at,
+        ar.token_access_expires_at,
         ROW_NUMBER() OVER (
           PARTITION BY lower(ar.email)
           ORDER BY ar.updated_at DESC, ar.imported_at DESC, ar.record_key DESC
@@ -1184,12 +1290,23 @@ const listAccounts = (options = {}) => {
   `).get(...params)?.total || 0;
   const records = mailDb.prepare(`
     ${rankedCte}
-    SELECT record_key, email, password, client_id, refresh_token, source, updated_at
+    SELECT
+      record_key,
+      email,
+      password,
+      client_id,
+      refresh_token,
+      source,
+      updated_at,
+      token_status,
+      last_token_error,
+      last_token_checked_at,
+      token_access_expires_at
     FROM ranked_accounts
     WHERE row_rank = 1
     ORDER BY email ASC, updated_at DESC
     LIMIT ? OFFSET ?
-  `).all(...params, pageSize, offset);
+  `).all(...params, pageSize, offset).map(decorateAccountTokenFields);
 
   return {
     records,
@@ -1208,6 +1325,148 @@ const listAccounts = (options = {}) => {
   };
 };
 
+/**
+ * 列出已配置 OAuth 令牌（client_id + refresh_token）的邮箱。
+ * 支持按「账号表单与账号记录」中的邮箱优先排序。
+ */
+const listTokenMailboxes = (options = {}) => {
+  const { ownerUsername } = resolveOwnerOptions(options);
+  const page = Math.max(1, Number(options.page) || 1);
+  const pageSize = Math.min(500, Math.max(1, Number(options.pageSize) || 50));
+  const offset = (page - 1) * pageSize;
+  const search = String(options.search || '').trim().toLowerCase();
+  const tokenStatusFilter = String(
+    options.tokenStatus
+    || options.tokenStatusFilter
+    || '',
+  ).trim().toLowerCase();
+  const onlyInAccountRecords = parseBoolean(options.onlyInAccountRecords);
+  const priorityEmails = [...new Set(
+    (Array.isArray(options.priorityEmails) ? options.priorityEmails : [])
+      .map((item) => normalizeEmail(item))
+      .filter(Boolean),
+  )];
+  // Per-query CTE (not connection TEMP table) so concurrent requests cannot clobber each other.
+  const priorityEmailsJson = JSON.stringify(priorityEmails);
+
+  const whereParts = [
+    `ar.status = 'active'`,
+    `ar.owner_username = ?`,
+    `ar.email <> ''`,
+    `TRIM(ar.client_id) <> ''`,
+    `TRIM(ar.refresh_token) <> ''`,
+  ];
+  const params = [priorityEmailsJson, ownerUsername];
+
+  if (search) {
+    whereParts.push(`lower(ar.email) LIKE ?`);
+    params.push(`%${search}%`);
+  }
+
+  if (tokenStatusFilter && tokenStatusFilter !== 'all') {
+    if (tokenStatusFilter === 'unchecked' || tokenStatusFilter === 'unknown') {
+      whereParts.push(`(ar.token_status IS NULL OR ar.token_status = '' OR ar.token_status = 'unknown')`);
+    } else {
+      whereParts.push(`ar.token_status = ?`);
+      params.push(tokenStatusFilter);
+    }
+  }
+
+  if (onlyInAccountRecords) {
+    whereParts.push(`EXISTS (
+      SELECT 1 FROM priority_emails pe
+      WHERE pe.email = lower(ar.email)
+    )`);
+  }
+
+  const where = `WHERE ${whereParts.join(' AND ')}`;
+  const rankedCte = `
+    WITH priority_emails AS (
+      SELECT lower(value) AS email
+      FROM json_each(?)
+    ),
+    ranked_accounts AS (
+      SELECT
+        ar.record_key,
+        ar.email,
+        ar.password,
+        ar.client_id,
+        ar.refresh_token,
+        ar.source,
+        ar.updated_at,
+        ar.token_status,
+        ar.last_token_error,
+        ar.last_token_checked_at,
+        ar.token_access_expires_at,
+        CASE WHEN pe.email IS NOT NULL THEN 1 ELSE 0 END AS in_account_records,
+        ROW_NUMBER() OVER (
+          PARTITION BY lower(ar.email)
+          ORDER BY ar.updated_at DESC, ar.imported_at DESC, ar.record_key DESC
+        ) AS row_rank
+      FROM account_records ar
+      LEFT JOIN priority_emails pe ON pe.email = lower(ar.email)
+      ${where}
+    )
+  `;
+
+  const total = accountsDb.prepare(`
+    ${rankedCte}
+    SELECT COUNT(*) AS total
+    FROM ranked_accounts
+    WHERE row_rank = 1
+  `).get(...params)?.total || 0;
+
+  const priorityMatched = accountsDb.prepare(`
+    ${rankedCte}
+    SELECT COUNT(*) AS total
+    FROM ranked_accounts
+    WHERE row_rank = 1 AND in_account_records = 1
+  `).get(...params)?.total || 0;
+
+  const records = accountsDb.prepare(`
+    ${rankedCte}
+    SELECT
+      record_key,
+      email,
+      password,
+      client_id,
+      refresh_token,
+      source,
+      updated_at,
+      token_status,
+      last_token_error,
+      last_token_checked_at,
+      token_access_expires_at,
+      in_account_records
+    FROM ranked_accounts
+    WHERE row_rank = 1
+    ORDER BY
+      in_account_records DESC,
+      CASE lower(COALESCE(token_status, 'unknown'))
+        WHEN 'invalid' THEN 0
+        WHEN 'transient' THEN 1
+        WHEN 'unknown' THEN 2
+        ELSE 3
+      END,
+      email ASC,
+      updated_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, pageSize, offset).map((row) => ({
+    ...decorateAccountTokenFields(row),
+    in_account_records: Number(row.in_account_records) === 1,
+  }));
+
+  return {
+    records,
+    page,
+    pageSize,
+    total,
+    priorityMatched,
+    priorityEmailCount: priorityEmails.length,
+    database: ACCOUNTS_DB_PATH,
+  };
+};
+
 const listAccountsForFetch = (options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
   const limit = Math.max(0, Number(options.limit) || 0);
@@ -1218,6 +1477,10 @@ const listAccountsForFetch = (options = {}) => {
   const whereParts = [`status = 'active'`, `owner_username = ?`, `email <> ''`, `client_id <> ''`, `refresh_token <> ''`];
   const params = [ownerUsername];
 
+  if (options.includeInvalid !== true) {
+    whereParts.push(`(token_status IS NULL OR token_status = '' OR token_status <> 'invalid')`);
+  }
+
   if (emailFilters.length > 0) {
     whereParts.push(`email IN (${emailFilters.map(() => '?').join(', ')})`);
     params.push(...emailFilters);
@@ -1225,7 +1488,18 @@ const listAccountsForFetch = (options = {}) => {
 
   const where = `WHERE ${whereParts.join(' AND ')}`;
   const sql = `
-    SELECT record_key, email, password, client_id, refresh_token, source, updated_at
+    SELECT
+      record_key,
+      email,
+      password,
+      client_id,
+      refresh_token,
+      source,
+      updated_at,
+      token_status,
+      last_token_error,
+      last_token_checked_at,
+      token_access_expires_at
     FROM account_records
     ${where}
     ORDER BY email ASC, updated_at DESC
@@ -1233,7 +1507,65 @@ const listAccountsForFetch = (options = {}) => {
   `;
   const finalParams = limit > 0 ? [...params, limit, offset] : params;
 
-  return accountsDb.prepare(sql).all(...finalParams);
+  return accountsDb.prepare(sql).all(...finalParams).map(decorateAccountTokenFields);
+};
+
+const listAccountsForTokenRefresh = (options = {}) => {
+  const ownerUsername = normalizeOwner(options.ownerUsername);
+  const limit = Math.max(0, Number(options.limit) || 0);
+  const offset = Math.max(0, Number(options.offset) || 0);
+  const emailFilters = Array.isArray(options.emails)
+    ? options.emails.map(normalizeEmail).filter(Boolean)
+    : [];
+  const whereParts = [`status = 'active'`, `email <> ''`, `client_id <> ''`, `refresh_token <> ''`];
+  const params = [];
+
+  if (ownerUsername) {
+    whereParts.push(`owner_username = ?`);
+    params.push(ownerUsername);
+  }
+
+  if (options.includeInvalid !== true) {
+    whereParts.push(`(token_status IS NULL OR token_status = '' OR token_status <> 'invalid')`);
+  }
+
+  const skipCheckedWithinMinutes = Math.max(0, Number(options.skipCheckedWithinMinutes) || 0);
+  if (skipCheckedWithinMinutes > 0) {
+    const since = new Date(Date.now() - skipCheckedWithinMinutes * 60 * 1000).toISOString();
+    whereParts.push(`(last_token_checked_at IS NULL OR last_token_checked_at = '' OR last_token_checked_at < ?)`);
+    params.push(since);
+  }
+
+  if (emailFilters.length > 0) {
+    whereParts.push(`lower(email) IN (${emailFilters.map(() => '?').join(', ')})`);
+    params.push(...emailFilters);
+  }
+
+  const where = `WHERE ${whereParts.join(' AND ')}`;
+  const sql = `
+    SELECT
+      record_key,
+      email,
+      password,
+      client_id,
+      refresh_token,
+      source,
+      updated_at,
+      owner_username,
+      token_status,
+      last_token_error,
+      last_token_checked_at,
+      token_access_expires_at
+    FROM account_records
+    ${where}
+    ORDER BY
+      CASE WHEN last_token_checked_at IS NULL OR last_token_checked_at = '' THEN 0 ELSE 1 END,
+      last_token_checked_at ASC,
+      email ASC
+    ${limit > 0 ? 'LIMIT ? OFFSET ?' : ''}
+  `;
+  const finalParams = limit > 0 ? [...params, limit, offset] : params;
+  return accountsDb.prepare(sql).all(...finalParams).map(decorateAccountTokenFields);
 };
 
 const getFetchableAccountCount = (options = {}) => {
@@ -1243,6 +1575,10 @@ const getFetchableAccountCount = (options = {}) => {
     : [];
   const whereParts = [`status = 'active'`, `owner_username = ?`, `email <> ''`, `client_id <> ''`, `refresh_token <> ''`];
   const params = [ownerUsername];
+
+  if (options.includeInvalid !== true) {
+    whereParts.push(`(token_status IS NULL OR token_status = '' OR token_status <> 'invalid')`);
+  }
 
   if (emailFilters.length > 0) {
     whereParts.push(`email IN (${emailFilters.map(() => '?').join(', ')})`);
@@ -2932,13 +3268,29 @@ const getAccountByEmail = (email, options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
   const accountEmail = normalizeEmail(email);
   if (!accountEmail) return null;
-  return accountsDb.prepare(`
-    SELECT record_key, email, password, client_id, refresh_token, raw_line, source, status, imported_at, updated_at, owner_username
+  const row = accountsDb.prepare(`
+    SELECT
+      record_key,
+      email,
+      password,
+      client_id,
+      refresh_token,
+      raw_line,
+      source,
+      status,
+      imported_at,
+      updated_at,
+      owner_username,
+      token_status,
+      last_token_error,
+      last_token_checked_at,
+      token_access_expires_at
     FROM account_records
     WHERE lower(email) = lower(?) AND status = 'active' AND owner_username = ?
     ORDER BY updated_at DESC
     LIMIT 1
   `).get(accountEmail, ownerUsername) || null;
+  return decorateAccountTokenFields(row);
 };
 
 const hasAccountReceivedProjectSender = (project, email) => {
@@ -3700,8 +4052,11 @@ module.exports = {
   acquirePendingTkAccount,
   takePendingTkAccount,
   completePendingTkAccount,
+  recordTokenCheckResult,
   listAccounts,
+  listTokenMailboxes,
   listAccountsForFetch,
+  listAccountsForTokenRefresh,
   getFetchableAccountCount,
   getRecentSuccessfulFetchKeys,
   listAccountEmails,
