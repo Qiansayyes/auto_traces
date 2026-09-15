@@ -644,6 +644,7 @@ def attach_mail_module(app) -> None:
             allowed = {
                 "",
                 "email",
+                "token-mailboxes",
                 "sender-groups",
                 "template-manager",
                 "project-api",
