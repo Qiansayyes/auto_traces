@@ -5,7 +5,7 @@
         <div>
           <h2 class="page-title">令牌邮箱管理</h2>
           <p class="page-desc">
-            按手机设备别名分组展示 OAuth 令牌邮箱；后台约每 20 天自动刷新一次。可在此全量刷新，或对单条邮箱手动刷新。
+            按手机设备别名分组展示 OAuth 令牌。主服务约每天巡检一次，跳过近 20 天已检测的令牌；可单条刷新、页面全量刷新，或点「立即后台巡检」。
           </p>
           <p class="auto-refresh-status">
             自动刷新：
@@ -61,12 +61,27 @@
         <el-form-item>
           <el-button type="primary" :loading="loading.list" @click="loadList(true)">刷新列表</el-button>
           <el-button
+            type="success"
+            :loading="loading.export"
+            :disabled="loading.list || loading.export"
+            @click="exportLinkedInvalid"
+          >
+            导出已关联失效
+          </el-button>
+          <el-button
             type="warning"
             :loading="loading.check"
             :disabled="loading.list || loading.check || Boolean(refreshingEmail)"
             @click="runBatchRefresh"
           >
             全量刷新令牌
+          </el-button>
+          <el-button
+            :loading="loading.autoRun"
+            :disabled="loading.autoRun || autoRefresh.inFlight"
+            @click="runServerAutoRefresh(false)"
+          >
+            立即后台巡检
           </el-button>
         </el-form-item>
       </el-form>
@@ -232,7 +247,9 @@ const form = reactive({
 const loading = reactive({
   list: false,
   check: false,
+  export: false,
   autoStatus: false,
+  autoRun: false,
 })
 
 const refreshingEmail = ref('')
@@ -296,6 +313,44 @@ const loadAutoRefreshStatus = async () => {
   }
 }
 
+/** 触发主服务后台巡检：默认跳过近 N 天已检测；forceAll 则全量。 */
+const runServerAutoRefresh = async (forceAll = false) => {
+  if (loading.autoRun || autoRefresh.inFlight) {
+    ElMessage.warning('后台刷新任务正在运行')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      forceAll
+        ? '将在后台全量刷新全部令牌（忽略「近 20 天已检测」跳过）。确认开始？'
+        : `将在后台巡检令牌：跳过近 ${autoRefresh.skipDays} 天内已检测过的邮箱。确认开始？`,
+      forceAll ? '后台全量刷新' : '立即后台巡检',
+      { type: 'warning', confirmButtonText: '开始', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  loading.autoRun = true
+  try {
+    const response = await fetch('/api/mail-module/token_refresh/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force_all: forceAll }),
+    })
+    const payload = await response.json()
+    if (Number(payload?.code) !== 0) {
+      throw new Error(payload?.msg || payload?.message || '启动失败')
+    }
+    ElMessage.success('已在后台启动，可点「刷新状态」查看进度')
+    autoRefresh.inFlight = true
+    await loadAutoRefreshStatus()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '启动失败')
+  } finally {
+    loading.autoRun = false
+  }
+}
+
 const normalizeAlias = (value?: string) => String(value || '').trim()
 
 const normalizeEmail = (value?: string) => String(value || '').trim().toLowerCase()
@@ -334,12 +389,44 @@ const getRowClassName = ({ row }: { row: TokenMailboxRow }) => {
   return classes.join(' ')
 }
 
+const copyWithFallback = (text: string) => {
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'readonly')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '0'
+  textarea.style.left = '0'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  textarea.setSelectionRange(0, textarea.value.length)
+  const ok = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!ok) throw new Error('execCommand copy failed')
+}
+
 const copyText = async (text: string, successMessage: string) => {
+  const value = String(text || '')
+  if (!value) {
+    ElMessage.warning('没有可复制的内容')
+    return
+  }
+
   try {
-    await navigator.clipboard.writeText(text)
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(value)
+    } else {
+      copyWithFallback(value)
+    }
     ElMessage.success(successMessage)
   } catch {
-    ElMessage.error('复制失败')
+    try {
+      copyWithFallback(value)
+      ElMessage.success(successMessage)
+    } catch {
+      ElMessage.error('复制失败')
+    }
   }
 }
 
@@ -628,6 +715,105 @@ const postTokenRefresh = async (emails: string[]) => {
     throw new Error(payload.error || payload.message || '刷新失败')
   }
   return payload.data || {}
+}
+
+const downloadTextFile = (filename: string, content: string) => {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+type LinkedInvalidExportRow = {
+  email: string
+  emailPassword: string
+}
+
+/**
+ * 导出数据源：
+ * - 邮箱 / 邮箱密码：账号表单与账号记录（account_editor_rows.email / email_password）
+ * - 令牌失效：与本页「已关联 + 失效」一致（mail_token_status=invalid）
+ */
+const fetchLinkedInvalidExportRows = async (): Promise<LinkedInvalidExportRow[]> => {
+  const accountResp = await fetch('/api/admin/editor/account_rows')
+  let accountPayload: {
+    code?: number | string
+    msg?: string
+    message?: string
+    items?: Array<{
+      email?: string
+      email_password?: string
+      mail_token_status?: string
+    }>
+  } | null = null
+  try {
+    accountPayload = await accountResp.json()
+  } catch {
+    throw new Error(`账号表单接口返回异常（HTTP ${accountResp.status}）`)
+  }
+
+  const code = Number(accountPayload?.code)
+  if (code === 401 || accountResp.status === 401) {
+    throw new Error(accountPayload?.msg || accountPayload?.message || '请先登录后再导出')
+  }
+  if (!accountResp.ok || code !== 0) {
+    throw new Error(
+      accountPayload?.msg || accountPayload?.message || `账号表单加载失败（HTTP ${accountResp.status}）`,
+    )
+  }
+
+  const seen = new Set<string>()
+  const targets: LinkedInvalidExportRow[] = []
+  for (const item of accountPayload?.items || []) {
+    const email = String(item?.email || '').trim()
+    const emailKey = normalizeEmail(email)
+    if (!emailKey || !emailKey.includes('@') || seen.has(emailKey)) continue
+    if (String(item?.mail_token_status || '').trim().toLowerCase() !== 'invalid') continue
+    seen.add(emailKey)
+    targets.push({
+      email,
+      emailPassword: String(item?.email_password || '').trim(),
+    })
+  }
+  return targets
+}
+
+const exportLinkedInvalid = async () => {
+  if (loading.export) return
+  loading.export = true
+  try {
+    const targets = await fetchLinkedInvalidExportRows()
+    if (!targets.length) {
+      ElMessage.warning('没有「账号表单已关联且令牌失效」的邮箱可导出')
+      return
+    }
+
+    const missingPassword = targets.filter((row) => !row.emailPassword).length
+    try {
+      await ElMessageBox.confirm(
+        `将导出 ${targets.length} 条「已关联 + 令牌失效」账号，格式：邮箱----邮箱密码。${
+          missingPassword > 0 ? `\n其中 ${missingPassword} 条缺少邮箱密码，仍会导出为空密码。` : ''
+        }`,
+        '导出确认',
+        { type: 'warning', confirmButtonText: '导出', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
+
+    const content = targets
+      .map((row) => `${row.email}----${row.emailPassword}`)
+      .join('\n')
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    downloadTextFile(`linked_invalid_mails_${stamp}.txt`, content)
+    ElMessage.success(`已导出 ${targets.length} 条`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '导出失败')
+  } finally {
+    loading.export = false
+  }
 }
 
 const runSingleRefresh = async (row: TokenMailboxRow) => {

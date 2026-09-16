@@ -10764,6 +10764,12 @@ function getAccountRowTemplate(source = {}) {
     basic_profile_modified: normalizeBasicProfileModifiedField(source.basic_profile_modified),
     // 分配别名仅以账号表单字段为准；备份档案别名由 backupAliasByUsername / 渲染层展示。
     assigned_alias: normalizeAliasValue(source.assigned_alias) || "",
+    // 收码/令牌状态（后端 account_rows 下发，勿丢）
+    has_two_fa: Boolean(source.has_two_fa),
+    mail_token_status: source.mail_token_status || "",
+    mail_gate: source.mail_gate || "",
+    mail_token_label: source.mail_token_label || "",
+    mail_module_code_available: Boolean(source.mail_module_code_available),
   };
 }
 
