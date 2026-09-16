@@ -9269,8 +9269,9 @@ object AppCoordinator {
     ) = handleAccountCredBlocked(alias, deviceId, ex.username, ex.blockKind, source)
 
     /**
-     * Account status：有 OK 则点 OK 并冷启；无 OK 则强停 + pm clear 后冷启。
-     * 随后走完整自动登录；Add another account / 登录状态保障路径则直接从当前登录入口续接。
+     * Account status：首遇尽力点 OK 后冷启；**重启后再多次 OCR 点 OK** 才继续；
+     * 仍无 OK 才强停 + pm clear 后冷启。随后走完整自动登录；
+     * Add another account / 登录状态保障路径则直接从当前登录入口续接。
      */
     private suspend fun recoverFromSafeguardStyleLogout(alias: String, deviceId: String, source: String): Boolean {
         LogCenter.op(

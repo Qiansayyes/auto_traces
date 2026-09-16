@@ -44,8 +44,9 @@ class GrowthFlowRestartRequired(message: String) : RuntimeException(message)
 const val SAFEGUARD_REQUIRES_AUTO_LOGIN_MESSAGE = "__SAFEGUARD_REQUIRES_AUTO_LOGIN__"
 
 /**
- * TikTok「Account status / 已登出」弹窗：已在设备端处理（有 OK 则点 OK 后强停冷启；
- * 无 OK 则强停 + pm clear 后冷启），需中止当前步骤并重新自动登录，再接回原步骤。
+ * TikTok「Account status / 已登出」弹窗：首遇尽力点 OK 后强停冷启；
+ * **重启后再多次 OCR 点 OK**（点到或确认弹窗消失才继续）；仍无 OK 才 pm clear 后冷启。
+ * 需中止当前步骤并重新自动登录，再接回原步骤。
  */
 class AccountStatusLoggedOutException(message: String) : RuntimeException(message)
 
@@ -1273,6 +1274,25 @@ class RealTraceExecutor(
         /** 切号后自动登录：通用 OCR 重试。 */
         private const val AUTO_LOGIN_OCR_MAX_PASSES = 6
         private const val AUTO_LOGIN_OCR_RETRY_DELAY_MS = 1000L
+        /**
+         * Account status 弹窗找 OK：
+         * 首遇可漏；**冷启/重启后再多次 OCR 点 OK**，点到（或确认弹窗已消失）才继续；
+         * 重启后仍点不到才 pm clear，避免首帧漏识就清数据。
+         */
+        private const val ACCOUNT_STATUS_OK_OCR_MAX_PASSES = 6
+        private const val ACCOUNT_STATUS_OK_OCR_RETRY_DELAY_MS = 700L
+        /** 首遇点 OK 不强制：少试几轮即可，避免拖慢强停冷启。 */
+        private const val ACCOUNT_STATUS_OK_FIRST_MAX_PASSES = 2
+        /** 强停冷启后，给弹窗重绘留一点时间再开始找 OK。 */
+        private const val ACCOUNT_STATUS_AFTER_RELAUNCH_SETTLE_MS = 1200L
+        private const val ACCOUNT_STATUS_AFTER_RELAUNCH_OK_MAX_PASSES = 8
+        private const val ACCOUNT_STATUS_AFTER_RELAUNCH_OK_RETRY_DELAY_MS = 800L
+        /**
+         * 「弹窗已消失」需连续确认次数，避免单帧漏识 Account status 标题就误判成功。
+         */
+        private const val ACCOUNT_STATUS_DIALOG_GONE_CONFIRM_PASSES = 2
+        /** 重启后全程未见弹窗时，至少观察这么多轮再放行（晚弹窗）。 */
+        private const val ACCOUNT_STATUS_AFTER_RELAUNCH_NO_DIALOG_MIN_PASSES = 4
         /** 入口页 Log in / Sign up 连续未识别超过此次数后，顺带探测 Edit 判定已登录。 */
         private const val AUTO_LOGIN_ENTRY_MISS_BEFORE_EDIT_PROBE = 3
         /** Username 未命中后：重新 OCR 判页（Already have/Log in/Sign up/Username）的最大纠正轮数。 */
@@ -3189,19 +3209,147 @@ class RealTraceExecutor(
         throw TikTokAnrRecoveredException("TikTok ANR 已点 Close app 并冷启，需中止当前步骤")
     }
 
+    private enum class AccountStatusOkHuntResult {
+        /** 已点到 OK，或确认弹窗已消失。 */
+        TappedOrGone,
+        /** 用尽次数仍见弹窗且点不到 OK。 */
+        NotFound,
+        /** 硬停中止。 */
+        HardStopped,
+    }
+
     private fun findAccountStatusOkButtonHit(vision: Text): StrictLabelHit? =
         findBottommostStrictExactLabelHit(vision, "OK")
             ?: findBottommostStrictExactLabelHit(vision, "Ok")
+            ?: findBottommostStrictExactLabelHit(vision, "ok")
+            ?: findStrictExactLabelHit(vision, "OK")
+            ?: findStrictExactLabelHit(vision, "Ok")
+            ?: findStrictExactLabelHit(vision, "ok")
+            ?: findStrictExactLabelHitIgnoreCase(vision, "OK")
 
     /** @return true 已点到 OCR 识别的 OK；无 OK 时不盲点，返回 false。 */
     private fun tapAccountStatusOk(alias: String, vision: Text, w: Int, h: Int): Boolean {
-        val okHit = findAccountStatusOkButtonHit(vision) ?: run {
-            devOp(alias, "掉登录：未 OCR 到 OK 按钮，跳过点击")
-            return false
-        }
+        val okHit = findAccountStatusOkButtonHit(vision) ?: return false
         val tap = coerceTapToScreen(okHit.point, w, h)
         devOp(alias, "掉登录：点 OK (${tap.x},${tap.y})")
         return runSuCommand("input tap ${tap.x} ${tap.y}")
+    }
+
+    /**
+     * 多次整屏 OCR 找 Account status 的 OK 并点击。
+     * 使用 [mlKitRecognizeFullScreenCore] 避免恢复过程中再触发掉登录观察。
+     * @param allowDialogGoneAsSuccess 弹窗已消失时是否视为可继续（重启后确认关窗用）。
+     */
+    private suspend fun findAndTapAccountStatusOkWithRetries(
+        ctx: Context,
+        alias: String,
+        initialVision: Text?,
+        phaseLog: String,
+        maxPasses: Int = ACCOUNT_STATUS_OK_OCR_MAX_PASSES,
+        retryDelayMs: Long = ACCOUNT_STATUS_OK_OCR_RETRY_DELAY_MS,
+        allowDialogGoneAsSuccess: Boolean = true,
+        ocrTagPrefix: String = "acct_status_ok_ocr",
+        noDialogMinPassesBeforeSuccess: Int = ACCOUNT_STATUS_AFTER_RELAUNCH_NO_DIALOG_MIN_PASSES,
+    ): AccountStatusOkHuntResult {
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val passes = maxPasses.coerceAtLeast(1)
+        var vision: Text? = initialVision
+        var dialogSeen = initialVision?.let { visionShowsAccountStatusLogoutDialog(it) } == true
+        var consecutiveNoDialog = 0
+        for (pass in 1..passes) {
+            if (hardStopOrNull(alias, "$phaseLog-找OK")) {
+                return AccountStatusOkHuntResult.HardStopped
+            }
+            if (vision == null) {
+                val (next, err) = mlKitRecognizeFullScreenCore(ctx, "${ocrTagPrefix}_$pass")
+                if (next == null) {
+                    devOp(
+                        alias,
+                        "$phaseLog：第 $pass/$passes 次 OCR 失败（$err），继续找 OK",
+                    )
+                } else {
+                    vision = next
+                }
+            }
+            val current = vision
+            if (current != null) {
+                val dialogNow = visionShowsAccountStatusLogoutDialog(current)
+                if (dialogNow) {
+                    dialogSeen = true
+                    consecutiveNoDialog = 0
+                } else {
+                    consecutiveNoDialog++
+                }
+                // 先尝试点 OK（标题偶发漏识时，OK 文案仍可能在）
+                if (tapAccountStatusOk(alias, current, w, h)) {
+                    devOp(alias, "$phaseLog：第 $pass/$passes 次 OCR 已点到 OK")
+                    delay(400L)
+                    return AccountStatusOkHuntResult.TappedOrGone
+                }
+                if (allowDialogGoneAsSuccess && !dialogNow) {
+                    val goneConfirmed =
+                        dialogSeen &&
+                            consecutiveNoDialog >= ACCOUNT_STATUS_DIALOG_GONE_CONFIRM_PASSES
+                    val neverAppeared =
+                        !dialogSeen &&
+                            pass >= noDialogMinPassesBeforeSuccess.coerceAtMost(passes)
+                    if (goneConfirmed) {
+                        devOp(
+                            alias,
+                            "$phaseLog：第 $pass/$passes 次 OCR 连续 $consecutiveNoDialog 次不见 Account status，视为可继续",
+                        )
+                        return AccountStatusOkHuntResult.TappedOrGone
+                    }
+                    if (neverAppeared) {
+                        devOp(
+                            alias,
+                            "$phaseLog：第 $pass/$passes 次 OCR 连续未见 Account status，视为可继续",
+                        )
+                        return AccountStatusOkHuntResult.TappedOrGone
+                    }
+                }
+                if (dialogNow) {
+                    devOp(alias, "$phaseLog：第 $pass/$passes 次 OCR 见 Account status 但未点到 OK")
+                } else {
+                    devOp(alias, "$phaseLog：第 $pass/$passes 次 OCR 未点到 OK（未见弹窗）")
+                }
+            }
+            if (pass < passes) {
+                delay(retryDelayMs.coerceAtLeast(200L))
+            }
+            vision = null
+        }
+        // 曾见弹窗却始终点不到 → NotFound；全程未见且允许消失成功 → 理论上已在中途返回
+        if (allowDialogGoneAsSuccess && !dialogSeen) {
+            devOp(alias, "$phaseLog：$passes 次 OCR 全程未见 Account status，视为可继续")
+            return AccountStatusOkHuntResult.TappedOrGone
+        }
+        devOp(alias, "$phaseLog：$passes 次 OCR 均未点到 OK")
+        return AccountStatusOkHuntResult.NotFound
+    }
+
+    /**
+     * 冷启/重启后专门找 OK：多等一会再 OCR，点到（或确认弹窗消失）才让后续自动登录继续。
+     */
+    private suspend fun findAndTapAccountStatusOkAfterRelaunch(
+        ctx: Context,
+        alias: String,
+        phaseLog: String = "掉登录·重启后",
+    ): AccountStatusOkHuntResult {
+        delay(ACCOUNT_STATUS_AFTER_RELAUNCH_SETTLE_MS)
+        return findAndTapAccountStatusOkWithRetries(
+            ctx = ctx,
+            alias = alias,
+            initialVision = null,
+            phaseLog = phaseLog,
+            maxPasses = ACCOUNT_STATUS_AFTER_RELAUNCH_OK_MAX_PASSES,
+            retryDelayMs = ACCOUNT_STATUS_AFTER_RELAUNCH_OK_RETRY_DELAY_MS,
+            allowDialogGoneAsSuccess = true,
+            ocrTagPrefix = "acct_status_ok_after_relaunch",
+            noDialogMinPassesBeforeSuccess = ACCOUNT_STATUS_AFTER_RELAUNCH_NO_DIALOG_MIN_PASSES,
+        )
     }
 
     /**
@@ -3248,10 +3396,32 @@ class RealTraceExecutor(
         return clearOk
     }
 
+    /** 点到 OK 后：强停 TikTok → 冷启，供协调器重新自动登录。 */
+    private suspend fun forceStopAndRelaunchTikTokAfterAccountStatusOk(
+        ctx: Context,
+        alias: String,
+    ) {
+        val pkg = Config.TIKTOK_PACKAGE_NAME
+        devOp(alias, "掉登录：强停 TikTok 后台")
+        runSuCommand("am force-stop $pkg")
+        val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
+        delay(forceStopWaitMs)
+        val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
+        val launched = launchTikTokOnceWithCheck(
+            ctx = ctx,
+            alias = alias,
+            tag = "掉登录恢复",
+            launchWaitMs = launchWaitMs,
+            forceStopBeforeLaunch = false,
+        )
+        devOp(alias, "掉登录：重新打开 TikTok ${if (launched) "成功" else "失败"}，待重新自动登录")
+    }
+
     /**
      * 掉登录弹窗（首遇）：
-     * - 有 OK：点 OK → 强停 TikTok → 冷启；
-     * - 无 OK：不强点比例位，直接强停 → pm clear 一次 → 冷启；
+     * - 首遇点 OK **不强制**（漏识可接受）：尽量点一下后一律强停冷启；
+     * - **重启后**再多次 OCR 找 OK 并点到（或确认弹窗已消失）才继续后续自动登录；
+     * - 重启后仍无 OK：才强停 → pm clear → 冷启；
      * 进入重登期后抛出 [AccountStatusLoggedOutException]，由协调器走正常登录并接回原步骤。
      * 重登期内见弹窗走 [dismissAccountStatusInline]；若重登期仍无 OK 则升级为本路径清数据。
      */
@@ -3269,28 +3439,38 @@ class RealTraceExecutor(
                 throw AccountStatusLoggedOutException("硬停")
             }
             devOp(alias, "掉登录：检测到 Account status 弹窗，立即终止当前步骤")
-            val dm = ctx.resources.displayMetrics
-            val w = dm.widthPixels.coerceAtLeast(1)
-            val h = dm.heightPixels.coerceAtLeast(1)
-            val hasOk = findAccountStatusOkButtonHit(vision) != null
-            if (hasOk) {
-                tapAccountStatusOk(alias, vision, w, h)
-                val pkg = Config.TIKTOK_PACKAGE_NAME
-                devOp(alias, "掉登录：强停 TikTok 后台")
-                runSuCommand("am force-stop $pkg")
-                val forceStopWaitMs = lastConfigSnapshot.tiktok_force_stop_wait_ms.coerceIn(100L, 8000L)
-                delay(forceStopWaitMs)
-                val launchWaitMs = lastConfigSnapshot.tiktok_launch_wait_ms.coerceIn(800L, 10000L)
-                val launched = launchTikTokOnceWithCheck(
+            // 首遇：尽力点 OK，失败也不清数据——关键的是重启后再关弹窗。
+            when (
+                findAndTapAccountStatusOkWithRetries(
                     ctx = ctx,
                     alias = alias,
-                    tag = "掉登录恢复",
-                    launchWaitMs = launchWaitMs,
-                    forceStopBeforeLaunch = false,
+                    initialVision = vision,
+                    phaseLog = "掉登录·首遇",
+                    maxPasses = ACCOUNT_STATUS_OK_FIRST_MAX_PASSES,
+                    retryDelayMs = ACCOUNT_STATUS_OK_OCR_RETRY_DELAY_MS,
+                    allowDialogGoneAsSuccess = false,
+                    ocrTagPrefix = "acct_status_ok_first",
                 )
-                devOp(alias, "掉登录：重新打开 TikTok ${if (launched) "成功" else "失败"}，待重新自动登录")
-            } else {
-                forceStopClearAndRelaunchTikTokForAccountStatusNoOk(ctx, alias)
+            ) {
+                AccountStatusOkHuntResult.HardStopped ->
+                    throw AccountStatusLoggedOutException("硬停")
+                AccountStatusOkHuntResult.TappedOrGone ->
+                    devOp(alias, "掉登录·首遇：已点到 OK，准备强停冷启")
+                AccountStatusOkHuntResult.NotFound ->
+                    devOp(alias, "掉登录·首遇：未点到 OK（可接受），仍强停冷启，重启后再找 OK")
+            }
+            forceStopAndRelaunchTikTokAfterAccountStatusOk(ctx, alias)
+
+            // 重启后：必须多次 OCR 点到 OK（或确认弹窗已消失）再交给自动登录。
+            when (val after = findAndTapAccountStatusOkAfterRelaunch(ctx, alias)) {
+                AccountStatusOkHuntResult.HardStopped ->
+                    throw AccountStatusLoggedOutException("硬停")
+                AccountStatusOkHuntResult.TappedOrGone ->
+                    devOp(alias, "掉登录·重启后：OK 已处理（或弹窗已消失），继续后续自动登录")
+                AccountStatusOkHuntResult.NotFound -> {
+                    devOp(alias, "掉登录·重启后：多次 OCR 仍无 OK，升级为强停+清数据+冷启")
+                    forceStopClearAndRelaunchTikTokForAccountStatusNoOk(ctx, alias)
+                }
             }
         } finally {
             accountStatusRecoveryInProgress = false
@@ -3300,29 +3480,42 @@ class RealTraceExecutor(
     }
 
     /**
-     * 重登期内：仅点 OK 关 Account status 弹窗，继续自动登录。
-     * 若无 OK（弹窗残缺），升级为清数据冷启并抛出 [AccountStatusLoggedOutException]。
-     * @return 是否已点击 OK
+     * 重登期内：多次 OCR 找 OK 关 Account status 弹窗，继续自动登录。
+     * 仍无 OK（弹窗残缺）则升级为清数据冷启并抛出 [AccountStatusLoggedOutException]。
+     * @return 是否已点击 OK（或确认弹窗已消失）
      */
     private suspend fun dismissAccountStatusInline(
         ctx: Context,
         alias: String,
         vision: Text,
     ): Boolean {
-        val dm = ctx.resources.displayMetrics
-        val w = dm.widthPixels.coerceAtLeast(1)
-        val h = dm.heightPixels.coerceAtLeast(1)
-        if (findAccountStatusOkButtonHit(vision) == null) {
-            devOp(alias, "掉登录重登期：Account status 无 OK，升级为强停+清数据+冷启")
-            performAccountStatusLogoutRecovery(ctx, alias, vision)
+        when (
+            findAndTapAccountStatusOkWithRetries(
+                ctx = ctx,
+                alias = alias,
+                initialVision = vision,
+                phaseLog = "掉登录重登期",
+                maxPasses = ACCOUNT_STATUS_AFTER_RELAUNCH_OK_MAX_PASSES,
+                retryDelayMs = ACCOUNT_STATUS_AFTER_RELAUNCH_OK_RETRY_DELAY_MS,
+                allowDialogGoneAsSuccess = true,
+                ocrTagPrefix = "acct_status_ok_inline",
+                // 重登期已确认见过弹窗（initialVision），未见时用连续确认即可，不必空等 4 轮
+                noDialogMinPassesBeforeSuccess = ACCOUNT_STATUS_DIALOG_GONE_CONFIRM_PASSES,
+            )
+        ) {
+            AccountStatusOkHuntResult.HardStopped ->
+                throw AccountStatusLoggedOutException("硬停")
+            AccountStatusOkHuntResult.NotFound -> {
+                devOp(alias, "掉登录重登期：多次 OCR 仍无 OK，升级为强停+清数据+冷启")
+                performAccountStatusLogoutRecovery(ctx, alias, vision)
+            }
+            AccountStatusOkHuntResult.TappedOrGone -> Unit
         }
-        if (!tapAccountStatusOk(alias, vision, w, h)) return false
         accountStatusInlineOkTapCount++
         devOp(
             alias,
             "掉登录重登期：顺手点 Account status OK（累计 $accountStatusInlineOkTapCount 次）",
         )
-        autoLoginDelay(alias, 400L, "Account status OK 后")
         return true
     }
 

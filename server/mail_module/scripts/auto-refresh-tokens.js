@@ -5,6 +5,7 @@ const path = require('path');
 const { refreshAccessToken } = require('../services/MailService');
 const database = require('../services/DatabaseService');
 const { classifyTokenError } = require('../utils/tokenError');
+const { maybeNotifyAfterTokenCheck } = require('../services/MainNotifyService');
 
 const toInt = (value, fallback) => {
   const parsed = Number(value);
@@ -81,6 +82,7 @@ const refreshAccountToken = async (account) => {
       expiresInSeconds: result.expires_in,
       refreshToken: result.refresh_token,
     });
+    maybeNotifyAfterTokenCheck(saved?.ownerUsername || account.owner_username, saved);
 
     if (result.refresh_token) {
       summary.refreshTokenUpdatedCount += 1;
@@ -91,12 +93,13 @@ const refreshAccountToken = async (account) => {
     return { ok: true, saved };
   } catch (error) {
     const classification = classifyTokenError(error);
-    database.recordTokenCheckResult({
+    const failed = database.recordTokenCheckResult({
       ownerUsername: account.owner_username,
       email: account.email,
       tokenStatus: classification.tokenStatus,
       lastTokenError: classification.lastTokenError,
     });
+    maybeNotifyAfterTokenCheck(failed?.ownerUsername || account.owner_username, failed);
 
     if (classification.tokenStatus === 'invalid') {
       summary.invalidCount += 1;

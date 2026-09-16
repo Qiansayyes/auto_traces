@@ -2123,6 +2123,41 @@ button.danger {
   line-height: 1.2;
 }
 
+.account-editor-table__mail-token {
+  min-width: 108px;
+  max-width: 140px;
+  white-space: nowrap;
+}
+
+.account-mail-token-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.account-mail-token-badge--ok {
+  color: #067647;
+  background: #ecfdf3;
+}
+
+.account-mail-token-badge--danger {
+  color: #b42318;
+  background: #fef3f2;
+  font-weight: 600;
+}
+
+.account-mail-token-badge--warn {
+  color: #b54708;
+  background: #fffaeb;
+}
+
+.account-mail-token-badge--muted {
+  color: #667085;
+  background: #f2f4f7;
+}
+
 .account-editor-table__cred-col--api {
   min-width: 140px;
   max-width: 200px;

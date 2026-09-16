@@ -1082,6 +1082,15 @@ const recordTokenCheckResult = (options = {}) => {
     return { updated: 0 };
   }
 
+  const previousRow = accountsDb.prepare(`
+    SELECT token_status
+    FROM account_records
+    WHERE owner_username = ? AND lower(email) = lower(?)
+    ORDER BY updated_at DESC, record_key DESC
+    LIMIT 1
+  `).get(ownerUsername, email);
+  const previousTokenStatus = normalizeTokenStatus(previousRow?.token_status);
+
   const tokenStatus = normalizeTokenStatus(options.tokenStatus);
   const lastTokenError = dbText(options.lastTokenError || '');
   const checkedAt = nowIso();
@@ -1121,7 +1130,11 @@ const recordTokenCheckResult = (options = {}) => {
     updated: result.changes || 0,
     email,
     tokenStatus,
+    previousTokenStatus,
+    statusChanged: previousTokenStatus !== tokenStatus,
+    lastTokenError,
     checkedAt,
+    ownerUsername,
   };
 };
 
@@ -1332,7 +1345,8 @@ const listAccounts = (options = {}) => {
 const listTokenMailboxes = (options = {}) => {
   const { ownerUsername } = resolveOwnerOptions(options);
   const page = Math.max(1, Number(options.page) || 1);
-  const pageSize = Math.min(500, Math.max(1, Number(options.pageSize) || 50));
+  // Alias grouping needs a wide window; allow up to 5000 for token-mailbox management.
+  const pageSize = Math.min(5000, Math.max(1, Number(options.pageSize) || 50));
   const offset = (page - 1) * pageSize;
   const search = String(options.search || '').trim().toLowerCase();
   const tokenStatusFilter = String(
@@ -1542,7 +1556,29 @@ const listAccountsForTokenRefresh = (options = {}) => {
   }
 
   const where = `WHERE ${whereParts.join(' AND ')}`;
+  // Deduplicate by email so a batch of N emails cannot be truncated by duplicate rows.
   const sql = `
+    WITH ranked AS (
+      SELECT
+        record_key,
+        email,
+        password,
+        client_id,
+        refresh_token,
+        source,
+        updated_at,
+        owner_username,
+        token_status,
+        last_token_error,
+        last_token_checked_at,
+        token_access_expires_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY lower(email)
+          ORDER BY updated_at DESC, imported_at DESC, record_key DESC
+        ) AS row_rank
+      FROM account_records
+      ${where}
+    )
     SELECT
       record_key,
       email,
@@ -1556,8 +1592,8 @@ const listAccountsForTokenRefresh = (options = {}) => {
       last_token_error,
       last_token_checked_at,
       token_access_expires_at
-    FROM account_records
-    ${where}
+    FROM ranked
+    WHERE row_rank = 1
     ORDER BY
       CASE WHEN last_token_checked_at IS NULL OR last_token_checked_at = '' THEN 0 ELSE 1 END,
       last_token_checked_at ASC,

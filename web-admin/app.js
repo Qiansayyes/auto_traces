@@ -11391,6 +11391,29 @@ function formatAccountGrowthTriple(row = {}, prefix = "follower") {
   return `<div class="account-growth-triple" title="${prefix === "follower" ? "粉丝" : "总赞"}增长（前天/昨天/今天）">${fmt("前", dayBefore)}${fmt("昨", yesterday)}${fmt("今", today)}</div>`;
 }
 
+function formatAccountMailTokenBadge(row = {}) {
+  const gate = String(row.mail_gate || "").trim().toLowerCase();
+  const label = String(row.mail_token_label || "").trim()
+    || (gate === "two_fa"
+      ? "2FA不依赖令牌"
+      : gate === "invalid"
+        ? "令牌失效"
+        : gate === "missing"
+          ? "无令牌"
+          : gate === "ok"
+            ? "令牌正常"
+            : gate === "transient"
+              ? "令牌临时失败"
+              : gate === "unknown"
+                ? "令牌未检测"
+                : "-");
+  let tone = "muted";
+  if (gate === "invalid" || gate === "missing") tone = "danger";
+  else if (gate === "ok" || gate === "two_fa") tone = "ok";
+  else if (gate === "transient" || gate === "unknown") tone = "warn";
+  return `<span class="account-mail-token-badge account-mail-token-badge--${tone}" title="${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+}
+
 function renderAccountEditorTableRow({ row, idx }, displayNum) {
   const aliasLocked = isAccountAliasLocked(row);
   const aliasCell = aliasLocked
@@ -11425,6 +11448,7 @@ function renderAccountEditorTableRow({ row, idx }, displayNum) {
         <button type="button" class="ghost account-editor-two-fa-code-btn" data-editor-index="${idx}" title="本地生成当前 TOTP">取码</button>
       </div>
     </td>
+    <td class="account-editor-table__mail-token">${formatAccountMailTokenBadge(row)}</td>
     <td class="account-editor-table__cred-col account-editor-table__cred-col--api">${accountEditorCellInput(idx, "api", row.api)}</td>
     <td class="account-editor-table__login">${loginSelect}</td>
     <td class="account-editor-table__login-time">${accountEditorCellInput(idx, "login_time", row.login_time, "", "account-editor-table__login-time-input")}</td>
@@ -11514,6 +11538,7 @@ function renderAccountEditorRows() {
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">2FA</th>
+                  <th class="account-editor-table__mail-token" title="邮件 OAuth 令牌状态（有 2FA 时不依赖令牌）">收码/令牌</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
                   <th class="account-editor-table__login">登录</th>
                   <th class="account-editor-table__login-time">登录时间</th>

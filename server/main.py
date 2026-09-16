@@ -877,6 +877,12 @@ def init_follow_db():
             pass
         try:
             conn.execute(
+                "ALTER TABLE device_editor_rows ADD COLUMN auto_switch_exclude_reason TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
                 "ALTER TABLE account_editor_rows ADD COLUMN basic_profile_modified TEXT NOT NULL DEFAULT '否'"
             )
         except sqlite3.OperationalError:
@@ -4264,6 +4270,21 @@ class DeviceEditorAutoSwitchExcludedBatchRequest(BaseModel):
     excluded: bool = False
 
 
+class InternalMailTokenStatusItem(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    token_status: str = Field(..., min_length=1, max_length=32)
+    last_token_error: str = Field(default="", max_length=1000)
+
+
+class InternalMailTokenStatusNotifyRequest(BaseModel):
+    """邮件模块 → 主服务：令牌状态变更，驱动自动切号排除/恢复。"""
+    owner_username: str = Field(..., min_length=1, max_length=128)
+    email: str = Field(default="", max_length=255)
+    token_status: str = Field(default="", max_length=32)
+    last_token_error: str = Field(default="", max_length=1000)
+    items: list[InternalMailTokenStatusItem] = Field(default_factory=list)
+
+
 class SetDeviceGroupRequest(BaseModel):
     device_group: str = Field(default="", max_length=64)
     aliases: list[str] = Field(default_factory=list)
@@ -5693,6 +5714,395 @@ ACCOUNT_CRED_LEGACY_BANNED = "banned"
 ACCOUNT_CRED_SUFFIX_BANNED = "----banned"
 ACCOUNT_CRED_SUFFIX_MAX_LOGIN = "----Maximum login"
 
+# device_editor_rows.auto_switch_exclude_reason：区分人工排除 / 令牌失效 / 凭据封禁
+AUTO_SWITCH_EXCLUDE_REASON_MANUAL = "manual"
+AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID = "mail_token_invalid"
+AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE = "mail_code_unavailable"
+AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED = "cred_blocked"
+AUTO_SWITCH_MAIL_CODE_EXCLUDE_REASONS = frozenset(
+    {
+        AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID,
+        AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE,
+    }
+)
+
+
+def _normalize_auto_switch_exclude_reason(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _auto_switch_exclude_reason_for_flag(excluded: bool, *, reason: str = "") -> str:
+    """写入排除标记时的原因：取消排除一律清空；开启时用显式 reason 或 manual。"""
+    if not excluded:
+        return ""
+    normalized = _normalize_auto_switch_exclude_reason(reason)
+    return normalized or AUTO_SWITCH_EXCLUDE_REASON_MANUAL
+
+
+def _account_email_for_mail_lookup(value: Any) -> str:
+    """账号表 email 可能带 ----banned / ----Maximum login 后缀，邮件库匹配前先剥掉。"""
+    s = _account_cred_text(value).strip()
+    for suffix in (ACCOUNT_CRED_SUFFIX_BANNED, ACCOUNT_CRED_SUFFIX_MAX_LOGIN):
+        idx = s.find(suffix)
+        if idx >= 0:
+            s = s[:idx]
+    return s.strip().lower()
+
+
+def _account_row_has_two_fa(two_fa: Any) -> bool:
+    """账号表配置了可用 2FA 密钥时，自动切号不依赖邮件令牌。"""
+    try:
+        return bool(_normalize_totp_secret(str(two_fa or "")))
+    except Exception:
+        return bool(str(two_fa or "").strip())
+
+
+def _list_mail_oauth_token_status_map(owner_username: str) -> dict[str, str] | None:
+    try:
+        from mail_integration import list_mail_oauth_token_status_map
+
+        return list_mail_oauth_token_status_map(owner_username)
+    except Exception as exc:
+        print(f"[{now_text()}] auto_switch | list_mail_oauth_token_status_map failed: {exc}")
+        return None
+
+
+def _list_fetchable_mail_emails(owner_username: str) -> set[str] | None:
+    try:
+        from mail_integration import list_fetchable_mail_emails
+
+        return list_fetchable_mail_emails(owner_username)
+    except Exception as exc:
+        print(f"[{now_text()}] auto_switch | list_fetchable_mail_emails failed: {exc}")
+        return None
+
+
+def _list_invalid_mail_token_emails(owner_username: str) -> set[str]:
+    try:
+        from mail_integration import list_invalid_mail_token_emails
+
+        return set(list_invalid_mail_token_emails(owner_username) or set())
+    except Exception as exc:
+        print(f"[{now_text()}] auto_switch | list_invalid_mail_token_emails failed: {exc}")
+        return set()
+
+
+def _usernames_blocked_by_mail_code(conn: sqlite3.Connection, owner_username: str) -> set[str]:
+    """账号表填了邮箱、无 2FA、且邮件库无法拉验证码的 username（小写）。
+
+    有 2FA 或无邮箱的账号不拦截。邮件库不可用时 fail-open。
+    """
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return set()
+    fetchable = _list_fetchable_mail_emails(owner)
+    if fetchable is None:
+        return set()
+    rows = conn.execute(
+        """
+        SELECT username, email, two_fa
+        FROM account_editor_rows
+        WHERE owner_username = ? AND TRIM(COALESCE(email, '')) <> ''
+        """,
+        (owner,),
+    ).fetchall()
+    out: set[str] = set()
+    for row in rows or []:
+        if _account_row_has_two_fa(row["two_fa"] if hasattr(row, "keys") else (row[2] if len(row) > 2 else "")):
+            continue
+        email = _account_email_for_mail_lookup(row["email"] if hasattr(row, "keys") else row[1])
+        if not email or "@" not in email:
+            continue
+        if email in fetchable:
+            continue
+        uname = str(row["username"] if hasattr(row, "keys") else row[0] or "").strip().lower()
+        if uname:
+            out.add(uname)
+    return out
+
+
+# 兼容旧名
+def _usernames_with_invalid_mail_token(conn: sqlite3.Connection, owner_username: str) -> set[str]:
+    return _usernames_blocked_by_mail_code(conn, owner_username)
+
+def _reconcile_mail_code_auto_switch_exclusions(
+    owner_username: str,
+    alias: str | None = None,
+) -> dict[str, Any]:
+    """按「能否拉验证码」对账设备备份排除标记。
+
+    - 无 2FA、账号表有邮箱且邮件库不可拉码 → 自动排除（reason=mail_code_unavailable）
+    - 有 2FA / 已可拉码，且排除原因属于邮件类 → 自动恢复参与
+    - 不覆盖 manual / cred_blocked
+    """
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias) if alias else ""
+    if not owner:
+        return {"updated_rows": 0, "affected_aliases": []}
+
+    fetchable = _list_fetchable_mail_emails(owner)
+    if fetchable is None:
+        return {"updated_rows": 0, "affected_aliases": [], "skipped": True, "reason": "mail_db_unavailable"}
+
+    now = now_text()
+    updated_rows = 0
+    affected_aliases: set[str] = set()
+    conn = _get_db()
+    try:
+        email_by_user: dict[str, str] = {}
+        two_fa_by_user: dict[str, bool] = {}
+        for row in conn.execute(
+            """
+            SELECT username, email, two_fa
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall() or []:
+            uname = str(row["username"] or "").strip().lower()
+            if not uname or uname in email_by_user:
+                continue
+            email_by_user[uname] = _account_email_for_mail_lookup(row["email"])
+            two_fa_by_user[uname] = _account_row_has_two_fa(row["two_fa"])
+
+        dev_rows = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias,
+                   auto_switch_excluded, COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+        for dr in dev_rows or []:
+            item = {
+                "row_index": int(dr["row_index"] or 0),
+                "username": str(dr["username"] or "").strip(),
+                "assigned_alias": str(dr["assigned_alias"] or "").strip(),
+                "device_alias": str(dr["device_alias"] or "").strip(),
+            }
+            row_alias = _device_editor_effective_alias(item)
+            if alias_key and _normalize_alias_key(row_alias) != alias_key:
+                continue
+            uname_key = item["username"].lower()
+            email = email_by_user.get(uname_key, "")
+            has_two_fa = bool(two_fa_by_user.get(uname_key))
+            # 有 2FA 或不依赖邮箱：不因邮件资格排除
+            can_fetch = has_two_fa or (not email) or (email in fetchable)
+            current_excluded = int(dr["auto_switch_excluded"] or 0)
+            current_reason = _normalize_auto_switch_exclude_reason(dr["auto_switch_exclude_reason"])
+
+            if not can_fetch:
+                if current_excluded == 1:
+                    continue
+                cur = conn.execute(
+                    """
+                    UPDATE device_editor_rows
+                    SET auto_switch_excluded = 1,
+                        auto_switch_exclude_reason = ?,
+                        updated_at = ?
+                    WHERE owner_username = ? AND row_index = ?
+                    """,
+                    (
+                        AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE,
+                        now,
+                        owner,
+                        int(item["row_index"]),
+                    ),
+                )
+            else:
+                if current_excluded != 1 or current_reason not in AUTO_SWITCH_MAIL_CODE_EXCLUDE_REASONS:
+                    continue
+                cur = conn.execute(
+                    """
+                    UPDATE device_editor_rows
+                    SET auto_switch_excluded = 0,
+                        auto_switch_exclude_reason = '',
+                        updated_at = ?
+                    WHERE owner_username = ? AND row_index = ?
+                    """,
+                    (now, owner, int(item["row_index"])),
+                )
+            if int(cur.rowcount or 0) > 0:
+                updated_rows += 1
+                if row_alias:
+                    affected_aliases.add(row_alias)
+        if updated_rows > 0:
+            conn.commit()
+    finally:
+        conn.close()
+
+    if updated_rows > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+        _auto_switch_log(
+            f"mail_code_reconcile | owner={owner} alias={alias_key or '*'} "
+            f"updated_rows={updated_rows} aliases={','.join(sorted(affected_aliases)) or '-'}"
+        )
+    return {
+        "updated_rows": updated_rows,
+        "affected_aliases": sorted(affected_aliases),
+    }
+
+
+def _apply_mail_token_status_to_auto_switch(
+    owner_username: str,
+    email: str,
+    token_status: str,
+    *,
+    last_token_error: str = "",
+) -> dict[str, Any]:
+    """令牌失效→排除并重算/推送；令牌恢复 valid→仅清除 mail_token_invalid 排除。"""
+    owner = str(owner_username or "").strip()
+    account_email = str(email or "").strip().lower()
+    status = str(token_status or "").strip().lower()
+    err_text = str(last_token_error or "").strip()[:500]
+    if not owner or not account_email or "@" not in account_email:
+        return {"code": 1, "msg": "owner_username/email 无效", "updated_rows": 0}
+    if status not in {"invalid", "valid"}:
+        return {"code": 0, "msg": "忽略非 invalid/valid 状态", "updated_rows": 0, "skipped": True}
+
+    now = now_text()
+    updated_rows = 0
+    matched_usernames: list[str] = []
+    affected_aliases: set[str] = set()
+    conn = _get_db()
+    try:
+        acct_rows = conn.execute(
+            """
+            SELECT username, email, two_fa
+            FROM account_editor_rows
+            WHERE owner_username = ? AND TRIM(COALESCE(email, '')) <> ''
+            """,
+            (owner,),
+        ).fetchall()
+        usernames: list[str] = []
+        seen: set[str] = set()
+        for row in acct_rows or []:
+            if _account_email_for_mail_lookup(row["email"]) != account_email:
+                continue
+            # 有 2FA：令牌失效也不排除（不依赖邮件收码）
+            if status == "invalid" and _account_row_has_two_fa(row["two_fa"]):
+                continue
+            uname = str(row["username"] or "").strip()
+            key = uname.lower()
+            if not uname or key in seen:
+                continue
+            seen.add(key)
+            usernames.append(uname)
+        if not usernames:
+            return {
+                "code": 0,
+                "msg": "账号表单中无此邮箱",
+                "updated_rows": 0,
+                "email": account_email,
+                "token_status": status,
+            }
+
+        for username in usernames:
+            matched_usernames.append(username)
+            dev_rows = conn.execute(
+                """
+                SELECT row_index, username, assigned_alias, device_alias,
+                       auto_switch_excluded, COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
+                FROM device_editor_rows
+                WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                """,
+                (owner, username),
+            ).fetchall()
+            for dr in dev_rows or []:
+                item = {
+                    "row_index": int(dr["row_index"] or 0),
+                    "username": str(dr["username"] or "").strip(),
+                    "assigned_alias": str(dr["assigned_alias"] or "").strip(),
+                    "device_alias": str(dr["device_alias"] or "").strip(),
+                }
+                row_alias = _device_editor_effective_alias(item)
+                current_excluded = int(dr["auto_switch_excluded"] or 0)
+                current_reason = _normalize_auto_switch_exclude_reason(dr["auto_switch_exclude_reason"])
+                if status == "invalid":
+                    if current_excluded == 1:
+                        continue
+                    cur = conn.execute(
+                        """
+                        UPDATE device_editor_rows
+                        SET auto_switch_excluded = 1,
+                            auto_switch_exclude_reason = ?,
+                            updated_at = ?
+                        WHERE owner_username = ? AND row_index = ?
+                        """,
+                        (
+                            AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE,
+                            now,
+                            owner,
+                            int(item["row_index"]),
+                        ),
+                    )
+                else:
+                    if current_excluded != 1 or current_reason not in AUTO_SWITCH_MAIL_CODE_EXCLUDE_REASONS:
+                        continue
+                    cur = conn.execute(
+                        """
+                        UPDATE device_editor_rows
+                        SET auto_switch_excluded = 0,
+                            auto_switch_exclude_reason = '',
+                            updated_at = ?
+                        WHERE owner_username = ? AND row_index = ?
+                        """,
+                        (now, owner, int(item["row_index"])),
+                    )
+                if int(cur.rowcount or 0) > 0:
+                    updated_rows += 1
+                    if row_alias:
+                        affected_aliases.add(row_alias)
+        if updated_rows > 0:
+            conn.commit()
+    finally:
+        conn.close()
+
+    plan_regenerated = 0
+    devices_notified = 0
+    devices_disabled = 0
+    alias_results: list[dict[str, Any]] = []
+    # 只有真正改了排除状态才重算/推送，避免无变更时打乱在线切号
+    if updated_rows > 0:
+        for ak in sorted(affected_aliases):
+            plan_info = _refresh_auto_switch_plans_for_alias(owner, ak)
+            sync_info = _resync_auto_switch_devices_for_alias(
+                owner, ak, int(plan_info.get("bucket_size") or 0)
+            )
+            if plan_info.get("plan_regenerated"):
+                plan_regenerated += 1
+            devices_notified += int(sync_info.get("notified") or 0)
+            devices_disabled += int(sync_info.get("disabled") or 0)
+            alias_results.append(
+                {
+                    "alias": ak,
+                    "bucket_size": int(plan_info.get("bucket_size") or 0),
+                    "plan_regenerated": bool(plan_info.get("plan_regenerated")),
+                    "devices_notified": int(sync_info.get("notified") or 0),
+                    "devices_disabled": int(sync_info.get("disabled") or 0),
+                }
+            )
+        _reset_device_editor_read_maintain_schedule(owner)
+    _auto_switch_log(
+        f"mail_token_status | owner={owner} email={account_email} status={status} "
+        f"usernames={','.join(matched_usernames) or '-'} updated_rows={updated_rows} "
+        f"plan_regen={plan_regenerated} notified={devices_notified} err={err_text[:120]}"
+    )
+    return {
+        "code": 0,
+        "msg": "ok",
+        "email": account_email,
+        "token_status": status,
+        "usernames": matched_usernames,
+        "updated_rows": updated_rows,
+        "plan_regenerated": plan_regenerated,
+        "devices_notified": devices_notified,
+        "devices_disabled": devices_disabled,
+        "aliases": alias_results,
+    }
+
 
 def _account_cred_text(value: Any) -> str:
     return str(value or "")
@@ -5796,6 +6206,7 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
     conn = _get_db()
     try:
         banned = _banned_usernames_for_owner(conn, owner)
+        mail_blocked = _usernames_blocked_by_mail_code(conn, owner)
         rows = conn.execute(
             """
             SELECT row_index, device_alias, device_id, username, assigned_alias,
@@ -5814,6 +6225,9 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
         uname = str(item.get("username") or "").strip().lower()
         # 密码/邮箱密码标 banned 的账号不进周计划桶（即使未勾 auto_switch_excluded）
         if uname and uname in banned:
+            continue
+        # 填了邮箱但无法拉验证码（无令牌 / 令牌失效）：统一拦截
+        if uname and uname in mail_blocked:
             continue
         alias_key = _device_editor_effective_alias(item)
         if not alias_key:
@@ -5847,14 +6261,24 @@ def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dic
     alias_key = _normalize_alias_key(alias)
     if not owner or not alias_key:
         return {"bucket_size": 0, "plan_regenerated": False}
+    # 重算前按「能否拉验证码」对账排除，保证计划与设备侧一致
+    reconcile = _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
     rows = _list_device_editor_buckets(owner).get(alias_key, [])
     _delete_auto_switch_plans_for_alias(owner, alias_key)
     if len(rows) < 2:
-        return {"bucket_size": len(rows), "plan_regenerated": False}
+        return {
+            "bucket_size": len(rows),
+            "plan_regenerated": False,
+            "mail_code_reconcile_updated": int(reconcile.get("updated_rows") or 0),
+        }
     schedule_date = _beijing_date_str()
     _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
     _ensure_auto_switch_daily_plan(owner, alias_key, rows, schedule_date)
-    return {"bucket_size": len(rows), "plan_regenerated": True}
+    return {
+        "bucket_size": len(rows),
+        "plan_regenerated": True,
+        "mail_code_reconcile_updated": int(reconcile.get("updated_rows") or 0),
+    }
 
 
 def _enabled_auto_switch_device_ids_for_owner_alias(owner_username: str, alias: str) -> list[str]:
@@ -11791,7 +12215,8 @@ def _fetch_device_assigned_accounts_list(
         sql = """
             SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
                    backup_path, backup_name, backup_time, backup_status, env_status,
-                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded
+                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded,
+                   COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
             FROM device_editor_rows
             WHERE owner_username = ?
               AND TRIM(username) <> ''
@@ -11801,7 +12226,8 @@ def _fetch_device_assigned_accounts_list(
         sql = """
             SELECT row_index, username, assigned_alias, device_alias, switch_highlight,
                    backup_path, backup_name, backup_time, backup_status, env_status,
-                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded
+                   COALESCE(auto_switch_excluded, 0) AS auto_switch_excluded,
+                   COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
             FROM device_editor_rows
             WHERE owner_username = ?
               AND TRIM(username) <> ''
@@ -11816,6 +12242,7 @@ def _fetch_device_assigned_accounts_list(
     ]
     if not matched:
         return []
+    token_blocked = set() if include_excluded else _usernames_blocked_by_mail_code(conn, owner)
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for pick in matched:
@@ -11827,6 +12254,9 @@ def _fetch_device_assigned_accounts_list(
             continue
         alias_err = _validate_username_device_effective_alias(conn, owner, username, alias_key)
         if alias_err:
+            continue
+        # 无法拉验证码：默认列表不下发（与周计划桶一致）
+        if uname_key in token_blocked:
             continue
         seen.add(uname_key)
         fields = _account_bundle_fields_for_username(conn, owner, username)
@@ -11864,6 +12294,9 @@ def _fetch_device_assigned_accounts_list(
                 "switch_highlight": _normalize_switch_highlight(pick.get("switch_highlight")),
                 "env_status": str(pick.get("env_status") or "").strip(),
                 "auto_switch_excluded": bool(int(pick.get("auto_switch_excluded") or 0)),
+                "auto_switch_exclude_reason": _normalize_auto_switch_exclude_reason(
+                    pick.get("auto_switch_exclude_reason")
+                ),
                 "looks_banned": bool(looks_banned),
                 "looks_max_login": bool(looks_max_login),
                 "video_count": str(fields.get("video_count") or "").strip(),
@@ -12061,6 +12494,7 @@ def device_assigned_account_set_auto_switch_excluded(
         ).fetchall()
         if not rows:
             return {"code": 1, "msg": "未找到对应设备账号记录"}
+        reason = _auto_switch_exclude_reason_for_flag(bool(excluded_i))
         for row in rows:
             item = {
                 "row_index": int(row["row_index"] or 0),
@@ -12078,10 +12512,10 @@ def device_assigned_account_set_auto_switch_excluded(
             cur = conn.execute(
                 """
                 UPDATE device_editor_rows
-                SET auto_switch_excluded = ?, updated_at = ?
+                SET auto_switch_excluded = ?, auto_switch_exclude_reason = ?, updated_at = ?
                 WHERE owner_username = ? AND row_index = ?
                 """,
-                (excluded_i, now, owner, matched_row_index),
+                (excluded_i, reason, now, owner, matched_row_index),
             )
             if int(cur.rowcount or 0) > 0:
                 updated_rows += 1
@@ -12180,13 +12614,14 @@ def device_assigned_accounts_sync_auto_switch_participation(
                 if current == want_excluded:
                     unchanged_rows += 1
                     continue
+                reason = _auto_switch_exclude_reason_for_flag(bool(want_excluded))
                 cur = conn.execute(
                     """
                     UPDATE device_editor_rows
-                    SET auto_switch_excluded = ?, updated_at = ?
+                    SET auto_switch_excluded = ?, auto_switch_exclude_reason = ?, updated_at = ?
                     WHERE owner_username = ? AND row_index = ?
                     """,
-                    (want_excluded, now, owner, int(item["row_index"])),
+                    (want_excluded, reason, now, owner, int(item["row_index"])),
                 )
                 if int(cur.rowcount or 0) > 0:
                     updated_rows += 1
@@ -12432,10 +12867,12 @@ def _device_assigned_account_mark_cred_block(
             cur = conn.execute(
                 """
                 UPDATE device_editor_rows
-                SET auto_switch_excluded = 1, updated_at = ?
+                SET auto_switch_excluded = 1,
+                    auto_switch_exclude_reason = ?,
+                    updated_at = ?
                 WHERE owner_username = ? AND row_index = ?
                 """,
-                (now, owner, int(item["row_index"])),
+                (AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED, now, owner, int(item["row_index"])),
             )
             if int(cur.rowcount or 0) > 0:
                 device_updated += 1
@@ -12493,6 +12930,67 @@ def _device_assigned_account_mark_cred_block(
         "devices_disabled": devices_disabled,
         "aliases": alias_results,
         "cloud_synced": True,
+    }
+
+
+@app.post("/api/internal/mail/token_status")
+def internal_mail_token_status_notify(
+    payload: InternalMailTokenStatusNotifyRequest,
+    x_mail_internal_secret: str | None = Header(default=None, alias="X-Mail-Internal-Secret"),
+):
+    """邮件模块内部回调：令牌 invalid/valid → 自动切号排除/恢复。"""
+    try:
+        from mail_integration import MAIL_INTERNAL_SECRET as mail_secret
+    except Exception:
+        mail_secret = os.environ.get("MAIL_INTERNAL_SECRET", "auto-traces-mail-internal").strip()
+    provided = str(x_mail_internal_secret or "").strip()
+    expected = str(mail_secret or "").strip()
+    if not expected or provided != expected:
+        return {"code": 401, "msg": "unauthorized"}
+
+    owner = str(payload.owner_username or "").strip()
+    items: list[dict[str, str]] = []
+    for raw in payload.items or []:
+        email = str(getattr(raw, "email", "") or "").strip()
+        status = str(getattr(raw, "token_status", "") or "").strip()
+        if not email or not status:
+            continue
+        items.append(
+            {
+                "email": email,
+                "token_status": status,
+                "last_token_error": str(getattr(raw, "last_token_error", "") or ""),
+            }
+        )
+    if payload.email and payload.token_status:
+        items.append(
+            {
+                "email": str(payload.email).strip(),
+                "token_status": str(payload.token_status).strip(),
+                "last_token_error": str(payload.last_token_error or ""),
+            }
+        )
+    if not owner or not items:
+        return {"code": 1, "msg": "owner_username 与 email/token_status 不能为空"}
+
+    results: list[dict[str, Any]] = []
+    updated_total = 0
+    for item in items:
+        result = _apply_mail_token_status_to_auto_switch(
+            owner,
+            item["email"],
+            item["token_status"],
+            last_token_error=item.get("last_token_error") or "",
+        )
+        updated_total += int(result.get("updated_rows") or 0)
+        results.append(result)
+    return {
+        "code": 0,
+        "msg": "ok",
+        "owner_username": owner,
+        "processed": len(results),
+        "updated_rows": updated_total,
+        "results": results,
     }
 
 
@@ -14143,7 +14641,41 @@ def list_account_editor_rows(authorization: str | None = Header(default=None)):
             """,
             (owner,),
         ).fetchall()
-        return {"code": 0, "items": [dict(r) for r in rows]}
+        token_status_map = _list_mail_oauth_token_status_map(owner) or {}
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            email = _account_email_for_mail_lookup(item.get("email"))
+            has_two_fa = _account_row_has_two_fa(item.get("two_fa"))
+            token_status = token_status_map.get(email, "") if email else ""
+            if has_two_fa:
+                mail_gate = "two_fa"
+                mail_token_label = "2FA不依赖令牌"
+            elif not email:
+                mail_gate = "none"
+                mail_token_label = "-"
+            elif not token_status:
+                mail_gate = "missing"
+                mail_token_label = "无令牌"
+            elif token_status == "invalid":
+                mail_gate = "invalid"
+                mail_token_label = "令牌失效"
+            elif token_status == "valid":
+                mail_gate = "ok"
+                mail_token_label = "令牌正常"
+            elif token_status == "transient":
+                mail_gate = "transient"
+                mail_token_label = "令牌临时失败"
+            else:
+                mail_gate = "unknown"
+                mail_token_label = "令牌未检测"
+            item["has_two_fa"] = bool(has_two_fa)
+            item["mail_token_status"] = token_status or ("missing" if email and not has_two_fa else "")
+            item["mail_gate"] = mail_gate
+            item["mail_token_label"] = mail_token_label
+            item["mail_module_code_available"] = bool(email and token_status and token_status != "invalid")
+            items.append(item)
+        return {"code": 0, "items": items}
     finally:
         conn.close()
 
@@ -14883,7 +15415,7 @@ def list_device_editor_rows(
         placeholders = ",".join("?" for _ in page_aliases)
         rows = conn.execute(
             f"""
-            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, auto_switch_excluded, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
+            SELECT row_index, device_alias, device_id, ip, region, username, assigned_alias, backup_path, backup_name, backup_time, backup_status, auto_switch_excluded, COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason, remark, switch_highlight, env_status, video_count, follower_count, follower_growth, updated_at
             FROM device_editor_rows
             WHERE owner_username = ? AND {paged_alias_expr} IN ({placeholders}){search_sql}
             ORDER BY {paged_alias_expr} ASC, row_index ASC
@@ -14907,6 +15439,9 @@ def list_device_editor_rows(
         for r in rows:
             item = dict(r)
             item["auto_switch_excluded"] = bool(int(item.get("auto_switch_excluded") or 0))
+            item["auto_switch_exclude_reason"] = _normalize_auto_switch_exclude_reason(
+                item.get("auto_switch_exclude_reason")
+            )
             ukey = str(item.get("username") or "").strip().lower()
             if ukey and ukey in account_alias_by_user:
                 item["account_assigned_alias"] = account_alias_by_user[ukey]
@@ -15747,13 +16282,14 @@ def set_device_editor_auto_switch_excluded(
         }
         alias_key = _device_editor_effective_alias(item)
         now = now_text()
+        reason = _auto_switch_exclude_reason_for_flag(bool(excluded_i))
         cur = conn.execute(
             """
             UPDATE device_editor_rows
-            SET auto_switch_excluded = ?, updated_at = ?
+            SET auto_switch_excluded = ?, auto_switch_exclude_reason = ?, updated_at = ?
             WHERE owner_username = ? AND row_index = ?
             """,
-            (excluded_i, now, owner, row_index),
+            (excluded_i, reason, now, owner, row_index),
         )
         if int(cur.rowcount or 0) <= 0:
             return {"code": 1, "msg": "未更新任何记录"}
@@ -15852,13 +16388,14 @@ def set_device_editor_auto_switch_excluded_batch(
             if current_excluded == excluded_i:
                 unchanged_rows += 1
                 continue
+            reason = _auto_switch_exclude_reason_for_flag(bool(excluded_i))
             cur = conn.execute(
                 """
                 UPDATE device_editor_rows
-                SET auto_switch_excluded = ?, updated_at = ?
+                SET auto_switch_excluded = ?, auto_switch_exclude_reason = ?, updated_at = ?
                 WHERE owner_username = ? AND row_index = ?
                 """,
-                (excluded_i, now, owner, int(row["row_index"] or 0)),
+                (excluded_i, reason, now, owner, int(row["row_index"] or 0)),
             )
             if int(cur.rowcount or 0) > 0:
                 updated_rows += 1

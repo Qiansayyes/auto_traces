@@ -5,7 +5,23 @@
         <div>
           <h2 class="page-title">令牌邮箱管理</h2>
           <p class="page-desc">
-            专门管理已配置 OAuth 令牌的邮箱；账号表单与账号记录中已存在的邮箱会优先排在前面。
+            按手机设备别名分组展示 OAuth 令牌邮箱；后台约每 20 天自动刷新一次。可在此全量刷新，或对单条邮箱手动刷新。
+          </p>
+          <p class="auto-refresh-status">
+            自动刷新：
+            <template v-if="autoRefresh.enabled">
+              已启用（约每 {{ autoRefresh.skipDays }} 天跳过已检测；每日巡检）
+              <span v-if="autoRefresh.inFlight"> · 正在运行</span>
+              <span v-else-if="autoRefresh.lastStatus">
+                · 上次 {{ autoRefresh.lastStatus }}
+                <template v-if="autoRefresh.lastFinishedAt">（{{ autoRefresh.lastFinishedAt }}）</template>
+              </span>
+              <span v-else> · 尚未跑过</span>
+            </template>
+            <template v-else>已关闭</template>
+            <el-button size="small" link type="primary" :loading="loading.autoStatus" @click="loadAutoRefreshStatus">
+              刷新状态
+            </el-button>
           </p>
         </div>
       </div>
@@ -34,13 +50,30 @@
         </el-form-item>
         <el-form-item>
           <el-checkbox v-model="form.onlyInAccountRecords" @change="loadList(true)">
-            仅账号记录中的邮箱
+            仅账号表单中的邮箱
+          </el-checkbox>
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="form.collapseUnlinked" @change="persistCollapseUnlinked">
+            折叠未关联邮箱（不在账号表单/记录中）
           </el-checkbox>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="loading.list" @click="loadList(true)">刷新列表</el-button>
+          <el-button
+            type="warning"
+            :loading="loading.check"
+            :disabled="loading.list || loading.check || Boolean(refreshingEmail)"
+            @click="runBatchRefresh"
+          >
+            全量刷新令牌
+          </el-button>
         </el-form-item>
       </el-form>
+      <div v-if="checkProgress.active" class="check-progress">
+        刷新进度：{{ checkProgress.done }} / {{ checkProgress.total }}
+        （正常 {{ checkProgress.valid }} / 失效 {{ checkProgress.invalid }} / 临时失败 {{ checkProgress.transient }}）
+      </div>
     </section>
 
     <section class="summary-grid">
@@ -49,81 +82,121 @@
         <div class="summary-value">{{ stats.total }}</div>
       </div>
       <div class="summary-card">
-        <div class="summary-label">账号记录优先命中</div>
+        <div class="summary-label">账号表单已关联</div>
         <div class="summary-value">{{ stats.priorityMatched }}</div>
       </div>
       <div class="summary-card">
-        <div class="summary-label">账号记录邮箱数</div>
+        <div class="summary-label">账号表单邮箱数</div>
         <div class="summary-value">{{ stats.priorityEmailCount }}</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">设备别名分组</div>
+        <div class="summary-value">{{ aliasGroups.length }}</div>
       </div>
     </section>
 
     <section class="panel">
-      <el-table
-        v-loading="loading.list"
-        :data="rows"
-        stripe
-        size="small"
-        :row-class-name="getRowClassName"
-      >
-        <el-table-column label="邮箱" min-width="240" show-overflow-tooltip>
-          <template #default="{ row }">
-            <div class="email-cell">
-              <span>{{ row.email }}</span>
-              <el-button size="small" type="primary" @click="copyText(row.email, '邮箱已复制')">复制</el-button>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="账号记录" width="120">
-          <template #default="{ row }">
-            <el-tag size="small" :type="row.in_account_records ? 'success' : 'info'">
-              {{ row.in_account_records ? '已关联' : '未关联' }}
+      <div v-loading="loading.list" class="alias-groups">
+        <el-empty v-if="!loading.list && !aliasGroups.length" description="暂无令牌邮箱" />
+        <details
+          v-for="group in aliasGroups"
+          :key="group.key"
+          class="alias-group"
+          :class="{ 'alias-group-unlinked': group.key === UNLINKED_KEY }"
+          :open="isGroupOpen(group.key)"
+          @toggle="onGroupToggle(group.key, $event)"
+        >
+          <summary class="alias-group-summary">
+            <span class="alias-group-title">{{ group.title }}</span>
+            <el-tag size="small" type="info">{{ group.rows.length }}</el-tag>
+            <el-tag
+              v-if="group.invalidCount > 0"
+              size="small"
+              type="danger"
+            >
+              失效 {{ group.invalidCount }}
             </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="令牌状态" width="140">
-          <template #default="{ row }">
-            <div class="token-status-cell">
-              <el-tag size="small" :type="getTokenStatusTagType(row.token_status)">
-                {{ formatTokenStatus(row.token_status) }}
-              </el-tag>
-              <span v-if="row.last_token_checked_at" class="token-status-hint">
-                {{ formatTokenCheckedAt(row.last_token_checked_at) }}
-              </span>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="最近错误" min-width="220" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span :class="{ 'token-error': row.token_status === 'invalid' }">
-              {{ row.last_token_error || '-' }}
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="更新时间" min-width="170" show-overflow-tooltip>
-          <template #default="{ row }">
-            {{ formatTokenCheckedAt(row.updated_at) || '-' }}
-          </template>
-        </el-table-column>
-      </el-table>
-      <div class="pager">
-        <el-pagination
-          v-model:current-page="pagination.page"
-          v-model:page-size="pagination.pageSize"
-          layout="total, sizes, prev, pager, next"
-          :page-sizes="[20, 50, 100, 200]"
-          :total="pagination.total"
-          @current-change="loadList()"
-          @size-change="loadList(true)"
-        />
+            <el-tag
+              v-if="group.unknownCount > 0"
+              size="small"
+            >
+              未检测 {{ group.unknownCount }}
+            </el-tag>
+          </summary>
+          <el-table
+            :data="group.rows"
+            stripe
+            size="small"
+            :row-class-name="getRowClassName"
+          >
+            <el-table-column label="邮箱" min-width="240" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div class="email-cell">
+                  <span>{{ row.email }}</span>
+                  <el-button size="small" type="primary" @click="copyText(row.email, '邮箱已复制')">复制</el-button>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="设备别名" width="140" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ row.assigned_alias || '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="账号表单" width="120">
+              <template #default="{ row }">
+                <el-tag size="small" :type="row.in_account_records ? 'success' : 'info'">
+                  {{ row.in_account_records ? '已关联' : '未关联' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="令牌状态" width="140">
+              <template #default="{ row }">
+                <div class="token-status-cell">
+                  <el-tag size="small" :type="getTokenStatusTagType(row.token_status)">
+                    {{ formatTokenStatus(row.token_status) }}
+                  </el-tag>
+                  <span v-if="row.last_token_checked_at" class="token-status-hint">
+                    {{ formatTokenCheckedAt(row.last_token_checked_at) }}
+                  </span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="最近错误" min-width="220" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span :class="{ 'token-error': row.token_status === 'invalid' }">
+                  {{ row.last_token_error || '-' }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="更新时间" min-width="170" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ formatTokenCheckedAt(row.updated_at) || '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="110" fixed="right">
+              <template #default="{ row }">
+                <el-button
+                  size="small"
+                  type="primary"
+                  link
+                  :loading="refreshingEmail === normalizeEmail(row.email)"
+                  :disabled="loading.check || (Boolean(refreshingEmail) && refreshingEmail !== normalizeEmail(row.email))"
+                  @click="runSingleRefresh(row)"
+                >
+                  刷新令牌
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </details>
       </div>
     </section>
   </div>
 </template>
 
 <script lang="ts" setup>
-import { onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 interface TokenMailboxRow {
   email: string
@@ -132,18 +205,37 @@ interface TokenMailboxRow {
   last_token_checked_at?: string
   updated_at?: string
   in_account_records?: boolean
+  assigned_alias?: string
 }
+
+interface AliasGroup {
+  key: string
+  title: string
+  rows: TokenMailboxRow[]
+  invalidCount: number
+  unknownCount: number
+}
+
+const EMPTY_ALIAS_KEY = '__EMPTY_ALIAS__'
+const UNLINKED_KEY = '__UNLINKED__'
+const CHECK_BATCH_SIZE = 30
+const LIST_PAGE_SIZE = 2000
 
 const form = reactive({
   apiPassword: localStorage.getItem('apiPassword') || '',
   search: '',
   tokenStatus: localStorage.getItem('tokenMailboxStatus') || 'all',
   onlyInAccountRecords: localStorage.getItem('tokenMailboxOnlyLinked') === '1',
+  collapseUnlinked: localStorage.getItem('tokenMailboxCollapseUnlinked') !== '0',
 })
 
 const loading = reactive({
   list: false,
+  check: false,
+  autoStatus: false,
 })
+
+const refreshingEmail = ref('')
 
 const stats = reactive({
   total: 0,
@@ -151,14 +243,28 @@ const stats = reactive({
   priorityEmailCount: 0,
 })
 
+const autoRefresh = reactive({
+  enabled: true,
+  skipDays: 20,
+  inFlight: false,
+  lastStatus: '',
+  lastFinishedAt: '',
+})
+
+const checkProgress = reactive({
+  active: false,
+  done: 0,
+  total: 0,
+  valid: 0,
+  invalid: 0,
+  transient: 0,
+})
+
 const rows = ref<TokenMailboxRow[]>([])
 const priorityEmails = ref<string[]>([])
-
-const pagination = reactive({
-  page: 1,
-  pageSize: 50,
-  total: 0,
-})
+const aliasByEmail = ref<Map<string, string>>(new Map())
+const openGroupKeys = ref<Set<string>>(new Set())
+const openGroupsInitialized = ref(false)
 
 watch(() => form.apiPassword, (value) => localStorage.setItem('apiPassword', value))
 watch(() => form.tokenStatus, (value) => localStorage.setItem('tokenMailboxStatus', value || 'all'))
@@ -166,6 +272,36 @@ watch(
   () => form.onlyInAccountRecords,
   (value) => localStorage.setItem('tokenMailboxOnlyLinked', value ? '1' : '0'),
 )
+
+const persistCollapseUnlinked = () => {
+  localStorage.setItem('tokenMailboxCollapseUnlinked', form.collapseUnlinked ? '1' : '0')
+}
+
+const loadAutoRefreshStatus = async () => {
+  loading.autoStatus = true
+  try {
+    const response = await fetch('/api/mail-module/token_refresh/status')
+    const payload = await response.json()
+    const data = payload?.data || {}
+    const last = data.last || {}
+    autoRefresh.enabled = data.enabled !== false
+    autoRefresh.skipDays = Number(data.skip_days) || 20
+    autoRefresh.inFlight = Boolean(data.in_flight)
+    autoRefresh.lastStatus = String(last.status || '').trim()
+    autoRefresh.lastFinishedAt = String(last.finished_at || '').trim()
+  } catch {
+    // 状态接口失败时不打断主流程
+  } finally {
+    loading.autoStatus = false
+  }
+}
+
+const normalizeAlias = (value?: string) => String(value || '').trim()
+
+const normalizeEmail = (value?: string) => String(value || '').trim().toLowerCase()
+
+const compareAliasNatural = (a: string, b: string) =>
+  a.localeCompare(b, 'zh-CN', { numeric: true, sensitivity: 'base' })
 
 const formatTokenStatus = (value?: string) => {
   const status = String(value || 'unknown').trim().toLowerCase()
@@ -207,109 +343,383 @@ const copyText = async (text: string, successMessage: string) => {
   }
 }
 
+const countStatus = (list: TokenMailboxRow[], status: string) =>
+  list.filter((row) => String(row.token_status || 'unknown').toLowerCase() === status).length
+
+const aliasGroups = computed<AliasGroup[]>(() => {
+  const linkedByAlias = new Map<string, TokenMailboxRow[]>()
+  const unlinked: TokenMailboxRow[] = []
+
+  for (const row of rows.value) {
+    if (!row.in_account_records) {
+      unlinked.push(row)
+      continue
+    }
+    const alias = normalizeAlias(row.assigned_alias)
+    const key = alias || EMPTY_ALIAS_KEY
+    if (!linkedByAlias.has(key)) linkedByAlias.set(key, [])
+    linkedByAlias.get(key)!.push(row)
+  }
+
+  const groups: AliasGroup[] = Array.from(linkedByAlias.entries())
+    .sort((a, b) => {
+      if (a[0] === EMPTY_ALIAS_KEY) return 1
+      if (b[0] === EMPTY_ALIAS_KEY) return -1
+      return compareAliasNatural(a[0], b[0])
+    })
+    .map(([key, groupRows]) => ({
+      key,
+      title: key === EMPTY_ALIAS_KEY ? '未分配别名' : key,
+      rows: groupRows,
+      invalidCount: countStatus(groupRows, 'invalid'),
+      unknownCount: countStatus(groupRows, 'unknown'),
+    }))
+
+  if (!form.onlyInAccountRecords && unlinked.length > 0) {
+    groups.push({
+      key: UNLINKED_KEY,
+      title: '未关联账号表单（可折叠）',
+      rows: unlinked,
+      invalidCount: countStatus(unlinked, 'invalid'),
+      unknownCount: countStatus(unlinked, 'unknown'),
+    })
+  }
+
+  return groups
+})
+
+const isGroupOpen = (key: string) => {
+  if (!openGroupsInitialized.value) {
+    if (key === UNLINKED_KEY) return !form.collapseUnlinked
+    return true
+  }
+  return openGroupKeys.value.has(key)
+}
+
+const onGroupToggle = (key: string, event: Event) => {
+  const el = event.currentTarget as HTMLDetailsElement | null
+  if (!el || el.tagName !== 'DETAILS') return
+  const next = new Set(openGroupKeys.value)
+  if (el.open) next.add(key)
+  else next.delete(key)
+  openGroupKeys.value = next
+  openGroupsInitialized.value = true
+}
+
+watch(
+  () => form.collapseUnlinked,
+  (collapse) => {
+    persistCollapseUnlinked()
+    if (!openGroupsInitialized.value) return
+    const next = new Set(openGroupKeys.value)
+    if (collapse) next.delete(UNLINKED_KEY)
+    else if (aliasGroups.value.some((group) => group.key === UNLINKED_KEY)) next.add(UNLINKED_KEY)
+    openGroupKeys.value = next
+  },
+)
+
+const syncOpenGroupsAfterLoad = () => {
+  if (openGroupsInitialized.value) {
+    const validKeys = new Set(aliasGroups.value.map((group) => group.key))
+    openGroupKeys.value = new Set([...openGroupKeys.value].filter((key) => validKeys.has(key)))
+    return
+  }
+  const next = new Set<string>()
+  for (const group of aliasGroups.value) {
+    if (group.key === UNLINKED_KEY && form.collapseUnlinked) continue
+    next.add(group.key)
+  }
+  openGroupKeys.value = next
+  openGroupsInitialized.value = true
+}
+
 type PriorityLoadResult =
-  | { ok: true; emails: string[] }
-  | { ok: false; emails: []; error: string }
+  | { ok: true; emails: string[]; aliasMap: Map<string, string> }
+  | { ok: false; emails: []; aliasMap: Map<string, string>; error: string }
 
 const loadPriorityEmails = async (): Promise<PriorityLoadResult> => {
   try {
-    const response = await fetch('/api/admin/editor/account_rows')
-    let payload: { code?: number | string; msg?: string; message?: string; items?: Array<{ email?: string }> } | null = null
+    const [accountResp, supportResp] = await Promise.all([
+      fetch('/api/admin/editor/account_rows'),
+      fetch('/api/admin/editor/account_rows/support'),
+    ])
+
+    let accountPayload: {
+      code?: number | string
+      msg?: string
+      message?: string
+      items?: Array<{ email?: string; username?: string; assigned_alias?: string }>
+    } | null = null
     try {
-      payload = await response.json()
+      accountPayload = await accountResp.json()
     } catch {
       return {
         ok: false,
         emails: [],
-        error: `账号记录接口返回异常（HTTP ${response.status}）`,
+        aliasMap: new Map(),
+        error: `账号表单接口返回异常（HTTP ${accountResp.status}）`,
       }
     }
 
-    const code = Number(payload?.code)
-    if (code === 401 || response.status === 401) {
+    const code = Number(accountPayload?.code)
+    if (code === 401 || accountResp.status === 401) {
       return {
         ok: false,
         emails: [],
-        error: payload?.msg || payload?.message || '请先登录后再加载账号记录优先邮箱',
+        aliasMap: new Map(),
+        error: accountPayload?.msg || accountPayload?.message || '请先登录后再加载账号表单邮箱',
       }
     }
-    if (!response.ok || code !== 0) {
+    if (!accountResp.ok || code !== 0) {
       return {
         ok: false,
         emails: [],
-        error: payload?.msg || payload?.message || `账号记录加载失败（HTTP ${response.status}）`,
+        aliasMap: new Map(),
+        error: accountPayload?.msg || accountPayload?.message || `账号表单加载失败（HTTP ${accountResp.status}）`,
       }
+    }
+
+    const aliasByUsername = new Map<string, string>()
+    try {
+      if (supportResp.ok) {
+        const supportPayload = await supportResp.json()
+        if (Number(supportPayload?.code) === 0 && Array.isArray(supportPayload?.items)) {
+          for (const item of supportPayload.items) {
+            const username = String(item?.username || '').trim().toLowerCase()
+            const alias = normalizeAlias(item?.assigned_alias || item?.device_alias)
+            if (username && alias && !aliasByUsername.has(username)) {
+              aliasByUsername.set(username, alias)
+            }
+          }
+        }
+      }
+    } catch {
+      // support endpoint is optional enrichment
     }
 
     const seen = new Set<string>()
     const emails: string[] = []
-    for (const item of payload?.items || []) {
-      const email = String(item?.email || '').trim().toLowerCase()
+    const aliasMap = new Map<string, string>()
+    for (const item of accountPayload?.items || []) {
+      const email = normalizeEmail(item?.email)
       if (!email || !email.includes('@') || seen.has(email)) continue
       seen.add(email)
       emails.push(email)
+      const alias = normalizeAlias(item?.assigned_alias)
+        || aliasByUsername.get(String(item?.username || '').trim().toLowerCase())
+        || ''
+      if (alias) aliasMap.set(email, alias)
     }
-    return { ok: true, emails }
+    return { ok: true, emails, aliasMap }
   } catch (error) {
     return {
       ok: false,
       emails: [],
-      error: error instanceof Error ? error.message : '账号记录优先邮箱加载失败',
+      aliasMap: new Map(),
+      error: error instanceof Error ? error.message : '账号表单邮箱加载失败',
     }
   }
 }
 
+const enrichRowsWithAlias = (records: TokenMailboxRow[]) =>
+  records.map((row) => {
+    const email = normalizeEmail(row.email)
+    return {
+      ...row,
+      assigned_alias: aliasByEmail.value.get(email) || '',
+    }
+  })
+
 const loadList = async (resetPage = false) => {
-  if (resetPage) pagination.page = 1
+  if (resetPage) {
+    openGroupsInitialized.value = false
+  }
   loading.list = true
   try {
     const priorityResult = await loadPriorityEmails()
     if (!priorityResult.ok) {
       priorityEmails.value = []
-      // Avoid treating auth/network failure as "no linked emails" (empty filter / all 未关联).
+      aliasByEmail.value = new Map()
       if (form.onlyInAccountRecords) {
-        ElMessage.error(`${priorityResult.error}；已停止本次「仅账号记录中的邮箱」筛选，避免误清空列表`)
+        ElMessage.error(`${priorityResult.error}；已停止本次「仅账号表单中的邮箱」筛选，避免误清空列表`)
         return
       }
-      ElMessage.warning(`${priorityResult.error}；已关联标记与优先排序可能不准`)
+      ElMessage.warning(`${priorityResult.error}；已关联标记与别名分组可能不准`)
     } else {
       priorityEmails.value = priorityResult.emails
+      aliasByEmail.value = priorityResult.aliasMap
     }
 
-    const response = await fetch('/api/accounts/token-mailboxes/list', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        password: form.apiPassword,
-        page: pagination.page,
-        pageSize: pagination.pageSize,
-        search: form.search,
-        tokenStatus: form.tokenStatus,
-        onlyInAccountRecords: form.onlyInAccountRecords,
-        priorityEmails: priorityEmails.value,
-      }),
-    })
-    const payload = await response.json()
-    if (!(payload.code === '200' || payload.code === 200)) {
-      throw new Error(payload.error || payload.message || '加载失败')
+    const collected: TokenMailboxRow[] = []
+    let page = 1
+    let total = 0
+    let priorityMatched = 0
+    let priorityEmailCount = priorityEmails.value.length
+
+    while (true) {
+      const response = await fetch('/api/accounts/token-mailboxes/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          password: form.apiPassword,
+          page,
+          pageSize: LIST_PAGE_SIZE,
+          search: form.search,
+          tokenStatus: form.tokenStatus,
+          onlyInAccountRecords: form.onlyInAccountRecords,
+          priorityEmails: priorityEmails.value,
+        }),
+      })
+      const payload = await response.json()
+      if (!(payload.code === '200' || payload.code === 200)) {
+        throw new Error(payload.error || payload.message || '加载失败')
+      }
+      const data = payload.data || {}
+      const batch = Array.isArray(data.records) ? data.records : []
+      collected.push(...batch)
+      total = Number(data.total) || collected.length
+      priorityMatched = Number(data.priorityMatched) || 0
+      priorityEmailCount = Number(data.priorityEmailCount) || priorityEmails.value.length
+      if (collected.length >= total || batch.length === 0) break
+      page += 1
+      if (page > 20) break
     }
-    const data = payload.data || {}
-    rows.value = Array.isArray(data.records) ? data.records : []
-    pagination.total = Number(data.total) || 0
-    stats.total = Number(data.total) || 0
-    stats.priorityMatched = Number(data.priorityMatched) || 0
-    stats.priorityEmailCount = Number(data.priorityEmailCount) || priorityEmails.value.length
+
+    rows.value = enrichRowsWithAlias(collected)
+    stats.total = total
+    stats.priorityMatched = priorityMatched
+    stats.priorityEmailCount = priorityEmailCount
+    syncOpenGroupsAfterLoad()
   } catch (error) {
     rows.value = []
-    pagination.total = 0
+    stats.total = 0
     ElMessage.error(error instanceof Error ? error.message : '加载失败')
   } finally {
     loading.list = false
   }
 }
 
+const collectCheckTargets = (includeUnlinked: boolean) => {
+  const targets: string[] = []
+  for (const group of aliasGroups.value) {
+    if (group.key === UNLINKED_KEY && !includeUnlinked) continue
+    for (const row of group.rows) {
+      const email = normalizeEmail(row.email)
+      if (email) targets.push(email)
+    }
+  }
+  return [...new Set(targets)]
+}
+
+const postTokenRefresh = async (emails: string[]) => {
+  const response = await fetch('/api/accounts/token-mailboxes/check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      password: form.apiPassword,
+      emails,
+      concurrency: Math.min(5, Math.max(1, emails.length)),
+      includeInvalid: true,
+      skipCheckedWithinMinutes: 0,
+    }),
+  })
+  const payload = await response.json()
+  if (!(payload.code === '200' || payload.code === 200)) {
+    throw new Error(payload.error || payload.message || '刷新失败')
+  }
+  return payload.data || {}
+}
+
+const runSingleRefresh = async (row: TokenMailboxRow) => {
+  const email = normalizeEmail(row.email)
+  if (!email) {
+    ElMessage.warning('邮箱无效')
+    return
+  }
+  if (loading.check || refreshingEmail.value) return
+
+  refreshingEmail.value = email
+  try {
+    const data = await postTokenRefresh([email])
+    const status = String(data.results?.[0]?.tokenStatus || '').toLowerCase()
+    if (status === 'valid') {
+      ElMessage.success(`${email} 令牌刷新成功`)
+    } else if (status === 'invalid') {
+      ElMessage.error(`${email} 令牌已失效`)
+    } else if (status === 'transient') {
+      ElMessage.warning(`${email} 临时失败，可稍后重试`)
+    } else if (Number(data.matched) === 0) {
+      ElMessage.warning(`${email} 未找到可刷新的令牌账号`)
+    } else {
+      ElMessage.success(`${email} 刷新完成`)
+    }
+    await loadList()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '刷新失败')
+  } finally {
+    refreshingEmail.value = ''
+  }
+}
+
+const runBatchRefresh = async () => {
+  const includeUnlinked = !form.collapseUnlinked
+  const targets = collectCheckTargets(includeUnlinked)
+  const linkedCount = collectCheckTargets(false).length
+  const unlinkedSkipped = Math.max(0, collectCheckTargets(true).length - linkedCount)
+
+  if (!targets.length) {
+    ElMessage.warning('当前没有可刷新的邮箱（可关闭「仅账号表单中的邮箱」）')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      includeUnlinked
+        ? `将全量刷新全部 ${targets.length} 个邮箱的 OAuth 令牌（含未关联）。过程可能较久，确认开始？`
+        : `将全量刷新 ${linkedCount} 个「账号表单已关联」邮箱的 OAuth 令牌。${
+            unlinkedSkipped > 0 ? `\n另有 ${unlinkedSkipped} 个未关联邮箱已跳过（取消勾选「折叠未关联邮箱」可一并刷新）。` : ''
+          }\n过程可能较久，确认开始？`,
+      '全量刷新令牌',
+      { type: 'warning', confirmButtonText: '开始刷新', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+
+  loading.check = true
+  checkProgress.active = true
+  checkProgress.done = 0
+  checkProgress.total = targets.length
+  checkProgress.valid = 0
+  checkProgress.invalid = 0
+  checkProgress.transient = 0
+
+  try {
+    for (let i = 0; i < targets.length; i += CHECK_BATCH_SIZE) {
+      const batch = targets.slice(i, i + CHECK_BATCH_SIZE)
+      const data = await postTokenRefresh(batch)
+      checkProgress.valid += Number(data.validCount) || 0
+      checkProgress.invalid += Number(data.invalidCount) || 0
+      checkProgress.transient += Number(data.transientCount) || 0
+      // Count by requested batch size so unmatched emails do not stall the progress bar.
+      checkProgress.done = Math.min(targets.length, i + batch.length)
+    }
+
+    ElMessage.success(
+      `刷新完成：正常 ${checkProgress.valid}，失效 ${checkProgress.invalid}，临时失败 ${checkProgress.transient}`,
+    )
+    await loadList()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '刷新失败')
+  } finally {
+    loading.check = false
+    checkProgress.active = false
+  }
+}
+
 onMounted(() => {
   void loadList(true)
+  void loadAutoRefreshStatus()
 })
 </script>
 
@@ -333,6 +743,13 @@ onMounted(() => {
   margin-bottom: 12px;
 }
 
+.auto-refresh-status {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.6;
+}
+
 .page-title {
   margin: 0;
   font-size: 18px;
@@ -352,9 +769,15 @@ onMounted(() => {
   gap: 8px 12px;
 }
 
+.check-progress {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #e6a23c;
+}
+
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -374,6 +797,45 @@ onMounted(() => {
 .summary-value {
   margin-top: 6px;
   font-size: 24px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.alias-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 120px;
+}
+
+.alias-group {
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.alias-group-unlinked {
+  border-style: dashed;
+  background: #fafafa;
+}
+
+.alias-group-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  background: #f5f7fa;
+}
+
+.alias-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.alias-group-title {
   font-weight: 600;
   color: #303133;
 }
@@ -399,12 +861,6 @@ onMounted(() => {
   color: #f56c6c;
 }
 
-.pager {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 14px;
-}
-
 :deep(.linked-account-row) {
   background: #f0f9eb;
 }
@@ -413,7 +869,13 @@ onMounted(() => {
   background: #fef0f0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
   .summary-grid {
     grid-template-columns: 1fr;
   }

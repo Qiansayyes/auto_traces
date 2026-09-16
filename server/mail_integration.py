@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +46,27 @@ MAIL_INTERNAL_SECRET = os.environ.get("MAIL_INTERNAL_SECRET", "auto-traces-mail-
 _node_process: subprocess.Popen[Any] | None = None
 _http_client: httpx.AsyncClient | None = None
 MAIL_SESSION_RESOLVER: Any = None
+_mail_token_refresh_stop = threading.Event()
+_mail_token_refresh_thread: threading.Thread | None = None
+_mail_token_refresh_lock = threading.Lock()
+_mail_token_refresh_in_flight = False
+_mail_token_refresh_last: dict[str, Any] = {
+    "started_at": "",
+    "finished_at": "",
+    "status": "idle",
+    "message": "",
+    "exit_code": None,
+}
+
+# 每日巡检；跳过「近 N 天已检测过」的令牌，实现约二十天刷一次
+MAIL_TOKEN_REFRESH_ENABLED = os.environ.get("MAIL_TOKEN_REFRESH_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+MAIL_TOKEN_REFRESH_TICK_SEC = max(3600, int(os.environ.get("MAIL_TOKEN_REFRESH_TICK_SEC", str(24 * 3600))))
+MAIL_TOKEN_REFRESH_SKIP_DAYS = max(1, int(os.environ.get("MAIL_TOKEN_REFRESH_SKIP_DAYS", "20")))
+MAIL_TOKEN_REFRESH_SCRIPT = MAIL_MODULE_DIR / "scripts" / "auto-refresh-tokens.js"
 
 # 无需登录的邮箱 API（健康检查）
 MAIL_API_PUBLIC_PATHS = {
@@ -180,10 +202,102 @@ def mail_account_has_valid_token(record: dict[str, Any] | None) -> bool:
     return bool(email and client_id and refresh_token)
 
 
+def list_invalid_mail_token_emails(owner_username: str) -> set[str]:
+    """返回 owner 下 token_status=invalid 的邮箱集合（小写）。"""
+    owner = str(owner_username or "").strip()
+    if not owner or not MAIL_ACCOUNTS_DB_PATH.exists():
+        return set()
+    try:
+        conn = sqlite3.connect(str(MAIL_ACCOUNTS_DB_PATH), timeout=2.0)
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT lower(email) AS email
+                FROM account_records
+                WHERE status = 'active'
+                  AND lower(COALESCE(token_status, '')) = 'invalid'
+                  AND TRIM(email) <> ''
+                  AND (owner_username = ? OR owner_username = '')
+                """,
+                (owner,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("Failed to list invalid mail token emails for %s: %s", owner, exc)
+        return set()
+    out: set[str] = set()
+    for row in rows or []:
+        email = _normalize_mail_email(row[0] if not hasattr(row, "keys") else row["email"])
+        if email and "@" in email:
+            out.add(email)
+    return out
+
+
+def list_fetchable_mail_emails(owner_username: str) -> set[str] | None:
+    """返回可拉验证码的邮箱集合（有 OAuth 且非 invalid）。
+
+    返回 None 表示邮件库不可用，调用方应 fail-open（不要误伤全部账号）。
+    """
+    status_map = list_mail_oauth_token_status_map(owner_username)
+    if status_map is None:
+        return None
+    return {email for email, status in status_map.items() if status != "invalid"}
+
+
+def list_mail_oauth_token_status_map(owner_username: str) -> dict[str, str] | None:
+    """返回 email -> token_status（仅含已配置 client_id+refresh_token 的活跃记录）。
+
+    返回 None 表示邮件库不可用。
+    """
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {}
+    if not MAIL_ACCOUNTS_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(MAIL_ACCOUNTS_DB_PATH), timeout=2.0)
+        try:
+            rows = conn.execute(
+                """
+                SELECT lower(email) AS email, lower(COALESCE(token_status, 'unknown')) AS token_status
+                FROM account_records
+                WHERE status = 'active'
+                  AND TRIM(email) <> ''
+                  AND TRIM(COALESCE(client_id, '')) <> ''
+                  AND TRIM(COALESCE(refresh_token, '')) <> ''
+                  AND (owner_username = ? OR owner_username = '')
+                ORDER BY
+                  CASE WHEN owner_username = ? THEN 0 ELSE 1 END,
+                  updated_at DESC
+                """,
+                (owner, owner),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("Failed to list mail oauth token status for %s: %s", owner, exc)
+        return None
+    out: dict[str, str] = {}
+    for row in rows or []:
+        email = _normalize_mail_email(row[0] if not hasattr(row, "keys") else row["email"])
+        if not email or "@" not in email or email in out:
+            continue
+        status = str(row[1] if not hasattr(row, "keys") else row["token_status"] or "unknown").strip().lower()
+        if status not in {"valid", "invalid", "transient", "unknown"}:
+            status = "unknown"
+        out[email] = status
+    return out
+
+
 def mail_module_can_fetch_code(owner_username: str, email: str) -> bool:
     """邮箱管理模块是否已配置该邮箱且令牌齐全。"""
     if not is_mail_module_ready():
-        return False
+        # Node 未就绪时仍可读本地 SQLite 判断（与建桶资格一致）
+        fetchable = list_fetchable_mail_emails(owner_username)
+        if fetchable is None:
+            return False
+        return _normalize_mail_email(email) in fetchable
     record = get_mail_account_record(owner_username, email)
     return mail_account_has_valid_token(record)
 
@@ -439,6 +553,15 @@ def _start_node_process() -> bool:
     env.setdefault("MAIL_MODULE_HOST", MAIL_MODULE_HOST)
     env["PORT"] = str(MAIL_MODULE_PORT)
     env["HOST"] = MAIL_MODULE_HOST
+    env.setdefault("MAIL_INTERNAL_SECRET", MAIL_INTERNAL_SECRET)
+    # 注意：下面会把 env["PORT"] 改成邮件模块端口，主服务端口必须从原始 os.environ 读
+    main_port = str(os.environ.get("MAIN_API_PORT") or os.environ.get("PORT") or "8000").strip() or "8000"
+    if main_port == str(MAIL_MODULE_PORT):
+        main_port = "8000"
+    main_host = str(os.environ.get("MAIN_API_HOST", "127.0.0.1")).strip() or "127.0.0.1"
+    env.setdefault("MAIN_API_BASE", os.environ.get("MAIN_API_BASE", f"http://{main_host}:{main_port}"))
+    env.setdefault("MAIN_API_PORT", main_port)
+    env.setdefault("MAIN_API_HOST", main_host)
 
     logs_dir = MAIL_MODULE_DIR / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -486,7 +609,162 @@ def _stop_node_process() -> None:
 
 def stop_mail_module_process() -> None:
     """供主服务 shutdown 钩子调用，快速终止 Node 子进程。"""
+    _mail_token_refresh_stop.set()
     _stop_node_process()
+
+
+def get_mail_token_refresh_status() -> dict[str, Any]:
+    with _mail_token_refresh_lock:
+        return {
+            "enabled": bool(MAIL_TOKEN_REFRESH_ENABLED),
+            "tick_sec": int(MAIL_TOKEN_REFRESH_TICK_SEC),
+            "skip_days": int(MAIL_TOKEN_REFRESH_SKIP_DAYS),
+            "in_flight": bool(_mail_token_refresh_in_flight),
+            "last": dict(_mail_token_refresh_last),
+            "script": str(MAIL_TOKEN_REFRESH_SCRIPT),
+        }
+
+
+def run_mail_token_refresh_job(*, force_all: bool = False, owner_username: str = "") -> dict[str, Any]:
+    """运行一次令牌刷新任务（子进程执行 Node 脚本）。
+
+    force_all=True：忽略「近 N 天已检测」跳过，全量刷新（仍默认跳过已标 invalid，除非脚本 env 打开）。
+    """
+    global _mail_token_refresh_in_flight
+    with _mail_token_refresh_lock:
+        if _mail_token_refresh_in_flight:
+            return {"code": 1, "msg": "令牌刷新任务正在运行"}
+        _mail_token_refresh_in_flight = True
+        _mail_token_refresh_last.update(
+            {
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": "",
+                "status": "running",
+                "message": "force_all" if force_all else f"skip_days={MAIL_TOKEN_REFRESH_SKIP_DAYS}",
+                "exit_code": None,
+            }
+        )
+
+    node = _node_binary()
+    if not node:
+        with _mail_token_refresh_lock:
+            _mail_token_refresh_in_flight = False
+            _mail_token_refresh_last.update(
+                {"status": "failed", "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"), "message": "Node.js not found"}
+            )
+        return {"code": 1, "msg": "未找到 Node.js"}
+    if not MAIL_TOKEN_REFRESH_SCRIPT.exists():
+        with _mail_token_refresh_lock:
+            _mail_token_refresh_in_flight = False
+            _mail_token_refresh_last.update(
+                {
+                    "status": "failed",
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": f"script missing: {MAIL_TOKEN_REFRESH_SCRIPT}",
+                }
+            )
+        return {"code": 1, "msg": "刷新脚本不存在"}
+
+    env = os.environ.copy()
+    env.setdefault("MAIL_INTERNAL_SECRET", MAIL_INTERNAL_SECRET)
+    main_port = str(os.environ.get("MAIN_API_PORT") or os.environ.get("PORT") or "8000").strip() or "8000"
+    if main_port == str(MAIL_MODULE_PORT):
+        main_port = "8000"
+    main_host = str(os.environ.get("MAIN_API_HOST", "127.0.0.1")).strip() or "127.0.0.1"
+    env.setdefault("MAIN_API_BASE", os.environ.get("MAIN_API_BASE", f"http://{main_host}:{main_port}"))
+    env["TOKEN_REFRESH_SKIP_CHECKED_WITHIN_MINUTES"] = "0" if force_all else str(MAIL_TOKEN_REFRESH_SKIP_DAYS * 24 * 60)
+    env["TOKEN_REFRESH_INCLUDE_INVALID"] = "1" if force_all else "0"
+    if owner_username:
+        env["TOKEN_REFRESH_OWNER"] = str(owner_username).strip()
+
+    logs_dir = MAIL_MODULE_DIR / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "mail-token-refresh.log"
+    logger.info(
+        "Starting mail token refresh | force_all=%s skip_days=%s owner=%s",
+        force_all,
+        0 if force_all else MAIL_TOKEN_REFRESH_SKIP_DAYS,
+        owner_username or "*",
+    )
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_fp:
+            log_fp.write(
+                f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} force_all={force_all} "
+                f"skip_days={0 if force_all else MAIL_TOKEN_REFRESH_SKIP_DAYS} =====\n"
+            )
+            log_fp.flush()
+            proc = subprocess.run(
+                [node, str(MAIL_TOKEN_REFRESH_SCRIPT)],
+                cwd=str(MAIL_MODULE_DIR),
+                env=env,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                timeout=6 * 60 * 60,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
+            )
+        code = int(proc.returncode or 0)
+        status = "ok" if code == 0 else "failed"
+        msg = f"exit_code={code} log={log_path}"
+        with _mail_token_refresh_lock:
+            _mail_token_refresh_in_flight = False
+            _mail_token_refresh_last.update(
+                {
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": status,
+                    "message": msg,
+                    "exit_code": code,
+                }
+            )
+        return {"code": 0 if code == 0 else 1, "msg": msg, "exit_code": code, "log": str(log_path)}
+    except Exception as exc:
+        with _mail_token_refresh_lock:
+            _mail_token_refresh_in_flight = False
+            _mail_token_refresh_last.update(
+                {
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "failed",
+                    "message": str(exc),
+                    "exit_code": -1,
+                }
+            )
+        logger.exception("Mail token refresh failed")
+        return {"code": 1, "msg": str(exc)}
+
+
+def _mail_token_refresh_worker_loop() -> None:
+    # 启动后稍等，避免与主服务/邮件模块冷启动抢资源
+    if _mail_token_refresh_stop.wait(90):
+        return
+    while not _mail_token_refresh_stop.is_set():
+        try:
+            if MAIL_TOKEN_REFRESH_ENABLED and ensure_mail_module_ready():
+                run_mail_token_refresh_job(force_all=False)
+        except Exception as exc:
+            logger.warning("Mail token refresh tick failed: %s", exc)
+        if _mail_token_refresh_stop.wait(MAIL_TOKEN_REFRESH_TICK_SEC):
+            break
+
+
+def start_mail_token_refresh_worker() -> None:
+    global _mail_token_refresh_thread
+    if not MAIL_TOKEN_REFRESH_ENABLED:
+        logger.info("Mail token refresh worker disabled (MAIL_TOKEN_REFRESH_ENABLED=0)")
+        return
+    if _mail_token_refresh_thread and _mail_token_refresh_thread.is_alive():
+        return
+    _mail_token_refresh_stop.clear()
+    _mail_token_refresh_thread = threading.Thread(
+        target=_mail_token_refresh_worker_loop,
+        name="mail_token_refresh",
+        daemon=True,
+    )
+    _mail_token_refresh_thread.start()
+    logger.info(
+        "Mail token refresh worker started | tick=%ss skip_days=%s",
+        MAIL_TOKEN_REFRESH_TICK_SEC,
+        MAIL_TOKEN_REFRESH_SKIP_DAYS,
+    )
 
 
 def _resolve_mail_owner(request: Request) -> tuple[str | None, JSONResponse | None]:
@@ -615,6 +893,7 @@ def attach_mail_module(app) -> None:
             "process_running": running,
             "upstream": _mail_upstream_base(),
             "web_admin": "/mail-admin/",
+            "token_refresh": get_mail_token_refresh_status(),
         }
 
     @router.post("/api/mail-module/restart")
@@ -622,6 +901,39 @@ def attach_mail_module(app) -> None:
         _stop_node_process()
         ok = await asyncio.to_thread(_start_node_process)
         return {"code": 0 if ok else 1, "ready": ok, "upstream": _mail_upstream_base()}
+
+    @router.get("/api/mail-module/token_refresh/status")
+    async def mail_token_refresh_status() -> dict[str, Any]:
+        return {"code": 0, "data": get_mail_token_refresh_status()}
+
+    @router.post("/api/mail-module/token_refresh/run")
+    async def mail_token_refresh_run(request: Request) -> dict[str, Any]:
+        """手动触发令牌刷新（后台跑，立即返回）。body: { force_all?: bool, owner_username?: str }"""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        force_all = bool(body.get("force_all") or body.get("forceAll"))
+        owner = str(body.get("owner_username") or body.get("ownerUsername") or "").strip()
+        status = get_mail_token_refresh_status()
+        if status.get("in_flight"):
+            return {"code": 1, "msg": "令牌刷新任务正在运行", "data": status}
+
+        def _bg() -> None:
+            run_mail_token_refresh_job(force_all=force_all, owner_username=owner)
+
+        threading.Thread(target=_bg, name="mail_token_refresh_manual", daemon=True).start()
+        return {
+            "code": 0,
+            "msg": "已启动令牌刷新任务",
+            "data": {
+                "force_all": force_all,
+                "owner_username": owner,
+                "skip_days": 0 if force_all else MAIL_TOKEN_REFRESH_SKIP_DAYS,
+            },
+        }
 
     app.include_router(router)
 
@@ -666,6 +978,7 @@ def attach_mail_module(app) -> None:
         ok = await asyncio.to_thread(_start_node_process)
         if not ok:
             logger.warning("Mail module did not start; API proxy will return 503 until ready")
+        start_mail_token_refresh_worker()
 
     @app.on_event("shutdown")
     async def _mail_module_shutdown() -> None:

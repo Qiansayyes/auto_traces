@@ -1,10 +1,12 @@
 const service = require('../services/api')
 const { listTemplates, saveTemplate, deleteTemplate } = require('../services/TemplateService')
 const database = require('../services/DatabaseService')
+const { refreshAccessToken } = require('../services/MailService')
 const logger = require('../utils/logger')
 const { addMailLinksToCollection } = require('../utils/mailLinks')
 const { withOwnerOptions } = require('../utils/requestOwner')
 const { classifyTokenError } = require('../utils/tokenError')
+const { maybeNotifyAfterTokenCheck } = require('../services/MainNotifyService')
 
 const ownerCtx = (ctx, extra = {}) => withOwnerOptions(ctx, extra)
 
@@ -17,22 +19,24 @@ const isTokenRelatedError = (err) => {
 const recordMailTokenFailure = (ctx, email, err) => {
   if (!email || !isTokenRelatedError(err)) return
   const classification = classifyTokenError(err)
-  database.recordTokenCheckResult(ownerCtx(ctx, {
+  const result = database.recordTokenCheckResult(ownerCtx(ctx, {
     email,
     tokenStatus: classification.tokenStatus,
     lastTokenError: classification.lastTokenError,
   }))
+  maybeNotifyAfterTokenCheck(result?.ownerUsername, result)
 }
 
 const recordMailTokenSuccess = (ctx, email, tokenHints = {}) => {
   if (!email) return
-  database.recordTokenCheckResult(ownerCtx(ctx, {
+  const result = database.recordTokenCheckResult(ownerCtx(ctx, {
     email,
     tokenStatus: 'valid',
     lastTokenError: '',
     expiresInSeconds: tokenHints.expiresInSeconds,
     refreshToken: tokenHints.refreshToken,
   }))
+  maybeNotifyAfterTokenCheck(result?.ownerUsername, result)
 }
 
 const extractFetchedEmails = (data) => {
@@ -552,6 +556,124 @@ const controller = {
     } catch (err) {
       logger.error("Failed to list token mailboxes", err);
       ctx.throw(500, "Failed to list token mailboxes");
+    }
+  },
+
+  async token_mailboxes_check(ctx) {
+    try {
+      const body = ctx.request.body || {};
+      let emails = body.emails;
+      if (typeof emails === "string") {
+        emails = emails.split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean);
+      }
+      emails = Array.isArray(emails)
+        ? [...new Set(emails.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean))]
+        : [];
+      if (!emails.length) {
+        ctx.throw(400, "emails is required");
+      }
+      if (emails.length > 50) {
+        ctx.throw(400, "emails batch size must be <= 50");
+      }
+
+      const concurrency = Math.min(10, Math.max(1, Number(body.concurrency) || 5));
+      const includeInvalid = body.includeInvalid === true
+        || body.includeInvalid === "1"
+        || body.includeInvalid === "true";
+      const skipCheckedWithinMinutes = Math.max(0, Number(body.skipCheckedWithinMinutes) || 0);
+      const socks5 = String(body.socks5 || "").trim();
+      const httpProxy = String(body.http || body.httpProxy || "").trim();
+
+      const accounts = database.listAccountsForTokenRefresh(ownerCtx(ctx, {
+        emails,
+        includeInvalid,
+        skipCheckedWithinMinutes,
+        limit: emails.length,
+      }));
+
+      const summary = {
+        requested: emails.length,
+        matched: accounts.length,
+        processed: 0,
+        validCount: 0,
+        invalidCount: 0,
+        transientCount: 0,
+        results: [],
+      };
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      let cursor = 0;
+      const worker = async () => {
+        while (true) {
+          const index = cursor;
+          cursor += 1;
+          if (index >= accounts.length) return;
+          const account = accounts[index];
+          try {
+            const result = await refreshAccessToken(
+              account.refresh_token,
+              account.client_id,
+              account.email,
+              socks5,
+              httpProxy,
+              { forceRefresh: true },
+            );
+            if (!result.status) {
+              const err = new Error("Token refresh succeeded but mail scope is missing");
+              err.tokenClassification = {
+                tokenStatus: "invalid",
+                lastTokenError: err.message,
+                recoverable: false,
+              };
+              throw err;
+            }
+            const validResult = database.recordTokenCheckResult(ownerCtx(ctx, {
+              email: account.email,
+              tokenStatus: "valid",
+              lastTokenError: "",
+              expiresInSeconds: result.expires_in,
+              refreshToken: result.refresh_token,
+            }));
+            maybeNotifyAfterTokenCheck(validResult?.ownerUsername, validResult);
+            summary.validCount += 1;
+            summary.results.push({
+              email: account.email,
+              tokenStatus: "valid",
+              lastTokenError: "",
+            });
+          } catch (error) {
+            const classification = classifyTokenError(error);
+            const failResult = database.recordTokenCheckResult(ownerCtx(ctx, {
+              email: account.email,
+              tokenStatus: classification.tokenStatus,
+              lastTokenError: classification.lastTokenError,
+            }));
+            maybeNotifyAfterTokenCheck(failResult?.ownerUsername, failResult);
+            if (classification.tokenStatus === "invalid") {
+              summary.invalidCount += 1;
+            } else {
+              summary.transientCount += 1;
+            }
+            summary.results.push({
+              email: account.email,
+              tokenStatus: classification.tokenStatus,
+              lastTokenError: classification.lastTokenError || error?.message || String(error),
+            });
+          }
+          summary.processed += 1;
+          await sleep(100);
+        }
+      };
+
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, Math.max(accounts.length, 1)) }, () => worker()),
+      );
+
+      ctx.body = { code: "200", data: summary };
+    } catch (err) {
+      if (err?.status) throw err;
+      logger.error("Failed to check token mailboxes", err);
+      ctx.throw(500, "Failed to check token mailboxes");
     }
   },
 
