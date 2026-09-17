@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260917-linked-invalid-xlsx";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260917-fix-login-encoding";
 
 {
 
@@ -105,7 +105,7 @@ let mobilePendingExportInFlight = false;
 
 const deviceTable = document.getElementById("deviceTable");
 
-/** 云端「绑定设备自行拉起程序」开关，�?overview 同步 */
+/** 云端「绑定设备自行拉起程序」开关，由 overview 同步 */
 let adminAutoStartEnabled = false;
 
 const configForm = document.getElementById("configForm");
@@ -253,7 +253,7 @@ const failureReportsErrorFilterEl = document.getElementById("failureReportsError
 const failureReportsRefreshBtn = document.getElementById("failureReportsRefreshBtn");
 const failureReportsTableBodyEl = document.getElementById("failureReportsTableBody");
 const GALLERY_LIBRARY_MAX_ITEMS = 100;
-// 单次 multipart 体积上限（需小于 Nginx client_max_body_size；未调大时默认约 1m�?
+// 单次 multipart 体积上限（需小于 Nginx client_max_body_size；未调大时默认约 1m）
 const GALLERY_UPLOAD_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 let galleryLibraryItems = [];
 const galleryLibrarySelectedIds = new Set();
@@ -330,7 +330,7 @@ const DEVICE_ROWS_API = "/api/admin/editor/device_rows";
 let accountEditorRows = [];
 let deviceEditorRows = [];
 let backupArchiveRows = [];
-/** 当前备份档案分页接口返回的原始行，用于把勾�?row_index 解析�?device_id�?*/
+/** 当前备份档案分页接口返回的原始行，用于把勾选 row_index 解析为 device_id。 */
 let backupArchivePageItems = [];
 let backupAliasByUsername = new Map();
 let accountFilterUnassignedOnly = false;
@@ -347,7 +347,7 @@ let currentAccountRecordsPage = 1;
 let accountRecordsFilteredTotal = 0;
 /** 别名组间排序：alias | count_desc | count_asc */
 let accountRecordsAliasSortMode = "alias";
-/** 账号记录批量删除勾选，键为数据�?row_index */
+/** 账号记录批量删除勾选，键为数据库 row_index */
 const accountRecordsSelectedRowIndexes = new Set();
 /** 是否展开 password / email / email_pwd / 2FA / api 凭据列（默认收起以留出可视空间） */
 let accountRecordsCredColsExpanded = loadAccountRecordsCredColsExpanded();
@@ -401,7 +401,7 @@ let smartTemplateConfig = {
 let aliasSmartTemplateByMode = { growth: {}, live: {}, direct: {}, mutual: {} };
 let smartTemplatePreviewCache = {};
 
-/** 智能模板暂仅涨粉模式生效（与服务�?SMART_TEMPLATE_RUN_MODES 一致） */
+/** 智能模板暂仅涨粉模式生效（与服务端 SMART_TEMPLATE_RUN_MODES 一致） */
 const SMART_TEMPLATE_MODE = "growth";
 
 const smartOldMinFollowersInput = document.getElementById("smartOldMinFollowers");
@@ -439,7 +439,7 @@ function normalizeTiktokUsernameKey(raw) {
   return String(raw || "").trim().replace(/^@+/, "").toLowerCase();
 }
 
-/** 别名设备上某 TikTok 账号的配置映射键（与�?alias 的设备级键并存）�?*/
+/** 别名设备上某 TikTok 账号的配置映射键（与仅 alias 的设备级键并存）。 */
 function accountTemplateMapKey(alias, tiktokUsername) {
   const aliasKey = String(alias || "").trim().toLowerCase();
   const userKey = normalizeTiktokUsernameKey(tiktokUsername);
@@ -464,7 +464,7 @@ function templateKeyExists(ref) {
   return Boolean(ref && t && typeof t === "object" && Object.prototype.hasOwnProperty.call(t, ref));
 }
 
-/** 与服务端 _lookup_mode_map（含 cand in templates）一�?*/
+/** 与服务端 _lookup_mode_map（含 cand in templates）一致 */
 function lookupAliasMapModeProbe(modeProbe, aliasClean, tiktokUsername) {
   const modeMap = aliasTemplateByMode?.[modeProbe];
   if (!modeMap || typeof modeMap !== "object") return "";
@@ -476,7 +476,7 @@ function lookupAliasMapModeProbe(modeProbe, aliasClean, tiktokUsername) {
   return String(modeMap[aliasClean] || "").trim();
 }
 
-/** 设备行下拉回显应与服务端 _resolve_template_for_mode_alias 一致（含跨模式复用）�?*/
+/** 设备行下拉回显应与服务端 _resolve_template_for_mode_alias 一致（含跨模式复用）。 */
 function resolveEffectiveDeviceTemplateUI(aliasRaw, tiktokUsername = "") {
   const aliasClean = String(aliasRaw || "").trim().toLowerCase();
   const templateModeKey = currentRunMode === "mutual" ? "growth" : currentRunMode;
@@ -528,7 +528,7 @@ function resolveEffectiveDeviceTemplateUI(aliasRaw, tiktokUsername = "") {
 
   const selectedTemplate = templateKeyExists(rawRef) ? rawRef : fallbackName;
 
-  /** 本条映射是否写在本模式下（与服务端语义一致）；跨模式借用不算「本模式显式�?*/
+  /** 本条映射是否写在本模式下（与服务端语义一致）；跨模式借用不算「本模式显式」 */
   let hasExplicitInCurrentMode =
     Boolean(rawRef && !fromCross && sourceProbe &&
       ((currentRunMode === "mutual" && sourceProbe === "mutual")
@@ -550,26 +550,26 @@ function resolveEffectiveDeviceTemplateUI(aliasRaw, tiktokUsername = "") {
   let badgeClass = "pending";
   let badgeHint = "";
   if (!keys.length) {
-    badgeText = "暂无可选模�?;
+    badgeText = "暂无可选模板";
     badgeClass = "offline";
   } else if (hasExplicitInCurrentMode) {
-    badgeText = "已绑�?本模�?";
+    badgeText = "已绑定(本模式)";
     badgeClass = "online";
-    badgeHint = "该别名已在当前运行模式下保存设备级模板映射�?;
+    badgeHint = "该别名已在当前运行模式下保存设备级模板映射。";
   } else if (fromCross) {
-    badgeText = crossFromMode ? `复用�?{modeLabel}」映射` : "复用其它模式映射";
+    badgeText = crossFromMode ? `复用「${modeLabel}」映射` : "复用其它模式映射";
     badgeClass = "online";
     badgeHint =
-      "当前模式下未单独保存该别名映射；后台会复用其它模式中已绑定的别名→模板键，且与设备端解析一致�?;
+      "当前模式下未单独保存该别名映射；后台会复用其它模式中已绑定的别名→模板键，且与设备端解析一致。";
   } else if (resolveBoundTemplateRef(aliasClean, tiktokUsername, currentRunMode)) {
     badgeText = "（映射已失效，沿用运行配置）";
     badgeClass = "pending";
     badgeHint =
-      "仍保存了别名→模板键，但该模板暂不可用（如被删除或取消共享）。设备将回退到运行配置当前模板�?;
+      "仍保存了别名→模板键，但该模板暂不可用（如被删除或取消共享）。设备将回退到运行配置当前模板。";
   } else {
     badgeText = "继承运行配置";
     badgeClass = "pending";
-    badgeHint = "未配置别名映射时，设备使用「运行配置」里当前选中的模板（active_template）�?;
+    badgeHint = "未配置别名映射时，设备使用「运行配置」里当前选中的模板（active_template）。";
   }
 
   return { selectedTemplate, badgeText, badgeClass, badgeHint, hasExplicitInCurrentMode };
@@ -610,7 +610,7 @@ function renderSmartTemplateWeightRows(branch, entries) {
         </div>
         <div class="field field--weight">
           <label>概率</label>
-          <input class="smart-template-weight" type="number" min="0" max="10000" step="1" value="${w}" data-branch="${branch}" data-row-index="${idx}" title="同一分支内为相对概率，数值越大占比越�? />
+          <input class="smart-template-weight" type="number" min="0" max="10000" step="1" value="${w}" data-branch="${branch}" data-row-index="${idx}" title="同一分支内为相对概率，数值越大占比越高" />
         </div>
         <button type="button" class="ghost smart-template-remove-row" data-branch="${branch}" data-row-index="${idx}">删除</button>
       </div>
@@ -646,18 +646,18 @@ async function saveSmartTemplateConfig() {
     old_branch_templates: collectSmartTemplateWeightRows("old"),
   };
   if (!payload.new_branch_templates.length || !payload.old_branch_templates.length) {
-    setSmartTemplateConfigStatus("每个分支至少保留一行模板概�?, "error");
+    setSmartTemplateConfigStatus("每个分支至少保留一行模板概率", "error");
     return;
   }
   try {
-    setSmartTemplateConfigStatus("正在保存�?);
+    setSmartTemplateConfigStatus("正在保存…");
     const data = await request("/api/admin/smart_template/config", {
       method: "POST",
       body: JSON.stringify(payload),
     });
     smartTemplateConfig = data?.smart_template_config || payload;
     applySmartTemplateConfigToForm(smartTemplateConfig);
-    setSmartTemplateConfigStatus("智能模板规则已保�?, "success");
+    setSmartTemplateConfigStatus("智能模板规则已保存", "success");
     smartTemplatePreviewCache = {};
     if (latestDevices && typeof latestDevices === "object") {
       await refreshSmartTemplatePreviews(Object.entries(latestDevices).map(([deviceId, info]) => ({ deviceId, info })));
@@ -726,7 +726,7 @@ let overviewAutoRefreshInFlight = false;
 let deviceLogsFetchInFlight = false;
 let deviceLogsPullInFlight = false;
 const DEVICE_LOG_PULL_POLL_MS = 2500;
-// 设备�?mode_wait 常见 timeout_sec=50；管理台等待窗口需明显大于 50s，避免“设备尚未出轮询就被判超时”�?
+// 设备端 mode_wait 常见 timeout_sec=50；管理台等待窗口需明显大于 50s，避免“设备尚未出轮询就被判超时”。
 const DEVICE_LOG_PULL_TIMEOUT_MS = 95000;
 let taskStatusRefreshInFlight = false;
 let backupStatsFullQueryInFlight = false;
@@ -771,20 +771,20 @@ function appendPublishPostBatchLog(line, reset = false) {
   if (!publishPostBatchLogsEl) return;
   const text = String(line || "");
   if (reset) {
-    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇�?;
+    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇总";
     publishPostBatchLogsEl.scrollTop = 0;
     return;
   }
   const current = String(publishPostBatchLogsEl.textContent || "").trim();
-  if (!current || current === "暂无汇�?) {
-    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇�?;
+  if (!current || current === "暂无汇总") {
+    publishPostBatchLogsEl.textContent = text.trim() || "暂无汇总";
   } else {
     publishPostBatchLogsEl.textContent = `${current}\n${text}`;
   }
   publishPostBatchLogsEl.scrollTop = publishPostBatchLogsEl.scrollHeight;
 }
 
-/** 轮询发作品最终回执（须带 publish_post_outcome_report；忽略旧版「已收到」早�?success）�?*/
+/** 轮询发作品最终回执（须带 publish_post_outcome_report；忽略旧版「已收到」早期 success）。 */
 async function waitForPublishPostFinalResult(opId, timeoutMs = 900000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -813,18 +813,18 @@ async function waitForPublishPostFinalResult(opId, timeoutMs = 900000) {
       if (outcome.publish_post_outcome_report) {
         return result;
       }
-      // �?App 可能先报「已收到」：继续等最终结�?
+      // 旧 App 可能先报「已收到」：继续等最终结果
     } else if (data.status !== "pending" && data.code !== 1) {
-      throw new Error(data?.msg || "发作品结果轮询异�?);
+      throw new Error(data?.msg || "发作品结果轮询异常");
     }
     await new Promise((res) => setTimeout(res, 3000));
   }
-  throw new Error("等待发作品最终结果超时（设备可能仍在执行�?);
+  throw new Error("等待发作品最终结果超时（设备可能仍在执行）");
 }
 
 function formatPublishPostFinalLine(alias, result, errMsg) {
   if (errMsg) {
-    return `�?${alias}：超�?异常 �?${errMsg}`;
+    return `❌ ${alias}：超时/异常 — ${errMsg}`;
   }
   const data = result?.data && typeof result.data === "object" ? result.data : {};
   const ok = result?.status === "success" && Boolean(data.publish_post_completed);
@@ -832,10 +832,10 @@ function formatPublishPostFinalLine(alias, result, errMsg) {
   const targetCount = Number(data.publish_target_count);
   const countHint =
     Number.isFinite(successCount) && Number.isFinite(targetCount) && (successCount > 0 || targetCount > 0)
-      ? `�?{successCount}/${targetCount}）`
+      ? `（${successCount}/${targetCount}）`
       : "";
-  const msg = String(result?.message || "").trim() || (ok ? "发作品成�? : "发作品失�?);
-  return `${ok ? "�? : "�?} ${alias}${countHint}�?{msg}`;
+  const msg = String(result?.message || "").trim() || (ok ? "发作品成功" : "发作品失败");
+  return `${ok ? "✅" : "❌"} ${alias}${countHint}：${msg}`;
 }
 
 const sections = document.querySelectorAll(".panel");
@@ -891,10 +891,10 @@ function humanizeRequestErrorMessage(error) {
   raw = raw.replace(/\s*\[https?:\/\/[^\]]+\]\s*$/gi, "").trim();
   if (/^请求超时：\d+ms/i.test(raw)) return "请求超时，请稍后重试";
   if (/Unexpected token '<'|is not valid JSON/i.test(raw)) {
-    return "服务端返回了 HTML 页面而非 JSON，请检�?API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api�?;
+    return "服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）";
   }
   if (/网络请求失败|无法连接服务端|Failed to fetch|fetch failed/i.test(raw)) {
-    return "无法连接服务器，请检查网络或联系管理�?;
+    return "无法连接服务器，请检查网络或联系管理员";
   }
   if (/^Internal Server Error$/i.test(raw)) {
     return "服务器内部错误，请确认后端已重启且查看服务端日志";
@@ -902,13 +902,13 @@ function humanizeRequestErrorMessage(error) {
   return raw || "操作失败";
 }
 
-/** FastAPI/Pydantic 422 等返�?`{ detail: [...] }`；业务接口多�?`{ code, msg }` */
+/** FastAPI/Pydantic 422 等返回 `{ detail: [...] }`；业务接口多为 `{ code, msg }` */
 function formatHttpApiErrorMessage(responseStatus, data) {
   const apiMsg = data?.msg;
   if (typeof apiMsg === "string" && apiMsg.trim()) {
     const trimmed = apiMsg.trim();
     if (trimmed.startsWith("<")) {
-      return "服务端返回了 HTML 页面而非 JSON，请检�?API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api�?;
+      return "服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）";
     }
     return trimmed;
   }
@@ -921,10 +921,10 @@ function formatHttpApiErrorMessage(responseStatus, data) {
           : "";
         const piece = typeof item?.msg === "string" ? item.msg.trim() : "";
         if (!piece) return "";
-        return loc ? `${loc}�?{piece}` : piece;
+        return loc ? `${loc}：${piece}` : piece;
       })
       .filter(Boolean);
-    if (parts.length) return parts.join("�?);
+    if (parts.length) return parts.join("；");
   }
   if (apiMsg != null && typeof apiMsg !== "string") return JSON.stringify(apiMsg);
   if (responseStatus === 422) return "参数校验未通过（请检查表单数值是否在允许范围内）";
@@ -955,7 +955,7 @@ function updateStartupSelfCheck() {}
 function updateRequestTrace() {}
 
 function showDeleteResultNotice(message, type = "success") {
-  const icon = type === "success" ? "�? : (type === "error" ? "�? : "ℹ️");
+  const icon = type === "success" ? "✅" : (type === "error" ? "❌" : "ℹ️");
   const text = `${icon} ${message}`;
   setStatus(message, type);
   window.alert(text);
@@ -965,13 +965,13 @@ function appendDebugLog() {}
 
 window.addEventListener("error", (event) => {
   const msg = event?.error?.message || event?.message || "页面脚本异常";
-  if (cvTaskLogsEl) cvTaskLogsEl.textContent = `页面脚本异常�?{msg}`;
+  if (cvTaskLogsEl) cvTaskLogsEl.textContent = `页面脚本异常：${msg}`;
 });
 
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event?.reason;
-  const msg = reason?.message || String(reason || "Promise 未处理异�?);
-  if (cvTaskLogsEl) cvTaskLogsEl.textContent = `页面脚本异常�?{msg}`;
+  const msg = reason?.message || String(reason || "Promise 未处理异常");
+  if (cvTaskLogsEl) cvTaskLogsEl.textContent = `页面脚本异常：${msg}`;
 });
 
 function appendMobilePendingLog(line, reset = false) {
@@ -997,11 +997,11 @@ function setMobilePendingExportButtonsBusy(isBusy, action = "导出") {
   const label = String(action || "导出");
   if (exportMobilePendingUsernamesBtn) {
     exportMobilePendingUsernamesBtn.disabled = Boolean(isBusy);
-    exportMobilePendingUsernamesBtn.textContent = isBusy ? "导出�?.." : "导出�?xlsx";
+    exportMobilePendingUsernamesBtn.textContent = isBusy ? "导出中..." : "导出为 xlsx";
   }
   if (exportAndClearMobilePendingUsernamesBtn) {
     exportAndClearMobilePendingUsernamesBtn.disabled = Boolean(isBusy);
-    exportAndClearMobilePendingUsernamesBtn.textContent = isBusy ? `${label}�?..` : "导出并清空队�?;
+    exportAndClearMobilePendingUsernamesBtn.textContent = isBusy ? `${label}中...` : "导出并清空队列";
   }
 }
 
@@ -1013,7 +1013,7 @@ function logBackupAction(action, payload = {}) {
   } catch (_) {
     detail = String(payload || "");
   }
-  // 轮询日志仅走调试通道，不污染素材分发日志面板�?
+  // 轮询日志仅走调试通道，不污染素材分发日志面板。
   appendDebugLog("POLL", { action: act, detail });
 }
 
@@ -1024,11 +1024,11 @@ function humanizeOperationLogLine(line) {
 function summarizeDeviceOpResult(result) {
   if (!result) return "暂无设备执行结果";
   const lines = [];
-  if (result.status) lines.push(`状�? ${result.status}`);
+  if (result.status) lines.push(`状态: ${result.status}`);
   if (result.message) lines.push(`消息: ${result.message}`);
   if (result.op_type) lines.push(`操作: ${result.op_type}`);
   if (result.device_id) lines.push(`设备: ${result.device_id}`);
-  if (result.backup_name) lines.push(`备份档案�? ${result.backup_name}`);
+  if (result.backup_name) lines.push(`备份档案名: ${result.backup_name}`);
   const logs = result?.data?.operation_logs;
   if (Array.isArray(logs) && logs.length) {
     lines.push("执行步骤:");
@@ -1037,7 +1037,7 @@ function summarizeDeviceOpResult(result) {
   return lines.join("\n");
 }
 
-/** 任务轮询完成时展示「云端回执」：与概�?device_logs 同源（compactDeviceLogLines），缺失时再退�?operation_logs / 摘要 */
+/** 任务轮询完成时展示「云端回执」：与概览 device_logs 同源（compactDeviceLogLines），缺失时再退回 operation_logs / 摘要 */
 function formatBackupCloudReceiptFromOpPollPayload(data) {
   const dl = data?.device_logs && typeof data.device_logs === "object" ? data.device_logs : null;
   if (dl) {
@@ -1119,10 +1119,10 @@ function renderSchedulerTaskSettings(tasks = {}) {
           启用任务
         </label>
         <label style="display:flex;align-items:center;gap:8px;">
-          间隔（秒�?
+          间隔（秒）
           <input type="number" min="60" max="86400" value="${interval}" data-task-interval="${taskKey}" style="width:120px;" />
         </label>
-        <div style="color:#666;font-size:12px;">上次执行�?{lastRun}</div>
+        <div style="color:#666;font-size:12px;">上次执行：${lastRun}</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button type="button" class="ghost" data-task-save="${taskKey}">保存配置</button>
           <button type="button" class="primary" data-task-run="${taskKey}">立即执行</button>
@@ -1165,7 +1165,7 @@ function renderGroupedTaskLogs(taskLogs = {}) {
   }
   const blocks = names.map((name) => {
     const lines = Array.isArray(taskLogs[name]) ? taskLogs[name] : [];
-    const body = lines.length ? lines.slice(-150).join("\n") : "（无输出�?;
+    const body = lines.length ? lines.slice(-150).join("\n") : "（无输出）";
     return `── ${name} ──\n${body}`;
   });
   schedulerTaskLogsEl.textContent = blocks.join("\n\n");
@@ -1227,7 +1227,7 @@ function toggleDeviceOpsButtons() {
   }
 }
 
-function updateTaskStatusFromDeviceResult(result, fallback = "任务已完�?) {
+function updateTaskStatusFromDeviceResult(result, fallback = "任务已完成") {
   const summary = summarizeDeviceOpResult(result);
   const finalText = result?.status === "success"
     ? `${fallback}\n\n${summary}`
@@ -1236,7 +1236,7 @@ function updateTaskStatusFromDeviceResult(result, fallback = "任务已完�?) {
 }
 
 function confirmTikTokAction(actionLabel, detailText) {
-  return window.confirm(`确认执行�?{actionLabel}】吗？\n\n${detailText}\n\n该操作会影响 TikTok 应用数据，请确保已选对设备。`);
+  return window.confirm(`确认执行【${actionLabel}】吗？\n\n${detailText}\n\n该操作会影响 TikTok 应用数据，请确保已选对设备。`);
 }
 
 function splitDeviceLogLine(line) {
@@ -1259,14 +1259,14 @@ function compactDeviceLogLines(lines = []) {
     const next = splitDeviceLogLine(source[i + 1]);
     const next2 = splitDeviceLogLine(source[i + 2]);
 
-    // 合并「执行X�?「X完成，耗时Nms�?
+    // 合并「执行X」+「X完成，耗时Nms」
     if (current.body.startsWith("执行") && /完成，耗时\s*\d+ms/.test(next.body)) {
       merged.push(buildDeviceLogLine(current.prefix, `${current.body} -> ${next.body}`));
       i += 1;
       continue;
     }
 
-    // 合并 TikTok 重启流程的多行日�?
+    // 合并 TikTok 重启流程的多行日志
     if (
       current.body.includes("关闭 TikTok:") &&
       next.body.includes("首次启动：重打开TikTok") &&
@@ -1274,7 +1274,7 @@ function compactDeviceLogLines(lines = []) {
     ) {
       merged.push(buildDeviceLogLine(
         current.prefix,
-        `${current.body}�?{next.body}�?{next2.body}`
+        `${current.body}；${next.body}；${next2.body}`
       ));
       i += 2;
       continue;
@@ -1283,7 +1283,7 @@ function compactDeviceLogLines(lines = []) {
     merged.push(buildDeviceLogLine(current.prefix, current.body));
   }
 
-  // 连续重复日志折叠�?xN
+  // 连续重复日志折叠为 xN
   const folded = [];
   for (const line of merged) {
     const current = splitDeviceLogLine(line);
@@ -1367,7 +1367,7 @@ async function downloadDeviceLogFile(deviceId) {
       const data = JSON.parse(text);
       if (data?.msg) msg = String(data.msg);
     } catch {
-      /* �?JSON 时沿用原始文�?*/
+      /* 非 JSON 时沿用原始文本 */
     }
     const err = new Error(msg);
     err.httpStatus = response.status;
@@ -1398,7 +1398,7 @@ async function pullDeviceLogsFromDevices(ids) {
   deviceLogsPullInFlight = true;
   if (deviceLogPullBtn) {
     deviceLogPullBtn.disabled = true;
-    deviceLogPullBtn.textContent = "等待设备回传�?;
+    deviceLogPullBtn.textContent = "等待设备回传…";
   }
   try {
     await requestDeviceLogPull(ids, 400);
@@ -1442,16 +1442,16 @@ async function pullDeviceLogsFromDevices(ids) {
       }
     }
     if (downloaded > 0) {
-      const suffix = lastPending.length ? `；另�?${lastPending.length} 台设备未在时限内回传` : "";
-      setStatus(`已下�?${downloaded} 台设备今日日�?{suffix}`, lastPending.length ? "warning" : "success");
+      const suffix = lastPending.length ? `；另有 ${lastPending.length} 台设备未在时限内回传` : "";
+      setStatus(`已下载 ${downloaded} 台设备今日日志${suffix}`, lastPending.length ? "warning" : "success");
     } else if (cachedFallback > 0) {
-      const suffix = lastPending.length ? `；另�?${lastPending.length} 台设备未在时限内回传` : "";
+      const suffix = lastPending.length ? `；另有 ${lastPending.length} 台设备未在时限内回传` : "";
       setStatus(`设备今日本地日志为空，已下载 ${cachedFallback} 台设备的云端缓存日志${suffix}`, "info");
     } else if (emptyToday > 0) {
-      const suffix = lastPending.length ? `�?{lastPending.length} 台设备未在时限内回传` : "";
-      setStatus(`设备已回传，但今日本地与服务端均无可用日�?{suffix}`, "info");
+      const suffix = lastPending.length ? `；${lastPending.length} 台设备未在时限内回传` : "";
+      setStatus(`设备已回传，但今日本地与服务端均无可用日志${suffix}`, "info");
     } else if (lastPending.length) {
-      setStatus("设备未在时限内回传日志，请确�?App 在后台运行后重试", "error");
+      setStatus("设备未在时限内回传日志，请确认 App 在后台运行后重试", "error");
     }
   } catch (err) {
     appendDebugLog("DEVICE_LOG_PULL", { error: String(err?.message || err) });
@@ -1481,7 +1481,7 @@ async function refreshVisibleDeviceLogs({ requestPull = false } = {}) {
     await fetchCachedDeviceLogs(ids, 400);
     renderDeviceExecLogs(latestDeviceLogs);
   } catch (_) {
-    /* 读取缓存失败静默，用户可点「下载今日日志」重�?*/
+    /* 读取缓存失败静默，用户可点「下载今日日志」重试 */
   } finally {
     deviceLogsFetchInFlight = false;
   }
@@ -1549,10 +1549,10 @@ function defaultApiBase() {
     return "http://127.0.0.1:8000/api";
   }
   if (isCurrentPageLocalDevHost() && String(port || "") === "8080") {
-    // 本地静态服�?8080) + 后端(8000) 的固定组合，避免 /api 打到静态服�?404�?
+    // 本地静态服务(8080) + 后端(8000) 的固定组合，避免 /api 打到静态服务 404。
     return `${protocol}//${hostname || "127.0.0.1"}:8000/api`;
   }
-  // VPS / 公网部署默认走同�?/api（由 Nginx 反代到后端）�?
+  // VPS / 公网部署默认走同源 /api（由 Nginx 反代到后端）。
   return "/api";
 }
 
@@ -1573,14 +1573,14 @@ function isLoopbackApiBase(base) {
   }
 }
 
-/** �?VPS 等远程页面上，自动丢�?localStorage 里残留的 127.0.0.1:8000/api�?*/
+/** 在 VPS 等远程页面上，自动丢弃 localStorage 里残留的 127.0.0.1:8000/api。 */
 function sanitizeApiBaseForCurrentPage(base) {
   const normalized = normalizeApiBaseForCurrentPage(base);
   if (!normalized) return "";
   if (!isCurrentPageLocalDevHost() && isLoopbackApiBase(normalized)) {
     return defaultApiBase();
   }
-  // 本地 8080 静态服务时，localStorage 里残留的 /api 会打到静态端口而非 8000 后端�?
+  // 本地 8080 静态服务时，localStorage 里残留的 /api 会打到静态端口而非 8000 后端。
   if (isCurrentPageLocalDevHost() && String(window.location.port || "") === "8080" && normalized === "/api") {
     return defaultApiBase();
   }
@@ -1603,7 +1603,7 @@ async function probeAuthMeStatus(base) {
   const result = {
     ok: false,
     httpStatus: 0,
-    errorKind: "网络不可�?,
+    errorKind: "网络不可达",
     authState: "未知",
   };
   try {
@@ -1615,14 +1615,14 @@ async function probeAuthMeStatus(base) {
     result.httpStatus = response.status;
     if (response.ok) {
       result.ok = true;
-      result.errorKind = "�?;
+      result.errorKind = "无";
       result.authState = "有效";
       return result;
     }
     if (response.status === 401) {
       result.ok = true;
       result.errorKind = "401";
-      result.authState = "无效（未登录/失效�?;
+      result.authState = "无效（未登录/失效）";
       return result;
     }
     if (response.status === 403) {
@@ -1633,7 +1633,7 @@ async function probeAuthMeStatus(base) {
     }
     if (response.status === 404) {
       result.errorKind = "404";
-      result.authState = "不可�?;
+      result.authState = "不可用";
       return result;
     }
     result.errorKind = `HTTP ${response.status}`;
@@ -1642,11 +1642,11 @@ async function probeAuthMeStatus(base) {
   } catch (error) {
     const raw = String(error?.message || error || "");
     if (/abort/i.test(raw)) {
-      result.errorKind = "网络不可�?;
-      result.authState = "不可�?;
+      result.errorKind = "网络不可达";
+      result.authState = "不可达";
     } else {
-      result.errorKind = /failed to fetch|networkerror|load failed|fetch failed/i.test(raw) ? "网络不可�? : raw || "网络不可�?;
-      result.authState = "不可�?;
+      result.errorKind = /failed to fetch|networkerror|load failed|fetch failed/i.test(raw) ? "网络不可达" : raw || "网络不可达";
+      result.authState = "不可达";
     }
     return result;
   } finally {
@@ -1665,12 +1665,12 @@ async function ensureApiBaseHealthyOnBoot() {
   if (!preferred) return;
   const probe = await probeAuthMeStatus(preferred);
   updateStartupSelfCheck({
-    authMe: probe.ok ? "�? : `${probe.errorKind}（HTTP ${probe.httpStatus || "-"}）`,
+    authMe: probe.ok ? "通" : `${probe.errorKind}（HTTP ${probe.httpStatus || "-"}）`,
     authState: probe.authState,
     errorKind: probe.errorKind,
   });
   if (probe.ok) return;
-  setStatus(`API Base 连通性检查失败：${preferred}（请确认后端已启动且 Nginx 已反�?/api）`, "error");
+  setStatus(`API Base 连通性检查失败：${preferred}（请确认后端已启动且 Nginx 已反代 /api）`, "error");
 }
 
 function isAuthExpiredError(error) {
@@ -1718,7 +1718,7 @@ function applyRolePermissions() {
     el.style.display = isAdmin ? "" : "none";
   });
   if (userRoleLabel) {
-    userRoleLabel.textContent = currentUser ? `${currentUser.username} · ${isAdmin ? "管理�? : "普通用�?}` : "后台管理控制�?;
+    userRoleLabel.textContent = currentUser ? `${currentUser.username} · ${isAdmin ? "管理员" : "普通用户"}` : "后台管理控制台";
   }
   if (!isAdmin && document.getElementById("adminHint")) {
     document.getElementById("adminHint").style.display = "none";
@@ -1762,7 +1762,7 @@ function isMailModuleFrameLoadedWrong(frame) {
     if (doc.getElementById("authShell") || doc.getElementById("appShell")) return true;
     if (/Auto Traces/i.test(title)) return true;
   } catch (_) {
-    // 跨域�?iframe 未就绪时不判�?
+    // 跨域或 iframe 未就绪时不判定
   }
   return false;
 }
@@ -1776,7 +1776,7 @@ function pushMailAuthToFrame(frame) {
       origin,
     );
   } catch (_) {
-    // 忽略跨域�?iframe 未就�?
+    // 忽略跨域或 iframe 未就绪
   }
 }
 
@@ -1793,9 +1793,9 @@ function navigateMailModuleFrame(route = "email") {
       placeholder?.classList.remove("hidden");
       const hint = document.getElementById("mailModuleTargetHint");
       if (hint) {
-        hint.textContent = `iframe 内仍是主控制台（浏览器缓存了修复前的页面）。请�?Ctrl+Shift+R 强刷，或新标签打开�?{mailAdminOrigin()}/mail-admin/${safeRoute}`;
+        hint.textContent = `iframe 内仍是主控制台（浏览器缓存了修复前的页面）。请按 Ctrl+Shift+R 强刷，或新标签打开：${mailAdminOrigin()}/mail-admin/${safeRoute}`;
       }
-      setStatus("邮箱模块加载异常：iframe 缓存了旧页面，请强刷浏览�?, "error");
+      setStatus("邮箱模块加载异常：iframe 缓存了旧页面，请强刷浏览器", "error");
       return;
     }
     pushMailAuthToFrame(frame);
@@ -1818,7 +1818,7 @@ function syncMailModuleSection(route) {
   contentShell?.classList.add("content--mail-module");
   const hint = document.getElementById("mailModuleTargetHint");
   if (hint) {
-    hint.textContent = `加载地址�?{mailAdminUrl(safeRoute)}`;
+    hint.textContent = `加载地址：${mailAdminUrl(safeRoute)}`;
   }
   navigateMailModuleFrame(safeRoute);
 }
@@ -1854,39 +1854,39 @@ async function switchSection(id, options = {}) {
   if (persist) {
     localStorage.setItem(LAST_SECTION_KEY, nextSectionId);
   }
-  // 切换菜单后将主内容滚动到顶部，避免短面板看起来“空白”�?
+  // 切换菜单后将主内容滚动到顶部，避免短面板看起来“空白”。
   if (contentShell && typeof contentShell.scrollTo === "function") {
     contentShell.scrollTo({ top: 0, behavior: "auto" });
   } else {
     window.scrollTo({ top: 0, behavior: "auto" });
   }
-  // 切回设备概览时主动拉取一次完整数据，避免必须手动点“刷新数据”�?
+  // 切回设备概览时主动拉取一次完整数据，避免必须手动点“刷新数据”。
   if (nextSectionId === "overview") {
     try {
       await loadOverview();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
   if (nextSectionId === "pc-service") {
     try {
       await loadPcServiceDevices();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
-  // 进入 follower_queue 页面时主动刷新表格与日志，避免必须翻页后才看到数据�?
+  // 进入 follower_queue 页面时主动刷新表格与日志，避免必须翻页后才看到数据。
   if (nextSectionId === "cv-access-data") {
     try {
       currentCvPage = 1;
       await loadCvAccessData();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
     try {
       await refreshTaskStatus();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
   if (nextSectionId === "account-manager") {
@@ -1895,7 +1895,7 @@ async function switchSection(id, options = {}) {
       await refreshAccountEditorLight();
       renderAccountEditorRows();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
   if (nextSectionId === "batch-stream") {
@@ -1906,7 +1906,7 @@ async function switchSection(id, options = {}) {
       await pollBatchStreamStatus();
       scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   } else {
     clearBatchStreamPollTimer();
@@ -1920,14 +1920,14 @@ async function switchSection(id, options = {}) {
       await loadAutoSwitchConfig({ refreshArchive: false });
       await loadBackupArchiveRecords();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
   if (nextSectionId === "db-table-section") {
     try {
       await loadDbTablePage();
     } catch (_) {
-      // 保持静默，避免打断页面切换；状态栏会显示已有错误�?
+      // 保持静默，避免打断页面切换；状态栏会显示已有错误。
     }
   }
   if (nextSectionId === "gallery-dispatch") {
@@ -1980,18 +1980,18 @@ async function parseFetchJsonResponse(response) {
   const text = await response.text();
   if (!text) return {};
   if (response.status === 413) {
-    throw new Error("上传文件过大，超过服务器限制�?13）。请减少单次数量，或联系管理员调�?Nginx client_max_body_size");
+    throw new Error("上传文件过大，超过服务器限制（413）。请减少单次数量，或联系管理员调大 Nginx client_max_body_size");
   }
   try {
     return JSON.parse(text);
   } catch {
     if (/^\s*</.test(text)) {
       if (/413|Request Entity Too Large|client_max_body/i.test(text)) {
-        throw new Error("上传文件过大，超过服务器限制。请减少单次数量，或联系管理员调�?Nginx client_max_body_size");
+        throw new Error("上传文件过大，超过服务器限制。请减少单次数量，或联系管理员调大 Nginx client_max_body_size");
       }
-      throw new Error("服务端返回了 HTML 页面而非 JSON，请检�?API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api�?);
+      throw new Error("服务端返回了 HTML 页面而非 JSON，请检查 API Base 是否指向后端（本地开发一般为 http://127.0.0.1:8000/api）");
     }
-    throw new Error(String(text).slice(0, 240) || "服务返回�?JSON 响应");
+    throw new Error(String(text).slice(0, 240) || "服务返回非 JSON 响应");
   }
 }
 
@@ -2043,7 +2043,7 @@ async function request(path, options = {}) {
         currentUser = null;
         authShell?.classList.remove("hidden");
         appShell?.classList.add("hidden");
-        if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登�?;
+        if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
       }
     }
     const text = await response.text();
@@ -2051,7 +2051,7 @@ async function request(path, options = {}) {
     try {
       data = text ? JSON.parse(text) : {};
     } catch {
-      data = { code: 1, msg: text || "服务返回�?JSON 响应" };
+      data = { code: 1, msg: text || "服务返回非 JSON 响应" };
     }
     appendDebugLog("RESPONSE", { url, status: response.status, ok: response.ok, data, baseBefore });
     updateRequestTrace({ phase: "response", url, baseBefore, baseAfter: baseBefore, method, status: `http ${response.status}`, changed: "-", note: data?.code === 0 ? "ok" : String(data?.msg || "api-error") });
@@ -2074,7 +2074,7 @@ async function request(path, options = {}) {
     const friendly = isAbortError
       ? "请求超时，请稍后重试"
       : (isNetworkFetchError
-        ? "无法连接服务器，请检查网络或联系管理�?
+        ? "无法连接服务器，请检查网络或联系管理员"
         : humanizeRequestErrorMessage(error));
     appendDebugLog("ERROR", { url, message: friendly, rawMessage: raw, baseBefore, timeoutMs, elapsedMs });
     updateRequestTrace({
@@ -2097,8 +2097,8 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const fallbackTemplate = String(context.fallbackTemplate || "default").trim() || "default";
   const alias = String(info?.alias || "").trim();
   const statusClass = info?.status;
-  const pending = info?.pending_start ? "�? : "�?;
-  const pendingBadge = info?.pending_start ? "<span class=\"badge pending\">待启�?/span>" : "-";
+  const pending = info?.pending_start ? "是" : "否";
+  const pendingBadge = info?.pending_start ? "<span class=\"badge pending\">待启动</span>" : "-";
   const disabled = info?.status === "offline" ? "disabled" : "";
   const rowStyle = info?.status === "offline" ? ' style="opacity:.55;"' : "";
   const groupName = String(info?.device_group || "").trim();
@@ -2150,10 +2150,10 @@ function renderDeviceRow(deviceId, info, context = {}) {
     badgeText = `智能 · ${branchLabel}`;
     badgeClass = "online";
     badgeHint = [
-      `高亮账号�?{res.tiktok_username || "（未解析�?}`,
-      `粉丝 ${res.follower_count ?? 0}�?${res.threshold_followers ?? 100} �?`,
+      `高亮账号：${res.tiktok_username || "（未解析）"}`,
+      `粉丝 ${res.follower_count ?? 0}（>${res.threshold_followers ?? 100} 且 `,
       `作品 ${res.video_count ?? 0} >${res.threshold_video_count ?? 15} 为老号分支）`,
-      `命中模板�?{templateDisplayName(selectedTemplate, currentTemplateMeta) || selectedTemplate}`,
+      `命中模板：${templateDisplayName(selectedTemplate, currentTemplateMeta) || selectedTemplate}`,
     ].join("\n");
   }
   const rowTemplateNames = (() => {
@@ -2169,11 +2169,11 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const smartToggleDisabled = !alias || !smartModeActive ? "disabled" : "";
   const smartToggleClass = smartEnabled ? "primary" : "ghost";
   const smartToggleTitle = !smartModeActive
-    ? "智能模板暂仅支持涨粉模式，请先在运行配置切换到涨粉模�?
+    ? "智能模板暂仅支持涨粉模式，请先在运行配置切换到涨粉模式"
     : "开启后按智能模板规则自动选模板，右侧下拉不可手动修改";
   const smartToggleLabel = !smartModeActive
-    ? "仅涨粉可�?
-    : (smartEnabled ? "已启�? : "启用智能模版");
+    ? "仅涨粉可用"
+    : (smartEnabled ? "已启用" : "启用智能模版");
   const smartCell = `
     <td style="white-space:nowrap;vertical-align:middle;">
       <button
@@ -2202,14 +2202,14 @@ function renderDeviceRow(deviceId, info, context = {}) {
       </select>
       <div style="margin-top:6px;">
         <span class="badge ${badgeClass} js-template-bind-state" title="${escapeHtml(String(badgeHint || ""))}">
-          ${escapeHtml(badgeText || "�?)}
+          ${escapeHtml(badgeText || "—")}
         </span>
       </div>
     </td>
   `;
   const optOut = Boolean(info?.auto_start_opt_out);
   const effectiveEnabled = adminAutoStartEnabled && !optOut;
-  const autoStartLabel = effectiveEnabled ? "开�? : "关闭";
+  const autoStartLabel = effectiveEnabled ? "开启" : "关闭";
   const autoStartCell = `
     <td>
       <button
@@ -2219,7 +2219,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
         data-action="toggle-device-auto-start"
         data-device="${deviceId}"
         data-optout="${optOut ? "1" : "0"}"
-        title="${adminAutoStartEnabled ? "点击切换该设备是否参与自动起号策�? : "当前总开关关闭，设备自动起号策略不会生效"}"
+        title="${adminAutoStartEnabled ? "点击切换该设备是否参与自动起号策略" : "当前总开关关闭，设备自动起号策略不会生效"}"
       >
         ${autoStartLabel}
       </button>
@@ -2282,7 +2282,7 @@ function renderDevices(devices, options = {}) {
   const aliasRefKeys = Array.from(collectTemplateRefsFromAliasMaps());
   const templateNames = [...new Set([...baseTemplateKeys, ...aliasRefKeys])].sort((a, b) => a.localeCompare(b));
   if (!templateNames.length) templateNames.push("default");
-  // 未命�?alias 映射时，按服务端 active_template 回显，避免“看起来已绑定”的假象�?
+  // 未命中 alias 映射时，按服务端 active_template 回显，避免“看起来已绑定”的假象。
   const fallbackTemplate = String(currentConfigTemplate || templateNames[0] || "default").trim() || "default";
   const visibleRows = Object.entries(devices)
     .filter(([, info]) => {
@@ -2320,12 +2320,12 @@ function renderDevices(devices, options = {}) {
       const opt = el?.dataset?.optout === "1";
       if (!did) return;
       try {
-      setStatus("正在更新单设备自动起号策�?..", "info");
+      setStatus("正在更新单设备自动起号策略...", "info");
         const data = await request("/api/admin/device_auto_start_opt_out", {
           method: "POST",
           body: JSON.stringify({ device_id: did, opt_out: !opt }),
         });
-        // 更新本地缓存并重�?
+        // 更新本地缓存并重绘
         if (latestDevices?.[did]) {
           latestDevices[did].auto_start_opt_out = Boolean(data.auto_start_opt_out);
         }
@@ -2342,14 +2342,14 @@ function renderDevices(devices, options = {}) {
       const el = e.currentTarget;
       const did = String(el?.dataset?.device || "").trim();
       const alias = String(el?.dataset?.alias || "").trim();
-      if (!guardAutoSwitchManualOps("发作�?, did)) return;
+      if (!guardAutoSwitchManualOps("发作品", did)) return;
       if (!did || !alias || el.disabled) return;
       const oldText = String(el.textContent || "发布作品").trim() || "发布作品";
       el.disabled = true;
-      el.textContent = "执行中�?;
+      el.textContent = "执行中…";
       try {
         appendPublishPostBatchLog(
-          `======== 发作品单�?${new Date().toLocaleString()} · ${alias} ========\n下发中…`,
+          `======== 发作品单台 ${new Date().toLocaleString()} · ${alias} ========\n下发中…`,
           true,
         );
         setStatus(`正在下发发作品入口：${alias}…`, "info");
@@ -2360,14 +2360,14 @@ function renderDevices(devices, options = {}) {
         });
         const opId = String(resp?.op_id || "").trim();
         if (!opId) {
-          throw new Error(resp?.msg || "未返�?op_id");
+          throw new Error(resp?.msg || "未返回 op_id");
         }
-        appendPublishPostBatchLog(`�?${alias}：已下发，等待最终结果…`);
-        setStatus(`已下�?${alias}，等待发作品最终结果…`, "info");
+        appendPublishPostBatchLog(`⏳ ${alias}：已下发，等待最终结果…`);
+        setStatus(`已下发 ${alias}，等待发作品最终结果…`, "info");
         const result = await waitForPublishPostFinalResult(opId, 900000);
         const line = formatPublishPostFinalLine(alias, result, null);
         appendPublishPostBatchLog(
-          `======== 发作品最终结�?${new Date().toLocaleString()} ========\n${line}`,
+          `======== 发作品最终结果 ${new Date().toLocaleString()} ========\n${line}`,
           true,
         );
         await loadOverview();
@@ -2376,9 +2376,9 @@ function renderDevices(devices, options = {}) {
         const ok = result?.status === "success" && Boolean(data.publish_post_completed);
         setStatus(ok ? `发作品成功：${alias}` : `发作品失败：${alias}`, ok ? "success" : "error");
       } catch (error) {
-        const msg = error.message || "发作品失�?;
+        const msg = error.message || "发作品失败";
         appendPublishPostBatchLog(
-          `======== 发作品最终结�?${new Date().toLocaleString()} ========\n�?${alias}�?{msg}`,
+          `======== 发作品最终结果 ${new Date().toLocaleString()} ========\n❌ ${alias}：${msg}`,
           true,
         );
         setStatus(msg, "error");
@@ -2394,10 +2394,10 @@ function renderDevices(devices, options = {}) {
       const did = String(el?.dataset?.device || "").trim();
       const alias = String(el?.dataset?.alias || "").trim();
       if (!did) return;
-      if (!window.confirm(`确认删除设备�?{alias || did}」吗？`)) return;
+      if (!window.confirm(`确认删除设备「${alias || did}」吗？`)) return;
       const oldText = String(el.textContent || "删除").trim() || "删除";
       el.disabled = true;
-      el.textContent = "删除�?..";
+      el.textContent = "删除中...";
       try {
         setStatus("正在删除设备...", "info");
         await request("/api/admin/device/delete", {
@@ -2436,7 +2436,7 @@ function renderDevices(devices, options = {}) {
           persistCustomDeviceGroupNames();
         }
         void refreshDeviceGroupsDetail();
-        setStatus(data?.msg || `设备已设为�?{displayGroupName(picked)}」`, "success");
+        setStatus(data?.msg || `设备已设为「${displayGroupName(picked)}」`, "success");
       } catch (error) {
         setStatus(error.message || "更新设备分组失败", "error");
         target.value = prevValue;
@@ -2472,7 +2472,7 @@ function renderDevices(devices, options = {}) {
           : aliasTemplateByMode;
         const stateEl = target?.closest("td")?.querySelector(".js-template-bind-state");
         if (stateEl) {
-          stateEl.textContent = "已绑�?显式)";
+          stateEl.textContent = "已绑定(显式)";
           stateEl.classList.remove("offline", "pending");
           stateEl.classList.add("online");
         }
@@ -2508,7 +2508,7 @@ function renderDevices(devices, options = {}) {
       const nextEnabled = !currentlyOn;
       const oldText = String(el.textContent || "").trim();
       el.disabled = true;
-      el.textContent = "处理中�?;
+      el.textContent = "处理中…";
       try {
         const data = await request("/api/admin/alias_smart_template/toggle", {
           method: "POST",
@@ -2533,7 +2533,7 @@ function renderDevices(devices, options = {}) {
         };
         renderDevices(latestDevices, { skipSmartPreview: true });
         bindDeviceSelection();
-        setStatus(data?.msg || (nextEnabled ? "已启用智能模�? : "已关闭智能模�?), "success");
+        setStatus(data?.msg || (nextEnabled ? "已启用智能模板" : "已关闭智能模板"), "success");
       } catch (error) {
         setStatus(error.message || "切换智能模板失败", "error");
         el.textContent = oldText;
@@ -2557,7 +2557,7 @@ function renderTagList(target, items, options = {}) {
     .join("");
 }
 
-/** 与后�?BASE_DEFAULT_CONFIG 对齐：多行文案类控件在「配置对象缺键」时不得只靠 input �?HTML defaultValue，否则易误回退为旧默认�?*/
+/** 与后端 BASE_DEFAULT_CONFIG 对齐：多行文案类控件在「配置对象缺键」时不得只靠 input 的 HTML defaultValue，否则易误回退为旧默认。 */
 const TEXT_LIST_CONFIG_FORM_KEYS = [
   "comment_texts",
   "mutual_comment_texts",
@@ -2601,7 +2601,7 @@ function setupNoRestToggleListeners() {
   syncNoRestUi();
 }
 
-/** 「互�?仅关注」与评论/作者区/Followers 三项互斥�?*/
+/** 「互点-仅关注」与评论/作者区/Followers 三项互斥。 */
 function syncMutualTrafficActionMutex(changedInput = null) {
   const { followOnlyEl, actionEls } = mutualTrafficActionCheckboxEls();
   if (!followOnlyEl || !actionEls.length) return;
@@ -2654,7 +2654,7 @@ function fillConfigForm(config, mode = currentRunMode) {
   const modeSelect = document.getElementById("configModeSelect");
   if (modeSelect) modeSelect.value = mode;
   const cfg = config && typeof config === "object" ? config : {};
-  // 先回到页面默认值，避免不同来源配置仅返回部分字段时残留旧值�?
+  // 先回到页面默认值，避免不同来源配置仅返回部分字段时残留旧值。
   configForm.querySelectorAll("input[name], textarea[name], select[name]").forEach((input) => {
     if (TEXT_LIST_CONFIG_FORM_KEYS.includes(input.name)) {
       return;
@@ -2707,7 +2707,7 @@ function fillConfigForm(config, mode = currentRunMode) {
     }
     input.value = value;
   });
-  // 配置快照未带某多行键（旧库、共享模板直拷等）时，用当前模式默认 payload 回填，避免停�?HTML 内联默认文案上�?
+  // 配置快照未带某多行键（旧库、共享模板直拷等）时，用当前模式默认 payload 回填，避免停在 HTML 内联默认文案上。
   const modeKey = mode === "live" || mode === "direct" ? mode : "growth";
   const payloadDefaults = MODE_DEFAULT_CONFIG_PAYLOADS[modeKey] || MODE_DEFAULT_CONFIG_PAYLOADS.growth;
   for (const key of TEXT_LIST_CONFIG_FORM_KEYS) {
@@ -2764,7 +2764,7 @@ function populateDeviceGroupFilterOptions(groupNames = []) {
   const buildOptions = () => {
     const base = [
       '<option value="">全部分组</option>',
-      '<option value="__ungrouped__">未分�?/option>',
+      '<option value="__ungrouped__">未分组</option>',
     ];
     deviceGroupNames.forEach((name) => {
       base.push(`<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`);
@@ -2889,7 +2889,7 @@ function getFilteredAccountEditorIndexedRows() {
   return visibleRows;
 }
 
-/** 按有效别名分组（空别名归�?__EMPTY_ALIAS__）；sort=true 时按所选方式排序组间顺�?*/
+/** 按有效别名分组（空别名归入 __EMPTY_ALIAS__）；sort=true 时按所选方式排序组间顺序 */
 function buildAccountEditorAliasGroups(indexedRows = [], { sort = true } = {}) {
   const groups = new Map();
   (indexedRows || []).forEach((item) => {
@@ -3019,14 +3019,14 @@ function collectSelectedAccountDeleteSnapshots() {
 
 async function deleteSelectedAccountRecords() {
   if (!accountRecordsSelectedRowIndexes.size) {
-    setStatus("请先勾选要删除的账号记�?, "warning");
+    setStatus("请先勾选要删除的账号记录", "warning");
     return;
   }
   let pendingSnapshots = collectSelectedAccountDeleteSnapshots();
   if (!pendingSnapshots.length) {
     clearAccountRecordsSelection();
     renderAccountEditorRows();
-    setStatus("勾选的记录已不存在，请刷新后重�?, "warning");
+    setStatus("勾选的记录已不存在，请刷新后重试", "warning");
     return;
   }
   const withAlias = pendingSnapshots.filter((item) => Boolean(item.assignedAlias));
@@ -3036,7 +3036,7 @@ async function deleteSelectedAccountRecords() {
     .filter(Boolean)
     .slice(0, 8);
   if (previewNames.length) {
-    confirmLines.push(`账号�?{previewNames.join("�?)}${pendingSnapshots.length > previewNames.length ? " �? : ""}`);
+    confirmLines.push(`账号：${previewNames.join("、")}${pendingSnapshots.length > previewNames.length ? " …" : ""}`);
   }
   if (withAlias.length) {
     confirmLines.push(`其中 ${withAlias.length} 条已分配别名，将同步删除设备备份档案中的对应数据`);
@@ -3044,7 +3044,7 @@ async function deleteSelectedAccountRecords() {
   if (!window.confirm(confirmLines.join("\n"))) return;
 
   if (accountRecordsBatchDeleteBtn) accountRecordsBatchDeleteBtn.disabled = true;
-  setStatus(`正在批量删除 ${pendingSnapshots.length} 条账号记�?..`, "info");
+  setStatus(`正在批量删除 ${pendingSnapshots.length} 条账号记录...`, "info");
   let deletedAccounts = 0;
   let deletedDeviceRows = 0;
   let notFoundCount = 0;
@@ -3096,13 +3096,13 @@ async function deleteSelectedAccountRecords() {
       return;
     }
     if (deletedAccounts <= 0) {
-      setStatus(notFoundCount > 0 ? "所选记录已不存�? : "未删除任何记�?, "warning");
+      setStatus(notFoundCount > 0 ? "所选记录已不存在" : "未删除任何记录", "warning");
       return;
     }
-    const parts = [`已批量删�?${deletedAccounts} 条账号记录`];
+    const parts = [`已批量删除 ${deletedAccounts} 条账号记录`];
     if (deletedDeviceRows > 0) parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
     if (notFoundCount > 0) parts.push(`${notFoundCount} 条已不存在`);
-    setStatus(parts.join("�?), notFoundCount > 0 ? "warning" : "success");
+    setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
   } catch (error) {
     await refreshEditorTablesAfterAccountDelete();
     throw error;
@@ -3117,7 +3117,7 @@ function updateAccountRecordsPagerUi() {
   if (currentAccountRecordsPage > totalPages) currentAccountRecordsPage = totalPages;
   if (currentAccountRecordsPage < 1) currentAccountRecordsPage = 1;
   if (accountRecordsPagerEl) {
-    accountRecordsPagerEl.textContent = `�?${currentAccountRecordsPage} / ${totalPages} �?| 每页 ${pageSize} �?| �?${accountRecordsFilteredTotal} 条（按别名折叠）`;
+    accountRecordsPagerEl.textContent = `第 ${currentAccountRecordsPage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${accountRecordsFilteredTotal} 条（按别名折叠）`;
   }
   if (accountRecordsPrevPageBtn) accountRecordsPrevPageBtn.disabled = currentAccountRecordsPage <= 1;
   if (accountRecordsNextPageBtn) accountRecordsNextPageBtn.disabled = currentAccountRecordsPage >= totalPages;
@@ -3140,7 +3140,7 @@ function updateOverviewPagerUi() {
   if (currentOverviewPage > totalPages) currentOverviewPage = totalPages;
   if (currentOverviewPage < 1) currentOverviewPage = 1;
   if (overviewPageInfoEl) {
-    overviewPageInfoEl.textContent = `�?${currentOverviewPage} / ${totalPages} �?| 每页 ${pageSize} �?| �?${overviewDevicesTotal} 台`;
+    overviewPageInfoEl.textContent = `第 ${currentOverviewPage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${overviewDevicesTotal} 台`;
   }
   if (overviewPrevPageBtn) overviewPrevPageBtn.disabled = currentOverviewPage <= 1;
   if (overviewNextPageBtn) overviewNextPageBtn.disabled = currentOverviewPage >= totalPages;
@@ -3152,7 +3152,7 @@ function updateBackupArchivePagerUi() {
   if (currentBackupArchivePage > totalPages) currentBackupArchivePage = totalPages;
   if (currentBackupArchivePage < 1) currentBackupArchivePage = 1;
   if (deviceAliasGroupsPagerEl) {
-    deviceAliasGroupsPagerEl.textContent = `�?${currentBackupArchivePage} / ${totalPages} �?| 每页 ${pageSize} �?| �?${backupArchiveAliasTotal} 组`;
+    deviceAliasGroupsPagerEl.textContent = `第 ${currentBackupArchivePage} / ${totalPages} 页 | 每页 ${pageSize} 组 | 共 ${backupArchiveAliasTotal} 组`;
   }
   if (backupArchivePrevPageBtn) backupArchivePrevPageBtn.disabled = currentBackupArchivePage <= 1;
   if (backupArchiveNextPageBtn) backupArchiveNextPageBtn.disabled = currentBackupArchivePage >= totalPages;
@@ -3165,15 +3165,15 @@ function updateStartHint() {
   const groupLabel = !currentDeviceGroupFilter
     ? "全部分组"
     : currentDeviceGroupFilter === "__ungrouped__"
-      ? "未分�?
+      ? "未分组"
       : currentDeviceGroupFilter;
 
   if (!total) {
-    startHintEl.textContent = "暂无设备�?;
+    startHintEl.textContent = "暂无设备。";
   } else if (!selected.length) {
     startHintEl.textContent = `当前筛选：${groupLabel}；请选择设备：任意状态可启动，运行中/异常可停止。`;
   } else {
-    startHintEl.textContent = `当前筛选：${groupLabel}；已�?${selected.length} 台（可启�?${selected.length}，可停止 ${selectedRunnable.length}）`;
+    startHintEl.textContent = `当前筛选：${groupLabel}；已选 ${selected.length} 台（可启动 ${selected.length}，可停止 ${selectedRunnable.length}）`;
   }
 
   const allChecks = document.querySelectorAll(".device-check");
@@ -3210,7 +3210,7 @@ function selectedDeviceIds() {
 
 function displayGroupName(value) {
   const name = String(value || "").trim();
-  return !name || name === "__ungrouped__" ? "未分�? : name;
+  return !name || name === "__ungrouped__" ? "未分组" : name;
 }
 
 function loadCustomDeviceGroupNames() {
@@ -3272,12 +3272,12 @@ function renderGroupManagerList(items = []) {
   const rows = Array.isArray(items) ? items : [];
   if (!rows.length) {
     groupManagerListEl.innerHTML = '<div class="hint">暂无分组数据</div>';
-    if (groupManagerSummaryEl) groupManagerSummaryEl.textContent = "当前没有任何分组�?;
+    if (groupManagerSummaryEl) groupManagerSummaryEl.textContent = "当前没有任何分组。";
     return;
   }
   const totalAliases = rows.reduce((sum, row) => sum + Number(row?.count || 0), 0);
   if (groupManagerSummaryEl) {
-    groupManagerSummaryEl.textContent = `�?${rows.length} 个分组，覆盖 ${totalAliases} 个别名。`;
+    groupManagerSummaryEl.textContent = `共 ${rows.length} 个分组，覆盖 ${totalAliases} 个别名。`;
   }
   groupManagerListEl.innerHTML = rows.map((row) => {
     const name = String(row?.group_name || "").trim() || "__ungrouped__";
@@ -3286,9 +3286,9 @@ function renderGroupManagerList(items = []) {
       <div class="panel-card" style="margin:0 0 10px 0;padding:12px;background:#f8faff;">
         <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
           <strong>${escapeHtml(displayGroupName(name))}</strong>
-          <span class="hint">${aliases.length} 个别�?/span>
+          <span class="hint">${aliases.length} 个别名</span>
         </div>
-        <div class="tag-list" style="margin-top:8px;">${(aliases.length ? aliases : ["�?]).map((a) => `<li>${escapeHtml(a)}</li>`).join("")}</div>
+        <div class="tag-list" style="margin-top:8px;">${(aliases.length ? aliases : ["无"]).map((a) => `<li>${escapeHtml(a)}</li>`).join("")}</div>
       </div>
     `;
   }).join("");
@@ -3319,7 +3319,7 @@ async function openGroupMoveModal() {
   customDeviceGroupNames = loadCustomDeviceGroupNames();
   const aliases = getDeviceAliasesForSelection();
   if (groupMoveSelectedAliasesEl) {
-    groupMoveSelectedAliasesEl.textContent = aliases.length ? aliases.join("�?) : "暂无选择（可在概览表格中勾选设备）";
+    groupMoveSelectedAliasesEl.textContent = aliases.length ? aliases.join("、") : "暂无选择（可在概览表格中勾选设备）";
   }
   try {
     await refreshDeviceGroupsDetail();
@@ -3341,7 +3341,7 @@ function closeGroupMoveModal() {
 async function confirmGroupMove() {
   const deviceIds = selectedDeviceIds();
   if (!deviceIds.length) {
-    setGroupManageMessage("请先在设备概览勾选要分组的设�?, "warning");
+    setGroupManageMessage("请先在设备概览勾选要分组的设备", "warning");
     return;
   }
   const picked = String(groupMoveSelectEl?.value || "").trim();
@@ -3362,8 +3362,8 @@ async function confirmGroupMove() {
     if (document.querySelector(".panel.active")?.id === "backup-section") {
       await loadBackupArchiveRecords();
     }
-    setGroupManageMessage(`已将 ${deviceIds.length} 台设备设为�?{displayGroupName(picked)}」`, "success");
-    setStatus(data?.msg || "分组已更�?, "success");
+    setGroupManageMessage(`已将 ${deviceIds.length} 台设备设为「${displayGroupName(picked)}」`, "success");
+    setStatus(data?.msg || "分组已更新", "success");
   } catch (error) {
     setGroupManageMessage(error.message || "应用分组失败", "error");
   }
@@ -3372,11 +3372,11 @@ async function confirmGroupMove() {
 async function addDeviceAliasGroup() {
   const name = String(newGroupNameInput?.value || "").trim();
   if (!name) {
-    setGroupManageMessage("请输入分组名�?, "warning");
+    setGroupManageMessage("请输入分组名称", "warning");
     return;
   }
   if (name === "__ungrouped__") {
-    setGroupManageMessage("不能使用保留名称「未分组�?, "warning");
+    setGroupManageMessage("不能使用保留名称「未分组」", "warning");
     return;
   }
   if (!customDeviceGroupNames.includes(name)) {
@@ -3385,16 +3385,16 @@ async function addDeviceAliasGroup() {
   }
   newGroupNameInput.value = "";
   renderGroupMoveSelect(name);
-  setGroupManageMessage(`已添加分组名�?{name}`, "success");
+  setGroupManageMessage(`已添加分组名：${name}`, "success");
 }
 
 async function deleteCurrentDeviceAliasGroup() {
   const name = String(groupMoveSelectEl?.value || "").trim();
   if (!name || name === "__ungrouped__") {
-    setGroupManageMessage("未分组不能删�?, "warning");
+    setGroupManageMessage("未分组不能删除", "warning");
     return;
   }
-  if (!window.confirm(`确定删除分组�?{name}」？该组内设备将变为未分组。`)) return;
+  if (!window.confirm(`确定删除分组「${name}」？该组内设备将变为未分组。`)) return;
   try {
     setGroupManageMessage("正在删除分组...", "info");
     const data = await request("/api/admin/devices/delete_group", {
@@ -3406,7 +3406,7 @@ async function deleteCurrentDeviceAliasGroup() {
     await refreshDeviceGroupsDetail();
     renderGroupMoveSelect("__ungrouped__");
     await loadOverview();
-    setGroupManageMessage(data?.msg || "分组已删�?, "success");
+    setGroupManageMessage(data?.msg || "分组已删除", "success");
   } catch (error) {
     setGroupManageMessage(error.message || "删除分组失败", "error");
   }
@@ -3421,14 +3421,14 @@ async function startDevices(deviceIds) {
     return;
   }
   try {
-    setStatus("启动指令下发�?..", "info");
+    setStatus("启动指令下发中...", "info");
     const data = await request("/api/start_task", {
       method: "POST",
       body: JSON.stringify({ device_ids: deviceIds }),
     });
     await loadOverview();
     setStatus(
-      `启动指令已下�?${data.count} 台设备；下方日志每几秒自动刷新。若无新日志请打开手机 App 并保持后台运行。`,
+      `启动指令已下发 ${data.count} 台设备；下方日志每几秒自动刷新。若无新日志请打开手机 App 并保持后台运行。`,
       "success",
     );
   } catch (error) {
@@ -3451,7 +3451,7 @@ async function stopDevices(deviceIds) {
       body: JSON.stringify({ device_ids: deviceIds }),
     });
     await loadOverview();
-    setStatus(`已停�?${data.count} 台设备后台服务`, "success");
+    setStatus(`已停止 ${data.count} 台设备后台服务`, "success");
   } catch (error) {
     setStatus(error.message || "停止失败", "error");
   }
@@ -3465,7 +3465,7 @@ async function applyTemplateToSelectedDevices() {
   }
   const selectedIds = selectedDeviceIds();
   if (!selectedIds.length) {
-    setStatus("请先勾选设�?, "warning");
+    setStatus("请先勾选设备", "warning");
     return;
   }
   const targets = selectedIds
@@ -3486,7 +3486,7 @@ async function applyTemplateToSelectedDevices() {
 
   let successCount = 0;
   let failedCount = 0;
-  setStatus(`正在批量修改模板�?{uniqueTargets.length} 台）...`, "info");
+  setStatus(`正在批量修改模板（${uniqueTargets.length} 台）...`, "info");
   for (const item of uniqueTargets) {
     try {
       const data = await request("/api/admin/alias_template/select", {
@@ -3510,16 +3510,16 @@ async function applyTemplateToSelectedDevices() {
   bindDeviceSelection();
   const templateText = templateDisplayName(templateName, currentTemplateMeta) || templateName;
   if (failedCount > 0) {
-    setStatus(`批量修改完成：成�?${successCount} 台，失败 ${failedCount} 台（模板�?{templateText}）`, "warning");
+    setStatus(`批量修改完成：成功 ${successCount} 台，失败 ${failedCount} 台（模板：${templateText}）`, "warning");
   } else {
-    setStatus(`批量修改成功�?{successCount} 台已切换�?${templateText}`, "success");
+    setStatus(`批量修改成功：${successCount} 台已切换为 ${templateText}`, "success");
   }
 }
 
 function normalizePcServiceUrl(raw) {
   const url = String(raw || "").trim().replace(/\/+$/, "");
   if (!/^https?:\/\//i.test(url)) {
-    throw new Error("PC 服务地址须以 http:// �?https:// 开�?);
+    throw new Error("PC 服务地址须以 http:// 或 https:// 开头");
   }
   return url;
 }
@@ -3554,7 +3554,7 @@ function updatePcServicePagerUi() {
   const totalPages = Math.max(1, Math.ceil(pcServiceDevicesTotal / pageSize));
   if (currentPcServicePage > totalPages) currentPcServicePage = totalPages;
   if (pcServicePageInfoEl) {
-    pcServicePageInfoEl.textContent = `�?${currentPcServicePage} / ${totalPages} �?| 每页 ${pageSize} �?| �?${pcServiceDevicesTotal} 台`;
+    pcServicePageInfoEl.textContent = `第 ${currentPcServicePage} / ${totalPages} 页 | 每页 ${pageSize} 条 | 共 ${pcServiceDevicesTotal} 台`;
   }
   if (pcServicePrevPageBtn) pcServicePrevPageBtn.disabled = currentPcServicePage <= 1;
   if (pcServiceNextPageBtn) pcServiceNextPageBtn.disabled = currentPcServicePage >= totalPages;
@@ -3578,7 +3578,7 @@ function selectedPcServiceDeviceIds() {
 function updatePcServiceSelectionHint() {
   if (!pcServiceSelectionHint) return;
   const count = selectedPcServiceDeviceIds().length;
-  pcServiceSelectionHint.textContent = `已�?${count} 台`;
+  pcServiceSelectionHint.textContent = `已选 ${count} 台`;
 }
 
 function bindPcServiceSelection() {
@@ -3597,12 +3597,12 @@ function renderPcServiceTable(devices = pcServiceDevices) {
     return;
   }
   pcServiceTableBody.innerHTML = entries.map(([deviceId, info]) => {
-    const alias = String(info?.alias || "").trim() || "�?;
+    const alias = String(info?.alias || "").trim() || "—";
     const group = displayGroupName(info?.device_group || "");
     const status = String(info?.status || "offline");
     const statusClass = escapeHtml(status);
-    const currentUrl = String(info?.pc_service_url || "").trim() || "�?;
-    // offline 也可勾选下发：不灰置整行，避免误以为不可操�?
+    const currentUrl = String(info?.pc_service_url || "").trim() || "—";
+    // offline 也可勾选下发：不灰置整行，避免误以为不可操作
     return `
       <tr>
         <td><input type="checkbox" class="pc-service-check" data-device="${escapeHtml(deviceId)}" /></td>
@@ -3666,7 +3666,7 @@ async function applyPcServiceUrlToSelectedDevices() {
   }
   const selectedIds = selectedPcServiceDeviceIds();
   if (!selectedIds.length) {
-    setStatus("请先勾选要下发的设�?, "warning");
+    setStatus("请先勾选要下发的设备", "warning");
     return;
   }
   const items = selectedIds.map((deviceId) => {
@@ -3677,7 +3677,7 @@ async function applyPcServiceUrlToSelectedDevices() {
       windows_base_url: windowsBaseUrl,
     };
   });
-  setStatus(`正在下发 PC 地址�?${items.length} 台设�?..`, "info");
+  setStatus(`正在下发 PC 地址到 ${items.length} 台设备...`, "info");
   if (pcServiceApplyBtn) pcServiceApplyBtn.disabled = true;
   try {
     const { ok, data } = await requestPcServiceBatchSet({ items });
@@ -3685,19 +3685,19 @@ async function applyPcServiceUrlToSelectedDevices() {
     const enqueued = Number(data?.enqueued || 0);
     const failed = Number(data?.failed || 0);
     const stamp = new Date().toLocaleString();
-    appendPcServiceResultLog(`[${stamp}] ${data?.msg || "下发完成"} �?${windowsBaseUrl}`);
+    appendPcServiceResultLog(`[${stamp}] ${data?.msg || "下发完成"} → ${windowsBaseUrl}`);
     results.forEach((row) => {
       const alias = String(row?.alias || "").trim();
       const label = alias ? `${alias} (${row.device_id})` : String(row.device_id || "");
       const status = Number(row?.code) === 0 ? "成功" : "失败";
-      appendPcServiceResultLog(`  · ${label}: ${status}${row?.msg ? ` �?${row.msg}` : ""}`);
+      appendPcServiceResultLog(`  · ${label}: ${status}${row?.msg ? ` — ${row.msg}` : ""}`);
     });
     if (!ok || Number(data?.code) !== 0) {
       setStatus(data?.msg || "下发失败", failed > 0 && enqueued > 0 ? "warning" : "error");
     } else if (failed > 0) {
-      setStatus(`下发完成：成�?${enqueued} 台，失败 ${failed} 台`, "warning");
+      setStatus(`下发完成：成功 ${enqueued} 台，失败 ${failed} 台`, "warning");
     } else {
-      setStatus(`已入�?${enqueued} 台，设备轮询后将自动更新`, "success");
+      setStatus(`已入队 ${enqueued} 台，设备轮询后将自动更新`, "success");
     }
     await loadPcServiceDevices();
   } catch (error) {
@@ -3884,13 +3884,13 @@ function updateModeButtons() {
   }
 }
 
-/** 更新设备卡片、表格、别名筛选下表格、运维下拉与日志区（�?overview �?logs_snapshot 共用�?*/
+/** 更新设备卡片、表格、别名筛选下表格、运维下拉与日志区（由 overview 或 logs_snapshot 共用） */
 function applyDevicesAndLogsPayload(data, options = {}) {
   const shouldSyncRunMode = options.syncRunMode === true;
   const shouldSyncConfigForm = options.syncConfigForm === true;
   const hasDevicesField = data && Object.prototype.hasOwnProperty.call(data, "devices");
   const hasDeviceLogsField = data && Object.prototype.hasOwnProperty.call(data, "device_logs");
-  // logs_snapshot 可能只返回部分字段；缺失字段时保留上次有效数据，避免把概览清零�?
+  // logs_snapshot 可能只返回部分字段；缺失字段时保留上次有效数据，避免把概览清零。
   const devices = hasDevicesField ? (data.devices || {}) : (latestDevices || {});
   const deviceLogs = hasDeviceLogsField ? (data.device_logs || {}) : (latestDeviceLogs || {});
   latestDevices = devices;
@@ -3940,9 +3940,9 @@ async function loadOverview() {
   const startedAt = Date.now();
   const overviewPromise = request(`/api/admin/overview?${overviewQueryString()}`);
   const data = await overviewPromise;
-  // overview 仅用于设备与概览数据；配置表单必须由 runtime_config/template_select 驱动�?
-  // 否则会出现“模板名正确但表单值被 overview 旧快照覆盖”的错位�?
-  // 勿用 overview �?run_mode 覆盖本地：其曾取自全局 store，会导致别名模板映射查错 mode 并自动回�?default�?
+  // overview 仅用于设备与概览数据；配置表单必须由 runtime_config/template_select 驱动，
+  // 否则会出现“模板名正确但表单值被 overview 旧快照覆盖”的错位。
+  // 勿用 overview 的 run_mode 覆盖本地：其曾取自全局 store，会导致别名模板映射查错 mode 并自动回绑 default。
   applyDevicesAndLogsPayload(data, { syncRunMode: false, syncConfigForm: false });
   const queueStats = data?.queue_stats || {};
   const followerPendingCount =
@@ -3984,7 +3984,7 @@ async function pollOverviewSnapshot() {
     overviewAutoRefreshCooldownUntil = 0;
   } catch (_) {
     overviewAutoRefreshCooldownUntil = Date.now() + 30000;
-    // 静默失败，避免频繁提示；用户可手动刷新查看错误信息�?
+    // 静默失败，避免频繁提示；用户可手动刷新查看错误信息。
   } finally {
     overviewAutoRefreshInFlight = false;
   }
@@ -3992,13 +3992,13 @@ async function pollOverviewSnapshot() {
 
 async function handleRefresh() {
   try {
-    setStatus("刷新�?..", "info");
+    setStatus("刷新中...", "info");
     await loadUserRuntimeConfig();
     await loadOverview();
     if (document.getElementById("pc-service")?.classList.contains("active")) {
       await loadPcServiceDevices();
     }
-    setStatus("已刷新概�?, "success");
+    setStatus("已刷新概览", "success");
   } catch (error) {
     setStatus(error.message || "刷新失败", "error");
   }
@@ -4013,14 +4013,14 @@ async function uploadUsernames() {
     return;
   }
   try {
-    setStatus("导入�?..", "info");
+    setStatus("导入中...", "info");
     const data = await request("/api/admin/add_usernames", {
       method: "POST",
       body: JSON.stringify({ usernames }),
     });
     input.value = "";
     await loadOverview();
-    setStatus(`导入成功（新�?${data.count} 条）`, "success");
+    setStatus(`导入成功（新增 ${data.count} 条）`, "success");
   } catch (error) {
     setStatus(error.message || "导入失败", "error");
   }
@@ -4031,7 +4031,7 @@ function templateDisplayName(key, meta = {}) {
   if (!k) return "";
   const m = meta?.[k];
   if (!m || !m.shared) {
-    // Fallback: template_meta missing 时，尝试�?shared::<owner>::<name> 中解析展示名�?
+    // Fallback: template_meta missing 时，尝试从 shared::<owner>::<name> 中解析展示名。
     if (k.startsWith("shared::")) {
       const parts = k.split("::", 3);
       if (parts.length >= 3) {
@@ -4141,7 +4141,7 @@ function paintTemplateInventoryFromLastFetch() {
   if (!templateInventoryListEl) return;
   const d = lastTemplateInventoryData;
   if (!d) {
-    templateInventoryListEl.innerHTML = '<div class="hint">暂无清单数据，请点击「刷新模板列表�?/div>';
+    templateInventoryListEl.innerHTML = '<div class="hint">暂无清单数据，请点击「刷新模板列表」</div>';
     if (templateInventorySummaryEl) templateInventorySummaryEl.textContent = "";
     return;
   }
@@ -4152,7 +4152,7 @@ function paintTemplateInventoryFromLastFetch() {
 
   if (showAllUsers) {
     if (!allUsersRows.length) {
-      templateInventoryListEl.innerHTML = '<div class="hint">全站暂无 configs_by_template 数据�?/div>';
+      templateInventoryListEl.innerHTML = '<div class="hint">全站暂无 configs_by_template 数据行</div>';
       if (templateInventorySummaryEl) templateInventorySummaryEl.textContent = "已请求全站原始键视图（数据库无记录）";
       return;
     }
@@ -4161,14 +4161,14 @@ function paintTemplateInventoryFromLastFetch() {
       if (!u) return;
       const rawKeys = Array.isArray(row.raw_keys) ? row.raw_keys : [];
       const invalidKeys = new Set(Array.isArray(row.invalid_keys) ? row.invalid_keys : []);
-      parts.push(`<div style="margin-top:10px;font-weight:600;">用户 <code>${escapeHtml(u)}</code>：原始键 ${rawKeys.length} 个（损坏�?${invalidKeys.size} 个）</div>`);
+      parts.push(`<div style="margin-top:10px;font-weight:600;">用户 <code>${escapeHtml(u)}</code>：原始键 ${rawKeys.length} 个（损坏值 ${invalidKeys.size} 个）</div>`);
       rawKeys.forEach((name) => {
         const inv = invalidKeys.has(name);
         const canDel = u === me && templateInventoryRowCanDelete(name) && !inv;
         const checked = canDel && name !== currentConfigTemplate ? "checked" : "";
         const disabled = canDel ? "" : "disabled";
         const label = templateDisplayName(name, currentTemplateMeta) || name;
-        const tip = u !== me ? "非当前登录用户，仅展�? : (inv ? "值非对象，无法通过此处删除" : (canDel ? "可删�? : "不可�?));
+        const tip = u !== me ? "非当前登录用户，仅展示" : (inv ? "值非对象，无法通过此处删除" : (canDel ? "可删除" : "不可删"));
         parts.push(`<label style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px dashed #f0f0f0;">
           <input type="checkbox" class="template-inventory-check" data-template-name="${escapeHtml(name)}" ${checked} ${disabled} />
           <span style="flex:1;"><span class="hint">${escapeHtml(u)} /</span> ${escapeHtml(label)} <span class="hint">(key: ${escapeHtml(name)})</span>${inv ? ' <span class="hint">[损坏]</span>' : ""}</span>
@@ -4177,7 +4177,7 @@ function paintTemplateInventoryFromLastFetch() {
       });
     });
     if (templateInventorySummaryEl) {
-      templateInventorySummaryEl.textContent = `全站账号 ${allUsersRows.length} 个（数据�?configs_by_template 原始键，未过滤）`;
+      templateInventorySummaryEl.textContent = `全站账号 ${allUsersRows.length} 个（数据库 configs_by_template 原始键，未过滤）`;
     }
     templateInventoryListEl.innerHTML = parts.join("");
     return;
@@ -4190,7 +4190,7 @@ function paintTemplateInventoryFromLastFetch() {
       const mode = escapeHtml(o?.mode || "");
       const alias = escapeHtml(o?.alias || "");
       const ref = escapeHtml(o?.ref || "");
-      parts.push(`<div class="hint" style="padding:4px 0;border-bottom:1px dashed #eee;">${mode} / alias <code>${alias}</code> �?<code>${ref}</code></div>`);
+      parts.push(`<div class="hint" style="padding:4px 0;border-bottom:1px dashed #eee;">${mode} / alias <code>${alias}</code> → <code>${ref}</code></div>`);
     });
   }
 
@@ -4199,21 +4199,21 @@ function paintTemplateInventoryFromLastFetch() {
   const bad = new Set(d.raw_invalid_value_keys || []);
   const union = Array.from(new Set([...raw, ...eff])).sort((a, b) => a.localeCompare(b));
 
-  parts.push('<div style="margin:10px 0 6px;font-weight:600;">当前账号：原始键 �?合并可见�?/div>');
+  parts.push('<div style="margin:10px 0 6px;font-weight:600;">当前账号：原始键 ∪ 合并可见键</div>');
   union.forEach((name) => {
     const tags = [];
     if (raw.has(name)) tags.push("原始DB");
     if (eff.has(name)) tags.push("合并可见");
-    if (bad.has(name)) tags.push("值损�?);
+    if (bad.has(name)) tags.push("值损坏");
     const inv = bad.has(name);
     const canDel = templateInventoryRowCanDelete(name) && !inv;
     const checked = canDel && name !== currentConfigTemplate ? "checked" : "";
     const disabled = canDel ? "" : "disabled";
     const label = templateDisplayName(name, currentTemplateMeta) || name;
-    const tip = inv ? "值非对象" : (canDel ? "可删�? : (name === "default" ? "默认不可�? : "共享或不可删"));
+    const tip = inv ? "值非对象" : (canDel ? "可删除" : (name === "default" ? "默认不可删" : "共享或不可删"));
     parts.push(`<label style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px dashed #f0f0f0;">
       <input type="checkbox" class="template-inventory-check" data-template-name="${escapeHtml(name)}" ${checked} ${disabled} />
-      <span style="flex:1;">${escapeHtml(label)} <span class="hint">(key: ${escapeHtml(name)})</span> <span class="hint">[${escapeHtml(tags.join(" · ") || "�?)}]</span></span>
+      <span style="flex:1;">${escapeHtml(label)} <span class="hint">(key: ${escapeHtml(name)})</span> <span class="hint">[${escapeHtml(tags.join(" · ") || "—")}]</span></span>
       <span class="hint">${escapeHtml(tip)}</span>
     </label>`);
   });
@@ -4221,7 +4221,7 @@ function paintTemplateInventoryFromLastFetch() {
   templateInventoryListEl.innerHTML = parts.join("") || '<div class="hint">无模板键</div>';
   if (templateInventorySummaryEl) {
     const act = d.stored_active_template ? String(d.stored_active_template) : "";
-    templateInventorySummaryEl.textContent = `原始�?${raw.size} 个，合并可见 ${eff.size} 个，去重合并 ${union.size} 个；别名缺失引用 ${orphans.length} �?{act ? `；服务端 active_template�?{act}` : ""}`;
+    templateInventorySummaryEl.textContent = `原始键 ${raw.size} 个，合并可见 ${eff.size} 个，去重合并 ${union.size} 个；别名缺失引用 ${orphans.length} 条${act ? `；服务端 active_template：${act}` : ""}`;
   }
 }
 
@@ -4229,7 +4229,7 @@ async function refreshTemplateInventoryFromServer() {
   if (!templateInventoryListEl) return;
   const allUsers = templateInventoryAllUsersEl?.checked ? 1 : 0;
   lastTemplateInventoryData = null;
-  templateInventoryListEl.innerHTML = '<div class="hint">加载模板清单�?/div>';
+  templateInventoryListEl.innerHTML = '<div class="hint">加载模板清单…</div>';
   try {
     const data = await request(`/api/admin/template_inventory?all_users=${allUsers}&_ts=${Date.now()}`);
     lastTemplateInventoryData = data.data || null;
@@ -4274,7 +4274,7 @@ function describeCurrentTemplate() {
   const label = templateDisplayName(key, currentTemplateMeta) || key;
   const source = getCurrentTemplateSourceInfo();
   const owner = source?.source_username ? `，来源用户：${source.source_username}` : "";
-  return `当前模板�?{label}（key: ${key}${owner}）`;
+  return `当前模板：${label}（key: ${key}${owner}）`;
 }
 
 function setTemplateGrantStatus(text = "") {
@@ -4329,7 +4329,7 @@ function collectConfig() {
     }
     payload[key] = Number(value);
   }
-  // follower_queue 批次：控件在「直客访问模式数据」页，不�?configForm 内，保存运行配置时需合并
+  // follower_queue 批次：控件在「直客访问模式数据」页，不在 configForm 内，保存运行配置时需合并
   if (processQueueBatchSizeInput && processQueueBatchSizeInput.value.trim() !== "") {
     const v = Number(processQueueBatchSizeInput.value);
     if (Number.isFinite(v)) {
@@ -4369,7 +4369,7 @@ async function saveConfig() {
     return;
   }
   try {
-    setStatus(`保存账号独立配置�?{currentRunMode}）中...`, "info");
+    setStatus(`保存账号独立配置（${currentRunMode}）中...`, "info");
     console.log("[saveConfig] sending update_config", {
       currentRunMode,
       currentConfigTemplate,
@@ -4388,7 +4388,7 @@ async function saveConfig() {
     currentConfigTemplate = savedTemplate;
     localStorage.setItem(LAST_TEMPLATE_KEY, savedTemplate);
 
-    // 强制回显：先立即把刚保存的值写回表单，避免接口延迟或返回旧快照导致页面看起来没变�?
+    // 强制回显：先立即把刚保存的值写回表单，避免接口延迟或返回旧快照导致页面看起来没变。
     fillConfigForm({ ...collectConfig(), ...payload }, currentRunMode);
     syncCvQualityFilterInputsFromConfig({ ...collectConfig(), ...payload });
     persistCommentTextsToLocal();
@@ -4466,7 +4466,7 @@ async function saveCvQualityFilter() {
     syncCvQualityFilterInputsFromConfig(echoed);
     setStatus("筛选阈值已更新", "success");
   } catch (error) {
-    setStatus(error.message || "筛选阈值更新失�?, "error");
+    setStatus(error.message || "筛选阈值更新失败", "error");
   }
 }
 
@@ -4524,7 +4524,7 @@ function applyCvAccessView() {
   renderCvAccessTable(pageItems);
 
   if (cvPageInfoEl) {
-    cvPageInfoEl.textContent = `�?${currentCvPage} / ${totalPages} �?| 每页 ${pageSize} | 总数 ${total}`;
+    cvPageInfoEl.textContent = `第 ${currentCvPage} / ${totalPages} 页 | 每页 ${pageSize} | 总数 ${total}`;
   }
   if (cvPrevPageBtn) cvPrevPageBtn.disabled = currentCvPage <= 1;
   if (cvNextPageBtn) cvNextPageBtn.disabled = currentCvPage >= totalPages;
@@ -4553,7 +4553,7 @@ async function loadCvAccessDataFromTablePage() {
   cvAccessUseServerPaging = true;
   cvAccessTotal = Number(data.total || 0);
   cvAccessTotalPages = Math.max(1, Math.ceil(cvAccessTotal / pageSize));
-  // table_page 返回�?page 可能被服务端修正
+  // table_page 返回的 page 可能被服务端修正
   if (Number.isFinite(Number(data.page))) currentCvPage = Number(data.page);
 }
 
@@ -4571,7 +4571,7 @@ async function loadCvAccessData() {
       await loadCvAccessDataFromTablePage();
     }
   } catch (e) {
-    // follower_queue 快照明细不可用时回退�?table_page
+    // follower_queue 快照明细不可用时回退到 table_page
     await loadCvAccessDataFromTablePage();
   }
   applyCvAccessView();
@@ -4580,8 +4580,8 @@ async function loadCvAccessData() {
 
 async function loadAccounts() {
   const startedAt = Date.now();
-  if (liveCustomerList) liveCustomerList.innerHTML = '<li>加载�?..</li>';
-  if (tiktokRootsTableBody) tiktokRootsTableBody.innerHTML = '<tr><td colspan="5" style="padding:10px;color:#666;">加载�?..</td></tr>';
+  if (liveCustomerList) liveCustomerList.innerHTML = '<li>加载中...</li>';
+  if (tiktokRootsTableBody) tiktokRootsTableBody.innerHTML = '<tr><td colspan="5" style="padding:10px;color:#666;">加载中...</td></tr>';
   const [liveRes, rootsRes] = await Promise.allSettled([
     request("/api/admin/live_customers"),
     loadTiktokRootsData(),
@@ -4603,8 +4603,8 @@ async function loadAccounts() {
 
   if (liveRes.status === "rejected" || rootsRes.status === "rejected") {
     const messages = [];
-    if (liveRes.status === "rejected") messages.push(`live_customers 加载失败�?{liveRes.reason?.message || "unknown"}`);
-    if (rootsRes.status === "rejected") messages.push(`tiktok_roots 加载失败�?{rootsRes.reason?.message || "unknown"}`);
+    if (liveRes.status === "rejected") messages.push(`live_customers 加载失败：${liveRes.reason?.message || "unknown"}`);
+    if (rootsRes.status === "rejected") messages.push(`tiktok_roots 加载失败：${rootsRes.reason?.message || "unknown"}`);
     setStatus(messages.join(" | "), "warning");
   }
 
@@ -4663,7 +4663,7 @@ function currentTiktokRootsPageItems() {
 
 function updateTiktokRootsPageUi() {
   if (tiktokRootsPageInfoEl) {
-    tiktokRootsPageInfoEl.textContent = `�?${currentTiktokRootsPage} / ${tiktokRootsTotalPages} �?| 每页 ${Number(tiktokRootsPageSizeEl?.value || 100)} | 总数 ${tiktokRootsTotal}`;
+    tiktokRootsPageInfoEl.textContent = `第 ${currentTiktokRootsPage} / ${tiktokRootsTotalPages} 页 | 每页 ${Number(tiktokRootsPageSizeEl?.value || 100)} | 总数 ${tiktokRootsTotal}`;
   }
   if (tiktokRootsPrevPageBtn) tiktokRootsPrevPageBtn.disabled = currentTiktokRootsPage <= 1;
   if (tiktokRootsNextPageBtn) tiktokRootsNextPageBtn.disabled = currentTiktokRootsPage >= tiktokRootsTotalPages;
@@ -4695,7 +4695,7 @@ async function addSelectedRootsToPending() {
     });
     await loadTiktokRootsData();
     renderTikTokRootsTable(tiktokRootsItems || []);
-    setStatus(data.msg || `已加入待下发队列：新�?${data.inserted ?? data.count ?? 0} 条`, "success");
+    setStatus(data.msg || `已加入待下发队列：新增 ${data.inserted ?? data.count ?? 0} 条`, "success");
   } catch (error) {
     setStatus(error.message || "写入失败", "error");
   }
@@ -4703,7 +4703,7 @@ async function addSelectedRootsToPending() {
 
 async function addAllRootsToPending() {
   try {
-    setStatus("正在将全�?tiktok_roots 写入待下发队列（服务端处理）...", "info");
+    setStatus("正在将全部 tiktok_roots 写入待下发队列（服务端处理）...", "info");
     const result = await request("/api/admin/mobile_pending_usernames/add_all_roots", {
       method: "POST",
       timeoutMs: 600000,
@@ -4713,21 +4713,21 @@ async function addAllRootsToPending() {
     const selected = Number(result.selected || 0);
     const inserted = Number(result.inserted ?? result.count ?? 0);
     const skippedPending = Number(result.skipped_already_pending || 0);
-    const skippedNote = skippedPending > 0 ? `�?{skippedPending} 条已在队列中` : "";
+    const skippedNote = skippedPending > 0 ? `，${skippedPending} 条已在队列中` : "";
     setStatus(
       result.code === 0 && inserted <= 0 && skippedPending > 0
-        ? (result.msg || `无新用户写入�?{skippedPending} 个已在待下发队列中）`)
-        : `已将全部根用户写入待下发队列：新�?${inserted} 条（�?${selected} �?{skippedNote}）`,
+        ? (result.msg || `无新用户写入（${skippedPending} 个已在待下发队列中）`)
+        : `已将全部根用户写入待下发队列：新增 ${inserted} 条（共 ${selected} 条${skippedNote}）`,
       inserted > 0 || (result.code === 0 && skippedPending > 0) ? "success" : "warning",
     );
   } catch (error) {
-    setStatus(error.message || "全量加入待下发队列失�?, "error");
+    setStatus(error.message || "全量加入待下发队列失败", "error");
   }
 }
 
 async function loadTiktokRootsData() {
   const pageSize = Number(tiktokRootsPageSizeEl?.value || 100);
-  // 与“数据库分页”保持同源，避免不同后端版本的专用接口行为差异�?
+  // 与“数据库分页”保持同源，避免不同后端版本的专用接口行为差异。
   const data = await request(
     `/api/admin/table_page?table=tiktok_roots&page=${currentTiktokRootsPage}&page_size=${pageSize}`
   );
@@ -4755,7 +4755,7 @@ async function addTikTokRoots() {
   }
 
   try {
-    setStatus("添加根用户到 tiktok_roots �?..", "info");
+    setStatus("添加根用户到 tiktok_roots 中...", "info");
     const data = await request("/api/admin/tiktok_roots", {
       method: "POST",
       body: JSON.stringify({ usernames, roots_type }),
@@ -4765,9 +4765,9 @@ async function addTikTokRoots() {
     selectedTiktokRootIds.clear();
     await loadAccounts();
     await refreshTaskStatus();
-    setStatus(`已添加到 tiktok_roots�?{data.inserted}/${data.total_rows}`, "success");
+    setStatus(`已添加到 tiktok_roots：${data.inserted}/${data.total_rows}`, "success");
   } catch (error) {
-    setStatus(error.message || "添加根用户失�?, "error");
+    setStatus(error.message || "添加根用户失败", "error");
   }
 }
 
@@ -4778,9 +4778,9 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
   }
   mobilePendingExportInFlight = true;
   try {
-    const action = clearAfterExport ? "导出并清�? : "导出";
+    const action = clearAfterExport ? "导出并清空" : "导出";
     setMobilePendingExportButtonsBusy(true, action);
-    setStatus(`已提交后�?{action}任务，处理中…`, "info");
+    setStatus(`已提交后台${action}任务，处理中…`, "info");
     appendMobilePendingLog(`异步${action}：已提交后台任务`, true);
 
     const startData = await request("/api/admin/mobile_pending_usernames/export_start", {
@@ -4792,7 +4792,7 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
     if (!jobId) {
       throw new Error("服务端未返回 job_id");
     }
-    appendMobilePendingLog(`任务 id�?{jobId}`);
+    appendMobilePendingLog(`任务 id：${jobId}`);
 
     const pollIntervalMs = 500;
     const maxWaitMs = 20 * 60 * 1000;
@@ -4822,7 +4822,7 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
         continue;
       }
       if (status === "gone") {
-        throw new Error(String(st?.msg || "任务不存在或已过�?));
+        throw new Error(String(st?.msg || "任务不存在或已过期"));
       }
       if (status === "failed") {
         const msg =
@@ -4843,7 +4843,7 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
 
     if (!data) {
       throw new Error(
-        `${action}等待超时�?{Math.round(maxWaitMs / 60000)} 分钟）；若导出量大可能仍在服务端执行，请稍后再刷新查看队列`,
+        `${action}等待超时（${Math.round(maxWaitMs / 60000)} 分钟）；若导出量大可能仍在服务端执行，请稍后再刷新查看队列`,
       );
     }
 
@@ -4853,7 +4853,7 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
     const previewText = filenames.slice(0, 5).join(", ");
     const suffix = filenames.length > 5 ? ` ... (+${filenames.length - 5})` : "";
     appendMobilePendingLog(
-      `结果�?{JSON.stringify({
+      `结果：${JSON.stringify({
         count: data?.count,
         cleared: data?.cleared,
         batch_count: data?.batch_count,
@@ -4871,16 +4871,16 @@ async function exportMobilePendingUsernames(clearAfterExport = false) {
     const cleared = Number(data?.cleared || 0) || 0;
     const batchText = batchCount > 1 ? `，共 ${batchCount} 个文件` : "";
     if (clearAfterExport) {
-      setStatus(`导出成功�?{fileName}${batchText}，共 ${count} 条，已清�?${cleared} 条`, "success");
-      appendMobilePendingLog(`完成�?{fileName}${batchText}，共 ${count} 条，已清�?${cleared} 条`);
+      setStatus(`导出成功：${fileName}${batchText}，共 ${count} 条，已清空 ${cleared} 条`, "success");
+      appendMobilePendingLog(`完成：${fileName}${batchText}，共 ${count} 条，已清空 ${cleared} 条`);
     } else {
-      setStatus(`导出成功�?{fileName}${batchText}，共 ${count} 条`, "success");
-      appendMobilePendingLog(`完成�?{fileName}${batchText}，共 ${count} 条`);
+      setStatus(`导出成功：${fileName}${batchText}，共 ${count} 条`, "success");
+      appendMobilePendingLog(`完成：${fileName}${batchText}，共 ${count} 条`);
     }
   } catch (error) {
     const message = error.message || "导出失败";
     setStatus(message, "error");
-    appendMobilePendingLog(`失败�?{message}`);
+    appendMobilePendingLog(`失败：${message}`);
   } finally {
     mobilePendingExportInFlight = false;
     setMobilePendingExportButtonsBusy(false);
@@ -4898,13 +4898,13 @@ async function downloadMobilePendingExportFiles(fileNames) {
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index];
     if (index > 0) {
-      // 主动让出主线程，避免大批量文件时 UI 假死�?
+      // 主动让出主线程，避免大批量文件时 UI 假死。
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     }
     const url = `${base}/admin/mobile_pending_usernames/export_file?filename=${encodeURIComponent(name)}`;
     const response = await fetch(url, { method: "GET", headers, cache: "no-store" });
     if (!response.ok) {
-      throw new Error(`下载导出文件失败�?{name} (HTTP ${response.status})`);
+      throw new Error(`下载导出文件失败：${name} (HTTP ${response.status})`);
     }
     const blob = await response.blob();
     const objectUrl = window.URL.createObjectURL(blob);
@@ -4926,11 +4926,11 @@ async function addMobilePendingUsernames() {
   const raw = (input?.value || "").split("\n").map((item) => item.trim());
   const usernames = raw.filter(Boolean);
   if (!usernames.length) {
-    setStatus("请填写要加入待下发队列的用户�?, "warning");
+    setStatus("请填写要加入待下发队列的用户名", "warning");
     return;
   }
   try {
-    setStatus("写入 mobile_pending_usernames �?..", "info");
+    setStatus("写入 mobile_pending_usernames 中...", "info");
     const data = await request("/api/admin/mobile_pending_usernames/add", {
       method: "POST",
       body: JSON.stringify({ usernames }),
@@ -4938,15 +4938,15 @@ async function addMobilePendingUsernames() {
     if (input) input.value = "";
     await loadOverview();
     await loadAccounts();
-    setStatus(`已写入待下发队列�?{data.inserted ?? data.count ?? 0} 条`, "success");
+    setStatus(`已写入待下发队列：${data.inserted ?? data.count ?? 0} 条`, "success");
   } catch (error) {
-    setStatus(error.message || "写入待下发队列失�?, "error");
+    setStatus(error.message || "写入待下发队列失败", "error");
   }
 }
 
 async function resetTikTokRootsUsage() {
   try {
-    setStatus("正在�?usage_count 归零...", "info");
+    setStatus("正在将 usage_count 归零...", "info");
     const data = await request("/api/admin/tiktok_roots/reset_usage", {
       method: "POST",
     });
@@ -4965,7 +4965,7 @@ async function importTikTokRoots() {
     return;
   }
   try {
-    setStatus(dedupOnly ? "正在按仅判重模式导入�?tiktok_roots..." : "正在导入根用户表格到 tiktok_roots...", "info");
+    setStatus(dedupOnly ? "正在按仅判重模式导入到 tiktok_roots..." : "正在导入根用户表格到 tiktok_roots...", "info");
     const formData = new FormData();
     formData.append("file", file);
     formData.append("dedup_only", dedupOnly ? "1" : "0");
@@ -4984,13 +4984,13 @@ async function importTikTokRoots() {
     const queuedText = dedupOnly ? "" : (typeof data.queued === "number" ? `，待下发 ${data.queued}` : "");
     setStatus(`根用户导入完成：${data.inserted}/${data.total_rows}${queuedText}`, "success");
   } catch (error) {
-    setStatus(error.message || "导入根用户失�?, "error");
+    setStatus(error.message || "导入根用户失败", "error");
   }
 }
 
 async function triggerTask(path, successText) {
   try {
-    setStatus("任务触发�?..", "info");
+    setStatus("任务触发中...", "info");
     const container_ids = (taskContainerIdsInput?.value || "").trim();
     const parallelRaw = Number(taskParallelInput?.value || 1);
     const parallel = Math.max(1, Number.isFinite(parallelRaw) ? parallelRaw : 1);
@@ -5016,7 +5016,7 @@ async function stopTaskByPrefix(prefix, successText) {
       body: JSON.stringify({ prefix }),
     });
     await refreshTaskStatus();
-    setStatus(`${successText}（停�?${data.stopped_count ?? 0} 个进程）`, "success");
+    setStatus(`${successText}（停止 ${data.stopped_count ?? 0} 个进程）`, "success");
   } catch (error) {
     setStatus(error.message || "停止任务失败", "error");
   }
@@ -5026,7 +5026,7 @@ async function triggerTaskWithOptions(path, successText, options = {}) {
   const containerIdsInput = options.containerIdsInput || taskContainerIdsInput;
   const parallelInput = options.parallelInput || taskParallelInput;
   try {
-    setStatus("任务触发�?..", "info");
+    setStatus("任务触发中...", "info");
     const container_ids = (containerIdsInput?.value || "").trim();
     const parallelRaw = Number(parallelInput?.value || 1);
     const parallel = Math.max(1, Number.isFinite(parallelRaw) ? parallelRaw : 1);
@@ -5157,28 +5157,28 @@ async function refreshTaskStatus() {
     applyBackupStatsFullQueryScheduleUi({
       available: data.backup_stats_full_query_schedule_available !== false,
       enabled: !!data.backup_stats_full_query_enabled,
-      disabled_reason: data.backup_stats_full_query_schedule === "暂时不可�?
-        ? "每日定时全量查询暂时不可�?
+      disabled_reason: data.backup_stats_full_query_schedule === "暂时不可用"
+        ? "每日定时全量查询暂时不可用"
         : "",
     });
     if (taskStatusEl) {
       const runningLabel = runningTasks.length
         ? runningTasks.map((item) => item?.name || item).join(", ")
-        : "�?;
-      const autoSw = data.auto_switch_enabled ? "开" : "�?;
+        : "无";
+      const autoSw = data.auto_switch_enabled ? "开" : "关";
       const bj = data.auto_switch_beijing_time
         ? `${data.auto_switch_beijing_date || ""} ${data.auto_switch_beijing_time}`.trim()
         : "";
       const bsq = data.backup_stats_full_query_schedule_available === false
         ? "暂不可用"
-        : (data.backup_stats_full_query_enabled ? "开" : "�?);
+        : (data.backup_stats_full_query_enabled ? "开" : "关");
       const bsqLast = data.backup_stats_full_query_last_run_date || "-";
-      const bsqRun = data.backup_stats_full_query_in_flight ? "执行�? : "空闲";
+      const bsqRun = data.backup_stats_full_query_in_flight ? "执行中" : "空闲";
       taskStatusEl.textContent = [
-        `总开�? ${data.scheduler_enabled ? "开" : "�?}`,
-        `自动切号: ${autoSw}${bj ? `（北�?${bj}）` : ""}`,
-        `每日全量: ${bsq}（上�?${bsqLast}�?{bsqRun}）`,
-        `运行�? ${runningLabel}`,
+        `总开关: ${data.scheduler_enabled ? "开" : "关"}`,
+        `自动切号: ${autoSw}${bj ? `（北京 ${bj}）` : ""}`,
+        `每日全量: ${bsq}（上次 ${bsqLast}，${bsqRun}）`,
+        `运行中: ${runningLabel}`,
         `粉丝增长监控: ${JSON.stringify(data.auto_search_schedule || {})}`,
       ].join("  |  ");
     }
@@ -5188,10 +5188,10 @@ async function refreshTaskStatus() {
   } catch (error) {
     taskStatusRefreshCooldownUntil = Date.now() + 15000;
     if (taskStatusEl) {
-      taskStatusEl.textContent = `任务状态读取失�? ${error.message || "unknown"}`;
+      taskStatusEl.textContent = `任务状态读取失败: ${error.message || "unknown"}`;
     }
     if (schedulerTaskSettingsEl) {
-      schedulerTaskSettingsEl.textContent = "任务状态读取失�?;
+      schedulerTaskSettingsEl.textContent = "任务状态读取失败";
     }
     if (schedulerTaskLogsEl) {
       schedulerTaskLogsEl.textContent = "日志读取失败";
@@ -5283,7 +5283,7 @@ function countVisibleAutoSwitchSelectedGroups() {
   return count;
 }
 
-/** 收集待开�?关闭自动切号�?device_id（勾选记�?/ 本组全�?/ 按别名多�?/ 程序化全选）�?*/
+/** 收集待开启/关闭自动切号的 device_id（勾选记录 / 本组全选 / 按别名多选 / 程序化全选）。 */
 function collectAutoSwitchTargetDeviceIds() {
   const ids = new Set();
   if (autoSwitchPickDeviceIds instanceof Set) {
@@ -5344,7 +5344,7 @@ function isAutoSwitchGloballyEnabled() {
 function updateAutoSwitchEnabledCountHint() {
   if (!autoSwitchEnabledCountHint) return;
   const enabled = Array.from(autoSwitchDevicesById.entries()).filter(([, on]) => on).length;
-  autoSwitchEnabledCountHint.textContent = enabled > 0 ? `自动切号中：${enabled} 台设备` : "自动切号：未开�?;
+  autoSwitchEnabledCountHint.textContent = enabled > 0 ? `自动切号中：${enabled} 台设备` : "自动切号：未开启";
 }
 
 function applyAutoSwitchManualOpsUi() {
@@ -5353,7 +5353,7 @@ function applyAutoSwitchManualOpsUi() {
     ["startSelectedBtn", "启动选中"],
     ["startAllBtn", "启动全部"],
     ["stopSelectedBtn", "停止选中"],
-    ["publishPostStartSelectedBtn", "批量发作�?],
+    ["publishPostStartSelectedBtn", "批量发作品"],
   ].forEach(([id, label]) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -5371,8 +5371,8 @@ function applyAutoSwitchManualOpsUi() {
       pickCount > 0
         ? `为已选的 ${pickCount} 台设备开启自动切号（本机自治）`
         : rawCount > 0
-          ? "所选别名尚未绑定有�?device_id，请先在设备总览完成客户端绑�?
-          : "请勾选别名组左侧复选框，或点「全选本页�?;
+          ? "所选别名尚未绑定有效 device_id，请先在设备总览完成客户端绑定"
+          : "请勾选别名组左侧复选框，或点「全选本页」";
   }
   if (autoSwitchDisableSelectedBtn) {
     const pickCount = collectAutoSwitchTargetDeviceIds().length;
@@ -5383,7 +5383,7 @@ function applyAutoSwitchManualOpsUi() {
 
 const AUTO_SWITCH_MANUAL_BLOCK_HINT = "该设备已开启自动切号，请先关闭后再操作";
 
-function guardAutoSwitchManualOps(actionLabel = "该操�?, deviceId = "", alias = "", rowDeviceId = "") {
+function guardAutoSwitchManualOps(actionLabel = "该操作", deviceId = "", alias = "", rowDeviceId = "") {
   const did = String(deviceId || "").trim() || resolveDeviceIdForArchiveAlias(alias, rowDeviceId);
   if (!isAutoSwitchEnabledForDeviceId(did)) return true;
   setStatus(`${actionLabel}不可用：${AUTO_SWITCH_MANUAL_BLOCK_HINT}`, "warning");
@@ -5403,7 +5403,7 @@ function parseAutoSwitchExcludedBatchUsernames(rawText) {
   for (const line of lines) {
     let name = String(line || "").trim();
     if (!name) continue;
-    // 兼容粘贴�?@ 前缀�?TikTok username
+    // 兼容粘贴带 @ 前缀的 TikTok username
     if (name.startsWith("@")) name = name.slice(1).trim();
     if (!name) continue;
     const key = name.toLowerCase();
@@ -5422,7 +5422,7 @@ function openAutoSwitchExcludedBatchModal() {
   }
   autoSwitchExcludedBatchModalEl.classList.remove("hidden");
   autoSwitchExcludedBatchModalEl.setAttribute("aria-hidden", "false");
-  // 先展示弹窗再聚焦，避�?hidden 状态下 focus 无效
+  // 先展示弹窗再聚焦，避免 hidden 状态下 focus 无效
   autoSwitchExcludedBatchTextarea?.focus();
 }
 
@@ -5435,19 +5435,19 @@ function closeAutoSwitchExcludedBatchModal() {
 async function submitAutoSwitchExcludedBatch(excluded) {
   const usernames = parseAutoSwitchExcludedBatchUsernames(autoSwitchExcludedBatchTextarea?.value || "");
   if (!usernames.length) {
-    setAutoSwitchExcludedBatchMessage("请至少填写一�?username（一行一个）", "warning");
+    setAutoSwitchExcludedBatchMessage("请至少填写一个 username（一行一个）", "warning");
     return;
   }
-  const actionText = excluded ? "不参加自动切�? : "参加自动切号";
+  const actionText = excluded ? "不参加自动切号" : "参加自动切号";
   const detail = excluded
-    ? "开启后，这些账号将从自动切号计划和 bundle 中排除�?
-    : "关闭后，这些账号会重新参与自动切号计划�?;
-  if (!window.confirm(`确认�?${usernames.length} 个账号批量设置为�?{actionText}”？\n${detail}`)) {
+    ? "开启后，这些账号将从自动切号计划和 bundle 中排除。"
+    : "关闭后，这些账号会重新参与自动切号计划。";
+  if (!window.confirm(`确认将 ${usernames.length} 个账号批量设置为“${actionText}”？\n${detail}`)) {
     return;
   }
   if (autoSwitchExcludedBatchExcludeBtn) autoSwitchExcludedBatchExcludeBtn.disabled = true;
   if (autoSwitchExcludedBatchJoinBtn) autoSwitchExcludedBatchJoinBtn.disabled = true;
-  setAutoSwitchExcludedBatchMessage(`正在批量设置为�?{actionText}”…`, "info");
+  setAutoSwitchExcludedBatchMessage(`正在批量设置为“${actionText}”…`, "info");
   try {
     const resp = await request("/api/admin/editor/device_rows/auto_switch_excluded_batch", {
       method: "POST",
@@ -5462,15 +5462,15 @@ async function submitAutoSwitchExcludedBatch(excluded) {
     const notFound = Array.isArray(resp?.not_found) ? resp.not_found : [];
     const disabledDevices = Number(resp?.devices_disabled || 0);
     const notifiedDevices = Number(resp?.devices_notified || 0);
-    const parts = [`已批量设置为�?{actionText}”：更新 ${updatedRows} 条`];
-    if (unchangedRows > 0) parts.push(`已是该状�?${unchangedRows} 条`);
-    if (notFound.length > 0) parts.push(`未找�?${notFound.length} 个`);
-    if (disabledDevices > 0) parts.push(`已自动关�?${disabledDevices} 台设备自动切号`);
+    const parts = [`已批量设置为“${actionText}”：更新 ${updatedRows} 条`];
+    if (unchangedRows > 0) parts.push(`已是该状态 ${unchangedRows} 条`);
+    if (notFound.length > 0) parts.push(`未找到 ${notFound.length} 个`);
+    if (disabledDevices > 0) parts.push(`已自动关闭 ${disabledDevices} 台设备自动切号`);
     else if (notifiedDevices > 0) parts.push(`已重同步 ${notifiedDevices} 台设备`);
-    const msg = parts.join("�?);
+    const msg = parts.join("，");
     const level = notFound.length > 0 || disabledDevices > 0 ? "warning" : "success";
     setAutoSwitchExcludedBatchMessage(
-      notFound.length > 0 ? `${msg}。未找到�?{notFound.slice(0, 20).join(", ")}${notFound.length > 20 ? "�? : ""}` : msg,
+      notFound.length > 0 ? `${msg}。未找到：${notFound.slice(0, 20).join(", ")}${notFound.length > 20 ? "…" : ""}` : msg,
       level,
     );
     setStatus(msg, level);
@@ -5501,7 +5501,7 @@ async function loadAutoSwitchConfig(options = {}) {
       autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
       autoSwitchCutSchemeSelect.title = autoSwitchCutScheme === "login"
         ? "当前：登录切号（清数据后直接登录目标号，不还原备份）"
-        : "当前：备份切号（备份→清理→还原�?;
+        : "当前：备份切号（备份→清理→还原）";
     }
     applyAutoSwitchManualOpsUi();
     populateAutoSwitchSessionSummariesAliasOptions();
@@ -5518,7 +5518,7 @@ async function loadAutoSwitchConfig(options = {}) {
 }
 
 async function saveAutoSwitchCutScheme(scheme) {
-  // 并发保存排队等待，避免下拉已切到新值但请求被静默丢�?
+  // 并发保存排队等待，避免下拉已切到新值但请求被静默丢弃
   while (autoSwitchCutSchemeSaveInFlight) {
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
@@ -5535,12 +5535,12 @@ async function saveAutoSwitchCutScheme(scheme) {
       autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
       autoSwitchCutSchemeSelect.title = autoSwitchCutScheme === "login"
         ? "当前：登录切号（清数据后直接登录目标号，不还原备份）"
-        : "当前：备份切号（备份→清理→还原�?;
+        : "当前：备份切号（备份→清理→还原）";
     }
     const notified = Number(data?.data?.notified || 0);
     const parts = [data?.msg || (autoSwitchCutScheme === "login" ? "已切换为登录切号" : "已切换为备份切号")];
     if (notified > 0) parts.push(`已通知 ${notified} 台自动切号设备重同步`);
-    setStatus(parts.join("�?), "success");
+    setStatus(parts.join("；"), "success");
   } catch (error) {
     if (autoSwitchCutSchemeSelect) autoSwitchCutSchemeSelect.value = autoSwitchCutScheme;
     setStatus(error.message || "保存切号方案失败", "error");
@@ -5569,7 +5569,7 @@ function renderSmartTemplateDebugBlock(debug) {
         : "";
     const src = String(row.resolution_source || "");
     const srcText = src ? ` · ${src}` : "";
-    return `<li><code>${escapeHtml(user)}</code> �?${escapeHtml(tpl)}�?{escapeHtml(branch)}${rollText}${srcText}�?/li>`;
+    return `<li><code>${escapeHtml(user)}</code> → ${escapeHtml(tpl)}（${escapeHtml(branch)}${rollText}${srcText}）</li>`;
   });
   if (!rows.length && !debug.session_id) return "";
   const meta = [
@@ -5589,11 +5589,11 @@ function renderAccountActivityAuditBlock(reconciliation) {
   const items = Array.isArray(reconciliation?.account_activity) ? reconciliation.account_activity : [];
   if (!items.length) return "";
   const actionLabel = {
-    like: "�?,
-    comment: "�?,
-    favorite: "�?,
-    share: "�?,
-    mutual_traffic_comment: "引流�?,
+    like: "赞",
+    comment: "评",
+    favorite: "藏",
+    share: "转",
+    mutual_traffic_comment: "引流评",
     mutual_follow: "关注",
   };
   const rows = items.map((item) => {
@@ -5606,25 +5606,25 @@ function renderAccountActivityAuditBlock(reconciliation) {
     const cfg = item?.template_config && typeof item.template_config === "object" ? item.template_config : {};
     const counts = item?.action_counts && typeof item.action_counts === "object" ? item.action_counts : {};
     const cfgParts = [];
-    if (cfg.mutual_traffic_comment) cfgParts.push("引流�?);
+    if (cfg.mutual_traffic_comment) cfgParts.push("引流评");
     if (cfg.mutual_traffic_author_follow) cfgParts.push("作者区关注");
     if (cfg.mutual_traffic_followers_follow) cfgParts.push("Followers关注");
-    if (cfg.mutual_traffic_follow_only) cfgParts.push("仅关�?);
+    if (cfg.mutual_traffic_follow_only) cfgParts.push("仅关注");
     const probParts = ["like_prob", "comment_prob", "favorite_prob", "share_prob"]
       .filter((k) => typeof cfg[k] === "number" && cfg[k] > 0)
       .map((k) => `${actionLabel[k.replace("_prob", "")] || k}${cfg[k]}`);
     const countParts = Object.entries(counts)
       .filter(([, v]) => Number(v) > 0)
       .map(([k, v]) => `${actionLabel[k] || k}×${v}`);
-    const cfgText = [...probParts, ...cfgParts].join(" · ") || "�?;
-    const countText = countParts.length ? countParts.join(" · ") : "无计�?;
+    const cfgText = [...probParts, ...cfgParts].join(" · ") || "—";
+    const countText = countParts.length ? countParts.join(" · ") : "无计数";
     return `<li><strong>${escapeHtml(account)}</strong> · ${escapeHtml(tpl)} · ${escapeHtml(start)}~${escapeHtml(end)}` +
       `${reason ? ` · ${escapeHtml(reason)}` : ""}<br/>` +
       `<span class="hint">时段 ${escapeHtml(slot)} · 模板配置 ${escapeHtml(cfgText)} · 执行 ${escapeHtml(countText)}</span></li>`;
   });
   return `
     <div class="auto-switch-activity-audit" style="margin:8px 0;">
-      <div class="hint"><strong>账号任务对账</strong> · ${items.length} �?/div>
+      <div class="hint"><strong>账号任务对账</strong> · ${items.length} 段</div>
       <ul class="auto-switch-summary-notes">${rows.join("")}</ul>
     </div>
   `;
@@ -5642,7 +5642,7 @@ function renderAutoSwitchSessionSummaryCard(item) {
     `成功 ${Number(stats.success ?? 0)}`,
     `失败 ${Number(stats.failed ?? 0)}`,
     Number(stats.cut_switch_missing_backup ?? 0) > 0
-      ? `备份缺失改登�?${Number(stats.cut_switch_missing_backup ?? 0)}`
+      ? `备份缺失改登录 ${Number(stats.cut_switch_missing_backup ?? 0)}`
       : "",
   ].filter(Boolean).join(" · ");
   const notes = Array.isArray(item?.reconciliation?.notes) ? item.reconciliation.notes : [];
@@ -5662,7 +5662,7 @@ function renderAutoSwitchSessionSummaryCard(item) {
       ${activityHtml}
       ${smartDebugHtml}
       ${notesHtml}
-      <pre class="auto-switch-human-log">${escapeHtml(humanLog || "（无 human_log�?)}</pre>
+      <pre class="auto-switch-human-log">${escapeHtml(humanLog || "（无 human_log）")}</pre>
     </div>
   `;
 }
@@ -5707,18 +5707,18 @@ async function loadAutoSwitchSessionSummaries() {
     if (autoSwitchSessionSummariesHint) {
       const hintParts = [];
       if (aliasFilter) hintParts.push(aliasFilter);
-      hintParts.push(items.length ? `最�?${items.length} 条` : "无记�?);
+      hintParts.push(items.length ? `最近 ${items.length} 条` : "无记录");
       autoSwitchSessionSummariesHint.textContent = hintParts.join(" · ");
     }
     if (!items.length) {
       autoSwitchSessionSummariesEl.innerHTML = aliasFilter
-        ? `<div class="hint">别名�?{escapeHtml(aliasFilter)}」暂无已关闭的自动切号会话总结</div>`
+        ? `<div class="hint">别名「${escapeHtml(aliasFilter)}」暂无已关闭的自动切号会话总结</div>`
         : '<div class="hint">暂无已关闭的自动切号会话总结（关闭设备自动切号后由设备端一次性上报）</div>';
       return;
     }
     autoSwitchSessionSummariesEl.innerHTML = items.map((item) => renderAutoSwitchSessionSummaryCard(item)).join("");
   } catch (error) {
-    autoSwitchSessionSummariesEl.innerHTML = `<div class="hint">加载会话总结失败�?{escapeHtml(error.message || "unknown")}</div>`;
+    autoSwitchSessionSummariesEl.innerHTML = `<div class="hint">加载会话总结失败：${escapeHtml(error.message || "unknown")}</div>`;
   }
 }
 
@@ -5751,7 +5751,7 @@ async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
     enabled
       ? resynced > 0 && changed === 0
         ? `已向 ${notified} 台设备推送自动切号资料（${resynced} 台资料重同步）`
-        : `已向 ${notified} 台设备推送资料（${changed} 台新开�?{resynced > 0 ? `�?{resynced} 台重同步` : ""}）`
+        : `已向 ${notified} 台设备推送资料（${changed} 台新开启${resynced > 0 ? `，${resynced} 台重同步` : ""}）`
       : `已为 ${changed} 台设备关闭自动切号`,
     "success",
   );
@@ -5759,7 +5759,7 @@ async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
 
 async function saveAutoSwitchConfig(options = {}) {
   if (autoSwitchSaveInFlight) {
-    setStatus("自动切号配置保存中，请稍候�?, "info");
+    setStatus("自动切号配置保存中，请稍候…", "info");
     return;
   }
   const enabled = !!options.enabled;
@@ -5772,8 +5772,8 @@ async function saveAutoSwitchConfig(options = {}) {
   if (!deviceIds.length) {
     setStatus(
       countVisibleAutoSwitchSelectedGroups() > 0
-        ? "所选别名未绑定有效 device_id，请先在设备总览确认客户端已绑定后再开启自动切�?
-        : "请先选择设备：勾选别名组左侧复选框，或点「全选本页�?,
+        ? "所选别名未绑定有效 device_id，请先在设备总览确认客户端已绑定后再开启自动切号"
+        : "请先选择设备：勾选别名组左侧复选框，或点「全选本页」",
       "warning",
     );
     return;
@@ -5819,14 +5819,14 @@ async function enableAutoSwitchForAllDevices() {
     await loadBoundDeviceAliases().catch(() => {});
     const deviceIds = await collectAllAutoSwitchDeviceIds();
     if (!deviceIds.length) {
-      setStatus("当前账号下没有可开启自动切号的设备（请确认客户端已绑定�?, "warning");
+      setStatus("当前账号下没有可开启自动切号的设备（请确认客户端已绑定）", "warning");
       return;
     }
     autoSwitchPickDeviceIds = new Set(deviceIds);
     await saveAutoSwitchForDeviceIds(deviceIds, true);
   } catch (error) {
     await loadAutoSwitchConfig({ refreshArchive: true });
-    setStatus(error.message || "全选并开启失�?, "error");
+    setStatus(error.message || "全选并开启失败", "error");
   } finally {
     autoSwitchSaveInFlight = false;
     applyAutoSwitchManualOpsUi();
@@ -5844,8 +5844,8 @@ function applyBackupStatsFullQueryScheduleUi(cfg = {}) {
   if (label) {
     label.style.opacity = available ? "" : "0.55";
     label.title = available
-      ? "每天北京时间 0:00 自动对全�?owner 的备份档案执行全量查询并落库（不限分组）"
-      : (String(cfg.disabled_reason || "").trim() || "每日定时全量查询暂时不可�?);
+      ? "每天北京时间 0:00 自动对全部 owner 的备份档案执行全量查询并落库（不限分组）"
+      : (String(cfg.disabled_reason || "").trim() || "每日定时全量查询暂时不可用");
   }
   applyBackupStatsFullQueryManualUi(cfg);
 }
@@ -5857,7 +5857,7 @@ function applyBackupStatsFullQueryManualUi(cfg = {}) {
     fetchTiktokStatsFullBtn.disabled = !available || backupStatsFullQueryInFlight;
     fetchTiktokStatsFullBtn.style.opacity = available ? "" : "0.55";
     fetchTiktokStatsFullBtn.title = available
-      ? "批量查询全部备份账号�?TikTok 数据并写回档案（无需手动填用户名�?
+      ? "批量查询全部备份账号的 TikTok 数据并写回档案（无需手动填用户名）"
       : (String(cfg.manual_disabled_reason || "").trim() || "暂时不可用：全量查询并落库功能已关闭");
   }
 }
@@ -5875,7 +5875,7 @@ async function loadBackupStatsFullQueryConfig() {
 async function saveBackupStatsFullQueryConfig(options = {}) {
   if (backupStatsFullQuerySaveInFlight) return;
   if (!backupStatsFullQueryScheduleAvailable) {
-    setStatus("每日定时全量查询暂时不可�?, "warning");
+    setStatus("每日定时全量查询暂时不可用", "warning");
     applyBackupStatsFullQueryScheduleUi({ available: false, enabled: false });
     return;
   }
@@ -5890,7 +5890,7 @@ async function saveBackupStatsFullQueryConfig(options = {}) {
     if (options.refreshStatus !== false) {
       await refreshTaskStatus();
     }
-    setStatus(enabled ? "已开启每�?0 点自动全量查�? : "已关闭每日自动全量查�?, "success");
+    setStatus(enabled ? "已开启每日 0 点自动全量查询" : "已关闭每日自动全量查询", "success");
   } catch (error) {
     await loadBackupStatsFullQueryConfig();
     setStatus(error.message || "保存失败", "error");
@@ -5903,9 +5903,9 @@ async function startSchedulers() {
   try {
     await request("/api/admin/tasks/scheduler/start", { method: "POST" });
     await refreshTaskStatus();
-    setStatus("定时任务总开关已开�?, "success");
+    setStatus("定时任务总开关已开启", "success");
   } catch (error) {
-    setStatus(error.message || "开启失�?, "error");
+    setStatus(error.message || "开启失败", "error");
   }
 }
 
@@ -5923,7 +5923,7 @@ async function loadUserRuntimeConfig() {
   try {
     const data = await request(`/api/admin/runtime_config?_ts=${Date.now()}`);
     const cfg = data.data || {};
-    // 刷新后优先沿用本地上次选择的模式，避免被服务端 run_mode 覆盖导致“模板看起来被切回去”�?
+    // 刷新后优先沿用本地上次选择的模式，避免被服务端 run_mode 覆盖导致“模板看起来被切回去”。
     const rawSavedMode = localStorage.getItem(RUN_MODE_KEY) || cfg.run_mode || currentRunMode || "growth";
     const savedMode = rawSavedMode === "mutual" ? "growth" : rawSavedMode;
     currentRunMode = savedMode;
@@ -5968,7 +5968,7 @@ async function loadUserRuntimeConfig() {
     fillConfigForm(modeConfig, savedMode);
     syncCvQualityFilterInputsFromConfig(modeConfig);
     setTemplateGrantStatus(describeCurrentTemplate());
-    setStatus(`已加载配置�?{describeCurrentTemplate()}`, "info");
+    setStatus(`已加载配置。${describeCurrentTemplate()}`, "info");
     if (currentUser?.role === "admin") {
       await loadConfigTargetUsers();
     }
@@ -6007,7 +6007,7 @@ async function switchRunMode(mode) {
 function buildMutualOpTargetsForSelectedDevices() {
   const selectedIds = selectedDeviceIds();
   if (!selectedIds.length) {
-    setStatus("请先勾选设�?, "warning");
+    setStatus("请先勾选设备", "warning");
     return null;
   }
   const targets = selectedIds
@@ -6035,9 +6035,9 @@ async function startMutualClickForSelectedDevices(options = {}) {
   let followOnlyCount = 0;
   let trafficCount = 0;
   const statusPrefix = forceFollowOnly
-    ? "互点-仅关�?
+    ? "互点-仅关注"
     : "互点";
-  setStatus(`正在为所选设备启�?{statusPrefix}�?{targets.length} 台）...`, "info");
+  setStatus(`正在为所选设备启动${statusPrefix}（${targets.length} 台）...`, "info");
   for (const payload of targets) {
     const info = latestDevices?.[payload.device_id] || {};
     const tiktokUsername = String(info.tiktok_username || info.tiktokUsername || "").trim();
@@ -6064,18 +6064,18 @@ async function startMutualClickForSelectedDevices(options = {}) {
     followOnlyCount && trafficCount
       ? `（仅关注 ${followOnlyCount} / 引流 ${trafficCount}）`
       : followOnlyCount
-        ? "（仅关注分支�?
+        ? "（仅关注分支）"
         : forceFollowOnly
           ? ""
           : "（引流分支）";
   if (!failedCount) {
     setStatus(
-      `${statusPrefix}启动指令已下�?{branchHint}�?{successCount}/${targets.length}）`,
+      `${statusPrefix}启动指令已下发${branchHint}（${successCount}/${targets.length}）`,
       "success",
     );
   } else {
     setStatus(
-      `${statusPrefix}部分下发失败${branchHint}：成�?${successCount}，失�?${failedCount}`,
+      `${statusPrefix}部分下发失败${branchHint}：成功 ${successCount}，失败 ${failedCount}`,
       "warning",
     );
   }
@@ -6095,10 +6095,10 @@ async function apiPublishPostStart(payload) {
 async function startPublishPostForSelectedDevices() {
   const selectedIds = selectedDeviceIds();
   for (const id of selectedIds) {
-    if (!guardAutoSwitchManualOps("发作�?, id)) return;
+    if (!guardAutoSwitchManualOps("发作品", id)) return;
   }
   if (!selectedIds.length) {
-    setStatus("请先勾选设�?, "warning");
+    setStatus("请先勾选设备", "warning");
     return;
   }
 
@@ -6112,7 +6112,7 @@ async function startPublishPostForSelectedDevices() {
     .filter(Boolean);
 
   if (!targets.length) {
-    setStatus("所选设备缺少别名，无法下发发作品任�?, "warning");
+    setStatus("所选设备缺少别名，无法下发发作品任务", "warning");
     return;
   }
 
@@ -6120,10 +6120,10 @@ async function startPublishPostForSelectedDevices() {
   try {
     const startedAt = new Date().toLocaleString();
     appendPublishPostBatchLog(
-      `======== 发作品批量执�?${startedAt}�?{targets.length} 台）========\n下发中…`,
+      `======== 发作品批量执行 ${startedAt}（${targets.length} 台）========\n下发中…`,
       true,
     );
-    setStatus(`正在为所选设备下发发作品入口�?{targets.length} 台）...`, "info");
+    setStatus(`正在为所选设备下发发作品入口（${targets.length} 台）...`, "info");
 
     const queued = [];
     const enqueueFailed = [];
@@ -6132,16 +6132,16 @@ async function startPublishPostForSelectedDevices() {
         const resp = await apiPublishPostStart(payload);
         const opId = String(resp?.op_id || "").trim();
         if (!opId) {
-          enqueueFailed.push({ alias: payload.alias, error: resp?.msg || "未返�?op_id" });
-          appendPublishPostBatchLog(`�?${payload.alias}：下发失败（�?op_id）`);
+          enqueueFailed.push({ alias: payload.alias, error: resp?.msg || "未返回 op_id" });
+          appendPublishPostBatchLog(`❌ ${payload.alias}：下发失败（无 op_id）`);
           continue;
         }
         queued.push({ ...payload, opId });
-        appendPublishPostBatchLog(`�?${payload.alias}：已下发，等待最终结果（op=${opId.slice(0, 8)}…）`);
+        appendPublishPostBatchLog(`⏳ ${payload.alias}：已下发，等待最终结果（op=${opId.slice(0, 8)}…）`);
       } catch (err) {
         const msg = err?.message || "下发失败";
         enqueueFailed.push({ alias: payload.alias, error: msg });
-        appendPublishPostBatchLog(`�?${payload.alias}：下发失�?�?${msg}`);
+        appendPublishPostBatchLog(`❌ ${payload.alias}：下发失败 — ${msg}`);
       }
     }
 
@@ -6163,9 +6163,9 @@ async function startPublishPostForSelectedDevices() {
 
     let okCount = 0;
     let failCount = enqueueFailed.length;
-    const lines = [`======== 发作品最终结果汇�?${new Date().toLocaleString()} ========`];
+    const lines = [`======== 发作品最终结果汇总 ${new Date().toLocaleString()} ========`];
     for (const row of enqueueFailed) {
-      lines.push(`�?${row.alias}：下发失�?�?${row.error}`);
+      lines.push(`❌ ${row.alias}：下发失败 — ${row.error}`);
     }
     for (const row of finals) {
       const line = formatPublishPostFinalLine(row.alias, row.result, row.error);
@@ -6175,14 +6175,14 @@ async function startPublishPostForSelectedDevices() {
       if (ok) okCount += 1;
       else failCount += 1;
     }
-    lines.push(`-------- 合计：成�?${okCount} · 失败 ${failCount} · �?${targets.length} �?--------`);
+    lines.push(`-------- 合计：成功 ${okCount} · 失败 ${failCount} · 共 ${targets.length} 台 --------`);
     appendPublishPostBatchLog(lines.join("\n"), true);
 
     await loadOverview();
     if (!failCount) {
       setStatus(`发作品全部成功（${okCount}/${targets.length}），详见「发作品执行汇总」`, "success");
     } else if (okCount > 0) {
-      setStatus(`发作品部分完成：成功 ${okCount}，失�?${failCount}，详见「发作品执行汇总」`, "warning");
+      setStatus(`发作品部分完成：成功 ${okCount}，失败 ${failCount}，详见「发作品执行汇总」`, "warning");
     } else {
       setStatus(`发作品全部失败（${failCount}/${targets.length}），详见「发作品执行汇总」`, "error");
     }
@@ -6229,7 +6229,7 @@ async function copyCurrentTemplate() {
   if (name == null) return;
   const nextName = String(name || "").trim();
   if (!nextName) {
-    setStatus("模板名不能为�?, "warning");
+    setStatus("模板名不能为空", "warning");
     return;
   }
   try {
@@ -6286,21 +6286,21 @@ async function renameCurrentTemplate() {
       ? data.template_meta
       : currentTemplateMeta;
     renderConfigTemplateOptions(currentTemplatesByName, currentConfigTemplate, currentTemplateMeta);
-    setStatus(data?.msg || "模板重命名成�?, "success");
+    setStatus(data?.msg || "模板重命名成功", "success");
   } catch (error) {
-    setStatus(error.message || "模板重命名失�?, "error");
+    setStatus(error.message || "模板重命名失败", "error");
   }
 }
 
 async function deleteCurrentTemplate() {
   const { own } = getCurrentTemplateSourceInfo();
   if (!own) {
-    setStatus("共享模板不可删除，请先切换到自己的模�?, "warning");
+    setStatus("共享模板不可删除，请先切换到自己的模板", "warning");
     return;
   }
   const name = String(currentConfigTemplate || "").trim();
   if (!name) return;
-  if (!window.confirm(`确认删除模板�?{name}」吗？`)) return;
+  if (!window.confirm(`确认删除模板「${name}」吗？`)) return;
   try {
     const data = await request("/api/admin/config_template/delete", {
       method: "POST",
@@ -6317,7 +6317,7 @@ async function deleteCurrentTemplate() {
     const cfg = currentTemplatesByName?.[currentConfigTemplate] || {};
     fillConfigForm(cfg, currentRunMode);
     syncCvQualityFilterInputsFromConfig(cfg);
-    setStatus(data?.msg || "模板已删�?, "success");
+    setStatus(data?.msg || "模板已删除", "success");
   } catch (error) {
     setStatus(error.message || "删除模板失败", "error");
   }
@@ -6326,7 +6326,7 @@ async function deleteCurrentTemplate() {
 async function deleteSelectedTemplates() {
   const selected = getSelectedTemplateNamesForDeletion();
   if (!selected.length) {
-    setStatus("请先在模板总览里勾选要删除的模�?, "warning");
+    setStatus("请先在模板总览里勾选要删除的模板", "warning");
     return;
   }
   const ownDeletable = new Set(listOwnDeletableTemplateNames().filter((name) => name !== "default"));
@@ -6361,16 +6361,16 @@ async function deleteSelectedTemplates() {
   fillConfigForm(cfg, currentRunMode);
   syncCvQualityFilterInputsFromConfig(cfg);
   if (failed) {
-    setStatus(`批量删除完成：成�?${success}，失�?${failed}`, "warning");
+    setStatus(`批量删除完成：成功 ${success}，失败 ${failed}`, "warning");
   } else {
-    setStatus(`批量删除完成：成功删�?${success} 个模板`, "success");
+    setStatus(`批量删除完成：成功删除 ${success} 个模板`, "success");
   }
   await refreshTemplateInventoryFromServer();
 }
 
 async function setTemplateGrant(enabled) {
   if (currentUser?.role !== "admin") {
-    setStatus("仅管理员可操作模板共�?, "warning");
+    setStatus("仅管理员可操作模板共享", "warning");
     return;
   }
   const target = String(configTargetUserSelect?.value || "").trim();
@@ -6407,10 +6407,10 @@ async function setTemplateGrant(enabled) {
     const expected = Boolean(enabled);
     const ok = exists === expected;
     const actionText = enabled ? "授权" : "取消授权";
-    const resultText = ok ? "已确认生�? : "状态未达预期，请重�?;
-    const line = `${actionText}结果�?{target} <- ${sourceInfo.source_username}/${sourceInfo.template_name}�?{resultText}）`;
+    const resultText = ok ? "已确认生效" : "状态未达预期，请重试";
+    const line = `${actionText}结果：${target} <- ${sourceInfo.source_username}/${sourceInfo.template_name}（${resultText}）`;
     setTemplateGrantStatus(line);
-    setStatus(data?.msg || (enabled ? "授权成功" : "已取消授�?), ok ? "success" : "warning");
+    setStatus(data?.msg || (enabled ? "授权成功" : "已取消授权"), ok ? "success" : "warning");
   } catch (error) {
     setTemplateGrantStatus("");
     setStatus(error.message || (enabled ? "授权失败" : "取消授权失败"), "error");
@@ -6420,11 +6420,11 @@ async function setTemplateGrant(enabled) {
 async function importLiveCustomers() {
   const file = liveCustomerFileInput?.files?.[0];
   if (!file) {
-    setStatus("请先选择 txt �?xlsx 文件", "warning");
+    setStatus("请先选择 txt 或 xlsx 文件", "warning");
     return;
   }
   try {
-    setStatus("导入主播访问数据�?..", "info");
+    setStatus("导入主播访问数据中...", "info");
     const formData = new FormData();
     formData.append("file", file);
     const base = String(await resolvedApiBase()).replace(/\/$/, "");
@@ -6439,7 +6439,7 @@ async function importLiveCustomers() {
     liveCustomerFileInput.value = "";
     await loadAccounts();
     await loadOverview();
-    setStatus(`导入完成：新�?${data.inserted}/${data.total_rows}`, "success");
+    setStatus(`导入完成：新增 ${data.inserted}/${data.total_rows}`, "success");
   } catch (error) {
     setStatus(error.message || "导入失败", "error");
   }
@@ -6480,20 +6480,20 @@ async function collectBackupArchiveUsernamesForQuery(options = {}) {
 
 async function fetchTiktokStats() {
   if (statsXlsxBusy) {
-    setStatus("批量查询进行中，请稍�?, "warning");
+    setStatus("批量查询进行中，请稍候", "warning");
     return;
   }
   const username = (statsUsernameInput?.value || "").trim();
 
   if (!username) {
-    setStatus("请先填写用户�?, "warning");
+    setStatus("请先填写用户名", "warning");
     return;
   }
 
   try {
     setStatus("正在查询 TikTok 数据...", "info");
     if (statsResultEl) {
-      statsResultEl.textContent = "查询中，请稍�?..";
+      statsResultEl.textContent = "查询中，请稍候...";
     }
     const include_raw = Boolean(statsIncludeRawInput?.checked);
     const data = await request("/api/admin/tiktok_profile_stats", {
@@ -6508,9 +6508,9 @@ async function fetchTiktokStats() {
     if (statsResultEl) {
       if (data && Number(data.code) === 0 && data.universal_extract) {
         const summary = [
-          `账号私密: ${data.private_account_guess ?? "�?}`,
-          `关注列表 visibility: ${data.profile_following_visibility ?? "�?} (1=公开)`,
-          `关注列表对他人隐�? ${data.following_list_hidden_guess ?? "�?}`,
+          `账号私密: ${data.private_account_guess ?? "—"}`,
+          `关注列表 visibility: ${data.profile_following_visibility ?? "—"} (1=公开)`,
+          `关注列表对他人隐藏: ${data.following_list_hidden_guess ?? "—"}`,
         ].join("\n");
         const lines = [summary, "", JSON.stringify(data.universal_extract, null, 2)];
         if (include_raw) {
@@ -6524,7 +6524,7 @@ async function fetchTiktokStats() {
             debug: data.debug,
             raw_response: data.raw_response,
           };
-          lines.push("\n--- 调试信息（已省略完整 HTTP headers�?--\n");
+          lines.push("\n--- 调试信息（已省略完整 HTTP headers）---\n");
           lines.push(JSON.stringify(debug, null, 2));
         }
         statsResultEl.textContent = lines.join("\n");
@@ -6543,7 +6543,7 @@ async function fetchTiktokStats() {
 }
 
 function formatTiktokStatsMetricsLine(metrics) {
-  const keys = ["粉丝�?, "关注�?, "总赞", "视频�?, "点赞�?];
+  const keys = ["粉丝量", "关注数", "总赞", "视频数", "点赞量"];
   return keys.map((key) => `${key}=${metrics?.[key] ?? ""}`).join("  ");
 }
 
@@ -6552,7 +6552,7 @@ function setTiktokStatsXlsxBusy(busy) {
   if (fetchTiktokStatsBtn) fetchTiktokStatsBtn.disabled = statsXlsxBusy;
   if (fetchTiktokStatsXlsxBtn) {
     fetchTiktokStatsXlsxBtn.disabled = statsXlsxBusy;
-    fetchTiktokStatsXlsxBtn.textContent = statsXlsxBusy ? "批量查询�?.." : "上传表格并查�?;
+    fetchTiktokStatsXlsxBtn.textContent = statsXlsxBusy ? "批量查询中..." : "上传表格并查询";
   }
   if (statsXlsxFileInput) statsXlsxFileInput.disabled = statsXlsxBusy;
   if (downloadTiktokStatsXlsxBtn) {
@@ -6564,7 +6564,7 @@ function renderTiktokStatsXlsxProgress(lines, debugPayload) {
   if (!statsResultEl) return;
   const body = lines.join("\n");
   if (debugPayload) {
-    statsResultEl.textContent = `${body}\n\n--- 调试信息（已省略完整 HTTP headers�?--\n${JSON.stringify(debugPayload, null, 2)}`;
+    statsResultEl.textContent = `${body}\n\n--- 调试信息（已省略完整 HTTP headers）---\n${JSON.stringify(debugPayload, null, 2)}`;
     return;
   }
   statsResultEl.textContent = body;
@@ -6623,10 +6623,10 @@ async function runTiktokStatsXlsxBatch(file) {
     const rows = Array.isArray(uploadData?.rows) ? uploadData.rows : [];
     const total = rows.length;
     if (statsXlsxHintEl) {
-      statsXlsxHintEl.textContent = `已上�?${file.name}，共 ${total} 行，开始查�?..`;
+      statsXlsxHintEl.textContent = `已上传 ${file.name}，共 ${total} 行，开始查询...`;
     }
     if (!statsXlsxSessionId || !total) {
-      throw new Error("表格中没有可查询�?username");
+      throw new Error("表格中没有可查询的 username");
     }
     let okCount = 0;
     let failCount = 0;
@@ -6635,9 +6635,9 @@ async function runTiktokStatsXlsxBatch(file) {
       const row = rows[i] || {};
       const username = String(row.username || "").trim();
       const sheetRow = Number(row.sheet_row || 0);
-      progressLines.push(`[${i + 1}/${total}] ${username || "-"} 查询�?..`);
+      progressLines.push(`[${i + 1}/${total}] ${username || "-"} 查询中...`);
       renderTiktokStatsXlsxProgress(progressLines);
-      setStatus(`正在查询 ${i + 1}/${total}�?{username}`, "info");
+      setStatus(`正在查询 ${i + 1}/${total}：${username}`, "info");
       let line = `[${i + 1}/${total}] ${username || "-"}`;
       let debugPayload = null;
       try {
@@ -6656,7 +6656,7 @@ async function runTiktokStatsXlsxBatch(file) {
           line = `${line}  ${formatTiktokStatsMetricsLine(data.metrics)}`;
         } else {
           failCount += 1;
-          line = `${line}  失败�?{data?.msg || "查询失败"}`;
+          line = `${line}  失败：${data?.msg || "查询失败"}`;
         }
         if (includeRaw) {
           debugPayload = {
@@ -6672,7 +6672,7 @@ async function runTiktokStatsXlsxBatch(file) {
         }
       } catch (error) {
         failCount += 1;
-        line = `${line}  失败�?{error.message || "查询失败"}`;
+        line = `${line}  失败：${error.message || "查询失败"}`;
       }
       progressLines[progressLines.length - 1] = line;
       renderTiktokStatsXlsxProgress(progressLines, debugPayload);
@@ -6681,17 +6681,17 @@ async function runTiktokStatsXlsxBatch(file) {
       }
     }
     progressLines.push("");
-    progressLines.push(`完成：成�?${okCount}，失�?${failCount}，共 ${total} 行`);
+    progressLines.push(`完成：成功 ${okCount}，失败 ${failCount}，共 ${total} 行`);
     renderTiktokStatsXlsxProgress(progressLines);
     if (statsXlsxHintEl) {
-      statsXlsxHintEl.textContent = `查询完成：成�?${okCount}，失�?${failCount}。可下载写回后的表格。`;
+      statsXlsxHintEl.textContent = `查询完成：成功 ${okCount}，失败 ${failCount}。可下载写回后的表格。`;
     }
     try {
       await downloadTiktokStatsXlsx();
-      setStatus(`批量查询完成，已下载表格（成�?${okCount}，失�?${failCount}）`, failCount ? "warning" : "success");
+      setStatus(`批量查询完成，已下载表格（成功 ${okCount}，失败 ${failCount}）`, failCount ? "warning" : "success");
     } catch (downloadError) {
       setStatus(
-        `查询完成，但自动下载失败�?{downloadError.message || "unknown error"}。请点击「下载写回表格」`,
+        `查询完成，但自动下载失败：${downloadError.message || "unknown error"}。请点击「下载写回表格」`,
         "warning",
       );
     }
@@ -6729,7 +6729,7 @@ async function fetchTiktokStatsFullForBackupArchive() {
     return;
   }
   if (backupStatsFullQueryInFlight) {
-    setStatus("全量查询正在进行中，请稍�?, "warning");
+    setStatus("全量查询正在进行中，请稍候", "warning");
     return;
   }
 
@@ -6741,7 +6741,7 @@ async function fetchTiktokStatsFullForBackupArchive() {
 
     const { usernames } = await collectBackupArchiveUsernamesForQuery({ scope: "group" });
     if (!usernames.length) {
-      setStatus("没有可查询的用户�?, "warning");
+      setStatus("没有可查询的用户名", "warning");
       return;
     }
 
@@ -6754,10 +6754,10 @@ async function fetchTiktokStatsFullForBackupArchive() {
       const username = usernames[i];
       const index = i + 1;
       const remain = Math.max(total - index, 0);
-      const progress = `正在全量查询�?${index} 个，还剩 ${remain} 个`;
+      const progress = `正在全量查询第 ${index} 个，还剩 ${remain} 个`;
       setStatus(`${progress}（@${username}）`, "info");
       if (deviceAliasGroupsPagerEl) {
-        deviceAliasGroupsPagerEl.textContent = `${progress} | �?${total} 个账号`;
+        deviceAliasGroupsPagerEl.textContent = `${progress} | 共 ${total} 个账号`;
       }
 
       try {
@@ -6789,10 +6789,10 @@ async function fetchTiktokStatsFullForBackupArchive() {
 
     await loadBackupArchiveRecords();
 
-    const summary = `全量查询完成：成�?${ok}/${total}，失�?${fail}`;
+    const summary = `全量查询完成：成功 ${ok}/${total}，失败 ${fail}`;
     if (fail > 0) {
-      const detail = failedItems.slice(0, 3).join("�?);
-      const suffix = failedItems.length > 3 ? "�? : "";
+      const detail = failedItems.slice(0, 3).join("；");
+      const suffix = failedItems.length > 3 ? "…" : "";
       setStatus(`${summary}；失败：${detail}${suffix}`, fail === total ? "error" : "warning");
     } else {
       setStatus(summary, "success");
@@ -6809,10 +6809,10 @@ async function fetchTiktokStatsFullForBackupArchive() {
 function collectDeviceIdentityByAlias(alias, options = {}) {
   const normalizedAlias = String(alias || "").trim();
   if (!normalizedAlias) {
-    setStatus("未提供设备别�?, "warning");
+    setStatus("未提供设备别名", "warning");
     return null;
   }
-  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直�?ReferenceError
+  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
   const package_name = String(
     options.package_name
       || (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput ? backupPackageNameInput.value : "")
@@ -6835,11 +6835,11 @@ function collectDeviceIdentityByAlias(alias, options = {}) {
   return { device_id, alias: normalizedAlias, package_name };
 }
 
-/** 备份档案行的 device_id 可能过期；始终以当前在线设备�?device_id 下发远控�?*/
+/** 备份档案行的 device_id 可能过期；始终以当前在线设备的 device_id 下发远控。 */
 function resolveLiveDeviceIdentityForArchive(actionAlias, rowDeviceId = "", options = {}) {
   const normalizedAlias = String(actionAlias || "").trim();
   if (!normalizedAlias) {
-    setStatus("未提供设备别�?, "warning");
+    setStatus("未提供设备别名", "warning");
     return null;
   }
   const live = collectDeviceIdentityByAlias(normalizedAlias, options);
@@ -6847,7 +6847,7 @@ function resolveLiveDeviceIdentityForArchive(actionAlias, rowDeviceId = "", opti
   const rowId = String(rowDeviceId || "").trim();
   if (rowId && rowId !== live.device_id) {
     console.warn(
-      `[backup-archive] 档案 device_id=${rowId} 与当前在线设�?${live.device_id} 不一致，已使用在线设备`,
+      `[backup-archive] 档案 device_id=${rowId} 与当前在线设备 ${live.device_id} 不一致，已使用在线设备`,
     );
   }
   return live;
@@ -6859,7 +6859,7 @@ function collectDeviceIdentityByDeviceAndAlias(deviceId, alias, options = {}) {
   if (!normalizedDeviceId || !normalizedAlias) {
     return resolveLiveDeviceIdentityForArchive(normalizedAlias, "", options);
   }
-  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直�?ReferenceError
+  // 兜底：若旧版本前端脚本未声明 backupPackageNameInput，避免启动阶段直接 ReferenceError
   const package_name = String(
     options.package_name
       || (typeof backupPackageNameInput !== "undefined" && backupPackageNameInput ? backupPackageNameInput.value : "")
@@ -6953,7 +6953,7 @@ async function waitForDeviceOpResult(opId, timeoutMs = 120000, graceAfterTimeout
 }
 
 async function submitAndWaitTikTokDeviceOp(path, body, options = {}) {
-  const pendingText = options.pendingText || "设备操作下发�?..";
+  const pendingText = options.pendingText || "设备操作下发中...";
   const successText = options.successText || "设备操作完成";
   const errorText = options.errorText || "设备操作失败";
   const shouldRefresh = options.refreshAfter !== false;
@@ -7014,8 +7014,8 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
   } = execOptions;
   const identity = resolveLiveDeviceIdentityForArchive(alias, deviceId);
   if (!identity) return;
-  const detailText = [`设备别名�?{alias}`, username ? `账号�?{username}` : null].filter(Boolean).join("\n");
-  if (!skipConfirm && !confirmTikTokAction("备份并清理设�?, detailText)) return;
+  const detailText = [`设备别名：${alias}`, username ? `账号：${username}` : null].filter(Boolean).join("\n");
+  if (!skipConfirm && !confirmTikTokAction("备份并清理设备", detailText)) return;
   const payload = {
     ...identity,
     backup_record_id: backupRecordId ? Number(backupRecordId) : undefined,
@@ -7029,16 +7029,16 @@ async function handleBackupAndClearClick(alias, backupRecordId, username = "", d
     payload.cut_switch_target_row_index = Number(cutSwitchTargetRowIndex);
   }
   const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/backup_and_clear", payload, {
-    pendingText: "正在下发备份并清理任�?..",
+    pendingText: "正在下发备份并清理任务...",
     successText: "备份并清理任务已完成",
-    errorText: "备份并清理失�?,
+    errorText: "备份并清理失败",
     refreshAfter,
     pollTimeoutMs,
     graceAfterTimeoutMs,
     refreshOnEnqueue,
   });
   if (result?.status !== "success") {
-    throw new Error(result?.message || "备份并清理失�?);
+    throw new Error(result?.message || "备份并清理失败");
   }
   return result;
 }
@@ -7057,7 +7057,7 @@ async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
     ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
     : collectDeviceIdentityByAlias(alias);
   if (!identity) return;
-  if (!skipConfirm && !confirmTikTokAction("清理 TikTok 数据", `设备别名�?{alias}`)) return;
+  if (!skipConfirm && !confirmTikTokAction("清理 TikTok 数据", `设备别名：${alias}`)) return;
   const payload = { ...identity };
   const cs = String(cutSwitchAfterBackup || "").trim().toLowerCase();
   if (cs === "clear_source_for_restore" || cs === "exclusive_activate_target") {
@@ -7068,7 +7068,7 @@ async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
   }
   const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/clear", payload, {
     pendingText: "正在下发清理任务...",
-    successText: "TikTok 数据已清�?,
+    successText: "TikTok 数据已清理",
     errorText: "清理 TikTok 数据失败",
     refreshAfter,
     pollTimeoutMs,
@@ -7084,7 +7084,7 @@ async function handleAliasClearClick(alias, deviceId = "", execOptions = {}) {
 async function setBackupArchiveSwitchHighlight(rowIndex) {
   const ri = Number(rowIndex);
   if (!Number.isFinite(ri) || ri < 0) {
-    throw new Error("无效的设备档案行�?);
+    throw new Error("无效的设备档案行号");
   }
   const resp = await request("/api/admin/editor/device_rows/set_switch_highlight", {
     method: "POST",
@@ -7100,9 +7100,9 @@ async function handleBasicProfileEditFromBackupCard(card) {
   const details = card.closest("details");
   const bucketSize = Number(card.getAttribute("data-bucket-size") || "") || (details ? details.querySelectorAll(".backup-archive-record").length : 0);
   const switchHlDb = normalizeSwitchHighlightField(card.getAttribute("data-switch-hl"));
-  const effectiveHighlight = bucketSize <= 1 || switchHlDb === "�?;
+  const effectiveHighlight = bucketSize <= 1 || switchHlDb === "是";
   if (!effectiveHighlight) {
-    setStatus("请先点击「切号」将本条设为当前高亮账号，再执行「修改账号基本资料�?, "warning");
+    setStatus("请先点击「切号」将本条设为当前高亮账号，再执行「修改账号基本资料」", "warning");
     return;
   }
 
@@ -7116,22 +7116,22 @@ async function handleBasicProfileEditFromBackupCard(card) {
   if (!identity) return;
 
   const detailLines = [
-    `设备别名�?{actionAlias}`,
-    username ? `账号�?{username}` : null,
-    "执行期间设备会暂停涨粉并临时关闭「自动起号策略参与」，避免与修改资料流程争�?TikTok�?,
-    "设备端总结果为 success 并回传云端后，系统会自动将该账号「基本资料已修改」标为「是」并关闭 TikTok；随后可回到 AutoTraces 查看�?,
+    `设备别名：${actionAlias}`,
+    username ? `账号：${username}` : null,
+    "执行期间设备会暂停涨粉并临时关闭「自动起号策略参与」，避免与修改资料流程争抢 TikTok。",
+    "设备端总结果为 success 并回传云端后，系统会自动将该账号「基本资料已修改」标为「是」并关闭 TikTok；随后可回到 AutoTraces 查看。",
   ].filter(Boolean);
   if (!confirmTikTokAction("修改账号基本资料", detailLines.join("\n"))) return;
 
   await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/edit_basic_profile", identity, {
-    pendingText: "正在下发「修改账号基本资料」设备任�?..",
+    pendingText: "正在下发「修改账号基本资料」设备任务...",
     successText: "任务已下发；设备成功回传后云端会自动更新「基本资料已修改」并关闭 TikTok（见设备日志与账号记录）",
-    errorText: "「修改账号基本资料」设备任务失�?,
+    errorText: "「修改账号基本资料」设备任务失败",
   });
 }
 
 async function handleRestoreClick(alias, backupName, deviceId = "", execOptions = {}) {
-  if (!guardAutoSwitchManualOps("清理并还�?, deviceId, alias, deviceId)) return;
+  if (!guardAutoSwitchManualOps("清理并还原", deviceId, alias, deviceId)) return;
   const {
     skipConfirm = false,
     skipPmClear = false,
@@ -7162,23 +7162,23 @@ async function handleRestoreClick(alias, backupName, deviceId = "", execOptions 
     && !confirmTikTokAction(
       "清理并还原该备份",
       skipPmClear
-        ? `将直接还原以下备份（切号流程中上一步已清空 TikTok 数据）。\n设备别名�?{alias}\n备份�?{normalizedBackupName}`
-        : `将先清空设备上的 TikTok 数据，再还原以下备份。\n设备别名�?{alias}\n备份�?{normalizedBackupName}`,
+        ? `将直接还原以下备份（切号流程中上一步已清空 TikTok 数据）。\n设备别名：${alias}\n备份：${normalizedBackupName}`
+        : `将先清空设备上的 TikTok 数据，再还原以下备份。\n设备别名：${alias}\n备份：${normalizedBackupName}`,
     )
   ) {
     return;
   }
   const result = await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/restore", payload, {
-    pendingText: "正在下发清理并还原任�?..",
+    pendingText: "正在下发清理并还原任务...",
     successText: "清理并还原已完成",
-    errorText: "清理并还原失�?,
+    errorText: "清理并还原失败",
     refreshAfter,
     pollTimeoutMs,
     graceAfterTimeoutMs,
     refreshOnEnqueue,
   });
   if (result?.status !== "success") {
-    throw new Error(result?.message || "清理并还原失�?);
+    throw new Error(result?.message || "清理并还原失败");
   }
   return result;
 }
@@ -7228,7 +7228,7 @@ function resolveBackupArchiveAliasKey(alias, row = {}) {
   );
 }
 
-/** 按云�?daily_plan + 北京时间解析当前时段应归属的 row（与设备端调度一致） */
+/** 按云端 daily_plan + 北京时间解析当前时段应归属的 row（与设备端调度一致） */
 function resolveCurrentSlotEntryForAliasKey(aliasKey) {
   const key = normalizeAliasKey(aliasKey);
   if (!key) return null;
@@ -7277,8 +7277,8 @@ function isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias) {
 
 /**
  * 同别名桶内高亮：
- * - 自动切号开启时按云端时段计划（北京时间）展示当前归属，不依赖设备回�?switch_highlight�?
- * - 否则仍以 switch_highlight===「是」为准�?
+ * - 自动切号开启时按云端时段计划（北京时间）展示当前归属，不依赖设备回写 switch_highlight；
+ * - 否则仍以 switch_highlight===「是」为准。
  */
 function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row, alias = "") {
   const n = Array.isArray(rowsInBucket) ? rowsInBucket.length : 0;
@@ -7289,14 +7289,14 @@ function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row, alias = "")
   if (isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId) && isAutoSwitchDailyPlanScheduleCurrent()) {
     return false;
   }
-  return normalizeSwitchHighlightField(row?.switch_highlight) === "�?;
+  return normalizeSwitchHighlightField(row?.switch_highlight) === "是";
 }
 
-/** 同别名桶内是否存在切号高亮（多条且全部为「否」时返回 false�?*/
+/** 同别名桶内是否存在切号高亮（多条且全部为「否」时返回 false） */
 function backupArchiveBucketHasHighlightFromCards(cards) {
   const list = Array.isArray(cards) ? cards : [];
   if (list.length <= 1) return true;
-  return list.some((c) => c instanceof HTMLElement && normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "�?);
+  return list.some((c) => c instanceof HTMLElement && normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "是");
 }
 
 async function runBackupArchiveAccountCutSwitch(clickedCard) {
@@ -7307,14 +7307,14 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
   const details = clickedCard.closest("details");
   const bucketSize = Number(clickedCard.getAttribute("data-bucket-size") || "") || (details ? details.querySelectorAll(".backup-archive-record").length : 0);
   const switchHlDb = normalizeSwitchHighlightField(clickedCard.getAttribute("data-switch-hl"));
-  const effectiveHighlight = bucketSize <= 1 || switchHlDb === "�?;
+  const effectiveHighlight = bucketSize <= 1 || switchHlDb === "是";
   if (effectiveHighlight) return;
 
   const targetRi = Number(clickedCard.getAttribute("data-backup-row-index"));
   const targetBackup = String(clickedCard.getAttribute("data-row-backup-name") || "").trim();
   const canRestoreToDevice = Boolean(targetBackup && targetBackup !== "-");
   if (!Number.isFinite(targetRi) || targetRi < 0 || !actionAlias) {
-    setStatus("切号参数不完�?, "warning");
+    setStatus("切号参数不完整", "warning");
     return;
   }
 
@@ -7334,23 +7334,23 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     const useLoginScheme = isLoginCutSwitchScheme();
     const detailLines = useLoginScheme
       ? [
-        `设备别名�?{actionAlias}`,
-        "确认后将立即切换环境归属高亮到目标账号�?,
-        "切号方案：登录切�?�?将【清�?TikTok 全部数据】后直接登录目标号（不还原备份）�?,
-        `目标 username�?{targetUser || "-"}`,
+        `设备别名：${actionAlias}`,
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "切号方案：登录切号 — 将【清理 TikTok 全部数据】后直接登录目标号（不还原备份）。",
+        `目标 username：${targetUser || "-"}`,
       ]
       : canRestoreToDevice
       ? [
-        `设备别名�?{actionAlias}`,
-        "确认后将立即切换环境归属高亮到目标账号�?,
-        "将【仅清理 TikTok】后还原目标账号备份（不备份）�?,
-        `目标 username�?{targetUser || "-"}`,
+        `设备别名：${actionAlias}`,
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "将【仅清理 TikTok】后还原目标账号备份（不备份）。",
+        `目标 username：${targetUser || "-"}`,
       ]
       : [
-        `设备别名�?{actionAlias}`,
-        "确认后将立即切换环境归属高亮到目标账号�?,
-        "将【仅清理 TikTok】（目标无备份元数据，不还原）�?,
-        `目标 username�?{targetUser || "-"}`,
+        `设备别名：${actionAlias}`,
+        "确认后将立即切换环境归属高亮到目标账号。",
+        "将【仅清理 TikTok】（目标无备份元数据，不还原）。",
+        `目标 username：${targetUser || "-"}`,
       ];
     if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
     try {
@@ -7377,7 +7377,7 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
         useLoginScheme
           ? "切号：环境归属已切换；设备将清理后自动登录目标号"
           : canRestoreToDevice
-          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签�?
+          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
           : "切号：环境归属已切换；设备清理任务已完成",
         "success",
       );
@@ -7400,9 +7400,9 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
     return;
   }
 
-  const sourceCard = bucketSize > 1 ? cards.find((c) => normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "�?) : null;
+  const sourceCard = bucketSize > 1 ? cards.find((c) => normalizeSwitchHighlightField(c.getAttribute("data-switch-hl")) === "是") : null;
   if (bucketSize > 1 && (!sourceCard || sourceCard === clickedCard)) {
-    setStatus("同别名高亮数据异常（服务端应保证有且仅有一条为「是」），请刷新备份档案后重�?, "warning");
+    setStatus("同别名高亮数据异常（服务端应保证有且仅有一条为「是」），请刷新备份档案后重试", "warning");
     return;
   }
 
@@ -7414,23 +7414,23 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
 
   const detailLines = isLoginCutSwitchScheme()
     ? [
-      `设备别名�?{actionAlias}`,
-      "确认后将立即切换环境归属高亮到目标账号�?,
-      "切号方案：登录切�?�?将【清�?TikTok 全部数据】后直接登录目标号（不备份、不还原）�?,
-      `目标 username�?{targetUser || "-"}`,
+      `设备别名：${actionAlias}`,
+      "确认后将立即切换环境归属高亮到目标账号。",
+      "切号方案：登录切号 — 将【清理 TikTok 全部数据】后直接登录目标号（不备份、不还原）。",
+      `目标 username：${targetUser || "-"}`,
     ]
     : canRestoreToDevice
     ? [
-      `设备别名�?{actionAlias}`,
-      "确认后将立即切换环境归属高亮到目标账号�?,
-      "将对当前「切号高亮」账号执行【备份并清理】，再对目标账号执行【还原备份】�?,
-      `目标 username�?{targetUser || "-"}`,
+      `设备别名：${actionAlias}`,
+      "确认后将立即切换环境归属高亮到目标账号。",
+      "将对当前「切号高亮」账号执行【备份并清理】，再对目标账号执行【还原备份】。",
+      `目标 username：${targetUser || "-"}`,
     ]
     : [
-      `设备别名�?{actionAlias}`,
-      "确认后将立即切换环境归属高亮到目标账号�?,
-      "将对当前「切号高亮」账号执行【备份并清理】；目标无备份元数据，不做还原�?,
-      `目标 username�?{targetUser || "-"}`,
+      `设备别名：${actionAlias}`,
+      "确认后将立即切换环境归属高亮到目标账号。",
+      "将对当前「切号高亮」账号执行【备份并清理】；目标无备份元数据，不做还原。",
+      `目标 username：${targetUser || "-"}`,
     ];
   if (!confirmTikTokAction("切号", detailLines.join("\n"))) return;
 
@@ -7470,8 +7470,8 @@ async function runBackupArchiveAccountCutSwitch(clickedCard) {
       }
       setStatus(
         canRestoreToDevice
-          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签�?
-          : "切号：环境归属已切换；设备备份并清理任务已完�?,
+          ? "切号：环境归属已切换；设备任务已完成（含还原，登录状态见环境标签）"
+          : "切号：环境归属已切换；设备备份并清理任务已完成",
         "success",
       );
     }
@@ -7522,7 +7522,7 @@ function toggleGalleryLibrarySelection(itemId, selected) {
   const card = galleryLibraryGridEl?.querySelector(`[data-gallery-id="${id}"]`);
   card?.classList.toggle("selected", selected);
   const check = card?.querySelector(".gallery-library-item__check");
-  if (check) check.textContent = selected ? "�? : "";
+  if (check) check.textContent = selected ? "✓" : "";
   updateGalleryLibraryCount();
 }
 
@@ -7547,7 +7547,7 @@ async function renderGalleryLibraryGrid() {
   if (!galleryLibraryGridEl) return;
   revokeGalleryLibraryThumbUrls();
   if (!galleryLibraryItems.length) {
-    galleryLibraryGridEl.innerHTML = '<div class="gallery-library-empty">暂无图片，点击「上传到图库」添加素�?/div>';
+    galleryLibraryGridEl.innerHTML = '<div class="gallery-library-empty">暂无图片，点击「上传到图库」添加素材</div>';
     updateGalleryLibraryCount();
     return;
   }
@@ -7559,7 +7559,7 @@ async function renderGalleryLibraryGrid() {
       const selected = galleryLibrarySelectedIds.has(id);
       return `
         <div class="gallery-library-item${selected ? " selected" : ""}" data-gallery-id="${id}" title="${safeName}">
-          <div class="gallery-library-item__check">${selected ? "�? : ""}</div>
+          <div class="gallery-library-item__check">${selected ? "✓" : ""}</div>
           <button type="button" class="gallery-library-item__delete" data-gallery-delete="${id}" title="删除">×</button>
           <img alt="${safeName}" data-gallery-thumb="${id}" />
           <div class="gallery-library-item__name">${safeName}</div>
@@ -7663,12 +7663,12 @@ async function uploadGalleryLibraryBatches(files) {
 async function uploadGalleryLibraryFromInput() {
   const files = Array.from(galleryLibraryUploadInput?.files || []);
   if (!files.length) {
-    setStatus("请先选择要上传到图库的图�?, "warning");
+    setStatus("请先选择要上传到图库的图片", "warning");
     return;
   }
   const remaining = GALLERY_LIBRARY_MAX_ITEMS - galleryLibraryItems.length;
   if (remaining <= 0) {
-    setStatus(`图库已满（最�?${GALLERY_LIBRARY_MAX_ITEMS} 张）`, "warning");
+    setStatus(`图库已满（最多 ${GALLERY_LIBRARY_MAX_ITEMS} 张）`, "warning");
     return;
   }
   if (files.length > remaining) {
@@ -7678,7 +7678,7 @@ async function uploadGalleryLibraryFromInput() {
   const { uploaded, msg } = await uploadGalleryLibraryBatches(files);
   if (galleryLibraryUploadInput) galleryLibraryUploadInput.value = "";
   await loadGalleryLibrary();
-  setStatus(msg || `已上�?${uploaded} 张图片到图库`, "success");
+  setStatus(msg || `已上传 ${uploaded} 张图片到图库`, "success");
 }
 
 async function deleteGalleryLibraryItem(itemId) {
@@ -7735,7 +7735,7 @@ function renderFailureReportsTable(items) {
       const business = escapeHtml(String(item?.business || "-"));
       const errorType = escapeHtml(String(item?.error_type || "-"));
       const summary = escapeHtml(String(item?.summary || "").slice(0, 240));
-      const ocr = item?.ocr_related ? "�? : "�?;
+      const ocr = item?.ocr_related ? "是" : "否";
       const createdAt = escapeHtml(String(item?.created_at || "-"));
       const size = formatFailureReportBytes(item?.size);
       return `<tr data-report-id="${escapeHtml(id)}">
@@ -7805,16 +7805,16 @@ async function downloadFailureReport(reportId) {
   a.click();
   a.remove();
   URL.revokeObjectURL(objectUrl);
-  setStatus("失败采集包已开始下�?, "success");
+  setStatus("失败采集包已开始下载", "success");
 }
 
 async function deleteFailureReport(reportId) {
   const id = String(reportId || "").trim();
   if (!id) return;
-  if (!window.confirm("确定删除这条失败采集记录？压缩包将一并移除�?)) return;
+  if (!window.confirm("确定删除这条失败采集记录？压缩包将一并移除。")) return;
   await request(`/api/admin/failure_reports/${encodeURIComponent(id)}`, { method: "DELETE" });
   await loadFailureReports();
-  setStatus("已删除失败采集记�?, "success");
+  setStatus("已删除失败采集记录", "success");
 }
 
 async function resolveGalleryDispatchFiles() {
@@ -7834,7 +7834,7 @@ async function resolveGalleryDispatchFiles() {
         { headers },
       );
       if (!response.ok) {
-        throw new Error(`读取图库图片失败�?{meta?.filename || id}`);
+        throw new Error(`读取图库图片失败：${meta?.filename || id}`);
       }
       const blob = await response.blob();
       const filename = String(meta?.filename || `${id}.jpg`);
@@ -7851,7 +7851,7 @@ async function uploadGalleryImagesToDevice() {
     .map((option) => String(option.value || "").trim())
     .filter(Boolean);
   if (!aliases.length) {
-    setStatus("请先选择至少一个目标设备别�?, "warning");
+    setStatus("请先选择至少一个目标设备别名", "warning");
     return;
   }
   const files = await resolveGalleryDispatchFiles();
@@ -7872,8 +7872,8 @@ async function uploadGalleryImagesToDevice() {
     }
     const skippedAliases = aliases.length - pairCount;
     const skippedFiles = files.length - pairCount;
-    setStatus(`正在按一对一下发�?{pairCount} 台设�?<- ${pairCount} 个素�?..`, "info");
-    appendGalleryDispatchLog(`[${new Date().toLocaleString()}] 开始下发：别名=${aliases.length}，素�?${files.length}，配�?${pairCount}`, true);
+    setStatus(`正在按一对一下发：${pairCount} 台设备 <- ${pairCount} 个素材...`, "info");
+    appendGalleryDispatchLog(`[${new Date().toLocaleString()}] 开始下发：别名=${aliases.length}，素材=${files.length}，配对=${pairCount}`, true);
     const headers = {};
     const token = authToken();
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -7886,7 +7886,7 @@ async function uploadGalleryImagesToDevice() {
       appendGalleryDispatchLog(`[${i + 1}/${pairCount}] ${alias} <- ${file?.name || "unknown"}`);
       const deviceId = resolveDeviceIdByAlias(alias);
       if (!deviceId) {
-        summaries.push({ alias, status: "failed", message: "未找到在线设�? });
+        summaries.push({ alias, status: "failed", message: "未找到在线设备" });
         appendGalleryDispatchLog(`  失败：未找到在线设备`);
         continue;
       }
@@ -7900,14 +7900,14 @@ async function uploadGalleryImagesToDevice() {
       } catch (error) {
         const message = error?.message || "下发图库任务失败";
         summaries.push({ alias, status: "failed", message });
-        appendGalleryDispatchLog(`  失败�?{message}`);
+        appendGalleryDispatchLog(`  失败：${message}`);
         continue;
       }
       const opId = data.op_id;
       successCount += 1;
       if (!opId) {
-        summaries.push({ alias, status: "queued", message: "任务已入队（�?op_id�? });
-        appendGalleryDispatchLog("  已入队：任务已创建（�?op_id�?);
+        summaries.push({ alias, status: "queued", message: "任务已入队（无 op_id）" });
+        appendGalleryDispatchLog("  已入队：任务已创建（无 op_id）");
         continue;
       }
       summaries.push({ alias, status: "queued", message: `任务已入队（op_id=${opId}）`, opId });
@@ -7919,8 +7919,8 @@ async function uploadGalleryImagesToDevice() {
         .map((item) => `${item.alias} | ${item.status} | ${item.message}`)
         .join("\n");
       const extra = [
-        skippedAliases > 0 ? `未分配别�? ${skippedAliases}` : "",
-        skippedFiles > 0 ? `未分配素�? ${skippedFiles}` : "",
+        skippedAliases > 0 ? `未分配别名: ${skippedAliases}` : "",
+        skippedFiles > 0 ? `未分配素材: ${skippedFiles}` : "",
       ].filter(Boolean).join(" | ");
       backupCloudInfoEl.textContent = extra ? `${detail}\n${extra}` : detail;
     }
@@ -7933,16 +7933,16 @@ async function uploadGalleryImagesToDevice() {
       const suffix = (skippedAliases > 0 || skippedFiles > 0)
         ? `（未分配别名 ${Math.max(0, skippedAliases)}，未分配素材 ${Math.max(0, skippedFiles)}）`
         : "";
-      setStatus(`全部入队�?{successCount}/${pairCount} 台设备素材任务已创建${suffix}`, "success");
+      setStatus(`全部入队：${successCount}/${pairCount} 台设备素材任务已创建${suffix}`, "success");
       if (galleryImageFilesInput) galleryImageFilesInput.value = "";
     } else if (successCount > 0) {
-      setStatus(`部分入队�?{successCount}/${pairCount} 台设备素材任务已创建`, "warning");
+      setStatus(`部分入队：${successCount}/${pairCount} 台设备素材任务已创建`, "warning");
     } else {
       setStatus("全部入队失败，请查看结果详情", "error");
     }
   } catch (error) {
-    appendGalleryDispatchLog(`异常�?{error.message || "上传并下发图库失�?}`);
-    setStatus(error.message || "上传并下发图库失�?, "error");
+    appendGalleryDispatchLog(`异常：${error.message || "上传并下发图库失败"}`);
+    setStatus(error.message || "上传并下发图库失败", "error");
   }
 }
 
@@ -7983,7 +7983,7 @@ async function loadDbTablePage(preferredTable = "") {
   const table = getActiveDbTableValue(safePreferredTable);
   const searchField = currentDbSearchField || "";
   const searchKeyword = currentDbSearchKeyword || "";
-  if (dbTableBodyEl) dbTableBodyEl.innerHTML = `<tr><td colspan="${Math.max((dbTableHeadEl?.querySelectorAll("th")?.length || 1), 1)}" style="padding:10px;color:#666;">加载�?..</td></tr>`;
+  if (dbTableBodyEl) dbTableBodyEl.innerHTML = `<tr><td colspan="${Math.max((dbTableHeadEl?.querySelectorAll("th")?.length || 1), 1)}" style="padding:10px;color:#666;">加载中...</td></tr>`;
   try {
     const params = new URLSearchParams({
       table,
@@ -8000,7 +8000,7 @@ async function loadDbTablePage(preferredTable = "") {
     }
 
     if (dbPageInfoEl) {
-      dbPageInfoEl.textContent = `�? ${table} | �?${data.page} / ${totalPages} �?| 每页 ${data.page_size} | 总数 ${total}`;
+      dbPageInfoEl.textContent = `表: ${table} | 第 ${data.page} / ${totalPages} 页 | 每页 ${data.page_size} | 总数 ${total}`;
     }
 
     const items = Array.isArray(data.items) ? data.items : [];
@@ -8065,7 +8065,7 @@ async function authCheck() {
       currentUser = null;
       authShell?.classList.remove("hidden");
       appShell?.classList.add("hidden");
-      if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登�?;
+      if (authMessageEl) authMessageEl.textContent = "登录已失效，请重新登录";
       return false;
     }
     if (cachedUser) {
@@ -8074,10 +8074,10 @@ async function authCheck() {
       authShell?.classList.add("hidden");
       appShell?.classList.remove("hidden");
       applyRolePermissions();
-      if (authMessageEl) authMessageEl.textContent = "服务连接异常，已使用本地登录�?;
+      if (authMessageEl) authMessageEl.textContent = "服务连接异常，已使用本地登录态";
       return true;
     }
-    if (authMessageEl) authMessageEl.textContent = "服务连接失败，请检�?API Base 后重�?;
+    if (authMessageEl) authMessageEl.textContent = "服务连接失败，请检查 API Base 后重试";
     return false;
   }
 }
@@ -8117,7 +8117,7 @@ function renderAdminUsers(items = []) {
 async function loadAdminUsers() {
   if (currentUser?.role !== "admin") return;
   const startedAt = Date.now();
-  if (adminUsersTableBodyEl) adminUsersTableBodyEl.innerHTML = '<tr><td colspan="6" style="padding:10px;color:#666;">加载�?..</td></tr>';
+  if (adminUsersTableBodyEl) adminUsersTableBodyEl.innerHTML = '<tr><td colspan="6" style="padding:10px;color:#666;">加载中...</td></tr>';
   const data = await request("/api/admin/users");
   const items = Array.isArray(data.items) ? data.items : [];
   renderAdminUsers(items);
@@ -8148,7 +8148,7 @@ async function createAdminUser() {
     method: "POST",
     body: JSON.stringify({ username, password, role, is_active: true }),
   });
-  if (adminUsersMsgEl) adminUsersMsgEl.textContent = `创建成功�?{username}`;
+  if (adminUsersMsgEl) adminUsersMsgEl.textContent = `创建成功：${username}`;
   if (adminCreateUsernameInput) adminCreateUsernameInput.value = "";
   if (adminCreatePasswordInput) adminCreatePasswordInput.value = "";
   await loadAdminUsers();
@@ -8165,7 +8165,7 @@ async function doLogin() {
     configTargetUsersLoaded = false;
     authShell?.classList.add("hidden");
     appShell?.classList.remove("hidden");
-    if (authMessageEl) authMessageEl.textContent = `欢迎�?{data.username}`;
+    if (authMessageEl) authMessageEl.textContent = `欢迎，${data.username}`;
     try { applyRolePermissions(); } catch (_) {}
     try { await loadUserRuntimeConfig(); } catch (_) {}
     try { await loadAdminUsers(); } catch (_) {}
@@ -8263,13 +8263,13 @@ if (autoStartToggleBtn) {
       });
       adminAutoStartEnabled = Boolean(data.auto_start_enabled);
       updateAutoStartToggleUi();
-      // 顶部总开关切换后，单设备按钮显示需立即与生效状态同步�?
+      // 顶部总开关切换后，单设备按钮显示需立即与生效状态同步。
       renderDevices(latestDevices);
       bindDeviceSelection();
       setStatus(
         next
-          ? "已开启：已绑定设备在轮询到策略后将自行拉起程序（本机未暂停时�?
-          : `已关闭自动起号（已暂�?${data.paused_count ?? 0} 台，清空待启�?${data.cleared_pending_count ?? 0} 台）`,
+          ? "已开启：已绑定设备在轮询到策略后将自行拉起程序（本机未暂停时）"
+          : `已关闭自动起号（已暂停 ${data.paused_count ?? 0} 台，清空待启动 ${data.cleared_pending_count ?? 0} 台）`,
         "success",
       );
     } catch (error) {
@@ -8397,7 +8397,7 @@ if (backupArchiveSelectAllPageBtn) {
 if (backupArchiveClearSelectionBtn) {
   backupArchiveClearSelectionBtn.addEventListener("click", () => {
     clearBackupArchiveSelection();
-    setStatus("已取消全部勾�?, "info");
+    setStatus("已取消全部勾选", "info");
   });
 }
 if (backupAliasPickBtn) {
@@ -8460,7 +8460,7 @@ if (backupAliasPickListEl) {
     else backupAliasPickSelectedAliases.delete(alias);
     updateBackupAliasPickSummary();
     syncBackupAliasPickSelectAllState();
-    // 同步分组标题勾选状态（不整表重绘，避免滚动跳动�?
+    // 同步分组标题勾选状态（不整表重绘，避免滚动跳动）
     ["on", "off"].forEach((groupKey) => {
       const groupCb = backupAliasPickListEl.querySelector(`.backup-alias-pick-group-select[data-group="${groupKey}"]`);
       if (!(groupCb instanceof HTMLInputElement)) return;
@@ -8480,7 +8480,7 @@ if (backupAliasPickListEl) {
 }
 if (backupAliasPickEnableAutoSwitchBtn) {
   backupAliasPickEnableAutoSwitchBtn.addEventListener("click", () => {
-    saveAutoSwitchFromAliasPick(true).catch((e) => setStatus(e?.message || "开启失�?, "error"));
+    saveAutoSwitchFromAliasPick(true).catch((e) => setStatus(e?.message || "开启失败", "error"));
   });
 }
 if (backupAliasPickDisableAutoSwitchBtn) {
@@ -8608,10 +8608,10 @@ if (addAllRootsToPendingBtn) {
   addAllRootsToPendingBtn.addEventListener("click", addAllRootsToPending);
 }
 if (triggerCollectRootsExcelBtn) {
-  triggerCollectRootsExcelBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_collect_roots_excel", "已触发：Excel根用户抓�?));
+  triggerCollectRootsExcelBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_collect_roots_excel", "已触发：Excel根用户抓取"));
 }
 if (stopCollectRootsExcelBtn) {
-  stopCollectRootsExcelBtn.addEventListener("click", () => stopTaskByPrefix("collect_roots_excel", "已停�?Excel 抓取任务"));
+  stopCollectRootsExcelBtn.addEventListener("click", () => stopTaskByPrefix("collect_roots_excel", "已停止 Excel 抓取任务"));
 }
 if (triggerCollectRootsDbBtn) {
   triggerCollectRootsDbBtn.addEventListener("click", () => {
@@ -8623,7 +8623,7 @@ if (triggerCollectRootsDbBtn) {
   });
 }
 if (stopCollectRootsDbBtn) {
-  stopCollectRootsDbBtn.addEventListener("click", () => stopTaskByPrefix("collect_roots_db", "已停�?tiktok_roots 抓取任务"));
+  stopCollectRootsDbBtn.addEventListener("click", () => stopTaskByPrefix("collect_roots_db", "已停止 tiktok_roots 抓取任务"));
 }
 function formatPreflightStats(stats) {
   if (!stats || typeof stats !== "object") return "";
@@ -8631,15 +8631,15 @@ function formatPreflightStats(stats) {
     `预检扫描=${stats.scanned ?? 0}`,
     `标记关注列表隐藏=${stats.marked_following_private ?? 0}`,
     `标记私密=${stats.marked_private_account ?? 0}`,
-    `标记不可�?${stats.marked_not_found ?? 0}`,
+    `标记不可用=${stats.marked_not_found ?? 0}`,
     `仍可处理=${stats.still_processable ?? 0}`,
-  ].join("�?);
+  ].join("，");
 }
 
 if (preflightFollowerQueueBtn) {
   preflightFollowerQueueBtn.addEventListener("click", async () => {
     try {
-      setStatus("正在预检关注列表可见�?..", "info");
+      setStatus("正在预检关注列表可见性...", "info");
       const raw = Number(processQueueBatchSizeInput?.value || 100);
       const limit = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : 100);
       const data = await request(
@@ -8647,7 +8647,7 @@ if (preflightFollowerQueueBtn) {
         { method: "POST" }
       );
       const summary = formatPreflightStats(data.stats);
-      setStatus(summary ? `预检完成�?{summary}` : "预检完成", "success");
+      setStatus(summary ? `预检完成：${summary}` : "预检完成", "success");
       await loadCvAccessData();
       currentCvPage = 1;
       applyCvAccessView();
@@ -8659,7 +8659,7 @@ if (preflightFollowerQueueBtn) {
 if (triggerProcessQueueInlineBtn) {
   triggerProcessQueueInlineBtn.addEventListener("click", async () => {
     try {
-      setStatus("任务触发中（含预检�?..", "info");
+      setStatus("任务触发中（含预检）...", "info");
       const raw = Number(processQueueBatchSizeInput?.value || 100);
       const limit = Math.max(1, Number.isFinite(raw) ? Math.floor(raw) : 100);
       const container_ids = (cvTaskContainerIdsInput?.value || "").trim();
@@ -8670,28 +8670,28 @@ if (triggerProcessQueueInlineBtn) {
       const pre = formatPreflightStats(data.preflight);
       if (data.workers) {
         setStatus(
-          `已触发：follower_queue处理（workers=${data.workers}�?{pre ? `�?{pre}` : ""}`,
+          `已触发：follower_queue处理（workers=${data.workers}）${pre ? `；${pre}` : ""}`,
           "success"
         );
       } else {
         setStatus(
-          `已触发：follower_queue处理（pid=${data.pid ?? "-"}�?{pre ? `�?{pre}` : ""}`,
+          `已触发：follower_queue处理（pid=${data.pid ?? "-"}）${pre ? `；${pre}` : ""}`,
           "success"
         );
       }
     } catch (error) {
       const msg = error.message || "任务触发失败";
       setStatus(msg, "error");
-      // 触发失败时右侧日志区先给出明确错误，避免用户误以为“没有任何响应”�?
+      // 触发失败时右侧日志区先给出明确错误，避免用户误以为“没有任何响应”。
       if (cvTaskLogsEl) cvTaskLogsEl.textContent = msg;
     } finally {
-      // 触发失败/被拦截时也刷新一次，至少让用户看�?scheduler 开关状态或已有日志�?
+      // 触发失败/被拦截时也刷新一次，至少让用户看到 scheduler 开关状态或已有日志。
       await refreshTaskStatus();
     }
   });
 }
 if (stopProcessQueueInlineBtn) {
-  stopProcessQueueInlineBtn.addEventListener("click", () => stopTaskByPrefix("process_queue", "已停�?follower_queue 处理任务"));
+  stopProcessQueueInlineBtn.addEventListener("click", () => stopTaskByPrefix("process_queue", "已停止 follower_queue 处理任务"));
 }
 if (queryCvAccessDataBtn) {
   queryCvAccessDataBtn.addEventListener("click", async () => {
@@ -8700,7 +8700,7 @@ if (queryCvAccessDataBtn) {
       await loadCvAccessData();
       currentCvPage = 1;
       applyCvAccessView();
-      setStatus("直客模式数据已刷�?, "success");
+      setStatus("直客模式数据已刷新", "success");
     } catch (error) {
       setStatus(error.message || "查询直客模式数据失败", "error");
     }
@@ -8743,7 +8743,7 @@ if (saveCvQualityFilterBtn) {
   saveCvQualityFilterBtn.addEventListener("click", saveCvQualityFilter);
 }
 if (triggerAutoSearchBtn) {
-  triggerAutoSearchBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_autosearch_once", "已触发：粉丝增长监控执行一�?));
+  triggerAutoSearchBtn.addEventListener("click", () => triggerTask("/api/admin/tasks/trigger_autosearch_once", "已触发：粉丝增长监控执行一次"));
 }
 if (schedulerLogsScrollBottomBtn) {
   schedulerLogsScrollBottomBtn.addEventListener("click", () => {
@@ -8770,13 +8770,13 @@ if (backupStatsFullQueryEnabledToggle) {
 }
 if (autoSwitchSelectAllEnableBtn) {
   autoSwitchSelectAllEnableBtn.addEventListener("click", () => {
-    enableAutoSwitchForAllDevices().catch((e) => setStatus(e.message || "全选并开启失�?, "error"));
+    enableAutoSwitchForAllDevices().catch((e) => setStatus(e.message || "全选并开启失败", "error"));
   });
 }
 if (autoSwitchEnableSelectedBtn) {
   autoSwitchEnableSelectedBtn.addEventListener("click", () => {
     saveAutoSwitchConfig({ enabled: true }).catch((e) =>
-      setStatus(e.message || "开启失�?, "error"),
+      setStatus(e.message || "开启失败", "error"),
     );
   });
 }
@@ -8814,8 +8814,8 @@ if (autoSwitchExcludedBatchExcludeBtn) {
 if (autoSwitchExcludedBatchJoinBtn) {
   autoSwitchExcludedBatchJoinBtn.addEventListener("click", () => {
     submitAutoSwitchExcludedBatch(false).catch((e) => {
-      setAutoSwitchExcludedBatchMessage(e.message || "批量退出失�?, "error");
-      setStatus(e.message || "批量退出失�?, "error");
+      setAutoSwitchExcludedBatchMessage(e.message || "批量退出失败", "error");
+      setStatus(e.message || "批量退出失败", "error");
     });
   });
 }
@@ -8997,7 +8997,7 @@ if (dbTableSelect) {
   });
 }
 
-// 兜底：某些浏览器/脚本热更新场景下，局部节点可能被替换导致原监听丢失�?
+// 兜底：某些浏览器/脚本热更新场景下，局部节点可能被替换导致原监听丢失。
 document.addEventListener("change", (event) => {
   const target = event?.target;
   if (!target || target.id !== "dbTableSelect") return;
@@ -9057,7 +9057,7 @@ if (dbSearchKeywordInput) {
 if (uploadGalleryBtn) {
   uploadGalleryBtn.addEventListener("click", () => {
     uploadGalleryImagesToDevice().catch((error) => {
-      setStatus(error?.message || "上传并下发图库失�?, "error");
+      setStatus(error?.message || "上传并下发图库失败", "error");
     });
   });
 }
@@ -9067,7 +9067,7 @@ if (galleryLibraryUploadBtn && galleryLibraryUploadInput) {
   });
   galleryLibraryUploadInput.addEventListener("change", () => {
     uploadGalleryLibraryFromInput().catch((error) => {
-      setStatus(error?.message || "上传到图库失�?, "error");
+      setStatus(error?.message || "上传到图库失败", "error");
     });
   });
 }
@@ -9089,7 +9089,7 @@ if (failureReportsRefreshBtn) {
   if (!el) return;
   el.addEventListener("change", () => {
     loadFailureReports().catch((error) => {
-      setStatus(error?.message || "筛选失败采集失�?, "error");
+      setStatus(error?.message || "筛选失败采集失败", "error");
     });
   });
 });
@@ -9163,7 +9163,7 @@ function isAccountManagerActive() {
   return document.querySelector(".panel.active")?.id === "account-manager";
 }
 
-/** 在多个字段中做包含匹配（忽略大小写），任一字段命中即返�?true */
+/** 在多个字段中做包含匹配（忽略大小写），任一字段命中即返回 true */
 function matchesSearchInFields(needle, fields = []) {
   const n = String(needle || "").trim().toLowerCase();
   if (!n) return true;
@@ -9183,7 +9183,7 @@ function formatAccountRecordsSearchHint(query, field = "") {
   const q = String(query || "").trim();
   if (!q) return "";
   const fieldLabel = ACCOUNT_RECORDS_SEARCH_FIELD_LABELS[String(field || "").trim()] || "全部字段";
-  return `未找到在�?{fieldLabel}」中匹配�?{q}」的账号记录`;
+  return `未找到在「${fieldLabel}」中匹配「${q}」的账号记录`;
 }
 
 function accountRecordMatchesSearch(row = {}) {
@@ -9373,7 +9373,7 @@ function rebuildBackupAliasByUsername() {
   (deviceEditorRows || []).forEach(ingest);
 }
 
-/** 账号�?assigned_alias 为空时，从设备档案反查别名用于展示与保存 */
+/** 账号表 assigned_alias 为空时，从设备档案反查别名用于展示与保存 */
 function syncAccountAliasFromDeviceRows() {
   (accountEditorRows || []).forEach((row) => {
     if (normalizeAliasValue(row?.assigned_alias)) return;
@@ -9431,7 +9431,7 @@ function renderBackupArchiveSummaryTable(rows = []) {
   }
   const groups = buildBackupGroups(rows);
   deviceAliasGroupsEl.innerHTML = groups.map(([aliasKey, items], groupIdx) => {
-    const aliasLabel = aliasKey === "__UNASSIGNED__" ? "未分配别�? : aliasKey;
+    const aliasLabel = aliasKey === "__UNASSIGNED__" ? "未分配别名" : aliasKey;
     const count = items.length;
     const rowsHtml = items.map((row) => {
       const backupName = String(row.backup_name || "").trim() || "-";
@@ -9443,7 +9443,7 @@ function renderBackupArchiveSummaryTable(rows = []) {
       <details class="panel-card" style="margin-bottom:12px;background:#f8faff;" ${groupIdx < 2 ? "open" : ""}>
         <summary style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;align-items:center;">
           <strong>${aliasLabel}</strong>
-          <span class="hint">${count} �?/span>
+          <span class="hint">${count} 条</span>
         </summary>
         <div style="overflow:auto;margin-top:10px;border:1px solid #e5e7eb;border-radius:8px;background:#fff;">
           <table style="width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;">
@@ -9480,7 +9480,7 @@ async function ensureBackupArchiveEntryForAccount(row, assignedAlias) {
   const normalizedAlias = normalizeAliasValue(assignedAlias);
   const username = String(row?.username || "").trim().toLowerCase();
   if (!normalizedAlias || !username) return;
-  // upsert 已在服务端同�?device_editor_rows；仅更新本地反查缓存，避�?loadBackupArchiveRecords 全量刷新�?
+  // upsert 已在服务端同步 device_editor_rows；仅更新本地反查缓存，避免 loadBackupArchiveRecords 全量刷新。
   backupAliasByUsername.set(username, normalizedAlias);
 }
 
@@ -9525,12 +9525,12 @@ function hasMeaningfulAccountValue(value) {
 const ACCOUNT_IMPORT_MERGE_FIELDS = ["password", "email", "email_password", "two_fa", "api", "region"];
 
 const ACCOUNT_BATCH_NOISE_VALUES = new Set([
-  "未售�?,
-  "已售�?,
-  "已卖�?,
+  "未售出",
+  "已售出",
+  "已卖出",
   "卡号",
   "卡密",
-  "状�?,
+  "状态",
   "status",
   "sold",
   "unsold",
@@ -9540,12 +9540,12 @@ function normalizeAccountTwoFaSecret(value) {
   return String(value || "").trim().replace(/\s+/g, "").toUpperCase();
 }
 
-/** TOTP/2FA 密钥：Base32（A-Z2-7），常见 16/26/32/64 位；勿回�?looksLikeAccountApiValue（会循环�?*/
+/** TOTP/2FA 密钥：Base32（A-Z2-7），常见 16/26/32/64 位；勿回调 looksLikeAccountApiValue（会循环） */
 function looksLikeTwoFaSecret(value) {
   const text = normalizeAccountTwoFaSecret(value);
   if (!hasMeaningfulAccountValue(text)) return false;
   if (text.includes("@")) return false;
-  // 排除 UUID / URL / �?0/1/8/9 的普通口�?
+  // 排除 UUID / URL / 含 0/1/8/9 的普通口令
   if (/[0189_\-.:/\\]/.test(text)) return false;
   return /^[A-Z2-7]{16,64}$/.test(text);
 }
@@ -9563,12 +9563,12 @@ function isAccountBatchHeaderLine(cols) {
   const first = String(cols[0] || "").trim().toLowerCase();
   if (first === "username" || first === "user" || first === "卡号") return true;
   const joined = cols.map((c) => String(c || "").trim()).join(" ");
-  return /卡号|卡密|状�?.test(joined) && cols.length <= 4 && !looksLikeTwoFaSecret(cols[2] || "");
+  return /卡号|卡密|状态/.test(joined) && cols.length <= 4 && !looksLikeTwoFaSecret(cols[2] || "");
 }
 
 /**
- * 展开厂家「凭�?---�?+ TAB 状态」与标准 TAB/---- 列�?
- * 例：username----password----2FA\t\t未售�?�?[username, password, 2FA]
+ * 展开厂家「凭证----串 + TAB 状态」与标准 TAB/---- 列。
+ * 例：username----password----2FA\t\t未售出 → [username, password, 2FA]
  */
 function splitAccountBatchColumns(rawLine) {
   const raw = String(rawLine || "").trim();
@@ -9616,7 +9616,7 @@ function looksLikeAccountApiValue(value) {
 
 function resolveAccountBatchTwoFa(normalizedCols) {
   if (!normalizedCols.length) return "";
-  // �?2FA：username, password, two_fa
+  // 仅 2FA：username, password, two_fa
   if (normalizedCols.length === 3 && looksLikeTwoFaSecret(normalizedCols[2])) {
     return normalizeAccountTwoFaSecret(normalizedCols[2]);
   }
@@ -9625,12 +9625,12 @@ function resolveAccountBatchTwoFa(normalizedCols) {
     if (looksLikeTwoFaSecret(normalizedCols[2])) {
       return normalizeAccountTwoFaSecret(normalizedCols[2]);
     }
-    // username, password, email, two_fa（无邮箱密码�?
+    // username, password, email, two_fa（无邮箱密码）
     if (String(normalizedCols[2] || "").includes("@") && looksLikeTwoFaSecret(normalizedCols[3])) {
       return normalizeAccountTwoFaSecret(normalizedCols[3]);
     }
   }
-  // 标准邮箱格式：从 email_password 之后的尾列识�?2FA
+  // 标准邮箱格式：从 email_password 之后的尾列识别 2FA
   if (normalizedCols.length >= 5) {
     for (let i = 4; i < normalizedCols.length; i += 1) {
       if (looksLikeTwoFaSecret(normalizedCols[i])) {
@@ -9643,7 +9643,7 @@ function resolveAccountBatchTwoFa(normalizedCols) {
 
 function resolveAccountBatchApi(normalizedCols) {
   if (normalizedCols.length <= 3) return "";
-  // �?2FA + api：username, password, two_fa, api
+  // 仅 2FA + api：username, password, two_fa, api
   if (normalizedCols.length === 4 && looksLikeTwoFaSecret(normalizedCols[2])) {
     const maybeApi = String(normalizedCols[3] || "").trim();
     if (hasMeaningfulAccountValue(maybeApi) && !looksLikeTwoFaSecret(maybeApi)) return maybeApi;
@@ -9700,7 +9700,7 @@ function getAccountImportOverwriteChanges(existing, incoming) {
 function buildAccountImportOverwriteConfirmMessage(overwriteSummaries) {
   const lines = overwriteSummaries.map(({ username, changes }) => {
     const fieldLines = changes
-      .map((item) => `  - ${item.field}: �?{item.before}」→�?{item.after}」`)
+      .map((item) => `  - ${item.field}: 「${item.before}」→「${item.after}」`)
       .join("\n");
     return `${username}:\n${fieldLines}`;
   });
@@ -9737,7 +9737,7 @@ function setAccountBatchPreviewBusy(busy) {
   const disabled = Boolean(busy);
   if (confirmAccountBatchPreviewBtn) {
     confirmAccountBatchPreviewBtn.disabled = disabled;
-    confirmAccountBatchPreviewBtn.textContent = disabled ? "导入中�? : "确定导入";
+    confirmAccountBatchPreviewBtn.textContent = disabled ? "导入中…" : "确定导入";
   }
   if (importAccountBatchBtn) importAccountBatchBtn.disabled = disabled;
 }
@@ -9773,7 +9773,7 @@ function buildAccountBatchPreviewAliasOptionsHtml(currentValue = "") {
   const current = normalizeAliasValue(currentValue);
   const aliases = collectAssignableAliases(current);
   return [
-    '<option value="">�?/option>',
+    '<option value="">无</option>',
     ...aliases.map((alias) => `<option value="${escapeHtml(alias)}" ${alias === current ? "selected" : ""}>${escapeHtml(alias)}</option>`),
   ].join("");
 }
@@ -9802,7 +9802,7 @@ function refreshAccountBatchPreviewSmartAliasList() {
   }
   const selectedCount = accountBatchPreviewSmartAliases.size;
   accountBatchPreviewSmartAliasListEl.innerHTML = `
-    <div class="import-preview-smart-alias-meta hint">已勾�?${selectedCount} / ${aliases.length} 个别名（可多选）</div>
+    <div class="import-preview-smart-alias-meta hint">已勾选 ${selectedCount} / ${aliases.length} 个别名（可多选）</div>
     <div class="import-preview-smart-alias-grid">
       ${aliases.map((alias) => {
         const checked = accountBatchPreviewSmartAliases.has(alias);
@@ -9831,7 +9831,7 @@ function applyAccountBatchPreviewSmartDistribution() {
   syncAccountBatchPreviewItemsFromDom();
   const aliases = Array.from(accountBatchPreviewSmartAliases).sort(compareAliasNatural);
   if (!aliases.length) {
-    setStatus("请先勾选至少一个别�?, "warning");
+    setStatus("请先勾选至少一个别名", "warning");
     return;
   }
   const targets = collectAccountBatchPreviewAliasTargets();
@@ -9855,8 +9855,8 @@ function applyAccountBatchPreviewSmartDistribution() {
   const perAlias = aliases.map((alias, aliasIndex) => {
     const count = base + (aliasIndex < remainder ? 1 : 0);
     return `${alias}×${count}`;
-  }).join("�?);
-  setStatus(`已为 ${targets.length} 条选中记录智能分配别名�?{perAlias}）`, "success");
+  }).join("、");
+  setStatus(`已为 ${targets.length} 条选中记录智能分配别名（${perAlias}）`, "success");
 }
 
 function updateAccountBatchPreviewSummary() {
@@ -9864,9 +9864,9 @@ function updateAccountBatchPreviewSummary() {
   const total = accountBatchPreviewItems.length;
   const selected = accountBatchPreviewItems.filter((item) => item.selected && item.kind !== "duplicate").length;
   const duplicateCount = accountBatchPreviewItems.filter((item) => item.kind === "duplicate").length;
-  const parts = [`�?${total} 条`, `已�?${selected} 条`];
-  if (duplicateCount) parts.push(`文件内重�?${duplicateCount} 条（不可选）`);
-  accountBatchPreviewSummaryEl.textContent = parts.join("�?);
+  const parts = [`共 ${total} 条`, `已选 ${selected} 条`];
+  if (duplicateCount) parts.push(`文件内重复 ${duplicateCount} 条（不可选）`);
+  accountBatchPreviewSummaryEl.textContent = parts.join("，");
 }
 
 function renderAccountBatchPreviewTable() {
@@ -9891,7 +9891,7 @@ function renderAccountBatchPreviewTable() {
       : item.kind === "update"
         ? "更新已有"
         : item.kind === "duplicate"
-          ? "文件内重�?
+          ? "文件内重复"
           : "无需更新";
     const previewExisting = item.existingIndex != null ? accountEditorRows[item.existingIndex] : item.row;
     const aliasDisabled = isDuplicate || (item.kind === "skip" && getEffectiveAccountAssignedAlias(previewExisting))
@@ -9914,7 +9914,7 @@ function renderAccountBatchPreviewTable() {
   accountBatchPreviewTableWrapEl.innerHTML = `<table class="import-preview-table">
     <thead>
       <tr>
-        <th style="width:44px;">�?/th>
+        <th style="width:44px;">选</th>
         <th>username</th>
         <th>password</th>
         <th>email</th>
@@ -9923,7 +9923,7 @@ function renderAccountBatchPreviewTable() {
         <th>api</th>
         <th>地区</th>
         <th style="min-width:120px;">别名</th>
-        <th style="width:96px;">状�?/th>
+        <th style="width:96px;">状态</th>
       </tr>
     </thead>
     <tbody>${rowsHtml}</tbody>
@@ -9990,7 +9990,7 @@ function applyAccountStatsQueryScheduleUi(cfg = {}) {
   }
   if (accountStatsQueryBtn) {
     accountStatsQueryBtn.disabled = accountStatsQueryInFlight;
-    accountStatsQueryBtn.textContent = accountStatsQueryInFlight ? "查询进行中�? : "全量查询并落�?;
+    accountStatsQueryBtn.textContent = accountStatsQueryInFlight ? "查询进行中…" : "全量查询并落库";
   }
 }
 
@@ -10005,7 +10005,7 @@ function updateAccountStatsQuerySummary() {
       usernameCount += Number(group?.count) || (Array.isArray(group?.usernames) ? group.usernames.length : 0);
     }
   });
-  accountStatsQuerySummaryEl.textContent = `已�?${selectedCount}/${totalAliases} 个别名，�?${usernameCount} 个账号`;
+  accountStatsQuerySummaryEl.textContent = `已选 ${selectedCount}/${totalAliases} 个别名，约 ${usernameCount} 个账号`;
 }
 
 function syncAccountStatsQuerySelectAllState() {
@@ -10019,7 +10019,7 @@ function syncAccountStatsQuerySelectAllState() {
 function renderAccountStatsQueryAliasList() {
   if (!accountStatsQueryAliasListEl) return;
   if (!accountStatsQueryAliasGroups.length) {
-    accountStatsQueryAliasListEl.innerHTML = '<div class="hint" style="padding:16px;">暂无已分配别名的账号，请先在账号记录或设备档案中分配别名�?/div>';
+    accountStatsQueryAliasListEl.innerHTML = '<div class="hint" style="padding:16px;">暂无已分配别名的账号，请先在账号记录或设备档案中分配别名。</div>';
     updateAccountStatsQuerySummary();
     syncAccountStatsQuerySelectAllState();
     return;
@@ -10029,7 +10029,7 @@ function renderAccountStatsQueryAliasList() {
     const count = Number(group?.count) || (Array.isArray(group?.usernames) ? group.usernames.length : 0);
     const checked = alias && accountStatsQuerySelectedAliases.has(alias);
     const preview = (Array.isArray(group?.usernames) ? group.usernames.slice(0, 5) : []).join(", ");
-    const more = count > 5 ? ` �?${count} 个` : "";
+    const more = count > 5 ? ` 等 ${count} 个` : "";
     return `<tr>
       <td style="width:40px;text-align:center;">
         <input type="checkbox" class="account-stats-query-alias-check" data-alias="${escapeHtml(alias)}"${checked ? " checked" : ""} />
@@ -10040,7 +10040,7 @@ function renderAccountStatsQueryAliasList() {
     </tr>`;
   }).join("");
   accountStatsQueryAliasListEl.innerHTML = `<table class="import-preview-table">
-    <thead><tr><th></th><th>别名</th><th>账号�?/th><th>username 预览</th></tr></thead>
+    <thead><tr><th></th><th>别名</th><th>账号数</th><th>username 预览</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>`;
   updateAccountStatsQuerySummary();
@@ -10082,7 +10082,7 @@ function scheduleAccountStatsQueryPoll(active) {
       const cfg = await loadAccountStatsQueryConfig();
       if (prevInFlight && !cfg.in_flight) {
         await refreshAccountEditorLight();
-        setStatus("账号统计查询已完成，表格已刷�?, "success");
+        setStatus("账号统计查询已完成，表格已刷新", "success");
       }
     } catch (_) {
       // 静默轮询失败
@@ -10100,7 +10100,7 @@ function restoreAccountStatsQuerySelectionFromConfig() {
 }
 
 async function saveAccountStatsQueryConfig(options = {}) {
-  // 并发保存时排队等待，避免“看起来成功但其实没写库�?
+  // 并发保存时排队等待，避免“看起来成功但其实没写库”
   while (accountStatsQueryConfigSaveInFlight) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -10146,13 +10146,13 @@ function closeAccountStatsQueryModal({ discardSelection = true } = {}) {
   if (!accountStatsQueryModalEl) return;
   accountStatsQueryModalEl.classList.add("hidden");
   accountStatsQueryModalEl.setAttribute("aria-hidden", "true");
-  // 取消/关闭时丢弃未确认勾选，避免污染定时保存与下次记�?
+  // 取消/关闭时丢弃未确认勾选，避免污染定时保存与下次记忆
   if (discardSelection) restoreAccountStatsQuerySelectionFromConfig();
 }
 
 async function openAccountStatsQueryFlow() {
   if (accountStatsQueryInFlight) {
-    setStatus("查询任务正在执行中，请稍后再�?, "warning");
+    setStatus("查询任务正在执行中，请稍后再试", "warning");
     return;
   }
   try {
@@ -10165,12 +10165,12 @@ async function openAccountStatsQueryFlow() {
 
 async function confirmAccountStatsQueryRun() {
   if (accountStatsQueryInFlight) {
-    setStatus("查询任务正在执行中，请稍后再�?, "warning");
+    setStatus("查询任务正在执行中，请稍后再试", "warning");
     return;
   }
   const selected = Array.from(accountStatsQuerySelectedAliases).filter(Boolean);
   if (!selected.length) {
-    setStatus("请至少选择一个别�?, "warning");
+    setStatus("请至少选择一个别名", "warning");
     return;
   }
   try {
@@ -10183,7 +10183,7 @@ async function confirmAccountStatsQueryRun() {
     accountStatsQueryInFlight = true;
     applyAccountStatsQueryScheduleUi({ ...accountStatsQueryConfig, in_flight: true });
     scheduleAccountStatsQueryPoll(true);
-    setStatus(data.msg || "已提交查询任�?, "success");
+    setStatus(data.msg || "已提交查询任务", "success");
   } catch (error) {
     setStatus(error.message || "提交查询失败", "error");
   }
@@ -10202,7 +10202,7 @@ async function downloadAccountStatsQueryLogs() {
       const data = JSON.parse(text);
       if (data?.msg) msg = String(data.msg);
     } catch {
-      /* �?JSON 时沿用原始文�?*/
+      /* 非 JSON 时沿用原始文本 */
     }
     throw new Error(msg);
   }
@@ -10279,7 +10279,7 @@ async function commitAccountBatchImportFromPreview() {
     if (bulkAliasApplied > 0) renderAccountBatchPreviewTable();
     const selectedItems = accountBatchPreviewItems.filter(isAccountBatchPreviewItemCommittable);
     if (!selectedItems.length) {
-      throw new Error("请至少勾选一条可导入的记�?);
+      throw new Error("请至少勾选一条可导入的记录");
     }
     syncAccountAliasFromDeviceRows();
     const existingUsernameIndex = buildAccountUsernameIndex();
@@ -10327,7 +10327,7 @@ async function commitAccountBatchImportFromPreview() {
       .filter(Boolean);
     if (overwriteSummaries.length) {
       if (!window.confirm(buildAccountImportOverwriteConfirmMessage(overwriteSummaries))) {
-        setStatus("已取消批量导入：未覆盖任何已有非空字�?, "info");
+        setStatus("已取消批量导入：未覆盖任何已有非空字段", "info");
         return;
       }
     }
@@ -10345,9 +10345,9 @@ async function commitAccountBatchImportFromPreview() {
     const statusParts = [];
     if (rowsToImport.length) statusParts.push(`新增 ${rowsToImport.length} 条`);
     if (rowsToUpdate.length) statusParts.push(`更新已有 ${rowsToUpdate.length} 条`);
-    if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别�?api（请检查列格式）`);
-    if (duplicateCount) statusParts.push(`跳过文件内重�?${duplicateCount} 条`);
-    if (bulkAliasApplied > 0) statusParts.push(`已自动分配别�?${bulkAliasApplied} 条`);
+    if (parsedWithoutApi > 0) statusParts.push(`其中 ${parsedWithoutApi} 条未识别到 api（请检查列格式）`);
+    if (duplicateCount) statusParts.push(`跳过文件内重复 ${duplicateCount} 条`);
+    if (bulkAliasApplied > 0) statusParts.push(`已自动分配别名 ${bulkAliasApplied} 条`);
     const hasChanges = rowsToImport.length > 0 || rowsToUpdate.length > 0;
     const statusLevel = parsedWithoutApi > 0 ? "warning" : (hasChanges ? "success" : "warning");
     await request(`${ACCOUNT_ROWS_API}/batch_upsert`, {
@@ -10356,7 +10356,7 @@ async function commitAccountBatchImportFromPreview() {
     });
     closeAccountBatchPreviewModal();
     if (accountBatchInputEl) accountBatchInputEl.value = "";
-    setStatus(`批量导入完成�?{statusParts.join("�?)}`, statusLevel);
+    setStatus(`批量导入完成：${statusParts.join("，")}`, statusLevel);
     try {
       await loadAccountEditorRows();
       renderAccountEditorRows();
@@ -10380,7 +10380,7 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   const normalizedCols = splitAccountBatchColumns(raw);
   if (isAccountBatchHeaderLine(normalizedCols)) return null;
   if (normalizedCols.length < 3) {
-    throw new Error(`格式错误：至少需�?列（username、password、two_fa）或4列（username、password、email、email_password）。支�?TAB �?---- 分隔，实�?${normalizedCols.length} 列`);
+    throw new Error(`格式错误：至少需要3列（username、password、two_fa）或4列（username、password、email、email_password）。支持 TAB 或 ---- 分隔，实际 ${normalizedCols.length} 列`);
   }
   const username = String(normalizedCols[0] || "").trim();
   if (!username) {
@@ -10390,25 +10390,25 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
   let email = "";
   let emailPassword = "";
   const twoFa = resolveAccountBatchTwoFa(normalizedCols);
-  // 支持格式�?
+  // 支持格式：
   // 1) 3列仅2FA：username,password,two_fa
   // 2) 4列仅2FA+api：username,password,two_fa,api
   // 3) 4列邮箱：username,password,email,email_password
-  // 4) 4列邮�?2FA：username,password,email,two_fa
-  // 5) 5列：username,password,email,email_password,api �?�?two_fa
-  // 6) 6列：�?two_fa,api 或旧�?�?(忽略),api
-  // 7) 7列：�?two_fa,(忽略),api 或旧�?�?(忽略),(忽略),api
+  // 4) 4列邮箱+2FA：username,password,email,two_fa
+  // 5) 5列：username,password,email,email_password,api 或 …,two_fa
+  // 6) 6列：…,two_fa,api 或旧版 …,(忽略),api
+  // 7) 7列：…,two_fa,(忽略),api 或旧版 …,(忽略),(忽略),api
   const twoFaOnly = (
     (normalizedCols.length === 3 && Boolean(twoFa))
     || (normalizedCols.length === 4 && looksLikeTwoFaSecret(normalizedCols[2]))
   );
   if (!twoFaOnly) {
     if (normalizedCols.length < 4) {
-      throw new Error("格式错误：无 2FA 时至少需�?列（username、password、email、email_password�?);
+      throw new Error("格式错误：无 2FA 时至少需要4列（username、password、email、email_password）");
     }
     email = String(normalizedCols[2] || "").trim();
     const col3 = String(normalizedCols[3] || "").trim();
-    // �?列为 2FA 时不要把它写�?email_password
+    // 第4列为 2FA 时不要把它写进 email_password
     emailPassword = (looksLikeTwoFaSecret(col3) && !looksLikeTwoFaSecret(normalizedCols[2]))
       ? ""
       : col3;
@@ -10420,10 +10420,10 @@ function parseAccountBatchLine(line, sharedRegion = "", rejectEmpty = false) {
     if (!hasMeaningfulAccountValue(password)) missingFields.push("password");
     const hasEmailCreds = hasMeaningfulAccountValue(email) && hasMeaningfulAccountValue(emailPassword);
     const hasTwoFa = hasMeaningfulAccountValue(twoFa);
-    if (!hasEmailCreds && !hasTwoFa) missingFields.push("email/email_password �?two_fa");
+    if (!hasEmailCreds && !hasTwoFa) missingFields.push("email/email_password 或 two_fa");
     if (!hasMeaningfulAccountValue(api) && !hasTwoFa) missingFields.push("api");
     if (missingFields.length) {
-      throw new Error(`存在空值字段：${missingFields.join("�?)}`);
+      throw new Error(`存在空值字段：${missingFields.join("、")}`);
     }
   }
   return getAccountRowTemplate({
@@ -10441,7 +10441,7 @@ async function importAccountBatchFromText() {
   const text = String(accountBatchInputEl?.value || "");
   const sharedRegion = String(accountBatchRegionInputEl?.value || "").trim();
   if (!sharedRegion) {
-    const msg = "批量导入前请先填写「统一国家地区」（例如 MX / US）�?;
+    const msg = "批量导入前请先填写「统一国家地区」（例如 MX / US）。";
     setStatus(msg, "error");
     window.alert(msg);
     return;
@@ -10461,7 +10461,7 @@ async function importAccountBatchFromText() {
       return row;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`�?${idx + 1} 行解析失败：${message}`);
+      throw new Error(`第 ${idx + 1} 行解析失败：${message}`);
     }
   }).filter(Boolean);
   const existingUsernameIndex = buildAccountUsernameIndex();
@@ -10470,14 +10470,14 @@ async function importAccountBatchFromText() {
   const duplicateCount = previewItems.filter((item) => item.kind === "duplicate").length;
   if (!importableCount) {
     if (duplicateCount) {
-      throw new Error(`没有可导入的账号：检测到文件内重�?username �?${duplicateCount} 条`);
+      throw new Error(`没有可导入的账号：检测到文件内重复 username 共 ${duplicateCount} 条`);
     }
     throw new Error("没有可导入的账号：所有记录已存在且字段无需更新");
   }
   if (parsedWithoutApi > 0) {
-    setStatus(`已解�?${previewItems.length} 条，其中 ${parsedWithoutApi} 条未识别�?api，请在预览中确认`, "warning");
+    setStatus(`已解析 ${previewItems.length} 条，其中 ${parsedWithoutApi} 条未识别到 api，请在预览中确认`, "warning");
   } else {
-    setStatus(`已解�?${previewItems.length} 条，请在预览中勾选并确认导入`, "info");
+    setStatus(`已解析 ${previewItems.length} 条，请在预览中勾选并确认导入`, "info");
   }
   openAccountBatchPreviewModal(previewItems);
 }
@@ -10499,7 +10499,7 @@ function normalizeAliasKey(value) {
   return normalizeAliasValue(value).toLowerCase();
 }
 
-/** 别名自然排序：按段比较，阿拉伯数字按数值（�?9_Ma11 先比 9 再比 11；BR9 < BR11�?*/
+/** 别名自然排序：按段比较，阿拉伯数字按数值（如 9_Ma11 先比 9 再比 11；BR9 < BR11） */
 function compareAliasNatural(a, b) {
   const aStr = String(a || "");
   const bStr = String(b || "");
@@ -10536,12 +10536,12 @@ function normalizeAutoSwitchPlansByAlias(rawPlans = {}) {
 }
 
 function normalizeSwitchHighlightField(value) {
-  return String(value || "").trim() === "�? ? "�? : "�?;
+  return String(value || "").trim() === "是" ? "是" : "否";
 }
 
 const ENV_STATUS_ACTIVE = "环境活跃";
 const ENV_STATUS_RESTORE_FAILED = "还原失败";
-const ENV_STATUS_PENDING = "待就�?;
+const ENV_STATUS_PENDING = "待就绪";
 
 function normalizeEnvStatusField(value) {
   const raw = String(value || "").trim();
@@ -10557,28 +10557,28 @@ function resolveBackupArchiveEnvRuntimeMeta(envStatus) {
     return {
       label: ENV_STATUS_ACTIVE,
       className: "backup-archive-env-badge--env-active",
-      title: "备份已还原到设备，环境处于活跃可用状�?,
+      title: "备份已还原到设备，环境处于活跃可用状态",
     };
   }
   if (status === ENV_STATUS_RESTORE_FAILED) {
     return {
       label: ENV_STATUS_RESTORE_FAILED,
       className: "backup-archive-env-badge--env-restore-failed",
-      title: "环境归属未变，但最近一次还原失�?,
+      title: "环境归属未变，但最近一次还原失败",
     };
   }
   if (status === ENV_STATUS_PENDING) {
     return {
       label: ENV_STATUS_PENDING,
       className: "backup-archive-env-badge--env-pending",
-      title: "环境归属已切换，设备任务尚未完成（清�?还原进行中）",
+      title: "环境归属已切换，设备任务尚未完成（清理/还原进行中）",
     };
   }
   return null;
 }
 
 function normalizeBasicProfileModifiedField(value) {
-  return String(value || "").trim() === "�? ? "�? : "�?;
+  return String(value || "").trim() === "是" ? "是" : "否";
 }
 
 function getAssignedAliasStats() {
@@ -10609,7 +10609,7 @@ async function saveDeviceRow(index, options = {}) {
   const { skipUsernameDuplicateCheck = false, skipReload = false, rowIndex: rowIndexOverride } = options || {};
   const username = String(row.username || "").trim();
   if (!skipUsernameDuplicateCheck && username && isUsernameUsedElsewhere(username, index)) {
-    throw new Error(`username 已被其他设备别名占用�?{username}`);
+    throw new Error(`username 已被其他设备别名占用：${username}`);
   }
   const rowIndex = Number.isFinite(Number(rowIndexOverride))
     ? Number(rowIndexOverride)
@@ -10630,7 +10630,7 @@ function resolveAccountRowIndex(row, fallbackIndex) {
   return Number.isFinite(ri) && ri >= 0 ? ri : fallbackIndex;
 }
 
-/** 账号记录上展�?保存用的有效分配别名（含备份档案反查�?*/
+/** 账号记录上展示/保存用的有效分配别名（含备份档案反查） */
 function getEffectiveAccountAssignedAlias(row = {}) {
   const fromRow = normalizeAliasValue(row?.assigned_alias);
   if (fromRow) return fromRow;
@@ -10666,7 +10666,7 @@ function getAccountRowTemplate(source = {}) {
     heart_growth_yesterday: source.heart_growth_yesterday || "",
     heart_growth_today: source.heart_growth_today || "",
     basic_profile_modified: normalizeBasicProfileModifiedField(source.basic_profile_modified),
-    // 分配别名仅以账号表单字段为准；备份档案别名由 backupAliasByUsername / 渲染层展示�?
+    // 分配别名仅以账号表单字段为准；备份档案别名由 backupAliasByUsername / 渲染层展示。
     assigned_alias: normalizeAliasValue(source.assigned_alias) || "",
     // 收码/令牌状态（后端 account_rows 下发，勿丢）
     has_two_fa: Boolean(source.has_two_fa),
@@ -10677,7 +10677,7 @@ function getAccountRowTemplate(source = {}) {
   };
 }
 
-/** 删除分配后同步释放账号记录中的分配别名（本地缓存 + 备份索引�?*/
+/** 删除分配后同步释放账号记录中的分配别名（本地缓存 + 备份索引） */
 function releaseAccountAliasBindingLocally(username, assignedAlias) {
   const uname = String(username || "").trim().toLowerCase();
   const alias = normalizeAliasValue(assignedAlias);
@@ -10764,7 +10764,7 @@ function updateBatchStreamProgressVisibility() {
 
 function batchStreamRowStatusBadge(status) {
   const text = String(status || "").trim();
-  if (!text) return '<span class="badge pending">待处�?/span>';
+  if (!text) return '<span class="badge pending">待处理</span>';
   return `<span class="badge online">${escapeHtml(text)}</span>`;
 }
 
@@ -10819,16 +10819,16 @@ function renderBatchStreamProgress(data) {
     const devDone = Number(deviceState.completed_rows || 0);
     const devTotal = Number(deviceState.total_rows || 0);
     const statusLabel = devStatus === "done"
-      ? "已完�?
+      ? "已完成"
       : devStatus === "stopping"
-        ? "停止�?
+        ? "停止中"
         : devStatus === "running"
-          ? "进行�?
+          ? "进行中"
           : devStatus;
-    summaryParts.push(`设备 ${statusLabel}�?{devDone}/${devTotal}`);
+    summaryParts.push(`设备 ${statusLabel}：${devDone}/${devTotal}`);
   }
   if (batchStreamProgressSummary) {
-    batchStreamProgressSummary.textContent = summaryParts.join("�?);
+    batchStreamProgressSummary.textContent = summaryParts.join("；");
   }
 
   let progressPct = 0;
@@ -10844,12 +10844,12 @@ function renderBatchStreamProgress(data) {
     batchStreamProgressBar.style.width = `${progressPct}%`;
   }
   if (batchStreamProgressPercent) {
-    batchStreamProgressPercent.textContent = filteredTotal > 0 ? `${progressPct}%�?{doneCount}/${filteredTotal}）` : "0%";
+    batchStreamProgressPercent.textContent = filteredTotal > 0 ? `${progressPct}%（${doneCount}/${filteredTotal}）` : "0%";
   }
 
   if (!rows.length) {
     batchStreamTableBody.innerHTML =
-      '<tr><td colspan="5" style="padding:10px;color:#666;">当前筛选下暂无账号�?/td></tr>';
+      '<tr><td colspan="5" style="padding:10px;color:#666;">当前筛选下暂无账号行</td></tr>';
     return;
   }
 
@@ -10885,7 +10885,7 @@ async function pollBatchStreamStatus() {
     if (Number(data?.code) !== 0) return;
     renderBatchStreamProgress(data);
   } catch (_) {
-    // 轮询失败时保持静默，避免打断操作�?
+    // 轮询失败时保持静默，避免打断操作。
   }
 }
 
@@ -10916,10 +10916,10 @@ async function uploadBatchStreamXlsx(file) {
     const aliasCounts = data?.alias_counts || {};
     const aliasSummary = Object.entries(aliasCounts)
       .map(([alias, count]) => `${alias}:${count}`)
-      .join("�?);
+      .join("，");
     updateBatchStreamUploadHint(
       batchStreamSessionId
-        ? `已上�?${file.name}（会�?${batchStreamSessionId}，共 ${rowCount} �?{aliasSummary ? `�?{aliasSummary}` : ""}）`
+        ? `已上传 ${file.name}（会话 ${batchStreamSessionId}，共 ${rowCount} 行${aliasSummary ? `；${aliasSummary}` : ""}）`
         : "上传完成",
     );
     if (batchStreamDownloadBtn) batchStreamDownloadBtn.disabled = !batchStreamSessionId;
@@ -10948,17 +10948,17 @@ async function startBatchStreamOnDevice() {
   }
   const hours = Number(batchStreamHoursInput?.value || 0);
   if (!Number.isFinite(hours) || hours <= 0) {
-    setStatus("请填写有效的单账号活跃时长（小时�?, "warning");
+    setStatus("请填写有效的单账号活跃时长（小时）", "warning");
     return;
   }
   const rounds = Math.max(1, Math.min(20, Math.floor(Number(batchStreamRoundsInput?.value || 1))));
   if (!Number.isFinite(rounds) || rounds < 1) {
-    setStatus("请填写有效的活跃轮数�?~20�?, "warning");
+    setStatus("请填写有效的活跃轮数（1~20）", "warning");
     return;
   }
   setBatchStreamUiBusy(true);
   try {
-    setStatus(`正在�?${target.alias} 下发批量带流...`, "info");
+    setStatus(`正在向 ${target.alias} 下发批量带流...`, "info");
     const data = await request("/api/admin/batch_stream/start", {
       method: "POST",
       body: JSON.stringify({
@@ -10976,13 +10976,13 @@ async function startBatchStreamOnDevice() {
     const totalHours = hours * rounds;
     if (batchStreamStatusHint) {
       batchStreamStatusHint.textContent = rounds > 1
-        ? `带流已启动：${target.alias}�?{Number(data?.row_count || 0)} 个账号，每轮 ${hours} 小时，共 ${rounds} 轮（累计 ${totalHours} 小时/账号）。设备进入独占模式。`
-        : `带流已启动：${target.alias}�?{Number(data?.row_count || 0)} 个账号，每台 ${hours} 小时。设备进入独占模式。`;
+        ? `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每轮 ${hours} 小时，共 ${rounds} 轮（累计 ${totalHours} 小时/账号）。设备进入独占模式。`
+        : `带流已启动：${target.alias}，${Number(data?.row_count || 0)} 个账号，每台 ${hours} 小时。设备进入独占模式。`;
     }
     batchStreamLastSnapshot = "";
     await pollBatchStreamStatus();
     scheduleBatchStreamPoll(BATCH_STREAM_POLL_MS);
-    setStatus(String(data?.msg || "批量带流已启�?), "success");
+    setStatus(String(data?.msg || "批量带流已启动"), "success");
   } catch (e) {
     setStatus(e.message || "批量带流启动失败", "error");
   } finally {
@@ -11014,7 +11014,7 @@ async function stopBatchStreamOnDevice() {
     }
     batchStreamLastSnapshot = "";
     await pollBatchStreamStatus();
-    setStatus(String(data?.msg || "已请求停止批量带�?), "success");
+    setStatus(String(data?.msg || "已请求停止批量带流"), "success");
   } catch (e) {
     setStatus(e.message || "停止批量带流失败", "error");
   } finally {
@@ -11044,7 +11044,7 @@ async function downloadBatchStreamXlsx() {
     a.click();
     a.remove();
     URL.revokeObjectURL(objectUrl);
-    setStatus("批量带流 Excel 已下�?, "success");
+    setStatus("批量带流 Excel 已下载", "success");
   } catch (e) {
     setStatus(e.message || "下载 Excel 失败", "error");
   } finally {
@@ -11093,7 +11093,7 @@ function renderDeviceAliasPresetOptions() {
   if (!deviceAliasPresetSelect) return;
   const previous = String(deviceAliasPresetSelect.value || "").trim();
   const html = [
-    '<option value="">手动填写（不自动带入�?/option>',
+    '<option value="">手动填写（不自动带入）</option>',
     ...options.map((item) => `<option value="${item.device_alias}">${item.device_alias} | ${item.device_id}</option>`),
   ];
   deviceAliasPresetSelect.innerHTML = html.join("");
@@ -11187,7 +11187,7 @@ function getAssignableAliasOptions(currentValue = "") {
   const current = normalizeAliasValue(currentValue);
   const merged = collectAssignableAliases(current);
   return [
-    '<option value="">�?/option>',
+    '<option value="">无</option>',
     ...merged.map((alias) => `<option value="${escapeHtml(alias)}" ${alias === current ? "selected" : ""}>${escapeHtml(alias)}</option>`),
   ].join("");
 }
@@ -11225,13 +11225,13 @@ function persistAccountRecordsCredColsExpanded() {
 function updateAccountRecordsCredColsToggleBtn() {
   if (!accountRecordsToggleCredColsBtn) return;
   if (accountRecordsCredColsExpanded) {
-    accountRecordsToggleCredColsBtn.textContent = "收起凭据�?;
+    accountRecordsToggleCredColsBtn.textContent = "收起凭据列";
     accountRecordsToggleCredColsBtn.title =
-      "收起 password / email / email_pwd / 2FA / api 列，为登录、统计等列腾出空�?;
+      "收起 password / email / email_pwd / 2FA / api 列，为登录、统计等列腾出空间";
   } else {
-    accountRecordsToggleCredColsBtn.textContent = "展开凭据�?;
+    accountRecordsToggleCredColsBtn.textContent = "展开凭据列";
     accountRecordsToggleCredColsBtn.title =
-      "展开 password / email / email_pwd / 2FA / api 列（默认收起�?;
+      "展开 password / email / email_pwd / 2FA / api 列（默认收起）";
   }
 }
 
@@ -11271,15 +11271,15 @@ async function fetchAccountEditorTwoFaCode(index) {
   const code = String(data?.two_fa_code || "").trim();
   const remaining = Number(data?.remaining_sec);
   if (!/^\d{6,8}$/.test(code)) {
-    throw new Error("服务端未返回有效 2FA 验证�?);
+    throw new Error("服务端未返回有效 2FA 验证码");
   }
   try {
     await navigator.clipboard.writeText(code);
   } catch (_) {
     /* ignore clipboard failures */
   }
-  const remText = Number.isFinite(remaining) ? `，剩�?${remaining}s` : "";
-  setStatus(`${username || "账号"} 2FA�?{code}${remText}（已复制）`, "success");
+  const remText = Number.isFinite(remaining) ? `，剩余 ${remaining}s` : "";
+  setStatus(`${username || "账号"} 2FA：${code}${remText}（已复制）`, "success");
 }
 
 function accountEditorCellSelect(idx, field, innerHtml, cellClass = "") {
@@ -11298,24 +11298,24 @@ function formatAccountGrowthTriple(row = {}, prefix = "follower") {
     const text = value === "" ? "-" : value;
     return `<span class="account-growth-triple__item"><em>${label}</em>${escapeHtml(text)}</span>`;
   };
-  return `<div class="account-growth-triple" title="${prefix === "follower" ? "粉丝" : "总赞"}增长（前�?昨天/今天�?>${fmt("�?, dayBefore)}${fmt("�?, yesterday)}${fmt("�?, today)}</div>`;
+  return `<div class="account-growth-triple" title="${prefix === "follower" ? "粉丝" : "总赞"}增长（前天/昨天/今天）">${fmt("前", dayBefore)}${fmt("昨", yesterday)}${fmt("今", today)}</div>`;
 }
 
 function formatAccountMailTokenBadge(row = {}) {
   const gate = String(row.mail_gate || "").trim().toLowerCase();
   const label = String(row.mail_token_label || "").trim()
     || (gate === "two_fa"
-      ? "2FA不依赖令�?
+      ? "2FA不依赖令牌"
       : gate === "invalid"
         ? "令牌失效"
         : gate === "missing"
-          ? "无令�?
+          ? "无令牌"
           : gate === "ok"
             ? "令牌正常"
             : gate === "transient"
               ? "令牌临时失败"
               : gate === "unknown"
-                ? "令牌未检�?
+                ? "令牌未检测"
                 : "-");
   let tone = "muted";
   if (gate === "invalid" || gate === "missing") tone = "danger";
@@ -11332,13 +11332,13 @@ function renderAccountEditorTableRow({ row, idx }, displayNum) {
   const loginSelect = accountEditorCellSelect(
     idx,
     "is_login",
-    `<option value="false" ${row.is_login ? "" : "selected"}>�?/option><option value="true" ${row.is_login ? "selected" : ""}>�?/option>`,
+    `<option value="false" ${row.is_login ? "" : "selected"}>否</option><option value="true" ${row.is_login ? "selected" : ""}>是</option>`,
     "account-editor-table__login-select",
   );
   const profileSelect = accountEditorCellSelect(
     idx,
     "basic_profile_modified",
-    `<option value="�? ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "�? ? "selected" : ""}>�?/option><option value="�? ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "�? ? "selected" : ""}>�?/option>`,
+    `<option value="否" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "否" ? "selected" : ""}>否</option><option value="是" ${normalizeBasicProfileModifiedField(row.basic_profile_modified) === "是" ? "selected" : ""}>是</option>`,
     "account-editor-table__profile-select",
   );
   const dbRowIndex = resolveAccountRowIndex(row, idx);
@@ -11370,7 +11370,7 @@ function renderAccountEditorTableRow({ row, idx }, displayNum) {
     <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
     <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
     <td class="account-editor-table__profile">${profileSelect}</td>
-    <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">�?/button></td>
+    <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
   </tr>`;
 }
 
@@ -11391,11 +11391,11 @@ function renderAccountEditorRows() {
   const pageSize = getAccountRecordsPageSize();
   const start = (currentAccountRecordsPage - 1) * pageSize;
   const pageRows = flatRows.slice(start, start + pageSize);
-  const pageGroups = buildAccountEditorAliasGroups(pageRows, { sort: false });
+  const pageGroups = buildAccountEditorAliasGroups(pageRows);
   if (!flatRows.length) {
     const emptyHint = accountRecordsSearchQuery
       ? formatAccountRecordsSearchHint(accountRecordsSearchQuery, accountRecordsSearchField)
-      : "暂无记录，点击“新增空白记录”开�?;
+      : "暂无记录，点击“新增空白记录”开始";
     accountEditorListEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
     return;
   }
@@ -11408,24 +11408,24 @@ function renderAccountEditorRows() {
     const openGroups = collectOpenAccountAliasGroups();
     const pageFoldKeys = pageGroups.map(([aliasKey]) => accountAliasGroupFoldKey(aliasKey));
     const anyCurrentPageOpen = pageFoldKeys.some((key) => openGroups.has(key));
-    // 翻页/筛选后当前页没有已展开组时，默认全部展开；否则保留本页展开状�?
+    // 翻页/筛选后当前页没有已展开组时，重新默认展开前两组；否则保留本页展开状态
     const useSavedOpenState = anyCurrentPageOpen;
     const aliasTotalByKey = new Map(aliasGroups.map(([aliasKey, items]) => [aliasKey, items.length]));
     let displayCursor = start;
-    const groupsHtml = pageGroups.map(([aliasKey, items]) => {
-      const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未分配别�? : aliasKey;
+    const groupsHtml = pageGroups.map(([aliasKey, items], groupIdx) => {
+      const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未分配别名" : aliasKey;
       const foldKey = accountAliasGroupFoldKey(aliasKey);
       const totalForAlias = aliasTotalByKey.get(aliasKey) || items.length;
       const countLabel = totalForAlias === items.length
         ? `${items.length} 条`
-        : `本页 ${items.length} / �?${totalForAlias} 条`;
+        : `本页 ${items.length} / 共 ${totalForAlias} 条`;
       const bodyHtml = items.map((item) => {
         displayCursor += 1;
         return renderAccountEditorTableRow(item, displayCursor);
       }).join("");
       const shouldOpen = useSavedOpenState
         ? openGroups.has(foldKey)
-        : true;
+        : groupIdx < 2;
       return `
         <details class="account-alias-group" data-account-alias="${escapeHtml(foldKey)}"${shouldOpen ? " open" : ""}>
           <summary class="account-alias-group__summary">
@@ -11440,7 +11440,7 @@ function renderAccountEditorRows() {
               <thead>
                 <tr>
                   <th class="account-editor-table__select">
-                    <input type="checkbox" class="account-records-select-all" title="全选本�? />
+                    <input type="checkbox" class="account-records-select-all" title="全选本组" />
                   </th>
                   <th class="account-editor-table__num">#</th>
                   <th class="account-editor-table__username">username</th>
@@ -11448,7 +11448,7 @@ function renderAccountEditorRows() {
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--email">email</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--email-pwd">email_pwd</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--two-fa">2FA</th>
-                  <th class="account-editor-table__mail-token" title="邮件 OAuth 令牌状态（�?2FA 时不依赖令牌�?>收码/令牌</th>
+                  <th class="account-editor-table__mail-token" title="邮件 OAuth 令牌状态（有 2FA 时不依赖令牌）">收码/令牌</th>
                   <th class="account-editor-table__cred-col account-editor-table__cred-col--api">api</th>
                   <th class="account-editor-table__login">登录</th>
                   <th class="account-editor-table__login-time">登录时间</th>
@@ -11474,7 +11474,7 @@ function renderAccountEditorRows() {
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
     const msg = (error && (error.message || error.toString?.())) || "unknown";
-    accountEditorListEl.innerHTML = `<div class="hint">账号记录渲染失败�?{escapeHtml(msg)}</div>`;
+    accountEditorListEl.innerHTML = `<div class="hint">账号记录渲染失败：${escapeHtml(msg)}</div>`;
   }
   renderDeviceRegionPresetOptions();
 }
@@ -11527,29 +11527,29 @@ function resolveBackupRowStats(row = {}) {
 function renderLinkedAccountInfo(row = {}) {
   const username = String(row?.username || "").trim();
   if (!username) {
-    return '<div class="hint">当前条目未填�?username，无法关联账号记录�?/div>';
+    return '<div class="hint">当前条目未填写 username，无法关联账号记录。</div>';
   }
   const matched = getAccountRecordByUsername(username);
   if (!matched) {
-    return `<div class="hint">未在账号表单中找�?username 为�?{username}」的记录�?/div>`;
+    return `<div class="hint">未在账号表单中找到 username 为「${username}」的记录。</div>`;
   }
   const stats = resolveBackupRowStats({ ...matched, ...row, username });
   return `
     <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;font-size:12px;color:#334155;">
-      <div><strong>username�?/strong>${matched.username || "-"}</div>
-      <div><strong>password�?/strong>${matched.password || "-"}</div>
-      <div><strong>email�?/strong>${matched.email || "-"}</div>
-      <div><strong>email_password�?/strong>${matched.email_password || "-"}</div>
-      <div><strong>2FA�?/strong>${matched.two_fa || "-"}</div>
-      <div><strong>api�?/strong>${renderClickableValue(matched.api)}</div>
-      <div><strong>is_login�?/strong>${matched.is_login ? "�? : "�?}</div>
-      <div><strong>login_time�?/strong>${matched.login_time || "-"}</div>
-      <div><strong>region�?/strong>${matched.region || "-"}</div>
-      <div><strong>分配别名�?/strong>${normalizeAliasValue(getEffectiveAccountAssignedAlias(matched)) || "�?}</div>
-      <div><strong>video_count�?/strong>${stats.video_count}</div>
-      <div><strong>follower_count�?/strong>${stats.follower_count}</div>
-      <div><strong>follower_growth�?/strong>${stats.follower_growth}</div>
-      <div><strong>基本资料已修改：</strong>${normalizeBasicProfileModifiedField(matched.basic_profile_modified) === "�? ? "�? : "�?}</div>
+      <div><strong>username：</strong>${matched.username || "-"}</div>
+      <div><strong>password：</strong>${matched.password || "-"}</div>
+      <div><strong>email：</strong>${matched.email || "-"}</div>
+      <div><strong>email_password：</strong>${matched.email_password || "-"}</div>
+      <div><strong>2FA：</strong>${matched.two_fa || "-"}</div>
+      <div><strong>api：</strong>${renderClickableValue(matched.api)}</div>
+      <div><strong>is_login：</strong>${matched.is_login ? "是" : "否"}</div>
+      <div><strong>login_time：</strong>${matched.login_time || "-"}</div>
+      <div><strong>region：</strong>${matched.region || "-"}</div>
+      <div><strong>分配别名：</strong>${normalizeAliasValue(getEffectiveAccountAssignedAlias(matched)) || "无"}</div>
+      <div><strong>video_count：</strong>${stats.video_count}</div>
+      <div><strong>follower_count：</strong>${stats.follower_count}</div>
+      <div><strong>follower_growth：</strong>${stats.follower_growth}</div>
+      <div><strong>基本资料已修改：</strong>${normalizeBasicProfileModifiedField(matched.basic_profile_modified) === "是" ? "是" : "否"}</div>
     </div>
   `;
 }
@@ -11557,7 +11557,7 @@ function renderLinkedAccountInfo(row = {}) {
 function renderDeviceEditorRows() {
   if (!deviceAliasGroupsEl) return;
   renderDeviceAliasPresetOptions();
-  // 备份档案页用分页接口渲染；勿用本地全�?deviceEditorRows 覆盖�?
+  // 备份档案页用分页接口渲染；勿用本地全量 deviceEditorRows 覆盖。
   if (document.getElementById("backup-section")?.classList.contains("active")) {
     void loadBackupArchiveRecords();
     return;
@@ -11582,23 +11582,23 @@ function renderDeviceEditorRows() {
   });
 
   deviceAliasGroupsEl.innerHTML = orderedGroups.map(([aliasKey, items], groupIdx) => {
-    const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未设置别�? : aliasKey;
+    const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未设置别名" : aliasKey;
     const firstDeviceId = String(items[0]?.row?.device_id || "").trim() || "-";
     const rowsHtml = items.map(({ row, idx }) => {
       const linkedAccountInfo = renderLinkedAccountInfo(row);
       const username = String(row?.username || "").trim();
       const acct = username ? getAccountRecordByUsername(username) : null;
-      const switchActive = items.length <= 1 || normalizeSwitchHighlightField(row?.switch_highlight) === "�?;
+      const switchActive = items.length <= 1 || normalizeSwitchHighlightField(row?.switch_highlight) === "是";
       const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row);
       const envHintText = switchActive
         ? "当前高亮：该账号是这条设备环境的归属目标"
-        : "非高亮：需切号后才可操作备�?还原";
+        : "非高亮：需切号后才可操作备份/还原";
       return `
       <div class="panel-card" style="margin:0 0 10px 0;background:#fff;border:1px solid #eef2ff;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
           <strong>记录 #${idx + 1}</strong>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
-            <span class="hint">device_id�?{row.device_id || "-"}</span>
+            <span class="hint">device_id：${row.device_id || "-"}</span>
             <button class="ghost" data-action="alias-clear" data-device-alias="${row.device_alias || ""}" data-device-id="${row.device_id || ""}">清理</button>
             <button class="ghost" data-account-backup="${row.device_alias || ""}" data-device-id="${row.device_id || ""}" data-account-username="${row.username || ""}" data-account-id="${row.row_index != null && row.row_index !== "" ? row.row_index : ""}">备份</button>
             <button class="ghost" data-account-restore="${row.device_alias || ""}" data-device-id="${row.device_id || ""}" data-account-backup-name="${row.backup_name || ""}" data-account-id="${row.row_index != null && row.row_index !== "" ? row.row_index : ""}">清理并还原该备份</button>
@@ -11634,8 +11634,8 @@ function renderDeviceEditorRows() {
     return `
       <details class="panel-card" data-device-alias-group="1" style="margin:0 0 12px 0;background:#f8faff;" ${groupIdx < 2 ? "open" : ""}>
         <summary style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;list-style:none;">
-          <span><strong>${aliasLabel}</strong> <span class="hint">(${items.length} 条记�?</span></span>
-          <span class="hint">device_id示例�?{firstDeviceId}</span>
+          <span><strong>${aliasLabel}</strong> <span class="hint">(${items.length} 条记录)</span></span>
+          <span class="hint">device_id示例：${firstDeviceId}</span>
         </summary>
         <div style="margin-top:10px;">
           ${rowsHtml}
@@ -11742,7 +11742,7 @@ async function addDeviceBlankEditorRow(aliasOverride = "") {
   }
   const matchedAccounts = pickUnloggedAccountsByRegion(selectedRegion, assignCount);
   if (!matchedAccounts.length) {
-    throw new Error(`新增失败：账号表单中没有地区为�?{selectedRegion}」、未登录且未分配的可用账号`);
+    throw new Error(`新增失败：账号表单中没有地区为「${selectedRegion}」、未登录且未分配的可用账号`);
   }
   const selectedAlias = String(aliasOverride || deviceAliasPresetSelect?.value || "").trim();
   const inferredDeviceId = resolveDeviceIdByAlias(selectedAlias);
@@ -11767,14 +11767,14 @@ async function addDeviceBlankEditorRow(aliasOverride = "") {
     if (backupActive) {
       await loadBackupArchiveRecords();
     }
-    const aliasHint = selectedAlias ? `，别�?${selectedAlias}` : "";
+    const aliasHint = selectedAlias ? `，别名 ${selectedAlias}` : "";
     if (matchedAccounts.length < assignCount) {
       setStatus(
-        `已分�?${matchedAccounts.length} 条（请求 ${assignCount} 条，可用账号不足�?{aliasHint}`,
+        `已分配 ${matchedAccounts.length} 条（请求 ${assignCount} 条，可用账号不足）${aliasHint}`,
         "warning",
       );
     } else {
-      setStatus(`已成功分�?${matchedAccounts.length} 条账号到设备档案${aliasHint}`, "success");
+      setStatus(`已成功分配 ${matchedAccounts.length} 条账号到设备档案${aliasHint}`, "success");
     }
   } catch (error) {
     deviceEditorRows.splice(startIndex, newRows.length);
@@ -11788,8 +11788,8 @@ async function handleAddDeviceBlankRecordClick(aliasOverride = "") {
   if (addDeviceBlankRecordBtn.disabled) return;
   const previousLabel = addDeviceBlankRecordBtn.textContent;
   addDeviceBlankRecordBtn.disabled = true;
-  addDeviceBlankRecordBtn.textContent = "分配�?..";
-  setStatus("正在分配账号到设备档�?..", "info");
+  addDeviceBlankRecordBtn.textContent = "分配中...";
+  setStatus("正在分配账号到设备档案...", "info");
   try {
     await addDeviceBlankEditorRow(aliasOverride);
   } catch (error) {
@@ -11798,7 +11798,7 @@ async function handleAddDeviceBlankRecordClick(aliasOverride = "") {
     window.alert(message);
   } finally {
     addDeviceBlankRecordBtn.disabled = false;
-    addDeviceBlankRecordBtn.textContent = previousLabel || "新增并分配记�?;
+    addDeviceBlankRecordBtn.textContent = previousLabel || "新增并分配记录";
   }
 }
 
@@ -11810,7 +11810,7 @@ async function deleteEditorRow(scope, index) {
     const deletedUsername = payload.username;
     const deletedAlias = payload.assigned_alias;
     const confirmLines = ["确认删除该账号记录？"];
-    if (deletedUsername) confirmLines.push(`账号�?{deletedUsername}`);
+    if (deletedUsername) confirmLines.push(`账号：${deletedUsername}`);
     if (deletedAlias) {
       confirmLines.push(`将同时删除设备备份档案中该账号的数据（别名：${deletedAlias}）`);
     }
@@ -11825,11 +11825,11 @@ async function deleteEditorRow(scope, index) {
       updateAccountRecordsBatchDeleteBtn();
       await refreshEditorTablesAfterAccountDelete();
       if (deletedUsername && cleanedBackup > 0) {
-        setStatus(`已删除账�?${deletedUsername}，并同步清理 ${cleanedBackup} 条设备备份档案`, "success");
+        setStatus(`已删除账号 ${deletedUsername}，并同步清理 ${cleanedBackup} 条设备备份档案`, "success");
       } else if (deletedUsername) {
-        setStatus(`已删除账�?${deletedUsername}`, "success");
+        setStatus(`已删除账号 ${deletedUsername}`, "success");
       } else {
-        setStatus("账号记录已删�?, "success");
+        setStatus("账号记录已删除", "success");
       }
     } catch (error) {
       await refreshEditorTablesAfterAccountDelete();
@@ -11884,7 +11884,7 @@ function renderDeviceAliasGroups(groups = [], recordsByAlias = {}) {
           <div title="${row.backup_name ?? ""}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${row.backup_name ?? ""}</div>
         </td>
         <td style="padding:8px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:middle;">
-          <button class="ghost" data-account-backup="${alias}" data-account-username="${row.username ?? ""}" data-account-id="${row.row_index ?? row.id ?? ""}">备份并清�?/button>
+          <button class="ghost" data-account-backup="${alias}" data-account-username="${row.username ?? ""}" data-account-id="${row.row_index ?? row.id ?? ""}">备份并清理</button>
           <button class="ghost" data-account-restore="${alias}" data-account-backup-name="${row.backup_name ?? ""}" data-account-id="${row.row_index ?? row.id ?? ""}">清理并还原该备份</button>
         </td>
       </tr>
@@ -11938,7 +11938,7 @@ function buildBackupArchiveExtraSummary(stats = {}, backupName = "", backupPath 
   } else if (isMeaningfulBackupFieldValue(backupPath)) {
     parts.push("已有备份路径");
   }
-  return parts.length ? parts.join(" · ") : "数据统计与备份信�?;
+  return parts.length ? parts.join(" · ") : "数据统计与备份信息";
 }
 
 function resolveBackupRowDailySlot(alias, row) {
@@ -11978,9 +11978,9 @@ function renderAutoSwitchPublishStatusBadge(slotInfo) {
   if (status === "none") return "";
   const label = String(slotInfo.publishStatusLabel || "").trim() || status;
   const title = String(slotInfo.publishStatusTitle || "").trim()
-    || (slotInfo.publishAt ? `计划发作�?${slotInfo.publishAt}` : "自动切号发作品状�?);
+    || (slotInfo.publishAt ? `计划发作品 ${slotInfo.publishAt}` : "自动切号发作品状态");
   const cls = `backup-archive-publish-badge backup-archive-publish-badge--${status}`;
-  return `<span class="${cls}" title="${escapeHtml(title)}">发作品�?{escapeHtml(label)}</span>`;
+  return `<span class="${cls}" title="${escapeHtml(title)}">发作品·${escapeHtml(label)}</span>`;
 }
 
 function renderAutoSwitchDeviceBadge(alias, rowDeviceId = "") {
@@ -11990,35 +11990,35 @@ function renderAutoSwitchDeviceBadge(alias, rowDeviceId = "") {
   if (on) {
     return '<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启自动切号自治，手动切号/清理等操作已锁定">自动切号·开</span>';
   }
-  return '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该设备未开启自动切号，可手动操作或勾选别名组后批量开�?>自动切号·�?/span>';
+  return '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该设备未开启自动切号，可手动操作或勾选别名组后批量开启">自动切号·关</span>';
 }
 
 function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}, options = {}) {
   if (!switchActive) {
-    return `<span class="backup-archive-env-badge backup-archive-env-badge--idle" title="该账号不是此设备别名的当前环境归属；需先切号后才可操作备份/还原�?>非当前环�?/span>`;
+    return `<span class="backup-archive-env-badge backup-archive-env-badge--idle" title="该账号不是此设备别名的当前环境归属；需先切号后才可操作备份/还原等">非当前环境</span>`;
   }
   const slotDriven = Boolean(options?.slotDriven);
   const envMeta = resolveBackupArchiveEnvRuntimeMeta(row?.env_status);
   const loginKnown = Boolean(acct);
   const loginOk = loginKnown && Boolean(acct.is_login);
-  const loginLabel = loginKnown ? (loginOk ? "已登�? : "未登�?) : "登录未知";
+  const loginLabel = loginKnown ? (loginOk ? "已登录" : "未登录") : "登录未知";
   const loginClass = loginOk
     ? "backup-archive-env-badge--logged-in"
     : (loginKnown ? "backup-archive-env-badge--logged-out" : "backup-archive-env-badge--unknown");
   const runtimeLabel = envMeta?.label || "";
   const runtimeClass = envMeta?.className || "";
-  const runtimeTitle = envMeta?.title || "环境就绪状态未知（可能尚未执行切号/还原�?;
+  const runtimeTitle = envMeta?.title || "环境就绪状态未知（可能尚未执行切号/还原）";
   const textParts = [slotDriven ? "时段归属" : "环境归属"];
   if (runtimeLabel) textParts.push(runtimeLabel);
   textParts.push(loginLabel);
   const titleParts = [
     slotDriven
-      ? "时段归属=按云端今日计划当前时段应在设备内的账号（�?switch_highlight 无关�?
+      ? "时段归属=按云端今日计划当前时段应在设备内的账号（与 switch_highlight 无关）"
       : "高亮=该设备别名当前环境归属此账号",
-    runtimeLabel ? runtimeTitle : "尚未记录环境就绪状�?,
-    "登录状态来自账�?is_login（环境内结果，失败不回滚归属�?,
+    runtimeLabel ? runtimeTitle : "尚未记录环境就绪状态",
+    "登录状态来自账号 is_login（环境内结果，失败不回滚归属）",
   ];
-  return `<span class="backup-archive-env-badge backup-archive-env-badge--highlighted ${runtimeClass} ${loginClass}" title="${escapeHtml(titleParts.join("�?))}">${escapeHtml(textParts.join(" · "))}</span>`;
+  return `<span class="backup-archive-env-badge backup-archive-env-badge--highlighted ${runtimeClass} ${loginClass}" title="${escapeHtml(titleParts.join("；"))}">${escapeHtml(textParts.join(" · "))}</span>`;
 }
 
 /** 同别名组：默认只展示高亮记录，其余放入折叠区 */
@@ -12058,17 +12058,17 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const switchActive = isBackupArchiveRowEffectivelyHighlighted(rows, row, alias);
   const slotDrivenHighlight = isBackupArchiveRowCurrentSlotOwner(rows, row, alias);
   const acct = username ? getAccountRecordByUsername(username) : null;
-  const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "�?;
+  const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
   const autoSwitchBlocksManual = isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId);
   const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
   const switchTitle = autoSwitchBlocksManual
-    ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切�?
+    ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
     : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
   const manualBlockTitle = autoSwitchBlocksManual ? AUTO_SWITCH_MANUAL_BLOCK_HINT : "";
   const otherDisabled = autoSwitchBlocksManual || !switchActive ? " disabled" : "";
   const otherTitle = autoSwitchBlocksManual
     ? manualBlockTitle
-    : (switchActive ? "" : "需先切号为当前高亮账号后才可操�?);
+    : (switchActive ? "" : "需先切号为当前高亮账号后才可操作");
   const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row, { slotDriven: slotDrivenHighlight });
   const autoSwitchBadge = renderAutoSwitchDeviceBadge(actionAlias, deviceId);
   const envHintText = switchActive
@@ -12077,7 +12077,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
       : "当前高亮：该账号是这条设备环境的归属目标")
     : (autoSwitchBlocksManual
       ? "非当前时段：设备将在对应时段自动切号"
-      : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启�?);
+      : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用");
   const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
   const rowIndexNum = exportRowIndex ?? -1;
   const hasCutSwitchRow = exportRowIndex != null;
@@ -12085,14 +12085,14 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
   const autoSwitchExcluded = Boolean(row?.auto_switch_excluded);
   const autoSwitchExcludedBadge = autoSwitchExcluded
-    ? '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该账号已设置为不参加自动切号">不参加自动切�?/span>'
+    ? '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该账号已设置为不参加自动切号">不参加自动切号</span>'
     : "";
   const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
   const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
   const showRecordSelect = rows.length > 1;
   const exportSelectTitle = exportRowIndex != null
-    ? "勾选后可导�?/ 参与自动切号批量操作"
-    : "该记录缺�?row_index，暂无法参与导出";
+    ? "勾选后可导出 / 参与自动切号批量操作"
+    : "该记录缺少 row_index，暂无法参与导出";
   const recordSelectHtml = showRecordSelect
     ? `<label class="backup-archive-record__select" title="${escapeHtml(exportSelectTitle)}" onclick="event.stopPropagation()">
                 <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
@@ -12113,12 +12113,12 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
               <span class="hint backup-archive-record__meta">${escapeHtml(mobileAlias || "-")}${mobileAlias && displayAlias && mobileAlias.toLowerCase() !== displayAlias.toLowerCase() ? ` · 设备 ${escapeHtml(displayAlias)}` : ""} · 上次高亮 ${escapeHtml(lastHighlightAt || "-")}${switchActive ? ` · ${escapeHtml(envHintText)}` : ""}</span>
             </div>
             <div class="backup-archive-record__actions">
-              <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮�? data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
-              <button type="button" class="ghost" title="${escapeHtml(autoSwitchExcluded ? "恢复参加自动切号" : "将该账号从自动切号计划中排除")}" data-account-auto-switch-excluded="1" data-account-id="${backupRecordId || ""}" data-account-excluded="${autoSwitchExcluded ? "1" : "0"}">${autoSwitchExcluded ? "参加自动切号" : "不参加自动切�?}</button>
-              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "仅清理设备内 TikTok 数据，不做备�?)}" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
-              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先备份，再清理设备内 TikTok 数据")}" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清�?/button>
-              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "�?pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原")}" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
-              ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "高亮条目可点：下发后在设备完成修改链�?)}" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
+              <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
+              <button type="button" class="ghost" title="${escapeHtml(autoSwitchExcluded ? "恢复参加自动切号" : "将该账号从自动切号计划中排除")}" data-account-auto-switch-excluded="1" data-account-id="${backupRecordId || ""}" data-account-excluded="${autoSwitchExcluded ? "1" : "0"}">${autoSwitchExcluded ? "参加自动切号" : "不参加自动切号"}</button>
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "仅清理设备内 TikTok 数据，不做备份")}" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先备份，再清理设备内 TikTok 数据")}" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
+              <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原")}" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
+              ${showBasicProfileBtn ? `<button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "高亮条目可点：下发后在设备完成修改链路")}" data-basic-profile-edit="1">修改账号基本资料</button>` : ""}
               <button type="button" class="ghost${switchActive ? " backup-archive-switch-btn--active" : ""}"${switchDisabled} title="${escapeHtml(switchTitle)}" data-account-switch="1">切号</button>
             </div>
           </div>
@@ -12143,7 +12143,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
             </div>
           </details>
           <details class="backup-archive-record-linked">
-            <summary>查看�?username 关联的账号记�?/summary>
+            <summary>查看该 username 关联的账号记录</summary>
             <div class="backup-archive-record-linked__body">
               ${linkedAccountInfo}
             </div>
@@ -12157,7 +12157,7 @@ function syncBackupArchiveSearchFromInput() {
   backupArchiveSearchQuery = String(backupArchiveSearchInput.value || "").trim();
 }
 
-/** 备份档案分组「其�?N 条」折叠态；列表重渲（时段高�?日计划刷新）时需保留，否则会看起来像自动收起�?*/
+/** 备份档案分组「其它 N 条」折叠态；列表重渲（时段高亮/日计划刷新）时需保留，否则会看起来像自动收起。 */
 function collectOpenBackupArchiveGroupFolds() {
   const open = new Set();
   if (!deviceAliasGroupsEl) return open;
@@ -12179,7 +12179,7 @@ function renderBackupGroups(items = []) {
   if (!deviceAliasGroupsEl) return;
   if (!Array.isArray(items) || !items.length) {
     const emptyHint = backupArchiveSearchQuery
-      ? `未找到匹配�?{escapeHtml(backupArchiveSearchQuery)}」的备份档案`
+      ? `未找到匹配「${escapeHtml(backupArchiveSearchQuery)}」的备份档案`
       : "暂无备份档案";
     deviceAliasGroupsEl.innerHTML = `<div class="hint">${emptyHint}</div>`;
     return;
@@ -12192,10 +12192,10 @@ function renderBackupGroups(items = []) {
     groups.get(alias).push(item);
   });
   const planDateHint = autoSwitchDailyPlanDate
-    ? `<span class="hint" style="font-weight:400;">（北�?${escapeHtml(autoSwitchDailyPlanDate)}�?/span>`
+    ? `<span class="hint" style="font-weight:400;">（北京 ${escapeHtml(autoSwitchDailyPlanDate)}）</span>`
     : "";
   deviceAliasGroupsEl.innerHTML = Array.from(groups.entries()).map(([alias, rows]) => {
-    const label = alias === "__EMPTY_ALIAS__" ? "未分配别�? : alias;
+    const label = alias === "__EMPTY_ALIAS__" ? "未分配别名" : alias;
     const aliasKey = backupArchiveGroupFoldKey(alias);
     const deviceId = resolveDeviceIdForArchiveAlias(alias, rows[0]?.device_id);
     const autoSwitchOn = isAutoSwitchEnabledForDeviceId(deviceId);
@@ -12204,7 +12204,7 @@ function renderBackupGroups(items = []) {
     const foldOpenAttr = openGroupFolds.has(aliasKey) ? " open" : "";
     const secondaryHtml = secondary.length
       ? `<details class="backup-archive-group-fold"${foldOpenAttr}>
-          <summary class="backup-archive-group-fold__summary">其它 ${secondary.length} 条记录（点击展开�?/summary>
+          <summary class="backup-archive-group-fold__summary">其它 ${secondary.length} 条记录（点击展开）</summary>
           <div class="backup-archive-group-fold__body">${secondary.map((row, idx) => renderSingleBackupArchiveRecordCard(row, rows, primary.length + idx, alias)).join("")}</div>
         </details>`
       : "";
@@ -12217,10 +12217,10 @@ function renderBackupGroups(items = []) {
       <summary style="cursor:pointer;font-weight:600;display:flex;justify-content:space-between;gap:10px;align-items:center;">
         <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
           ${groupRowIndices.length ? `<label class="backup-archive-group-select" title="勾选本组：导出 xlsx / 开启或关闭自动切号" onclick="event.stopPropagation()"><input type="checkbox" class="backup-archive-group-select-all"${groupAllSelected ? " checked" : ""} data-group-row-indices="${escapeHtml(groupRowIndices.join(","))}" /></label>` : ""}
-          ${!deviceId ? `<span class="hint" title="未绑�?device_id，无法开启自动切号；请先在设备总览完成客户端绑�?>�?/span>` : ""}
-          <span>${escapeHtml(label)}${planDateHint}${autoSwitchOn ? ' <span class="badge badge--ok">自动切号�?/span>' : ""}</span>
+          ${!deviceId ? `<span class="hint" title="未绑定 device_id，无法开启自动切号；请先在设备总览完成客户端绑定">⚠</span>` : ""}
+          <span>${escapeHtml(label)}${planDateHint}${autoSwitchOn ? ' <span class="badge badge--ok">自动切号中</span>' : ""}</span>
         </span>
-        <span class="hint">${rows.length} �?/span>
+        <span class="hint">${rows.length} 条</span>
       </summary>
       <div style="margin-top:10px;">${body}</div>
     </details>`;
@@ -12330,9 +12330,9 @@ function updateBackupAliasPickSummary() {
     if (isAutoSwitchEnabledForDeviceId(item?.device_id)) onCount += 1;
     else offCount += 1;
   });
-  const parts = [`已�?${selected}/${total} 个别名设备`, `开 ${onCount}`, `�?${offCount}`];
+  const parts = [`已选 ${selected}/${total} 个别名设备`, `开 ${onCount}`, `关 ${offCount}`];
   if (backupAliasPickSearchQuery && visible.length !== total) {
-    parts.push(`当前筛�?${visible.length} 个`);
+    parts.push(`当前筛选 ${visible.length} 个`);
   }
   backupAliasPickSummaryEl.textContent = parts.join(" · ");
 }
@@ -12354,13 +12354,13 @@ function renderBackupAliasPickRow(item) {
   const autoOn = isAutoSwitchEnabledForDeviceId(deviceId);
   const statusBadge = autoOn
     ? '<span class="badge badge--ok">自动切号·开</span>'
-    : '<span class="hint">自动切号·�?/span>';
+    : '<span class="hint">自动切号·关</span>';
   return `<tr>
       <td style="width:40px;text-align:center;">
         <input type="checkbox" class="backup-alias-pick-check" data-alias="${escapeHtml(alias)}"${checked ? " checked" : ""} />
       </td>
       <td><strong>${escapeHtml(alias)}</strong></td>
-      <td class="preview-cell-truncate" title="${escapeHtml(deviceId)}">${escapeHtml(deviceId || "�?)}</td>
+      <td class="preview-cell-truncate" title="${escapeHtml(deviceId)}">${escapeHtml(deviceId || "—")}</td>
       <td>${statusBadge}</td>
     </tr>`;
 }
@@ -12381,7 +12381,7 @@ function renderBackupAliasPickGroupSection(title, pairs, groupKey) {
       <span class="hint">${selectedInGroup}/${pairs.length}</span>
     </div>
     <table class="import-preview-table">
-      <thead><tr><th></th><th>别名</th><th>device_id</th><th>状�?/th></tr></thead>
+      <thead><tr><th></th><th>别名</th><th>device_id</th><th>状态</th></tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
   </div>`;
@@ -12392,8 +12392,8 @@ function renderBackupAliasPickList() {
   const pairs = getBackupAliasPickVisiblePairs();
   if (!pairs.length) {
     const emptyHint = backupAliasPickSearchQuery
-      ? `未找到匹配�?{escapeHtml(backupAliasPickSearchQuery)}」的别名设备`
-      : "暂无已绑定别名的设备，请先在设备总览完成客户端绑�?;
+      ? `未找到匹配「${escapeHtml(backupAliasPickSearchQuery)}」的别名设备`
+      : "暂无已绑定别名的设备，请先在设备总览完成客户端绑定";
     backupAliasPickListEl.innerHTML = `<div class="hint" style="padding:16px;">${emptyHint}</div>`;
     updateBackupAliasPickSummary();
     syncBackupAliasPickSelectAllState();
@@ -12406,7 +12406,7 @@ function renderBackupAliasPickList() {
     else offPairs.push(item);
   });
   const sections = [
-    renderBackupAliasPickGroupSection(`自动切号·开�?{onPairs.length}）`, onPairs, "on"),
+    renderBackupAliasPickGroupSection(`自动切号·开（${onPairs.length}）`, onPairs, "on"),
     renderBackupAliasPickGroupSection(`自动切号·关（${offPairs.length}）`, offPairs, "off"),
   ].filter(Boolean);
   backupAliasPickListEl.innerHTML = sections.join("") || '<div class="hint" style="padding:16px;">暂无别名设备</div>';
@@ -12441,7 +12441,7 @@ async function openBackupAliasPickModal() {
     setStatus(error.message || "加载别名设备失败", "error");
     return;
   }
-  // 打开时按当前列表勾选预填（若有�?
+  // 打开时按当前列表勾选预填（若有）
   if (!backupAliasPickSelectedAliases.size && autoSwitchPickDeviceIds instanceof Set && autoSwitchPickDeviceIds.size) {
     const idSet = autoSwitchPickDeviceIds;
     buildAliasDevicePairs().forEach((item) => {
@@ -12467,7 +12467,7 @@ function closeBackupAliasPickModal() {
 async function saveAutoSwitchFromAliasPick(enabled) {
   const deviceIds = collectBackupAliasPickDeviceIds();
   if (!deviceIds.length) {
-    setStatus("请至少勾选一个已绑定 device_id 的别名设�?, "warning");
+    setStatus("请至少勾选一个已绑定 device_id 的别名设备", "warning");
     return;
   }
   // 保留打开弹窗前的列表勾选设备，避免弹窗内直接开/关后污染页面按钮目标
@@ -12516,17 +12516,17 @@ async function applyBackupAliasPickToArchiveSelection() {
   if (backupAliasPickApplyBusy) return;
   const aliases = Array.from(backupAliasPickSelectedAliases);
   if (!aliases.length) {
-    setStatus("请至少勾选一个别名设�?, "warning");
+    setStatus("请至少勾选一个别名设备", "warning");
     return;
   }
   const deviceIds = collectBackupAliasPickDeviceIds();
   backupAliasPickApplyBusy = true;
   if (backupAliasPickApplySelectionBtn) {
     backupAliasPickApplySelectionBtn.disabled = true;
-    backupAliasPickApplySelectionBtn.textContent = "应用中�?;
+    backupAliasPickApplySelectionBtn.textContent = "应用中…";
   }
   try {
-    setStatus("正在按别名同步列表勾选�?, "info");
+    setStatus("正在按别名同步列表勾选…", "info");
     const indices = await collectBackupArchiveRowIndicesForAliases(aliases);
     backupArchiveSelectedRowIndices.clear();
     indices.forEach((idx) => backupArchiveSelectedRowIndices.add(idx));
@@ -12549,18 +12549,18 @@ async function applyBackupAliasPickToArchiveSelection() {
     updateBackupArchiveSelectionUi();
     closeBackupAliasPickModal();
     setStatus(
-      `已按 ${aliases.length} 个别名勾�?${indices.length} 条备份记录` +
-        (deviceIds.length ? `�?{deviceIds.length} 台设备可操作自动切号）` : "") +
-        "，可继续使用本页开�?关闭自动切号、导出已选等按钮",
+      `已按 ${aliases.length} 个别名勾选 ${indices.length} 条备份记录` +
+        (deviceIds.length ? `（${deviceIds.length} 台设备可操作自动切号）` : "") +
+        "，可继续使用本页开启/关闭自动切号、导出已选等按钮",
       "success",
     );
   } catch (error) {
-    setStatus(error.message || "同步列表勾选失�?, "error");
+    setStatus(error.message || "同步列表勾选失败", "error");
   } finally {
     backupAliasPickApplyBusy = false;
     if (backupAliasPickApplySelectionBtn) {
       backupAliasPickApplySelectionBtn.disabled = false;
-      backupAliasPickApplySelectionBtn.textContent = "应用到列表勾�?;
+      backupAliasPickApplySelectionBtn.textContent = "应用到列表勾选";
     }
   }
 }
@@ -12569,23 +12569,23 @@ function setBackupArchiveXlsxButtonsBusy(busy) {
   backupArchiveXlsxBusy = Boolean(busy);
   if (exportBackupArchiveXlsxBtn) {
     exportBackupArchiveXlsxBtn.disabled = busy;
-    exportBackupArchiveXlsxBtn.textContent = busy ? "导出�?.." : "导出全部 xlsx";
+    exportBackupArchiveXlsxBtn.textContent = busy ? "导出中..." : "导出全部 xlsx";
   }
   if (exportBackupArchiveSelectedXlsxBtn) {
     exportBackupArchiveSelectedXlsxBtn.disabled = busy || backupArchiveSelectedRowIndices.size <= 0;
-    exportBackupArchiveSelectedXlsxBtn.textContent = busy ? "导出�?.." : "导出已�?xlsx";
+    exportBackupArchiveSelectedXlsxBtn.textContent = busy ? "导出中..." : "导出已选 xlsx";
   }
   if (backupArchiveSelectAllPageBtn) backupArchiveSelectAllPageBtn.disabled = busy;
   if (backupArchiveClearSelectionBtn) backupArchiveClearSelectionBtn.disabled = busy;
   if (importBackupArchiveXlsxBtn) {
     importBackupArchiveXlsxBtn.disabled = busy;
-    importBackupArchiveXlsxBtn.textContent = busy ? "导入�?.." : "导入 xlsx";
+    importBackupArchiveXlsxBtn.textContent = busy ? "导入中..." : "导入 xlsx";
   }
 }
 
 async function downloadBackupArchiveExportFile(filename) {
   const safeName = String(filename || "").trim();
-  if (!safeName) throw new Error("服务端未返回导出文件�?);
+  if (!safeName) throw new Error("服务端未返回导出文件名");
   const token = authToken();
   const url = await buildApiUrl(
     `/api/admin/editor/backup_archive/export_file?filename=${encodeURIComponent(safeName)}`,
@@ -12621,7 +12621,7 @@ async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
   if (backupArchiveXlsxBusy) return;
   const selected = getBackupArchiveSelectedRowIndices();
   if (selectedOnly && !selected.length) {
-    setStatus("请先勾选要导出的备份记�?, "warning");
+    setStatus("请先勾选要导出的备份记录", "warning");
     return;
   }
   setBackupArchiveXlsxButtonsBusy(true);
@@ -12633,7 +12633,7 @@ async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
     const url = await buildApiUrl(
       `/api/admin/editor/backup_archive/export_xlsx${qs ? `?${qs}` : ""}`,
     );
-    setStatus(selectedOnly ? "正在导出已选备份为 xlsx..." : "正在导出全部备份�?xlsx...", "info");
+    setStatus(selectedOnly ? "正在导出已选备份为 xlsx..." : "正在导出全部备份为 xlsx...", "info");
     const response = await fetch(url, {
       method: "GET",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -12655,7 +12655,7 @@ async function exportBackupArchiveXlsx({ selectedOnly = false } = {}) {
     const filename = String(data?.filename || "").trim();
     const count = Number(data?.count || 0);
     await downloadBackupArchiveExportFile(filename);
-    setStatus(`备份档案已导出：${filename}�?{count} 条）`, "success");
+    setStatus(`备份档案已导出：${filename}（${count} 条）`, "success");
   } finally {
     setBackupArchiveXlsxButtonsBusy(false);
     updateBackupArchiveSelectionUi();
@@ -12693,10 +12693,10 @@ async function importBackupArchiveXlsxFile(file) {
     const parts = [];
     if (imported > 0) parts.push(`新增 ${imported} 条`);
     if (updated > 0) parts.push(`更新已有 ${updated} 条`);
-    if (!parts.length) parts.push("新增 0 �?);
-    if (skippedDup > 0) parts.push(`跳过文件内重�?username ${skippedDup} 条`);
-    if (skippedEmpty > 0) parts.push(`跳过�?username ${skippedEmpty} 条`);
-    setStatus(`备份档案导入完成�?{parts.join("�?)}`, imported > 0 || updated > 0 ? "success" : "warning");
+    if (!parts.length) parts.push("新增 0 条");
+    if (skippedDup > 0) parts.push(`跳过文件内重复 username ${skippedDup} 条`);
+    if (skippedEmpty > 0) parts.push(`跳过空 username ${skippedEmpty} 条`);
+    setStatus(`备份档案导入完成：${parts.join("，")}`, imported > 0 || updated > 0 ? "success" : "warning");
   } finally {
     setBackupArchiveXlsxButtonsBusy(false);
     if (backupArchiveImportFileInput) backupArchiveImportFileInput.value = "";
@@ -12737,7 +12737,7 @@ async function refreshAutoSwitchDailyPlansInBackground() {
     applyAutoSwitchManualOpsUi();
     scheduleBackupArchiveSlotHighlightRefresh();
   } catch (_) {
-    /* 时段计划展示失败不影响档案列�?*/
+    /* 时段计划展示失败不影响档案列表 */
   }
 }
 
@@ -12788,7 +12788,7 @@ async function loadBackupArchiveRecords() {
       clearTimeout(backupArchiveSlotHighlightTimer);
       backupArchiveSlotHighlightTimer = null;
     }
-    deviceAliasGroupsEl.innerHTML = `<div class="hint">加载备份档案失败�?{escapeHtml(error.message || "unknown")}</div>`;
+    deviceAliasGroupsEl.innerHTML = `<div class="hint">加载备份档案失败：${escapeHtml(error.message || "unknown")}</div>`;
   }
 }
 
@@ -12879,7 +12879,7 @@ if (accountBatchPreviewApplyAliasBtn) {
       return;
     }
     renderAccountBatchPreviewTable();
-    setStatus(`已为 ${applied} 条选中记录分配别名�?{alias}」`, "success");
+    setStatus(`已为 ${applied} 条选中记录分配别名「${alias}」`, "success");
   });
 }
 if (accountBatchPreviewSmartAliasListEl) {
@@ -12893,7 +12893,7 @@ if (accountBatchPreviewSmartAliasListEl) {
     const metaEl = accountBatchPreviewSmartAliasListEl.querySelector(".import-preview-smart-alias-meta");
     if (metaEl) {
       const total = accountBatchPreviewSmartAliasListEl.querySelectorAll(".account-batch-preview-smart-alias-check").length;
-      metaEl.textContent = `已勾�?${accountBatchPreviewSmartAliases.size} / ${total} 个别名（可多选）`;
+      metaEl.textContent = `已勾选 ${accountBatchPreviewSmartAliases.size} / ${total} 个别名（可多选）`;
     }
   });
 }
@@ -12931,7 +12931,7 @@ if (accountStatsQueryBtn) {
 if (accountStatsQueryLogDownloadBtn) {
   accountStatsQueryLogDownloadBtn.addEventListener("click", () => {
     downloadAccountStatsQueryLogs()
-      .then(() => setStatus("查询日志已下�?, "success"))
+      .then(() => setStatus("查询日志已下载", "success"))
       .catch((error) => setStatus(error.message || "下载查询日志失败", "error"));
   });
 }
@@ -12992,15 +12992,15 @@ if (accountStatsQueryScheduleToggle) {
         if (enabled && !savedAliasCount) {
           accountStatsQueryScheduleToggle.checked = false;
           if (accountStatsQueryScheduleTime) accountStatsQueryScheduleTime.disabled = true;
-          setStatus("请先通过「全量查询并落库」勾选并确认别名，再开启定时查�?, "warning");
+          setStatus("请先通过「全量查询并落库」勾选并确认别名，再开启定时查询", "warning");
           return;
         }
-        // 只改定时开�?时间，不覆盖已保存的别名记忆
+        // 只改定时开关/时间，不覆盖已保存的别名记忆
         await saveAccountStatsQueryConfig({
           schedule_enabled: enabled,
           schedule_time: accountStatsQueryScheduleTime?.value || "09:00",
         });
-        setStatus(enabled ? "已开启定时查�? : "已关闭定时查�?, "success");
+        setStatus(enabled ? "已开启定时查询" : "已关闭定时查询", "success");
       } catch (error) {
         setStatus(error.message || "保存定时配置失败", "error");
         loadAccountStatsQueryConfig().catch(() => {});
@@ -13128,7 +13128,7 @@ if (accountRecordsAliasSortSelect) {
   accountRecordsAliasSortSelect.addEventListener("change", () => {
     accountRecordsAliasSortMode = String(accountRecordsAliasSortSelect.value || "alias").trim() || "alias";
     currentAccountRecordsPage = 1;
-    // 清空�?DOM，避免沿用上一排序的展开集合导致部分组仍收起
+    // 清空旧 DOM，避免沿用上一排序的展开集合导致部分组仍收起
     if (accountEditorListEl) accountEditorListEl.innerHTML = "";
     renderAccountEditorRows();
   });
@@ -13293,11 +13293,11 @@ if (deviceAliasGroupsEl) {
         ? collectDeviceIdentityByDeviceAndAlias(deviceId, alias)
         : collectDeviceIdentityByAlias(alias);
       if (!identity) return;
-      const detailText = [`设备别名�?{alias}`].join("\n");
+      const detailText = [`设备别名：${alias}`].join("\n");
       if (!confirmTikTokAction("清理 TikTok 数据", detailText)) return;
       await submitAndWaitTikTokDeviceOp("/api/admin/device_tiktok/clear", identity, {
-        pendingText: "清理任务下发�?..",
-        successText: "清理任务已完�?,
+        pendingText: "清理任务下发中...",
+        successText: "清理任务已完成",
         errorText: "清理任务失败",
       }).catch((e) => setStatus(e.message || "清理失败", "error"));
       return;
@@ -13308,7 +13308,7 @@ if (deviceAliasGroupsEl) {
       const backupRecordId = Number(target.getAttribute("data-account-id") || 0) || undefined;
       const username = String(target.getAttribute("data-account-username") || "").trim();
       const deviceIdBtn = String(target.getAttribute("data-device-id") || "").trim();
-      if (!guardAutoSwitchManualOps("备份并清�?, deviceIdBtn, alias, deviceIdBtn)) return;
+      if (!guardAutoSwitchManualOps("备份并清理", deviceIdBtn, alias, deviceIdBtn)) return;
       await handleBackupAndClearClick(alias, backupRecordId, username, deviceIdBtn).catch((e) => {
         setStatus(e.message || "备份失败", "error");
       });
@@ -13321,7 +13321,7 @@ if (deviceAliasGroupsEl) {
       const deviceRowIndexRaw = String(target.getAttribute("data-device-row-index") || "").trim();
       const deviceRowIndex = deviceRowIndexRaw ? Number(deviceRowIndexRaw) : NaN;
       if (!username || !assignedAlias) return;
-      const ok = window.confirm(`确认删除分配？\n账号�?{username}\n别名�?{assignedAlias}`);
+      const ok = window.confirm(`确认删除分配？\n账号：${username}\n别名：${assignedAlias}`);
       if (!ok) return;
       const resp = await request("/api/admin/editor/account_rows/unassign_alias", {
         method: "POST",
@@ -13338,7 +13338,7 @@ if (deviceAliasGroupsEl) {
       const updatedAccounts = Number(resp?.updated_accounts ?? 0);
       const deletedDevices = Number(resp?.deleted_device_rows ?? 0);
       setStatus(
-        `已删除分配：${username} -> ${assignedAlias}（账�?${updatedAccounts}，备份档�?${deletedDevices}）`,
+        `已删除分配：${username} -> ${assignedAlias}（账号 ${updatedAccounts}，备份档案 ${deletedDevices}）`,
         "success",
       );
       return;
@@ -13349,11 +13349,11 @@ if (deviceAliasGroupsEl) {
       if (!rowIndex) return;
       const currentExcluded = String(target.getAttribute("data-account-excluded") || "").trim() === "1";
       const nextExcluded = !currentExcluded;
-      const actionText = nextExcluded ? "不参加自动切�? : "参加自动切号";
+      const actionText = nextExcluded ? "不参加自动切号" : "参加自动切号";
       const detail = nextExcluded
-        ? "开启后，该账号将从自动切号计划�?bundle 中排除�?
-        : "关闭后，该账号会重新参与自动切号计划�?;
-      if (!window.confirm(`确认设置为�?{actionText}”？\n${detail}`)) return;
+        ? "开启后，该账号将从自动切号计划和 bundle 中排除。"
+        : "关闭后，该账号会重新参与自动切号计划。";
+      if (!window.confirm(`确认设置为“${actionText}”？\n${detail}`)) return;
       const resp = await request("/api/admin/editor/device_rows/auto_switch_excluded", {
         method: "POST",
         body: JSON.stringify({
@@ -13367,18 +13367,18 @@ if (deviceAliasGroupsEl) {
       const bucketSize = Number(resp?.bucket_size || 0);
       const disabledDevices = Number(resp?.devices_disabled || 0);
       const notifiedDevices = Number(resp?.devices_notified || 0);
-      const parts = [`已设置为�?{actionText}”`];
+      const parts = [`已设置为“${actionText}”`];
       if (bucketSize > 0) parts.push(`当前参与自动切号账号 ${bucketSize} 个`);
-      if (disabledDevices > 0) parts.push(`已自动关�?${disabledDevices} 台设备自动切号`);
+      if (disabledDevices > 0) parts.push(`已自动关闭 ${disabledDevices} 台设备自动切号`);
       else if (notifiedDevices > 0) parts.push(`已重同步 ${notifiedDevices} 台设备`);
-      setStatus(parts.join("�?), disabledDevices > 0 ? "warning" : "success");
+      setStatus(parts.join("，"), disabledDevices > 0 ? "warning" : "success");
       return;
     }
     if (target.hasAttribute("data-account-switch")) {
       event.preventDefault();
       const card = target.closest(".backup-archive-record");
       if (!(card instanceof HTMLElement)) {
-        setStatus("未找到账号条�?, "warning");
+        setStatus("未找到账号条目", "warning");
         return;
       }
       runBackupArchiveAccountCutSwitch(card).catch((e) => setStatus(e.message || "切号失败", "error"));
@@ -13388,7 +13388,7 @@ if (deviceAliasGroupsEl) {
       event.preventDefault();
       const card = target.closest(".backup-archive-record");
       if (!(card instanceof HTMLElement)) {
-        setStatus("未找到账号条�?, "warning");
+        setStatus("未找到账号条目", "warning");
         return;
       }
       await handleBasicProfileEditFromBackupCard(card).catch((e) => setStatus(e.message || "操作失败", "error"));
@@ -13402,9 +13402,9 @@ if (deviceAliasGroupsEl) {
       const restoreDeviceId = restoreCard instanceof HTMLElement
         ? String(restoreCard.getAttribute("data-row-device-id") || "").trim()
         : "";
-      if (!guardAutoSwitchManualOps("清理并还�?, restoreDeviceId, alias, restoreDeviceId)) return;
+      if (!guardAutoSwitchManualOps("清理并还原", restoreDeviceId, alias, restoreDeviceId)) return;
       await handleRestoreClick(alias, backupName, restoreDeviceId).catch((e) => {
-        setStatus(e.message || "清理并还原失�?, "error");
+        setStatus(e.message || "清理并还原失败", "error");
       });
       return;
     }
@@ -13474,12 +13474,12 @@ if (apiBaseInput) {
   restoreUiStateSnapshot();
   const ok = await authCheck().catch(() => false);
   if (ok) {
-    // 先加载用户运行配置（含模板列表），避免首屏设备模板下拉先渲染�?default�?
+    // 先加载用户运行配置（含模板列表），避免首屏设备模板下拉先渲染成 default。
     await loadUserRuntimeConfig().catch(() => {});
     await switchSection("overview", { persist: false }).catch(() => {});
     handleRefresh();
     loadAccounts();
-    void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失�?, "error"));
+    void loadDbTablePage().catch((e) => setStatus(e?.message || "数据表加载失败", "error"));
     void loadAdminUsers().catch((e) => setStatus(e?.message || "用户列表加载失败", "error"));
     void loadAutoSwitchConfig({ refreshArchive: true });
     refreshAccountEditorLight().then(() => {
@@ -13488,7 +13488,7 @@ if (apiBaseInput) {
       void loadBackupStatsFullQueryConfig();
       void loadAccountStatsQueryConfig();
     }).catch((error) => {
-      // 避免静默失败：首屏卡�?“加载中...�?时直接给出错误原�?
+      // 避免静默失败：首屏卡在 “加载中...” 时直接给出错误原因
       const msg = error?.message || error?.toString?.() || "unknown";
       if (deviceAliasGroupsEl) {
         deviceAliasGroupsEl.innerHTML = `<div class="hint">初始化失败：${escapeHtml(msg)}</div>`;
