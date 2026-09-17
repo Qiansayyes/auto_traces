@@ -1,5 +1,6 @@
 package com.autotraces.app.videoded
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
@@ -23,6 +24,11 @@ import kotlin.coroutines.resume
  *
  * USB `adb push` 落点常为 `owner=shell`：App 用 File API 直接读会 EACCES（Permission Denied）。
  * [scanExistingFiles] 必须先把源文件中转到本 App 可读位置（cache），再经 MediaStore 正规入库。
+ *
+ * ## 同名 / UNIQUE 策略
+ * MediaStore 对 `_data` 路径有唯一约束。反复 push 同名文件时，若旧索引删不净再 insert，
+ * 会抛 `UNIQUE constraint failed: files._data`，整单 ACK 失败，PC 素材进不了 `used/`。
+ * 现行策略：先按路径/显示名查找已有行 → **覆盖写流复用 URI**；insert 冲突则再查或换时间戳文件名。
  */
 object GalleryMediaPublisher {
     private const val TAG = "GalleryMediaPublisher"
@@ -87,11 +93,28 @@ object GalleryMediaPublisher {
                     // 且 shell 属主文件不能用 App File API 直接读（EACCES）。
                     val staging = stageReadableCopy(app, src, name)
                     try {
-                        purgePicturesVideoByDisplayName(app, name)
+                        // 同名已在库：直接覆盖，避免 purge 失败后再 insert 撞 UNIQUE
+                        val absHint = File(
+                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                            name,
+                        ).absolutePath
+                        val existing = findExistingVideoUri(app, name, src.absolutePath)
+                            ?: findExistingVideoUri(app, name, absHint)
+                        if (existing != null) {
+                            Log.i(TAG, "USB reuse MediaStore row for $name -> $existing")
+                            overwriteMediaStoreUri(
+                                app.contentResolver,
+                                existing,
+                                staging,
+                                markPendingAroundWrite = true,
+                            )
+                        } else {
+                            purgePicturesVideoByDisplayName(app, name)
+                            insertMediaStoreQPlus(app, staging, name)
+                        }
                         runCatching { if (src.exists()) src.delete() }
                         // shell 文件 App 可能删不掉，再 su 删一次，避免双份幽灵
                         if (src.exists()) deleteViaSu(src)
-                        insertMediaStoreQPlus(app, staging, name)
                     } finally {
                         runCatching { staging.delete() }
                     }
@@ -343,6 +366,18 @@ object GalleryMediaPublisher {
         val resolver = context.contentResolver
         val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val mime = mimeForFileName(displayName)
+        val absHint = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+            displayName,
+        ).absolutePath
+
+        // 同名已在 Pictures：覆盖写入，避免 UNIQUE constraint failed: files._data
+        findExistingVideoUri(context, displayName, absHint)?.let { existing ->
+            Log.i(TAG, "reuse existing MediaStore row for $displayName -> $existing")
+            overwriteMediaStoreUri(resolver, existing, source, markPendingAroundWrite = true)
+            return existing
+        }
+
         // IS_PENDING=1 是 Android Q+ 正规两步写：占位→写字节→清 0。绝不能停在 1。
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
@@ -350,33 +385,184 @@ object GalleryMediaPublisher {
             put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
-        val uri = resolver.insert(collection, values) ?: error("mediastore_insert_failed")
+        val uri = try {
+            resolver.insert(collection, values)
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaStore insert conflict for $displayName: ${e.message}")
+            null
+        }
+
+        if (uri == null) {
+            findExistingVideoUri(context, displayName, absHint)?.let { existing ->
+                overwriteMediaStoreUri(resolver, existing, source, markPendingAroundWrite = true)
+                return existing
+            }
+            val uniqueName = uniqueDisplayName(displayName)
+            val retryValues = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, uniqueName)
+                put(MediaStore.Video.Media.MIME_TYPE, mime)
+                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val retryUri = try {
+                resolver.insert(collection, retryValues)
+            } catch (e: Exception) {
+                throw IOException("mediastore_insert_failed:${e.message}", e)
+            } ?: error("mediastore_insert_failed")
+            try {
+                overwriteMediaStoreUri(resolver, retryUri, source, clearPending = true)
+            } catch (t: Throwable) {
+                runCatching { resolver.delete(retryUri, null, null) }
+                throw wrapMediaStoreWriteError(t, source)
+            }
+            return retryUri
+        }
+
         try {
-            resolver.openOutputStream(uri)?.use { out ->
-                FileInputStream(source).use { input -> input.copyTo(out) }
-            } ?: error("mediastore_open_output_failed")
-            val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-            val updated = resolver.update(uri, done, null, null)
-            if (updated <= 0) error("mediastore_clear_pending_failed")
+            overwriteMediaStoreUri(resolver, uri, source, clearPending = true)
         } catch (t: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
-            val msg = t.message.orEmpty()
-            if (msg.contains("EACCES", ignoreCase = true) ||
-                msg.contains("Permission denied", ignoreCase = true) ||
-                t is SecurityException
-            ) {
-                throw IOException("eacces_mediastore_write:$msg:${source.absolutePath}", t)
-            }
-            throw t
+            throw wrapMediaStoreWriteError(t, source)
         }
         return uri
+    }
+
+    private fun wrapMediaStoreWriteError(t: Throwable, source: File): Throwable {
+        val msg = t.message.orEmpty()
+        if (msg.contains("EACCES", ignoreCase = true) ||
+            msg.contains("Permission denied", ignoreCase = true) ||
+            t is SecurityException
+        ) {
+            return IOException("eacces_mediastore_write:$msg:${source.absolutePath}", t)
+        }
+        return t
+    }
+
+    private fun overwriteMediaStoreUri(
+        resolver: android.content.ContentResolver,
+        uri: Uri,
+        source: File,
+        clearPending: Boolean = false,
+        markPendingAroundWrite: Boolean = false,
+    ) {
+        if (markPendingAroundWrite && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                resolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 1) },
+                    null,
+                    null,
+                )
+            }
+        }
+        val stream = try {
+            resolver.openOutputStream(uri, "wt")
+                ?: resolver.openOutputStream(uri)
+        } catch (e: Exception) {
+            Log.w(TAG, "openOutputStream wt failed, fallback: ${e.message}")
+            resolver.openOutputStream(uri)
+        } ?: error("mediastore_open_output_failed")
+
+        stream.use { out ->
+            FileInputStream(source).use { input -> input.copyTo(out) }
+        }
+        if (clearPending || markPendingAroundWrite) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                val updated = resolver.update(uri, done, null, null)
+                if (clearPending && updated <= 0) error("mediastore_clear_pending_failed")
+            }
+        }
+    }
+
+    /**
+     * 按显示名 + 可选绝对路径查找已有视频行。
+     * USB push 后 RELATIVE_PATH 常为空/不一致，必须用 `_data` 兜底，否则会误判「不存在」再 insert → UNIQUE。
+     */
+    private fun findExistingVideoUri(
+        context: Context,
+        displayName: String,
+        absolutePath: String? = null,
+    ): Uri? {
+        val resolver = context.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+        val projection = arrayOf(MediaStore.Video.Media._ID)
+
+        if (!absolutePath.isNullOrBlank()) {
+            resolver.query(
+                collection,
+                projection,
+                "${MediaStore.Video.Media.DATA}=?",
+                arrayOf(absolutePath),
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return ContentUris.withAppendedId(collection, cursor.getLong(0))
+                }
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val selection =
+                "${MediaStore.Video.Media.DISPLAY_NAME}=? AND (" +
+                    "${MediaStore.Video.Media.RELATIVE_PATH}=? OR ${MediaStore.Video.Media.RELATIVE_PATH}=? OR " +
+                    "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?)"
+            val args = arrayOf(
+                displayName,
+                "${Environment.DIRECTORY_PICTURES}/",
+                Environment.DIRECTORY_PICTURES,
+                "Pictures/%",
+            )
+            resolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return ContentUris.withAppendedId(collection, cursor.getLong(0))
+                }
+            }
+            resolver.query(
+                collection,
+                projection,
+                "${MediaStore.Video.Media.DISPLAY_NAME}=?",
+                arrayOf(displayName),
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return ContentUris.withAppendedId(collection, cursor.getLong(0))
+                }
+            }
+        } else {
+            resolver.query(
+                collection,
+                projection,
+                "${MediaStore.Video.Media.DISPLAY_NAME}=?",
+                arrayOf(displayName),
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return ContentUris.withAppendedId(collection, cursor.getLong(0))
+                }
+            }
+        }
+        return null
+    }
+
+    private fun uniqueDisplayName(displayName: String): String {
+        val dot = displayName.lastIndexOf('.')
+        val base = if (dot > 0) displayName.substring(0, dot) else displayName
+        val ext = if (dot > 0) displayName.substring(dot) else ""
+        return "${base}_${System.currentTimeMillis()}$ext"
     }
 
     private suspend fun insertLegacyPublicCopy(context: Context, source: File, displayName: String): Uri {
         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES).apply { mkdirs() }
         val dest = File(dir, displayName)
+        // 同名已存在：覆盖文件内容后再 scan / 复用
         source.inputStream().use { input -> dest.outputStream().use { output -> input.copyTo(output) } }
         val mime = mimeForFileName(displayName)
+        findExistingVideoUri(context, displayName, dest.absolutePath)?.let { return it }
         val uri = suspendCancellableCoroutine { cont ->
             MediaScannerConnection.scanFile(
                 context,
@@ -386,7 +572,8 @@ object GalleryMediaPublisher {
                 cont.resume(scanned ?: Uri.EMPTY)
             }
         }
-        if (uri == Uri.EMPTY) error("mediascan_failed")
-        return uri
+        if (uri != Uri.EMPTY) return uri
+        return findExistingVideoUri(context, displayName, dest.absolutePath)
+            ?: error("mediascan_failed")
     }
 }

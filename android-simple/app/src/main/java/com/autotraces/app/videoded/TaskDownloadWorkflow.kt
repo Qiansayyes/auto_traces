@@ -58,12 +58,24 @@ object TaskDownloadWorkflow {
                 GalleryMediaPublisher.tryDeletePublicFile(pushed)
             }
 
-            // 从私有 received 正规 MediaStore 入库（本包 owner + IS_PENDING 收尾），再清临时目录
-            val galleryUris = GalleryMediaPublisher.publishAndDeleteReceived(
-                app,
-                taskId,
-                files.map { it.fileName },
-            )
+            // MD5 已通过则文件可用；相册索引冲突（UNIQUE）不得让整单失败，否则素材进不了 used/
+            val galleryUris = try {
+                GalleryMediaPublisher.publishAndDeleteReceived(
+                    app,
+                    taskId,
+                    files.map { it.fileName },
+                )
+            } catch (t: Throwable) {
+                val msg = t.message.orEmpty()
+                if (msg.contains("UNIQUE", ignoreCase = true) ||
+                    msg.contains("SQLITE_CONSTRAINT", ignoreCase = true)
+                ) {
+                    Log.w(TAG, "gallery UNIQUE ignored after USB verify: $msg")
+                    files.map { "file://${java.io.File(receivedDir, it.fileName).absolutePath}" }
+                } else {
+                    throw t
+                }
+            }
             report("校验通过，已写入相册，向 PC 确认完成")
 
             CompanionApi.ackTask(app, taskId, true, "usb_push_complete", completedFiles)
@@ -104,6 +116,16 @@ object TaskDownloadWorkflow {
                     files = files.map { TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "failed", t.message) },
                 ),
             )
+            VideoDedEvents.sendTaskFinished(
+                app,
+                taskId = taskId,
+                success = false,
+                targetPath = targetPath,
+                error = t.message,
+                receivedDir = null,
+                galleryContentUriStrings = null,
+            )
+            report("USB 传输任务失败：${t.message.orEmpty()}")
             throw t
         } finally {
             TaskDownloadCoordinator.release(taskId)

@@ -45,6 +45,8 @@ object EgressIpGate {
      * 阻塞直到出口 IP 判定为非中国大陆；探测失败也继续轮询（不放行）。
      */
     suspend fun awaitUntilNotChina(alias: String, tag: String = "出口IP门阀") {
+        // 先校时再探测：墙钟错误时 HTTPS 先挂，校时本身走明文 HTTP
+        runCatching { DeviceClockSync.ensureSynced(alias, "$tag·校时") }
         val now = System.currentTimeMillis()
         if (lastOkAtMs > 0L && now - lastOkAtMs < OK_CACHE_MS && lastOkSummary.isNotBlank()) {
             LogCenter.op(alias, "$tag：沿用近期出口判定，允许拉起 TikTok（$lastOkSummary）")

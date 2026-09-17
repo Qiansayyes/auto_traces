@@ -12,8 +12,8 @@ android {
         applicationId = "com.autotraces.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1-eacces"
+        versionCode = 3
+        versionName = "1.0.2-unique-reuse"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

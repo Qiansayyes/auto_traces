@@ -1197,11 +1197,22 @@ object AppCoordinator {
             lastMessage = "应用已初始化",
         )
         scope.launch {
+            runCatching {
+                DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", "冷启校时")
+            }
             if (BindingRecovery.tryRecoverFromCloud(appContext)) {
                 ensureDeviceOpsLoopIfBound()
             }
             tryUploadPendingAutoSwitchSummary()
             startIfNeeded()
+        }
+    }
+
+    fun ensureClockSyncedAsync(tag: String = "系统校时") {
+        scope.launch {
+            runCatching {
+                DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", tag)
+            }
         }
     }
 
@@ -1288,6 +1299,9 @@ object AppCoordinator {
         }
         if (started.compareAndSet(false, true)) {
             scope.launch {
+                runCatching {
+                    DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", "启动前校时")
+                }
                 bootstrapAfterBinding()
                 if (!PrefsStore.isAutoSwitchAutonomousMode()) {
                     PrefsStore.saveLocalStatus("online")

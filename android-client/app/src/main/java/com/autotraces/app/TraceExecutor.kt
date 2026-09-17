@@ -8435,6 +8435,7 @@ class RealTraceExecutor(
         tag: String,
         allowForceRestart: Boolean = true,
     ): Boolean {
+        runCatching { DeviceClockSync.ensureSynced(alias, "$tag·校时") }
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {
             devOp(alias, "$tag：dumpsys 已确认 TikTok 在前台，跳过拉起")

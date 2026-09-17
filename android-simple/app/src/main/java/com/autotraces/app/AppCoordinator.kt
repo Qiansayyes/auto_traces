@@ -1519,11 +1519,24 @@ object AppCoordinator {
             lastMessage = "应用已初始化",
         )
         scope.launch {
+            // 冷启最先校时：墙钟错乱会导致 HTTPS 假断网，必须先于云端同步/开 TikTok
+            runCatching {
+                DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", "冷启校时")
+            }
             if (BindingRecovery.tryRecoverFromCloud(appContext)) {
                 ensureDeviceOpsLoopIfBound()
             }
             tryUploadPendingAutoSwitchSummary()
             startIfNeeded()
+        }
+    }
+
+    /** Worker / 外部触发：异步校时（有短缓存，可重复调用）。 */
+    fun ensureClockSyncedAsync(tag: String = "系统校时") {
+        scope.launch {
+            runCatching {
+                DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", tag)
+            }
         }
     }
 
@@ -1610,6 +1623,10 @@ object AppCoordinator {
         }
         if (started.compareAndSet(false, true)) {
             scope.launch {
+                // 与冷启互补：服务重建时也先 await 校时，再 HTTPS/业务
+                runCatching {
+                    DeviceClockSync.ensureSynced(PrefsStore.getAlias() ?: "SYSTEM", "启动前校时")
+                }
                 bootstrapAfterBinding()
                 if (!PrefsStore.isAutoSwitchAutonomousMode()) {
                     PrefsStore.saveLocalStatus("online")
