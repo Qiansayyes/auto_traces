@@ -30,7 +30,12 @@ object TotpCodeGenerator {
                 }
             }
         }
-        return text.replace(Regex("""[\s\-]+"""), "").uppercase()
+        // 账号表可能原样存带 '-' 的 Setup Key（如 V5F2-LWEL-...）；有 '-' 则去掉后再算 TOTP，无 '-' 则仅去空白。
+        return if (text.contains('-')) {
+            text.replace(Regex("""[\s\-]+"""), "").uppercase()
+        } else {
+            text.replace(Regex("""\s+"""), "").uppercase()
+        }
     }
 
     fun generate(

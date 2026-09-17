@@ -49,6 +49,8 @@ class MainActivity : AppCompatActivity() {
     private var logStickToBottom = true
     /** 防止连点弹出多个确认框 / 并发提交更新邮箱。 */
     private var updatingAccountEmailFromIssued = false
+    /** 防止连点并发提交 2FA Setup Key。 */
+    private var updatingAccountTwoFa = false
     /** 切换云端模式前的账号参与挑选（勾选=参与）。 */
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -256,6 +258,12 @@ class MainActivity : AppCompatActivity() {
         binding.assignedEmailInput.setText("")
         binding.assignedEmailPasswordInput.setText("")
         binding.assignedTwoFaInput.setText("")
+        binding.pasteTwoFaSecretInput.setText("")
+        updatePasteTwoFaHint(hasTwoFa = false)
+    }
+
+    private fun updatePasteTwoFaHint(hasTwoFa: Boolean) {
+        binding.pasteTwoFaSecretLayout.hint = if (hasTwoFa) "已有2FA" else "没有2FA"
     }
 
     private fun applyAssignedAccount(account: DeviceAssignedAccountResponse?) {
@@ -263,16 +271,23 @@ class MainActivity : AppCompatActivity() {
             clearAssignedAccountInputs()
             return
         }
+        val prevUser = binding.assignedUsernameInput.text?.toString().orEmpty().trim().removePrefix("@")
+        val nextUser = account.username.orEmpty().trim().removePrefix("@")
         binding.assignedUsernameInput.setText(account.username.orEmpty())
         binding.assignedPasswordInput.setText(account.password.orEmpty())
         binding.assignedApiInput.setText(account.api.orEmpty())
         binding.assignedEmailInput.setText(account.email.orEmpty())
         binding.assignedEmailPasswordInput.setText(account.email_password.orEmpty())
         binding.assignedTwoFaInput.setText(account.two_fa.orEmpty())
+        // 换账号时清空粘贴框，避免把上一个账号的密钥误提交到当前账号
+        if (!prevUser.equals(nextUser, ignoreCase = true)) {
+            binding.pasteTwoFaSecretInput.setText("")
+        }
         val apiBlank = account.api.isNullOrBlank()
         val emailPresent = !account.email.isNullOrBlank()
         val mailModuleOk = account.mail_module_code_available == true
         val twoFaPresent = !account.two_fa.isNullOrBlank()
+        updatePasteTwoFaHint(hasTwoFa = twoFaPresent)
         binding.fetchTikTokTwoFaCodeButton.visibility = View.GONE
         binding.fetchTikTokCodeButton.text = "获取验证码并复制"
         binding.assignedCopyStatusText.text = when {
@@ -317,6 +332,10 @@ class MainActivity : AppCompatActivity() {
         }
         binding.copyAssignedTwoFaButton.setOnClickListener {
             copy("2FA", binding.assignedTwoFaInput.text?.toString().orEmpty())
+        }
+
+        binding.submitTwoFaSecretButton.setOnClickListener {
+            promptSubmitTwoFaSecret()
         }
 
         binding.fetchTikTokCodeButton.setOnClickListener {
@@ -535,6 +554,164 @@ class MainActivity : AppCompatActivity() {
 
         binding.updateAccountEmailFromIssuedButton.setOnClickListener {
             promptUpdateAccountEmailFromIssued()
+        }
+    }
+
+    /** 将粘贴的 Setup Key 提交到云端当前下拉账号的 2FA 列（原样保留连字符）。 */
+    private fun promptSubmitTwoFaSecret() {
+        if (updatingAccountTwoFa) return
+        if (requireCloudLoginIfNeeded()) return
+        val deviceId = PrefsStore.getDeviceId().orEmpty()
+        val alias = PrefsStore.getAlias().orEmpty().trim()
+        if (deviceId.isBlank() || alias.isBlank()) {
+            binding.pasteTwoFaStatusText.text = "设备未绑定，无法上传 2FA"
+            return
+        }
+
+        val username = selectedManualUsername().ifBlank {
+            ManualDeviceControl.selectedManualUsername()
+        }.trim().removePrefix("@")
+        if (username.isBlank()) {
+            binding.pasteTwoFaStatusText.text = "请先在「手动任务」下拉选择要写入的账号"
+            Toast.makeText(this, "请先选择下拉账号", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // 仅 trim 首尾；中间 '-' 原样保留上传
+        val pasted = binding.pasteTwoFaSecretInput.text?.toString().orEmpty().trim()
+        if (pasted.isBlank()) {
+            binding.pasteTwoFaStatusText.text = "请先粘贴 Setup Key"
+            Toast.makeText(this, "2FA 密钥为空", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val normalized = TotpCodeGenerator.normalizeSecret(pasted)
+        if (normalized.isBlank()) {
+            binding.pasteTwoFaStatusText.text = "密钥格式无效，无法生成验证码"
+            Toast.makeText(this, "密钥无效", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val localOk = runCatching { TotpCodeGenerator.generate(pasted).code }.isSuccess
+        if (!localOk) {
+            binding.pasteTwoFaStatusText.text = "密钥不是有效 Base32，请检查后重试"
+            Toast.makeText(this, "密钥无效", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val opt = ManualDeviceControl.findCachedAccount(username)
+            ?: manualAccounts.firstOrNull { it.username.equals(username, ignoreCase = true) }
+        val oldTwoFa = opt?.twoFa.orEmpty()
+            .ifBlank { binding.assignedTwoFaInput.text?.toString().orEmpty() }
+        if (oldTwoFa == pasted) {
+            binding.pasteTwoFaStatusText.text = "与云端现有 2FA 一致，无需提交"
+            Toast.makeText(this, "无需更新", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val message = buildString {
+            append("将把 Setup Key 原样写入云端账号表 2FA 列：\n\n")
+            append("账号：@$username\n\n")
+            append("原 2FA：${if (oldTwoFa.isBlank()) "(空 / 没有2FA)" else "已有2FA"}\n")
+            append("新密钥长度：${pasted.length}")
+            if (pasted.contains('-')) append("（含连字符，入库保留）")
+            append("\n\n确定后上传，并自动拉取最新账号数据。")
+        }
+
+        binding.submitTwoFaSecretButton.isEnabled = false
+        AlertDialog.Builder(this)
+            .setTitle("确认提交 2FA 密钥")
+            .setMessage(message)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确定提交") { _, _ ->
+                performSubmitTwoFaSecret(
+                    deviceId = deviceId,
+                    alias = alias,
+                    username = username,
+                    twoFa = pasted,
+                )
+            }
+            .setOnDismissListener {
+                if (!updatingAccountTwoFa && !isFinishing && !isDestroyed) {
+                    binding.submitTwoFaSecretButton.isEnabled = true
+                }
+            }
+            .show()
+    }
+
+    private fun performSubmitTwoFaSecret(
+        deviceId: String,
+        alias: String,
+        username: String,
+        twoFa: String,
+    ) {
+        if (updatingAccountTwoFa) return
+        if (isFinishing || isDestroyed) return
+        updatingAccountTwoFa = true
+        binding.submitTwoFaSecretButton.isEnabled = false
+        binding.pasteTwoFaStatusText.text = "正在上传 @$username 的 2FA…"
+        lifecycleScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        ApiService.updateDeviceAssignedAccountTwoFa(
+                            deviceId = deviceId,
+                            alias = alias,
+                            username = username,
+                            twoFa = twoFa,
+                        )
+                    }
+                }
+                if (isFinishing || isDestroyed) return@launch
+                val resp = result.getOrNull()
+                if (resp == null) {
+                    binding.pasteTwoFaStatusText.text =
+                        "上传失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+                    return@launch
+                }
+                if (resp.code != 0) {
+                    binding.pasteTwoFaStatusText.text =
+                        resp.msg?.trim().orEmpty().ifBlank { "上传失败（code=${resp.code}）" }
+                    return@launch
+                }
+
+                val saved = resp.two_fa.orEmpty().ifBlank { twoFa }
+                ManualDeviceControl.updateCachedAccountTwoFa(username, saved)
+                AutoSwitchBundleHolder.notifyAccountTwoFaUpdated(username, saved)
+
+                binding.pasteTwoFaStatusText.text = "已写入云端，正在拉取最新账号…"
+                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
+                if (isFinishing || isDestroyed) return@launch
+                refresh.onSuccess { list ->
+                    // bindManualAccountSpinner 会优先选「本机当前」；此处强制留在刚写入的账号，
+                    // 避免 selected≠active 时 UI 跳走、2FA 列看似没更新。
+                    PrefsStore.setManualSelectedUsername(username)
+                    bindManualAccountSpinnerKeepingUsername(list, username)
+                    binding.pasteTwoFaSecretInput.setText("")
+                    binding.pasteTwoFaStatusText.text =
+                        if (resp.updated == true) {
+                            "已提交 @$username 的 2FA，并刷新账号列表"
+                        } else {
+                            resp.msg?.trim().orEmpty().ifBlank { "2FA 无变化，已刷新账号列表" }
+                        }
+                    Toast.makeText(
+                        this@MainActivity,
+                        if (resp.updated == true) "2FA 已上传并刷新" else "无需更新",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }.onFailure { err ->
+                    // 上传已成功：至少刷新本机展示
+                    ManualDeviceControl.findCachedAccount(username)?.let { applyManualAccountFields(it) }
+                    updatePasteTwoFaHint(hasTwoFa = saved.isNotBlank())
+                    binding.pasteTwoFaSecretInput.setText("")
+                    binding.pasteTwoFaStatusText.text =
+                        "2FA 已写入，但拉取账号失败：${err.message}"
+                    Toast.makeText(this@MainActivity, "2FA 已写上云，刷新失败", Toast.LENGTH_SHORT).show()
+                }
+            } finally {
+                updatingAccountTwoFa = false
+                if (!isFinishing && !isDestroyed) {
+                    binding.submitTwoFaSecretButton.isEnabled = true
+                }
+            }
         }
     }
 
@@ -1359,17 +1536,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun bindManualAccountSpinner(list: List<ManualDeviceControl.AccountOption>) {
+        // 优先展示本机当前账号，否则用上次选中
+        val preferred = ManualDeviceControl.activeManualUsername()
+            .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
+        bindManualAccountSpinnerKeepingUsername(list, preferred)
+    }
+
+    /**
+     * 刷新下拉并尽量选中 [keepUsername]（找不到则回退本机当前 / 列表首项）。
+     * 提交 2FA 后必须用此方法，避免被「本机当前」抢走选中项。
+     */
+    private fun bindManualAccountSpinnerKeepingUsername(
+        list: List<ManualDeviceControl.AccountOption>,
+        keepUsername: String,
+    ) {
         manualAccounts = sortManualAccountsForSpinner(list)
         val active = ManualDeviceControl.activeManualUsername()
         val labels = manualAccounts.map { opt -> formatManualAccountSpinnerLabel(opt, active) }
         suppressingManualSpinnerCallback = true
         binding.manualAccountSelect.adapter =
             ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-        // 优先展示本机当前账号，否则用上次选中
-        val preferred = ManualDeviceControl.activeManualUsername()
-            .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
-        val idx = manualAccounts.indexOfFirst { it.username.equals(preferred, ignoreCase = true) }
-            .takeIf { it >= 0 } ?: 0
+        val keep = keepUsername.trim().removePrefix("@")
+        val idx = when {
+            keep.isNotBlank() ->
+                manualAccounts.indexOfFirst { it.username.equals(keep, ignoreCase = true) }
+                    .takeIf { it >= 0 }
+            else -> null
+        } ?: manualAccounts.indexOfFirst {
+            it.username.equals(active, ignoreCase = true)
+        }.takeIf { it >= 0 } ?: 0
         if (manualAccounts.isNotEmpty()) {
             binding.manualAccountSelect.setSelection(idx)
             applyManualAccountFields(manualAccounts[idx])

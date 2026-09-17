@@ -304,6 +304,22 @@ object ApiService {
         clazz = DeviceAssignedAccountUpdateEmailResponse::class.java,
     )
 
+    suspend fun updateDeviceAssignedAccountTwoFa(
+        deviceId: String,
+        alias: String,
+        username: String,
+        twoFa: String,
+    ): DeviceAssignedAccountUpdateTwoFaResponse = post(
+        path = "/api/device/assigned_account/update_two_fa",
+        body = DeviceAssignedAccountUpdateTwoFaRequest(
+            device_id = deviceId,
+            alias = alias,
+            username = username,
+            two_fa = twoFa,
+        ),
+        clazz = DeviceAssignedAccountUpdateTwoFaResponse::class.java,
+    )
+
     suspend fun acquireTkPendingEmail(
         deviceId: String,
         alias: String,

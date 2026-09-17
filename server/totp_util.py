@@ -12,7 +12,10 @@ from urllib.parse import unquote
 
 
 def normalize_totp_secret(secret: str) -> str:
-    """规范化 TOTP Base32 密钥；兼容 otpauth URI 与空白/连字符。"""
+    """规范化 TOTP Base32 密钥；兼容 otpauth URI。
+
+    账号表可原样存带连字符的 Setup Key：有 '-' 则去掉空白与 '-'，无 '-' 则仅去空白。
+    """
     text = str(secret or "").strip()
     if not text:
         return ""
@@ -20,7 +23,7 @@ def normalize_totp_secret(secret: str) -> str:
         m = re.search(r"(?i)(?:^|[?&])secret=([^&]+)", text)
         if m:
             text = unquote(m.group(1))
-    return re.sub(r"[\s\-]+", "", text).upper()
+    return re.sub(r"[\s\-]+", "", text).upper() if "-" in text else re.sub(r"\s+", "", text).upper()
 
 
 def decode_totp_secret_bytes(secret: str) -> bytes:

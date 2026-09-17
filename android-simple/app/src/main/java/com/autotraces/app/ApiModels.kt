@@ -622,6 +622,24 @@ data class DeviceAssignedAccountUpdateEmailResponse(
     val updated: Boolean? = null,
 )
 
+/** POST /api/device/assigned_account/update_two_fa */
+data class DeviceAssignedAccountUpdateTwoFaRequest(
+    val device_id: String,
+    val alias: String,
+    val username: String,
+    /** Setup Key 原样写入；可含连字符，服务端不去掉。 */
+    val two_fa: String,
+)
+
+data class DeviceAssignedAccountUpdateTwoFaResponse(
+    val code: Int,
+    val msg: String? = null,
+    val username: String? = null,
+    val two_fa: String? = null,
+    val old_two_fa: String? = null,
+    val updated: Boolean? = null,
+)
+
 data class TikTokAutoLoginCredentials(
     val username: String,
     val email: String,

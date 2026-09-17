@@ -317,6 +317,10 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
+const accountRecordsExportMinFollowersInput = document.getElementById("accountRecordsExportMinFollowersInput");
+const accountRecordsExportByFollowersBtn = document.getElementById("accountRecordsExportByFollowersBtn");
+const accountRecordsDeleteByUsernameInput = document.getElementById("accountRecordsDeleteByUsernameInput");
+const accountRecordsDeleteByUsernameBtn = document.getElementById("accountRecordsDeleteByUsernameBtn");
 const accountRecordsAliasSortSelect = document.getElementById("accountRecordsAliasSortSelect");
 const accountRecordsToggleCredColsBtn = document.getElementById("accountRecordsToggleCredColsBtn");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
@@ -3107,6 +3111,128 @@ async function deleteSelectedAccountRecords() {
     await refreshEditorTablesAfterAccountDelete();
     throw error;
   } finally {
+    updateAccountRecordsBatchDeleteBtn();
+  }
+}
+
+function getAccountRecordsExportMinFollowers() {
+  const raw = Number(accountRecordsExportMinFollowersInput?.value);
+  if (!Number.isFinite(raw) || raw < 0) return 1000;
+  return Math.floor(raw);
+}
+
+async function downloadAccountRowsExportFile(filename) {
+  const safeName = String(filename || "").trim();
+  if (!safeName) throw new Error("服务端未返回导出文件名");
+  const token = authToken();
+  const url = await buildApiUrl(
+    `${ACCOUNT_ROWS_API}/export_file?filename=${encodeURIComponent(safeName)}`,
+  );
+  const response = await fetch(url, {
+    method: "GET",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    let msg = `下载失败 (HTTP ${response.status})`;
+    try {
+      const data = await response.json();
+      msg = String(data?.msg || msg);
+    } catch {
+      const text = await response.text();
+      if (text) msg = text.slice(0, 200);
+    }
+    throw new Error(msg);
+  }
+  const blob = await response.blob();
+  const objectUrl = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = safeName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function exportAccountRowsByFollowers() {
+  if (accountRecordsExportByFollowersBtn?.disabled) return;
+  const minFollowers = getAccountRecordsExportMinFollowers();
+  if (accountRecordsExportMinFollowersInput) {
+    accountRecordsExportMinFollowersInput.value = String(minFollowers);
+  }
+  const previousLabel = accountRecordsExportByFollowersBtn?.textContent || "提取高粉账号";
+  if (accountRecordsExportByFollowersBtn) {
+    accountRecordsExportByFollowersBtn.disabled = true;
+    accountRecordsExportByFollowersBtn.textContent = "导出中...";
+  }
+  try {
+    setStatus(`正在提取粉丝数大于 ${minFollowers} 的账号到 XLSX...`, "info");
+    const resp = await request(
+      `${ACCOUNT_ROWS_API}/export_by_followers?min_followers=${encodeURIComponent(String(minFollowers))}`,
+      { timeoutMs: 120000 },
+    );
+    const filename = String(resp?.filename || "").trim();
+    const count = Number(resp?.count || 0);
+    await downloadAccountRowsExportFile(filename);
+    setStatus(`已导出 ${count} 条高粉账号：${filename}（原记录未删除）`, "success");
+  } finally {
+    if (accountRecordsExportByFollowersBtn) {
+      accountRecordsExportByFollowersBtn.disabled = false;
+      accountRecordsExportByFollowersBtn.textContent = previousLabel;
+    }
+  }
+}
+
+async function deleteAccountRowsByUsername() {
+  if (accountRecordsDeleteByUsernameBtn?.disabled) return;
+  const usernameText = String(accountRecordsDeleteByUsernameInput?.value || "").trim();
+  if (!usernameText) {
+    setStatus("请输入要删除的 username", "warning");
+    accountRecordsDeleteByUsernameInput?.focus();
+    return;
+  }
+  const previewNames = usernameText
+    .split(/[\s,;，；]+/)
+    .map((item) => item.trim().replace(/^@+/, ""))
+    .filter(Boolean)
+    .slice(0, 8);
+  const confirmLines = ["确认按 username 删除对应账号记录整行？"];
+  if (previewNames.length) {
+    confirmLines.push(`账号：${previewNames.join("、")}${previewNames.length >= 8 ? " …" : ""}`);
+  }
+  confirmLines.push("已分配别名的账号将同步清理设备备份档案中的对应数据");
+  if (!window.confirm(confirmLines.join("\n"))) return;
+
+  const previousLabel = accountRecordsDeleteByUsernameBtn?.textContent || "按用户名删除";
+  if (accountRecordsDeleteByUsernameBtn) {
+    accountRecordsDeleteByUsernameBtn.disabled = true;
+    accountRecordsDeleteByUsernameBtn.textContent = "删除中...";
+  }
+  try {
+    setStatus("正在按 username 删除账号记录...", "info");
+    const resp = await request(`${ACCOUNT_ROWS_API}/delete_by_username`, {
+      method: "POST",
+      body: JSON.stringify({ username: usernameText }),
+    });
+    const deletedAccounts = Number(resp?.deleted_accounts || 0);
+    const deletedDeviceRows = Number(resp?.deleted_device_rows || 0);
+    const notFoundCount = Number(resp?.not_found_count || 0);
+    clearAccountRecordsSelection();
+    if (accountRecordsDeleteByUsernameInput) accountRecordsDeleteByUsernameInput.value = "";
+    await refreshEditorTablesAfterAccountDelete();
+    const parts = [`已按 username 删除 ${deletedAccounts} 条账号记录`];
+    if (deletedDeviceRows > 0) parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
+    if (notFoundCount > 0) parts.push(`${notFoundCount} 个 username 未找到`);
+    setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
+  } catch (error) {
+    await refreshEditorTablesAfterAccountDelete();
+    throw error;
+  } finally {
+    if (accountRecordsDeleteByUsernameBtn) {
+      accountRecordsDeleteByUsernameBtn.disabled = false;
+      accountRecordsDeleteByUsernameBtn.textContent = previousLabel;
+    }
     updateAccountRecordsBatchDeleteBtn();
   }
 }
@@ -13136,6 +13262,23 @@ if (accountRecordsAliasSortSelect) {
 if (accountRecordsBatchDeleteBtn) {
   accountRecordsBatchDeleteBtn.addEventListener("click", () => {
     deleteSelectedAccountRecords().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "批量删除失败", "error"));
+  });
+}
+if (accountRecordsExportByFollowersBtn) {
+  accountRecordsExportByFollowersBtn.addEventListener("click", () => {
+    exportAccountRowsByFollowers().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "提取高粉账号失败", "error"));
+  });
+}
+if (accountRecordsDeleteByUsernameBtn) {
+  accountRecordsDeleteByUsernameBtn.addEventListener("click", () => {
+    deleteAccountRowsByUsername().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按用户名删除失败", "error"));
+  });
+}
+if (accountRecordsDeleteByUsernameInput) {
+  accountRecordsDeleteByUsernameInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    deleteAccountRowsByUsername().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按用户名删除失败", "error"));
   });
 }
 if (accountEditorListEl) {

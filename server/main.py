@@ -4231,6 +4231,15 @@ class AccountEditorRowBatchDeleteRequest(BaseModel):
 ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX = 100
 
 
+class AccountEditorRowDeleteByUsernameRequest(BaseModel):
+    """按 username 删除账号记录整行；支持多个（换行/逗号/空白分隔）。"""
+    username: str = Field(default="", max_length=8192)
+    usernames: list[str] = Field(default_factory=list)
+
+
+ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX = 200
+
+
 class AccountEditorRowBatchSetBasicProfileItem(BaseModel):
     row_index: int = Field(..., ge=0)
     username: str = Field(default="", max_length=256)
@@ -4444,6 +4453,13 @@ class DeviceAssignedAccountUpdateEmailRequest(DeviceAuthModel):
     email_password: str = Field(default="", max_length=255)
     # 新邮箱走邮箱管理模块取码时，清空旧 API 链接，避免仍指向旧邮箱。
     clear_api: bool = True
+
+
+class DeviceAssignedAccountUpdateTwoFaRequest(DeviceAuthModel):
+    """设备端：将粘贴的 Authenticator Setup Key 原样写入账号表 two_fa（保留连字符）。"""
+    username: str = Field(..., min_length=1, max_length=128)
+    # 允许较长密钥 / otpauth URI；入库不规范化、不去掉 '-'。
+    two_fa: str = Field(..., min_length=1, max_length=512)
 
 
 class DeviceOpReportRequest(BaseModel):
@@ -13267,6 +13283,95 @@ def device_assigned_account_update_email(payload: DeviceAssignedAccountUpdateEma
         conn.close()
 
 
+@app.post("/api/device/assigned_account/update_two_fa")
+def device_assigned_account_update_two_fa(payload: DeviceAssignedAccountUpdateTwoFaRequest):
+    """设备端：将 Setup Key 原样写入账号表 two_fa（不去掉 '-'，取码时再规范化）。"""
+    error, device = auth_or_error(payload.device_id, payload.alias)
+    if error:
+        return error
+    owner = str(getattr(device, "owner_username", "") or "").strip()
+    username = str(payload.username or "").strip().lstrip("@")
+    # 仅去掉首尾空白；中间连字符等字符原样保留
+    new_two_fa = str(payload.two_fa or "").strip()
+    alias_key = _normalize_alias_key(payload.alias)
+    if not owner:
+        return {"code": 1, "msg": "设备未关联管理账号"}
+    if not username:
+        return {"code": 1, "msg": "用户名为空"}
+    if not new_two_fa:
+        return {"code": 1, "msg": "2FA 密钥为空"}
+    if not alias_key:
+        return {"code": 1, "msg": "设备别名无效"}
+    # 入库前校验：规范化后须能作为 Base32 TOTP 密钥（含连字符的 Setup Key 也可）
+    try:
+        normalized = _normalize_totp_secret(new_two_fa)
+        if not normalized:
+            return {"code": 1, "msg": "2FA 密钥无效"}
+        _decode_totp_secret_bytes(new_two_fa)
+    except Exception as exc:
+        return {"code": 1, "msg": f"2FA 密钥无法用于生成验证码：{exc}"}
+    conn = _get_db()
+    try:
+        alias_err = _validate_username_device_effective_alias(conn, owner, username, alias_key)
+        if alias_err:
+            return {"code": 1, "msg": alias_err}
+        bucket = _fetch_device_assigned_accounts_list(conn, owner, payload.alias)
+        if not any(
+            str(it.get("username") or "").strip().lower() == username.lower() for it in bucket
+        ):
+            return {"code": 1, "msg": f"账号 @{username} 不在当前设备别名下拉列表中"}
+        row = conn.execute(
+            """
+            SELECT row_index, username, two_fa
+            FROM account_editor_rows
+            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+            LIMIT 1
+            """,
+            (owner, username),
+        ).fetchone()
+        if not row:
+            return {"code": 1, "msg": "未找到对应账号记录"}
+        acct = dict(row)
+        old_two_fa = str(acct.get("two_fa") or "")
+        if old_two_fa == new_two_fa:
+            return {
+                "code": 0,
+                "msg": "2FA 密钥无变化，无需更新",
+                "username": username,
+                "two_fa": old_two_fa,
+                "old_two_fa": old_two_fa,
+                "updated": False,
+            }
+        now = now_text()
+        cur = conn.execute(
+            """
+            UPDATE account_editor_rows
+            SET two_fa = ?,
+                updated_at = ?
+            WHERE owner_username = ? AND row_index = ?
+            """,
+            (new_two_fa, now, owner, int(acct["row_index"])),
+        )
+        if int(cur.rowcount or 0) < 1:
+            return {"code": 1, "msg": "账号表更新失败"}
+        conn.commit()
+        _append_device_log(
+            payload.device_id,
+            f"[{now}] 更新2FA | @{username} "
+            f"{'(空)' if not old_two_fa.strip() else '已有'} → 已写入（len={len(new_two_fa)}）",
+        )
+        return {
+            "code": 0,
+            "msg": "已更新 2FA 密钥",
+            "username": username,
+            "two_fa": new_two_fa,
+            "old_two_fa": old_two_fa,
+            "updated": True,
+        }
+    finally:
+        conn.close()
+
+
 def _resolve_device_tiktok_account_email(
     owner_username: str,
     alias: str,
@@ -15243,6 +15348,261 @@ def batch_delete_account_editor_rows(
     except Exception as exc:
         print(f"[{now_text()}] account_rows.batch_delete | owner={owner} count={len(row_indices)} EXC={exc}")
         return {"code": 1, "msg": f"批量删除失败：{exc}"}
+    finally:
+        conn.close()
+
+
+ACCOUNT_EDITOR_XLSX_HEADERS: List[str] = [
+    "row_index",
+    "username",
+    "password",
+    "email",
+    "email_password",
+    "two_fa",
+    "api",
+    "is_login",
+    "login_time",
+    "region",
+    "assigned_alias",
+    "video_count",
+    "follower_count",
+    "follower_growth",
+    "heart_count",
+    "follower_growth_day_before",
+    "follower_growth_yesterday",
+    "follower_growth_today",
+    "heart_growth_day_before",
+    "heart_growth_yesterday",
+    "heart_growth_today",
+    "basic_profile_modified",
+]
+
+
+def _parse_usernames_from_delete_request(payload: AccountEditorRowDeleteByUsernameRequest) -> list[str]:
+    raw_parts: list[str] = []
+    text = str(payload.username or "").strip()
+    if text:
+        raw_parts.extend(re.split(r"[\s,;，；]+", text))
+    for item in payload.usernames or []:
+        part = str(item or "").strip()
+        if part:
+            raw_parts.extend(re.split(r"[\s,;，；]+", part))
+    seen: set[str] = set()
+    result: list[str] = []
+    for part in raw_parts:
+        username = _normalized_alias(part).lstrip("@")
+        if not username:
+            continue
+        key = username.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(username)
+    return result
+
+
+def _export_account_editor_rows_by_followers_xlsx(owner: str, min_followers: int) -> dict:
+    """导出粉丝数大于 min_followers 的账号整行到 xlsx；不删除原记录。"""
+    if Workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法导出 xlsx"}
+    min_followers = max(0, int(min_followers))
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias,
+                   video_count, follower_count, follower_growth, heart_count,
+                   follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                   heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                   basic_profile_modified
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    matched: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        follower_value = _parse_count_text_to_int(str(item.get("follower_count") or ""))
+        if follower_value is None:
+            continue
+        if int(follower_value) > min_followers:
+            matched.append(item)
+    if not matched:
+        return {
+            "code": 1,
+            "msg": f"没有粉丝数大于 {min_followers} 的账号记录",
+            "count": 0,
+            "min_followers": min_followers,
+        }
+
+    export_dir = (BASE_DIR / "exports").resolve()
+    export_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"account_rows_followers_gt_{min_followers}_{timestamp}.xlsx"
+    file_path = export_dir / filename
+    try:
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(title="account_rows")
+        ws.append(ACCOUNT_EDITOR_XLSX_HEADERS)
+        for item in matched:
+            ws.append(
+                [
+                    int(item.get("row_index") or 0),
+                    _xlsx_cell_str(item.get("username")),
+                    _xlsx_cell_str(item.get("password")),
+                    _xlsx_cell_str(item.get("email")),
+                    _xlsx_cell_str(item.get("email_password")),
+                    _xlsx_cell_str(item.get("two_fa")),
+                    _xlsx_cell_str(item.get("api")),
+                    "1" if int(item.get("is_login") or 0) else "0",
+                    _xlsx_cell_str(item.get("login_time")),
+                    _xlsx_cell_str(item.get("region")),
+                    _xlsx_cell_str(item.get("assigned_alias")),
+                    _xlsx_cell_str(item.get("video_count")),
+                    _xlsx_cell_str(item.get("follower_count")),
+                    _xlsx_cell_str(item.get("follower_growth")),
+                    _xlsx_cell_str(item.get("heart_count")),
+                    _xlsx_cell_str(item.get("follower_growth_day_before")),
+                    _xlsx_cell_str(item.get("follower_growth_yesterday")),
+                    _xlsx_cell_str(item.get("follower_growth_today")),
+                    _xlsx_cell_str(item.get("heart_growth_day_before")),
+                    _xlsx_cell_str(item.get("heart_growth_yesterday")),
+                    _xlsx_cell_str(item.get("heart_growth_today")),
+                    _xlsx_cell_str(item.get("basic_profile_modified")),
+                ]
+            )
+        wb.save(file_path)
+    except Exception as exc:
+        return {"code": 1, "msg": f"生成 xlsx 失败：{exc}"}
+    if not file_path.is_file() or int(file_path.stat().st_size or 0) <= 0:
+        return {"code": 1, "msg": "导出文件生成失败"}
+    return {
+        "code": 0,
+        "msg": "导出成功",
+        "filename": filename,
+        "file_path": str(file_path),
+        "count": len(matched),
+        "min_followers": min_followers,
+    }
+
+
+@app.get("/api/admin/editor/account_rows/export_by_followers")
+def export_account_editor_rows_by_followers(
+    min_followers: int = 1000,
+    authorization: str | None = Header(default=None),
+):
+    """提取粉丝数大于指定值的账号整行到 xlsx（不删除原记录）；默认阈值 1000。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    try:
+        threshold = int(min_followers)
+    except (TypeError, ValueError):
+        threshold = 1000
+    if threshold < 0:
+        threshold = 0
+    return _export_account_editor_rows_by_followers_xlsx(owner, threshold)
+
+
+@app.get("/api/admin/editor/account_rows/export_file")
+def download_account_editor_export_file(
+    filename: str = "",
+    authorization: str | None = Header(default=None),
+):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    safe_name = Path(str(filename or "").strip()).name
+    if not safe_name.endswith(".xlsx") or not safe_name.startswith("account_rows_followers_"):
+        return {"code": 1, "msg": "非法文件名"}
+    file_path = (BASE_DIR / "exports" / safe_name).resolve()
+    export_root = (BASE_DIR / "exports").resolve()
+    if not str(file_path).startswith(str(export_root)) or not file_path.is_file():
+        return {"code": 1, "msg": "文件不存在"}
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=safe_name,
+    )
+
+
+@app.post("/api/admin/editor/account_rows/delete_by_username")
+def delete_account_editor_rows_by_username(
+    payload: AccountEditorRowDeleteByUsernameRequest, authorization: str | None = Header(default=None)
+):
+    """按指定 username 删除对应账号记录整行，并级联清理设备备份档案。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    usernames = _parse_usernames_from_delete_request(payload)
+    if not usernames:
+        return {"code": 1, "msg": "请输入要删除的 username"}
+    if len(usernames) > ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多按 username 删除 {ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX} 个，请分批操作",
+        }
+    conn = _get_db()
+    try:
+        wanted = {u.lower() for u in usernames}
+        rows = conn.execute(
+            """
+            SELECT row_index, username
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall()
+        targets: list[tuple[int, str]] = []
+        for r in rows:
+            uname = _normalized_alias(r["username"]).lstrip("@")
+            if uname.lower() in wanted:
+                targets.append((int(r["row_index"]), uname))
+        if not targets:
+            return {"code": 1, "msg": "未找到匹配的账号记录", "not_found_count": len(usernames)}
+        targets.sort(key=lambda item: item[0], reverse=True)
+        deleted_accounts = 0
+        deleted_device_rows = 0
+        deleted_usernames: list[str] = []
+        for row_index, username in targets:
+            result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, username)
+            if not result["found"]:
+                continue
+            deleted_accounts += int(result["deleted_accounts"] or 0)
+            deleted_device_rows += int(result["deleted_device_rows"] or 0)
+            deleted_name = str(result.get("username") or "").strip()
+            if deleted_name:
+                deleted_usernames.append(deleted_name)
+        if deleted_accounts <= 0:
+            return {"code": 1, "msg": "未删除任何账号记录（可能已不存在）"}
+        found_keys = {u.lower() for u in deleted_usernames}
+        not_found = [u for u in usernames if u.lower() not in found_keys]
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"已按 username 删除 {deleted_accounts} 条账号记录",
+            "deleted_accounts": deleted_accounts,
+            "deleted_device_rows": deleted_device_rows,
+            "deleted_usernames": deleted_usernames,
+            "not_found_usernames": not_found,
+            "not_found_count": len(not_found),
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
+        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
+    except Exception as exc:
+        print(f"[{now_text()}] account_rows.delete_by_username | owner={owner} count={len(usernames)} EXC={exc}")
+        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
     finally:
         conn.close()
 

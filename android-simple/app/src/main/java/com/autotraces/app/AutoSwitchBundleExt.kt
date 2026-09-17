@@ -127,6 +127,27 @@ object AutoSwitchBundleHolder {
         setBundle(current.copy(accounts = nextAccounts))
     }
 
+    /** 写入 2FA 后同步 bundle，避免自动登录仍用旧密钥。 */
+    fun notifyAccountTwoFaUpdated(username: String, twoFa: String) {
+        val uname = username.trim().removePrefix("@")
+        if (uname.isEmpty()) return
+        val current = bundle ?: return
+        val accounts = current.accounts.orEmpty()
+        if (accounts.isEmpty()) return
+        var changed = false
+        val nextAccounts = accounts.map { acc ->
+            val u = acc.username?.trim()?.removePrefix("@").orEmpty()
+            if (!u.equals(uname, ignoreCase = true)) {
+                acc
+            } else {
+                changed = true
+                acc.copy(two_fa = twoFa)
+            }
+        }
+        if (!changed) return
+        setBundle(current.copy(accounts = nextAccounts))
+    }
+
     private fun refreshFromPlan() {
         val current = bundle ?: return
         bundle = AutoSwitchLocalPlanStore.applyRuntimeToBundle(current)
