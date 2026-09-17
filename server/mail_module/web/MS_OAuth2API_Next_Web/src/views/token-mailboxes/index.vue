@@ -212,6 +212,7 @@
 <script lang="ts" setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import * as XLSX from 'xlsx'
 
 interface TokenMailboxRow {
   email: string
@@ -717,34 +718,42 @@ const postTokenRefresh = async (emails: string[]) => {
   return payload.data || {}
 }
 
-const downloadTextFile = (filename: string, content: string) => {
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
-  const link = document.createElement('a')
-  link.href = URL.createObjectURL(blob)
-  link.download = filename
-  link.click()
-  URL.revokeObjectURL(link.href)
-}
-
 type LinkedInvalidExportRow = {
   email: string
   emailPassword: string
+  alias: string
+}
+
+const compareLinkedInvalidExportRows = (a: LinkedInvalidExportRow, b: LinkedInvalidExportRow) => {
+  const aliasA = a.alias
+  const aliasB = b.alias
+  if (!aliasA && aliasB) return 1
+  if (aliasA && !aliasB) return -1
+  const aliasCmp = aliasA.localeCompare(aliasB, 'zh-CN')
+  if (aliasCmp !== 0) return aliasCmp
+  return a.email.localeCompare(b.email, 'zh-CN')
 }
 
 /**
  * 导出数据源：
  * - 邮箱 / 邮箱密码：账号表单与账号记录（account_editor_rows.email / email_password）
+ * - 别名：账号表 assigned_alias，缺失时从设备档案 support 反查
  * - 令牌失效：与本页「已关联 + 失效」一致（mail_token_status=invalid）
  */
 const fetchLinkedInvalidExportRows = async (): Promise<LinkedInvalidExportRow[]> => {
-  const accountResp = await fetch('/api/admin/editor/account_rows')
+  const [accountResp, supportResp] = await Promise.all([
+    fetch('/api/admin/editor/account_rows'),
+    fetch('/api/admin/editor/account_rows/support'),
+  ])
   let accountPayload: {
     code?: number | string
     msg?: string
     message?: string
     items?: Array<{
       email?: string
+      username?: string
       email_password?: string
+      assigned_alias?: string
       mail_token_status?: string
     }>
   } | null = null
@@ -764,6 +773,24 @@ const fetchLinkedInvalidExportRows = async (): Promise<LinkedInvalidExportRow[]>
     )
   }
 
+  const aliasByUsername = new Map<string, string>()
+  try {
+    if (supportResp.ok) {
+      const supportPayload = await supportResp.json()
+      if (Number(supportPayload?.code) === 0 && Array.isArray(supportPayload?.items)) {
+        for (const item of supportPayload.items) {
+          const username = String(item?.username || '').trim().toLowerCase()
+          const alias = normalizeAlias(item?.assigned_alias || item?.device_alias)
+          if (username && alias && !aliasByUsername.has(username)) {
+            aliasByUsername.set(username, alias)
+          }
+        }
+      }
+    }
+  } catch {
+    // support endpoint is optional enrichment
+  }
+
   const seen = new Set<string>()
   const targets: LinkedInvalidExportRow[] = []
   for (const item of accountPayload?.items || []) {
@@ -772,9 +799,13 @@ const fetchLinkedInvalidExportRows = async (): Promise<LinkedInvalidExportRow[]>
     if (!emailKey || !emailKey.includes('@') || seen.has(emailKey)) continue
     if (String(item?.mail_token_status || '').trim().toLowerCase() !== 'invalid') continue
     seen.add(emailKey)
+    const alias = normalizeAlias(item?.assigned_alias)
+      || aliasByUsername.get(String(item?.username || '').trim().toLowerCase())
+      || ''
     targets.push({
       email,
       emailPassword: String(item?.email_password || '').trim(),
+      alias,
     })
   }
   return targets
@@ -793,7 +824,7 @@ const exportLinkedInvalid = async () => {
     const missingPassword = targets.filter((row) => !row.emailPassword).length
     try {
       await ElMessageBox.confirm(
-        `将导出 ${targets.length} 条「已关联 + 令牌失效」账号，格式：邮箱----邮箱密码。${
+        `将导出 ${targets.length} 条「已关联 + 令牌失效」账号为表格：A 列邮箱----密码，B 列别名（同别名相邻）。${
           missingPassword > 0 ? `\n其中 ${missingPassword} 条缺少邮箱密码，仍会导出为空密码。` : ''
         }`,
         '导出确认',
@@ -803,11 +834,17 @@ const exportLinkedInvalid = async () => {
       return
     }
 
-    const content = targets
-      .map((row) => `${row.email}----${row.emailPassword}`)
-      .join('\n')
+    const sorted = [...targets].sort(compareLinkedInvalidExportRows)
+    const sheetData = [
+      ['邮箱----密码', '别名'],
+      ...sorted.map((row) => [`${row.email}----${row.emailPassword}`, row.alias]),
+    ]
+    const worksheet = XLSX.utils.aoa_to_sheet(sheetData)
+    worksheet['!cols'] = [{ wch: 48 }, { wch: 20 }]
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, worksheet, '已关联失效')
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
-    downloadTextFile(`linked_invalid_mails_${stamp}.txt`, content)
+    XLSX.writeFile(workbook, `linked_invalid_mails_${stamp}.xlsx`)
     ElMessage.success(`已导出 ${targets.length} 条`)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '导出失败')
