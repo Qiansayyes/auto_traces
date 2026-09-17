@@ -19572,10 +19572,37 @@ class RealTraceExecutor(
                 return AutoLoginEntryPath.AlreadyLoggedIn
             }
 
-            devOp(
-                alias,
-                "自动登录：底栏 Log in / Sign up 均未识别（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次，连续 $loginEntryMissStreak 次）",
-            )
+            // 打开后不保证有 Log in/Sign up：有则上面已走；没有且仍在主 Feed 才点 Profile。
+            // 已离开主 Feed（加载中/子页）时只等待，禁止 navBack+点 Profile 把页点跑。
+            val preview = buildProfileEditOcrPreview(vision).take(280)
+            if (autoLoginSeesMainFeedBottomNav(vision, h)) {
+                val profileHit = findAutoLoginProfileTabHit(vision, h)
+                    ?: findBottomBandLabelContaining(vision, h, "profile")
+                if (profileHit != null) {
+                    val tap = autoLoginTapWithJitter(profileHit.point, w, h)
+                    devOp(
+                        alias,
+                        "自动登录：未见 Log in/Sign up，仍在主 Feed，先点 Profile" +
+                            "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次，连续 $loginEntryMissStreak 次）" +
+                            " tap (${tap.x},${tap.y})",
+                    )
+                    if (navBackThenTapProfile(alias, "自动登录入口Profile·解析轮", tap.x, tap.y)) {
+                        autoLoginDelay(alias, 700L, "入口解析轮点 Profile 后")
+                    }
+                } else {
+                    devOp(
+                        alias,
+                        "自动登录：未见 Log in/Sign up，主 Feed 底栏也未定位到 Profile" +
+                            "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次，连续 $loginEntryMissStreak 次）；OCR=$preview",
+                    )
+                }
+            } else {
+                devOp(
+                    alias,
+                    "自动登录：未见 Log in/Sign up，且非主 Feed，等待下一轮" +
+                        "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次，连续 $loginEntryMissStreak 次）；OCR=$preview",
+                )
+            }
         }
         return AutoLoginEntryPath.None
     }
@@ -20197,8 +20224,9 @@ class RealTraceExecutor(
     }
 
     /**
-     * 预处理：从 For You 点底栏 Profile，进入可看到 Log in / Sign up 的页面。
-     * 这不是密码后「处理 profile 弹窗」——弹窗逻辑已取消，仅保留此入口导航。
+     * 预处理：打开后若已见 Log in / Sign up / Add another 等登录入口则不点 Profile；
+     * 否则点底栏 Profile，再进入可看到登录入口的页面。
+     * 打开后不保证百分百有 Log in/Sign up。
      */
     private suspend fun autoLoginTapProfileForLoginEntry(
         ctx: Context,
@@ -20218,7 +20246,14 @@ class RealTraceExecutor(
             }
             val hit = findBottomBandLabelContaining(vision, h, "profile")
                 ?: findLabelHitContainingIgnoreCase(vision, "profile")
-            if (hit == null) continue
+            if (hit == null) {
+                val preview = buildProfileEditOcrPreview(vision).take(200)
+                devOp(
+                    alias,
+                    "自动登录：预处理未见登录入口也未见 Profile（第 $pass/3 次）；OCR=$preview",
+                )
+                continue
+            }
             val tap = autoLoginTapWithJitter(hit.point, w, h)
             devOp(alias, "自动登录：预处理点 Profile 进登录入口 (${tap.x},${tap.y})")
             if (navBackThenTapProfile(alias, "自动登录入口Profile", tap.x, tap.y)) {
@@ -20226,6 +20261,7 @@ class RealTraceExecutor(
                 return ProfileLoginEntryTapOutcome.ProfileTapped
             }
         }
+        devOp(alias, "自动登录：预处理点 Profile 失败（3 轮）")
         return ProfileLoginEntryTapOutcome.Failed
     }
 
@@ -22660,10 +22696,11 @@ class RealTraceExecutor(
             }
 
             if (!skipColdBootstrap) {
-                // 打开 TikTok 后：首帧 OCR 由 autoLoginOcrOnce 顺带处理 agree and / Don't allow / Swipe，再点 Profile
+                // 打开 TikTok 后：首帧 OCR 由 autoLoginOcrOnce 顺带处理 agree and / Don't allow / Swipe；
+                // 若已见 Log in/Sign up 则不点 Profile，否则先点 Profile 再进入口解析。
                 if (!ensureTikTokInForeground(ctx, alias, "自动登录-Profile前")) return false
                 // 不可裸用 runCatching：封禁 / ANR / 掉登录须上浮到协调器
-                runCatching {
+                val profilePrep = runCatching {
                     autoLoginTapProfileForLoginEntry(ctx, alias)
                 }.onFailure { ex ->
                     when (ex) {
@@ -22675,6 +22712,14 @@ class RealTraceExecutor(
                         -> throw ex
                         else -> Unit
                     }
+                }.getOrNull()
+                when (profilePrep) {
+                    ProfileLoginEntryTapOutcome.OnLoginEntryScreen ->
+                        devOp(alias, "自动登录：预处理已见登录入口，跳过点 Profile")
+                    ProfileLoginEntryTapOutcome.ProfileTapped ->
+                        devOp(alias, "自动登录：预处理已点 Profile，进入入口解析")
+                    ProfileLoginEntryTapOutcome.Failed, null ->
+                        devOp(alias, "自动登录：预处理未点到 Profile，入口解析轮次内继续尝试点 Profile")
                 }
                 dontAllowHandledEarly = autoLoginDontAllowHandledInThisChain
             }
@@ -22693,10 +22738,10 @@ class RealTraceExecutor(
                 }
                 AutoLoginEntryPath.None -> {
                     if (chain < AUTO_LOGIN_MAX_CHAIN_RESTARTS) {
-                        devOp(alias, "自动登录：入口未就绪（底栏 Log in 或 Sign up），整链重来")
+                        devOp(alias, "自动登录：入口未就绪（点 Profile 后仍未见 Log in/Sign up），整链重来")
                         continue
                     }
-                    devOp(alias, "自动登录：入口未就绪且已达整链重试上限")
+                    devOp(alias, "自动登录：入口未就绪且已达整链重试上限（点 Profile 后仍未见登录入口）")
                     return false
                 }
                 AutoLoginEntryPath.ViaWelcomeBackLogIn -> {

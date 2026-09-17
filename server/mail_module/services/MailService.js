@@ -6,6 +6,43 @@ const { classifyOAuthResponse } = require('../utils/tokenError');
 
 const MICROSOFT_TOKEN_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
 const GRAPH_MAIL_SCOPE = 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access';
+// 云外码/部分 Graph 批量工具只授权了 Mail.Read，不含 Mail.ReadWrite
+const GRAPH_MAIL_READ_SCOPE = 'https://graph.microsoft.com/Mail.Read offline_access';
+const GRAPH_SCOPE_FALLBACKS = [GRAPH_MAIL_SCOPE, GRAPH_MAIL_READ_SCOPE, ''];
+
+const hasMailReadScope = (scope = '') => {
+    const text = String(scope || '');
+    if (!text) return false;
+    // 完整资源名或短名；ReadWrite 也视为可读邮件
+    return /(^|\s)(https:\/\/graph\.microsoft\.com\/)?Mail\.Read(Write)?(\s|$)/i.test(text);
+};
+
+const isScopeUnauthorizedError = (error) => {
+    const message = String(error?.message || error || '');
+    // 仅对「请求的 scope 未授权」降级，避免把过期/吊销令牌误判成可降级
+    return /AADSTS70000/i.test(message)
+        || /scopes requested are unauthorized/i.test(message);
+};
+
+const parseCachedAccessToken = (redisResult = '') => {
+    const raw = String(redisResult || '').trim();
+    if (!raw) return null;
+    if (raw.startsWith('{')) {
+        try {
+            const parsed = JSON.parse(raw);
+            const accessToken = String(parsed?.access_token || '').trim();
+            if (accessToken) {
+                return {
+                    access_token: accessToken,
+                    scope: String(parsed?.scope || '').trim(),
+                };
+            }
+        } catch {
+            // 兼容历史纯字符串缓存
+        }
+    }
+    return { access_token: raw, scope: '' };
+};
 
 const requestMicrosoftAccessToken = async ({
     refresh_token,
@@ -21,9 +58,11 @@ const requestMicrosoftAccessToken = async ({
 
     if (!forceRefresh) {
         const redis_result = await getRedisKey(redis_name);
-        if (redis_result) {
+        const cached = parseCachedAccessToken(redis_result);
+        if (cached?.access_token) {
             return {
-                access_token: redis_result,
+                access_token: cached.access_token,
+                scope: cached.scope || '',
                 fromCache: true,
             };
         }
@@ -72,32 +111,79 @@ const requestMicrosoftAccessToken = async ({
         throw err;
     }
 
-    await setRedisKey(redis_name, data.access_token, (data.expires_in || 3600) - 60);
+    const issuedScope = data.scope || '';
+    await setRedisKey(
+        redis_name,
+        JSON.stringify({
+            access_token: data.access_token,
+            scope: issuedScope,
+        }),
+        (data.expires_in || 3600) - 60,
+    );
 
     return {
         access_token: data.access_token,
         refresh_token: data.refresh_token || '',
         expires_in: data.expires_in || 3600,
-        scope: data.scope || '',
+        scope: issuedScope,
         fromCache: false,
     };
 };
 
+const requestGraphAccessTokenWithFallback = async (params) => {
+    // 仅读缓存，未命中时不要用空 scope 直接换票（否则会跳过完整权限尝试）
+    if (!params.forceRefresh) {
+        const redisName = `${params.redisKeyPrefix}_${params.email}_access_token`;
+        const cached = parseCachedAccessToken(await getRedisKey(redisName));
+        if (cached?.access_token) {
+            return {
+                access_token: cached.access_token,
+                scope: cached.scope || '',
+                fromCache: true,
+            };
+        }
+    }
+
+    let lastError;
+    for (const scope of GRAPH_SCOPE_FALLBACKS) {
+        try {
+            return await requestMicrosoftAccessToken({
+                ...params,
+                scope,
+                forceRefresh: true,
+            });
+        } catch (error) {
+            lastError = error;
+            if (!isScopeUnauthorizedError(error)) {
+                throw error;
+            }
+        }
+    }
+    throw lastError;
+};
+
+const resolveGraphMailStatus = (tokenResult = {}) => {
+    // 历史纯 token 缓存没有 scope：保守视为不可直接走 Graph，走后续 IMAP 回退
+    if (tokenResult.fromCache && !tokenResult.scope) {
+        return false;
+    }
+    return hasMailReadScope(tokenResult.scope);
+};
+
 const refreshAccessToken = async (refresh_token, client_id, email, socks5, http, options = {}) => {
-    const result = await requestMicrosoftAccessToken({
+    const result = await requestGraphAccessTokenWithFallback({
         refresh_token,
         client_id,
         email,
         socks5,
         http,
-        scope: GRAPH_MAIL_SCOPE,
         redisKeyPrefix: 'graph_api_result',
         forceRefresh: options.forceRefresh === true,
     });
 
     return {
         ...result,
-        status: String(result.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1,
+        status: resolveGraphMailStatus(result),
     };
 };
 
@@ -113,19 +199,18 @@ const MAILBOX_MAP = {
 
 const use_graph_api = async (refresh_token, client_id, mailbox, email, socks5, http) => {
     const temp_mailbox = MAILBOX_MAP[mailbox] || 'inbox';
-    const tokenResult = await requestMicrosoftAccessToken({
+    const tokenResult = await requestGraphAccessTokenWithFallback({
         refresh_token,
         client_id,
         email,
         socks5,
         http,
-        scope: GRAPH_MAIL_SCOPE,
         redisKeyPrefix: 'graph_api_result',
     });
 
     return {
         access_token: tokenResult.access_token,
-        status: String(tokenResult.scope || '').indexOf('https://graph.microsoft.com/Mail.Read') !== -1,
+        status: resolveGraphMailStatus(tokenResult),
         mailbox: temp_mailbox,
         refresh_token: tokenResult.refresh_token || '',
         expires_in: tokenResult.expires_in || 3600,

@@ -852,12 +852,12 @@
             </div>
           </div>
           <div class="pager-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;">
-            <label class="pager-size-label account-records-batch-profile-label" for="accountRecordsBatchProfileSelect">资料</label>
-            <select id="accountRecordsBatchProfileSelect" class="ui-select account-records-batch-profile-select" title="批量设置勾选记录的「资料」字段为">
-              <option value="是">是</option>
-              <option value="否">否</option>
+            <label class="pager-size-label" for="accountRecordsAliasSortSelect">排序</label>
+            <select id="accountRecordsAliasSortSelect" class="ui-select" style="min-width:148px;" title="按别名分组后的组间排序方式">
+              <option value="alias">别名自然排序</option>
+              <option value="count_desc">账号数降序</option>
+              <option value="count_asc">账号数升序</option>
             </select>
-            <button id="accountRecordsBatchProfileBtn" type="button" class="ghost" disabled title="将勾选记录的「资料」批量设为左侧所选值">批量改资料</button>
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
             <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
