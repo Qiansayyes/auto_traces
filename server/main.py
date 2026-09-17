@@ -5757,6 +5757,42 @@ def _account_row_has_two_fa(two_fa: Any) -> bool:
         return bool(str(two_fa or "").strip())
 
 
+def _account_row_has_api_link(api: Any) -> bool:
+    """账号表配置了可用收码 API 链接（可无 OAuth 令牌直接 GET 拿验证码）。"""
+    url = str(api or "").strip()
+    return url.startswith(("http://", "https://"))
+
+
+def _account_can_fetch_verification_code(
+    *,
+    has_two_fa: bool,
+    email: str,
+    has_api_link: bool,
+    email_in_fetchable: bool,
+    email_token_invalid: bool,
+) -> bool:
+    """能否完成登录验证（自动切号排除用）。返回 True = 不排除。
+
+    优先级（有 2FA 一律不排除，与链接/令牌无关）：
+    1. 有 2FA → 永不排除
+    2. 无邮箱 → 不排除（不依赖邮件收码）
+    3. 邮件 OAuth 可拉（令牌非 invalid）→ 不排除
+    4. 令牌已失效 → 排除（即便有链接；此类链接依赖令牌）
+    5. 有 API 链接且令牌未失效/未配置 → 不排除
+    6. 无 2FA、有邮箱、无可用收码手段 → 排除
+    """
+    if has_two_fa:
+        return True
+    email_key = str(email or "").strip().lower()
+    if not email_key or "@" not in email_key:
+        return True
+    if email_in_fetchable:
+        return True
+    if email_token_invalid:
+        return False
+    return bool(has_api_link)
+
+
 def _list_mail_oauth_token_status_map(owner_username: str) -> dict[str, str] | None:
     try:
         from mail_integration import list_mail_oauth_token_status_map
@@ -5788,19 +5824,23 @@ def _list_invalid_mail_token_emails(owner_username: str) -> set[str]:
 
 
 def _usernames_blocked_by_mail_code(conn: sqlite3.Connection, owner_username: str) -> set[str]:
-    """账号表填了邮箱、无 2FA、且邮件库无法拉验证码的 username（小写）。
+    """账号表填了邮箱、无 2FA、且无法拉验证码的 username（小写）。
 
-    有 2FA 或无邮箱的账号不拦截。邮件库不可用时 fail-open。
+    有 2FA / 无邮箱 / OAuth 可拉 /「有 API 链接且令牌未标 invalid」均不拦截。
+    令牌 invalid 即使有链接也拦截（链接依赖令牌）。邮件库不可用时 fail-open。
     """
     owner = str(owner_username or "").strip()
     if not owner:
         return set()
-    fetchable = _list_fetchable_mail_emails(owner)
-    if fetchable is None:
+    # 同一份 status_map 推导 fetchable / invalid，避免两次查询不一致
+    status_map = _list_mail_oauth_token_status_map(owner)
+    if status_map is None:
         return set()
+    fetchable = {email for email, status in status_map.items() if status != "invalid"}
+    invalid_tokens = {email for email, status in status_map.items() if status == "invalid"}
     rows = conn.execute(
         """
-        SELECT username, email, two_fa
+        SELECT username, email, two_fa, api
         FROM account_editor_rows
         WHERE owner_username = ? AND TRIM(COALESCE(email, '')) <> ''
         """,
@@ -5808,14 +5848,26 @@ def _usernames_blocked_by_mail_code(conn: sqlite3.Connection, owner_username: st
     ).fetchall()
     out: set[str] = set()
     for row in rows or []:
-        if _account_row_has_two_fa(row["two_fa"] if hasattr(row, "keys") else (row[2] if len(row) > 2 else "")):
+        if hasattr(row, "keys"):
+            two_fa = row["two_fa"]
+            email_raw = row["email"]
+            api_raw = row["api"]
+            username_raw = row["username"]
+        else:
+            two_fa = row[2] if len(row) > 2 else ""
+            email_raw = row[1]
+            api_raw = row[3] if len(row) > 3 else ""
+            username_raw = row[0]
+        email = _account_email_for_mail_lookup(email_raw)
+        if _account_can_fetch_verification_code(
+            has_two_fa=_account_row_has_two_fa(two_fa),
+            email=email,
+            has_api_link=_account_row_has_api_link(api_raw),
+            email_in_fetchable=bool(email and email in fetchable),
+            email_token_invalid=bool(email and email in invalid_tokens),
+        ):
             continue
-        email = _account_email_for_mail_lookup(row["email"] if hasattr(row, "keys") else row[1])
-        if not email or "@" not in email:
-            continue
-        if email in fetchable:
-            continue
-        uname = str(row["username"] if hasattr(row, "keys") else row[0] or "").strip().lower()
+        uname = str(username_raw or "").strip().lower()
         if uname:
             out.add(uname)
     return out
@@ -5831,8 +5883,8 @@ def _reconcile_mail_code_auto_switch_exclusions(
 ) -> dict[str, Any]:
     """按「能否拉验证码」对账设备备份排除标记。
 
-    - 无 2FA、账号表有邮箱且邮件库不可拉码 → 自动排除（reason=mail_code_unavailable）
-    - 有 2FA / 已可拉码，且排除原因属于邮件类 → 自动恢复参与
+    - 无 2FA、有邮箱、且既不可 OAuth 拉码又（无 API 链接或令牌已 invalid）→ 自动排除
+    - 有 2FA / OAuth 可拉 /「有 API 链接且令牌未 invalid」且排除原因属邮件类 → 自动恢复
     - 不覆盖 manual / cred_blocked
     """
     owner = str(owner_username or "").strip()
@@ -5840,9 +5892,12 @@ def _reconcile_mail_code_auto_switch_exclusions(
     if not owner:
         return {"updated_rows": 0, "affected_aliases": []}
 
-    fetchable = _list_fetchable_mail_emails(owner)
-    if fetchable is None:
+    # 同一份 status_map 推导，避免 fetchable / invalid 两次查询不一致
+    status_map = _list_mail_oauth_token_status_map(owner)
+    if status_map is None:
         return {"updated_rows": 0, "affected_aliases": [], "skipped": True, "reason": "mail_db_unavailable"}
+    fetchable = {email for email, status in status_map.items() if status != "invalid"}
+    invalid_tokens = {email for email, status in status_map.items() if status == "invalid"}
 
     now = now_text()
     updated_rows = 0
@@ -5851,9 +5906,10 @@ def _reconcile_mail_code_auto_switch_exclusions(
     try:
         email_by_user: dict[str, str] = {}
         two_fa_by_user: dict[str, bool] = {}
+        api_by_user: dict[str, bool] = {}
         for row in conn.execute(
             """
-            SELECT username, email, two_fa
+            SELECT username, email, two_fa, api
             FROM account_editor_rows
             WHERE owner_username = ?
             """,
@@ -5864,6 +5920,7 @@ def _reconcile_mail_code_auto_switch_exclusions(
                 continue
             email_by_user[uname] = _account_email_for_mail_lookup(row["email"])
             two_fa_by_user[uname] = _account_row_has_two_fa(row["two_fa"])
+            api_by_user[uname] = _account_row_has_api_link(row["api"])
 
         dev_rows = conn.execute(
             """
@@ -5887,9 +5944,13 @@ def _reconcile_mail_code_auto_switch_exclusions(
                 continue
             uname_key = item["username"].lower()
             email = email_by_user.get(uname_key, "")
-            has_two_fa = bool(two_fa_by_user.get(uname_key))
-            # 有 2FA 或不依赖邮箱：不因邮件资格排除
-            can_fetch = has_two_fa or (not email) or (email in fetchable)
+            can_fetch = _account_can_fetch_verification_code(
+                has_two_fa=bool(two_fa_by_user.get(uname_key)),
+                email=email,
+                has_api_link=bool(api_by_user.get(uname_key)),
+                email_in_fetchable=bool(email and email in fetchable),
+                email_token_invalid=bool(email and email in invalid_tokens),
+            )
             current_excluded = int(dr["auto_switch_excluded"] or 0)
             current_reason = _normalize_auto_switch_exclude_reason(dr["auto_switch_exclude_reason"])
 
@@ -6226,7 +6287,7 @@ def _list_device_editor_buckets(owner_username: str) -> Dict[str, List[dict[str,
         # 密码/邮箱密码标 banned 的账号不进周计划桶（即使未勾 auto_switch_excluded）
         if uname and uname in banned:
             continue
-        # 填了邮箱但无法拉验证码（无令牌 / 令牌失效）：统一拦截
+        # 填了邮箱但无法拉验证码：无令牌且无 API 链接，或令牌失效（含有链接但依赖令牌）
         if uname and uname in mail_blocked:
             continue
         alias_key = _device_editor_effective_alias(item)
@@ -19645,6 +19706,8 @@ def _build_auto_switch_bundle_for_device(
     owner = str(device.owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     schedule_date = _beijing_date_str()
+    # 拉 bundle 前按最新规则对账：恢复「有 API 链接、无令牌」等被误排的账号
+    _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
     buckets = _list_device_editor_buckets(owner)
     rows = buckets.get(alias_key, [])
     if not rows:
