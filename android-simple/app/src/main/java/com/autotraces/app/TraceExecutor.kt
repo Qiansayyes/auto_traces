@@ -704,6 +704,7 @@ class RealTraceExecutor(
     private var lastVerifyToContinuePopupDismissAtMs: Long = 0L
     private var lastRepostIntroPopupDismissAtMs: Long = 0L
     private var lastUpdateYourAppPopupDismissAtMs: Long = 0L
+    private var lastLinkEmailPopupDismissAtMs: Long = 0L
     private var lastTikTokNotificationsPopupDismissAtMs: Long = 0L
     private var lastMetaFacebookTikTokRecoverAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
@@ -1328,6 +1329,8 @@ class RealTraceExecutor(
         private const val REPOST_INTRO_OCR_RETRY_DELAY_MS = 500L
         /** 「Update your app」升级弹窗：点 Not now 的冷却。 */
         private const val INLINE_UPDATE_YOUR_APP_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 「Link email」关联邮箱弹窗：点 Not now 的冷却。 */
+        private const val INLINE_LINK_EMAIL_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 「Allow TikTok to send you notifications?」弹窗：点 Don't allow 的冷却。 */
         private const val INLINE_TIKTOK_NOTIFICATIONS_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 整屏 OCR 见 Meta/Facebook：拉回 TikTok 的冷却，避免连环重入。 */
@@ -4043,7 +4046,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 后顺手关弹窗（通知权限 Don't allow / Update your app Not now / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue / Repost 介绍 OK 等）。
+     * 整屏 OCR 后顺手关弹窗（通知权限 Don't allow / Update your app Not now / Link email Not now / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue / Repost 介绍 OK 等）。
      * @return 非 null 表示已点击关弹窗，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun dismissFullScreenInlinePopupsIfPresent(
@@ -4078,6 +4081,16 @@ class RealTraceExecutor(
             )
         }.getOrDefault(false)
         if (updateYourAppDismissed) return "update_your_app_popup_dismissed"
+        val linkEmailDismissed = runCatching {
+            tryDismissLinkEmailPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (linkEmailDismissed) return "link_email_popup_dismissed"
         // 任意整屏 OCR：同屏见 Viewer history + Save 即认定为弹窗并点 Save（不限 profile_edit_）
         val viewerDismissed = runCatching {
             tryDismissViewerHistoryPopupFromVision(
@@ -4195,6 +4208,69 @@ class RealTraceExecutor(
         }
         if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
         lastUpdateYourAppPopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(400L)
+        return true
+    }
+
+    /**
+     * 「Link email」关联邮箱弹窗：先确认标题/正文，再点 Not now（勿点 OK）。
+     */
+    private fun visionHasLinkEmailPopup(vision: Text): Boolean {
+        if (findStrictExactLabelHit(vision, "Link email") != null) return true
+        if (findLabelHitContainingIgnoreCaseRelaxed(vision, "link email") != null) return true
+        val full = vision.text.lowercase(Locale.US)
+        if (full.contains("link email")) return true
+        if (full.contains("linking your android email") &&
+            (findStrictExactLabelHit(vision, "Not now") != null ||
+                findLabelHitContainingIgnoreCaseRelaxed(vision, "not now") != null)
+        ) {
+            return true
+        }
+        if (full.contains("android email addresses") &&
+            (findStrictExactLabelHit(vision, "Not now") != null ||
+                findLabelHitContainingIgnoreCaseRelaxed(vision, "not now") != null)
+        ) {
+            return true
+        }
+        return false
+    }
+
+    private fun findLinkEmailNotNowHit(vision: Text): StrictLabelHit? =
+        findBottommostStrictExactLabelHit(vision, "Not now")
+            ?: findStrictExactLabelHit(vision, "Not now")
+            ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "not now")
+
+    private suspend fun tryDismissLinkEmailPopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+    ): Boolean {
+        if (!visionHasLinkEmailPopup(vision)) return false
+        val notNowHit = findLinkEmailNotNowHit(vision) ?: run {
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(safeAlias, "$phaseLog：见 Link email 但未同屏命中 Not now，跳过")
+            }
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastLinkEmailPopupDismissAtMs < INLINE_LINK_EMAIL_POPUP_DISMISS_COOLDOWN_MS) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(notNowHit.point, w, h)
+        } else {
+            coerceTapToScreen(notNowHit.point, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            devOp(safeAlias, "$phaseLog：Link email 弹窗，点 Not now (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastLinkEmailPopupDismissAtMs = SystemClock.elapsedRealtime()
         delay(400L)
         return true
     }
@@ -19105,6 +19181,20 @@ class RealTraceExecutor(
             )
         ) {
             autoLoginDelay(alias, 450L, "Update your app Not now 后")
+            return true
+        }
+
+        // 2c) 「Link email」关联邮箱弹窗：点 Not now（勿点 OK）
+        if (
+            tryDismissLinkEmailPopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Link email 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            autoLoginDelay(alias, 450L, "Link email Not now 后")
             return true
         }
 
