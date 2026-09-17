@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260703-1";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260917-linked-invalid-xlsx";
 
 {
 
