@@ -859,6 +859,7 @@
               <option value="count_asc">账号数升序</option>
             </select>
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
+            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" disabled title="勾选别名组左侧复选框后：导出这些别名下全部账号到 XLSX，下载成功后从数据库删除（可多选）">导出并删除别名</button>
             <label class="pager-size-label" for="accountRecordsExportMinFollowersInput" title="导出粉丝数大于该值的账号整行到 xlsx（不删除）">粉丝&gt;</label>
             <input id="accountRecordsExportMinFollowersInput" type="number" class="pager-size-input" min="0" step="1" value="1000" style="width:88px;" title="默认 1000：导出粉丝数大于该阈值的账号整行" />
             <button id="accountRecordsExportByFollowersBtn" type="button" class="ghost" title="提取粉丝数大于指定值的账号整行到 XLSX，不删除原记录">提取高粉账号</button>

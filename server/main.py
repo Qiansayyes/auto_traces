@@ -4240,6 +4240,14 @@ class AccountEditorRowDeleteByUsernameRequest(BaseModel):
 ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX = 5000
 
 
+class AccountEditorRowExportByAliasesRequest(BaseModel):
+    """按别名导出账号整行；空字符串或 __EMPTY_ALIAS__ 表示未分配别名。"""
+    aliases: list[str] = Field(default_factory=list)
+
+
+ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX = 200
+
+
 class AccountEditorRowBatchSetBasicProfileItem(BaseModel):
     row_index: int = Field(..., ge=0)
     username: str = Field(default="", max_length=256)
@@ -15401,50 +15409,16 @@ def _parse_usernames_from_delete_request(payload: AccountEditorRowDeleteByUserna
     return result
 
 
-def _export_account_editor_rows_by_followers_xlsx(owner: str, min_followers: int) -> dict:
-    """导出粉丝数大于 min_followers 的账号整行到 xlsx；不删除原记录。"""
+def _write_account_editor_rows_xlsx(matched: list[dict[str, Any]], filename: str) -> dict:
+    """将账号整行写入 exports/<filename>；成功返回 code=0。"""
     if Workbook is None:
         return {"code": 1, "msg": "缺少 openpyxl 依赖，无法导出 xlsx"}
-    min_followers = max(0, int(min_followers))
-    conn = _get_db()
-    try:
-        rows = conn.execute(
-            """
-            SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias,
-                   video_count, follower_count, follower_growth, heart_count,
-                   follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
-                   heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
-                   basic_profile_modified
-            FROM account_editor_rows
-            WHERE owner_username = ?
-            ORDER BY row_index ASC
-            """,
-            (owner,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    matched: list[dict[str, Any]] = []
-    for r in rows:
-        item = dict(r)
-        follower_value = _parse_count_text_to_int(str(item.get("follower_count") or ""))
-        if follower_value is None:
-            continue
-        if int(follower_value) > min_followers:
-            matched.append(item)
-    if not matched:
-        return {
-            "code": 1,
-            "msg": f"没有粉丝数大于 {min_followers} 的账号记录",
-            "count": 0,
-            "min_followers": min_followers,
-        }
-
+    safe_name = Path(str(filename or "").strip()).name
+    if not safe_name.endswith(".xlsx") or not safe_name.startswith("account_rows_"):
+        return {"code": 1, "msg": "非法导出文件名"}
     export_dir = (BASE_DIR / "exports").resolve()
     export_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"account_rows_followers_gt_{min_followers}_{timestamp}.xlsx"
-    file_path = export_dir / filename
+    file_path = export_dir / safe_name
     try:
         wb = Workbook(write_only=True)
         ws = wb.create_sheet(title="account_rows")
@@ -15484,11 +15458,168 @@ def _export_account_editor_rows_by_followers_xlsx(owner: str, min_followers: int
     return {
         "code": 0,
         "msg": "导出成功",
-        "filename": filename,
+        "filename": safe_name,
         "file_path": str(file_path),
         "count": len(matched),
-        "min_followers": min_followers,
     }
+
+
+def _load_account_editor_export_rows(owner: str) -> list[dict[str, Any]]:
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, username, password, email, email_password, two_fa, api, is_login, login_time, region, assigned_alias,
+                   video_count, follower_count, follower_growth, heart_count,
+                   follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                   heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                   basic_profile_modified
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _build_account_username_alias_recovery_map(owner: str) -> dict[str, str]:
+    """username(lower) -> 设备档案有效别名（账号表 assigned_alias 为空时兜底）。"""
+    owner_clean = str(owner or "").strip()
+    if not owner_clean:
+        return {}
+    alias_expr = _backup_record_alias_expr()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT username, {alias_expr} AS eff_alias, updated_at, row_index
+            FROM device_editor_rows
+            WHERE owner_username = ?
+              AND TRIM({alias_expr}) <> ''
+            ORDER BY updated_at DESC, row_index DESC
+            """,
+            (owner_clean,),
+        ).fetchall()
+    finally:
+        conn.close()
+    result: dict[str, str] = {}
+    for r in rows:
+        uname = _normalized_alias(r["username"]).lstrip("@").lower()
+        if not uname or uname in result:
+            continue
+        alias = _normalized_alias(r["eff_alias"])
+        if alias:
+            result[uname] = alias
+    return result
+
+
+def _parse_aliases_from_export_request(payload: AccountEditorRowExportByAliasesRequest) -> list[str]:
+    """返回去重后的别名列表；保留空字符串表示未分配别名。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in payload.aliases or []:
+        text = str(raw or "").strip()
+        if text in {"__EMPTY_ALIAS__", "__UNASSIGNED__"}:
+            text = ""
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _export_account_editor_rows_by_followers_xlsx(owner: str, min_followers: int) -> dict:
+    """导出粉丝数大于 min_followers 的账号整行到 xlsx；不删除原记录。"""
+    min_followers = max(0, int(min_followers))
+    rows = _load_account_editor_export_rows(owner)
+    matched: list[dict[str, Any]] = []
+    for item in rows:
+        follower_value = _parse_count_text_to_int(str(item.get("follower_count") or ""))
+        if follower_value is None:
+            continue
+        if int(follower_value) > min_followers:
+            matched.append(item)
+    if not matched:
+        return {
+            "code": 1,
+            "msg": f"没有粉丝数大于 {min_followers} 的账号记录",
+            "count": 0,
+            "min_followers": min_followers,
+        }
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"account_rows_followers_gt_{min_followers}_{timestamp}.xlsx"
+    written = _write_account_editor_rows_xlsx(matched, filename)
+    if int(written.get("code") or 1) != 0:
+        return written
+    written["min_followers"] = min_followers
+    return written
+
+
+def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) -> dict:
+    """按有效别名导出账号整行到 xlsx；不删除原记录（删除由前端在下载成功后触发）。"""
+    wanted_keys = {_normalize_alias_key(a) for a in aliases}
+    if not aliases:
+        return {"code": 1, "msg": "请至少选择一个别名", "count": 0}
+    include_unassigned = "" in wanted_keys
+    wanted_nonempty = {k for k in wanted_keys if k}
+    rows = _load_account_editor_export_rows(owner)
+    recovery_map = _build_account_username_alias_recovery_map(owner)
+    matched: list[dict[str, Any]] = []
+    matched_alias_labels: set[str] = set()
+    for item in rows:
+        assigned = _normalized_alias(item.get("assigned_alias"))
+        username = _normalized_alias(item.get("username")).lstrip("@")
+        effective = assigned or recovery_map.get(username.lower(), "")
+        eff_key = _normalize_alias_key(effective)
+        if eff_key:
+            if eff_key not in wanted_nonempty:
+                continue
+            matched_alias_labels.add(effective)
+        else:
+            if not include_unassigned:
+                continue
+            matched_alias_labels.add("")
+        matched.append(item)
+    if not matched:
+        return {
+            "code": 1,
+            "msg": "所选别名下没有可导出的账号记录",
+            "count": 0,
+            "aliases": aliases,
+        }
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"account_rows_by_alias_{timestamp}.xlsx"
+    written = _write_account_editor_rows_xlsx(matched, filename)
+    if int(written.get("code") or 1) != 0:
+        return written
+    # usernames 去重；无 username 的行返回 row_index，供下载成功后补删
+    seen_u: set[str] = set()
+    unique_usernames: list[str] = []
+    blank_row_indexes: list[int] = []
+    for item in matched:
+        username = _normalized_alias(item.get("username")).lstrip("@")
+        if username:
+            key = username.lower()
+            if key not in seen_u:
+                seen_u.add(key)
+                unique_usernames.append(username)
+            continue
+        try:
+            blank_row_indexes.append(int(item.get("row_index") or 0))
+        except (TypeError, ValueError):
+            continue
+    alias_labels = sorted((a for a in matched_alias_labels if a), key=lambda s: s.lower())
+    if "" in matched_alias_labels:
+        alias_labels.append("")
+    written["usernames"] = unique_usernames
+    written["blank_row_indexes"] = blank_row_indexes
+    written["aliases"] = alias_labels
+    written["alias_count"] = len(matched_alias_labels)
+    return written
 
 
 @app.get("/api/admin/editor/account_rows/export_by_followers")
@@ -15510,6 +15641,29 @@ def export_account_editor_rows_by_followers(
     return _export_account_editor_rows_by_followers_xlsx(owner, threshold)
 
 
+@app.post("/api/admin/editor/account_rows/export_by_aliases")
+def export_account_editor_rows_by_aliases(
+    payload: AccountEditorRowExportByAliasesRequest,
+    authorization: str | None = Header(default=None),
+):
+    """按所选别名导出账号整行到 xlsx（不删除）；返回 usernames 供下载成功后删除。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    if not payload.aliases:
+        return {"code": 1, "msg": "请至少选择一个别名"}
+    aliases = _parse_aliases_from_export_request(payload)
+    if not aliases:
+        return {"code": 1, "msg": "请至少选择一个别名"}
+    if len(aliases) > ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多导出 {ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作",
+        }
+    return _export_account_editor_rows_by_aliases_xlsx(owner, aliases)
+
+
 @app.get("/api/admin/editor/account_rows/export_file")
 def download_account_editor_export_file(
     filename: str = "",
@@ -15519,7 +15673,8 @@ def download_account_editor_export_file(
     if not session:
         return {"code": 401, "msg": "请先登录"}
     safe_name = Path(str(filename or "").strip()).name
-    if not safe_name.endswith(".xlsx") or not safe_name.startswith("account_rows_followers_"):
+    allowed_prefixes = ("account_rows_followers_", "account_rows_by_alias_")
+    if not safe_name.endswith(".xlsx") or not safe_name.startswith(allowed_prefixes):
         return {"code": 1, "msg": "非法文件名"}
     file_path = (BASE_DIR / "exports" / safe_name).resolve()
     export_root = (BASE_DIR / "exports").resolve()

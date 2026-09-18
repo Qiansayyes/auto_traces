@@ -317,12 +317,14 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
+const accountRecordsExportSelectedAliasesBtn = document.getElementById("accountRecordsExportSelectedAliasesBtn");
 const accountRecordsExportMinFollowersInput = document.getElementById("accountRecordsExportMinFollowersInput");
 const accountRecordsExportByFollowersBtn = document.getElementById("accountRecordsExportByFollowersBtn");
 const accountRecordsDeleteUsernameTemplateBtn = document.getElementById("accountRecordsDeleteUsernameTemplateBtn");
 const accountRecordsDeleteByUsernameFile = document.getElementById("accountRecordsDeleteByUsernameFile");
 const accountRecordsDeleteByUsernameBtn = document.getElementById("accountRecordsDeleteByUsernameBtn");
 const ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX = 5000;
+const ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX = 200;
 const ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE = [
   "# 按用户名删除账号记录模板",
   "# 说明：每行填写一个 username；以 # 开头的行为注释，会被忽略",
@@ -364,6 +366,8 @@ let accountRecordsFilteredTotal = 0;
 let accountRecordsAliasSortMode = "alias";
 /** 账号记录批量删除勾选，键为数据库 row_index */
 const accountRecordsSelectedRowIndexes = new Set();
+/** 账号记录「按别名导出并删除」勾选，键为 foldKey（空字符串=未分配别名） */
+const accountRecordsSelectedAliases = new Set();
 /** 是否展开 password / email / email_pwd / 2FA / api 凭据列（默认收起以留出可视空间） */
 let accountRecordsCredColsExpanded = loadAccountRecordsCredColsExpanded();
 const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
@@ -2874,6 +2878,13 @@ function updateAccountRecordsBatchActionBtns() {
     accountRecordsBatchDeleteBtn.disabled = count <= 0;
     accountRecordsBatchDeleteBtn.textContent = count > 0 ? `批量删除 (${count})` : "批量删除";
   }
+  const aliasCount = accountRecordsSelectedAliases.size;
+  if (accountRecordsExportSelectedAliasesBtn) {
+    accountRecordsExportSelectedAliasesBtn.disabled = aliasCount <= 0;
+    accountRecordsExportSelectedAliasesBtn.textContent = aliasCount > 0
+      ? `导出并删除别名 (${aliasCount})`
+      : "导出并删除别名";
+  }
 }
 
 function updateAccountRecordsBatchDeleteBtn() {
@@ -2888,8 +2899,16 @@ function setAccountRecordRowSelected(rowIndex, checked) {
   updateAccountRecordsBatchDeleteBtn();
 }
 
+function setAccountRecordsAliasSelected(aliasFoldKey, checked) {
+  const key = String(aliasFoldKey ?? "");
+  if (checked) accountRecordsSelectedAliases.add(key);
+  else accountRecordsSelectedAliases.delete(key);
+  updateAccountRecordsBatchActionBtns();
+}
+
 function clearAccountRecordsSelection() {
   accountRecordsSelectedRowIndexes.clear();
+  accountRecordsSelectedAliases.clear();
   updateAccountRecordsBatchDeleteBtn();
 }
 
@@ -3192,6 +3211,174 @@ async function exportAccountRowsByFollowers() {
       accountRecordsExportByFollowersBtn.disabled = false;
       accountRecordsExportByFollowersBtn.textContent = previousLabel;
     }
+  }
+}
+
+function collectSelectedAliasExportPayload() {
+  const aliases = Array.from(accountRecordsSelectedAliases);
+  if (!aliases.length) return { aliases: [], previewLabels: [], estimatedCount: 0 };
+  const wanted = new Set(aliases.map((a) => normalizeAliasKey(a)));
+  let estimatedCount = 0;
+  (accountEditorRows || []).forEach((row) => {
+    const eff = normalizeAliasValue(getEffectiveAccountAssignedAlias(row));
+    if (wanted.has(normalizeAliasKey(eff))) estimatedCount += 1;
+  });
+  const previewLabels = aliases
+    .map((a) => (a ? a : "未分配别名"))
+    .slice(0, 8);
+  return { aliases, previewLabels, estimatedCount };
+}
+
+async function deleteAccountRowsByUsernameList(usernames = []) {
+  const list = Array.from(
+    new Map(
+      (usernames || [])
+        .map((u) => String(u || "").trim().replace(/^@+/, ""))
+        .filter(Boolean)
+        .map((u) => [u.toLowerCase(), u]),
+    ).values(),
+  );
+  if (!list.length) return { deleted_accounts: 0, deleted_device_rows: 0, not_found_count: 0 };
+  let deletedAccounts = 0;
+  let deletedDeviceRows = 0;
+  let notFoundCount = 0;
+  for (let i = 0; i < list.length; i += ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX) {
+    const chunk = list.slice(i, i + ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX);
+    const resp = await request(`${ACCOUNT_ROWS_API}/delete_by_username`, {
+      method: "POST",
+      body: JSON.stringify({ usernames: chunk }),
+      timeoutMs: 180000,
+    });
+    deletedAccounts += Number(resp?.deleted_accounts || 0);
+    deletedDeviceRows += Number(resp?.deleted_device_rows || 0);
+    notFoundCount += Number(resp?.not_found_count || 0);
+  }
+  return {
+    deleted_accounts: deletedAccounts,
+    deleted_device_rows: deletedDeviceRows,
+    not_found_count: notFoundCount,
+  };
+}
+
+async function deleteAccountRowsByBlankRowIndexes(rowIndexes = []) {
+  const indexes = Array.from(
+    new Set(
+      (rowIndexes || [])
+        .map((ri) => Number(ri))
+        .filter((ri) => Number.isFinite(ri) && ri >= 0),
+    ),
+  ).sort((a, b) => b - a);
+  if (!indexes.length) return { deleted_accounts: 0, deleted_device_rows: 0, not_found_count: 0 };
+  let deletedAccounts = 0;
+  let deletedDeviceRows = 0;
+  let notFoundCount = 0;
+  for (let i = 0; i < indexes.length; i += ACCOUNT_RECORDS_BATCH_DELETE_MAX) {
+    const chunk = indexes.slice(i, i + ACCOUNT_RECORDS_BATCH_DELETE_MAX);
+    const resp = await request(`${ACCOUNT_ROWS_API}/batch_delete`, {
+      method: "POST",
+      body: JSON.stringify({
+        items: chunk.map((row_index) => ({ row_index, username: "" })),
+      }),
+      timeoutMs: 180000,
+    });
+    deletedAccounts += Number(resp?.deleted_accounts || 0);
+    deletedDeviceRows += Number(resp?.deleted_device_rows || 0);
+    notFoundCount += Number(resp?.not_found_count || 0);
+  }
+  return {
+    deleted_accounts: deletedAccounts,
+    deleted_device_rows: deletedDeviceRows,
+    not_found_count: notFoundCount,
+  };
+}
+
+async function exportAndDeleteSelectedAliases() {
+  if (accountRecordsExportSelectedAliasesBtn?.disabled) return;
+  const { aliases, previewLabels, estimatedCount } = collectSelectedAliasExportPayload();
+  if (!aliases.length) {
+    setStatus("请先勾选要导出的别名组", "warning");
+    return;
+  }
+  if (aliases.length > ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX) {
+    setStatus(`单次最多导出 ${ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作`, "warning");
+    return;
+  }
+  const confirmLines = [
+    `确认导出并删除 ${aliases.length} 个别名下的账号？`,
+    `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
+  ];
+  if (estimatedCount > 0) {
+    confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
+  }
+  confirmLines.push("下载成功后才会删除；已分配别名的账号会同步清理设备备份档案。");
+  if (!window.confirm(confirmLines.join("\n"))) return;
+
+  const previousLabel = accountRecordsExportSelectedAliasesBtn?.textContent || "导出并删除别名";
+  if (accountRecordsExportSelectedAliasesBtn) {
+    accountRecordsExportSelectedAliasesBtn.disabled = true;
+    accountRecordsExportSelectedAliasesBtn.textContent = "导出中...";
+  }
+  try {
+    setStatus(`正在按别名导出 ${aliases.length} 组账号到 XLSX...`, "info");
+    const resp = await request(`${ACCOUNT_ROWS_API}/export_by_aliases`, {
+      method: "POST",
+      body: JSON.stringify({ aliases }),
+      timeoutMs: 180000,
+    });
+    const filename = String(resp?.filename || "").trim();
+    const count = Number(resp?.count || 0);
+    const usernames = Array.isArray(resp?.usernames) ? resp.usernames : [];
+    const blankRowIndexes = Array.isArray(resp?.blank_row_indexes) ? resp.blank_row_indexes : [];
+    if (!filename || count <= 0) {
+      setStatus(String(resp?.msg || "所选别名下没有可导出的账号"), "warning");
+      return;
+    }
+    await downloadAccountRowsExportFile(filename);
+    if (!usernames.length && !blankRowIndexes.length) {
+      setStatus(`已导出 ${count} 条到 ${filename}，但缺少可删除标识，库内记录未删除`, "warning");
+      return;
+    }
+    setStatus(`已下载 ${count} 条：${filename}，正在从数据库删除...`, "info");
+    if (accountRecordsExportSelectedAliasesBtn) {
+      accountRecordsExportSelectedAliasesBtn.textContent = "删除中...";
+    }
+    // 无 username 的行必须先按导出时的 row_index 删（否则后续按 username 删除会移位）
+    const byBlank = await deleteAccountRowsByBlankRowIndexes(blankRowIndexes);
+    const byUsername = await deleteAccountRowsByUsernameList(usernames);
+    const deletedAccounts = Number(byUsername.deleted_accounts || 0) + Number(byBlank.deleted_accounts || 0);
+    const deletedDeviceRows = Number(byUsername.deleted_device_rows || 0) + Number(byBlank.deleted_device_rows || 0);
+    const notFoundCount = Number(byUsername.not_found_count || 0) + Number(byBlank.not_found_count || 0);
+    clearAccountRecordsSelection();
+    await refreshEditorTablesAfterAccountDelete();
+    if (deletedAccounts <= 0) {
+      setStatus(
+        `已导出 ${count} 条到 ${filename}，但删除未生效（记录可能已不存在），请刷新后检查`,
+        "warning",
+      );
+      return;
+    }
+    const parts = [
+      `已导出并删除 ${deletedAccounts} 条账号（${aliases.length} 个别名）`,
+      `文件：${filename}`,
+    ];
+    if (deletedDeviceRows > 0) {
+      parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
+    }
+    if (notFoundCount > 0) {
+      parts.push(`${notFoundCount} 条删除时已不存在`);
+    }
+    if (deletedAccounts < count) {
+      parts.push(`导出 ${count} 条中有 ${count - deletedAccounts} 条未删掉`);
+    }
+    setStatus(parts.join("，"), (notFoundCount > 0 || deletedAccounts < count) ? "warning" : "success");
+  } catch (error) {
+    await refreshEditorTablesAfterAccountDelete();
+    throw error;
+  } finally {
+    if (accountRecordsExportSelectedAliasesBtn && accountRecordsSelectedAliases.size > 0) {
+      accountRecordsExportSelectedAliasesBtn.textContent = previousLabel;
+    }
+    updateAccountRecordsBatchActionBtns();
   }
 }
 
@@ -11568,6 +11755,15 @@ function renderAccountEditorRows() {
   accountRecordsSelectedRowIndexes.forEach((ri) => {
     if (!existingRowIndexes.has(ri)) accountRecordsSelectedRowIndexes.delete(ri);
   });
+  const allAliasKeys = new Set(
+    buildAccountEditorAliasGroups(
+      (accountEditorRows || []).map((row, idx) => ({ row, idx })),
+      { sort: false },
+    ).map(([aliasKey]) => accountAliasGroupFoldKey(aliasKey)),
+  );
+  accountRecordsSelectedAliases.forEach((aliasKey) => {
+    if (!allAliasKeys.has(aliasKey)) accountRecordsSelectedAliases.delete(aliasKey);
+  });
   updateAccountRecordsBatchDeleteBtn();
   const visibleRows = getFilteredAccountEditorIndexedRows();
   const aliasGroups = buildAccountEditorAliasGroups(visibleRows);
@@ -11601,6 +11797,7 @@ function renderAccountEditorRows() {
     const groupsHtml = pageGroups.map(([aliasKey, items], groupIdx) => {
       const aliasLabel = aliasKey === "__EMPTY_ALIAS__" ? "未分配别名" : aliasKey;
       const foldKey = accountAliasGroupFoldKey(aliasKey);
+      const aliasChecked = accountRecordsSelectedAliases.has(foldKey);
       const totalForAlias = aliasTotalByKey.get(aliasKey) || items.length;
       const countLabel = totalForAlias === items.length
         ? `${items.length} 条`
@@ -11616,6 +11813,7 @@ function renderAccountEditorRows() {
         <details class="account-alias-group" data-account-alias="${escapeHtml(foldKey)}"${shouldOpen ? " open" : ""}>
           <summary class="account-alias-group__summary">
             <span class="account-alias-group__title">
+              <input type="checkbox" class="account-records-alias-select" data-account-alias="${escapeHtml(foldKey)}" title="勾选该别名下全部账号（可多选，用于导出并删除）"${aliasChecked ? " checked" : ""} />
               <strong>${escapeHtml(aliasLabel)}</strong>
               <span class="hint">(${escapeHtml(countLabel)})</span>
             </span>
@@ -13324,6 +13522,11 @@ if (accountRecordsBatchDeleteBtn) {
     deleteSelectedAccountRecords().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "批量删除失败", "error"));
   });
 }
+if (accountRecordsExportSelectedAliasesBtn) {
+  accountRecordsExportSelectedAliasesBtn.addEventListener("click", () => {
+    exportAndDeleteSelectedAliases().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "导出并删除别名失败", "error"));
+  });
+}
 if (accountRecordsExportByFollowersBtn) {
   accountRecordsExportByFollowersBtn.addEventListener("click", () => {
     exportAccountRowsByFollowers().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "提取高粉账号失败", "error"));
@@ -13343,6 +13546,11 @@ if (accountEditorListEl) {
   accountEditorListEl.addEventListener("change", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
+    if (target.classList.contains("account-records-alias-select")) {
+      event.stopPropagation();
+      setAccountRecordsAliasSelected(target.dataset.accountAlias ?? "", target.checked);
+      return;
+    }
     if (target.classList.contains("account-records-row-select")) {
       event.stopPropagation();
       setAccountRecordRowSelected(target.dataset.accountRowIndex, target.checked);
@@ -13366,6 +13574,15 @@ if (accountEditorListEl) {
       return;
     }
   });
+  accountEditorListEl.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const aliasCheck = target.closest(".account-records-alias-select");
+    if (aliasCheck) {
+      // 必须在捕获阶段拦截，否则 summary 会先收到冒泡并展开/收起
+      event.stopPropagation();
+    }
+  }, true);
   accountEditorListEl.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
