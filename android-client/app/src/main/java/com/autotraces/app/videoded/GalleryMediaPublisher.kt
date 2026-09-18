@@ -67,8 +67,39 @@ object GalleryMediaPublisher {
             }
             uris.add(uri.toString())
         }
+        assertPublishedVisible(app, uris)
         taskDir.deleteRecursively()
         uris
+    }
+
+    /**
+     * ACK 前硬校验：必须是 content://，且 IS_PENDING=0。
+     * 否则 PC/日志会报「拉取成功」，TikTok 选图页仍空（shell 幽灵 / pending 卡住）。
+     */
+    fun assertPublishedVisible(context: Context, uriStrings: List<String>) {
+        if (uriStrings.isEmpty()) error("gallery_publish_empty")
+        val resolver = context.applicationContext.contentResolver
+        for (raw in uriStrings) {
+            if (!raw.startsWith("content://")) {
+                error("gallery_uri_not_content:$raw")
+            }
+            val uri = Uri.parse(raw)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                var pending = readIsPending(resolver, uri)
+                if (pending == null) {
+                    error("gallery_pending_unreadable:$raw")
+                }
+                if (pending != 0) {
+                    if (!forceClearPending(resolver, uri)) {
+                        error("gallery_still_pending:$raw")
+                    }
+                    pending = readIsPending(resolver, uri)
+                    if (pending == null || pending != 0) {
+                        error("gallery_still_pending:$raw")
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -93,7 +124,7 @@ object GalleryMediaPublisher {
                     // 且 shell 属主文件不能用 App File API 直接读（EACCES）。
                     val staging = stageReadableCopy(app, src, name)
                     try {
-                        // 同名已在库：直接覆盖，避免 purge 失败后再 insert 撞 UNIQUE
+                        // shell/IS_PENDING 幽灵行禁止直接 reuse：先 purge 再 App 正规入库
                         val absHint = File(
                             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
                             name,
@@ -101,17 +132,11 @@ object GalleryMediaPublisher {
                         val existing = findExistingVideoUri(app, name, src.absolutePath)
                             ?: findExistingVideoUri(app, name, absHint)
                         if (existing != null) {
-                            Log.i(TAG, "USB reuse MediaStore row for $name -> $existing")
-                            overwriteMediaStoreUri(
-                                app.contentResolver,
-                                existing,
-                                staging,
-                                markPendingAroundWrite = true,
-                            )
-                        } else {
-                            purgePicturesVideoByDisplayName(app, name)
-                            insertMediaStoreQPlus(app, staging, name)
+                            Log.i(TAG, "USB purge before republish $name -> $existing")
+                            purgeVideoUri(app, existing)
                         }
+                        purgePicturesVideoByDisplayName(app, name)
+                        insertMediaStoreQPlus(app, staging, name)
                         runCatching { if (src.exists()) src.delete() }
                         // shell 文件 App 可能删不掉，再 su 删一次，避免双份幽灵
                         if (src.exists()) deleteViaSu(src)
@@ -293,8 +318,8 @@ object GalleryMediaPublisher {
         return runSu("rm -f ${shellSingleQuote(file.absolutePath)}")
     }
 
-    private fun runSu(command: String): Boolean {
-        val candidates = listOf(
+    private fun runSu(command: String): Boolean = runSuWithArgs(
+        listOf(
             arrayOf("su", "-c", command),
             arrayOf("/system/bin/su", "-c", command),
             arrayOf("/system/xbin/su", "-c", command),
@@ -302,7 +327,27 @@ object GalleryMediaPublisher {
             arrayOf("/data/adb/magisk/su", "-c", command),
             arrayOf("/su/bin/su", "-c", command),
             arrayOf("sh", "-c", "su -c " + shellSingleQuote(command)),
-        )
+        ),
+    )
+
+    /**
+     * 以 shell 身份跑 content 命令：root 直接 delete MediaStore 常报
+     * `UID 0 has no associated package`；`su shell -c content delete` 可删 shell 幽灵行
+     * （部分机 exit 非 0 / segfault，以复查询为准）。
+     */
+    private fun runSuAsShell(command: String): Boolean = runSuWithArgs(
+        listOf(
+            arrayOf("su", "shell", "-c", command),
+            arrayOf("/system/bin/su", "shell", "-c", command),
+            arrayOf("sh", "-c", "su shell -c " + shellSingleQuote(command)),
+        ),
+        requireExitZero = false,
+    )
+
+    private fun runSuWithArgs(
+        candidates: List<Array<String>>,
+        requireExitZero: Boolean = true,
+    ): Boolean {
         for (args in candidates) {
             val ok = try {
                 val p = ProcessBuilder(*args).redirectErrorStream(true).start()
@@ -313,8 +358,11 @@ object GalleryMediaPublisher {
                 if (!finished) {
                     runCatching { p.destroyForcibly() }
                     false
-                } else {
+                } else if (requireExitZero) {
                     p.exitValue() == 0
+                } else {
+                    // shell content delete 可能 segfault 但仍删成功
+                    true
                 }
             } catch (t: Throwable) {
                 Log.w(TAG, "su candidate ${args.firstOrNull()} failed: ${t.message}")
@@ -351,12 +399,84 @@ object GalleryMediaPublisher {
                 "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?" +
                 ")"
         val args = arrayOf(displayName, "Pictures/", "Pictures/%")
+        val ids = mutableListOf<Long>()
+        runCatching {
+            resolver.query(
+                collection,
+                arrayOf(MediaStore.Video.Media._ID),
+                selection,
+                args,
+                null,
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                while (cursor.moveToNext()) ids.add(cursor.getLong(idCol))
+            }
+        }
         runCatching { resolver.delete(collection, selection, args) }
-        // 非本包 owner 的行可能删不掉：用 su content delete 兜底
+        for (id in ids) {
+            purgeVideoUri(context, ContentUris.withAppendedId(collection, id))
+        }
+        // where 兜底（部分机有效）
         runSu(
             "content delete --uri content://media/external/video/media " +
                 "--where \"_display_name='${displayName.replace("'", "")}'\"",
         )
+        runSuAsShell(
+            "content delete --uri content://media/external/video/media " +
+                "--where \"_display_name='${displayName.replace("'", "")}'\"",
+        )
+    }
+
+    /** App 删不掉的 shell 幽灵行：root content 常失败，改用 su shell content delete。 */
+    private fun purgeVideoUri(context: Context, uri: Uri) {
+        runCatching { context.contentResolver.delete(uri, null, null) }
+        val flat = uri.toString()
+        runSu("content delete --uri $flat")
+        runSuAsShell("content delete --uri $flat")
+    }
+
+    private fun readIsPending(resolver: android.content.ContentResolver, uri: Uri): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        return runCatching {
+            resolver.query(
+                uri,
+                arrayOf(MediaStore.Video.Media.IS_PENDING),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use null
+                cursor.getInt(0)
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * 清 IS_PENDING：App update → su content update。
+     * USB push 幽灵行 App 常 update 失败/返回 0，必须 su 兜底，否则 TikTok 选图页不可见。
+     */
+    private fun forceClearPending(
+        resolver: android.content.ContentResolver,
+        uri: Uri,
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+        val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+        runCatching { resolver.update(uri, done, null, null) }
+        if (readIsPending(resolver, uri) == 0) return true
+        val id = try {
+            ContentUris.parseId(uri)
+        } catch (_: Exception) {
+            -1L
+        }
+        if (id >= 0L) {
+            val updateCmd =
+                "content update --uri content://media/external/video/media/$id --bind is_pending:i:0"
+            runSu(updateCmd)
+            runSuAsShell(updateCmd)
+        }
+        val after = readIsPending(resolver, uri)
+        // 读不到 pending 不能当成功：否则 shell 幽灵行会 ACK 成功但 TikTok 仍不可见
+        return after == 0
     }
 
     private fun insertMediaStoreQPlus(context: Context, source: File, displayName: String): Uri {
@@ -371,10 +491,19 @@ object GalleryMediaPublisher {
             displayName,
         ).absolutePath
 
-        // 同名已在 Pictures：覆盖写入，避免 UNIQUE constraint failed: files._data
+        // 同名已在库（多为 USB shell 幽灵）：先 purge，再 App 新建；purge 不掉才覆盖并强制清 pending
         findExistingVideoUri(context, displayName, absHint)?.let { existing ->
-            Log.i(TAG, "reuse existing MediaStore row for $displayName -> $existing")
+            Log.i(TAG, "purge-before-insert existing for $displayName -> $existing")
+            purgeVideoUri(context, existing)
+        }
+        purgePicturesVideoByDisplayName(context, displayName)
+
+        findExistingVideoUri(context, displayName, absHint)?.let { existing ->
+            Log.w(TAG, "reuse after purge-failed for $displayName -> $existing")
             overwriteMediaStoreUri(resolver, existing, source, markPendingAroundWrite = true)
+            if (!forceClearPending(resolver, existing)) {
+                error("mediastore_pending_stuck:$displayName:$existing")
+            }
             return existing
         }
 
@@ -395,6 +524,9 @@ object GalleryMediaPublisher {
         if (uri == null) {
             findExistingVideoUri(context, displayName, absHint)?.let { existing ->
                 overwriteMediaStoreUri(resolver, existing, source, markPendingAroundWrite = true)
+                if (!forceClearPending(resolver, existing)) {
+                    error("mediastore_pending_stuck:$displayName:$existing")
+                }
                 return existing
             }
             val uniqueName = uniqueDisplayName(displayName)
@@ -411,6 +543,9 @@ object GalleryMediaPublisher {
             } ?: error("mediastore_insert_failed")
             try {
                 overwriteMediaStoreUri(resolver, retryUri, source, clearPending = true)
+                if (!forceClearPending(resolver, retryUri)) {
+                    error("mediastore_pending_stuck:$uniqueName:$retryUri")
+                }
             } catch (t: Throwable) {
                 runCatching { resolver.delete(retryUri, null, null) }
                 throw wrapMediaStoreWriteError(t, source)
@@ -420,6 +555,9 @@ object GalleryMediaPublisher {
 
         try {
             overwriteMediaStoreUri(resolver, uri, source, clearPending = true)
+            if (!forceClearPending(resolver, uri)) {
+                error("mediastore_pending_stuck:$displayName:$uri")
+            }
         } catch (t: Throwable) {
             runCatching { resolver.delete(uri, null, null) }
             throw wrapMediaStoreWriteError(t, source)
@@ -468,9 +606,9 @@ object GalleryMediaPublisher {
         }
         if (clearPending || markPendingAroundWrite) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                val updated = resolver.update(uri, done, null, null)
-                if (clearPending && updated <= 0) error("mediastore_clear_pending_failed")
+                if (!forceClearPending(resolver, uri)) {
+                    error("mediastore_clear_pending_failed:$uri")
+                }
             }
         }
     }

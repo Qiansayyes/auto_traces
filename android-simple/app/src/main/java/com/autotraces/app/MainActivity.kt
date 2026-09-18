@@ -904,6 +904,7 @@ class MainActivity : AppCompatActivity() {
         if (!PrefsStore.getAuthToken().isNullOrBlank()) return false
         binding.logPanel.visibility = View.GONE
         binding.actionPanel.visibility = View.VISIBLE
+        applyTopNavSelection(logSelected = false)
         binding.bindStatusText.text = "请先在设置中登录云端账号"
         startActivity(Intent(this, SettingsActivity::class.java))
         return true
@@ -915,6 +916,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请先在设置中登录云端账号", Toast.LENGTH_SHORT).show()
             binding.logPanel.visibility = View.GONE
             binding.actionPanel.visibility = View.VISIBLE
+            applyTopNavSelection(logSelected = false)
             binding.bindStatusText.text = "请先在设置中登录云端账号"
             startActivity(Intent(this, SettingsActivity::class.java))
             return false
@@ -923,6 +925,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请先填写别名并点击「绑定」完成设备绑定", Toast.LENGTH_SHORT).show()
             binding.logPanel.visibility = View.GONE
             binding.actionPanel.visibility = View.VISIBLE
+            applyTopNavSelection(logSelected = false)
             binding.bindStatusText.text = "启动前需完成绑定：填写别名后点击绑定"
             LogCenter.op(PrefsStore.getAlias(), "启动被拒绝：设备未绑定（无 deviceId/alias）")
             return false
@@ -940,12 +943,14 @@ class MainActivity : AppCompatActivity() {
     private fun showLogPanel() {
         binding.logPanel.visibility = View.VISIBLE
         binding.actionPanel.visibility = View.GONE
+        applyTopNavSelection(logSelected = true)
         if (logStickToBottom) scrollLogToLatest()
     }
 
     private fun showActionPanel() {
         binding.logPanel.visibility = View.GONE
         binding.actionPanel.visibility = View.VISIBLE
+        applyTopNavSelection(logSelected = false)
         updateConfigSummaryLine()
         val cached = ManualDeviceControl.getCachedAccounts()
         if (cached.isNotEmpty()) {
@@ -962,6 +967,33 @@ class MainActivity : AppCompatActivity() {
         }
         refreshManualAutoSwitchStatus()
         applyControlModeUi()
+    }
+
+    /** 顶部「操作 / 日志」选中态：实心=当前页，描边=可切换。 */
+    private fun applyTopNavSelection(logSelected: Boolean) {
+        styleTopNavButton(binding.showLogButton, selected = logSelected)
+        styleTopNavButton(binding.showActionButton, selected = !logSelected)
+    }
+
+    private fun styleTopNavButton(button: com.google.android.material.button.MaterialButton, selected: Boolean) {
+        val primary = com.google.android.material.color.MaterialColors.getColor(
+            button,
+            com.google.android.material.R.attr.colorPrimary,
+        )
+        val onPrimary = com.google.android.material.color.MaterialColors.getColor(
+            button,
+            com.google.android.material.R.attr.colorOnPrimary,
+        )
+        if (selected) {
+            button.backgroundTintList = android.content.res.ColorStateList.valueOf(primary)
+            button.setTextColor(onPrimary)
+            button.strokeWidth = 0
+        } else {
+            button.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
+            button.setTextColor(primary)
+            button.strokeWidth = resources.displayMetrics.density.toInt().coerceAtLeast(1)
+            button.strokeColor = android.content.res.ColorStateList.valueOf(primary)
+        }
     }
 
     private fun applyControlModeUi() {
@@ -1765,6 +1797,35 @@ class MainActivity : AppCompatActivity() {
             "${PrefsStore.getAlias().orEmpty()} · ${PrefsStore.getLocalStatus()} · 云端: $cloudLabel"
     }
 
+    /**
+     * 日志页状态摘要：只保留看日志时真正有用的信息，压成最多两行。
+     * 本地状态/云端账号已在顶部 deviceInfo；服务端、配置是否拉取等到设置/操作页看。
+     */
+    private fun buildCompactRuntimeSummary(state: RuntimeState): String {
+        val parts = mutableListOf<String>()
+        parts.add(if (state.serviceRunning) "服务运行中" else "服务未启动")
+        val mode = state.effectiveRunMode.trim()
+        val template = state.effectiveTemplate.trim()
+        when {
+            mode.isNotEmpty() && template.isNotEmpty() -> parts.add("$mode/$template")
+            mode.isNotEmpty() -> parts.add(mode)
+            template.isNotEmpty() -> parts.add(template)
+        }
+        val autoSwitchMode = PrefsStore.getAutoSwitchMode()
+        if (autoSwitchMode != "off" || PrefsStore.isManualLocalAutoSwitchEnabled()) {
+            parts.add("切号$autoSwitchMode")
+        }
+        if (state.cloudAutoStart == true) {
+            parts.add("云端起号开")
+        }
+        if (state.hardStopRequested) {
+            parts.add("硬停中")
+        }
+        val line1 = parts.joinToString(" · ")
+        val msg = state.lastMessage.trim()
+        return if (msg.isNotEmpty()) "$line1\n$msg" else line1
+    }
+
     private fun scrollLogToLatest() {
         binding.logScroll.post {
             binding.logScroll.fullScroll(View.FOCUS_DOWN)
@@ -1799,34 +1860,9 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.runtimeState.collectLatest { state ->
                 if (state.hardStopRequested) logStickToBottom = false
                 updateConfigSummaryLine()
-                binding.runtimeStateText.text = buildString {
-                    appendLine("后台服务: ${if (state.serviceRunning) "运行中" else "未启动"}")
-                    appendLine("本地状态: ${state.localStatus}")
-                    appendLine("配置状态: ${if (state.configLoaded) "已拉取" else "默认配置"}")
-                    if (state.effectiveRunMode.isNotBlank()) {
-                        appendLine("当前生效模式: ${state.effectiveRunMode}")
-                    }
-                    if (state.effectiveTemplate.isNotBlank()) {
-                        appendLine("当前生效模板: ${state.effectiveTemplate}")
-                    }
-                    appendLine("服务端: ${state.currentServerUrl}")
-                    val cloudAutoStartLabel = when (state.cloudAutoStart) {
-                        true -> "开启"
-                        false -> "关闭"
-                        null -> "—"
-                    }
-                    appendLine("云端自动起号: $cloudAutoStartLabel")
-                    val autoSwitchMode = PrefsStore.getAutoSwitchMode()
-                    if (autoSwitchMode != "off" || PrefsStore.isManualLocalAutoSwitchEnabled()) {
-                        appendLine(
-                            "自动切号自治（本机）: $autoSwitchMode" +
-                                if (PrefsStore.isManualLocalAutoSwitchEnabled()) " · APP开关=开" else "",
-                        )
-                    }
-                    refreshManualAutoSwitchStatus()
-                    appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
-                    append("最近状态: ${state.lastMessage}")
-                }
+                // 日志页只保留关键状态（一行摘要 + 可选最近消息），避免横屏挤掉日志
+                binding.runtimeStateText.text = buildCompactRuntimeSummary(state)
+                refreshManualAutoSwitchStatus()
                 renderDeviceInfo()
             }
         }

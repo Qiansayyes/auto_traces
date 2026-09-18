@@ -505,33 +505,38 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.runtimeState.collectLatest { state ->
                 if (state.hardStopRequested) logStickToBottom = false
                 updateConfigSummaryLine()
-                binding.runtimeStateText.text = buildString {
-                    appendLine("后台服务: ${if (state.serviceRunning) "运行中" else "未启动"}")
-                    appendLine("本地状态: ${state.localStatus}")
-                    appendLine("配置状态: ${if (state.configLoaded) "已拉取" else "默认配置"}")
-                    if (state.effectiveRunMode.isNotBlank()) {
-                        appendLine("当前生效模式: ${state.effectiveRunMode}")
-                    }
-                    if (state.effectiveTemplate.isNotBlank()) {
-                        appendLine("当前生效模板: ${state.effectiveTemplate}")
-                    }
-                    appendLine("服务端: ${state.currentServerUrl}")
-                    val cloudAutoStartLabel = when (state.cloudAutoStart) {
-                        true -> "开启"
-                        false -> "关闭"
-                        null -> "—"
-                    }
-                    appendLine("云端自动起号: $cloudAutoStartLabel")
-                    val autoSwitchMode = PrefsStore.getAutoSwitchMode()
-                    if (autoSwitchMode != "off") {
-                        appendLine("自动切号自治（本机）: $autoSwitchMode")
-                    }
-                    appendLine("硬停状态: ${if (state.hardStopRequested) "已启用" else "未启用"}")
-                    append("最近状态: ${state.lastMessage}")
-                }
+                binding.runtimeStateText.text = buildCompactRuntimeSummary(state)
                 renderDeviceInfo()
             }
         }
+    }
+
+    /**
+     * 日志页状态摘要：只保留看日志时真正有用的信息，压成最多两行。
+     */
+    private fun buildCompactRuntimeSummary(state: RuntimeState): String {
+        val parts = mutableListOf<String>()
+        parts.add(if (state.serviceRunning) "服务运行中" else "服务未启动")
+        val mode = state.effectiveRunMode.trim()
+        val template = state.effectiveTemplate.trim()
+        when {
+            mode.isNotEmpty() && template.isNotEmpty() -> parts.add("$mode/$template")
+            mode.isNotEmpty() -> parts.add(mode)
+            template.isNotEmpty() -> parts.add(template)
+        }
+        val autoSwitchMode = PrefsStore.getAutoSwitchMode()
+        if (autoSwitchMode != "off") {
+            parts.add("切号$autoSwitchMode")
+        }
+        if (state.cloudAutoStart == true) {
+            parts.add("云端起号开")
+        }
+        if (state.hardStopRequested) {
+            parts.add("硬停中")
+        }
+        val line1 = parts.joinToString(" · ")
+        val msg = state.lastMessage.trim()
+        return if (msg.isNotEmpty()) "$line1\n$msg" else line1
     }
 
     private fun setupBindingSection() {

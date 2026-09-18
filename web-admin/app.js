@@ -319,8 +319,19 @@ const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageS
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
 const accountRecordsExportMinFollowersInput = document.getElementById("accountRecordsExportMinFollowersInput");
 const accountRecordsExportByFollowersBtn = document.getElementById("accountRecordsExportByFollowersBtn");
-const accountRecordsDeleteByUsernameInput = document.getElementById("accountRecordsDeleteByUsernameInput");
+const accountRecordsDeleteUsernameTemplateBtn = document.getElementById("accountRecordsDeleteUsernameTemplateBtn");
+const accountRecordsDeleteByUsernameFile = document.getElementById("accountRecordsDeleteByUsernameFile");
 const accountRecordsDeleteByUsernameBtn = document.getElementById("accountRecordsDeleteByUsernameBtn");
+const ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX = 5000;
+const ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE = [
+  "# 按用户名删除账号记录模板",
+  "# 说明：每行填写一个 username；以 # 开头的行为注释，会被忽略",
+  "# 也支持用逗号/分号/空白分隔多个用户名",
+  "# 下面两行是示例（已注释，不会被删除），请新增真实账号行：",
+  "# example_user_1",
+  "# example_user_2",
+  "",
+].join("\n");
 const accountRecordsAliasSortSelect = document.getElementById("accountRecordsAliasSortSelect");
 const accountRecordsToggleCredColsBtn = document.getElementById("accountRecordsToggleCredColsBtn");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
@@ -3184,44 +3195,93 @@ async function exportAccountRowsByFollowers() {
   }
 }
 
+function parseUsernamesFromDeleteFileText(text) {
+  const seen = new Set();
+  const result = [];
+  const lines = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/);
+  for (const rawLine of lines) {
+    let line = String(rawLine || "").trim();
+    if (!line || line.startsWith("#")) continue;
+    // 去掉行内注释：user1 # 备注
+    const hashPos = line.indexOf("#");
+    if (hashPos >= 0) line = line.slice(0, hashPos).trim();
+    if (!line) continue;
+    const parts = line.split(/[\s,;，；]+/);
+    for (const part of parts) {
+      const username = String(part || "").trim().replace(/^@+/, "");
+      if (!username || username === "#") continue;
+      const key = username.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(username);
+    }
+  }
+  return result;
+}
+
+function downloadAccountRecordsDeleteUsernameTemplate() {
+  downloadTextAsFile(ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE, "delete_usernames_template.txt");
+  setStatus("已下载删除模板：每行一个 username，以 # 开头的行为注释", "success");
+}
+
+async function readAccountRecordsDeleteUsernamesFromFile() {
+  const file = accountRecordsDeleteByUsernameFile?.files?.[0];
+  if (!file) {
+    setStatus("请先选择要删除的 username 文件（可先下载模板）", "warning");
+    accountRecordsDeleteByUsernameFile?.focus();
+    return null;
+  }
+  const name = String(file.name || "").toLowerCase();
+  if (!(name.endsWith(".txt") || name.endsWith(".csv"))) {
+    setStatus("请上传 .txt 或 .csv 文件（可先下载模板）", "warning");
+    return null;
+  }
+  const text = await file.text();
+  const usernames = parseUsernamesFromDeleteFileText(text);
+  if (!usernames.length) {
+    setStatus("文件中没有可用的 username（空行和 # 注释会被忽略）", "warning");
+    return null;
+  }
+  if (usernames.length > ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX) {
+    setStatus(`单次最多按文件删除 ${ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX} 个 username，请分批操作`, "warning");
+    return null;
+  }
+  return usernames;
+}
+
 async function deleteAccountRowsByUsername() {
   if (accountRecordsDeleteByUsernameBtn?.disabled) return;
-  const usernameText = String(accountRecordsDeleteByUsernameInput?.value || "").trim();
-  if (!usernameText) {
-    setStatus("请输入要删除的 username", "warning");
-    accountRecordsDeleteByUsernameInput?.focus();
-    return;
-  }
-  const previewNames = usernameText
-    .split(/[\s,;，；]+/)
-    .map((item) => item.trim().replace(/^@+/, ""))
-    .filter(Boolean)
-    .slice(0, 8);
-  const confirmLines = ["确认按 username 删除对应账号记录整行？"];
+  const usernames = await readAccountRecordsDeleteUsernamesFromFile();
+  if (!usernames) return;
+  const previewNames = usernames.slice(0, 8);
+  const confirmLines = [
+    `确认按文件中的 ${usernames.length} 个 username 删除对应账号记录整行？`,
+  ];
   if (previewNames.length) {
-    confirmLines.push(`账号：${previewNames.join("、")}${previewNames.length >= 8 ? " …" : ""}`);
+    confirmLines.push(`账号：${previewNames.join("、")}${usernames.length > 8 ? " …" : ""}`);
   }
   confirmLines.push("已分配别名的账号将同步清理设备备份档案中的对应数据");
   if (!window.confirm(confirmLines.join("\n"))) return;
 
-  const previousLabel = accountRecordsDeleteByUsernameBtn?.textContent || "按用户名删除";
+  const previousLabel = accountRecordsDeleteByUsernameBtn?.textContent || "按文件删除";
   if (accountRecordsDeleteByUsernameBtn) {
     accountRecordsDeleteByUsernameBtn.disabled = true;
     accountRecordsDeleteByUsernameBtn.textContent = "删除中...";
   }
   try {
-    setStatus("正在按 username 删除账号记录...", "info");
+    setStatus(`正在按文件删除 ${usernames.length} 个 username 对应的账号记录...`, "info");
     const resp = await request(`${ACCOUNT_ROWS_API}/delete_by_username`, {
       method: "POST",
-      body: JSON.stringify({ username: usernameText }),
+      body: JSON.stringify({ usernames }),
+      timeoutMs: 120000,
     });
     const deletedAccounts = Number(resp?.deleted_accounts || 0);
     const deletedDeviceRows = Number(resp?.deleted_device_rows || 0);
     const notFoundCount = Number(resp?.not_found_count || 0);
     clearAccountRecordsSelection();
-    if (accountRecordsDeleteByUsernameInput) accountRecordsDeleteByUsernameInput.value = "";
+    if (accountRecordsDeleteByUsernameFile) accountRecordsDeleteByUsernameFile.value = "";
     await refreshEditorTablesAfterAccountDelete();
-    const parts = [`已按 username 删除 ${deletedAccounts} 条账号记录`];
+    const parts = [`已按文件删除 ${deletedAccounts} 条账号记录`];
     if (deletedDeviceRows > 0) parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
     if (notFoundCount > 0) parts.push(`${notFoundCount} 个 username 未找到`);
     setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
@@ -13269,16 +13329,14 @@ if (accountRecordsExportByFollowersBtn) {
     exportAccountRowsByFollowers().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "提取高粉账号失败", "error"));
   });
 }
-if (accountRecordsDeleteByUsernameBtn) {
-  accountRecordsDeleteByUsernameBtn.addEventListener("click", () => {
-    deleteAccountRowsByUsername().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按用户名删除失败", "error"));
+if (accountRecordsDeleteUsernameTemplateBtn) {
+  accountRecordsDeleteUsernameTemplateBtn.addEventListener("click", () => {
+    downloadAccountRecordsDeleteUsernameTemplate();
   });
 }
-if (accountRecordsDeleteByUsernameInput) {
-  accountRecordsDeleteByUsernameInput.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    deleteAccountRowsByUsername().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按用户名删除失败", "error"));
+if (accountRecordsDeleteByUsernameBtn) {
+  accountRecordsDeleteByUsernameBtn.addEventListener("click", () => {
+    deleteAccountRowsByUsername().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按文件删除失败", "error"));
   });
 }
 if (accountEditorListEl) {

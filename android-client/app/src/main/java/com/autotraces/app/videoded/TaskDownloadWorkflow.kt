@@ -58,24 +58,25 @@ object TaskDownloadWorkflow {
                 GalleryMediaPublisher.tryDeletePublicFile(pushed)
             }
 
-            // MD5 已通过则文件可用；相册索引冲突（UNIQUE）不得让整单失败，否则素材进不了 used/
+            // 必须经 MediaStore 正规入库（IS_PENDING=0）才 ACK。
+            // 禁止 UNIQUE 时用 file:// 假成功：那会让 PC 以为完成、TikTok 选图页仍空。
+            val names = files.map { it.fileName }
             val galleryUris = try {
-                GalleryMediaPublisher.publishAndDeleteReceived(
-                    app,
-                    taskId,
-                    files.map { it.fileName },
-                )
+                GalleryMediaPublisher.publishAndDeleteReceived(app, taskId, names)
             } catch (t: Throwable) {
                 val msg = t.message.orEmpty()
                 if (msg.contains("UNIQUE", ignoreCase = true) ||
-                    msg.contains("SQLITE_CONSTRAINT", ignoreCase = true)
+                    msg.contains("SQLITE_CONSTRAINT", ignoreCase = true) ||
+                    msg.contains("mediastore_pending_stuck", ignoreCase = true)
                 ) {
-                    Log.w(TAG, "gallery UNIQUE ignored after USB verify: $msg")
-                    files.map { "file://${java.io.File(receivedDir, it.fileName).absolutePath}" }
+                    Log.w(TAG, "gallery publish retry after $msg")
+                    report("相册入库冲突，清理索引后重试…")
+                    GalleryMediaPublisher.publishAndDeleteReceived(app, taskId, names)
                 } else {
                     throw t
                 }
             }
+            GalleryMediaPublisher.assertPublishedVisible(app, galleryUris)
             report("校验通过，已写入相册，向 PC 确认完成")
 
             CompanionApi.ackTask(app, taskId, true, "usb_push_complete", completedFiles)
@@ -175,9 +176,20 @@ object TaskDownloadWorkflow {
                     report("已发布到相册并完成清理")
                 }
             } catch (e: Throwable) {
-                report("发布到相册失败：${e.message}")
-                throw e
+                val msg = e.message.orEmpty()
+                if (msg.contains("UNIQUE", ignoreCase = true) ||
+                    msg.contains("SQLITE_CONSTRAINT", ignoreCase = true) ||
+                    msg.contains("mediastore_pending_stuck", ignoreCase = true)
+                ) {
+                    Log.w(TAG, "gallery publish retry after HTTP path: $msg")
+                    report("相册入库冲突，清理索引后重试…")
+                    GalleryMediaPublisher.publishAndDeleteReceived(app, taskId, names)
+                } else {
+                    report("发布到相册失败：${e.message}")
+                    throw e
+                }
             }
+            GalleryMediaPublisher.assertPublishedVisible(app, galleryUris)
 
             CompanionApi.ackTask(app, taskId, true, "download_complete", completedFiles)
             TaskStore.saveTaskSnapshot(

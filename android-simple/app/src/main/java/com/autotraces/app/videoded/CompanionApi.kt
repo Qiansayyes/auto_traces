@@ -10,7 +10,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.logging.HttpLoggingInterceptor
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -75,9 +74,7 @@ object CompanionApi {
         return ""
     }
 
-    private fun okhttpBuilder(): OkHttpClient.Builder =
-        OkHttpClient.Builder()
-            .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
+    private fun okhttpBuilder(): OkHttpClient.Builder = OkHttpClient.Builder()
 
     private val apiClient = okhttpBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -184,7 +181,6 @@ object CompanionApi {
 
     fun setWindowsBaseUrl(context: Context, value: String) {
         val normalized = value.trim().trimEnd('/')
-        Log.d(TAG, "setWindowsBaseUrl=$normalized")
         prefs(context).edit().putString(KEY_WINDOWS_BASE_URL, normalized).apply()
     }
 
@@ -227,7 +223,6 @@ object CompanionApi {
             groupName = getBackendGroupName(context),
         )
         val url = "${windowsBaseUrl(context)}/api/devices/register"
-        Log.d(TAG, "ensureRegistered -> $url request=$request")
         val reg = org.json.JSONObject(postJson(url, request))
         adoptCanonicalDeviceId(context, reg)
         setBackendGroupName(context, parseGroupNameFromRegistration(reg))
@@ -249,9 +244,8 @@ object CompanionApi {
         setMaterialUsername(context, resolvedUsername)
         val req = CreateTaskRequest(deviceId(context), count, resolved, resolvedUsername)
         val url = "${windowsBaseUrl(context)}/api/tasks/create"
-        Log.d(TAG, "createTask -> $url count=$count username=$resolvedUsername targetPath=$resolved request=$req")
         val raw = postJson(url, req)
-        Log.d(TAG, "createTask <- response=$raw")
+        Log.i(TAG, "createTask ok count=$count username=$resolvedUsername")
         gson.fromJson(raw, CreateTaskResponse::class.java)
     }
 
@@ -287,21 +281,18 @@ object CompanionApi {
         } else {
             req["target"] = resolvedTarget
         }
-        Log.d(TAG, "requestPcWirelessPipeline -> $url req=$req")
+        Log.d(TAG, "requestPcWirelessPipeline -> $url target=$resolvedTarget launchMirror=$launchMirror")
         postJson(url, req)
     }
 
     suspend fun getTaskStatus(context: Context, taskId: String): TaskStatusResponse = withContext(Dispatchers.IO) {
         val url = "${windowsBaseUrl(context)}/api/tasks/$taskId"
-        Log.d(TAG, "getTaskStatus -> $url taskId=$taskId")
         val raw = get(url)
-        Log.d(TAG, "getTaskStatus <- response=$raw")
         gson.fromJson(raw, TaskStatusResponse::class.java)
     }
 
     suspend fun fetchTaskDetail(context: Context, taskId: String): PcTaskDetailDto? = withContext(Dispatchers.IO) {
         val url = "${windowsBaseUrl(context)}/api/tasks/$taskId"
-        Log.d(TAG, "fetchTaskDetail -> $url")
         val raw = runCatching { get(url) }.getOrElse {
             Log.w(TAG, "fetchTaskDetail failed: ${it.message}")
             return@withContext null
@@ -315,8 +306,8 @@ object CompanionApi {
     suspend fun ackTask(context: Context, taskId: String, success: Boolean, message: String? = null, files: List<TaskFileAck> = emptyList()) = withContext(Dispatchers.IO) {
         val req = TaskAckRequest(success, message, files)
         val url = "${windowsBaseUrl(context)}/api/tasks/$taskId/ack"
-        Log.d(TAG, "ackTask -> $url success=$success message=$message files=${files.size}")
         postJson(url, req)
+        Log.i(TAG, "ackTask taskId=$taskId success=$success files=${files.size}")
     }
 
     suspend fun downloadAndVerifyFile(
@@ -355,7 +346,6 @@ object CompanionApi {
 
     private suspend fun downloadFileOnce(context: Context, taskId: String, fileName: String, destination: File) = withContext(Dispatchers.IO) {
         val url = "${windowsBaseUrl(context)}/api/tasks/$taskId/download/$fileName"
-        Log.d(TAG, "downloadFileOnce -> $url destination=${destination.absolutePath}")
         val request = Request.Builder()
             .url(url)
             .get()
@@ -364,11 +354,10 @@ object CompanionApi {
         downloadClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 val bodyText = response.body?.string().orEmpty()
-                Log.d(TAG, "downloadFileOnce <- code=${response.code} body=$bodyText")
+                Log.w(TAG, "downloadFileOnce failed code=${response.code} body=${bodyText.take(200)}")
                 error("download_failed_${response.code}: $bodyText")
             }
             val body = response.body ?: error("empty_response_body")
-            Log.d(TAG, "downloadFileOnce <- code=${response.code} streaming to ${destination.absolutePath}")
             destination.parentFile?.mkdirs()
             body.byteStream().use { input ->
                 FileOutputStream(destination).use { output ->
@@ -408,7 +397,6 @@ object CompanionApi {
 
     private fun postJson(url: String, body: Any): String {
         val payload = gson.toJson(body)
-        Log.d(TAG, "POST $url payload=$payload")
         val request = Request.Builder()
             .url(url)
             .post(payload.toRequestBody(json.toMediaType()))
@@ -416,19 +404,22 @@ object CompanionApi {
 
         apiClient.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
-            Log.d(TAG, "POST $url <- code=${response.code} success=${response.isSuccessful} body=$text")
-            if (!response.isSuccessful) error("request_failed_${response.code}: $text")
+            if (!response.isSuccessful) {
+                Log.w(TAG, "POST $url failed code=${response.code} body=${text.take(300)}")
+                error("request_failed_${response.code}: $text")
+            }
             return text
         }
     }
 
     private fun get(url: String): String {
-        Log.d(TAG, "GET $url")
         val request = Request.Builder().url(url).get().build()
         apiClient.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
-            Log.d(TAG, "GET $url <- code=${response.code} success=${response.isSuccessful} body=$text")
-            if (!response.isSuccessful) error("request_failed_${response.code}: $text")
+            if (!response.isSuccessful) {
+                Log.w(TAG, "GET $url failed code=${response.code} body=${text.take(300)}")
+                error("request_failed_${response.code}: $text")
+            }
             return text
         }
     }

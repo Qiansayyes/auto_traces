@@ -45,6 +45,16 @@ class AutoSwitchLocalScheduler(
     ) -> Pair<String, String>? = { _, _, _, _, _ -> null },
     private val verifyInsertionLogin: suspend (AutoSwitchSlotTickContext, String) -> Boolean =
         { _, _ -> true },
+    /**
+     * 本地 OP 抛出 [AccountPlanBlockedException]（封禁 / 登录次数上限）时回调；
+     * 调度器本身只记 ledger，由协调器执行 mark_banned / mark_max_login 并移出计划。
+     */
+    private val onAccountPlanBlocked: suspend (
+        alias: String,
+        deviceId: String,
+        ex: AccountPlanBlockedException,
+        source: String,
+    ) -> Unit = { _, _, _, _ -> },
     private val slotInsertions: List<AutoSwitchSlotInsertion> = DEFAULT_INSERTIONS,
 ) : AutoSwitchSlotInsertionHost {
     private val beijingTz = TimeZone.getTimeZone("Asia/Shanghai")
@@ -618,6 +628,22 @@ class AutoSwitchLocalScheduler(
             }.onFailure { err ->
                 LogCenter.op(alias, "【自动切号】本地 OP 执行失败 ${op.op_type}：${err.message}")
                 AutoSwitchLedger.recordOpFailure(op, err.message ?: "执行异常")
+                // 切号登录链抛出的封禁/登录上限不可只记失败：须上报云端并移出计划，否则会卡在 RESTORE_OR_LOGIN。
+                if (err is AccountPlanBlockedException) {
+                    runCatching {
+                        onAccountPlanBlocked(
+                            alias,
+                            deviceId,
+                            err,
+                            "本地OP(${op.op_type})",
+                        )
+                    }.onFailure { handleErr ->
+                        LogCenter.op(
+                            alias,
+                            "【自动切号】本地 OP 账号阻断后续处理失败 ${op.op_type}：${handleErr.message}",
+                        )
+                    }
+                }
             }
             busy.set(false)
             if (opQueue.isEmpty()) {

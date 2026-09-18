@@ -65,24 +65,20 @@ class VideoDedMainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.d(TAG, "onCreate start")
         startForegroundService(Intent(this, VideoDedDeviceService::class.java))
         buildUi()
         lifecycleScope.launch { refreshRegistration() }
         refreshHistorySummary()
         refreshApiSection()
         startPollingCurrentTask()
-        Log.d(TAG, "onCreate done")
     }
 
     override fun onResume() {
         super.onResume()
-        Log.d(TAG, "onResume")
         refreshApiSection()
         if (::mirrorIpOverrideInput.isInitialized && mirrorIpOverrideInput.text.isNullOrBlank()) {
             val wifiIp = ApiSettings.probeLiveLanIpv4(this)
                 ?: WifiUtils.getWifiIp(this).orEmpty()
-            Log.d(TAG, "auto fill mirrorIpOverrideInput=$wifiIp")
             if (wifiIp.isNotEmpty()) mirrorIpOverrideInput.setText(wifiIp)
         }
         if (::mirrorAddrView.isInitialized) {
@@ -222,7 +218,6 @@ class VideoDedMainActivity : ComponentActivity() {
             text = "切换 API 开关"
             setOnClickListener {
                 val next = !ApiSettings.isApiEnabled(this@VideoDedMainActivity)
-                Log.d(TAG, "toggle api enabled -> $next")
                 ApiSettings.setApiEnabled(this@VideoDedMainActivity, next)
                 refreshApiSection()
             }
@@ -283,7 +278,6 @@ class VideoDedMainActivity : ComponentActivity() {
                 CompanionApi.setMaterialUsername(this@VideoDedMainActivity, username)
                 usernameInput.setText(username)
                 val count = countInput.text?.toString()?.toIntOrNull() ?: 1
-                Log.d(TAG, "request button clicked count=$count username=$username targetPath=${CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH}")
                 lifecycleScope.launch {
                     requestVideos(count, username)
                 }
@@ -371,7 +365,6 @@ class VideoDedMainActivity : ComponentActivity() {
         val port = adbTcpPortInput.text?.toString()?.toIntOrNull() ?: 5555
         val rawIp = mirrorIpOverrideInput.text?.toString().orEmpty().trim()
         val windowsUrl = windowsUrlInput.text?.toString().orEmpty().trim()
-        Log.d(TAG, "save settings clicked port=$port rawIp=$rawIp windowsUrl=$windowsUrl")
         if (rawIp.isNotEmpty() && !ApiSettings.isPlausibleLanIpv4(rawIp)) {
             Log.w(TAG, "invalid mirror ip: $rawIp")
             Toast.makeText(this@VideoDedMainActivity, "本机 IPv4 格式不正确，请检查或留空", Toast.LENGTH_LONG).show()
@@ -453,7 +446,6 @@ class VideoDedMainActivity : ComponentActivity() {
             }
             Toast.makeText(this, toast, Toast.LENGTH_LONG).show()
         }
-        Log.d(TAG, "refreshRegistration success mirrorReady=${result.mirrorReadyOnPc}")
     }
 
     private fun explainWindowsServiceFailure(t: Throwable): String {
@@ -486,9 +478,7 @@ class VideoDedMainActivity : ComponentActivity() {
     private suspend fun requestVideos(count: Int, username: String) {
         val targetPath = CompanionApi.DEFAULT_MATERIAL_STORAGE_PATH
         try {
-            Log.d(TAG, "requestVideos start count=$count username=$username targetPath=$targetPath")
             val task = CompanionApi.createTask(applicationContext, count, targetPath, username)
-            Log.d(TAG, "requestVideos task=${task.taskId} status=${task.status} files=${task.files.size}")
             currentTaskId = task.taskId
             currentTaskView.text = "当前任务：${task.taskId} (${task.status})"
             TaskStore.saveTaskSnapshot(
@@ -529,20 +519,17 @@ class VideoDedMainActivity : ComponentActivity() {
 
     private suspend fun downloadTask(taskId: String, files: List<TaskFileInfo>, targetPath: String?) {
         try {
-            Log.d(TAG, "downloadTask start taskId=$taskId files=${files.size} targetPath=$targetPath")
             TaskDownloadWorkflow.downloadVerifyAndAck(
                 applicationContext,
                 taskId,
                 files,
                 targetPath,
             ) { msg ->
-                Log.d(TAG, "downloadTask progress taskId=$taskId msg=$msg")
                 appendLog(msg)
             }
             lastResultView.text = "最近结果：任务 $taskId 下载完成"
             currentTaskView.text = "当前任务：$taskId (completed)"
             refreshHistorySummary()
-            Log.d(TAG, "downloadTask success taskId=$taskId")
         } catch (t: Throwable) {
             Log.e(TAG, "downloadTask failed taskId=$taskId", t)
             refreshHistorySummary()
@@ -571,7 +558,6 @@ class VideoDedMainActivity : ComponentActivity() {
     private suspend fun refreshCurrentTaskStatus(taskId: String? = null) {
         val id = taskId ?: currentTaskId ?: return
         try {
-            Log.d(TAG, "refreshCurrentTaskStatus id=$id")
             val local = TaskStore.loadTasks(this).firstOrNull { it.taskId == id }
             val status = CompanionApi.getTaskStatus(applicationContext, id)
             val localSt = local?.status ?: "—"
@@ -608,7 +594,6 @@ class VideoDedMainActivity : ComponentActivity() {
     }
 
     private fun appendLog(message: String) {
-        Log.d(TAG, "appendLog: $message")
         StatusLogBuffer.append(message)
     }
 
@@ -624,7 +609,6 @@ class VideoDedMainActivity : ComponentActivity() {
     private fun refreshMirrorAddrLine() {
         val port = ApiSettings.getAdbTcpipPort(this)
         val ip = ApiSettings.getEffectiveMirrorLanIpv4(this)
-        Log.d(TAG, "refreshMirrorAddrLine ip=$ip port=$port")
         mirrorAddrView.text = if (ip.isNullOrBlank()) {
             "无线 ADB 地址：adb connect <本机 IPv4>:$port"
         } else {
@@ -643,7 +627,6 @@ class VideoDedMainActivity : ComponentActivity() {
     private fun copyMirrorAddressToClipboard() {
         val port = ApiSettings.getAdbTcpipPort(this)
         val ip = ApiSettings.getEffectiveMirrorLanIpv4(this)
-        Log.d(TAG, "copyMirrorAddressToClipboard ip=$ip port=$port")
         if (ip.isNullOrBlank()) {
             Toast.makeText(this, "未取得局域网 IPv4，请先在上方自动获取或手填本机 IP", Toast.LENGTH_LONG).show()
             return

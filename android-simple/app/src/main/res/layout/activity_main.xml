@@ -30,7 +30,7 @@
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/showActionButton"
-                style="@style/Widget.MaterialComponents.Button"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="6dp"
@@ -70,7 +70,7 @@
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/showLogButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                style="@style/Widget.MaterialComponents.Button"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="6dp"
@@ -98,10 +98,21 @@
             android:textSize="12sp"
             android:textColor="@android:color/darker_gray" />
 
+        <!-- 紧凑状态：最多两行，避免横屏把日志区挤没 -->
+        <TextView
+            android:id="@+id/runtimeStateText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="11sp" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="4dp"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
@@ -118,6 +129,7 @@
                 style="@style/Widget.MaterialComponents.Button.TextButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:minHeight="36dp"
                 android:text="一键清理日志" />
         </LinearLayout>
 
@@ -125,28 +137,13 @@
             android:id="@+id/logScroll"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="4dp"
             android:layout_weight="1"
             android:fillViewport="true"
             android:scrollbars="vertical">
 
             <TextView
                 android:id="@+id/logText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:textColor="@android:color/darker_gray" />
-        </ScrollView>
-
-        <ScrollView
-            android:id="@+id/runtimeStateScroll"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:maxHeight="132dp"
-            android:scrollbars="vertical">
-
-            <TextView
-                android:id="@+id/runtimeStateText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textColor="@android:color/darker_gray"

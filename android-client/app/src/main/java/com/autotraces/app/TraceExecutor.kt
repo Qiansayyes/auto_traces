@@ -1312,6 +1312,13 @@ class RealTraceExecutor(
         /** 发作品前额外清空的系统 Camera 相册目录（DCIM/Camera）。 */
         private const val PUBLISH_POST_DCIM_CAMERA_PATH = "/storage/emulated/0/DCIM/Camera"
 
+        /** 发作品清理：整棵 DCIM（含 Camera 外其它子相册，TikTok Recents 会扫到）。 */
+        private const val PUBLISH_POST_DCIM_PATH = "/storage/emulated/0/DCIM"
+
+        /** 发作品清理：Download / Movies，避免 Recents 残留旧素材。 */
+        private const val PUBLISH_POST_DOWNLOAD_PATH = "/storage/emulated/0/Download"
+        private const val PUBLISH_POST_MOVIES_PATH = "/storage/emulated/0/Movies"
+
         /** 发作品统计/选图时排除的子目录（App 调试截图、下发缓存等，不计入可发条数）。 */
         private const val PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR = "AutoTraces"
 
@@ -12863,7 +12870,7 @@ class RealTraceExecutor(
                 PrefsStore.setPublishPostMaterialReady(false)
                 devOp(alias, "发作品：忽略残留素材就绪标记，强制清理图库后重新拉取")
             }
-            devOp(alias, "发作品：清理设备图库 Pictures + DCIM/Camera（拉取新素材前）")
+            devOp(alias, "发作品：清理设备图库 Pictures+DCIM+Download+Movies（拉取新素材前）")
             deleteAllPicturesOnDevice(alias, "发作品", includeDcimCameraAlbum = true)
             if (configuredFetchCount > 0) {
                 if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
@@ -14034,10 +14041,8 @@ class RealTraceExecutor(
 
     private fun galleryCleanupMediaStoreSelection(includeDcimCameraAlbum: Boolean): Pair<String, Array<String>> =
         if (includeDcimCameraAlbum) {
-            combineMediaStoreSelections(
-                picturesMediaStorePicturesSelection(),
-                dcimCameraMediaStoreSelection(),
-            )
+            // 发作品：TikTok Recents 展示全盘最近图/视频；只清 Pictures+Camera 会漏改资料头像等旧素材
+            "1=1" to emptyArray()
         } else {
             picturesMediaStorePicturesSelection()
         }
@@ -14061,6 +14066,7 @@ class RealTraceExecutor(
         ctx: Context,
         exts: List<String>? = null,
         excludeAutoTraces: Boolean = false,
+        includePending: Boolean = false,
     ): Int {
         val extSet = exts?.map { it.lowercase(Locale.US) }?.toSet()
         val resolver = ctx.contentResolver
@@ -14079,8 +14085,9 @@ class RealTraceExecutor(
                 val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
                 val pendingCol = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
                 while (cursor.moveToNext()) {
-                    // IS_PENDING=1 对第三方（TikTok）不可见，不能算作可用素材
-                    if (pendingCol >= 0 && cursor.getInt(pendingCol) != 0) continue
+                    // 发作品可用素材统计：IS_PENDING=1 对 TikTok 不可见，不计
+                    // 清理统计：必须含 pending，否则 shell 幽灵行会被漏清
+                    if (!includePending && pendingCol >= 0 && cursor.getInt(pendingCol) != 0) continue
                     val rel = cursor.getString(relCol)
                     val data = cursor.getString(dataCol)
                     if (excludeAutoTraces && publishPostIsAutoTracesMediaPath(rel, data)) continue
@@ -14097,23 +14104,37 @@ class RealTraceExecutor(
         return count
     }
 
-    private fun countDcimCameraMediaStoreEntries(ctx: Context): Int =
-        countMediaStoreEntriesWithSelection(ctx, dcimCameraMediaStoreSelection(), exts = null)
+    private fun countDcimCameraMediaStoreEntries(
+        ctx: Context,
+        includePending: Boolean = false,
+    ): Int =
+        countMediaStoreEntriesWithSelection(
+            ctx,
+            dcimCameraMediaStoreSelection(),
+            exts = null,
+            includePending = includePending,
+        )
 
     private fun countMediaStoreEntriesWithSelection(
         ctx: Context,
         selectionPair: Pair<String, Array<String>>,
         exts: List<String>?,
+        includePending: Boolean = false,
     ): Int {
         val extSet = exts?.map { it.lowercase(Locale.US) }?.toSet()
         val resolver = ctx.contentResolver
         val (selection, selectionArgs) = selectionPair
-        val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME)
+        val projection = arrayOf(
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.IS_PENDING,
+        )
         var count = 0
         for (collection in picturesMediaStoreCollections()) {
             resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
                 val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val pendingCol = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
                 while (cursor.moveToNext()) {
+                    if (!includePending && pendingCol >= 0 && cursor.getInt(pendingCol) != 0) continue
                     val displayName = cursor.getString(nameCol)?.trim().orEmpty()
                     if (displayName.isEmpty()) continue
                     if (extSet != null) {
@@ -14128,43 +14149,120 @@ class RealTraceExecutor(
     }
 
     private fun countGalleryCleanupMediaStoreEntries(ctx: Context, includeDcimCameraAlbum: Boolean): Int {
-        var total = countPicturesMediaStoreEntries(ctx)
-        if (includeDcimCameraAlbum) total += countDcimCameraMediaStoreEntries(ctx)
-        return total
+        // 清理必须统计 pending 幽灵，否则日志会假报「清理前=0」而 TikTok Recents 仍有旧素材
+        if (includeDcimCameraAlbum) {
+            return countMediaStoreEntriesWithSelection(
+                ctx,
+                "1=1" to emptyArray(),
+                exts = null,
+                includePending = true,
+            )
+        }
+        return countPicturesMediaStoreEntries(ctx, includePending = true)
     }
 
     private fun countGalleryCleanupFilesViaSu(includeDcimCameraAlbum: Boolean): Int {
-        var pictures = countAllPicturesFilesViaSu()
-        if (!includeDcimCameraAlbum) return pictures
-        val camera = countAllFilesViaSu(PUBLISH_POST_DCIM_CAMERA_PATH)
-        return when {
-            pictures < 0 && camera < 0 -> -1
-            pictures < 0 -> camera
-            camera < 0 -> pictures
-            else -> pictures + camera
+        if (!includeDcimCameraAlbum) return countAllPicturesFilesViaSu()
+        val paths = listOf(
+            PUBLISH_POST_PICTURES_PATH,
+            PUBLISH_POST_DCIM_PATH,
+            PUBLISH_POST_DOWNLOAD_PATH,
+            PUBLISH_POST_MOVIES_PATH,
+        )
+        var total = 0
+        var anyOk = false
+        for (path in paths) {
+            val n = countAllFilesViaSu(path)
+            if (n >= 0) {
+                anyOk = true
+                total += n
+            }
         }
+        return if (anyOk) total else -1
     }
 
     /**
      * 删除经 MediaStore 写入、仅 rm 文件仍会残留在图库里的索引（含 IS_PENDING 幽灵项）。
+     * App ContentResolver 删不掉 owner=shell 的行；root content delete 常报 UID 0；
+     * 实测 `su shell -c content delete --uri …/id` 可删（exit 可能非 0）。
      */
     private fun deleteGalleryMediaStoreEntries(ctx: Context, includeDcimCameraAlbum: Boolean): Int {
         var deleted = 0
         val resolver = ctx.contentResolver
         val (selection, selectionArgs) = galleryCleanupMediaStoreSelection(includeDcimCameraAlbum)
         val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val leftover = mutableListOf<Pair<Uri, Long>>()
         for (collection in picturesMediaStoreCollections()) {
             resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol)
                     val itemUri = ContentUris.withAppendedId(collection, id)
-                    deleted += resolver.delete(itemUri, null, null).coerceAtLeast(0)
+                    val n = resolver.delete(itemUri, null, null).coerceAtLeast(0)
+                    if (n > 0) {
+                        deleted += n
+                    } else {
+                        leftover.add(itemUri to id)
+                    }
                 }
+            }
+        }
+        for ((itemUri, id) in leftover) {
+            val flat = itemUri.toString()
+            // root 常失败，仍尝试；shell 身份才能删 shell 幽灵
+            runSuCommand("content delete --uri $flat")
+            runSuShellContentDelete(flat)
+            // 删不掉则藏起来，避免 TikTok Recents 继续展示旧缩略图
+            if (mediaStoreRowStillExists(ctx, itemUri)) {
+                runSuCommand(
+                    "content update --uri content://media/external/video/media/$id --bind is_pending:i:1",
+                )
+                runSuCommand(
+                    "content update --uri content://media/external/images/media/$id --bind is_pending:i:1",
+                )
+                runSuShellContentDelete(flat)
+            } else {
+                deleted++
             }
         }
         return deleted
     }
+
+    /** `su shell -c content delete`：不要求 exit=0（部分机 segfault 但仍删成功）。 */
+    private fun runSuShellContentDelete(contentUri: String) {
+        val cmd = "content delete --uri $contentUri"
+        val candidates = listOf(
+            arrayOf("su", "shell", "-c", cmd),
+            arrayOf("/system/bin/su", "shell", "-c", cmd),
+            arrayOf("sh", "-c", "su shell -c " + shellEscape(cmd)),
+        )
+        for (args in candidates) {
+            try {
+                val process = Runtime.getRuntime().exec(args)
+                thread(start = true, name = "su-shell-out") {
+                    runCatching { process.inputStream.bufferedReader().use { it.readText() } }
+                }
+                thread(start = true, name = "su-shell-err") {
+                    runCatching { process.errorStream.bufferedReader().use { it.readText() } }
+                }
+                process.waitFor()
+                return
+            } catch (_: Exception) {
+                // try next
+            }
+        }
+    }
+
+    private fun mediaStoreRowStillExists(ctx: Context, uri: Uri): Boolean =
+        runCatching {
+            ctx.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns._ID),
+                null,
+                null,
+                null,
+            )?.use { it.moveToFirst() } == true
+        }.getOrDefault(false)
 
     /** su 递归清空指定目录（与 adb `find … -delete` 一致）。 */
     private fun deleteFilesystemGalleryDir(absolutePath: String) {
@@ -14196,8 +14294,10 @@ class RealTraceExecutor(
     }
 
     /**
-     * 清理图库：先删 MediaStore 索引，再 su 递归删磁盘，最后触发媒体库扫描。
-     * [includeDcimCameraAlbum] 为 true 时额外清空 DCIM/Camera（发作品用）；修改基本资料为 false。
+     * 清理图库：先删磁盘再清 MediaStore 索引，最后触发媒体库扫描。
+     * [includeDcimCameraAlbum] 为 true（发作品）时：清空 Pictures+DCIM+Download+Movies，
+     * 并删除全部外部图/视频 MediaStore 行 + 强停 TikTok，避免 Recents 仍展示旧缩略图。
+     * 修改基本资料为 false：仅清 Pictures。
      */
     private suspend fun deleteAllPicturesOnDevice(
         alias: String,
@@ -14208,32 +14308,64 @@ class RealTraceExecutor(
             val ctx = appContextProvider().applicationContext
             val fsPaths = buildList {
                 add(PUBLISH_POST_PICTURES_PATH)
-                if (includeDcimCameraAlbum) add(PUBLISH_POST_DCIM_CAMERA_PATH)
+                if (includeDcimCameraAlbum) {
+                    add(PUBLISH_POST_DCIM_PATH)
+                    add(PUBLISH_POST_DOWNLOAD_PATH)
+                    add(PUBLISH_POST_MOVIES_PATH)
+                }
             }
             val scopeLabel = if (includeDcimCameraAlbum) {
-                "${PUBLISH_POST_PICTURES_PATH} + ${PUBLISH_POST_DCIM_CAMERA_PATH}"
+                "Pictures+DCIM+Download+Movies（全量 MediaStore 图/视频）"
             } else {
                 PUBLISH_POST_PICTURES_PATH
             }
             val beforeMs = countGalleryCleanupMediaStoreEntries(ctx, includeDcimCameraAlbum)
             val beforeFs = countGalleryCleanupFilesViaSu(includeDcimCameraAlbum)
+            // 先清磁盘再清索引：避免 shell 幽灵行删不干净时 TikTok Recents 仍读到旧文件
+            for (path in fsPaths) {
+                deleteFilesystemGalleryDir(path)
+            }
+            // 入库失败残留的 received 任务目录（不进 TikTok，但会占空间且干扰排查）
+            if (includeDcimCameraAlbum) {
+                runCatching {
+                    CompanionApi.receivedStorageRoot(ctx).listFiles()?.forEach { child ->
+                        if (child.isDirectory) child.deleteRecursively()
+                    }
+                }
+            }
             val msDeletedFirst = runCatching { deleteGalleryMediaStoreEntries(ctx, includeDcimCameraAlbum) }
                 .getOrElse { ex ->
                     devOp(alias, "$logContext：MediaStore 清理异常 ${ex.message}")
                     0
                 }
-            for (path in fsPaths) {
-                deleteFilesystemGalleryDir(path)
-            }
             val msDeletedSecond = runCatching {
                 deleteGalleryMediaStoreEntries(ctx, includeDcimCameraAlbum)
             }.getOrElse { 0 }
-            requestGalleryPathsMediaRescan(ctx, alias, logContext, fsPaths)
-            delay(800)
+            if (includeDcimCameraAlbum) {
+                // 发作品清库：只扫已清空的目录，禁止 cmd media scan-volume（会把残留重新扫成 shell 幽灵）
+                MediaScannerConnection.scanFile(ctx, fsPaths.toTypedArray(), null) { path, uri ->
+                    devOp(alias, "$logContext：媒体库刷新 scan path=$path uri=$uri")
+                }
+                // Recents 会缓存旧缩略图；强停后下次进选图页按 MediaStore 重载
+                val ttPkg = Config.TIKTOK_PACKAGE_NAME
+                runSuCommand("am force-stop $ttPkg")
+                runSuCommand("am kill $ttPkg")
+                runSuCommand("rm -rf /data/data/$ttPkg/cache 2>/dev/null")
+                delay(500)
+            } else {
+                requestGalleryPathsMediaRescan(ctx, alias, logContext, fsPaths)
+                delay(800)
+            }
             val afterMs = countGalleryCleanupMediaStoreEntries(ctx, includeDcimCameraAlbum)
             val afterFs = countGalleryCleanupFilesViaSu(includeDcimCameraAlbum)
             val fsRemoved = if (beforeFs >= 0 && afterFs >= 0) (beforeFs - afterFs).coerceAtLeast(0) else beforeFs
             val msRemoved = (beforeMs - afterMs).coerceAtLeast(0)
+            if (afterMs > 0 || (afterFs > 0)) {
+                devOp(
+                    alias,
+                    "$logContext：图库清理后仍有残留 MediaStore=$afterMs 磁盘=$afterFs（含 pending/shell 幽灵时已尝试 su shell delete / 藏 pending）",
+                )
+            }
             devOp(
                 alias,
                 "$logContext：图库清理完成（范围 $scopeLabel） " +
@@ -14458,27 +14590,31 @@ class RealTraceExecutor(
         val ctx = appContextProvider().applicationContext
         val suImages = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_IMAGE_EXTS)
         val suVideos = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_VIDEO_EXTS)
+        // TikTok 可见性以 MediaStore 非 pending 为准；su find 会把 IS_PENDING/shell 幽灵算进去，
+        // 导致「日志有素材、选图页空」并错误跳过补拉。
         val msImages = countPicturesMediaStoreEntries(
             ctx,
             PUBLISH_POST_PICTURES_IMAGE_EXTS,
             excludeAutoTraces = true,
+            includePending = false,
         )
         val msVideos = countPicturesMediaStoreEntries(
             ctx,
             PUBLISH_POST_PICTURES_VIDEO_EXTS,
             excludeAutoTraces = true,
+            includePending = false,
         )
-        fun resolved(su: Int, ms: Int): Int {
-            if (su < 0) return ms
-            return maxOf(su, ms)
-        }
-        val images = resolved(suImages, msImages)
-        val videos = resolved(suVideos, msVideos)
         if (suImages < 0 || suVideos < 0) {
             devOp(
                 alias,
                 "发作品：su find 统计 Pictures 失败（images=$suImages videos=$suVideos），" +
-                    "MediaStore 补统计 images=$msImages videos=$msVideos",
+                    "改用 MediaStore 图片=$msImages 视频=$msVideos",
+            )
+        } else if (suImages > msImages || suVideos > msVideos) {
+            devOp(
+                alias,
+                "发作品：磁盘 find 图片=$suImages 视频=$suVideos 大于 MediaStore 可见 " +
+                    "图片=$msImages 视频=$msVideos（多为 IS_PENDING/shell 幽灵，按 MediaStore 可见数计）",
             )
         } else if ((suImages + suVideos) == 0 && (msImages + msVideos) > 0) {
             devOp(
@@ -14486,7 +14622,7 @@ class RealTraceExecutor(
                 "发作品：su find 未见 Pictures 文件，MediaStore 统计 图片=$msImages 视频=$msVideos",
             )
         }
-        return images to videos
+        return msImages to msVideos
     }
 
     override fun countPicturesGalleryImageFiles(): Int {
@@ -18298,11 +18434,186 @@ class RealTraceExecutor(
         return findAllPasswordLabelHits(vision).isNotEmpty()
     }
 
-    /** Authenticator app 二步验证页。 */
+    /**
+     * 真·2FA 输入页：必须以 Authenticator app 认定。
+     * 注意：Email 二步页也有「2-step verification」，不能单靠它判定。
+     */
     private fun visionHasAuthenticatorAppPage(vision: Text): Boolean =
-        findLabelHitContainingIgnoreCase(vision, "authenticator app") != null ||
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "authenticator app") != null
+
+    /**
+     * 密码后落到的邮箱二步验证页（非真 2FA）。
+     * 以大标题 Email 为主；再要求同屏有 2-step / Use another method，避免误把「选验证方式」页的 Email 选项当成此页。
+     */
+    private fun visionHasEmailTwoStepVerificationPage(vision: Text): Boolean {
+        if (visionHasAuthenticatorAppPage(vision)) return false
+        if (findTwoStepEmailTitleHit(vision) == null) return false
+        val hasTwoStep =
             findLabelHitContainingIgnoreCase(vision, "2-step verification") != null ||
-            findLabelHitContainingIgnoreCase(vision, "2 step verification") != null
+                findLabelHitContainingIgnoreCase(vision, "2 step verification") != null
+        val hasUseAnother = findUseAnotherMethodHit(vision) != null
+        val hasMaxAttempts =
+            findLabelHitContainingIgnoreCase(vision, "maximum number of attempts") != null
+        return hasTwoStep || hasUseAnother || hasMaxAttempts
+    }
+
+    /** Email 二步页大标题（严格 Email，避免误点其它含 email 的文案）。 */
+    private fun findTwoStepEmailTitleHit(vision: Text): StrictLabelHit? =
+        findStrictExactLabelHit(vision, "Email")
+            ?: findStrictExactLabelHitIgnoreCase(vision, "Email")
+
+    /** 「Use another method >」入口。 */
+    private fun findUseAnotherMethodHit(vision: Text): StrictLabelHit? =
+        findLabelHitContainingIgnoreCaseRelaxed(vision, "use another method")
+            ?: findLabelHitContainingIgnoreCase(vision, "use another method")
+
+    /**
+     * 底部「Select verification method」弹层里的 Authenticator 选项。
+     * 排除最终页标题「Authenticator app」里拆出来的 Authenticator 单词，避免误点标题。
+     */
+    private fun findSelectMethodAuthenticatorHit(vision: Text): StrictLabelHit? {
+        if (visionHasAuthenticatorAppPage(vision)) return null
+        val hasSelectSheet =
+            findLabelHitContainingIgnoreCase(vision, "select verification method") != null
+        // 优先：同屏已见选择方式弹层时，取严格 Authenticator
+        if (hasSelectSheet) {
+            findStrictExactLabelHit(vision, "Authenticator")?.let { return it }
+            findStrictExactLabelHitIgnoreCase(vision, "Authenticator")?.let { return it }
+            findLabelHitContainingIgnoreCase(vision, "authenticator")?.let { hit ->
+                if (!ocrHitLineLooksLikeAuthenticatorApp(vision, hit)) return hit
+            }
+        }
+        // 弹层标题 OCR 偶发漏识：仍允许严格 Authenticator，但排除 app 标题行
+        findStrictExactLabelHit(vision, "Authenticator")?.let { hit ->
+            if (!ocrHitLineLooksLikeAuthenticatorApp(vision, hit)) return hit
+        }
+        findStrictExactLabelHitIgnoreCase(vision, "Authenticator")?.let { hit ->
+            if (!ocrHitLineLooksLikeAuthenticatorApp(vision, hit)) return hit
+        }
+        return null
+    }
+
+    /** 命中点所在行是否像「Authenticator app」标题（避免弹层选项与最终页标题混淆）。 */
+    private fun ocrHitLineLooksLikeAuthenticatorApp(vision: Text, hit: StrictLabelHit): Boolean {
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                val b = line.boundingBox ?: continue
+                if (!Rect.intersects(b, hit.rect)) continue
+                val t = line.text.lowercase(Locale.US)
+                if (t.contains("authenticator") && t.contains("app")) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Email 二步页 → 切到 Authenticator app：
+     * 1) OCR Email（带重试）→ 点 Email 两次防漏点
+     * 2) OCR Use another method（带重试）→ 点击
+     * 3) 弹层 OCR Authenticator（带重试）→ 点击
+     * 调用方再继续等到 Authenticator app。
+     */
+    private suspend fun autoLoginSwitchEmailTwoStepToAuthenticator(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        tagPrefix: String,
+        initialVision: Text? = null,
+    ): Boolean {
+        var emailHit: StrictLabelHit? =
+            initialVision?.let { findTwoStepEmailTitleHit(it) }
+        if (emailHit == null) {
+            for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+                if (hardStopOrNull(alias, "自动登录-2FA切Email")) return false
+                if (pass > 1) {
+                    if (!autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "2FA-Email定位")) {
+                        return false
+                    }
+                }
+                val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_email_$pass") ?: continue
+                if (visionHasAuthenticatorAppPage(vision)) {
+                    devOp(alias, "自动登录(2FA)：切方法前已是 Authenticator app，跳过 Email 切换")
+                    return true
+                }
+                emailHit = findTwoStepEmailTitleHit(vision)
+                if (emailHit != null) {
+                    devOp(alias, "自动登录(2FA)：第 $pass 次 OCR 命中 Email 标题")
+                    break
+                }
+                devOp(alias, "自动登录(2FA)：第 $pass/${AUTO_LOGIN_OCR_MAX_PASSES} 次未命中 Email")
+            }
+        }
+        val hit = emailHit
+        if (hit == null) {
+            devOp(alias, "自动登录(2FA)：Email 标题 OCR 重试耗尽")
+            return false
+        }
+        // 点 Email 两次，降低单次漏点
+        repeat(2) { idx ->
+            val tap = autoLoginTapWithJitter(hit.point, w, h)
+            devOp(alias, "自动登录(2FA)：点 Email 第 ${idx + 1}/2 次 (${tap.x},${tap.y})")
+            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                devOp(alias, "自动登录(2FA)：点 Email 第 ${idx + 1} 次失败")
+                return false
+            }
+            if (!autoLoginDelay(alias, 450L, "2FA-点Email后")) return false
+        }
+
+        val useAnotherOutcome = autoLoginOcrTapByFinder(
+            ctx, alias, w, h,
+            "${tagPrefix}_use_another",
+            "Use another method(2FA)",
+            maxPasses = AUTO_LOGIN_OCR_MAX_PASSES,
+            findHit = { v -> findUseAnotherMethodHit(v) },
+        )
+        if (useAnotherOutcome != AutoLoginStepOutcome.Ok) {
+            devOp(alias, "自动登录(2FA)：未点到 Use another method")
+            return false
+        }
+
+        // 点完 Use another method 后：可能已在 Authenticator app，或需点弹层 Authenticator
+        for (pass in 1..AUTO_LOGIN_OCR_MAX_PASSES) {
+            if (hardStopOrNull(alias, "自动登录-2FA选Authenticator")) return false
+            if (pass > 1) {
+                if (!autoLoginDelay(alias, AUTO_LOGIN_OCR_RETRY_DELAY_MS, "2FA-选Authenticator")) {
+                    return false
+                }
+            } else {
+                if (!autoLoginDelay(alias, 450L, "2FA-选Authenticator")) return false
+            }
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_pick_auth_$pass") ?: continue
+            if (visionHasAuthenticatorAppPage(vision)) {
+                devOp(alias, "自动登录(2FA)：弹层阶段已识别 Authenticator app（第 $pass 次）")
+                return true
+            }
+            val authHit = findSelectMethodAuthenticatorHit(vision)
+            if (authHit == null) {
+                devOp(alias, "自动登录(2FA)：第 $pass/${AUTO_LOGIN_OCR_MAX_PASSES} 次未命中弹层 Authenticator")
+                continue
+            }
+            val tap = autoLoginTapWithJitter(authHit.point, w, h)
+            devOp(alias, "自动登录(2FA)：点弹层 Authenticator (${tap.x},${tap.y})")
+            if (!runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                devOp(alias, "自动登录(2FA)：点弹层 Authenticator 失败")
+                return false
+            }
+            if (!autoLoginDelay(alias, 550L, "2FA-点Authenticator后")) return false
+            // 点完后再确认是否已进入真·2FA 页（短确认，失败也交回等待环）
+            for (confirm in 1..3) {
+                val again = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_after_auth_$confirm")
+                if (again != null && visionHasAuthenticatorAppPage(again)) {
+                    devOp(alias, "自动登录(2FA)：已从 Email 切到 Authenticator app")
+                    return true
+                }
+                if (confirm < 3 && !autoLoginDelay(alias, 500L, "2FA-切后确认")) return false
+            }
+            devOp(alias, "自动登录(2FA)：已点弹层 Authenticator，交回等待环确认页面")
+            return true
+        }
+        devOp(alias, "自动登录(2FA)：未点到弹层 Authenticator")
+        return false
+    }
 
     /**
      * 布局 B：定位 password 输入区 → 输密 → 点 Continue。
@@ -18417,7 +18728,10 @@ class RealTraceExecutor(
         return false
     }
 
-    /** 密码 Continue 后等待 Authenticator app 页（最长 80s）。 */
+    /**
+     * 密码 Continue 后等待 Authenticator app 页（最长 80s）。
+     * 若先落到 Email 二步页：点 Email×2 → Use another method → Authenticator，再等到真·2FA 页。
+     */
     private suspend fun autoLoginWaitForAuthenticatorAppPage(
         ctx: Context,
         alias: String,
@@ -18429,6 +18743,8 @@ class RealTraceExecutor(
         val startedAt = System.currentTimeMillis()
         var pass = 0
         var lastContinueTapAt = 0L
+        var emailSwitchAttempts = 0
+        val emailSwitchMax = 3
         devOp(alias, "自动登录(2FA)：密码后等待 Authenticator 页（最长 ${timeoutMs / 1000}s）")
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
             if (hardStopOrNull(alias, "自动登录-等待2FA页")) return false
@@ -18441,6 +18757,27 @@ class RealTraceExecutor(
             if (visionHasAuthenticatorAppPage(vision)) {
                 devOp(alias, "自动登录(2FA)：已识别 Authenticator app 页（第 $pass 次 OCR）")
                 return true
+            }
+            // 路径 B：先落到 Email → 切 Authenticator（OCR 均带重试；Email 点两次）
+            if (visionHasEmailTwoStepVerificationPage(vision)) {
+                if (emailSwitchAttempts >= emailSwitchMax) {
+                    devOp(alias, "自动登录(2FA)：Email→Authenticator 切换已达 $emailSwitchMax 次仍未进入")
+                    if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+                    continue
+                }
+                emailSwitchAttempts++
+                devOp(
+                    alias,
+                    "自动登录(2FA)：密码后落在 Email 页，开始切 Authenticator（第 $emailSwitchAttempts/$emailSwitchMax 次）",
+                )
+                val switched = autoLoginSwitchEmailTwoStepToAuthenticator(
+                    ctx, alias, w, h, "${tagPrefix}_email_switch$emailSwitchAttempts", vision,
+                )
+                if (!switched) {
+                    devOp(alias, "自动登录(2FA)：Email→Authenticator 本轮切换失败，继续 OCR 重试")
+                }
+                if (!autoLoginDelay(alias, 800L, "Email切Authenticator后")) return false
+                continue
             }
             val continueHit = findStrictExactLabelHit(vision, "Continue")
                 ?: findStrictExactLabelHit(vision, "continue")
@@ -18504,7 +18841,7 @@ class RealTraceExecutor(
         ) == AutoLoginStepOutcome.Ok
     }
 
-    /** 2FA 账号：Username → Password(布局B) → Authenticator → 兴趣页/Home。 */
+    /** 2FA 账号：Username → Password(布局B) → [可选 Email 切 Authenticator] → Authenticator app → 兴趣页/Home。 */
     private suspend fun runAutoLoginTwoFaUsernameChain(
         ctx: Context,
         alias: String,

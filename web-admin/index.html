@@ -862,8 +862,9 @@
             <label class="pager-size-label" for="accountRecordsExportMinFollowersInput" title="导出粉丝数大于该值的账号整行到 xlsx（不删除）">粉丝&gt;</label>
             <input id="accountRecordsExportMinFollowersInput" type="number" class="pager-size-input" min="0" step="1" value="1000" style="width:88px;" title="默认 1000：导出粉丝数大于该阈值的账号整行" />
             <button id="accountRecordsExportByFollowersBtn" type="button" class="ghost" title="提取粉丝数大于指定值的账号整行到 XLSX，不删除原记录">提取高粉账号</button>
-            <input id="accountRecordsDeleteByUsernameInput" type="text" class="ui-input" placeholder="输入 username 删除整行" style="min-width:160px;max-width:220px;" autocomplete="off" title="按 username 删除对应整行；多个可用逗号/空格/换行分隔" />
-            <button id="accountRecordsDeleteByUsernameBtn" type="button" class="danger" title="删除指定 username 对应的账号记录整行，并同步清理设备备份档案">按用户名删除</button>
+            <button id="accountRecordsDeleteUsernameTemplateBtn" type="button" class="ghost" title="下载按用户名删除的文件模板（每行一个 username）">下载删除模板</button>
+            <input id="accountRecordsDeleteByUsernameFile" type="file" accept=".txt,.csv,text/plain,text/csv" style="max-width:220px;" title="上传要删除的 username 列表文件（txt/csv，每行一个）" />
+            <button id="accountRecordsDeleteByUsernameBtn" type="button" class="danger" title="按上传文件中的 username 删除对应账号记录整行，并同步清理设备备份档案">按文件删除</button>
             <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
             <button id="accountRecordsNextPageBtn" type="button" class="ghost">下一页</button>
@@ -1764,6 +1765,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260917-fix-login"></script>
+  <script src="app.js?v=20260918-account-delete-file2"></script>
 </body>
 </html>

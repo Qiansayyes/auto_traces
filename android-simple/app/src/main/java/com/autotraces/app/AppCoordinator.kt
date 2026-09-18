@@ -168,6 +168,9 @@ object AppCoordinator {
                 else -> true
             }
         },
+        onAccountPlanBlocked = { a, d, ex, source ->
+            handleAccountPlanBlocked(a, d, ex, source)
+        },
     )
     private var pullLoopJob: Job? = null
     private var forYouSwipeJob: Job? = null
@@ -7962,28 +7965,48 @@ object AppCoordinator {
             ?.username?.trim().orEmpty()
         if (PrefsStore.isAutoSwitchAutonomousMode()) {
             withContext(NonCancellable) {
-                val loginOk = verifyAutoSwitchCutSwitchSessionAfterChain(
-                    alias = alias,
-                    deviceId = deviceId,
-                    opId = opId,
-                    targetUsername = targetUser,
-                    phase = "exclusive_auto_login",
-                )
-                if (loginOk) {
-                    finishAutoSwitchCutSwitchAfterSuccess(
+                try {
+                    val loginOk = verifyAutoSwitchCutSwitchSessionAfterChain(
+                        alias = alias,
+                        deviceId = deviceId,
+                        opId = opId,
+                        targetUsername = targetUser,
+                        phase = "exclusive_auto_login",
+                    )
+                    if (loginOk) {
+                        finishAutoSwitchCutSwitchAfterSuccess(
+                            alias,
+                            opId,
+                            targetRowIndex = targetRi,
+                            slotKey = slotKey.trim(),
+                            completionMethod = "exclusive_auto_login",
+                        )
+                        scheduleCutSwitchDeferredBasicProfileEdit(alias, deviceId, opId)
+                    } else {
+                        notifyAutoSwitchCutSwitchStepFailed(
+                            payload,
+                            CutSwitchFailureKind.RESTORE_OR_LOGIN,
+                            "切号自动登录失败",
+                        )
+                    }
+                } catch (blocked: AccountPlanBlockedException) {
+                    // 登录保障层可能已 handle 过；再调一次云端幂等，并终止本 slot 切号（勿续跑登录）。
+                    handleAccountPlanBlocked(
                         alias,
-                        opId,
-                        targetRowIndex = targetRi,
-                        slotKey = slotKey.trim(),
-                        completionMethod = "exclusive_auto_login",
+                        deviceId,
+                        blocked,
+                        "切号后登录校验(exclusive_auto_login)",
                     )
-                    scheduleCutSwitchDeferredBasicProfileEdit(alias, deviceId, opId)
-                } else {
-                    notifyAutoSwitchCutSwitchStepFailed(
-                        payload,
-                        CutSwitchFailureKind.RESTORE_OR_LOGIN,
-                        "切号自动登录失败",
-                    )
+                    val sk = slotKey.trim()
+                    if (sk.isNotEmpty()) {
+                        AutoSwitchLocalPlanStore.markCutSwitchStepFailed(
+                            sk,
+                            CutSwitchStepKind.RESTORE_OR_LOGIN,
+                        )
+                        autoSwitchLocalScheduler.cancelPendingCutSwitchFollowUps(sk)
+                        autoSwitchLocalScheduler.clearCutSwitchInflight()
+                        AutoSwitchLedger.recordCutSwitchSlotAborted(sk, "账号阻断移出计划")
+                    }
                 }
             }
             return
@@ -8114,13 +8137,33 @@ object AppCoordinator {
             val targetUser = AutoSwitchBundleHolder.getBundle()?.accounts.orEmpty()
                 .firstOrNull { (it.row_index ?: -1) == targetRowIndex }
                 ?.username?.trim().orEmpty()
-            val loginOk = verifyAutoSwitchCutSwitchSessionAfterChain(
-                alias = alias,
-                deviceId = deviceId,
-                opId = opId,
-                targetUsername = targetUser,
-                phase = "restore_chain",
-            )
+            val loginOk = try {
+                verifyAutoSwitchCutSwitchSessionAfterChain(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = opId,
+                    targetUsername = targetUser,
+                    phase = "restore_chain",
+                )
+            } catch (blocked: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(
+                    alias,
+                    deviceId,
+                    blocked,
+                    "切号后登录校验(restore_chain)",
+                )
+                // 勿走 FailureFallback / RestoreOnly 续跑：账号已阻断。
+                if (sk.isNotEmpty()) {
+                    AutoSwitchLocalPlanStore.markCutSwitchStepFailed(
+                        sk,
+                        CutSwitchStepKind.RESTORE_OR_LOGIN,
+                    )
+                    autoSwitchLocalScheduler.cancelPendingCutSwitchFollowUps(sk)
+                    autoSwitchLocalScheduler.clearCutSwitchInflight()
+                    AutoSwitchLedger.recordCutSwitchSlotAborted(sk, "账号阻断移出计划")
+                }
+                return
+            }
             if (!loginOk) {
                 if (sk.isNotEmpty()) {
                     AutoSwitchLocalPlanStore.markCutSwitchStepFailed(sk, CutSwitchStepKind.RESTORE_OR_LOGIN)
@@ -8165,17 +8208,27 @@ object AppCoordinator {
                 alias,
                 "[OP][$opId] 切号后云端 is_login=否，执行自动登录（username=${accountBeforeSafeguard?.username.orEmpty()}）",
             )
-            ensureAccountLoggedIn(
-                alias = alias,
-                deviceId = deviceId,
-                opId = opId,
-                reason = "切号后 is_login=否",
-                strict = false,
-                forceRelogin = false,
-                resumeFromLoginEntryScreen = false,
-            )
+            try {
+                ensureAccountLoggedIn(
+                    alias = alias,
+                    deviceId = deviceId,
+                    opId = opId,
+                    reason = "切号后 is_login=否",
+                    strict = false,
+                    forceRelogin = false,
+                    resumeFromLoginEntryScreen = false,
+                )
+            } catch (blocked: AccountPlanBlockedException) {
+                handleAccountPlanBlocked(alias, deviceId, blocked, "切号后 is_login=否")
+                false
+            }
         } else {
-            ensureLoginSafeguardMeasure(alias, deviceId, "切号完成", strict = false)
+            try {
+                ensureLoginSafeguardMeasure(alias, deviceId, "切号完成", strict = false)
+            } catch (_: AccountPlanBlockedException) {
+                // 保障层已处理移出计划
+                false
+            }
         }
         if (!loginPathOk) {
             LogCenter.op(alias, "[OP][$opId] 切号后自动登录/登录保障未通过，仍将按云端策略尝试恢复自动开启")
@@ -8959,11 +9012,11 @@ object AppCoordinator {
                 ok
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
-                false
+                throw banned
             }
         } catch (banned: AccountPlanBlockedException) {
             handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
-            false
+            throw banned
         } catch (logout: AccountStatusLoggedOutException) {
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
             executor.setAccountStatusReloginInProgress(true)
@@ -8985,7 +9038,7 @@ object AppCoordinator {
                 ok
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
-                false
+                throw banned
             }
         }
     }
@@ -9025,14 +9078,19 @@ object AppCoordinator {
                 )
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($safeguardSource)")
-                false
+                throw banned
             }
         }
         if (!launched) {
             LogCenter.op(alias, "登录状态保障：TikTok 拉起失败（$safeguardSource）")
             return false
         }
-        return ensureLoginSafeguardMeasure(alias, deviceId, safeguardSource, strict)
+        return try {
+            ensureLoginSafeguardMeasure(alias, deviceId, safeguardSource, strict)
+        } catch (blocked: AccountPlanBlockedException) {
+            // 保障层已 handle；继续上抛，避免 WithRetry 把 false 当可重试失败。
+            throw blocked
+        }
     }
 
     /** 整段登录状态保障（拉起 → 前台校验 → OCR → 必要时自动登录）外层重试；仅全部失败后才由调用方 pause。 */
@@ -9083,6 +9141,9 @@ object AppCoordinator {
                         safeguardSource = safeguardSource,
                         strict = strict,
                     )
+                } catch (blocked: AccountPlanBlockedException) {
+                    // 保障/登录链已 handleAccountPlanBlocked；禁止外层继续重试同一账号。
+                    return@withExclusive false
                 } catch (logout: LoginSafeguardRequiresAutoLoginException) {
                     // 兜底：拉起层若仍上抛 Welcome back/Add another，从入口续接，禁止冒成进程崩溃。
                     LogCenter.op(
@@ -9101,7 +9162,7 @@ object AppCoordinator {
                         )
                     } catch (banned: AccountPlanBlockedException) {
                         handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($safeguardSource)")
-                        false
+                        return@withExclusive false
                     }
                 }
                 if (ok) {
@@ -9235,7 +9296,7 @@ object AppCoordinator {
             ),
         )
 
-        // 本机自动切号开启时：剔除后重建计划并立刻切号，切勿走「登录失败 hold」——
+        // 自动切号开启时：剔除后重建/刷新计划并立刻切号，切勿走「登录失败 hold」——
         // 否则会周期性重登已阻断账号，并挡住 requestImmediateTick。
         if (ManualDeviceControl.ENABLED && PrefsStore.isManualLocalAutoSwitchEnabled() && deviceId.isNotBlank()) {
             PrefsStore.clearAutoSwitchTikTokLoginHold()
@@ -9254,6 +9315,20 @@ object AppCoordinator {
                     deviceId,
                     "账号 @$username 已$label；本机计划重建失败，请手动切号",
                 )
+            }
+        } else if (PrefsStore.isAutoSwitchAutonomousMode() && deviceId.isNotBlank()) {
+            PrefsStore.clearAutoSwitchTikTokLoginHold()
+            autoSwitchLocalScheduler.clearCutSwitchInflight()
+            val refreshed = refreshAutoSwitchWeeklyBundleFromCloud()
+            autoSwitchLocalScheduler.requestImmediateTick()
+            if (refreshed) {
+                updateRuntime(lastMessage = "账号 @$username 已${label}并移出计划，将切到其他账号")
+            } else {
+                LogCenter.op(
+                    alias,
+                    "${label}处理：周计划刷新失败，已清登录 hold；等待云端推送后继续（@$username）",
+                )
+                updateRuntime(lastMessage = "账号 @$username 已${label}并移出计划（等待计划刷新）")
             }
         } else {
             pauseGrowthAfterLoginFailure(

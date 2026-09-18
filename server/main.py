@@ -4232,12 +4232,12 @@ ACCOUNT_EDITOR_ROW_BATCH_DELETE_MAX = 100
 
 
 class AccountEditorRowDeleteByUsernameRequest(BaseModel):
-    """按 username 删除账号记录整行；支持多个（换行/逗号/空白分隔）。"""
-    username: str = Field(default="", max_length=8192)
+    """按 username 删除账号记录整行；支持文件导入后的 usernames 列表，或单个 username 文本（换行/逗号/空白分隔）。"""
+    username: str = Field(default="", max_length=65536)
     usernames: list[str] = Field(default_factory=list)
 
 
-ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX = 200
+ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX = 5000
 
 
 class AccountEditorRowBatchSetBasicProfileItem(BaseModel):
@@ -15543,7 +15543,7 @@ def delete_account_editor_rows_by_username(
     owner = str(session["username"] or "").strip()
     usernames = _parse_usernames_from_delete_request(payload)
     if not usernames:
-        return {"code": 1, "msg": "请输入要删除的 username"}
+        return {"code": 1, "msg": "请提供要删除的 username（可上传文件后提交）"}
     if len(usernames) > ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX:
         return {
             "code": 1,

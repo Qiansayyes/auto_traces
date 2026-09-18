@@ -318,7 +318,6 @@ class VideoDedDeviceService : Service() {
         /** @return 是否已入队（false 表示同 taskId 已在下载或入队被跳过） */
         fun enqueueDownloadTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
-                Log.d("VideoDedDeviceService", "enqueueDownloadTask skipped duplicate taskId=$taskId")
                 return false
             }
             val intent = Intent(context, VideoDedDeviceService::class.java).apply {
@@ -333,7 +332,6 @@ class VideoDedDeviceService : Service() {
 
         fun enqueueUsbPushedVerifyTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
-                Log.d("VideoDedDeviceService", "enqueueUsbPushedVerifyTask skipped duplicate taskId=$taskId")
                 return false
             }
             val intent = Intent(context, VideoDedDeviceService::class.java).apply {

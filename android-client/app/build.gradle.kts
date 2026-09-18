@@ -12,8 +12,8 @@ android {
         applicationId = "com.autotraces.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.0.2-unique-reuse"
+        versionCode = 5
+        versionName = "1.0.5-gallery-visible"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
