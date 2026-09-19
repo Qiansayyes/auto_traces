@@ -18729,8 +18729,19 @@ class RealTraceExecutor(
     }
 
     /**
+     * 密码 Continue 后等待结果：可能已是 Authenticator，也可能直达兴趣页/Home。
+     */
+    private enum class AutoLoginAuthPageWaitResult {
+        AuthenticatorReady,
+        ReachedInterest,
+        ReachedHome,
+        Failed,
+    }
+
+    /**
      * 密码 Continue 后等待 Authenticator app 页（最长 80s）。
      * 若先落到 Email 二步页：点 Email×2 → Use another method → Authenticator，再等到真·2FA 页。
+     * 若 TikTok 跳过验证直达兴趣页/主 Feed，同样视为成功出口。
      */
     private suspend fun autoLoginWaitForAuthenticatorAppPage(
         ctx: Context,
@@ -18739,30 +18750,41 @@ class RealTraceExecutor(
         h: Int,
         tagPrefix: String,
         timeoutMs: Long = AUTO_LOGIN_CUT_SWITCH_PAGE_TRANSITION_MS,
-    ): Boolean {
+    ): AutoLoginAuthPageWaitResult {
         val startedAt = System.currentTimeMillis()
         var pass = 0
         var lastContinueTapAt = 0L
         var emailSwitchAttempts = 0
         val emailSwitchMax = 3
-        devOp(alias, "自动登录(2FA)：密码后等待 Authenticator 页（最长 ${timeoutMs / 1000}s）")
+        devOp(alias, "自动登录(2FA)：密码后等待 Authenticator/兴趣页/Home（最长 ${timeoutMs / 1000}s）")
         while (System.currentTimeMillis() - startedAt < timeoutMs) {
-            if (hardStopOrNull(alias, "自动登录-等待2FA页")) return false
+            if (hardStopOrNull(alias, "自动登录-等待2FA页")) return AutoLoginAuthPageWaitResult.Failed
             pass++
             val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass")
             if (vision == null) {
-                if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+                if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return AutoLoginAuthPageWaitResult.Failed
                 continue
+            }
+            when (autoLoginClassifyRouteScreen(vision, h)) {
+                AutoLoginRouteScreenKind.Interest -> {
+                    devOp(alias, "自动登录(2FA)：密码后直达兴趣页（第 $pass 次 OCR）")
+                    return AutoLoginAuthPageWaitResult.ReachedInterest
+                }
+                AutoLoginRouteScreenKind.MainFeed -> {
+                    devOp(alias, "自动登录(2FA)：密码后直达主 Feed（第 $pass 次 OCR）")
+                    return AutoLoginAuthPageWaitResult.ReachedHome
+                }
+                AutoLoginRouteScreenKind.Unknown -> Unit
             }
             if (visionHasAuthenticatorAppPage(vision)) {
                 devOp(alias, "自动登录(2FA)：已识别 Authenticator app 页（第 $pass 次 OCR）")
-                return true
+                return AutoLoginAuthPageWaitResult.AuthenticatorReady
             }
             // 路径 B：先落到 Email → 切 Authenticator（OCR 均带重试；Email 点两次）
             if (visionHasEmailTwoStepVerificationPage(vision)) {
                 if (emailSwitchAttempts >= emailSwitchMax) {
                     devOp(alias, "自动登录(2FA)：Email→Authenticator 切换已达 $emailSwitchMax 次仍未进入")
-                    if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+                    if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return AutoLoginAuthPageWaitResult.Failed
                     continue
                 }
                 emailSwitchAttempts++
@@ -18776,7 +18798,9 @@ class RealTraceExecutor(
                 if (!switched) {
                     devOp(alias, "自动登录(2FA)：Email→Authenticator 本轮切换失败，继续 OCR 重试")
                 }
-                if (!autoLoginDelay(alias, 800L, "Email切Authenticator后")) return false
+                if (!autoLoginDelay(alias, 800L, "Email切Authenticator后")) {
+                    return AutoLoginAuthPageWaitResult.Failed
+                }
                 continue
             }
             val continueHit = findStrictExactLabelHit(vision, "Continue")
@@ -18790,10 +18814,10 @@ class RealTraceExecutor(
                     autoLoginDelay(alias, 600L, "Continue 点击后")
                 }
             }
-            if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return false
+            if (!autoLoginDelay(alias, 1000L, "等待2FA页")) return AutoLoginAuthPageWaitResult.Failed
         }
-        devOp(alias, "自动登录(2FA)：等待 Authenticator 页超时")
-        return false
+        devOp(alias, "自动登录(2FA)：等待 Authenticator/兴趣页/Home 超时")
+        return AutoLoginAuthPageWaitResult.Failed
     }
 
     /** Authenticator app：本地 TOTP → 输入 → Continue。 */
@@ -18874,24 +18898,28 @@ class RealTraceExecutor(
             devOp(alias, "自动登录(2FA)：布局 B 输密码失败")
             return AutoLoginCutSwitchStepOutcome.ChainRestart
         }
-        if (!autoLoginWaitForAuthenticatorAppPage(ctx, alias, w, h, "auto_login_2fa_wait_auth")) {
-            return AutoLoginCutSwitchStepOutcome.ChainRestart
-        }
-        if (!autoLoginEnterAuthenticatorAppCode(
-                ctx, alias, w, h, deviceId, username, twoFaSecret, "auto_login_2fa_code",
-            )
-        ) {
-            devOp(alias, "自动登录(2FA)：输入 Authenticator 验证码失败")
-            return AutoLoginCutSwitchStepOutcome.ChainRestart
-        }
         var reachedInterest = false
         var reachedHome = false
-        when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
-            AutoLoginStepOutcome.ReachedInterest -> reachedInterest = true
-            AutoLoginStepOutcome.ReachedHome -> reachedHome = true
-            else -> {
-                devOp(alias, "自动登录(2FA)：2FA 提交后路由探测失败")
-                return AutoLoginCutSwitchStepOutcome.ChainRestart
+        when (autoLoginWaitForAuthenticatorAppPage(ctx, alias, w, h, "auto_login_2fa_wait_auth")) {
+            AutoLoginAuthPageWaitResult.ReachedInterest -> reachedInterest = true
+            AutoLoginAuthPageWaitResult.ReachedHome -> reachedHome = true
+            AutoLoginAuthPageWaitResult.Failed -> return AutoLoginCutSwitchStepOutcome.ChainRestart
+            AutoLoginAuthPageWaitResult.AuthenticatorReady -> {
+                if (!autoLoginEnterAuthenticatorAppCode(
+                        ctx, alias, w, h, deviceId, username, twoFaSecret, "auto_login_2fa_code",
+                    )
+                ) {
+                    devOp(alias, "自动登录(2FA)：输入 Authenticator 验证码失败")
+                    return AutoLoginCutSwitchStepOutcome.ChainRestart
+                }
+                when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                    AutoLoginStepOutcome.ReachedInterest -> reachedInterest = true
+                    AutoLoginStepOutcome.ReachedHome -> reachedHome = true
+                    else -> {
+                        devOp(alias, "自动登录(2FA)：2FA 提交后路由探测失败")
+                        return AutoLoginCutSwitchStepOutcome.ChainRestart
+                    }
+                }
             }
         }
         return if (
@@ -21811,14 +21839,74 @@ class RealTraceExecutor(
      * - 密码页 → 既有布局 A/C/B 输密，之后可能再接验证码
      * - 兴趣页 / 底栏 Home → 直达成功
      */
+    /**
+     * Welcome back 输密后：有 2FA 则等 Authenticator / 兴趣页 / Home；无则返回 null，由调用方走邮箱验证码门禁。
+     * 成功时写入 [reachedInterest]/[reachedHome]。
+     */
+    private suspend fun autoLoginAfterPasswordIfTwoFa(
+        ctx: Context,
+        alias: String,
+        deviceId: String,
+        w: Int,
+        h: Int,
+        username: String,
+        twoFaSecret: String,
+        tagPrefix: String,
+        phaseLog: String,
+        reachedInterest: BooleanArray,
+        reachedHome: BooleanArray,
+    ): AutoLoginCutSwitchStepOutcome? {
+        val secret = twoFaSecret.trim()
+        if (secret.isBlank()) return null
+        devOp(alias, "自动登录($phaseLog)：有 2FA，密码后等 Authenticator/兴趣页/Home")
+        when (autoLoginWaitForAuthenticatorAppPage(ctx, alias, w, h, "${tagPrefix}_wait_auth")) {
+            AutoLoginAuthPageWaitResult.ReachedInterest -> {
+                reachedInterest[0] = true
+                return AutoLoginCutSwitchStepOutcome.Ok
+            }
+            AutoLoginAuthPageWaitResult.ReachedHome -> {
+                reachedHome[0] = true
+                return AutoLoginCutSwitchStepOutcome.Ok
+            }
+            AutoLoginAuthPageWaitResult.Failed -> {
+                devOp(alias, "自动登录($phaseLog)：等待 Authenticator/兴趣页/Home 失败")
+                return AutoLoginCutSwitchStepOutcome.ChainRestart
+            }
+            AutoLoginAuthPageWaitResult.AuthenticatorReady -> Unit
+        }
+        if (!autoLoginEnterAuthenticatorAppCode(
+                ctx, alias, w, h, deviceId, username, secret, "${tagPrefix}_code",
+            )
+        ) {
+            devOp(alias, "自动登录($phaseLog)：输入 Authenticator 验证码失败")
+            return AutoLoginCutSwitchStepOutcome.ChainRestart
+        }
+        when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+            AutoLoginStepOutcome.ReachedInterest -> {
+                reachedInterest[0] = true
+                return AutoLoginCutSwitchStepOutcome.Ok
+            }
+            AutoLoginStepOutcome.ReachedHome -> {
+                reachedHome[0] = true
+                return AutoLoginCutSwitchStepOutcome.Ok
+            }
+            else -> {
+                devOp(alias, "自动登录($phaseLog)：2FA 提交后路由探测失败")
+                return AutoLoginCutSwitchStepOutcome.ChainRestart
+            }
+        }
+    }
+
     private suspend fun autoLoginRunWelcomeBackLogInPath(
         ctx: Context,
         alias: String,
         deviceId: String,
         w: Int,
         h: Int,
+        username: String,
         email: String,
         password: String,
+        twoFa: String,
         apiUrl: String,
         dontAllowHandledEarly: Boolean,
     ): AutoLoginCutSwitchStepOutcome {
@@ -21947,10 +22035,20 @@ class RealTraceExecutor(
                     }
                     AutoLoginVerifyGateResult.PasswordDone -> {
                         devOp(alias, "自动登录(Welcome back)：验证方式页已点 Password 并输密")
-                        when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
-                            AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
-                            AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
-                            else -> Unit
+                        when (
+                            val twoFaAfterPwd = autoLoginAfterPasswordIfTwoFa(
+                                ctx, alias, deviceId, w, h, username, twoFa,
+                                "welcome_back_method_pwd_2fa", "Welcome back验证方式后",
+                                reachedInterest, reachedHome,
+                            )
+                        ) {
+                            null -> when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                                AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
+                                AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
+                                else -> Unit
+                            }
+                            AutoLoginCutSwitchStepOutcome.Ok -> Unit
+                            else -> return twoFaAfterPwd
                         }
                     }
                     AutoLoginVerifyGateResult.ResendReady -> {
@@ -21981,27 +22079,41 @@ class RealTraceExecutor(
                 ) {
                     return AutoLoginCutSwitchStepOutcome.Failed
                 }
-                val transition = autoLoginWaitPageTransitionCutSwitch(
-                    ctx = ctx,
-                    alias = alias,
-                    h = h,
-                    phaseLog = "Welcome back密码后",
-                    tagPrefix = "welcome_back_pwd_transition",
-                    markerGone = { v ->
-                        !autoLoginVisionHasContinueMarker(v) &&
-                            findSinglePasswordAndNextHits(v) == null &&
-                            findSinglePasswordWithAccessThese(v, h) == null &&
-                            findAllPasswordLabelHits(v).isEmpty()
-                    },
-                    allowVerifySuccess = true,
-                )
                 when (
-                    autoLoginCutSwitchApplyTransitionOutcome(
-                        alias, transition, "Welcome back密码后", reachedInterest, reachedHome, needVerify,
+                    val twoFaAfterPwd = autoLoginAfterPasswordIfTwoFa(
+                        ctx, alias, deviceId, w, h, username, twoFa,
+                        "welcome_back_direct_2fa", "Welcome back密码后",
+                        reachedInterest, reachedHome,
                     )
                 ) {
+                    null -> {
+                        // 无 2FA：密码后走邮箱验证码 / 兴趣页 / Home
+                        val transition = autoLoginWaitPageTransitionCutSwitch(
+                            ctx = ctx,
+                            alias = alias,
+                            h = h,
+                            phaseLog = "Welcome back密码后",
+                            tagPrefix = "welcome_back_pwd_transition",
+                            markerGone = { v ->
+                                !autoLoginVisionHasContinueMarker(v) &&
+                                    findSinglePasswordAndNextHits(v) == null &&
+                                    findSinglePasswordWithAccessThese(v, h) == null &&
+                                    findAllPasswordLabelHits(v).isEmpty()
+                            },
+                            allowVerifySuccess = true,
+                        )
+                        when (
+                            autoLoginCutSwitchApplyTransitionOutcome(
+                                alias, transition, "Welcome back密码后",
+                                reachedInterest, reachedHome, needVerify,
+                            )
+                        ) {
+                            AutoLoginCutSwitchStepOutcome.Ok -> Unit
+                            else -> return AutoLoginCutSwitchStepOutcome.Failed
+                        }
+                    }
                     AutoLoginCutSwitchStepOutcome.Ok -> Unit
-                    else -> return AutoLoginCutSwitchStepOutcome.Failed
+                    else -> return twoFaAfterPwd
                 }
             }
             else -> {
@@ -22014,10 +22126,20 @@ class RealTraceExecutor(
             when (val gate = autoLoginOcrConfirmVerificationPageAndWaitResendCode(ctx, alias, w, h, password)) {
                 AutoLoginVerifyGateResult.Failed -> return AutoLoginCutSwitchStepOutcome.ChainRestart
                 AutoLoginVerifyGateResult.PasswordDone -> {
-                    when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
-                        AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
-                        AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
-                        else -> Unit
+                    when (
+                        val twoFaAfterPwd = autoLoginAfterPasswordIfTwoFa(
+                            ctx, alias, deviceId, w, h, username, twoFa,
+                            "welcome_back_need_verify_pwd_2fa", "Welcome back密码后需验证",
+                            reachedInterest, reachedHome,
+                        )
+                    ) {
+                        null -> when (autoLoginPollPostPasswordRoute(ctx, alias, h)) {
+                            AutoLoginStepOutcome.ReachedInterest -> reachedInterest[0] = true
+                            AutoLoginStepOutcome.ReachedHome -> reachedHome[0] = true
+                            else -> Unit
+                        }
+                        AutoLoginCutSwitchStepOutcome.Ok -> Unit
+                        else -> return twoFaAfterPwd
                     }
                 }
                 AutoLoginVerifyGateResult.ResendReady -> {
@@ -22641,8 +22763,10 @@ class RealTraceExecutor(
                             deviceId = deviceId,
                             w = w,
                             h = h,
+                            username = username,
                             email = email,
                             password = password,
+                            twoFa = twoFa,
                             apiUrl = apiUrl,
                             dontAllowHandledEarly = dontAllowHandledEarly,
                         )
@@ -22684,8 +22808,10 @@ class RealTraceExecutor(
                                     deviceId = deviceId,
                                     w = w,
                                     h = h,
+                                    username = username,
                                     email = email,
                                     password = password,
+                                    twoFa = twoFa,
                                     apiUrl = apiUrl,
                                     dontAllowHandledEarly = dontAllowHandledEarly,
                                 )
