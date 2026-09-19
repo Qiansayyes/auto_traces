@@ -5637,7 +5637,10 @@ object AppCoordinator {
             false
         }
         if (!packageInstalled) return
-        if (isTikTokGalleryPermissionGranted()) return
+        if (isTikTokGalleryPermissionGranted()) {
+            ProcessDiagnostics.setPhase("TikTok权限已就绪")
+            return
+        }
 
         forceStopTikTokCleanly(pkg, alias, "TikTok 图库/通知/联系人权限未开放")
         LogCenter.op(alias, "TikTok 图库/通知/联系人权限未开放，开始 root 授予…")
@@ -5672,6 +5675,7 @@ object AppCoordinator {
         }
         if (failed == 0) {
             LogCenter.op(alias, "TikTok 图库/通知/联系人权限开放完成")
+            ProcessDiagnostics.setPhase("TikTok权限已就绪")
         } else {
             LogCenter.op(alias, "TikTok 图库/通知/联系人权限开放存在失败：$failed/${commands.size}")
             failLogs.take(4).forEach { item ->
@@ -5680,6 +5684,7 @@ object AppCoordinator {
             if (failLogs.size > 4) {
                 LogCenter.op(alias, "TikTok 权限开放失败明细省略 ${failLogs.size - 4} 条")
             }
+            ProcessDiagnostics.setPhase("TikTok权限部分失败")
         }
     }
 

@@ -30,6 +30,13 @@ object DeviceClockSync {
     private const val DRIFT_THRESHOLD_MS = 90_000L
     private const val OK_CACHE_MS = 6L * 60L * 60L * 1000L
     private const val FORCE_RETRY_AFTER_FAIL_MS = 5L * 60L * 1000L
+    /** Date 头回退源之间允许的互差；超过则视为不可信。 */
+    private const val DATE_FALLBACK_AGREE_MS = 120_000L
+    /**
+     * 仅 Date 回退时：若设备墙钟年份看起来正常，禁止一次性大幅改钟
+     * （避免 captive portal / 代理缓存的陈旧 Date 把正确时钟改坏，如 br8→2026-05-20）。
+     */
+    private const val DATE_FALLBACK_MAX_CORRECT_MS = 36L * 60L * 60L * 1000L
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
@@ -97,6 +104,21 @@ object DeviceClockSync {
             val driftMs = probe.utcEpochMs - deviceNow
             val absDrift = kotlin.math.abs(driftMs)
             val currentTz = readPersistTimezone().ifBlank { TimeZone.getDefault().id }
+            val dateOnly = probe.source.startsWith("date:")
+            val deviceYear = java.util.Calendar.getInstance().apply {
+                timeInMillis = deviceNow
+            }.get(java.util.Calendar.YEAR)
+            val deviceYearPlausible = deviceYear in 2025..2035
+
+            // Date 头回退不可靠（代理/captive 常返回陈旧 Date）。设备年份已正常时禁止大幅回拨/快进。
+            if (dateOnly && absDrift > DATE_FALLBACK_MAX_CORRECT_MS && deviceYearPlausible) {
+                LogCenter.op(
+                    alias,
+                    "$tag：拒绝 Date 回退大幅改钟（漂移=${absDrift / 1000}s src=${probe.source} " +
+                        "权威UTC=${formatUtc(probe.utcEpochMs)} 设备年=$deviceYear），避免写坏正确时钟",
+                )
+                return@withLock false
+            }
 
             // 路径1：墙钟错乱 → 必须改时间（可无 IP 时区）
             val needFixTime = absDrift > DRIFT_THRESHOLD_MS
@@ -183,29 +205,70 @@ object DeviceClockSync {
         }
         if (primaryProbe.ok && primaryProbe.utcEpochMs > 0L) return primaryProbe
 
-        // Date 回退：只解决「时间错乱假断网」，绝不带权威时区（避免无脑改时区）
+        // Date 回退：只解决「时间错乱假断网」，绝不带权威时区（避免无脑改时区）。
+        // 必须 ≥2 个源互差 ≤ DATE_FALLBACK_AGREE_MS，拒绝单一 captive/代理陈旧 Date。
         val dateFallbacks = listOf(
             "http://example.com/",
             "http://neverssl.com/",
             "http://captive.apple.com/",
         )
+        val samples = mutableListOf<Pair<String, Long>>()
         for (url in dateFallbacks) {
             val utc = runCatching { fetchHttpDateOnly(url) }.getOrNull() ?: continue
             if (utc <= 0L) continue
-            return Probe(
-                ok = true,
-                utcEpochMs = utc,
-                timezoneId = "",
-                hasAuthoritativeTimezone = false,
-                utcOffsetSeconds = null,
-                ip = primaryProbe.ip,
-                countryCode = primaryProbe.countryCode,
-                error = if (primaryProbe.error.isBlank()) "" else "date_fallback:$url; primary=${primaryProbe.error}",
-                source = "date:$url",
-            )
+            samples += url to utc
         }
-        return if (primaryProbe.error.isNotBlank()) primaryProbe
-        else Probe(ok = false, error = "all_http_time_sources_failed", source = "none")
+        if (samples.size >= 2) {
+            // 取与其它样本互证最多的那个时间
+            var bestUrl = samples[0].first
+            var bestUtc = samples[0].second
+            var bestPeers = 0
+            for ((url, utc) in samples) {
+                val peers = samples.count { (_, other) ->
+                    kotlin.math.abs(other - utc) <= DATE_FALLBACK_AGREE_MS
+                }
+                if (peers > bestPeers) {
+                    bestPeers = peers
+                    bestUrl = url
+                    bestUtc = utc
+                }
+            }
+            if (bestPeers >= 2) {
+                return Probe(
+                    ok = true,
+                    utcEpochMs = bestUtc,
+                    timezoneId = "",
+                    hasAuthoritativeTimezone = false,
+                    utcOffsetSeconds = null,
+                    ip = primaryProbe.ip,
+                    countryCode = primaryProbe.countryCode,
+                    error = if (primaryProbe.error.isBlank()) {
+                        "date_fallback_consensus:$bestPeers"
+                    } else {
+                        "date_fallback_consensus:$bestPeers; primary=${primaryProbe.error}"
+                    },
+                    source = "date:$bestUrl",
+                )
+            }
+        }
+        val detail = buildString {
+            if (primaryProbe.error.isNotBlank()) append("primary=${primaryProbe.error}; ")
+            append("date_samples=${samples.size}")
+            if (samples.isNotEmpty()) {
+                append("(")
+                append(samples.joinToString(",") { (u, t) -> "${u.substringAfter("://").substringBefore("/")}=${formatUtc(t)}" })
+                append(")")
+            }
+        }
+        return Probe(
+            ok = false,
+            error = if (samples.isEmpty()) {
+                if (primaryProbe.error.isNotBlank()) primaryProbe.error else "all_http_time_sources_failed"
+            } else {
+                "date_fallback_no_consensus:$detail"
+            },
+            source = "none",
+        )
     }
 
     private fun fetchIpApiProbe(url: String): Probe {
