@@ -559,6 +559,11 @@ data class AutoSwitchBundle(
     val daily_plan: AutoSwitchDailyPlan? = null,
     val weekly_plan: AutoSwitchWeeklyPlan? = null,
     val retry_policy: AutoSwitchRetryPolicy? = null,
+    /** 单号活跃：全天单 slot，跳过排班切号（开启时云端已入队一次切号）。 */
+    val single_account_active: Boolean? = null,
+    val skip_scheduled_cut_switch: Boolean? = null,
+    val single_account_username: String? = null,
+    val single_account_row_index: Int? = null,
 )
 
 data class AutoSwitchBundledAccountConfig(

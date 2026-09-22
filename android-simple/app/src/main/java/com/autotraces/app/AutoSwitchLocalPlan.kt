@@ -291,6 +291,8 @@ object AutoSwitchLocalPlanStore {
     fun isCutSwitchDone(slotKey: String): Boolean {
         val cs = slot(slotKey)?.cut_switch ?: return false
         if (!cs.isDone()) return false
+        // 单号活跃：云端已入队一次性切号，本地排班刻意跳过切号链，视为完成。
+        if (cs.mode == "single_account") return true
         // 历史假完成：三步全 SKIPPED（未经真实 backup→clear→restore 链）
         if (cs.backup == PlanStepState.SKIPPED &&
             cs.clear == PlanStepState.SKIPPED &&
@@ -1714,6 +1716,7 @@ object AutoSwitchLocalPlanStore {
                 ?: slot.username?.trim()
                 ?: continue
             val slotKey = "$scheduleDate|$slotIndex"
+            val skipCut = bundle.skip_scheduled_cut_switch == true || bundle.single_account_active == true
             out.add(
                 SlotPlanEntry(
                     slot_key = slotKey,
@@ -1723,7 +1726,18 @@ object AutoSwitchLocalPlanStore {
                     end_min = end,
                     target_row_index = targetRi,
                     target_username = username,
-                    cut_switch = CutSwitchPlanSteps(mode = "switch"),
+                    cut_switch = if (skipCut) {
+                        // 单号活跃：开启时云端已入队一次切号；本地用 DONE + mode 标记跳过排班切号。
+                        // 不可用三步全 SKIPPED：isCutSwitchDone 会把「全 SKIPPED」当历史假完成拒绝。
+                        CutSwitchPlanSteps(
+                            backup = PlanStepState.DONE,
+                            clear = PlanStepState.DONE,
+                            restore_or_login = PlanStepState.DONE,
+                            mode = "single_account",
+                        )
+                    } else {
+                        CutSwitchPlanSteps(mode = "switch")
+                    },
                     publish = TimedInsertionPlan(
                         trigger_at_min = slot.auto_publish_minute,
                         state = if (slot.auto_publish_minute == null) PlanStepState.SKIPPED else PlanStepState.PENDING,

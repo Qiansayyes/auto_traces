@@ -911,6 +911,8 @@ let backupArchiveSlotHighlightTimer = null;
 let autoSwitchCutScheme = "backup";
 let autoSwitchCutSchemeSaveInFlight = false;
 let autoSwitchDevicesById = new Map();
+/** device_id -> { active, username, rowIndex } */
+let singleAccountActiveById = new Map();
 let autoSwitchPickDeviceIds = new Set();
 let autoSwitchSaveInFlight = false;
 let backupStatsFullQueryScheduleAvailable = false;
@@ -2270,10 +2272,12 @@ function renderDeviceRow(deviceId, info, context = {}) {
       </button>
     </td>
   `;
-  const publishOneDisabled = !alias || info?.status === "offline" || isAutoSwitchEnabledForDeviceId(deviceId) ? "disabled" : "";
-  const publishOneTitle = isAutoSwitchEnabledForDeviceId(deviceId)
-    ? AUTO_SWITCH_MANUAL_BLOCK_HINT
-    : "本行单台下发发作品入口（与上方批量「发布作品」相同接口）";
+  const publishOneDisabled = !alias || info?.status === "offline" || isDeviceAutonomyBlockingManualOps(deviceId) ? "disabled" : "";
+  const publishOneTitle = isSingleAccountActiveForDeviceId(deviceId)
+    ? SINGLE_ACCOUNT_MANUAL_BLOCK_HINT
+    : (isAutoSwitchEnabledForDeviceId(deviceId)
+      ? AUTO_SWITCH_MANUAL_BLOCK_HINT
+      : "本行单台下发发作品入口（与上方批量「发布作品」相同接口）");
   const opsCell = `
     <td style="white-space:nowrap;">
       <button
@@ -6174,8 +6178,33 @@ function isAutoSwitchEnabledForDeviceId(deviceId) {
   return !!autoSwitchDevicesById.get(did);
 }
 
+function getSingleAccountActiveInfo(deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did) return null;
+  return singleAccountActiveById.get(did) || null;
+}
+
+function isSingleAccountActiveForDeviceId(deviceId) {
+  const info = getSingleAccountActiveInfo(deviceId);
+  return Boolean(info?.active);
+}
+
+function isDeviceAutonomyBlockingManualOps(deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did) return false;
+  return isAutoSwitchEnabledForDeviceId(did) || isSingleAccountActiveForDeviceId(did);
+}
+
 function isAutoSwitchEnabledForArchiveAlias(alias, rowDeviceId = "") {
   return isAutoSwitchEnabledForDeviceId(resolveDeviceIdForArchiveAlias(alias, rowDeviceId));
+}
+
+function isSingleAccountActiveForArchiveAlias(alias, rowDeviceId = "") {
+  return isSingleAccountActiveForDeviceId(resolveDeviceIdForArchiveAlias(alias, rowDeviceId));
+}
+
+function isAutonomyBlockingForArchiveAlias(alias, rowDeviceId = "") {
+  return isDeviceAutonomyBlockingManualOps(resolveDeviceIdForArchiveAlias(alias, rowDeviceId));
 }
 
 function isAutoSwitchGloballyEnabled() {
@@ -6185,7 +6214,13 @@ function isAutoSwitchGloballyEnabled() {
 function updateAutoSwitchEnabledCountHint() {
   if (!autoSwitchEnabledCountHint) return;
   const enabled = Array.from(autoSwitchDevicesById.entries()).filter(([, on]) => on).length;
-  autoSwitchEnabledCountHint.textContent = enabled > 0 ? `自动切号中：${enabled} 台设备` : "自动切号：未开启";
+  const single = Array.from(singleAccountActiveById.values()).filter((info) => info?.active).length;
+  const parts = [];
+  if (enabled > 0) parts.push(`自动切号中：${enabled} 台`);
+  if (single > 0) parts.push(`单号活跃：${single} 台`);
+  autoSwitchEnabledCountHint.textContent = parts.length
+    ? parts.join("；")
+    : "自动切号：未开启";
 }
 
 function applyAutoSwitchManualOpsUi() {
@@ -6223,9 +6258,14 @@ function applyAutoSwitchManualOpsUi() {
 }
 
 const AUTO_SWITCH_MANUAL_BLOCK_HINT = "该设备已开启自动切号，请先关闭后再操作";
+const SINGLE_ACCOUNT_MANUAL_BLOCK_HINT = "该设备已开启单号活跃，请先关闭后再操作";
 
 function guardAutoSwitchManualOps(actionLabel = "该操作", deviceId = "", alias = "", rowDeviceId = "") {
   const did = String(deviceId || "").trim() || resolveDeviceIdForArchiveAlias(alias, rowDeviceId);
+  if (isSingleAccountActiveForDeviceId(did)) {
+    setStatus(`${actionLabel}不可用：${SINGLE_ACCOUNT_MANUAL_BLOCK_HINT}`, "warning");
+    return false;
+  }
   if (!isAutoSwitchEnabledForDeviceId(did)) return true;
   setStatus(`${actionLabel}不可用：${AUTO_SWITCH_MANUAL_BLOCK_HINT}`, "warning");
   return false;
@@ -6330,10 +6370,19 @@ async function loadAutoSwitchConfig(options = {}) {
     const data = await request("/api/admin/auto_switch/config");
     const cfg = data.data || {};
     autoSwitchDevicesById = new Map();
+    singleAccountActiveById = new Map();
     const devices = Array.isArray(cfg.devices) ? cfg.devices : [];
     devices.forEach((item) => {
       const did = String(item?.device_id || "").trim();
-      if (did) autoSwitchDevicesById.set(did, !!item?.enabled);
+      if (!did) return;
+      autoSwitchDevicesById.set(did, !!item?.enabled);
+      if (item?.single_account_active) {
+        singleAccountActiveById.set(did, {
+          active: true,
+          username: String(item?.single_account_username || "").trim(),
+          rowIndex: Number(item?.single_account_row_index || 0) || 0,
+        });
+      }
     });
     autoSwitchCutScheme = String(cfg.cut_switch_scheme || "backup").trim().toLowerCase() === "login"
       ? "login"
@@ -8103,6 +8152,15 @@ function isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias) {
   if (n <= 1) return true;
   const actionAlias = alias === "__EMPTY_ALIAS__" ? resolveBackupArchiveDisplayAlias(row) : alias;
   const deviceId = String(row?.device_id || "").trim();
+  const singleInfo = getSingleAccountActiveInfo(deviceId);
+  if (singleInfo?.active) {
+    const username = String(row?.username || "").trim().toLowerCase();
+    const lockedUser = String(singleInfo.username || "").trim().toLowerCase();
+    const rowRi = resolveBackupArchiveRowIndex(row);
+    if (lockedUser && username === lockedUser) return true;
+    if (singleInfo.rowIndex >= 0 && rowRi != null && rowRi === singleInfo.rowIndex) return true;
+    return false;
+  }
   if (!isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId)) return false;
   if (!isAutoSwitchDailyPlanScheduleCurrent()) return false;
   const current = resolveCurrentSlotEntryForAliasKey(resolveBackupArchiveAliasKey(alias, row));
@@ -8119,6 +8177,7 @@ function isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias) {
 /**
  * 同别名桶内高亮：
  * - 自动切号开启时按云端时段计划（北京时间）展示当前归属，不依赖设备回写 switch_highlight；
+ * - 单号活跃时仅锁定账号为高亮；
  * - 否则仍以 switch_highlight===「是」为准。
  */
 function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row, alias = "") {
@@ -8127,6 +8186,7 @@ function isBackupArchiveRowEffectivelyHighlighted(rowsInBucket, row, alias = "")
   if (isBackupArchiveRowCurrentSlotOwner(rowsInBucket, row, alias)) return true;
   const actionAlias = alias === "__EMPTY_ALIAS__" ? resolveBackupArchiveDisplayAlias(row) : alias;
   const deviceId = String(row?.device_id || "").trim();
+  if (isSingleAccountActiveForDeviceId(deviceId)) return false;
   if (isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId) && isAutoSwitchDailyPlanScheduleCurrent()) {
     return false;
   }
@@ -12838,11 +12898,30 @@ function renderAutoSwitchPublishStatusBadge(slotInfo) {
 function renderAutoSwitchDeviceBadge(alias, rowDeviceId = "") {
   const deviceId = resolveDeviceIdForArchiveAlias(alias, rowDeviceId);
   if (!deviceId) return "";
+  const singleInfo = getSingleAccountActiveInfo(deviceId);
+  if (singleInfo?.active) {
+    const locked = singleInfo.username ? `@${singleInfo.username}` : "已锁定账号";
+    return `<span class="badge badge--ok backup-archive-auto-switch-badge" title="单号活跃中：全天只运营 ${escapeHtml(locked)}，已跳过切号；手动操作已锁定">单号活跃·开</span>`;
+  }
   const on = isAutoSwitchEnabledForDeviceId(deviceId);
   if (on) {
     return '<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启自动切号自治，手动切号/清理等操作已锁定">自动切号·开</span>';
   }
   return '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该设备未开启自动切号，可手动操作或勾选别名组后批量开启">自动切号·关</span>';
+}
+
+function renderSingleAccountTargetBadge(row, deviceId) {
+  const info = getSingleAccountActiveInfo(deviceId);
+  if (!info?.active) return "";
+  const username = String(row?.username || "").trim().toLowerCase();
+  const lockedUser = String(info.username || "").trim().toLowerCase();
+  const rowIndex = Number(row?.row_index ?? row?.id ?? 0) || 0;
+  const isTarget = (lockedUser && username === lockedUser)
+    || (info.rowIndex >= 0 && rowIndex === info.rowIndex);
+  if (isTarget) {
+    return `<span class="badge badge--ok" title="开启单号活跃时按粉丝量锁定的唯一运营账号">单号目标</span>`;
+  }
+  return `<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="单号活跃期间整机只运营粉丝最多的账号，本号已锁定不可操作">单号锁定</span>`;
 }
 
 function renderBackupArchiveEnvStatusBadge(switchActive, acct, row = {}, options = {}) {
@@ -12911,25 +12990,44 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const slotDrivenHighlight = isBackupArchiveRowCurrentSlotOwner(rows, row, alias);
   const acct = username ? getAccountRecordByUsername(username) : null;
   const showBasicProfileBtn = Boolean(acct) && normalizeBasicProfileModifiedField(acct.basic_profile_modified) === "否";
-  const autoSwitchBlocksManual = isAutoSwitchEnabledForArchiveAlias(actionAlias, deviceId);
-  const switchDisabled = autoSwitchBlocksManual ? " disabled" : "";
-  const switchTitle = autoSwitchBlocksManual
-    ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
-    : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原";
-  const manualBlockTitle = autoSwitchBlocksManual ? AUTO_SWITCH_MANUAL_BLOCK_HINT : "";
-  const otherDisabled = autoSwitchBlocksManual || !switchActive ? " disabled" : "";
-  const otherTitle = autoSwitchBlocksManual
-    ? manualBlockTitle
-    : (switchActive ? "" : "需先切号为当前高亮账号后才可操作");
+  const singleActive = isSingleAccountActiveForDeviceId(deviceId);
+  const singleInfo = getSingleAccountActiveInfo(deviceId);
+  const lockedUser = String(singleInfo?.username || "").trim().toLowerCase();
+  const lockedRi = Number(singleInfo?.rowIndex || 0) || 0;
+  const isSingleTarget = singleActive && (
+    (lockedUser && username.toLowerCase() === lockedUser)
+    || (lockedRi >= 0 && backupRecordId === lockedRi)
+  );
+  const autoSwitchBlocksManual = isAutonomyBlockingForArchiveAlias(actionAlias, deviceId);
+  const switchDisabled = autoSwitchBlocksManual || (singleActive && !isSingleTarget) ? " disabled" : "";
+  const switchTitle = singleActive
+    ? (isSingleTarget
+      ? "单号活跃中：已锁定本号，不可手动切号"
+      : "单号活跃中：整机只运营粉丝最多的账号，本号已锁定")
+    : (autoSwitchBlocksManual
+      ? "已开启自动切号（全局），请按系统时段安排切号，不可手动切号"
+      : "切号：确认后立即切换环境归属高亮；有高亮时先备份当前再还原，无高亮时仅清理后还原");
+  const manualBlockTitle = singleActive
+    ? SINGLE_ACCOUNT_MANUAL_BLOCK_HINT
+    : (autoSwitchBlocksManual ? AUTO_SWITCH_MANUAL_BLOCK_HINT : "");
+  const otherDisabled = autoSwitchBlocksManual || (singleActive && !isSingleTarget) || !switchActive ? " disabled" : "";
+  const otherTitle = singleActive && !isSingleTarget
+    ? "单号活跃中：整机只运营粉丝最多的账号，本号已锁定"
+    : (autoSwitchBlocksManual
+      ? manualBlockTitle
+      : (switchActive ? "" : "需先切号为当前高亮账号后才可操作"));
   const envStatusBadge = renderBackupArchiveEnvStatusBadge(switchActive, acct, row, { slotDriven: slotDrivenHighlight });
   const autoSwitchBadge = renderAutoSwitchDeviceBadge(actionAlias, deviceId);
+  const singleTargetBadge = renderSingleAccountTargetBadge(row, deviceId);
   const envHintText = switchActive
     ? (slotDrivenHighlight
       ? "当前时段归属：云端计划内该账号应在设备环境内"
       : "当前高亮：该账号是这条设备环境的归属目标")
-    : (autoSwitchBlocksManual
-      ? "非当前时段：设备将在对应时段自动切号"
-      : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用");
+    : (singleActive
+      ? (isSingleTarget ? "单号活跃目标账号" : "单号活跃期间本号不运营")
+      : (autoSwitchBlocksManual
+        ? "非当前时段：设备将在对应时段自动切号"
+        : "非高亮：该账号不是当前设备环境归属目标，按钮仅在切号后启用"));
   const exportRowIndex = resolveBackupArchiveExportRowIndex(row);
   const rowIndexNum = exportRowIndex ?? -1;
   const hasCutSwitchRow = exportRowIndex != null;
@@ -12954,14 +13052,19 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
                 <input type="checkbox" class="backup-archive-export-select" data-row-index="${exportRowIndex != null ? exportRowIndex : ""}"${exportRowIndex == null ? " disabled" : ""}${exportChecked ? " checked" : ""} />
               </label>`
     : "";
+  const singleBtnLabel = singleActive ? "取消单号活跃" : "单号活跃";
+  const singleBtnTitle = singleActive
+    ? "关闭后退出单号活跃自治，不会自动重开自动切号"
+    : "开启后锁定粉丝最多的账号：全天只做涨粉/发作品/引流互点，跳过切号；并关闭多号自动切号";
   return `
-        <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
+        <div class="panel-card backup-archive-record${switchActive ? " backup-archive-record--active" : ""}${singleActive && !isSingleTarget ? " backup-archive-record--locked" : ""}" data-backup-row-index="${hasCutSwitchRow ? rowIndexNum : ""}" data-switch-hl="${escapeHtml(switchHl)}" data-bucket-size="${rows.length}" data-row-username="${escapeHtml(username)}" data-row-backup-name="${escapeHtml(backupName)}" data-row-backup-path="${escapeHtml(backupPath)}" data-row-device-id="${escapeHtml(deviceId)}" data-action-alias="${escapeHtml(actionAlias)}">
           <div class="backup-archive-record__head">
             <div class="backup-archive-record__title">
               ${recordSelectHtml}
               <strong class="backup-archive-record__index">记录 #${idx + 1}</strong>
               ${aliasBadge}
               ${autoSwitchBadge}
+              ${singleTargetBadge}
               ${autoSwitchExcludedBadge}
               ${envStatusBadge}
               ${dailyPublishBadge}
@@ -12971,6 +13074,7 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
             <div class="backup-archive-record__actions">
               <button type="button" class="ghost" title="删除该账号与别名的分配关系（无需高亮）" data-account-unassign="1" data-account-username="${escapeHtml(username)}" data-account-alias="${escapeHtml(actionAlias)}" data-device-row-index="${Number.isFinite(deviceRowIndex) ? deviceRowIndex : ""}">删除分配</button>
               <button type="button" class="ghost" title="${escapeHtml(autoSwitchExcluded ? "恢复参加自动切号" : "将该账号从自动切号计划中排除")}" data-account-auto-switch-excluded="1" data-account-id="${backupRecordId || ""}" data-account-excluded="${autoSwitchExcluded ? "1" : "0"}">${autoSwitchExcluded ? "参加自动切号" : "不参加自动切号"}</button>
+              <button type="button" class="ghost${singleActive ? " backup-archive-switch-btn--active" : ""}"${deviceId ? "" : " disabled"} title="${escapeHtml(deviceId ? singleBtnTitle : "未绑定 device_id，无法开启单号活跃")}" data-single-account-active="1" data-device-id="${escapeHtml(deviceId)}" data-single-enabled="${singleActive ? "1" : "0"}">${singleBtnLabel}</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "仅清理设备内 TikTok 数据，不做备份")}" data-action="alias-clear" data-device-alias="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}">清理TikTok数据</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先备份，再清理设备内 TikTok 数据")}" data-account-backup="${escapeHtml(actionAlias)}" data-device-id="${escapeHtml(deviceId)}" data-account-id="${backupRecordId || ""}" data-account-username="${escapeHtml(username)}">备份并清理</button>
               <button type="button" class="ghost"${otherDisabled} title="${escapeHtml(otherTitle || "先 pm clear 清理 TikTok 数据，再从该条记录的 tar 解压还原")}" data-account-restore="${escapeHtml(actionAlias)}" data-account-backup-name="${escapeHtml(backupName)}">清理并还原该备份</button>
@@ -14349,6 +14453,33 @@ if (deviceAliasGroupsEl) {
       if (disabledDevices > 0) parts.push(`已自动关闭 ${disabledDevices} 台设备自动切号`);
       else if (notifiedDevices > 0) parts.push(`已重同步 ${notifiedDevices} 台设备`);
       setStatus(parts.join("，"), disabledDevices > 0 ? "warning" : "success");
+      return;
+    }
+    if (target.hasAttribute("data-single-account-active")) {
+      event.preventDefault();
+      const deviceId = String(target.getAttribute("data-device-id") || "").trim();
+      if (!deviceId) {
+        setStatus("未绑定 device_id，无法开启单号活跃", "warning");
+        return;
+      }
+      const currentlyOn = String(target.getAttribute("data-single-enabled") || "").trim() === "1";
+      const nextEnabled = !currentlyOn;
+      const detail = nextEnabled
+        ? "开启后将：1) 关闭多号自动切号；2) 按当前粉丝量锁定最多的账号；3) 立刻切到该号一次，之后只做涨粉/发作品/引流互点。"
+        : "关闭后退出单号活跃，不会自动重开自动切号，需手动再开。";
+      if (!window.confirm(`确认${nextEnabled ? "开启" : "关闭"}「单号活跃」？\n${detail}`)) return;
+      try {
+        const resp = await request("/api/admin/single_account_active", {
+          method: "POST",
+          body: JSON.stringify({ device_id: deviceId, enabled: nextEnabled }),
+        });
+        await loadAutoSwitchConfig({ refreshArchive: false });
+        await loadBackupArchiveRecords();
+        await refreshAutoSwitchDailyPlansInBackground();
+        setStatus(resp?.msg || (nextEnabled ? "已开启单号活跃" : "已关闭单号活跃"), "success");
+      } catch (e) {
+        setStatus(e.message || "单号活跃操作失败", "error");
+      }
       return;
     }
     if (target.hasAttribute("data-account-switch")) {

@@ -1035,6 +1035,24 @@ def init_auth_db():
             conn.execute("ALTER TABLE client_devices ADD COLUMN pc_service_url TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN single_account_active INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN single_account_username TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN single_account_row_index INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_owner ON client_devices(owner_username)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_group ON client_devices(device_group)")
         conn.commit()
@@ -1791,6 +1809,10 @@ class DeviceInfo:
     paused: bool = False
     auto_start_opt_out: bool = False
     auto_switch_enabled: bool = False
+    # 单号活跃：关掉多号自动切号，但复用自治管线（全天单 slot、跳过排班切号）
+    single_account_active: bool = False
+    single_account_username: str = ""
+    single_account_row_index: int = 0
 
 
 @dataclass
@@ -1975,10 +1997,23 @@ def _load_client_devices_from_db() -> None:
     rows: list[Any] = []
     try:
         rows = conn.execute(
-            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices"
+            """
+            SELECT device_id, owner_username, alias, device_group, fingerprint, status,
+                   pending_start, paused, auto_start_opt_out, auto_switch_enabled,
+                   COALESCE(single_account_active, 0) AS single_account_active,
+                   COALESCE(single_account_username, '') AS single_account_username,
+                   COALESCE(single_account_row_index, 0) AS single_account_row_index
+            FROM client_devices
+            """
         ).fetchall()
     except sqlite3.OperationalError:
-        rows = []
+        # 旧库尚未迁移单号活跃列时回退
+        try:
+            rows = conn.execute(
+                "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
     finally:
         conn.close()
     with _tracked_store_lock("_load_client_devices_from_db", blocking=True):
@@ -1989,6 +2024,7 @@ def _load_client_devices_from_db() -> None:
             st = str(row["status"] or "offline")
             if st not in ("offline", "online", "running", "error"):
                 st = "offline"
+            keys = row.keys() if hasattr(row, "keys") else []
             store.devices[did] = DeviceInfo(
                 alias=str(row["alias"]),
                 fingerprint=str(row["fingerprint"]),
@@ -1997,8 +2033,11 @@ def _load_client_devices_from_db() -> None:
                 status=st,  # type: ignore[arg-type]
                 pending_start=bool(int(row["pending_start"] or 0)),
                 paused=bool(int(row["paused"] or 0)),
-                auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in row.keys() else False,
-                auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in row.keys() else False,
+                auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in keys else False,
+                auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in keys else False,
+                single_account_active=bool(int(row["single_account_active"] or 0)) if "single_account_active" in keys else False,
+                single_account_username=str(row["single_account_username"] or "").strip() if "single_account_username" in keys else "",
+                single_account_row_index=int(row["single_account_row_index"] or 0) if "single_account_row_index" in keys else 0,
             )
             store.fingerprint_to_device[str(row["fingerprint"])] = did
     if rows:
@@ -2016,6 +2055,9 @@ def _device_persist_row_snapshot(dev: DeviceInfo) -> tuple:
         bool(dev.paused),
         bool(dev.auto_start_opt_out),
         bool(dev.auto_switch_enabled),
+        bool(dev.single_account_active),
+        str(dev.single_account_username or "").strip(),
+        int(dev.single_account_row_index or 0),
     )
 
 
@@ -2049,17 +2091,25 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                 paused,
                 auto_start_opt_out,
                 auto_switch_enabled,
+                single_account_active,
+                single_account_username,
+                single_account_row_index,
             ) = snap
             pending_i = 1 if pending_start else 0
             paused_i = 1 if paused else 0
             auto_start_i = 1 if auto_start_opt_out else 0
             auto_switch_i = 1 if auto_switch_enabled else 0
+            single_i = 1 if single_account_active else 0
+            single_user = str(single_account_username or "").strip()
+            single_ri = int(single_account_row_index or 0)
             exists = conn.execute("SELECT created_at FROM client_devices WHERE device_id = ?", (did,)).fetchone()
             if exists:
                 conn.execute(
                     """
                     UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, fingerprint = ?, status = ?,
-                        pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?, updated_at = ?
+                        pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?,
+                        single_account_active = ?, single_account_username = ?, single_account_row_index = ?,
+                        updated_at = ?
                     WHERE device_id = ?
                     """,
                     (
@@ -2072,6 +2122,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                         paused_i,
                         auto_start_i,
                         auto_switch_i,
+                        single_i,
+                        single_user,
+                        single_ri,
                         now,
                         did,
                     ),
@@ -2079,8 +2132,13 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
             else:
                 conn.execute(
                     """
-                    INSERT INTO client_devices (device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO client_devices (
+                        device_id, owner_username, alias, device_group, fingerprint, status,
+                        pending_start, paused, auto_start_opt_out, auto_switch_enabled,
+                        single_account_active, single_account_username, single_account_row_index,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         did,
@@ -2093,6 +2151,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                         paused_i,
                         auto_start_i,
                         auto_switch_i,
+                        single_i,
+                        single_user,
+                        single_ri,
                         now,
                         now,
                     ),
@@ -2110,7 +2171,7 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
 
 
 def _device_persist_min_interval_sec(device_id: str) -> float:
-    if _device_auto_switch_enabled(device_id):
+    if _device_autonomy_enabled(device_id):
         return _AUTO_SWITCH_DEVICE_PERSIST_MIN_INTERVAL_SEC
     return _DEVICE_PERSIST_MIN_INTERVAL_SEC
 
@@ -3949,6 +4010,11 @@ class AutoSwitchConfigRequest(BaseModel):
 
 class AutoSwitchDevicesRequest(BaseModel):
     device_ids: List[str] = Field(default_factory=list)
+    enabled: bool
+
+
+class SingleAccountActiveRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=128)
     enabled: bool
 
 
@@ -7720,7 +7786,7 @@ def _auto_switch_enqueue_cut_switch(
     source_row: dict[str, Any],
     target_row: dict[str, Any],
 ) -> bool:
-    if not _device_auto_switch_enabled(device_id):
+    if not _device_autonomy_enabled(device_id):
         return False
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
@@ -7781,7 +7847,7 @@ def _auto_switch_enqueue_cut_switch(
         "package_name": TIKTOK_PACKAGE_NAME,
         "backup_record_id": source_ri,
         "username": source_user,
-        "source": "auto_switch",
+        "source": "auto_switch" if _device_auto_switch_enabled(did) else "single_account_active",
     }
     if prev_path:
         backup_payload["previous_backup_path"] = prev_path
@@ -7833,7 +7899,7 @@ def _auto_switch_enqueue_bootstrap_cut_switch(
     target_row: dict[str, Any],
 ) -> bool:
     """无切号高亮的多账号桶：仅清理 TikTok 后还原目标（不备份源），对齐到当前时段账号。"""
-    if not _device_auto_switch_enabled(device_id):
+    if not _device_autonomy_enabled(device_id):
         return False
     alias_clean = _normalize_alias_key(alias)
     did = str(device_id or "").strip()
@@ -7887,7 +7953,7 @@ def _auto_switch_enqueue_bootstrap_cut_switch(
         "package_name": TIKTOK_PACKAGE_NAME,
         "cut_switch_after_backup": cut_mode,
         "cut_switch_target_row_index": target_ri,
-        "source": "auto_switch",
+        "source": "auto_switch" if _device_auto_switch_enabled(did) else "single_account_active",
     }
     _resume_device_for_cloud_op(
         did,
@@ -10781,10 +10847,23 @@ def _hydrate_device_from_db(device_id: str) -> None:
     """按 device_id 从 client_devices 读一行并写回内存 store。"""
     conn = _get_db()
     try:
-        row = conn.execute(
-            "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                """
+                SELECT device_id, owner_username, alias, device_group, fingerprint, status,
+                       pending_start, paused, auto_start_opt_out, auto_switch_enabled,
+                       COALESCE(single_account_active, 0) AS single_account_active,
+                       COALESCE(single_account_username, '') AS single_account_username,
+                       COALESCE(single_account_row_index, 0) AS single_account_row_index
+                FROM client_devices WHERE device_id = ?
+                """,
+                (device_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
     finally:
         conn.close()
     if not row:
@@ -10792,17 +10871,21 @@ def _hydrate_device_from_db(device_id: str) -> None:
     st = str(row["status"] or "offline")
     if st not in ("offline", "online", "running", "error"):
         st = "offline"
+    keys = row.keys() if hasattr(row, "keys") else []
     with store.lock:
         store.devices[device_id] = DeviceInfo(
             alias=str(row["alias"]),
             fingerprint=str(row["fingerprint"]),
             owner_username=str(row["owner_username"]),
-            device_group=str(row["device_group"] or "") if "device_group" in row.keys() else "",
+            device_group=str(row["device_group"] or "") if "device_group" in keys else "",
             status=st,  # type: ignore[arg-type]
             pending_start=bool(int(row["pending_start"] or 0)),
             paused=bool(int(row["paused"] or 0)),
-            auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in row.keys() else False,
-            auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in row.keys() else False,
+            auto_start_opt_out=bool(int(row["auto_start_opt_out"] or 0)) if "auto_start_opt_out" in keys else False,
+            auto_switch_enabled=bool(int(row["auto_switch_enabled"] or 0)) if "auto_switch_enabled" in keys else False,
+            single_account_active=bool(int(row["single_account_active"] or 0)) if "single_account_active" in keys else False,
+            single_account_username=str(row["single_account_username"] or "").strip() if "single_account_username" in keys else "",
+            single_account_row_index=int(row["single_account_row_index"] or 0) if "single_account_row_index" in keys else 0,
         )
         store.fingerprint_to_device[str(row["fingerprint"])] = device_id
 
@@ -10944,7 +11027,7 @@ def sync_status(payload: SyncStatusRequest):
     if str(device.status or "") == new_status:
         return {"code": 0, "msg": "状态未变化"}
 
-    autonomous = _device_auto_switch_enabled(payload.device_id)
+    autonomous = _device_autonomy_enabled(payload.device_id)
     try:
         with _store_lock("sync_status", wait_sec=STORE_LOCK_DEVICE_WAIT_SEC):
             if str(device.status or "") == new_status:
@@ -20359,6 +20442,7 @@ def download_account_stats_query_logs(
 
 
 AUTO_SWITCH_MANUAL_BLOCK_MSG = "该设备已开启自动切号，请先关闭后再执行手动操作"
+SINGLE_ACCOUNT_MANUAL_BLOCK_MSG = "该设备已开启单号活跃，请先关闭后再执行手动操作"
 
 
 def _device_auto_switch_enabled(device_id: str) -> bool:
@@ -20368,6 +20452,139 @@ def _device_auto_switch_enabled(device_id: str) -> bool:
     with store.lock:
         dev = store.devices.get(did)
         return bool(dev and dev.auto_switch_enabled)
+
+
+def _device_single_account_active(device_id: str) -> bool:
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    with store.lock:
+        dev = store.devices.get(did)
+        return bool(dev and dev.single_account_active)
+
+
+def _device_autonomy_enabled(device_id: str) -> bool:
+    """多号自动切号或单号活跃任一开启，即视为自治中（可拉 bundle / 本地调度）。"""
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return False
+        return bool(dev.auto_switch_enabled or dev.single_account_active)
+
+
+def _device_single_account_lock(device_id: str) -> tuple[str, int]:
+    did = str(device_id or "").strip()
+    if not did:
+        return "", -1
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev or not dev.single_account_active:
+            return "", -1
+        return str(dev.single_account_username or "").strip(), int(dev.single_account_row_index or 0)
+
+
+def _safe_row_index(value: object, default: int = -1) -> int:
+    """解析 row_index；0 是合法下标，不能用 `x or default`。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _list_alias_device_editor_rows_for_single_account(
+    owner_username: str,
+    alias: str,
+) -> list[dict[str, Any]]:
+    """别名桶内全部有 username 的档案（含已排除号），供单号活跃挑选粉丝最多账号。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return []
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, device_alias, device_id, username, assigned_alias,
+                   backup_path, backup_name, switch_highlight, video_count,
+                   follower_count, follower_growth, auto_switch_excluded
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        item = _auto_switch_row_dict(row)
+        item["follower_count"] = _parse_stat_int(row["follower_count"] if hasattr(row, "keys") else None)
+        item["follower_growth"] = row["follower_growth"] if hasattr(row, "keys") else ""
+        if _device_editor_effective_alias(item) != alias_key:
+            continue
+        out.append(item)
+    return out
+
+
+def _pick_top_follower_row_for_single_account(
+    owner_username: str,
+    alias: str,
+) -> dict[str, Any] | None:
+    rows = _list_alias_device_editor_rows_for_single_account(owner_username, alias)
+    if not rows:
+        return None
+    ranked = sorted(
+        rows,
+        key=lambda it: (-int(it.get("follower_count") or 0), _safe_row_index(it.get("row_index"), 0)),
+    )
+    return ranked[0]
+
+
+def _single_account_full_day_plan(row: dict[str, Any]) -> dict[str, Any]:
+    """单号活跃：全天唯一 slot，跳过排班切号（切号由开启时一次性入队）。"""
+    pub_min = _random_auto_publish_minute(0, 1440)
+    return {
+        "slot_minutes": 1440,
+        "account_count": 1,
+        "slots": [
+            {
+                "slot_index": 0,
+                "start_min": 0,
+                "end_min": 1440,
+                "row_index": _safe_row_index(row.get("row_index"), 0),
+                "username": str(row.get("username") or "").strip(),
+                "auto_publish_minute": pub_min,
+                "auto_mutual_minute": _random_auto_mutual_minute(0, 1440, pub_min),
+            }
+        ],
+    }
+
+
+def _clear_device_single_account_active(device_id: str, *, persist: bool = True) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return
+        dev.single_account_active = False
+        dev.single_account_username = ""
+        dev.single_account_row_index = 0
+    if persist:
+        _persist_client_device_to_db(did, force=True)
 
 
 def _auto_switch_enter_session_active(session_id: str) -> bool:
@@ -20428,14 +20645,18 @@ def _sync_device_auto_switch_enabled(device_id: str, enabled: bool, *, force_per
 
 
 def _device_auto_switch_enabled_resolved(device_id: str, session_id: str = "") -> bool:
-    """内存开关 + enter session 真源（修复多 worker / 异步落库滞后导致 bundle 被拒）。"""
-    if _device_auto_switch_enabled(device_id):
+    """内存开关 + enter session 真源（修复多 worker / 异步落库滞后导致 bundle 被拒）。
+
+    单号活跃与多号自动切号共用自治控制面：任一开启即可拉 bundle。
+    """
+    if _device_autonomy_enabled(device_id):
         return True
     # 管理台已关且有待投递 exit 时，不得凭陈旧 enter session 把开关复活。
     if _has_pending_auto_switch_exit_event(device_id):
         return False
     sid = str(session_id or "").strip() or _latest_auto_switch_enter_session_id(device_id)
     if sid and _auto_switch_enter_session_active(sid):
+        # 仅恢复多号自动切号标记；单号活跃以 DB/内存字段为准，不在此复活。
         _sync_device_auto_switch_enabled(device_id, True, force_persist=True)
         return True
     return False
@@ -20443,7 +20664,9 @@ def _device_auto_switch_enabled_resolved(device_id: str, session_id: str = "") -
 
 def _any_device_auto_switch_enabled() -> bool:
     with store.lock:
-        return any(bool(d.auto_switch_enabled) for d in store.devices.values())
+        return any(
+            bool(d.auto_switch_enabled or d.single_account_active) for d in store.devices.values()
+        )
 
 
 def _resolve_device_id_for_owner_alias(owner_username: str, alias: str, fallback_device_id: str = "") -> str:
@@ -20475,7 +20698,11 @@ def _reject_if_auto_switch_manual_ops(
     did = str(device_id or "").strip()
     if not did:
         did = _resolve_device_id_for_owner_alias(owner_username, alias)
-    if did and _device_auto_switch_enabled(did):
+    if not did:
+        return None
+    if _device_single_account_active(did):
+        return {"code": 1, "msg": SINGLE_ACCOUNT_MANUAL_BLOCK_MSG}
+    if _device_auto_switch_enabled(did):
         return {"code": 1, "msg": AUTO_SWITCH_MANUAL_BLOCK_MSG}
     return None
 
@@ -20959,23 +21186,65 @@ def _build_auto_switch_bundle_for_device(
     owner = str(device.owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     schedule_date = _beijing_date_str()
-    # 拉 bundle 前按最新规则对账：粉丝前 N + 邮件收码能力
-    _reconcile_follower_cap_auto_switch_exclusions(owner, alias_key)
-    _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
-    buckets = _list_device_editor_buckets(owner)
-    rows = buckets.get(alias_key, [])
-    if not rows:
-        raise ValueError(f"别名 {alias_key} 无备份档案")
-    weekly_plan = _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
-    week_start = str(weekly_plan.get("week_start_date") or "").strip()
-    week_end = str(weekly_plan.get("week_end_date") or "").strip()
-    plan = _daily_plan_for_schedule_date(weekly_plan, schedule_date)
-    if not plan:
-        raise ValueError(f"本周排班缺少今日计划 date={schedule_date}")
-    minute_of_day = _beijing_minute_of_day()
-    slot_highlight_ri = _resolve_slot_highlight_row_index(
-        owner, alias_key, schedule_date, minute_of_day, rows,
-    )
+    did = str(device_id or "").strip()
+    single_active = _device_single_account_active(did)
+    locked_user, locked_ri = _device_single_account_lock(did) if single_active else ("", 0)
+
+    if single_active:
+        all_rows = _list_alias_device_editor_rows_for_single_account(owner, alias_key)
+        if not all_rows:
+            raise ValueError(f"别名 {alias_key} 无备份档案")
+        locked_row = None
+        if locked_ri >= 0:
+            locked_row = next(
+                (r for r in all_rows if _safe_row_index(r.get("row_index")) == locked_ri),
+                None,
+            )
+        if locked_row is None and locked_user:
+            locked_row = next(
+                (
+                    r
+                    for r in all_rows
+                    if str(r.get("username") or "").strip().lower() == locked_user.lower()
+                ),
+                None,
+            )
+        if locked_row is None:
+            locked_row = _pick_top_follower_row_for_single_account(owner, alias_key)
+        if locked_row is None:
+            raise ValueError(f"别名 {alias_key} 无可用账号用于单号活跃")
+        rows = [locked_row]
+        plan = _single_account_full_day_plan(locked_row)
+        week_start, week_end = _beijing_week_bounds(schedule_date)
+        days: dict[str, Any] = {}
+        for date_key in _iter_dates_inclusive(week_start, week_end):
+            days[date_key] = _single_account_full_day_plan(locked_row) if date_key != schedule_date else plan
+        weekly_plan = {
+            "week_start_date": week_start,
+            "week_end_date": week_end,
+            "account_count": 1,
+            "rows_fingerprint": _weekly_plan_rows_fingerprint(rows),
+            "days": days,
+        }
+        slot_highlight_ri = _safe_row_index(locked_row.get("row_index"), 0)
+    else:
+        # 拉 bundle 前按最新规则对账：粉丝前 N + 邮件收码能力
+        _reconcile_follower_cap_auto_switch_exclusions(owner, alias_key)
+        _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
+        buckets = _list_device_editor_buckets(owner)
+        rows = buckets.get(alias_key, [])
+        if not rows:
+            raise ValueError(f"别名 {alias_key} 无备份档案")
+        weekly_plan = _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
+        week_start = str(weekly_plan.get("week_start_date") or "").strip()
+        week_end = str(weekly_plan.get("week_end_date") or "").strip()
+        plan = _daily_plan_for_schedule_date(weekly_plan, schedule_date)
+        if not plan:
+            raise ValueError(f"本周排班缺少今日计划 date={schedule_date}")
+        minute_of_day = _beijing_minute_of_day()
+        slot_highlight_ri = _resolve_slot_highlight_row_index(
+            owner, alias_key, schedule_date, minute_of_day, rows,
+        )
     runtime = _normalize_user_runtime_state(_load_user_runtime_state(owner))
     mode = str(runtime.get("run_mode") or "growth")
     if mode not in RUN_MODES:
@@ -21060,6 +21329,22 @@ def _build_auto_switch_bundle_for_device(
         "smart_template_debug": smart_template_debug,
         "accounts": accounts,
         "daily_plan": plan,
+        "single_account_active": bool(single_active),
+        "skip_scheduled_cut_switch": bool(single_active),
+        "single_account_username": str(
+            (locked_user if single_active else "")
+            or (rows[0].get("username") if single_active and rows else "")
+            or ""
+        ).strip(),
+        "single_account_row_index": int(
+            locked_ri
+            if single_active and locked_ri >= 0
+            else (
+                _safe_row_index(rows[0].get("row_index"), -1)
+                if single_active and rows
+                else -1
+            )
+        ),
         "retry_policy": {
             "cut_switch_max_attempts": 3,
             "login_max_attempts": 5,
@@ -21208,12 +21493,16 @@ def get_auto_switch_config(authorization: str | None = Header(default=None)):
                         "device_id": did,
                         "alias": str(dev.alias or ""),
                         "enabled": bool(dev.auto_switch_enabled),
+                        "single_account_active": bool(dev.single_account_active),
+                        "single_account_username": str(dev.single_account_username or "").strip(),
+                        "single_account_row_index": int(dev.single_account_row_index or 0),
                     }
                 )
     except StoreLockBusy:
         return {"code": 503, "msg": "服务繁忙，请稍后重试"}
     enabled_count = sum(1 for d in devices_out if d.get("enabled"))
-    autonomous_mode = enabled_count > 0
+    single_count = sum(1 for d in devices_out if d.get("single_account_active"))
+    autonomous_mode = enabled_count > 0 or single_count > 0
     owner = str(session.get("username") or "").strip()
     cut_switch_scheme = _load_cut_switch_scheme(owner)
     return {
@@ -21221,6 +21510,7 @@ def get_auto_switch_config(authorization: str | None = Header(default=None)):
         "data": {
             "devices": devices_out,
             "enabled_count": enabled_count,
+            "single_account_active_count": single_count,
             "any_enabled": enabled_count > 0,
             "autonomous_mode": autonomous_mode,
             "cloud_tick_active": not autonomous_mode,
@@ -21326,6 +21616,11 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
                 continue
             owner = str(dev.owner_username or "").strip()
             was_enabled = bool(dev.auto_switch_enabled)
+            # 开启多号自动切号时退出单号活跃（两模式互斥）
+            if target_enabled and bool(dev.single_account_active):
+                dev.single_account_active = False
+                dev.single_account_username = ""
+                dev.single_account_row_index = 0
             dev.auto_switch_enabled = bool(target_enabled)
             if target_enabled and not was_enabled:
                 turning_on = True
@@ -21417,6 +21712,216 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
     }
 
 
+def _find_current_highlight_row_in_alias(
+    owner_username: str,
+    alias: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    yes_rows = [
+        r for r in rows if _normalize_switch_highlight(r.get("switch_highlight")) == "是"
+    ]
+    if len(yes_rows) == 1:
+        return yes_rows[0]
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+@app.post("/api/admin/single_account_active")
+def set_single_account_active(
+    payload: SingleAccountActiveRequest,
+    authorization: str | None = Header(default=None),
+):
+    """开启/关闭单号活跃：关掉多号自动切号，锁死粉丝最多账号，全天单 slot 自治。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    allowed = _session_device_ids(session)
+    did = str(payload.device_id or "").strip()
+    if not did or did not in allowed:
+        return {"code": 1, "msg": "未选择有效设备"}
+    if not store.devices.get(did):
+        _hydrate_device_from_db(did)
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return {"code": 1, "msg": "设备不存在"}
+        owner = str(dev.owner_username or "").strip()
+        alias_key = _normalize_alias_key(dev.alias)
+        was_single = bool(dev.single_account_active)
+        was_auto = bool(dev.auto_switch_enabled)
+    if not owner or not alias_key:
+        return {"code": 1, "msg": "设备别名未绑定"}
+
+    target_enabled = bool(payload.enabled)
+    if target_enabled and was_single:
+        locked_user, locked_ri = _device_single_account_lock(did)
+        return {
+            "code": 0,
+            "msg": "该设备已处于单号活跃",
+            "data": {
+                "enabled": True,
+                "device_id": did,
+                "alias": alias_key,
+                "single_account_username": locked_user,
+                "single_account_row_index": locked_ri,
+            },
+        }
+    if (not target_enabled) and not was_single:
+        return {
+            "code": 0,
+            "msg": "该设备未开启单号活跃",
+            "data": {"enabled": False, "device_id": did, "alias": alias_key},
+        }
+
+    cut_enqueued = False
+    cut_skipped_same = False
+    notified = 0
+    cancelled_ops = 0
+    locked_username = ""
+    locked_row_index = 0
+    follower_count = 0
+
+    if target_enabled:
+        pick = _pick_top_follower_row_for_single_account(owner, alias_key)
+        if not pick:
+            return {"code": 1, "msg": f"别名 {alias_key} 无可用账号，无法开启单号活跃"}
+        locked_username = str(pick.get("username") or "").strip()
+        locked_row_index = _safe_row_index(pick.get("row_index"), -1)
+        follower_count = int(pick.get("follower_count") or 0)
+        if not locked_username or locked_row_index < 0:
+            return {"code": 1, "msg": "粉丝最多账号缺少 username/row_index"}
+
+        # 先关掉多号自动切号（用户侧「自动切号·关」）
+        if was_auto:
+            off_session = _new_auto_switch_session_id(entering=False)
+            _persist_auto_switch_session_row(off_session, enabled=False, bundle_revision=0)
+            with store.lock:
+                d2 = store.devices.get(did)
+                if d2:
+                    d2.auto_switch_enabled = False
+            _persist_client_device_to_db(did, force=True)
+            _close_active_auto_switch_enter_sessions_for_device(did)
+            _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+            cancelled_ops += _cancel_pending_auto_switch_device_ops_for_device(did)
+            _enqueue_device_mode_event(did, owner, "auto_switch_exit", off_session, bundle_revision=0)
+            _append_device_log(did, f"[{now_text()}] 单号活跃 | 已关闭多号自动切号")
+
+        with store.lock:
+            d3 = store.devices.get(did)
+            if not d3:
+                return {"code": 1, "msg": "设备不存在"}
+            d3.single_account_active = True
+            d3.single_account_username = locked_username
+            d3.single_account_row_index = locked_row_index
+            d3.auto_switch_enabled = False
+        _persist_client_device_to_db(did, force=True)
+
+        all_rows = _list_alias_device_editor_rows_for_single_account(owner, alias_key)
+        current = _find_current_highlight_row_in_alias(owner, alias_key, all_rows)
+        current_ri = _safe_row_index(current.get("row_index"), -1) if current else -1
+        if current is not None and current_ri == locked_row_index:
+            cut_skipped_same = True
+            _apply_cut_switch_highlight_intent(owner, locked_row_index)
+        elif current is not None and current_ri >= 0:
+            cut_enqueued = bool(
+                _auto_switch_enqueue_cut_switch(owner, alias_key, did, current, pick)
+            )
+        else:
+            cut_enqueued = bool(
+                _auto_switch_enqueue_bootstrap_cut_switch(owner, alias_key, did, pick)
+            )
+
+        session_id = _new_auto_switch_session_id(entering=True)
+        with store.lock:
+            store.auto_switch_bundle_revision = int(store.auto_switch_bundle_revision or 0) + 1
+            bundle_revision = int(store.auto_switch_bundle_revision)
+        persist_runtime_state()
+        _persist_auto_switch_session_row(session_id, enabled=True, bundle_revision=bundle_revision)
+        _close_active_auto_switch_enter_sessions_for_device(did, except_session_id=session_id)
+        _supersede_pending_device_mode_events(did, ("auto_switch_exit",))
+        if _enqueue_device_mode_event(
+            did,
+            owner,
+            "auto_switch_enter",
+            session_id,
+            bundle_revision=bundle_revision,
+            payload={
+                "single_account_active": True,
+                "skip_scheduled_cut_switch": True,
+                "single_account_username": locked_username,
+                "single_account_row_index": locked_row_index,
+            },
+        ):
+            notified = 1
+        _append_device_log(
+            did,
+            f"[{now_text()}] 单号活跃 | 已开启 目标={locked_username} followers={follower_count} "
+            f"cut={'skip_same' if cut_skipped_same else ('enqueued' if cut_enqueued else 'none')} "
+            f"session={session_id}",
+        )
+        with store.lock:
+            store.auto_switch_align_on_next_tick = True
+        return {
+            "code": 0,
+            "msg": (
+                f"已开启单号活跃：锁定 @{locked_username}（粉丝 {follower_count}）"
+                + ("，已与当前环境一致无需切号" if cut_skipped_same else "，已入队切到该号一次")
+            ),
+            "data": {
+                "enabled": True,
+                "device_id": did,
+                "alias": alias_key,
+                "single_account_username": locked_username,
+                "single_account_row_index": locked_row_index,
+                "follower_count": follower_count,
+                "cut_enqueued": cut_enqueued,
+                "cut_skipped_same": cut_skipped_same,
+                "session_id": session_id,
+                "bundle_revision": bundle_revision,
+                "devices_notified": notified,
+                "auto_switch_was_disabled": was_auto,
+                "cancelled_ops": cancelled_ops,
+            },
+        }
+
+    # 关闭：只退出单号活跃，不自动重开多号自动切号
+    session_id = _new_auto_switch_session_id(entering=False)
+    _persist_auto_switch_session_row(session_id, enabled=False, bundle_revision=0)
+    locked_username, locked_row_index = _device_single_account_lock(did)
+    with store.lock:
+        d4 = store.devices.get(did)
+        if d4:
+            d4.single_account_active = False
+            d4.single_account_username = ""
+            d4.single_account_row_index = 0
+            d4.auto_switch_enabled = False
+    _persist_client_device_to_db(did, force=True)
+    _close_active_auto_switch_enter_sessions_for_device(did)
+    _supersede_pending_device_mode_events(did, ("auto_switch_enter",))
+    cancelled_ops += _cancel_pending_auto_switch_device_ops_for_device(did)
+    if _enqueue_device_mode_event(did, owner, "auto_switch_exit", session_id, bundle_revision=0):
+        notified = 1
+    _append_device_log(
+        did,
+        f"[{now_text()}] 单号活跃 | 已关闭（原锁定={locked_username or '-'}），请手动再开自动切号",
+    )
+    return {
+        "code": 0,
+        "msg": "已关闭单号活跃；自动切号保持关闭，需手动再开",
+        "data": {
+            "enabled": False,
+            "device_id": did,
+            "alias": alias_key,
+            "prev_single_account_username": locked_username,
+            "prev_single_account_row_index": locked_row_index,
+            "session_id": session_id,
+            "devices_notified": notified,
+            "cancelled_ops": cancelled_ops,
+        },
+    }
+
+
 @app.post("/api/admin/auto_switch/config")
 def config_auto_switch(payload: AutoSwitchConfigRequest, authorization: str | None = Header(default=None)):
     """兼容旧全局开关：转为对当前用户全部设备批量开/关；也可单独更新切号方案。"""
@@ -21447,7 +21952,7 @@ def get_auto_switch_bundle(
     if error:
         return error
     if not _device_auto_switch_enabled_resolved(device_id, session_id):
-        return {"code": 1, "msg": "该设备未开启自动切号"}
+        return {"code": 1, "msg": "该设备未开启自动切号或单号活跃"}
     try:
         bundle = _build_auto_switch_bundle_for_device(device_id, alias, session_id, revision)
     except ValueError as exc:
