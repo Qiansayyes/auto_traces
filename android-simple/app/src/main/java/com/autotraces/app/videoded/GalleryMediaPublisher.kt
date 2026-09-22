@@ -57,6 +57,8 @@ object GalleryMediaPublisher {
         val app = context.applicationContext
         val taskDir = CompanionApi.receivedTaskDir(app, taskId)
         val uris = mutableListOf<String>()
+        // 先清幽灵行，避免同名 UNIQUE / 选图点到空索引
+        runCatching { purgeGhostPicturesVideoRows(app) }
         for (name in fileNames) {
             val src = File(taskDir, name)
             if (!src.isFile) error("missing_file:$name")
@@ -68,13 +70,16 @@ object GalleryMediaPublisher {
             uris.add(uri.toString())
         }
         assertPublishedVisible(app, uris)
+        // 入库后再扫一遍无关幽灵；若本批 URI 被误伤成幽灵，二次 assert 会失败
+        runCatching { purgeGhostPicturesVideoRows(app) }
+        assertPublishedVisible(app, uris)
         taskDir.deleteRecursively()
         uris
     }
 
     /**
-     * ACK 前硬校验：必须是 content://，且 IS_PENDING=0。
-     * 否则 PC/日志会报「拉取成功」，TikTok 选图页仍空（shell 幽灵 / pending 卡住）。
+     * ACK 前硬校验：必须是 content://，且 IS_PENDING=0，且 `_data` 指向的磁盘文件真实存在且 size>0。
+     * 否则 PC/日志会报「拉取成功」，TikTok 选图页仍空或点到「幽灵行」（索引在、文件没了）。
      */
     fun assertPublishedVisible(context: Context, uriStrings: List<String>) {
         if (uriStrings.isEmpty()) error("gallery_publish_empty")
@@ -99,7 +104,131 @@ object GalleryMediaPublisher {
                     }
                 }
             }
+            val disk = readMediaStoreDiskFile(resolver, uri)
+                ?: error("gallery_data_unreadable:$raw")
+            if (!disk.exists || disk.sizeBytes <= 0L) {
+                // 索引还在、文件已删：典型幽灵行，禁止 ACK 成功
+                purgeVideoUri(context.applicationContext, uri)
+                error("gallery_ghost_missing_file:$raw:${disk.path}:size=${disk.sizeBytes}")
+            }
         }
+    }
+
+    /**
+     * 清理 Pictures 下「MediaStore 有行、磁盘无文件」的幽灵视频行。
+     * 发作品选图前 / 入库后调用，避免固定点「第 N 张」点到不可用格导致 Next 空转。
+     *
+     * 注意：不得用「_data 为空 + 有文件名」当 Pictures——会误伤 DCIM/其它卷。
+     */
+    fun purgeGhostPicturesVideoRows(context: Context): Int {
+        val app = context.applicationContext
+        val resolver = app.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+        val projection = arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DATA,
+            MediaStore.Video.Media.SIZE,
+            MediaStore.Video.Media.RELATIVE_PATH,
+            MediaStore.Video.Media.DISPLAY_NAME,
+        )
+        val ghosts = mutableListOf<Uri>()
+        runCatching {
+            resolver.query(collection, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATA)
+                val sizeCol = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+                val relCol = cursor.getColumnIndex(MediaStore.Video.Media.RELATIVE_PATH)
+                while (cursor.moveToNext()) {
+                    val rel = if (relCol >= 0) cursor.getString(relCol).orEmpty() else ""
+                    val data = cursor.getString(dataCol).orEmpty()
+                    val inPictures =
+                        rel.startsWith("Pictures", ignoreCase = true) ||
+                            data.contains("/Pictures/", ignoreCase = true)
+                    if (!inPictures) continue
+                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(idCol))
+                    val path = data.trim()
+                    val fileMissing =
+                        path.isNotEmpty() && (!File(path).isFile || File(path).length() <= 0L)
+                    // _data 空时不要直接当幽灵：改用 URI 可读性（Scoped Storage 下 _data 常空但仍可用）
+                    val uriUnreadable =
+                        path.isEmpty() && !isMediaStoreUriReadable(resolver, uri)
+                    val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else -1L
+                    val sizeLie =
+                        size > 0L && path.isNotEmpty() &&
+                            (!File(path).isFile || File(path).length() <= 0L)
+                    if (fileMissing || uriUnreadable || sizeLie) {
+                        ghosts.add(uri)
+                    }
+                }
+            }
+        }
+        for (uri in ghosts) {
+            Log.w(TAG, "purge ghost MediaStore row: $uri")
+            purgeVideoUri(app, uri)
+        }
+        return ghosts.size
+    }
+
+    private fun isMediaStoreUriReadable(
+        resolver: android.content.ContentResolver,
+        uri: Uri,
+    ): Boolean {
+        return runCatching {
+            resolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                pfd.statSize > 0L
+            } == true
+        }.getOrDefault(false)
+    }
+
+    private data class MediaStoreDiskFile(val path: String, val exists: Boolean, val sizeBytes: Long)
+
+    private fun readMediaStoreDiskFile(
+        resolver: android.content.ContentResolver,
+        uri: Uri,
+    ): MediaStoreDiskFile? {
+        return runCatching {
+            // 优先用 URI 打开：Scoped Storage 下 File(_data) 可能误判不存在
+            resolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                val len = pfd.statSize.coerceAtLeast(0L)
+                if (len > 0L) {
+                    return@runCatching MediaStoreDiskFile(
+                        path = uri.toString(),
+                        exists = true,
+                        sizeBytes = len,
+                    )
+                }
+            }
+            resolver.query(
+                uri,
+                arrayOf(MediaStore.Video.Media.DATA, MediaStore.Video.Media.SIZE),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use null
+                val path = cursor.getString(0).orEmpty()
+                val declaredSize = if (cursor.columnCount > 1) cursor.getLong(1) else -1L
+                if (path.isEmpty()) {
+                    return@use MediaStoreDiskFile(path = "", exists = false, sizeBytes = 0L)
+                }
+                val f = File(path)
+                val len = if (f.isFile) f.length() else 0L
+                MediaStoreDiskFile(
+                    path = path,
+                    exists = f.isFile && len > 0L,
+                    sizeBytes = if (len > 0L) len else 0L,
+                ).also {
+                    // declaredSize 不能代替真实可读；缺文件时保持 exists=false
+                    if (!it.exists && declaredSize > 0L) {
+                        Log.w(TAG, "MediaStore size=$declaredSize but file missing: $path")
+                    }
+                }
+            }
+        }.getOrNull()
     }
 
     /**
@@ -116,6 +245,7 @@ object GalleryMediaPublisher {
         withContext(Dispatchers.IO) {
             val app = context.applicationContext
             ensureOwnMediaReadGrants()
+            runCatching { purgeGhostPicturesVideoRows(app) }
             for (name in fileNames) {
                 val src = File(root, name)
                 if (!src.isFile) continue

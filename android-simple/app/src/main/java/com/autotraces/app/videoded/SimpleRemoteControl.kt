@@ -330,11 +330,14 @@ object SimpleRemoteControl {
 
             "switch_to_manual_mode" -> {
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
+                if (ManualDeviceControl.ENABLED) {
+                    return ok("当前已是本机手动模式").put("manualMode", true).put("alreadyManual", true)
+                }
                 val result = kotlinx.coroutines.runBlocking {
                     AppCoordinator.switchToManualControlMode()
                 }
                 result.fold(
-                    onSuccess = { tip -> ok(tip) },
+                    onSuccess = { tip -> ok(tip).put("manualMode", true) },
                     onFailure = { err -> fail("switch_mode_failed", err.message ?: "切回手动失败") },
                 )
             }

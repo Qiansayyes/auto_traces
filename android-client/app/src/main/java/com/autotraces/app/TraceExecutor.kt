@@ -1199,6 +1199,21 @@ class RealTraceExecutor(
         private const val AUTO_LOGIN_ENTRY_MISS_BEFORE_EDIT_PROBE = 3
         /** Username 未命中后：重新 OCR 判页（Already have/Log in/Sign up/Username）的最大纠正轮数。 */
         private const val AUTO_LOGIN_USERNAME_PAGE_REDISCOVER_MAX = 4
+        /**
+         * Sign up 落地页底栏「Already have / Log in」：点击命中须在此比例以下区域。
+         * 0.55 过松，会把中部 Continue with Google 当成底栏（日志里 y≈1079 误点）。
+         */
+        private const val SIGN_UP_LANDING_FOOTER_BAND_START = 0.82f
+        /** 底栏命中框最大高度占比；超过视为多行并框（中部+脚注），一律丢弃。 */
+        private const val SIGN_UP_LANDING_FOOTER_MAX_RECT_HEIGHT_FRAC = 0.12f
+        /** 底栏 Log in 几何兜底（相对屏宽/屏高）。 */
+        private const val SIGN_UP_LANDING_LOG_IN_GEOM_X_FRAC = 0.78f
+        private const val SIGN_UP_LANDING_LOG_IN_GEOM_Y_FRAC = 0.94f
+        /**
+         * 登录页底栏「Sign up」识别带：可比落地页 Log in 略松。
+         * 标题「Sign up for TikTok」已由 ocrHitLooksLikeSignUpForTitle 排除，无需像 Log in 一样卡到 0.82。
+         */
+        private const val SIGN_UP_ENTRY_FOOTER_BAND_START = 0.72f
         /** 验证码输入后 OCR 轮询最长时长（毫秒）。 */
         private const val AUTO_LOGIN_CODE_AFTER_OCR_MAX_DURATION_MS = 360_000L
         /** 已拿到验证码后 OCR 轮询间隔（毫秒）；等待页跳转无需高频探页。 */
@@ -18820,7 +18835,92 @@ class RealTraceExecutor(
         return AutoLoginAuthPageWaitResult.Failed
     }
 
-    /** Authenticator app：本地 TOTP → 输入 → Continue。 */
+    /**
+     * 2FA 输码后：反复 OCR 点 Continue（键盘收起/上滑后按钮坐标会飘），
+     * 每次重取坐标；点完须确认已离开 Authenticator 页才算成功。
+     */
+    private suspend fun autoLoginTapContinueAndWaitLeaveAuthenticatorPage(
+        ctx: Context,
+        alias: String,
+        w: Int,
+        h: Int,
+        tagPrefix: String,
+        timeoutMs: Long = AUTO_LOGIN_CUT_SWITCH_PAGE_TRANSITION_MS,
+    ): Boolean {
+        val startedAt = System.currentTimeMillis()
+        var pass = 0
+        var lastContinueTapAt = 0L
+        var tapCount = 0
+        var lastRevealSwipeAt = 0L
+        devOp(alias, "自动登录(2FA)：输码后等待离开 Authenticator（最长 ${timeoutMs / 1000}s）")
+        while (System.currentTimeMillis() - startedAt < timeoutMs) {
+            if (hardStopOrNull(alias, "自动登录-2FA Continue验证")) return false
+            pass++
+            val vision = autoLoginOcrOnce(ctx, alias, "${tagPrefix}_$pass")
+            if (vision == null) {
+                if (!autoLoginDelay(alias, 1000L, "2FA Continue验证")) return false
+                continue
+            }
+            // 成功须有正向证据，避免 OCR 漏读「Authenticator app」却仍停在 2FA 页时误判离开。
+            val routeKind = autoLoginClassifyRouteScreen(vision, h)
+            if (routeKind == AutoLoginRouteScreenKind.Interest ||
+                routeKind == AutoLoginRouteScreenKind.MainFeed
+            ) {
+                devOp(
+                    alias,
+                    "自动登录(2FA)：已离开 Authenticator（${autoLoginRouteScreenKindLabel(routeKind)}，" +
+                        "第 $pass 次 OCR，已点 Continue $tapCount 次）",
+                )
+                return true
+            }
+            val stillOnAuth = visionHasAuthenticatorAppPage(vision)
+            val found = findAutoLoginContinueOrNextHit(vision)
+            if (!stillOnAuth && found == null) {
+                // 既无 Authenticator 标题，也无 Continue/Next：视为已离开（加载中/下一页）
+                if (tapCount > 0) {
+                    devOp(
+                        alias,
+                        "自动登录(2FA)：已离开 Authenticator（未见标题且无 Continue，" +
+                            "第 $pass 次 OCR，已点 Continue $tapCount 次）",
+                    )
+                    return true
+                }
+                // 尚未点过 Continue 就「双消失」：更像 OCR 漏读，继续重试
+                devOp(alias, "自动登录(2FA)：第 $pass 次未见 Authenticator/Continue，且尚未点击，继续 OCR")
+            }
+            val now = System.currentTimeMillis()
+            if (found != null && now - lastContinueTapAt >= AUTO_LOGIN_EMAIL_CONTINUE_TAP_COOLDOWN_MS) {
+                val (label, hit) = found
+                val tap = autoLoginTapWithJitter(hit.point, w, h)
+                tapCount++
+                devOp(
+                    alias,
+                    "自动登录(2FA) Continue(输码后验证)：第 $tapCount 次命中 $label，tap (${tap.x},${tap.y})",
+                )
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    lastContinueTapAt = now
+                    if (!autoLoginDelay(alias, 600L, "Continue 点击后")) return false
+                }
+            } else if (found == null && stillOnAuth) {
+                // 仍在 2FA 页但按钮未露出：隔冷却再上滑，下一轮重 OCR
+                if (now - lastRevealSwipeAt >= AUTO_LOGIN_EMAIL_CONTINUE_TAP_COOLDOWN_MS) {
+                    devOp(alias, "自动登录(2FA)：第 $pass 次 OCR 未见 Continue，再上滑露出按钮")
+                    if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "2FA-Continue露出")) return false
+                    lastRevealSwipeAt = now
+                    continue
+                }
+                devOp(alias, "自动登录(2FA)：第 $pass 次 OCR 未见 Continue，继续重试")
+            }
+            if (!autoLoginDelay(alias, 1000L, "2FA Continue验证")) return false
+        }
+        devOp(
+            alias,
+            "自动登录(2FA)：输码后 Continue 未确认离开 Authenticator（已点 $tapCount 次）",
+        )
+        return false
+    }
+
+    /** Authenticator app：本地 TOTP → 输入 → Continue（点后校验已离开 2FA 页）。 */
     private suspend fun autoLoginEnterAuthenticatorAppCode(
         ctx: Context,
         alias: String,
@@ -18849,20 +18949,9 @@ class RealTraceExecutor(
         if (!autoLoginInputText(alias, code)) return false
         if (!autoLoginDelay(alias, 400L, "2FA验证码输入后")) return false
         if (!autoLoginSwipeUpperHalfAfterAuth(alias, w, h, "2FA")) return false
-        val continueOutcome = autoLoginOcrTapContinueOrNext(
-            ctx, alias, w, h,
-            "${tagPrefix}_continue",
-            "Continue(2FA)",
-            maxPasses = AUTO_LOGIN_OCR_MAX_PASSES,
+        return autoLoginTapContinueAndWaitLeaveAuthenticatorPage(
+            ctx, alias, w, h, "${tagPrefix}_continue",
         )
-        if (continueOutcome == AutoLoginStepOutcome.Ok) return true
-        devOp(alias, "自动登录(2FA)：Continue 未命中，再试一次")
-        return autoLoginOcrTapContinueOrNext(
-            ctx, alias, w, h,
-            "${tagPrefix}_continue_retry",
-            "Continue(2FA-重试)",
-            maxPasses = 3,
-        ) == AutoLoginStepOutcome.Ok
     }
 
     /** 2FA 账号：Username → Password(布局B) → [可选 Email 切 Authenticator] → Authenticator app → 兴趣页/Home。 */
@@ -19267,50 +19356,183 @@ class RealTraceExecutor(
         return false
     }
 
+    /** 误点 Continue with Google 后的系统/WebView 登录页。 */
+    private fun visionShowsGoogleOauthForTikTok(vision: Text): Boolean {
+        val full = vision.text.lowercase(Locale.US)
+        if (full.contains("accounts.google.com")) return true
+        val toTikTok = full.contains("continue to tiktok") || full.contains("to continue to tiktok")
+        if (full.contains("sign in with google") && toTikTok) return true
+        if (toTikTok && full.contains("email or phone") && full.contains("sign in")) return true
+        return false
+    }
+
+    private suspend fun autoLoginDismissGoogleOauthIfPresent(alias: String, vision: Text): Boolean {
+        if (!visionShowsGoogleOauthForTikTok(vision)) return false
+        devOp(alias, "自动登录：见 Google 登录页（误入），按返回退出")
+        runSuCommand("input keyevent 4")
+        autoLoginDelay(alias, 800L, "退出 Google 登录页后")
+        return true
+    }
+
+    /** Sign up 落地页底栏几何点（右侧 Log in）。 */
+    private fun signUpLandingFooterLogInGeometricHit(w: Int, h: Int): StrictLabelHit {
+        val x = (w * SIGN_UP_LANDING_LOG_IN_GEOM_X_FRAC).toInt().coerceIn(1, w - 1)
+        val y = (h * SIGN_UP_LANDING_LOG_IN_GEOM_Y_FRAC).toInt().coerceIn(1, h - 1)
+        return StrictLabelHit(Point(x, y), Rect(x - 24, y - 12, x + 24, y + 12))
+    }
+
+    /** 底栏窄带 + 矮框：拒绝中部 Google/FB 与多行并框。 */
+    private fun ocrHitIsSignUpLandingFooterBand(hit: StrictLabelHit, h: Int): Boolean {
+        val bandTop = (h * SIGN_UP_LANDING_FOOTER_BAND_START).toInt()
+        val maxH = (h * SIGN_UP_LANDING_FOOTER_MAX_RECT_HEIGHT_FRAC).toInt().coerceAtLeast(48)
+        return hit.rect.centerY() >= bandTop && hit.rect.height() <= maxH
+    }
+
+    /**
+     * 仅在底栏窄带内找独立 Log in/Login（取最靠下的命中）。
+     * 不含全屏 findLogInEntryTapHit，避免 Welcome back 中央按钮或并框污染。
+     */
+    private fun findFooterBandExactLogInHit(vision: Text, h: Int): StrictLabelHit? {
+        val bandTop = (h * SIGN_UP_LANDING_FOOTER_BAND_START).toInt()
+        val maxH = (h * SIGN_UP_LANDING_FOOTER_MAX_RECT_HEIGHT_FRAC).toInt().coerceAtLeast(48)
+        var best: StrictLabelHit? = null
+        var bestBottom = Int.MIN_VALUE
+        fun consider(box: Rect) {
+            if (box.centerY() < bandTop) return
+            if (box.height() > maxH) return
+            if (box.bottom > bestBottom) {
+                bestBottom = box.bottom
+                best = StrictLabelHit(Point(box.centerX(), box.centerY()), box)
+            }
+        }
+        for (exact in listOf("Log in", "log in", "Login", "login")) {
+            findStrictExactLabelHit(vision, exact)?.rect?.let { consider(it) }
+        }
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                for (el in line.elements) {
+                    val low = el.text.lowercase(Locale.US).trim()
+                    if (low == "log in" || low == "login" || low == "log-in") {
+                        el.boundingBox?.let { consider(it) }
+                    }
+                }
+                val lowLine = line.text.lowercase(Locale.US).trim()
+                if (lowLine == "log in" || lowLine == "login" || lowLine == "log-in") {
+                    line.boundingBox?.let { consider(it) }
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * 底栏窄带内找 Already have…（只扫单行/单 element，禁止全屏多行拼接）。
+     */
+    private fun findFooterBandAlreadyHaveHit(vision: Text, h: Int): StrictLabelHit? {
+        val bandTop = (h * SIGN_UP_LANDING_FOOTER_BAND_START).toInt()
+        val maxH = (h * SIGN_UP_LANDING_FOOTER_MAX_RECT_HEIGHT_FRAC).toInt().coerceAtLeast(48)
+        var best: StrictLabelHit? = null
+        var bestBottom = Int.MIN_VALUE
+        fun consider(text: String, box: Rect) {
+            val low = text.lowercase(Locale.US)
+            if (!low.contains("already have")) return
+            if (box.centerY() < bandTop) return
+            if (box.height() > maxH) return
+            if (box.bottom > bestBottom) {
+                bestBottom = box.bottom
+                best = StrictLabelHit(Point(box.centerX(), box.centerY()), box)
+            }
+        }
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                line.boundingBox?.let { consider(line.text, it) }
+                val boxes = line.elements.mapNotNull { it.boundingBox }
+                if (boxes.isNotEmpty()) {
+                    val joined = line.elements.joinToString(" ") { it.text.trim() }
+                    val u = boxes.fold(boxes[0]) { acc, r ->
+                        Rect(
+                            minOf(acc.left, r.left),
+                            minOf(acc.top, r.top),
+                            maxOf(acc.right, r.right),
+                            maxOf(acc.bottom, r.bottom),
+                        )
+                    }
+                    consider(joined, u)
+                }
+                for (el in line.elements) {
+                    el.boundingBox?.let { consider(el.text, it) }
+                }
+            }
+        }
+        return best
+    }
+
+    /** Already have 行：点右侧 Log in；OCR 只扫到左半句时向右外推。 */
+    private fun refineAlreadyHaveRowToLogInTap(already: StrictLabelHit, w: Int, h: Int): StrictLabelHit {
+        val y = already.point.y.coerceIn(1, h - 1)
+        val x = if (already.rect.width() >= (w * 0.45f).toInt()) {
+            (already.rect.left + (already.rect.width() * 0.88f).toInt()).coerceIn(1, w - 1)
+        } else {
+            val pushed = (already.rect.right + (w * 0.1f).toInt()).coerceIn(1, w - 1)
+            if (pushed < (w * 0.55f).toInt()) {
+                (w * SIGN_UP_LANDING_LOG_IN_GEOM_X_FRAC).toInt().coerceIn(1, w - 1)
+            } else {
+                pushed
+            }
+        }
+        return StrictLabelHit(Point(x, y), already.rect)
+    }
+
     /**
      * Sign up 落地页底栏：「Already have an account? Log in」。
-     * OCR 常截成 Already have a…，或整句过长；优先点独立 Log in，否则按 Already have 行几何点右侧。
+     * 只认屏幕最底部窄带；拒绝多行并框；失败则几何兜底。绝不回退到全屏 Log in（会点到中部 Google）。
      */
     private fun findAlreadyHaveAccountLogInTapHit(vision: Text, w: Int, h: Int): StrictLabelHit? {
-        val bandTop = (h * 0.55f).toInt()
-        findStrictExactLabelHit(vision, "Log in")?.let { hit ->
-            if (hit.rect.centerY() >= bandTop) return hit
-        }
-        findStrictExactLabelHit(vision, "log in")?.let { hit ->
-            if (hit.rect.centerY() >= bandTop) return hit
-        }
-        findStrictExactLabelHit(vision, "Login")?.let { hit ->
-            if (hit.rect.centerY() >= bandTop) return hit
-        }
-        findBottomBandLabelContaining(vision, h, "log in", bottomFractionStart = 0.55f)?.let { return it }
+        findFooterBandExactLogInHit(vision, h)?.let { return it }
 
-        val already =
-            findLabelHitContainingIgnoreCaseRelaxed(vision, "already have an account")
-                ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "already have a")
-                ?: findLabelHitContainingIgnoreCaseRelaxed(vision, "already have")
-        if (already != null) {
-            findLogInEntryTapHit(vision)?.let { login ->
-                if (kotlin.math.abs(login.point.y - already.point.y) <= (h * 0.1f).toInt()) {
+        findBottomBandLabelContaining(
+            vision,
+            h,
+            "log in",
+            bottomFractionStart = SIGN_UP_LANDING_FOOTER_BAND_START,
+        )?.let { hit ->
+            if (ocrHitIsSignUpLandingFooterBand(hit, h)) {
+                // 整句「Already have…? Log in」：点右侧 Log in
+                val low = vision.text.lowercase(Locale.US)
+                if (low.contains("already have") && hit.rect.width() >= (w * 0.4f).toInt()) {
+                    return refineAlreadyHaveRowToLogInTap(hit, w, h)
+                }
+                return hit
+            }
+        }
+
+        findFooterBandAlreadyHaveHit(vision, h)?.let { already ->
+            findFooterBandExactLogInHit(vision, h)?.let { login ->
+                if (kotlin.math.abs(login.point.y - already.point.y) <= (h * 0.08f).toInt()) {
                     return login
                 }
             }
-            val y = already.point.y.coerceIn(1, h - 1)
-            // Log in 在「Already have…?」右侧；OCR 只扫到左半句时向右外推。
-            val x = if (already.rect.width() >= (w * 0.45f).toInt()) {
-                (already.rect.left + (already.rect.width() * 0.88f).toInt()).coerceIn(1, w - 1)
-            } else {
-                val pushed = (already.rect.right + (w * 0.1f).toInt()).coerceIn(1, w - 1)
-                if (pushed < (w * 0.55f).toInt()) (w * 0.72f).toInt() else pushed
-            }
-            return StrictLabelHit(Point(x, y), already.rect)
+            return refineAlreadyHaveRowToLogInTap(already, w, h)
         }
 
         if (visionShowsSignUpLandingPage(vision)) {
-            val x = (w * 0.72f).toInt().coerceIn(1, w - 1)
-            val y = (h * 0.93f).toInt().coerceIn(1, h - 1)
-            return StrictLabelHit(Point(x, y), Rect(x - 24, y - 12, x + 24, y + 12))
+            return signUpLandingFooterLogInGeometricHit(w, h)
         }
         return null
+    }
+
+    /**
+     * 落地页/重探点击前二次校验：Y 若仍落在中部，强制几何底栏，避免误点 Google/FB。
+     */
+    private fun coerceSignUpLandingLogInTapHit(
+        hit: StrictLabelHit,
+        w: Int,
+        h: Int,
+        onSignUpLanding: Boolean,
+    ): StrictLabelHit {
+        if (ocrHitIsSignUpLandingFooterBand(hit, h)) return hit
+        if (onSignUpLanding) return signUpLandingFooterLogInGeometricHit(w, h)
+        return hit
     }
 
     private fun ocrHitLooksLikeSignUpForTitle(vision: Text, hit: StrictLabelHit): Boolean {
@@ -19325,20 +19547,49 @@ class RealTraceExecutor(
         return false
     }
 
-    /** Profile 未登录入口：Sign up 文案（全屏 OCR，含底栏与页内链接；排除标题 Sign up for TikTok）。 */
-    private fun findSignUpEntryTapHit(vision: Text): StrictLabelHit? {
+    /**
+     * Profile 未登录入口：Sign up 文案。
+     * 优先底栏窄带（登录页脚「Sign up」）；排除标题 Sign up for TikTok；禁止全屏多行并框点中部。
+     */
+    private fun findSignUpEntryTapHit(vision: Text, screenH: Int = 0): StrictLabelHit? {
+        if (visionShowsSignUpLandingPage(vision)) return null
+        val h = screenH.coerceAtLeast(1)
+        val bandTop = if (screenH > 0) (h * SIGN_UP_ENTRY_FOOTER_BAND_START).toInt() else 0
+        val maxH = (h * SIGN_UP_LANDING_FOOTER_MAX_RECT_HEIGHT_FRAC).toInt().coerceAtLeast(48)
+
+        fun acceptFooterOrAny(hit: StrictLabelHit): StrictLabelHit? {
+            if (ocrHitLooksLikeSignUpForTitle(vision, hit)) return null
+            if (screenH > 0) {
+                if (hit.rect.centerY() < bandTop) return null
+                if (hit.rect.height() > maxH) return null
+            }
+            return hit
+        }
+
+        if (screenH > 0) {
+            findBottomBandLabelContaining(
+                vision,
+                h,
+                "sign up",
+                bottomFractionStart = SIGN_UP_ENTRY_FOOTER_BAND_START,
+            )?.let { hit ->
+                acceptFooterOrAny(hit)?.let { return it }
+            }
+        }
         findStrictExactLabelHit(vision, "Sign up")?.let { hit ->
-            if (!ocrHitLooksLikeSignUpForTitle(vision, hit)) return hit
+            acceptFooterOrAny(hit)?.let { return it }
+            if (screenH <= 0 && !ocrHitLooksLikeSignUpForTitle(vision, hit)) return hit
         }
         findStrictExactLabelHit(vision, "sign up")?.let { hit ->
-            if (!ocrHitLooksLikeSignUpForTitle(vision, hit)) return hit
+            acceptFooterOrAny(hit)?.let { return it }
+            if (screenH <= 0 && !ocrHitLooksLikeSignUpForTitle(vision, hit)) return hit
         }
+        // 有屏高时不再走全屏 relaxed 多行拼接（易把标题+正文并成中部大框）
+        if (screenH > 0) return null
         val relaxed = findLabelHitContainingIgnoreCaseRelaxed(vision, "sign up") ?: return null
         if (ocrHitLooksLikeSignUpForTitle(vision, relaxed)) return null
         val low = vision.text.lowercase(Locale.US)
-        // 整屏只有「Sign up for TikTok」标题命中时，不算底栏 Sign up 入口。
         if (low.contains("sign up for tiktok") && !low.contains("already have")) {
-            // 若 relaxed 实际是标题行，上面已滤；此处再挡纯标题落地页误命中。
             if (visionShowsSignUpLandingPage(vision)) return null
         }
         return relaxed
@@ -19364,14 +19615,29 @@ class RealTraceExecutor(
         if (visionShowsSignUpLandingPage(vision)) return true
         if (findLabelHitContainingIgnoreCaseRelaxed(vision, "already have") != null) return true
         if (findLogInEntryTapHit(vision) != null) return true
-        if (findSignUpEntryTapHit(vision) != null) return true
+        if (findSignUpEntryTapHit(vision, screenH) != null) return true
         val fullLow = vision.text.lowercase(Locale.US)
         val accountStatusBody =
             fullLow.contains("log in again") || fullLow.contains("please log in")
-        if (!accountStatusBody && findBottomBandLabelContaining(vision, screenH, "log in") != null) {
+        if (!accountStatusBody &&
+            findBottomBandLabelContaining(
+                vision,
+                screenH,
+                "log in",
+                bottomFractionStart = SIGN_UP_LANDING_FOOTER_BAND_START,
+            ) != null
+        ) {
             return true
         }
-        if (findBottomBandLabelContaining(vision, screenH, "sign up") != null) return true
+        if (findBottomBandLabelContaining(
+                vision,
+                screenH,
+                "sign up",
+                bottomFractionStart = SIGN_UP_ENTRY_FOOTER_BAND_START,
+            ) != null
+        ) {
+            return true
+        }
         return false
     }
 
@@ -19395,6 +19661,8 @@ class RealTraceExecutor(
                 return AutoLoginEntryPath.None
             }
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_entry_$pass") ?: continue
+
+            if (autoLoginDismissGoogleOauthIfPresent(alias, vision)) continue
 
             if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, h)) {
                 val preview = buildProfileEditOcrPreview(vision).take(400)
@@ -19443,43 +19711,38 @@ class RealTraceExecutor(
             }
 
             // Sign up 落地页 / Already have an account? Log in：必须先点 Log in，绝不能当成 ViaSignUp。
-            val alreadyHaveLogInHit = findAlreadyHaveAccountLogInTapHit(vision, w, h)
+            // 禁止回退到全屏 findLogInEntryTapHit（会点到中部 Continue with Google）。
             val onSignUpLanding = visionShowsSignUpLandingPage(vision)
+            val alreadyHaveLogInHit = findAlreadyHaveAccountLogInTapHit(vision, w, h)
             if (alreadyHaveLogInHit != null || onSignUpLanding) {
                 loginEntryMissStreak = 0
-                val hit = alreadyHaveLogInHit
-                    ?: findLogInEntryTapHit(vision)
+                val rawHit = alreadyHaveLogInHit
                     ?: findAlreadyHaveAccountLogInTapHit(vision, w, h)
-                if (hit != null) {
-                    val tap = autoLoginTapWithJitter(hit.point, w, h)
-                    val how = when {
-                        onSignUpLanding && alreadyHaveLogInHit != null ->
-                            "Sign up落地 + Already have/Log in"
-                        onSignUpLanding -> "Sign up for TikTok 落地页"
-                        else -> "Already have an account? Log in"
-                    }
-                    devOp(
-                        alias,
-                        "自动登录：点 $how（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）" +
-                            "tap (${tap.x},${tap.y})",
-                    )
-                    if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                        autoLoginDelay(alias, 700L, "Already have Log in 点击后")
-                        return AutoLoginEntryPath.ViaLogIn
-                    }
-                } else {
-                    val preview = buildProfileEditOcrPreview(vision).take(240)
-                    devOp(
-                        alias,
-                        "自动登录：见 Sign up 落地页但未定位到底栏 Log in" +
-                            "（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）；OCR=$preview",
-                    )
+                    ?: signUpLandingFooterLogInGeometricHit(w, h)
+                val hit = coerceSignUpLandingLogInTapHit(rawHit, w, h, onSignUpLanding)
+                val tap = autoLoginTapWithJitter(hit.point, w, h)
+                val how = when {
+                    onSignUpLanding && alreadyHaveLogInHit != null ->
+                        "Sign up落地 + Already have/Log in"
+                    onSignUpLanding -> "Sign up for TikTok 落地页(几何底栏)"
+                    else -> "Already have an account? Log in"
+                }
+                devOp(
+                    alias,
+                    "自动登录：点 $how（第 $pass/$AUTO_LOGIN_OCR_MAX_PASSES 次）" +
+                        "tap (${tap.x},${tap.y})",
+                )
+                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                    autoLoginDelay(alias, 700L, "Already have Log in 点击后")
+                    return AutoLoginEntryPath.ViaLogIn
                 }
                 continue
             }
 
             val logInHit = welcomeLogInHit
                 ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
+                // 落地页已在上方处理；此处再挡：带 Already have 底栏的 Log in 禁止用全屏坐标（可能被并到中部）
+                ?.takeUnless { findFooterBandAlreadyHaveHit(vision, h) != null }
             if (logInHit != null) {
                 loginEntryMissStreak = 0
                 val tap = autoLoginTapWithJitter(logInHit.point, w, h)
@@ -19491,7 +19754,7 @@ class RealTraceExecutor(
                 continue
             }
 
-            val signUpHit = findSignUpEntryTapHit(vision)
+            val signUpHit = findSignUpEntryTapHit(vision, h)
                 ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
             if (signUpHit != null) {
                 // 再防一层：同屏若其实是 Welcome back / Add another，禁止 Sign up→Username 卡死
@@ -19528,18 +19791,22 @@ class RealTraceExecutor(
                 // 落地页应已在上方分支处理；此处若仍误判则再点 Already have/Log in
                 if (visionShowsSignUpLandingPage(vision)) {
                     loginEntryMissStreak = 0
-                    val hit = findAlreadyHaveAccountLogInTapHit(vision, w, h)
-                    if (hit != null) {
-                        val tap = autoLoginTapWithJitter(hit.point, w, h)
-                        devOp(
-                            alias,
-                            "自动登录：Sign up 命中但实为落地页，改点 Already have/Log in " +
-                                "tap (${tap.x},${tap.y})",
-                        )
-                        if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                            autoLoginDelay(alias, 700L, "落地页 Log in 点击后")
-                            return AutoLoginEntryPath.ViaLogIn
-                        }
+                    val hit = coerceSignUpLandingLogInTapHit(
+                        findAlreadyHaveAccountLogInTapHit(vision, w, h)
+                            ?: signUpLandingFooterLogInGeometricHit(w, h),
+                        w,
+                        h,
+                        onSignUpLanding = true,
+                    )
+                    val tap = autoLoginTapWithJitter(hit.point, w, h)
+                    devOp(
+                        alias,
+                        "自动登录：Sign up 命中但实为落地页，改点 Already have/Log in " +
+                            "tap (${tap.x},${tap.y})",
+                    )
+                    if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
+                        autoLoginDelay(alias, 700L, "落地页 Log in 点击后")
+                        return AutoLoginEntryPath.ViaLogIn
                     }
                     continue
                 }
@@ -19625,6 +19892,7 @@ class RealTraceExecutor(
 
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_username_rediscover_$recover")
             if (vision != null) {
+                if (autoLoginDismissGoogleOauthIfPresent(alias, vision)) continue
                 if (safeguardVisionShowsProfileEditLoggedInSameScreen(vision, h)) {
                     val preview = buildProfileEditOcrPreview(vision).take(240)
                     devOp(alias, "自动登录：Username 重探见 Profile+Edit，判定已登录；OCR=$preview")
@@ -19634,11 +19902,21 @@ class RealTraceExecutor(
                     devOp(alias, "自动登录：重探已见 Username，继续点击")
                     continue
                 }
+                val onLanding = visionShowsSignUpLandingPage(vision)
                 val already = findAlreadyHaveAccountLogInTapHit(vision, w, h)
                 val logIn = findLogInEntryTapHit(vision)
-                if (already != null || visionShowsSignUpLandingPage(vision) || logIn != null) {
-                    val hit = already ?: logIn ?: findAlreadyHaveAccountLogInTapHit(vision, w, h)
-                    if (hit != null) {
+                    ?.takeUnless { findFooterBandAlreadyHaveHit(vision, h) != null }
+                if (already != null || onLanding || logIn != null) {
+                    val rawHit = when {
+                        onLanding ->
+                            already
+                                ?: findAlreadyHaveAccountLogInTapHit(vision, w, h)
+                                ?: signUpLandingFooterLogInGeometricHit(w, h)
+                        already != null -> already
+                        else -> logIn
+                    }
+                    if (rawHit != null) {
+                        val hit = coerceSignUpLandingLogInTapHit(rawHit, w, h, onLanding)
                         val tap = autoLoginTapWithJitter(hit.point, w, h)
                         devOp(
                             alias,

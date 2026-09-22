@@ -859,7 +859,11 @@
               <option value="count_asc">账号数升序</option>
             </select>
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
-            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" disabled title="勾选别名组左侧复选框后：导出这些别名下全部账号到 XLSX，下载成功后从数据库删除（可多选）">导出并删除别名</button>
+            <button id="accountRecordsSelectAllAliasesBtn" type="button" class="ghost" title="勾选当前筛选结果下的全部别名组（可跨页）">全选别名</button>
+            <button id="accountRecordsClearAliasSelectionBtn" type="button" class="ghost" title="取消已勾选的别名组">取消全选</button>
+            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" disabled title="勾选别名组左侧复选框（可多选/全选）后：提取这些别名下全部账号到 XLSX，下载成功后从数据库删除">按别名提取并删除</button>
+            <input id="accountRecordsImportXlsxFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:220px;" title="选择此前「按别名提取」导出的 xlsx，导回账号记录" />
+            <button id="accountRecordsImportXlsxBtn" type="button" class="ghost" title="将提取出的账号表格导回账号记录（按 username 新增或补全）">导回提取表格</button>
             <label class="pager-size-label" for="accountRecordsExportMinFollowersInput" title="导出粉丝数大于该值的账号整行到 xlsx（不删除）">粉丝&gt;</label>
             <input id="accountRecordsExportMinFollowersInput" type="number" class="pager-size-input" min="0" step="1" value="1000" style="width:88px;" title="默认 1000：导出粉丝数大于该阈值的账号整行" />
             <button id="accountRecordsExportByFollowersBtn" type="button" class="ghost" title="提取粉丝数大于指定值的账号整行到 XLSX，不删除原记录">提取高粉账号</button>

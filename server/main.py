@@ -4246,6 +4246,7 @@ class AccountEditorRowExportByAliasesRequest(BaseModel):
 
 
 ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX = 200
+ACCOUNT_EDITOR_ROW_IMPORT_XLSX_MAX = 10000
 
 
 class AccountEditorRowBatchSetBasicProfileItem(BaseModel):
@@ -5738,15 +5739,26 @@ ACCOUNT_CRED_LEGACY_BANNED = "banned"
 ACCOUNT_CRED_SUFFIX_BANNED = "----banned"
 ACCOUNT_CRED_SUFFIX_MAX_LOGIN = "----Maximum login"
 
-# device_editor_rows.auto_switch_exclude_reason：区分人工排除 / 令牌失效 / 凭据封禁
+# device_editor_rows.auto_switch_exclude_reason：区分人工排除 / 令牌失效 / 凭据封禁 / 粉丝未进前 N
 AUTO_SWITCH_EXCLUDE_REASON_MANUAL = "manual"
 AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID = "mail_token_invalid"
 AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE = "mail_code_unavailable"
 AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED = "cred_blocked"
+AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP = "follower_cap"
+AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS = 5
 AUTO_SWITCH_MAIL_CODE_EXCLUDE_REASONS = frozenset(
     {
         AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID,
         AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE,
+    }
+)
+# 粉丝前 N 内仍保留的排除原因（不对账清掉）
+AUTO_SWITCH_FOLLOWER_CAP_KEEP_EXCLUDE_REASONS = frozenset(
+    {
+        AUTO_SWITCH_EXCLUDE_REASON_MANUAL,
+        AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID,
+        AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE,
+        AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED,
     }
 )
 
@@ -6028,6 +6040,173 @@ def _reconcile_mail_code_auto_switch_exclusions(
         "updated_rows": updated_rows,
         "affected_aliases": sorted(affected_aliases),
     }
+
+
+def _reconcile_follower_cap_auto_switch_exclusions(
+    owner_username: str,
+    alias: str | None = None,
+) -> dict[str, Any]:
+    """按粉丝量限制每个别名桶最多 AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS 个参加自动切号。
+
+    - 同别名下全部有 username 的档案按 follower_count 降序、row_index 升序排名
+    - 未进前 N：强制「不参加」，原因 follower_cap（已是 manual/mail/cred 排除则保留原原因）
+    - 前 N 内且原因仅为 follower_cap：自动恢复参加
+    - 前 N 内的 manual/mail/cred 排除：尊重，不强制拉回
+    """
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias) if alias else ""
+    if not owner:
+        return {"updated_rows": 0, "affected_aliases": [], "capped_aliases": []}
+
+    now = now_text()
+    updated_rows = 0
+    affected_aliases: set[str] = set()
+    capped_aliases: set[str] = set()
+    max_active = max(1, int(AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS))
+    conn = _get_db()
+    try:
+        dev_rows = conn.execute(
+            """
+            SELECT row_index, username, assigned_alias, device_alias, follower_count,
+                   auto_switch_excluded, COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
+            FROM device_editor_rows
+            WHERE owner_username = ? AND TRIM(username) <> ''
+            ORDER BY row_index ASC
+            """,
+            (owner,),
+        ).fetchall()
+
+        by_alias: dict[str, list[dict[str, Any]]] = {}
+        for dr in dev_rows or []:
+            item = {
+                "row_index": int(dr["row_index"] or 0),
+                "username": str(dr["username"] or "").strip(),
+                "assigned_alias": str(dr["assigned_alias"] or "").strip(),
+                "device_alias": str(dr["device_alias"] or "").strip(),
+                "follower_count": _parse_stat_int(dr["follower_count"]),
+                "auto_switch_excluded": int(dr["auto_switch_excluded"] or 0),
+                "auto_switch_exclude_reason": _normalize_auto_switch_exclude_reason(
+                    dr["auto_switch_exclude_reason"]
+                ),
+            }
+            row_alias = _device_editor_effective_alias(item)
+            if not row_alias:
+                continue
+            if alias_key and _normalize_alias_key(row_alias) != alias_key:
+                continue
+            by_alias.setdefault(row_alias, []).append(item)
+
+        for row_alias, items in by_alias.items():
+            ranked = sorted(
+                items,
+                key=lambda it: (-int(it.get("follower_count") or 0), int(it.get("row_index") or 0)),
+            )
+            top_keys = {
+                int(it["row_index"])
+                for it in ranked[:max_active]
+            }
+            if len(ranked) > max_active:
+                capped_aliases.add(row_alias)
+
+            for it in items:
+                ri = int(it["row_index"])
+                current_excluded = int(it["auto_switch_excluded"] or 0)
+                current_reason = str(it["auto_switch_exclude_reason"] or "")
+                in_top = ri in top_keys
+
+                if not in_top:
+                    # 未进前 N：必须排除；保留更具体的排除原因
+                    if current_excluded == 1 and current_reason in AUTO_SWITCH_FOLLOWER_CAP_KEEP_EXCLUDE_REASONS:
+                        continue
+                    if current_excluded == 1 and current_reason == AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP:
+                        continue
+                    cur = conn.execute(
+                        """
+                        UPDATE device_editor_rows
+                        SET auto_switch_excluded = 1,
+                            auto_switch_exclude_reason = ?,
+                            updated_at = ?
+                        WHERE owner_username = ? AND row_index = ?
+                        """,
+                        (
+                            AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP,
+                            now,
+                            owner,
+                            ri,
+                        ),
+                    )
+                else:
+                    # 前 N：仅清掉粉丝上限导致的排除
+                    if current_excluded != 1 or current_reason != AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP:
+                        continue
+                    cur = conn.execute(
+                        """
+                        UPDATE device_editor_rows
+                        SET auto_switch_excluded = 0,
+                            auto_switch_exclude_reason = '',
+                            updated_at = ?
+                        WHERE owner_username = ? AND row_index = ?
+                        """,
+                        (now, owner, ri),
+                    )
+                if int(cur.rowcount or 0) > 0:
+                    updated_rows += 1
+                    affected_aliases.add(row_alias)
+
+        if updated_rows > 0:
+            conn.commit()
+    finally:
+        conn.close()
+
+    if updated_rows > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+        _auto_switch_log(
+            f"follower_cap_reconcile | owner={owner} alias={alias_key or '*'} "
+            f"max_active={max_active} updated_rows={updated_rows} "
+            f"aliases={','.join(sorted(affected_aliases)) or '-'}"
+        )
+    return {
+        "updated_rows": updated_rows,
+        "affected_aliases": sorted(affected_aliases),
+        "capped_aliases": sorted(capped_aliases),
+        "max_active": max_active,
+    }
+
+
+def _load_device_editor_auto_switch_exclusion(
+    owner_username: str,
+    row_index: int,
+) -> dict[str, Any] | None:
+    """读取单行自动切号排除状态（参与 API 对账后回写响应用）。"""
+    owner = str(owner_username or "").strip()
+    try:
+        ri = int(row_index)
+    except (TypeError, ValueError):
+        return None
+    if not owner or ri < 0:
+        return None
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT auto_switch_excluded, COALESCE(auto_switch_exclude_reason, '') AS auto_switch_exclude_reason
+            FROM device_editor_rows
+            WHERE owner_username = ? AND row_index = ?
+            LIMIT 1
+            """,
+            (owner, ri),
+        ).fetchone()
+        if not row:
+            return None
+        excluded = bool(int(row["auto_switch_excluded"] or 0))
+        reason = _normalize_auto_switch_exclude_reason(row["auto_switch_exclude_reason"])
+        return {
+            "excluded": excluded,
+            "participating": not excluded,
+            "auto_switch_exclude_reason": reason,
+        }
+    finally:
+        conn.close()
 
 
 def _apply_mail_token_status_to_auto_switch(
@@ -6346,7 +6525,8 @@ def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dic
     alias_key = _normalize_alias_key(alias)
     if not owner or not alias_key:
         return {"bucket_size": 0, "plan_regenerated": False}
-    # 重算前按「能否拉验证码」对账排除，保证计划与设备侧一致
+    # 先按粉丝上限裁剪参与名单，再按「能否拉验证码」对账，保证计划与设备侧一致
+    follower_cap = _reconcile_follower_cap_auto_switch_exclusions(owner, alias_key)
     reconcile = _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
     rows = _list_device_editor_buckets(owner).get(alias_key, [])
     _delete_auto_switch_plans_for_alias(owner, alias_key)
@@ -6354,6 +6534,7 @@ def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dic
         return {
             "bucket_size": len(rows),
             "plan_regenerated": False,
+            "follower_cap_reconcile_updated": int(follower_cap.get("updated_rows") or 0),
             "mail_code_reconcile_updated": int(reconcile.get("updated_rows") or 0),
         }
     schedule_date = _beijing_date_str()
@@ -6362,6 +6543,7 @@ def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dic
     return {
         "bucket_size": len(rows),
         "plan_regenerated": True,
+        "follower_cap_reconcile_updated": int(follower_cap.get("updated_rows") or 0),
         "mail_code_reconcile_updated": int(reconcile.get("updated_rows") or 0),
     }
 
@@ -12456,6 +12638,13 @@ def _apply_device_auto_switch_enabled_for_device(
         _persist_client_device_to_db(did, force=True)
     notified = False
     if turning_on or resync_bundle:
+        alias_key = ""
+        with store.lock:
+            dev2 = store.devices.get(did)
+            if dev2:
+                alias_key = _normalize_alias_key(dev2.alias)
+        if owner and alias_key:
+            _refresh_auto_switch_plans_for_alias(owner, alias_key)
         closed_sessions = _close_active_auto_switch_enter_sessions_for_device(
             did, except_session_id=session_id
         )
@@ -12617,12 +12806,23 @@ def device_assigned_account_set_auto_switch_excluded(
     )
     if updated_rows > 0:
         _reset_device_editor_read_maintain_schedule(owner)
+    final_state = (
+        _load_device_editor_auto_switch_exclusion(owner, matched_row_index)
+        if matched_row_index is not None
+        else None
+    ) or {}
+    final_excluded = bool(final_state.get("excluded")) if final_state else bool(excluded_i)
+    final_reason = str(final_state.get("auto_switch_exclude_reason") or "")
+    msg = "自动切号参与状态已更新"
+    if not bool(excluded_i) and final_excluded and final_reason == AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP:
+        msg = f"该账号粉丝量未进前 {AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS}，已自动保持不参加自动切号"
     return {
         "code": 0,
-        "msg": "自动切号参与状态已更新",
+        "msg": msg,
         "username": username,
-        "excluded": bool(excluded_i),
-        "participating": not bool(excluded_i),
+        "excluded": final_excluded,
+        "participating": not final_excluded,
+        "auto_switch_exclude_reason": final_reason,
         "updated_rows": updated_rows,
         "row_index": matched_row_index,
         "alias": alias_key,
@@ -15464,6 +15664,240 @@ def _write_account_editor_rows_xlsx(matched: list[dict[str, Any]], filename: str
     }
 
 
+def _parse_account_editor_xlsx_sheet(sheet) -> tuple[List[str], List[dict[str, str]]]:
+    """解析账号提取/导出 xlsx；表头需包含 username，并尽量对齐 ACCOUNT_EDITOR_XLSX_HEADERS。"""
+    rows_iter = list(sheet.iter_rows(values_only=True))
+    if not rows_iter:
+        return [], []
+    header_cells = [_xlsx_cell_str(cell) for cell in rows_iter[0]]
+    if not any(header_cells):
+        return [], []
+    header_map: Dict[str, int] = {}
+    for idx, name in enumerate(header_cells):
+        key = name.strip()
+        if key and key not in header_map:
+            header_map[key] = idx
+    if "username" not in header_map:
+        return list(header_map.keys()), []
+    parsed: List[dict[str, str]] = []
+    for raw in rows_iter[1:]:
+        if not raw or not any(cell is not None and str(cell).strip() for cell in raw):
+            continue
+        item: dict[str, str] = {}
+        for key, idx in header_map.items():
+            val = raw[idx] if idx < len(raw) else None
+            item[key] = _xlsx_cell_str(val)
+        parsed.append(item)
+    return list(header_map.keys()), parsed
+
+
+def _import_account_editor_xlsx_rows(owner: str, parsed_rows: List[dict[str, str]]) -> dict[str, Any]:
+    """将提取表格导回账号记录：按 username 新增或补全字段，并恢复 assigned_alias。"""
+    if not parsed_rows:
+        return {"code": 1, "msg": "xlsx 中没有可导入的数据行"}
+    if len(parsed_rows) > ACCOUNT_EDITOR_ROW_IMPORT_XLSX_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多导回 {ACCOUNT_EDITOR_ROW_IMPORT_XLSX_MAX} 行，请分批操作",
+        }
+    conn = _get_db()
+    try:
+        now = now_text()
+        accounts_by_user = _account_editor_rows_by_username(conn, owner)
+        max_account_ri = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(row_index), -1) FROM account_editor_rows WHERE owner_username = ?",
+                (owner,),
+            ).fetchone()[0]
+        )
+        imported = 0
+        updated = 0
+        skipped_duplicate = 0
+        skipped_empty = 0
+        seen_in_file: set[str] = set()
+
+        for row in parsed_rows:
+            username = _normalized_alias(row.get("username")).lstrip("@")
+            if not username:
+                skipped_empty += 1
+                continue
+            user_key = username.lower()
+            if user_key in seen_in_file:
+                skipped_duplicate += 1
+                continue
+            seen_in_file.add(user_key)
+
+            password = _blank_if_none(row.get("password"))
+            email = _blank_if_none(row.get("email"))
+            email_password = _blank_if_none(row.get("email_password"))
+            two_fa = _blank_if_none(row.get("two_fa"))
+            api = _blank_if_none(row.get("api"))
+            is_login = 1 if _parse_editor_login_flag(row.get("is_login")) else 0
+            login_time = _blank_if_none(row.get("login_time"))
+            region = _blank_if_none(row.get("region"))
+            assigned_alias = _blank_if_none(row.get("assigned_alias"))
+            video_count = _blank_if_none(row.get("video_count"))
+            follower_count = _blank_if_none(row.get("follower_count"))
+            follower_growth = _blank_if_none(row.get("follower_growth"))
+            heart_count = _blank_if_none(row.get("heart_count"))
+            follower_growth_day_before = _blank_if_none(row.get("follower_growth_day_before"))
+            follower_growth_yesterday = _blank_if_none(row.get("follower_growth_yesterday"))
+            follower_growth_today = _blank_if_none(row.get("follower_growth_today"))
+            heart_growth_day_before = _blank_if_none(row.get("heart_growth_day_before"))
+            heart_growth_yesterday = _blank_if_none(row.get("heart_growth_yesterday"))
+            heart_growth_today = _blank_if_none(row.get("heart_growth_today"))
+            basic_profile_modified = _normalize_switch_highlight(row.get("basic_profile_modified"))
+
+            existing = accounts_by_user.get(user_key)
+            if existing is None:
+                max_account_ri += 1
+                row_index = max_account_ri
+                if not video_count:
+                    video_count = str(NEW_ACCOUNT_VIDEO_COUNT_COOLDOWN)
+                conn.execute(
+                    """
+                    INSERT INTO account_editor_rows
+                        (owner_username, row_index, username, password, email, email_password, two_fa, api,
+                         is_login, login_time, region, assigned_alias, video_count, follower_count, follower_growth,
+                         heart_count, follower_growth_day_before, follower_growth_yesterday, follower_growth_today,
+                         heart_growth_day_before, heart_growth_yesterday, heart_growth_today,
+                         basic_profile_modified, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner,
+                        row_index,
+                        username,
+                        password,
+                        email,
+                        email_password,
+                        two_fa,
+                        api,
+                        is_login,
+                        login_time,
+                        region,
+                        assigned_alias,
+                        video_count,
+                        follower_count,
+                        follower_growth,
+                        heart_count,
+                        follower_growth_day_before,
+                        follower_growth_yesterday,
+                        follower_growth_today,
+                        heart_growth_day_before,
+                        heart_growth_yesterday,
+                        heart_growth_today,
+                        basic_profile_modified,
+                        now,
+                    ),
+                )
+                accounts_by_user[user_key] = {
+                    "row_index": row_index,
+                    "username": username,
+                    "assigned_alias": assigned_alias,
+                }
+                imported += 1
+                persisted_alias = assigned_alias
+            else:
+                row_index = int(existing["row_index"])
+                existing_alias = _blank_if_none(existing.get("assigned_alias"))
+                # 已有别名锁定：不改别名；空别名时允许从文件恢复
+                persisted_alias = existing_alias or assigned_alias
+                conn.execute(
+                    """
+                    UPDATE account_editor_rows
+                    SET username = ?,
+                        password = CASE WHEN TRIM(?) <> '' THEN ? ELSE password END,
+                        email = CASE WHEN TRIM(?) <> '' THEN ? ELSE email END,
+                        email_password = CASE WHEN TRIM(?) <> '' THEN ? ELSE email_password END,
+                        two_fa = CASE WHEN TRIM(?) <> '' THEN ? ELSE two_fa END,
+                        api = CASE WHEN TRIM(?) <> '' THEN ? ELSE api END,
+                        is_login = ?,
+                        login_time = CASE WHEN TRIM(?) <> '' THEN ? ELSE login_time END,
+                        region = CASE WHEN TRIM(?) <> '' THEN ? ELSE region END,
+                        assigned_alias = CASE
+                            WHEN TRIM(COALESCE(assigned_alias, '')) <> '' THEN assigned_alias
+                            WHEN TRIM(?) <> '' THEN ?
+                            ELSE assigned_alias
+                        END,
+                        video_count = CASE WHEN TRIM(?) <> '' THEN ? ELSE video_count END,
+                        follower_count = CASE WHEN TRIM(?) <> '' THEN ? ELSE follower_count END,
+                        follower_growth = CASE WHEN TRIM(?) <> '' THEN ? ELSE follower_growth END,
+                        heart_count = CASE WHEN TRIM(?) <> '' THEN ? ELSE heart_count END,
+                        follower_growth_day_before = CASE WHEN TRIM(?) <> '' THEN ? ELSE follower_growth_day_before END,
+                        follower_growth_yesterday = CASE WHEN TRIM(?) <> '' THEN ? ELSE follower_growth_yesterday END,
+                        follower_growth_today = CASE WHEN TRIM(?) <> '' THEN ? ELSE follower_growth_today END,
+                        heart_growth_day_before = CASE WHEN TRIM(?) <> '' THEN ? ELSE heart_growth_day_before END,
+                        heart_growth_yesterday = CASE WHEN TRIM(?) <> '' THEN ? ELSE heart_growth_yesterday END,
+                        heart_growth_today = CASE WHEN TRIM(?) <> '' THEN ? ELSE heart_growth_today END,
+                        basic_profile_modified = COALESCE(?, basic_profile_modified, '否'),
+                        updated_at = ?
+                    WHERE owner_username = ? AND row_index = ?
+                    """,
+                    (
+                        username,
+                        password, password,
+                        email, email,
+                        email_password, email_password,
+                        two_fa, two_fa,
+                        api, api,
+                        is_login,
+                        login_time, login_time,
+                        region, region,
+                        assigned_alias, assigned_alias,
+                        video_count, video_count,
+                        follower_count, follower_count,
+                        follower_growth, follower_growth,
+                        heart_count, heart_count,
+                        follower_growth_day_before, follower_growth_day_before,
+                        follower_growth_yesterday, follower_growth_yesterday,
+                        follower_growth_today, follower_growth_today,
+                        heart_growth_day_before, heart_growth_day_before,
+                        heart_growth_yesterday, heart_growth_yesterday,
+                        heart_growth_today, heart_growth_today,
+                        basic_profile_modified,
+                        now,
+                        owner,
+                        row_index,
+                    ),
+                )
+                existing["assigned_alias"] = persisted_alias
+                updated += 1
+
+            if persisted_alias and username:
+                _link_backup_record_alias_for_username(
+                    username, persisted_alias, owner_username=owner, conn=conn, commit=False
+                )
+                _upsert_backup_record_for_account(
+                    owner, username, persisted_alias, region, conn=conn, commit=False
+                )
+
+        if imported <= 0 and updated <= 0:
+            return {
+                "code": 1,
+                "msg": "没有可导回的账号（可能全部为空 username 或文件内重复）",
+                "imported": 0,
+                "updated": 0,
+                "skipped_duplicate": skipped_duplicate,
+                "skipped_empty": skipped_empty,
+            }
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"导回完成：新增 {imported} 条，更新 {updated} 条",
+            "imported": imported,
+            "updated": updated,
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_empty": skipped_empty,
+        }
+    except Exception as exc:
+        conn.rollback()
+        return {"code": 1, "msg": f"导回失败：{exc}"}
+    finally:
+        conn.close()
+
+
 def _load_account_editor_export_rows(owner: str) -> list[dict[str, Any]]:
     conn = _get_db()
     try:
@@ -15583,7 +16017,11 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
             if not include_unassigned:
                 continue
             matched_alias_labels.add("")
-        matched.append(item)
+        # 导回依赖文件中的 assigned_alias；匹配用了有效别名时需写回，避免导回丢别名
+        export_item = dict(item)
+        if effective and not assigned:
+            export_item["assigned_alias"] = effective
+        matched.append(export_item)
     if not matched:
         return {
             "code": 1,
@@ -15662,6 +16100,31 @@ def export_account_editor_rows_by_aliases(
             "msg": f"单次最多导出 {ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作",
         }
     return _export_account_editor_rows_by_aliases_xlsx(owner, aliases)
+
+
+@app.post("/api/admin/editor/account_rows/import_xlsx")
+def import_account_editor_rows_xlsx(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """导回「按别名提取」导出的账号 xlsx：按 username 新增或补全，并恢复 assigned_alias。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return {"code": 1, "msg": "仅支持 xlsx 文件"}
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法导入 xlsx"}
+    owner = str(session["username"] or "").strip()
+    workbook = load_workbook(file.file, read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    headers, parsed_rows = _parse_account_editor_xlsx_sheet(sheet)
+    if "username" not in {str(h or "").strip() for h in headers}:
+        return {"code": 1, "msg": "xlsx 表头缺少 username 列（请使用按别名提取导出的表格）"}
+    if not parsed_rows:
+        return {"code": 1, "msg": "xlsx 中没有可导入的数据行（需含表头与至少一行数据）"}
+    return _import_account_editor_xlsx_rows(owner, parsed_rows)
 
 
 @app.get("/api/admin/editor/account_rows/export_file")
@@ -16878,11 +17341,19 @@ def set_device_editor_auto_switch_excluded(
         owner, alias_key, int(plan_info.get("bucket_size") or 0)
     )
     _reset_device_editor_read_maintain_schedule(owner)
+    final_state = _load_device_editor_auto_switch_exclusion(owner, row_index) or {}
+    final_excluded = bool(final_state.get("excluded")) if final_state else bool(excluded_i)
+    final_reason = str(final_state.get("auto_switch_exclude_reason") or "")
+    msg = "自动切号参与状态已更新"
+    if not bool(excluded_i) and final_excluded and final_reason == AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP:
+        msg = f"该账号粉丝量未进前 {AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS}，已自动保持不参加自动切号"
     return {
         "code": 0,
-        "msg": "自动切号参与状态已更新",
+        "msg": msg,
         "row_index": row_index,
-        "excluded": bool(excluded_i),
+        "excluded": final_excluded,
+        "participating": not final_excluded,
+        "auto_switch_exclude_reason": final_reason,
         "alias": alias_key,
         "username": item["username"],
         "bucket_size": int(plan_info.get("bucket_size") or 0),
@@ -20221,7 +20692,8 @@ def _build_auto_switch_bundle_for_device(
     owner = str(device.owner_username or "").strip()
     alias_key = _normalize_alias_key(alias)
     schedule_date = _beijing_date_str()
-    # 拉 bundle 前按最新规则对账：恢复「有 API 链接、无令牌」等被误排的账号
+    # 拉 bundle 前按最新规则对账：粉丝前 N + 邮件收码能力
+    _reconcile_follower_cap_auto_switch_exclusions(owner, alias_key)
     _reconcile_mail_code_auto_switch_exclusions(owner, alias_key)
     buckets = _list_device_editor_buckets(owner)
     rows = buckets.get(alias_key, [])
@@ -20556,6 +21028,24 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
     notified = 0
     resynced = 0
     cancelled_ops = 0
+    # 开启前先按粉丝上限裁剪各设备别名桶，再下发 enter
+    if target_enabled:
+        refreshed_alias_keys: set[tuple[str, str]] = set()
+        for did in device_ids:
+            if not store.devices.get(did):
+                _hydrate_device_from_db(did)
+            with store.lock:
+                dev = store.devices.get(did)
+                if not dev:
+                    continue
+                owner_key = str(dev.owner_username or "").strip()
+                alias_key = _normalize_alias_key(dev.alias)
+            refresh_key = (owner_key, alias_key)
+            if not owner_key or not alias_key or refresh_key in refreshed_alias_keys:
+                continue
+            refreshed_alias_keys.add(refresh_key)
+            _refresh_auto_switch_plans_for_alias(owner_key, alias_key)
+
     for did in device_ids:
         turning_on = False
         turning_off = False

@@ -317,7 +317,11 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
+const accountRecordsSelectAllAliasesBtn = document.getElementById("accountRecordsSelectAllAliasesBtn");
+const accountRecordsClearAliasSelectionBtn = document.getElementById("accountRecordsClearAliasSelectionBtn");
 const accountRecordsExportSelectedAliasesBtn = document.getElementById("accountRecordsExportSelectedAliasesBtn");
+const accountRecordsImportXlsxFile = document.getElementById("accountRecordsImportXlsxFile");
+const accountRecordsImportXlsxBtn = document.getElementById("accountRecordsImportXlsxBtn");
 const accountRecordsExportMinFollowersInput = document.getElementById("accountRecordsExportMinFollowersInput");
 const accountRecordsExportByFollowersBtn = document.getElementById("accountRecordsExportByFollowersBtn");
 const accountRecordsDeleteUsernameTemplateBtn = document.getElementById("accountRecordsDeleteUsernameTemplateBtn");
@@ -325,6 +329,8 @@ const accountRecordsDeleteByUsernameFile = document.getElementById("accountRecor
 const accountRecordsDeleteByUsernameBtn = document.getElementById("accountRecordsDeleteByUsernameBtn");
 const ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX = 5000;
 const ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX = 200;
+/** @type {boolean} */
+let accountRecordsImportXlsxBusy = false;
 const ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE = [
   "# 按用户名删除账号记录模板",
   "# 说明：每行填写一个 username；以 # 开头的行为注释，会被忽略",
@@ -2882,8 +2888,21 @@ function updateAccountRecordsBatchActionBtns() {
   if (accountRecordsExportSelectedAliasesBtn) {
     accountRecordsExportSelectedAliasesBtn.disabled = aliasCount <= 0;
     accountRecordsExportSelectedAliasesBtn.textContent = aliasCount > 0
-      ? `导出并删除别名 (${aliasCount})`
-      : "导出并删除别名";
+      ? `按别名提取并删除 (${aliasCount})`
+      : "按别名提取并删除";
+  }
+  if (accountRecordsClearAliasSelectionBtn) {
+    accountRecordsClearAliasSelectionBtn.disabled = aliasCount <= 0;
+  }
+  if (accountRecordsSelectAllAliasesBtn) {
+    accountRecordsSelectAllAliasesBtn.disabled = accountRecordsImportXlsxBusy;
+  }
+  if (accountRecordsImportXlsxBtn) {
+    accountRecordsImportXlsxBtn.disabled = accountRecordsImportXlsxBusy;
+    accountRecordsImportXlsxBtn.textContent = accountRecordsImportXlsxBusy ? "导回中..." : "导回提取表格";
+  }
+  if (accountRecordsImportXlsxFile) {
+    accountRecordsImportXlsxFile.disabled = accountRecordsImportXlsxBusy;
   }
 }
 
@@ -2904,6 +2923,44 @@ function setAccountRecordsAliasSelected(aliasFoldKey, checked) {
   if (checked) accountRecordsSelectedAliases.add(key);
   else accountRecordsSelectedAliases.delete(key);
   updateAccountRecordsBatchActionBtns();
+}
+
+/**
+ * 勾选当前筛选结果下的全部别名组（可跨页）。
+ */
+function selectAllFilteredAccountAliases() {
+  const groups = buildAccountEditorAliasGroups(getFilteredAccountEditorIndexedRows(), { sort: false });
+  if (!groups.length) {
+    setStatus("当前没有可勾选的别名组", "warning");
+    return;
+  }
+  accountRecordsSelectedAliases.clear();
+  groups.forEach(([aliasKey]) => {
+    accountRecordsSelectedAliases.add(accountAliasGroupFoldKey(aliasKey));
+  });
+  accountEditorListEl?.querySelectorAll(".account-records-alias-select").forEach((el) => {
+    if (!(el instanceof HTMLInputElement)) return;
+    const key = el.dataset.accountAlias ?? "";
+    el.checked = accountRecordsSelectedAliases.has(key);
+  });
+  updateAccountRecordsBatchActionBtns();
+  setStatus(`已全选 ${accountRecordsSelectedAliases.size} 个别名，可点击「按别名提取并删除」`, "success");
+}
+
+/**
+ * 取消已勾选的别名组。
+ */
+function clearAccountRecordsAliasSelectionOnly() {
+  if (!accountRecordsSelectedAliases.size) {
+    setStatus("当前没有已勾选的别名", "info");
+    return;
+  }
+  accountRecordsSelectedAliases.clear();
+  accountEditorListEl?.querySelectorAll(".account-records-alias-select").forEach((el) => {
+    if (el instanceof HTMLInputElement) el.checked = false;
+  });
+  updateAccountRecordsBatchActionBtns();
+  setStatus("已取消别名勾选", "info");
 }
 
 function clearAccountRecordsSelection() {
@@ -3304,22 +3361,23 @@ async function exportAndDeleteSelectedAliases() {
     return;
   }
   const confirmLines = [
-    `确认导出并删除 ${aliases.length} 个别名下的账号？`,
+    `确认提取并删除 ${aliases.length} 个别名下的账号？`,
     `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
   ];
   if (estimatedCount > 0) {
     confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
   }
   confirmLines.push("下载成功后才会删除；已分配别名的账号会同步清理设备备份档案。");
+  confirmLines.push("提取出的表格可通过「导回提取表格」重新导入。");
   if (!window.confirm(confirmLines.join("\n"))) return;
 
-  const previousLabel = accountRecordsExportSelectedAliasesBtn?.textContent || "导出并删除别名";
+  const previousLabel = accountRecordsExportSelectedAliasesBtn?.textContent || "按别名提取并删除";
   if (accountRecordsExportSelectedAliasesBtn) {
     accountRecordsExportSelectedAliasesBtn.disabled = true;
-    accountRecordsExportSelectedAliasesBtn.textContent = "导出中...";
+    accountRecordsExportSelectedAliasesBtn.textContent = "提取中...";
   }
   try {
-    setStatus(`正在按别名导出 ${aliases.length} 组账号到 XLSX...`, "info");
+    setStatus(`正在按别名提取 ${aliases.length} 组账号到 XLSX...`, "info");
     const resp = await request(`${ACCOUNT_ROWS_API}/export_by_aliases`, {
       method: "POST",
       body: JSON.stringify({ aliases }),
@@ -3330,12 +3388,12 @@ async function exportAndDeleteSelectedAliases() {
     const usernames = Array.isArray(resp?.usernames) ? resp.usernames : [];
     const blankRowIndexes = Array.isArray(resp?.blank_row_indexes) ? resp.blank_row_indexes : [];
     if (!filename || count <= 0) {
-      setStatus(String(resp?.msg || "所选别名下没有可导出的账号"), "warning");
+      setStatus(String(resp?.msg || "所选别名下没有可提取的账号"), "warning");
       return;
     }
     await downloadAccountRowsExportFile(filename);
     if (!usernames.length && !blankRowIndexes.length) {
-      setStatus(`已导出 ${count} 条到 ${filename}，但缺少可删除标识，库内记录未删除`, "warning");
+      setStatus(`已提取 ${count} 条到 ${filename}，但缺少可删除标识，库内记录未删除`, "warning");
       return;
     }
     setStatus(`已下载 ${count} 条：${filename}，正在从数据库删除...`, "info");
@@ -3352,13 +3410,13 @@ async function exportAndDeleteSelectedAliases() {
     await refreshEditorTablesAfterAccountDelete();
     if (deletedAccounts <= 0) {
       setStatus(
-        `已导出 ${count} 条到 ${filename}，但删除未生效（记录可能已不存在），请刷新后检查`,
+        `已提取 ${count} 条到 ${filename}，但删除未生效（记录可能已不存在），请刷新后检查`,
         "warning",
       );
       return;
     }
     const parts = [
-      `已导出并删除 ${deletedAccounts} 条账号（${aliases.length} 个别名）`,
+      `已提取并删除 ${deletedAccounts} 条账号（${aliases.length} 个别名）`,
       `文件：${filename}`,
     ];
     if (deletedDeviceRows > 0) {
@@ -3368,8 +3426,9 @@ async function exportAndDeleteSelectedAliases() {
       parts.push(`${notFoundCount} 条删除时已不存在`);
     }
     if (deletedAccounts < count) {
-      parts.push(`导出 ${count} 条中有 ${count - deletedAccounts} 条未删掉`);
+      parts.push(`提取 ${count} 条中有 ${count - deletedAccounts} 条未删掉`);
     }
+    parts.push("可用「导回提取表格」重新导入");
     setStatus(parts.join("，"), (notFoundCount > 0 || deletedAccounts < count) ? "warning" : "success");
   } catch (error) {
     await refreshEditorTablesAfterAccountDelete();
@@ -3379,6 +3438,63 @@ async function exportAndDeleteSelectedAliases() {
       accountRecordsExportSelectedAliasesBtn.textContent = previousLabel;
     }
     updateAccountRecordsBatchActionBtns();
+  }
+}
+
+/**
+ * 将「按别名提取」导出的 xlsx 导回账号记录。
+ * @param {File} file
+ */
+async function importAccountRowsExportXlsxFile(file) {
+  if (!file || accountRecordsImportXlsxBusy) return;
+  const name = String(file.name || "").toLowerCase();
+  if (!name.endsWith(".xlsx")) {
+    setStatus("请选择 .xlsx 文件（与「按别名提取并删除」导出格式一致）", "warning");
+    return;
+  }
+  accountRecordsImportXlsxBusy = true;
+  updateAccountRecordsBatchActionBtns();
+  try {
+    const token = authToken();
+    const form = new FormData();
+    form.append("file", file);
+    setStatus("正在导回提取表格到账号记录...", "info");
+    const response = await fetch(await buildApiUrl(`${ACCOUNT_ROWS_API}/import_xlsx`), {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || Number(data?.code) !== 0) {
+      throw new Error(String(data?.msg || `导回失败 (HTTP ${response.status})`));
+    }
+    const imported = Number(data?.imported || 0);
+    const updated = Number(data?.updated || 0);
+    const skippedDup = Number(data?.skipped_duplicate || 0);
+    const skippedEmpty = Number(data?.skipped_empty || 0);
+    const parts = [];
+    if (imported > 0) parts.push(`新增 ${imported} 条`);
+    if (updated > 0) parts.push(`更新已有 ${updated} 条`);
+    if (!parts.length) parts.push("新增 0 条");
+    if (skippedDup > 0) parts.push(`跳过文件内重复 username ${skippedDup} 条`);
+    if (skippedEmpty > 0) parts.push(`跳过空 username ${skippedEmpty} 条`);
+    const statusLevel = imported > 0 || updated > 0 ? "success" : "warning";
+    try {
+      await loadAccountEditorRows();
+      renderAccountEditorRows();
+      renderDeviceRegionPresetOptions();
+      if (document.getElementById("backup-section")?.classList.contains("active")) {
+        await loadBackupArchiveRecords();
+      }
+      setStatus(`导回完成：${parts.join("，")}`, statusLevel);
+    } catch (reloadError) {
+      const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError || "刷新失败");
+      setStatus(`导回已写入，但刷新列表失败：${reloadMsg}`, "warning");
+    }
+  } finally {
+    accountRecordsImportXlsxBusy = false;
+    updateAccountRecordsBatchActionBtns();
+    if (accountRecordsImportXlsxFile) accountRecordsImportXlsxFile.value = "";
   }
 }
 
@@ -11813,7 +11929,7 @@ function renderAccountEditorRows() {
         <details class="account-alias-group" data-account-alias="${escapeHtml(foldKey)}"${shouldOpen ? " open" : ""}>
           <summary class="account-alias-group__summary">
             <span class="account-alias-group__title">
-              <input type="checkbox" class="account-records-alias-select" data-account-alias="${escapeHtml(foldKey)}" title="勾选该别名下全部账号（可多选，用于导出并删除）"${aliasChecked ? " checked" : ""} />
+              <input type="checkbox" class="account-records-alias-select" data-account-alias="${escapeHtml(foldKey)}" title="勾选该别名下全部账号（可多选/全选，用于按别名提取并删除）"${aliasChecked ? " checked" : ""} />
               <strong>${escapeHtml(aliasLabel)}</strong>
               <span class="hint">(${escapeHtml(countLabel)})</span>
             </span>
@@ -12468,8 +12584,12 @@ function renderSingleBackupArchiveRecordCard(row, rows, idx, alias) {
   const dailySlotInfo = resolveBackupRowSlotInfo(alias, row);
   const dailyPublishBadge = rows.length >= 2 ? renderAutoSwitchPublishStatusBadge(dailySlotInfo) : "";
   const autoSwitchExcluded = Boolean(row?.auto_switch_excluded);
+  const autoSwitchExcludeReason = String(row?.auto_switch_exclude_reason || "").trim().toLowerCase();
+  const autoSwitchExcludedTitle = autoSwitchExcludeReason === "follower_cap"
+    ? "粉丝量未进该设备前 5，已自动不参加自动切号"
+    : "该账号已设置为不参加自动切号";
   const autoSwitchExcludedBadge = autoSwitchExcluded
-    ? '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该账号已设置为不参加自动切号">不参加自动切号</span>'
+    ? `<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="${escapeHtml(autoSwitchExcludedTitle)}">不参加自动切号</span>`
     : "";
   const extraSummary = buildBackupArchiveExtraSummary(stats, backupName, backupPath);
   const exportChecked = exportRowIndex != null && backupArchiveSelectedRowIndices.has(exportRowIndex);
@@ -13522,9 +13642,29 @@ if (accountRecordsBatchDeleteBtn) {
     deleteSelectedAccountRecords().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "批量删除失败", "error"));
   });
 }
+if (accountRecordsSelectAllAliasesBtn) {
+  accountRecordsSelectAllAliasesBtn.addEventListener("click", () => {
+    selectAllFilteredAccountAliases();
+  });
+}
+if (accountRecordsClearAliasSelectionBtn) {
+  accountRecordsClearAliasSelectionBtn.addEventListener("click", () => {
+    clearAccountRecordsAliasSelectionOnly();
+  });
+}
 if (accountRecordsExportSelectedAliasesBtn) {
   accountRecordsExportSelectedAliasesBtn.addEventListener("click", () => {
-    exportAndDeleteSelectedAliases().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "导出并删除别名失败", "error"));
+    exportAndDeleteSelectedAliases().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按别名提取并删除失败", "error"));
+  });
+}
+if (accountRecordsImportXlsxBtn) {
+  accountRecordsImportXlsxBtn.addEventListener("click", () => {
+    const file = accountRecordsImportXlsxFile?.files?.[0];
+    if (!file) {
+      setStatus("请先选择要导回的 xlsx 文件", "warning");
+      return;
+    }
+    importAccountRowsExportXlsxFile(file).catch((e) => setStatus(humanizeRequestErrorMessage(e) || "导回提取表格失败", "error"));
   });
 }
 if (accountRecordsExportByFollowersBtn) {

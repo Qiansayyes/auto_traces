@@ -5245,15 +5245,16 @@ object AppCoordinator {
                 participateUsernames = null,
                 enableDeviceAutoSwitch = false,
             )
-            if (sync.code != 0) {
-                throw IllegalStateException(
-                    (sync.msg?.trim().orEmpty().ifBlank { "关闭云端自动切号失败" }) +
-                        "（TikTok 与旧进度已清空，请重试切回手动）",
-                )
-            }
+            // 无论云端同步成败都先落本机手动：TikTok/进度已清，不能卡在「本地仍云端」。
             PrefsStore.setManualControlMode(true)
             PrefsStore.setHardStopRequested(false)
             manuallyPaused = false
+            if (sync.code != 0) {
+                val syncMsg = sync.msg?.trim().orEmpty().ifBlank { "关闭云端自动切号失败" }
+                LogCenter.op(alias, "已切回本机手动（本地）；云端关自动切号失败：$syncMsg（TikTok/旧进度已清空）")
+                updateRuntime(lastMessage = "已切回本机手动（云端关自动切号失败，请重试或到管理台关闭）")
+                return@runCatching "已切回本机手动模式（本地已切换；云端关自动切号失败：$syncMsg）"
+            }
             LogCenter.op(alias, "已切回本机手动模式（已清空 TikTok/旧进度；云端自动切号已关；账号参与标记保留）")
             updateRuntime(lastMessage = "已切回本机手动模式")
             "已切回本机手动模式（已清空 TikTok/旧进度）"

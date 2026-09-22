@@ -201,6 +201,11 @@ object PrefsStore {
     private const val KEY_AUTO_SWITCH_MUTUAL_SLOT_KEY = "auto_switch_mutual_slot_key"
     /** 本轮发作品实际成功条数（全部完成后写入，供 ledger 写回 video_count）。 */
     private const val KEY_PUBLISH_POST_LAST_ACTUAL_SUCCESS_COUNT = "publish_post_last_actual_success_count"
+    /**
+     * 本轮从 PC 拉取并入库后的可用素材条数（已排除幽灵行）。
+     * 发布条数取 min(该值, 图库实时可用, 目标条数)，避免索引虚高多点空格。
+     */
+    private const val KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT = "publish_post_last_fetched_usable_count"
     /** 发作品素材已拉取并就绪；进程被杀后可凭此跳过清库/重拉并续发。 */
     private const val KEY_PUBLISH_POST_MATERIAL_READY = "publish_post_material_ready"
     /** 发作品保障重登成功后跳过一次冷启 force-stop 与登录保障（一次性消费）。 */
@@ -763,6 +768,26 @@ object PrefsStore {
         return v
     }
 
+    /**
+     * 本轮任务拉取并入库后的「可用」素材条数（已排除幽灵行）。
+     * 发作品条数应以它与图库实时可用数取 min，避免索引虚高导致多点空格。
+     */
+    fun setPublishPostLastFetchedUsableCount(count: Int) {
+        val v = count.coerceAtLeast(0)
+        if (v > 0) {
+            prefs.edit().putInt(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT, v).apply()
+        } else {
+            prefs.edit().remove(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT).apply()
+        }
+    }
+
+    fun getPublishPostLastFetchedUsableCount(): Int =
+        prefs.getInt(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT, 0).coerceAtLeast(0)
+
+    fun clearPublishPostLastFetchedUsableCount() {
+        prefs.edit().remove(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT).apply()
+    }
+
     fun setPublishPostMaterialReady(ready: Boolean) {
         if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
             AutoSwitchLocalPlanStore.setActivePublishMaterialReady(ready)
@@ -809,6 +834,7 @@ object PrefsStore {
             .remove(KEY_PUBLISH_POST_PACKAGE)
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)
+            .remove(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT)
             .apply()
     }
 
