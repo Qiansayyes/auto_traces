@@ -320,7 +320,10 @@ const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatc
 const accountRecordsSelectAllAliasesBtn = document.getElementById("accountRecordsSelectAllAliasesBtn");
 const accountRecordsClearAliasSelectionBtn = document.getElementById("accountRecordsClearAliasSelectionBtn");
 const accountRecordsExportSelectedAliasesBtn = document.getElementById("accountRecordsExportSelectedAliasesBtn");
+const accountRecordsDeleteSelectedAliasesBtn = document.getElementById("accountRecordsDeleteSelectedAliasesBtn");
 const accountRecordsExportAliasModalEl = document.getElementById("accountRecordsExportAliasModal");
+const accountRecordsExportAliasModalTitleEl = document.getElementById("accountRecordsExportAliasModalTitle");
+const accountRecordsExportAliasModalHintEl = document.getElementById("accountRecordsExportAliasModalHint");
 const closeAccountRecordsExportAliasModalBtn = document.getElementById("closeAccountRecordsExportAliasModalBtn");
 const cancelAccountRecordsExportAliasModalBtn = document.getElementById("cancelAccountRecordsExportAliasModalBtn");
 const confirmAccountRecordsExportAliasBtn = document.getElementById("confirmAccountRecordsExportAliasBtn");
@@ -332,6 +335,8 @@ const accountRecordsExportAliasListEl = document.getElementById("accountRecordsE
 const accountRecordsExportAliasModalSelected = new Set();
 let accountRecordsExportAliasModalSearchQuery = "";
 let accountRecordsExportAliasModalGroups = [];
+/** @type {"export"|"delete"} */
+let accountRecordsAliasModalMode = "export";
 /** 防止弹窗确认连点重复提交 */
 let accountRecordsExportAliasModalBusy = false;
 const accountRecordsImportXlsxFile = document.getElementById("accountRecordsImportXlsxFile");
@@ -343,6 +348,7 @@ const accountRecordsDeleteByUsernameFile = document.getElementById("accountRecor
 const accountRecordsDeleteByUsernameBtn = document.getElementById("accountRecordsDeleteByUsernameBtn");
 const ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX = 5000;
 const ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX = 200;
+const ACCOUNT_RECORDS_DELETE_BY_ALIASES_MAX = 200;
 /** @type {boolean} */
 let accountRecordsImportXlsxBusy = false;
 const ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE = [
@@ -2900,11 +2906,16 @@ function updateAccountRecordsBatchActionBtns() {
   }
   const aliasCount = accountRecordsSelectedAliases.size;
   if (accountRecordsExportSelectedAliasesBtn) {
-    // 按钮始终可点：点击弹出别名选择；若列表已预勾选则提示数量
-    accountRecordsExportSelectedAliasesBtn.disabled = accountRecordsImportXlsxBusy;
+    accountRecordsExportSelectedAliasesBtn.disabled = accountRecordsImportXlsxBusy || accountRecordsExportAliasModalBusy;
     accountRecordsExportSelectedAliasesBtn.textContent = aliasCount > 0
-      ? `按别名提取并删除 (${aliasCount})`
-      : "按别名提取并删除";
+      ? `按别名提取 (${aliasCount})`
+      : "按别名提取";
+  }
+  if (accountRecordsDeleteSelectedAliasesBtn) {
+    accountRecordsDeleteSelectedAliasesBtn.disabled = accountRecordsImportXlsxBusy || accountRecordsExportAliasModalBusy;
+    accountRecordsDeleteSelectedAliasesBtn.textContent = aliasCount > 0
+      ? `按别名批量删除 (${aliasCount})`
+      : "按别名批量删除";
   }
   if (accountRecordsClearAliasSelectionBtn) {
     accountRecordsClearAliasSelectionBtn.disabled = aliasCount <= 0;
@@ -2959,7 +2970,7 @@ function selectAllFilteredAccountAliases() {
     el.checked = accountRecordsSelectedAliases.has(key);
   });
   updateAccountRecordsBatchActionBtns();
-  setStatus(`已全选 ${accountRecordsSelectedAliases.size} 个别名（也可点「按别名提取并删除」在弹窗中调整）`, "success");
+  setStatus(`已全选 ${accountRecordsSelectedAliases.size} 个别名（也可点「按别名提取 / 按别名批量删除」在弹窗中调整）`, "success");
 }
 
 /**
@@ -3393,14 +3404,26 @@ function renderAccountRecordsExportAliasModalList() {
   syncAccountRecordsExportAliasModalSelectAll();
 }
 
-function openAccountRecordsExportAliasModal() {
+function openAccountRecordsExportAliasModal(mode = "export") {
   if (!accountRecordsExportAliasModalEl) {
     setStatus("别名选择弹窗未就绪，请强制刷新页面（Ctrl+F5）后再试", "error");
     return;
   }
   if (accountRecordsExportAliasModalBusy) {
-    setStatus("正在处理上一次提取，请稍候…", "warning");
+    setStatus("正在处理上一次操作，请稍候…", "warning");
     return;
+  }
+  accountRecordsAliasModalMode = mode === "delete" ? "delete" : "export";
+  const isDelete = accountRecordsAliasModalMode === "delete";
+  if (accountRecordsExportAliasModalTitleEl) {
+    accountRecordsExportAliasModalTitleEl.textContent = isDelete
+      ? "按别名批量删除 — 选择别名"
+      : "按别名提取 — 选择别名";
+  }
+  if (accountRecordsExportAliasModalHintEl) {
+    accountRecordsExportAliasModalHintEl.textContent = isDelete
+      ? "勾选要删除的别名组，确认后直接从数据库删除该别名下全部账号（已分配别名会同步清理设备备份档案）。账号数为该别名下全部记录（不受当前搜索筛选缩小）。此操作不可恢复，请先「按别名提取」备份。"
+      : "勾选要提取的别名组，确认后仅导出 XLSX，不删除库内记录。账号数为该别名下全部记录（不受当前搜索筛选缩小）。可搜索、全选。";
   }
   accountRecordsExportAliasModalGroups = buildAccountRecordsExportAliasModalGroups();
   const validKeys = new Set(accountRecordsExportAliasModalGroups.map((g) => g.foldKey));
@@ -3413,7 +3436,12 @@ function openAccountRecordsExportAliasModal() {
   if (accountRecordsExportAliasSearchInput) accountRecordsExportAliasSearchInput.value = "";
   if (confirmAccountRecordsExportAliasBtn) {
     confirmAccountRecordsExportAliasBtn.disabled = false;
-    confirmAccountRecordsExportAliasBtn.textContent = "确认提取并删除";
+    confirmAccountRecordsExportAliasBtn.textContent = isDelete ? "确认删除" : "确认提取";
+    confirmAccountRecordsExportAliasBtn.classList.toggle("danger", isDelete);
+    confirmAccountRecordsExportAliasBtn.classList.toggle("primary", !isDelete);
+    confirmAccountRecordsExportAliasBtn.title = isDelete
+      ? "删除所选别名下全部账号记录"
+      : "提取所选别名下全部账号到 XLSX（不删除）";
   }
   renderAccountRecordsExportAliasModalList();
   accountRecordsExportAliasModalEl.classList.remove("hidden");
@@ -3452,8 +3480,11 @@ async function confirmAccountRecordsExportAliasModal() {
     setStatus("请先勾选至少一个别名", "warning");
     return;
   }
-  if (accountRecordsExportAliasModalSelected.size > ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX) {
-    setStatus(`单次最多导出 ${ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作`, "warning");
+  const maxAliases = accountRecordsAliasModalMode === "delete"
+    ? ACCOUNT_RECORDS_DELETE_BY_ALIASES_MAX
+    : ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX;
+  if (accountRecordsExportAliasModalSelected.size > maxAliases) {
+    setStatus(`单次最多选择 ${maxAliases} 个别名，请分批操作`, "warning");
     return;
   }
   syncAccountRecordsAliasSelectionFromModal();
@@ -3462,32 +3493,165 @@ async function confirmAccountRecordsExportAliasModal() {
     setStatus("请先勾选至少一个别名", "warning");
     return;
   }
-  const confirmLines = [
-    `确认提取并删除 ${aliases.length} 个别名下的账号？`,
-    `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
-  ];
+  const isDelete = accountRecordsAliasModalMode === "delete";
+  const confirmLines = isDelete
+    ? [
+      `确认删除 ${aliases.length} 个别名下的账号？`,
+      `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
+    ]
+    : [
+      `确认提取 ${aliases.length} 个别名下的账号？`,
+      `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
+    ];
   if (estimatedCount > 0) {
-    confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
+    confirmLines.push(
+      isDelete
+        ? `预计约 ${estimatedCount} 条账号记录将从数据库删除（不可恢复）`
+        : `预计约 ${estimatedCount} 条账号记录将写入 XLSX（不删除库内记录）`,
+    );
   }
-  confirmLines.push("服务端写入文件成功后会立刻删除库内记录；下载失败可用「按文件删除」上传该 xlsx 补删。");
-  confirmLines.push("提取出的表格可通过「导回提取表格」重新导入。");
+  if (isDelete) {
+    confirmLines.push("已分配别名的账号会同步清理设备备份档案。");
+    confirmLines.push("建议先用「按别名提取」导出备份后再删除。");
+  } else {
+    confirmLines.push("仅导出，不删除；之后可用「按别名批量删除」或「按文件删除」清理。");
+  }
   // 取消时弹窗保持打开，便于改勾选
   if (!window.confirm(confirmLines.join("\n"))) return;
 
   accountRecordsExportAliasModalBusy = true;
+  updateAccountRecordsBatchActionBtns();
   if (confirmAccountRecordsExportAliasBtn) {
     confirmAccountRecordsExportAliasBtn.disabled = true;
     confirmAccountRecordsExportAliasBtn.textContent = "处理中...";
   }
   closeAccountRecordsExportAliasModal({ force: true });
   try {
-    await exportAndDeleteSelectedAliases({ skipConfirm: true });
+    if (isDelete) {
+      await deleteSelectedAliasesByAlias({ skipConfirm: true });
+    } else {
+      await exportSelectedAliasesOnly({ skipConfirm: true });
+    }
   } finally {
     accountRecordsExportAliasModalBusy = false;
     if (confirmAccountRecordsExportAliasBtn) {
       confirmAccountRecordsExportAliasBtn.disabled = false;
-      confirmAccountRecordsExportAliasBtn.textContent = "确认提取并删除";
+      confirmAccountRecordsExportAliasBtn.textContent = isDelete ? "确认删除" : "确认提取";
     }
+    updateAccountRecordsBatchActionBtns();
+  }
+}
+
+async function exportSelectedAliasesOnly({ skipConfirm = false } = {}) {
+  const { aliases, previewLabels, estimatedCount } = collectSelectedAliasExportPayload();
+  if (!aliases.length) {
+    setStatus("请先勾选要导出的别名组", "warning");
+    return false;
+  }
+  if (aliases.length > ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX) {
+    setStatus(`单次最多导出 ${ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作`, "warning");
+    return false;
+  }
+  if (!skipConfirm) {
+    const confirmLines = [
+      `确认提取 ${aliases.length} 个别名下的账号？`,
+      `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
+    ];
+    if (estimatedCount > 0) {
+      confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX（不删除库内记录）`);
+    }
+    if (!window.confirm(confirmLines.join("\n"))) return false;
+  }
+
+  const previousLabel = accountRecordsExportSelectedAliasesBtn?.textContent || "按别名提取";
+  if (accountRecordsExportSelectedAliasesBtn) {
+    accountRecordsExportSelectedAliasesBtn.disabled = true;
+    accountRecordsExportSelectedAliasesBtn.textContent = "提取中...";
+  }
+  try {
+    setStatus(`正在按别名提取 ${aliases.length} 组账号到 XLSX...`, "info");
+    const resp = await request(`${ACCOUNT_ROWS_API}/export_by_aliases`, {
+      method: "POST",
+      body: JSON.stringify({ aliases }),
+      timeoutMs: 180000,
+    });
+    const filename = String(resp?.filename || "").trim();
+    const count = Number(resp?.count || 0);
+    if (!filename || count <= 0) {
+      setStatus(String(resp?.msg || "所选别名下没有可提取的账号"), "warning");
+      return false;
+    }
+    if (accountRecordsExportSelectedAliasesBtn) {
+      accountRecordsExportSelectedAliasesBtn.textContent = "下载中...";
+    }
+    await downloadAccountRowsExportFile(filename);
+    setStatus(`已提取 ${count} 条到 ${filename}（未删除库内记录；可用「按别名批量删除」清理）`, "success");
+    return true;
+  } finally {
+    if (accountRecordsExportSelectedAliasesBtn) {
+      accountRecordsExportSelectedAliasesBtn.textContent = previousLabel;
+    }
+    updateAccountRecordsBatchActionBtns();
+  }
+}
+
+async function deleteSelectedAliasesByAlias({ skipConfirm = false } = {}) {
+  const { aliases, previewLabels, estimatedCount } = collectSelectedAliasExportPayload();
+  if (!aliases.length) {
+    setStatus("请先勾选要删除的别名组", "warning");
+    return false;
+  }
+  if (aliases.length > ACCOUNT_RECORDS_DELETE_BY_ALIASES_MAX) {
+    setStatus(`单次最多删除 ${ACCOUNT_RECORDS_DELETE_BY_ALIASES_MAX} 个别名，请分批操作`, "warning");
+    return false;
+  }
+  if (!skipConfirm) {
+    const confirmLines = [
+      `确认删除 ${aliases.length} 个别名下的账号？`,
+      `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
+    ];
+    if (estimatedCount > 0) {
+      confirmLines.push(`预计约 ${estimatedCount} 条账号记录将从数据库删除（不可恢复）`);
+    }
+    confirmLines.push("已分配别名的账号会同步清理设备备份档案。");
+    if (!window.confirm(confirmLines.join("\n"))) return false;
+  }
+
+  const previousLabel = accountRecordsDeleteSelectedAliasesBtn?.textContent || "按别名批量删除";
+  if (accountRecordsDeleteSelectedAliasesBtn) {
+    accountRecordsDeleteSelectedAliasesBtn.disabled = true;
+    accountRecordsDeleteSelectedAliasesBtn.textContent = "删除中...";
+  }
+  try {
+    setStatus(`正在按别名删除 ${aliases.length} 组账号...`, "info");
+    const resp = await request(`${ACCOUNT_ROWS_API}/delete_by_aliases`, {
+      method: "POST",
+      body: JSON.stringify({ aliases }),
+      timeoutMs: 180000,
+    });
+    const deletedAccounts = Number(resp?.deleted_accounts || 0);
+    const deletedDeviceRows = Number(resp?.deleted_device_rows || 0);
+    const notFoundCount = Number(resp?.not_found_count || 0);
+    clearAccountRecordsSelection();
+    accountRecordsSelectedAliases.clear();
+    await refreshEditorTablesAfterAccountDelete();
+    if (deletedAccounts <= 0) {
+      setStatus(String(resp?.msg || "未删除任何账号记录"), "warning");
+      return false;
+    }
+    const parts = [`已按别名删除 ${deletedAccounts} 条账号（${aliases.length} 组）`];
+    if (deletedDeviceRows > 0) parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
+    if (notFoundCount > 0) parts.push(`${notFoundCount} 条删除时已不存在`);
+    setStatus(parts.join("，"), notFoundCount > 0 ? "warning" : "success");
+    return true;
+  } catch (error) {
+    await refreshEditorTablesAfterAccountDelete();
+    throw error;
+  } finally {
+    if (accountRecordsDeleteSelectedAliasesBtn) {
+      accountRecordsDeleteSelectedAliasesBtn.textContent = previousLabel;
+    }
+    updateAccountRecordsBatchActionBtns();
   }
 }
 
@@ -3564,146 +3728,6 @@ async function deleteAccountRowsByBlankRowIndexes(rowIndexes = []) {
   };
 }
 
-async function exportAndDeleteSelectedAliases({ skipConfirm = false } = {}) {
-  const { aliases, previewLabels, estimatedCount } = collectSelectedAliasExportPayload();
-  if (!aliases.length) {
-    setStatus("请先勾选要导出的别名组", "warning");
-    return false;
-  }
-  if (aliases.length > ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX) {
-    setStatus(`单次最多导出 ${ACCOUNT_RECORDS_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作`, "warning");
-    return false;
-  }
-  if (!skipConfirm) {
-    const confirmLines = [
-      `确认提取并删除 ${aliases.length} 个别名下的账号？`,
-      `别名：${previewLabels.join("、")}${aliases.length > previewLabels.length ? " …" : ""}`,
-    ];
-    if (estimatedCount > 0) {
-      confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
-    }
-    confirmLines.push("服务端写入文件成功后会立刻删除库内记录；下载失败可稍后用「按文件删除」上传该 xlsx 补删。");
-    confirmLines.push("提取出的表格可通过「导回提取表格」重新导入。");
-    if (!window.confirm(confirmLines.join("\n"))) return false;
-  }
-
-  const previousLabel = accountRecordsExportSelectedAliasesBtn?.textContent || "按别名提取并删除";
-  if (accountRecordsExportSelectedAliasesBtn) {
-    accountRecordsExportSelectedAliasesBtn.disabled = true;
-    accountRecordsExportSelectedAliasesBtn.textContent = "提取中...";
-  }
-  try {
-    setStatus(`正在按别名提取 ${aliases.length} 组账号到 XLSX...`, "info");
-    const resp = await request(`${ACCOUNT_ROWS_API}/export_by_aliases`, {
-      method: "POST",
-      body: JSON.stringify({ aliases }),
-      timeoutMs: 180000,
-    });
-    const filename = String(resp?.filename || "").trim();
-    const count = Number(resp?.count || 0);
-    const usernames = Array.isArray(resp?.usernames) ? resp.usernames : [];
-    const blankRowIndexes = Array.isArray(resp?.blank_row_indexes) ? resp.blank_row_indexes : [];
-    const serverDeleted = Number(resp?.deleted_accounts || 0);
-    const serverDeletedDevices = Number(resp?.deleted_device_rows || 0);
-    const deletedOnServer = Boolean(resp?.deleted_on_server);
-    const deleteError = String(resp?.delete_error || "").trim();
-    if (!filename || count <= 0) {
-      setStatus(String(resp?.msg || "所选别名下没有可提取的账号"), "warning");
-      return false;
-    }
-    if (accountRecordsExportSelectedAliasesBtn) {
-      accountRecordsExportSelectedAliasesBtn.textContent = "下载中...";
-    }
-    await downloadAccountRowsExportFile(filename);
-
-    let deletedAccounts = serverDeleted;
-    let deletedDeviceRows = serverDeletedDevices;
-    let notFoundCount = Number(resp?.delete_not_found_count || 0);
-    let clientDeleteError = "";
-
-    // 服务端未删或整单失败时，前端补删。
-    // 注意：服务端已删过一部分后绝对不能再按 blank_row_indexes 补删（row_index 已移位，会误删）。
-    const serverPartialOrDone = deletedOnServer && deletedAccounts > 0;
-    const needClientDelete = (!deletedOnServer || deletedAccounts < count)
-      && (usernames.length > 0 || (!serverPartialOrDone && blankRowIndexes.length > 0));
-    if (needClientDelete) {
-      if (accountRecordsExportSelectedAliasesBtn) {
-        accountRecordsExportSelectedAliasesBtn.textContent = "删除中...";
-      }
-      setStatus(`已下载 ${count} 条：${filename}，正在补删库内记录...`, "info");
-      const blanksForClient = serverPartialOrDone ? [] : blankRowIndexes;
-      try {
-        const byBlank = await deleteAccountRowsByBlankRowIndexes(blanksForClient);
-        deletedAccounts += Number(byBlank.deleted_accounts || 0);
-        deletedDeviceRows += Number(byBlank.deleted_device_rows || 0);
-        notFoundCount += Number(byBlank.not_found_count || 0);
-      } catch (blankErr) {
-        clientDeleteError = humanizeRequestErrorMessage(blankErr) || "空行删除失败";
-      }
-      try {
-        const byUsername = await deleteAccountRowsByUsernameList(usernames);
-        deletedAccounts += Number(byUsername.deleted_accounts || 0);
-        deletedDeviceRows += Number(byUsername.deleted_device_rows || 0);
-        notFoundCount += Number(byUsername.not_found_count || 0);
-      } catch (usernameErr) {
-        const msg = humanizeRequestErrorMessage(usernameErr) || "按用户名删除失败";
-        // 服务端已删过时，补删「未找到」不算失败
-        if (!(serverPartialOrDone && /未找到|未删除|不存在/i.test(msg))) {
-          clientDeleteError = clientDeleteError ? `${clientDeleteError}；${msg}` : msg;
-        }
-      }
-    } else if (!deletedAccounts && !usernames.length && !blankRowIndexes.length) {
-      setStatus(
-        `已提取 ${count} 条到 ${filename}，但缺少可删除标识，请用「按文件删除」上传该 xlsx 补删`,
-        "warning",
-      );
-      await refreshEditorTablesAfterAccountDelete();
-      return false;
-    }
-
-    clearAccountRecordsSelection();
-    await refreshEditorTablesAfterAccountDelete();
-    if (deletedAccounts <= 0) {
-      const reason = deleteError || clientDeleteError || "记录可能已不存在";
-      setStatus(
-        `已提取 ${count} 条到 ${filename}，但删除未生效（${reason}）。请用「按文件删除」上传该 xlsx 补删`,
-        "warning",
-      );
-      return false;
-    }
-    const parts = [
-      `已提取并删除 ${deletedAccounts} 条账号（${aliases.length} 个别名）`,
-      `文件：${filename}`,
-    ];
-    if (deletedDeviceRows > 0) {
-      parts.push(`同步清理 ${deletedDeviceRows} 条设备备份档案`);
-    }
-    if (notFoundCount > 0) {
-      parts.push(`${notFoundCount} 条删除时已不存在`);
-    }
-    if (deletedAccounts < count) {
-      parts.push(`提取 ${count} 条中有 ${count - deletedAccounts} 条未删掉`);
-    }
-    if (clientDeleteError) {
-      parts.push(`补删告警：${clientDeleteError}`);
-    }
-    parts.push("可用「导回提取表格」重新导入");
-    setStatus(
-      parts.join("，"),
-      (notFoundCount > 0 || deletedAccounts < count || clientDeleteError) ? "warning" : "success",
-    );
-    return true;
-  } catch (error) {
-    await refreshEditorTablesAfterAccountDelete();
-    throw error;
-  } finally {
-    if (accountRecordsExportSelectedAliasesBtn && accountRecordsSelectedAliases.size > 0) {
-      accountRecordsExportSelectedAliasesBtn.textContent = previousLabel;
-    }
-    updateAccountRecordsBatchActionBtns();
-  }
-}
-
 /**
  * 将「按别名提取」导出的 xlsx 导回账号记录。
  * @param {File} file
@@ -3712,7 +3736,7 @@ async function importAccountRowsExportXlsxFile(file) {
   if (!file || accountRecordsImportXlsxBusy) return;
   const name = String(file.name || "").toLowerCase();
   if (!name.endsWith(".xlsx")) {
-    setStatus("请选择 .xlsx 文件（与「按别名提取并删除」导出格式一致）", "warning");
+    setStatus("请选择 .xlsx 文件（与「按别名提取」导出格式一致）", "warning");
     return;
   }
   accountRecordsImportXlsxBusy = true;
@@ -12229,7 +12253,7 @@ function renderAccountEditorRows() {
         <details class="account-alias-group" data-account-alias="${escapeHtml(foldKey)}"${shouldOpen ? " open" : ""}>
           <summary class="account-alias-group__summary">
             <span class="account-alias-group__title">
-              <input type="checkbox" class="account-records-alias-select" data-account-alias="${escapeHtml(foldKey)}" title="勾选该别名（可多选）；点「按别名提取并删除」也会弹出选择窗"${aliasChecked ? " checked" : ""} />
+              <input type="checkbox" class="account-records-alias-select" data-account-alias="${escapeHtml(foldKey)}" title="勾选该别名（可多选）；点「按别名提取」或「按别名批量删除」也会弹出选择窗"${aliasChecked ? " checked" : ""} />
               <strong>${escapeHtml(aliasLabel)}</strong>
               <span class="hint">(${escapeHtml(countLabel)})</span>
             </span>
@@ -13955,9 +13979,18 @@ if (accountRecordsClearAliasSelectionBtn) {
 if (accountRecordsExportSelectedAliasesBtn) {
   accountRecordsExportSelectedAliasesBtn.addEventListener("click", () => {
     try {
-      openAccountRecordsExportAliasModal();
+      openAccountRecordsExportAliasModal("export");
     } catch (e) {
-      setStatus(humanizeRequestErrorMessage(e) || "打开别名选择弹窗失败", "error");
+      setStatus(humanizeRequestErrorMessage(e) || "打开别名提取弹窗失败", "error");
+    }
+  });
+}
+if (accountRecordsDeleteSelectedAliasesBtn) {
+  accountRecordsDeleteSelectedAliasesBtn.addEventListener("click", () => {
+    try {
+      openAccountRecordsExportAliasModal("delete");
+    } catch (e) {
+      setStatus(humanizeRequestErrorMessage(e) || "打开别名删除弹窗失败", "error");
     }
   });
 }
@@ -13974,7 +14007,10 @@ if (cancelAccountRecordsExportAliasModalBtn) {
 }
 if (confirmAccountRecordsExportAliasBtn) {
   confirmAccountRecordsExportAliasBtn.addEventListener("click", () => {
-    confirmAccountRecordsExportAliasModal().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "按别名提取并删除失败", "error"));
+    confirmAccountRecordsExportAliasModal().catch((e) => {
+      const fallback = accountRecordsAliasModalMode === "delete" ? "按别名批量删除失败" : "按别名提取失败";
+      setStatus(humanizeRequestErrorMessage(e) || fallback, "error");
+    });
   });
 }
 if (accountRecordsExportAliasSelectAllEl) {

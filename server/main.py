@@ -4245,7 +4245,13 @@ class AccountEditorRowExportByAliasesRequest(BaseModel):
     aliases: list[str] = Field(default_factory=list)
 
 
+class AccountEditorRowDeleteByAliasesRequest(BaseModel):
+    """按别名批量删除账号整行；空字符串或 __EMPTY_ALIAS__ 表示未分配别名。"""
+    aliases: list[str] = Field(default_factory=list)
+
+
 ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX = 200
+ACCOUNT_EDITOR_ROW_DELETE_BY_ALIASES_MAX = 200
 ACCOUNT_EDITOR_ROW_IMPORT_XLSX_MAX = 10000
 
 
@@ -16162,11 +16168,11 @@ def _delete_account_editor_rows_by_usernames_core(owner: str, usernames: list[st
         conn.close()
 
 
-def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) -> dict:
-    """按有效别名导出账号整行到 xlsx，写入成功后立即从数据库删除（下载走 exports 文件）。"""
+def _match_account_editor_rows_by_aliases(owner: str, aliases: list[str]) -> dict[str, Any]:
+    """按有效别名匹配账号行；返回 matched / alias_labels / code。"""
     wanted_keys = {_normalize_alias_key(a) for a in aliases}
     if not aliases:
-        return {"code": 1, "msg": "请至少选择一个别名", "count": 0}
+        return {"code": 1, "msg": "请至少选择一个别名", "matched": [], "alias_labels": []}
     include_unassigned = "" in wanted_keys
     wanted_nonempty = {k for k in wanted_keys if k}
     rows = _load_account_editor_export_rows(owner)
@@ -16186,24 +16192,144 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
             if not include_unassigned:
                 continue
             matched_alias_labels.add("")
-        # 导回依赖文件中的 assigned_alias；匹配用了有效别名时需写回，避免导回丢别名
         export_item = dict(item)
         if effective and not assigned:
             export_item["assigned_alias"] = effective
         matched.append(export_item)
+    alias_labels = sorted((a for a in matched_alias_labels if a), key=lambda s: s.lower())
+    if "" in matched_alias_labels:
+        alias_labels.append("")
     if not matched:
         return {
             "code": 1,
-            "msg": "所选别名下没有可导出的账号记录",
+            "msg": "所选别名下没有可处理的账号记录",
+            "matched": [],
+            "alias_labels": alias_labels,
+            "aliases": aliases,
+        }
+    return {
+        "code": 0,
+        "msg": "ok",
+        "matched": matched,
+        "alias_labels": alias_labels,
+        "aliases": aliases,
+    }
+
+
+def _delete_account_editor_rows_by_aliases(owner: str, aliases: list[str]) -> dict:
+    """按别名匹配后，在同一事务内按 row_index 降序删除（含无 username 空行）。"""
+    matched_resp = _match_account_editor_rows_by_aliases(owner, aliases)
+    if int(matched_resp.get("code") or 1) != 0:
+        return {
+            "code": 1,
+            "msg": str(matched_resp.get("msg") or "没有可删除的账号"),
+            "deleted_accounts": 0,
+            "deleted_device_rows": 0,
+            "not_found_count": 0,
+            "aliases": matched_resp.get("alias_labels") or aliases,
+            "alias_count": len(matched_resp.get("alias_labels") or []),
+            "matched_count": 0,
+        }
+    matched = list(matched_resp.get("matched") or [])
+    alias_labels = list(matched_resp.get("alias_labels") or [])
+    indices: list[int] = []
+    for item in matched:
+        try:
+            ri = int(item.get("row_index"))
+        except (TypeError, ValueError):
+            continue
+        if ri >= 0:
+            indices.append(ri)
+    row_indices = sorted(set(indices), reverse=True)
+    if not row_indices:
+        return {
+            "code": 1,
+            "msg": "所选别名下没有可删除的账号记录",
+            "deleted_accounts": 0,
+            "deleted_device_rows": 0,
+            "not_found_count": 0,
+            "aliases": alias_labels,
+            "alias_count": len(alias_labels),
+            "matched_count": len(matched),
+        }
+    conn = _get_db()
+    try:
+        deleted_accounts = 0
+        deleted_device_rows = 0
+        not_found_count = 0
+        deleted_usernames: list[str] = []
+        for row_index in row_indices:
+            result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, "")
+            if not result["found"]:
+                not_found_count += 1
+                continue
+            deleted_accounts += int(result["deleted_accounts"] or 0)
+            deleted_device_rows += int(result["deleted_device_rows"] or 0)
+            uname = str(result.get("username") or "").strip()
+            if uname:
+                deleted_usernames.append(uname)
+        if deleted_accounts <= 0:
+            conn.rollback()
+            return {
+                "code": 1,
+                "msg": "未删除任何账号记录（可能已不存在）",
+                "deleted_accounts": 0,
+                "deleted_device_rows": 0,
+                "not_found_count": not_found_count,
+                "aliases": alias_labels,
+                "alias_count": len(alias_labels),
+                "matched_count": len(matched),
+            }
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"已按别名删除 {deleted_accounts} 条账号记录",
+            "deleted_accounts": deleted_accounts,
+            "deleted_device_rows": deleted_device_rows,
+            "not_found_count": not_found_count,
+            "deleted_usernames": deleted_usernames,
+            "aliases": alias_labels,
+            "alias_count": len(alias_labels),
+            "matched_count": len(matched),
+        }
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试", "deleted_accounts": 0}
+        return {"code": 1, "msg": f"按别名删除失败：{exc}", "deleted_accounts": 0}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[{now_text()}] account_rows.delete_by_aliases | owner={owner} aliases={len(aliases)} EXC={exc}")
+        return {"code": 1, "msg": f"按别名删除失败：{exc}", "deleted_accounts": 0}
+    finally:
+        conn.close()
+
+
+def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) -> dict:
+    """按有效别名导出账号整行到 xlsx（仅导出，不删除）。"""
+    matched_resp = _match_account_editor_rows_by_aliases(owner, aliases)
+    if int(matched_resp.get("code") or 1) != 0:
+        return {
+            "code": 1,
+            "msg": str(matched_resp.get("msg") or "所选别名下没有可导出的账号记录"),
             "count": 0,
             "aliases": aliases,
         }
+    matched = list(matched_resp.get("matched") or [])
+    alias_labels = list(matched_resp.get("alias_labels") or [])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"account_rows_by_alias_{timestamp}.xlsx"
     written = _write_account_editor_rows_xlsx(matched, filename)
     if int(written.get("code") or 1) != 0:
         return written
-    # usernames 去重；无 username 的行返回 row_index（兼容旧前端补删）
     seen_u: set[str] = set()
     unique_usernames: list[str] = []
     blank_row_indexes: list[int] = []
@@ -16221,35 +16347,13 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
             continue
         if ri >= 0:
             blank_row_indexes.append(ri)
-    alias_labels = sorted((a for a in matched_alias_labels if a), key=lambda s: s.lower())
-    if "" in matched_alias_labels:
-        alias_labels.append("")
     written["usernames"] = unique_usernames
     written["blank_row_indexes"] = blank_row_indexes
     written["aliases"] = alias_labels
-    written["alias_count"] = len(matched_alias_labels)
-    # 文件已落盘后再删库，避免「下载成功但前端补删被空行 batch_delete 打断」
-    deleted = _delete_account_editor_rows_by_matched_snapshot(owner, matched)
-    written["deleted_on_server"] = True
-    written["deleted_accounts"] = int(deleted.get("deleted_accounts") or 0)
-    written["deleted_device_rows"] = int(deleted.get("deleted_device_rows") or 0)
-    written["delete_not_found_count"] = int(deleted.get("not_found_count") or 0)
-    if int(deleted.get("code") or 1) != 0:
-        written["msg"] = (
-            f"已导出 {written.get('count') or 0} 条到 {filename}，但服务端删除失败："
-            f"{deleted.get('msg') or '未知错误'}（请用「按文件删除」上传该 xlsx 补删）"
-        )
-        written["delete_error"] = str(deleted.get("msg") or "删除失败")
-    elif int(written.get("deleted_accounts") or 0) <= 0:
-        written["msg"] = (
-            f"已导出 {written.get('count') or 0} 条到 {filename}，但未删掉库内记录"
-            "（请用「按文件删除」上传该 xlsx 补删）"
-        )
-    else:
-        written["msg"] = (
-            f"已导出并删除 {written['deleted_accounts']} 条账号记录"
-            f"（文件：{filename}）"
-        )
+    written["alias_count"] = len(alias_labels)
+    written["deleted_on_server"] = False
+    written["deleted_accounts"] = 0
+    written["msg"] = f"已导出 {written.get('count') or 0} 条到 {filename}（未删除库内记录）"
     return written
 
 
@@ -16277,7 +16381,7 @@ def export_account_editor_rows_by_aliases(
     payload: AccountEditorRowExportByAliasesRequest,
     authorization: str | None = Header(default=None),
 ):
-    """按所选别名导出账号整行到 xlsx，写入成功后服务端删除库内记录；返回文件名供下载。"""
+    """按所选别名导出账号整行到 xlsx（仅导出，不删除）。"""
     session = _current_session({"authorization": authorization} if authorization else {})
     if not session:
         return {"code": 401, "msg": "请先登录"}
@@ -16293,6 +16397,32 @@ def export_account_editor_rows_by_aliases(
             "msg": f"单次最多导出 {ACCOUNT_EDITOR_ROW_EXPORT_BY_ALIASES_MAX} 个别名，请分批操作",
         }
     return _export_account_editor_rows_by_aliases_xlsx(owner, aliases)
+
+
+@app.post("/api/admin/editor/account_rows/delete_by_aliases")
+def delete_account_editor_rows_by_aliases(
+    payload: AccountEditorRowDeleteByAliasesRequest,
+    authorization: str | None = Header(default=None),
+):
+    """按所选别名批量删除账号记录整行，并级联清理设备备份档案。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    if not payload.aliases:
+        return {"code": 1, "msg": "请至少选择一个别名"}
+    # 与导出共用别名解析（空串 / __EMPTY_ALIAS__）
+    aliases = _parse_aliases_from_export_request(
+        AccountEditorRowExportByAliasesRequest(aliases=payload.aliases)
+    )
+    if not aliases:
+        return {"code": 1, "msg": "请至少选择一个别名"}
+    if len(aliases) > ACCOUNT_EDITOR_ROW_DELETE_BY_ALIASES_MAX:
+        return {
+            "code": 1,
+            "msg": f"单次最多按别名删除 {ACCOUNT_EDITOR_ROW_DELETE_BY_ALIASES_MAX} 组，请分批操作",
+        }
+    return _delete_account_editor_rows_by_aliases(owner, aliases)
 
 
 @app.post("/api/admin/editor/account_rows/import_xlsx")
