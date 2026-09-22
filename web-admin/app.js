@@ -3394,7 +3394,14 @@ function renderAccountRecordsExportAliasModalList() {
 }
 
 function openAccountRecordsExportAliasModal() {
-  if (!accountRecordsExportAliasModalEl || accountRecordsExportAliasModalBusy) return;
+  if (!accountRecordsExportAliasModalEl) {
+    setStatus("别名选择弹窗未就绪，请强制刷新页面（Ctrl+F5）后再试", "error");
+    return;
+  }
+  if (accountRecordsExportAliasModalBusy) {
+    setStatus("正在处理上一次提取，请稍候…", "warning");
+    return;
+  }
   accountRecordsExportAliasModalGroups = buildAccountRecordsExportAliasModalGroups();
   const validKeys = new Set(accountRecordsExportAliasModalGroups.map((g) => g.foldKey));
   accountRecordsExportAliasModalSelected.clear();
@@ -3411,7 +3418,11 @@ function openAccountRecordsExportAliasModal() {
   renderAccountRecordsExportAliasModalList();
   accountRecordsExportAliasModalEl.classList.remove("hidden");
   accountRecordsExportAliasModalEl.setAttribute("aria-hidden", "false");
-  if (accountRecordsExportAliasSearchInput) accountRecordsExportAliasSearchInput.focus();
+  try {
+    accountRecordsExportAliasSearchInput?.focus();
+  } catch (_) {
+    /* ignore focus errors */
+  }
 }
 
 function closeAccountRecordsExportAliasModal({ force = false } = {}) {
@@ -13850,7 +13861,11 @@ if (accountRecordsClearAliasSelectionBtn) {
 }
 if (accountRecordsExportSelectedAliasesBtn) {
   accountRecordsExportSelectedAliasesBtn.addEventListener("click", () => {
-    openAccountRecordsExportAliasModal();
+    try {
+      openAccountRecordsExportAliasModal();
+    } catch (e) {
+      setStatus(humanizeRequestErrorMessage(e) || "打开别名选择弹窗失败", "error");
+    }
   });
 }
 if (accountRecordsExportAliasModalEl) {
