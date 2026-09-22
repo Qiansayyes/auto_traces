@@ -15993,8 +15993,177 @@ def _export_account_editor_rows_by_followers_xlsx(owner: str, min_followers: int
     return written
 
 
+def _delete_account_editor_rows_by_matched_snapshot(owner: str, matched: list[dict[str, Any]]) -> dict:
+    """按导出快照删除：有 username 的按用户名删（抗 row_index 漂移）；无用户名的再按 row_index 降序补删。"""
+    seen_u: set[str] = set()
+    usernames: list[str] = []
+    blank_indices: list[int] = []
+    for item in matched or []:
+        username = _normalized_alias(item.get("username")).lstrip("@")
+        if username:
+            key = username.lower()
+            if key in seen_u:
+                continue
+            seen_u.add(key)
+            usernames.append(username)
+            continue
+        try:
+            ri = int(item.get("row_index"))
+        except (TypeError, ValueError):
+            continue
+        if ri >= 0:
+            blank_indices.append(ri)
+
+    deleted_accounts = 0
+    deleted_device_rows = 0
+    not_found_count = 0
+    deleted_usernames: list[str] = []
+
+    # 先删无 username 空行（降序），避免与后续 username 删除互相干扰
+    blank_indices = sorted(set(blank_indices), reverse=True)
+    if blank_indices:
+        conn = _get_db()
+        try:
+            for row_index in blank_indices:
+                result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, "")
+                if not result["found"]:
+                    not_found_count += 1
+                    continue
+                # 空行若实际已有 username，仍计入删除
+                deleted_accounts += int(result["deleted_accounts"] or 0)
+                deleted_device_rows += int(result["deleted_device_rows"] or 0)
+                uname = str(result.get("username") or "").strip()
+                if uname:
+                    deleted_usernames.append(uname)
+            if deleted_accounts > 0:
+                _ensure_device_editor_switch_highlight_invariants(conn, owner)
+                conn.commit()
+                _reset_device_editor_read_maintain_schedule(owner)
+            else:
+                conn.rollback()
+        except sqlite3.OperationalError as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if _is_db_lock_error(exc):
+                return {"code": 1, "msg": "数据库繁忙，请稍后重试", "deleted_accounts": 0}
+            return {"code": 1, "msg": f"删除失败：{exc}", "deleted_accounts": 0}
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(
+                f"[{now_text()}] account_rows.delete_after_alias_export.blank "
+                f"| owner={owner} count={len(blank_indices)} EXC={exc}"
+            )
+            return {"code": 1, "msg": f"删除失败：{exc}", "deleted_accounts": 0}
+        finally:
+            conn.close()
+
+    if usernames:
+        by_user = _delete_account_editor_rows_by_usernames_core(owner, usernames)
+        if int(by_user.get("code") or 1) != 0:
+            # 空行可能已删成功；带上已删数量便于前端提示补删
+            if deleted_accounts > 0:
+                return {
+                    "code": 1,
+                    "msg": str(by_user.get("msg") or "按 username 删除失败"),
+                    "deleted_accounts": deleted_accounts,
+                    "deleted_device_rows": deleted_device_rows,
+                    "not_found_count": not_found_count + int(by_user.get("not_found_count") or 0),
+                    "deleted_usernames": deleted_usernames,
+                }
+            return {
+                "code": 1,
+                "msg": str(by_user.get("msg") or "按 username 删除失败"),
+                "deleted_accounts": 0,
+                "deleted_device_rows": 0,
+                "not_found_count": int(by_user.get("not_found_count") or 0),
+            }
+        deleted_accounts += int(by_user.get("deleted_accounts") or 0)
+        deleted_device_rows += int(by_user.get("deleted_device_rows") or 0)
+        not_found_count += int(by_user.get("not_found_count") or 0)
+        for name in by_user.get("deleted_usernames") or []:
+            text = str(name or "").strip()
+            if text:
+                deleted_usernames.append(text)
+
+    return {
+        "code": 0,
+        "msg": f"已删除 {deleted_accounts} 条账号记录",
+        "deleted_accounts": deleted_accounts,
+        "deleted_device_rows": deleted_device_rows,
+        "not_found_count": not_found_count,
+        "deleted_usernames": deleted_usernames,
+    }
+
+
+def _delete_account_editor_rows_by_usernames_core(owner: str, usernames: list[str]) -> dict:
+    """按 username 列表删除账号行（调用方已完成鉴权与数量校验）。"""
+    if not usernames:
+        return {"code": 1, "msg": "请提供要删除的 username（可上传文件后提交）"}
+    conn = _get_db()
+    try:
+        wanted = {u.lower() for u in usernames}
+        rows = conn.execute(
+            """
+            SELECT row_index, username
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall()
+        targets: list[tuple[int, str]] = []
+        for r in rows:
+            uname = _normalized_alias(r["username"]).lstrip("@")
+            if uname.lower() in wanted:
+                targets.append((int(r["row_index"]), uname))
+        if not targets:
+            return {"code": 1, "msg": "未找到匹配的账号记录", "not_found_count": len(usernames)}
+        targets.sort(key=lambda item: item[0], reverse=True)
+        deleted_accounts = 0
+        deleted_device_rows = 0
+        deleted_usernames: list[str] = []
+        for row_index, username in targets:
+            result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, username)
+            if not result["found"]:
+                continue
+            deleted_accounts += int(result["deleted_accounts"] or 0)
+            deleted_device_rows += int(result["deleted_device_rows"] or 0)
+            deleted_name = str(result.get("username") or "").strip()
+            if deleted_name:
+                deleted_usernames.append(deleted_name)
+        if deleted_accounts <= 0:
+            return {"code": 1, "msg": "未删除任何账号记录（可能已不存在）"}
+        found_keys = {u.lower() for u in deleted_usernames}
+        not_found = [u for u in usernames if u.lower() not in found_keys]
+        _ensure_device_editor_switch_highlight_invariants(conn, owner)
+        conn.commit()
+        _reset_device_editor_read_maintain_schedule(owner)
+        return {
+            "code": 0,
+            "msg": f"已按 username 删除 {deleted_accounts} 条账号记录",
+            "deleted_accounts": deleted_accounts,
+            "deleted_device_rows": deleted_device_rows,
+            "deleted_usernames": deleted_usernames,
+            "not_found_usernames": not_found,
+            "not_found_count": len(not_found),
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_db_lock_error(exc):
+            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
+        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
+    except Exception as exc:
+        print(f"[{now_text()}] account_rows.delete_by_username | owner={owner} count={len(usernames)} EXC={exc}")
+        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
+    finally:
+        conn.close()
+
+
 def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) -> dict:
-    """按有效别名导出账号整行到 xlsx；不删除原记录（删除由前端在下载成功后触发）。"""
+    """按有效别名导出账号整行到 xlsx，写入成功后立即从数据库删除（下载走 exports 文件）。"""
     wanted_keys = {_normalize_alias_key(a) for a in aliases}
     if not aliases:
         return {"code": 1, "msg": "请至少选择一个别名", "count": 0}
@@ -16034,7 +16203,7 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
     written = _write_account_editor_rows_xlsx(matched, filename)
     if int(written.get("code") or 1) != 0:
         return written
-    # usernames 去重；无 username 的行返回 row_index，供下载成功后补删
+    # usernames 去重；无 username 的行返回 row_index（兼容旧前端补删）
     seen_u: set[str] = set()
     unique_usernames: list[str] = []
     blank_row_indexes: list[int] = []
@@ -16047,9 +16216,11 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
                 unique_usernames.append(username)
             continue
         try:
-            blank_row_indexes.append(int(item.get("row_index") or 0))
+            ri = int(item.get("row_index"))
         except (TypeError, ValueError):
             continue
+        if ri >= 0:
+            blank_row_indexes.append(ri)
     alias_labels = sorted((a for a in matched_alias_labels if a), key=lambda s: s.lower())
     if "" in matched_alias_labels:
         alias_labels.append("")
@@ -16057,6 +16228,28 @@ def _export_account_editor_rows_by_aliases_xlsx(owner: str, aliases: list[str]) 
     written["blank_row_indexes"] = blank_row_indexes
     written["aliases"] = alias_labels
     written["alias_count"] = len(matched_alias_labels)
+    # 文件已落盘后再删库，避免「下载成功但前端补删被空行 batch_delete 打断」
+    deleted = _delete_account_editor_rows_by_matched_snapshot(owner, matched)
+    written["deleted_on_server"] = True
+    written["deleted_accounts"] = int(deleted.get("deleted_accounts") or 0)
+    written["deleted_device_rows"] = int(deleted.get("deleted_device_rows") or 0)
+    written["delete_not_found_count"] = int(deleted.get("not_found_count") or 0)
+    if int(deleted.get("code") or 1) != 0:
+        written["msg"] = (
+            f"已导出 {written.get('count') or 0} 条到 {filename}，但服务端删除失败："
+            f"{deleted.get('msg') or '未知错误'}（请用「按文件删除」上传该 xlsx 补删）"
+        )
+        written["delete_error"] = str(deleted.get("msg") or "删除失败")
+    elif int(written.get("deleted_accounts") or 0) <= 0:
+        written["msg"] = (
+            f"已导出 {written.get('count') or 0} 条到 {filename}，但未删掉库内记录"
+            "（请用「按文件删除」上传该 xlsx 补删）"
+        )
+    else:
+        written["msg"] = (
+            f"已导出并删除 {written['deleted_accounts']} 条账号记录"
+            f"（文件：{filename}）"
+        )
     return written
 
 
@@ -16084,7 +16277,7 @@ def export_account_editor_rows_by_aliases(
     payload: AccountEditorRowExportByAliasesRequest,
     authorization: str | None = Header(default=None),
 ):
-    """按所选别名导出账号整行到 xlsx（不删除）；返回 usernames 供下载成功后删除。"""
+    """按所选别名导出账号整行到 xlsx，写入成功后服务端删除库内记录；返回文件名供下载。"""
     session = _current_session({"authorization": authorization} if authorization else {})
     if not session:
         return {"code": 401, "msg": "请先登录"}
@@ -16167,62 +16360,50 @@ def delete_account_editor_rows_by_username(
             "code": 1,
             "msg": f"单次最多按 username 删除 {ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX} 个，请分批操作",
         }
-    conn = _get_db()
-    try:
-        wanted = {u.lower() for u in usernames}
-        rows = conn.execute(
-            """
-            SELECT row_index, username
-            FROM account_editor_rows
-            WHERE owner_username = ?
-            """,
-            (owner,),
-        ).fetchall()
-        targets: list[tuple[int, str]] = []
-        for r in rows:
-            uname = _normalized_alias(r["username"]).lstrip("@")
-            if uname.lower() in wanted:
-                targets.append((int(r["row_index"]), uname))
-        if not targets:
-            return {"code": 1, "msg": "未找到匹配的账号记录", "not_found_count": len(usernames)}
-        targets.sort(key=lambda item: item[0], reverse=True)
-        deleted_accounts = 0
-        deleted_device_rows = 0
-        deleted_usernames: list[str] = []
-        for row_index, username in targets:
-            result = _delete_one_account_editor_row_in_conn(conn, owner, row_index, username)
-            if not result["found"]:
-                continue
-            deleted_accounts += int(result["deleted_accounts"] or 0)
-            deleted_device_rows += int(result["deleted_device_rows"] or 0)
-            deleted_name = str(result.get("username") or "").strip()
-            if deleted_name:
-                deleted_usernames.append(deleted_name)
-        if deleted_accounts <= 0:
-            return {"code": 1, "msg": "未删除任何账号记录（可能已不存在）"}
-        found_keys = {u.lower() for u in deleted_usernames}
-        not_found = [u for u in usernames if u.lower() not in found_keys]
-        _ensure_device_editor_switch_highlight_invariants(conn, owner)
-        conn.commit()
-        _reset_device_editor_read_maintain_schedule(owner)
+    return _delete_account_editor_rows_by_usernames_core(owner, usernames)
+
+
+@app.post("/api/admin/editor/account_rows/delete_by_export_xlsx")
+def delete_account_editor_rows_by_export_xlsx(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """用「按别名提取」导出的 xlsx 按 username 补删账号记录（导出后漏删时使用）。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return {"code": 1, "msg": "仅支持 xlsx 文件（请上传按别名提取导出的表格）"}
+    if load_workbook is None:
+        return {"code": 1, "msg": "缺少 openpyxl 依赖，无法解析 xlsx"}
+    owner = str(session["username"] or "").strip()
+    workbook = load_workbook(file.file, read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    headers, parsed_rows = _parse_account_editor_xlsx_sheet(sheet)
+    if "username" not in {str(h or "").strip() for h in headers}:
+        return {"code": 1, "msg": "xlsx 表头缺少 username 列（请使用按别名提取导出的表格）"}
+    if not parsed_rows:
+        return {"code": 1, "msg": "xlsx 中没有可删除的数据行"}
+    seen: set[str] = set()
+    usernames: list[str] = []
+    for item in parsed_rows:
+        username = _normalized_alias(item.get("username")).lstrip("@")
+        if not username:
+            continue
+        key = username.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        usernames.append(username)
+    if not usernames:
+        return {"code": 1, "msg": "xlsx 中没有可用的 username"}
+    if len(usernames) > ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX:
         return {
-            "code": 0,
-            "msg": f"已按 username 删除 {deleted_accounts} 条账号记录",
-            "deleted_accounts": deleted_accounts,
-            "deleted_device_rows": deleted_device_rows,
-            "deleted_usernames": deleted_usernames,
-            "not_found_usernames": not_found,
-            "not_found_count": len(not_found),
+            "code": 1,
+            "msg": f"单次最多按 username 删除 {ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX} 个，请分批操作",
         }
-    except sqlite3.OperationalError as exc:
-        if _is_db_lock_error(exc):
-            return {"code": 1, "msg": "数据库繁忙，请稍后重试"}
-        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
-    except Exception as exc:
-        print(f"[{now_text()}] account_rows.delete_by_username | owner={owner} count={len(usernames)} EXC={exc}")
-        return {"code": 1, "msg": f"按 username 删除失败：{exc}"}
-    finally:
-        conn.close()
+    return _delete_account_editor_rows_by_usernames_core(owner, usernames)
 
 
 @app.post("/api/admin/editor/account_rows/batch_set_basic_profile")

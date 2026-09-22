@@ -884,15 +884,15 @@
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
             <button id="accountRecordsSelectAllAliasesBtn" type="button" class="ghost" title="勾选当前筛选结果下的全部别名组（可跨页）">全选别名</button>
             <button id="accountRecordsClearAliasSelectionBtn" type="button" class="ghost" title="取消已勾选的别名组">取消全选</button>
-            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" title="弹出别名选择：勾选后提取到 XLSX，下载成功后从数据库删除（也可先用左侧复选框/全选别名预勾选）">按别名提取并删除</button>
+            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" title="弹出别名选择：勾选后提取到 XLSX，服务端写入成功后删除库内记录（也可先用左侧复选框/全选别名预勾选）">按别名提取并删除</button>
             <input id="accountRecordsImportXlsxFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:220px;" title="选择此前「按别名提取」导出的 xlsx，导回账号记录" />
             <button id="accountRecordsImportXlsxBtn" type="button" class="ghost" title="将提取出的账号表格导回账号记录（按 username 新增或补全）">导回提取表格</button>
             <label class="pager-size-label" for="accountRecordsExportMinFollowersInput" title="导出粉丝数大于该值的账号整行到 xlsx（不删除）">粉丝&gt;</label>
             <input id="accountRecordsExportMinFollowersInput" type="number" class="pager-size-input" min="0" step="1" value="1000" style="width:88px;" title="默认 1000：导出粉丝数大于该阈值的账号整行" />
             <button id="accountRecordsExportByFollowersBtn" type="button" class="ghost" title="提取粉丝数大于指定值的账号整行到 XLSX，不删除原记录">提取高粉账号</button>
             <button id="accountRecordsDeleteUsernameTemplateBtn" type="button" class="ghost" title="下载按用户名删除的文件模板（每行一个 username）">下载删除模板</button>
-            <input id="accountRecordsDeleteByUsernameFile" type="file" accept=".txt,.csv,text/plain,text/csv" style="max-width:220px;" title="上传要删除的 username 列表文件（txt/csv，每行一个）" />
-            <button id="accountRecordsDeleteByUsernameBtn" type="button" class="danger" title="按上传文件中的 username 删除对应账号记录整行，并同步清理设备备份档案">按文件删除</button>
+            <input id="accountRecordsDeleteByUsernameFile" type="file" accept=".txt,.csv,.xlsx,text/plain,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:220px;" title="上传要删除的 username 列表（txt/csv），或直接上传「按别名提取」导出的 xlsx 补删" />
+            <button id="accountRecordsDeleteByUsernameBtn" type="button" class="danger" title="按上传文件中的 username 删除对应账号记录整行，并同步清理设备备份档案（支持提取出的 xlsx）">按文件删除</button>
             <button id="accountRecordsPrevPageBtn" type="button" class="ghost">上一页</button>
             <span id="accountRecordsPager" class="hint">第 1 / 1 页</span>
             <button id="accountRecordsNextPageBtn" type="button" class="ghost">下一页</button>
@@ -1793,6 +1793,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260922-alias-export-modal"></script>
+  <script src="app.js?v=20260922-alias-export-delete-fix"></script>
 </body>
 </html>

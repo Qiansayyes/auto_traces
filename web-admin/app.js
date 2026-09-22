@@ -3469,7 +3469,7 @@ async function confirmAccountRecordsExportAliasModal() {
   if (estimatedCount > 0) {
     confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
   }
-  confirmLines.push("下载成功后才会删除；已分配别名的账号会同步清理设备备份档案。");
+  confirmLines.push("服务端写入文件成功后会立刻删除库内记录；下载失败可用「按文件删除」上传该 xlsx 补删。");
   confirmLines.push("提取出的表格可通过「导回提取表格」重新导入。");
   // 取消时弹窗保持打开，便于改勾选
   if (!window.confirm(confirmLines.join("\n"))) return;
@@ -3536,16 +3536,26 @@ async function deleteAccountRowsByBlankRowIndexes(rowIndexes = []) {
   let notFoundCount = 0;
   for (let i = 0; i < indexes.length; i += ACCOUNT_RECORDS_BATCH_DELETE_MAX) {
     const chunk = indexes.slice(i, i + ACCOUNT_RECORDS_BATCH_DELETE_MAX);
-    const resp = await request(`${ACCOUNT_ROWS_API}/batch_delete`, {
-      method: "POST",
-      body: JSON.stringify({
-        items: chunk.map((row_index) => ({ row_index, username: "" })),
-      }),
-      timeoutMs: 180000,
-    });
-    deletedAccounts += Number(resp?.deleted_accounts || 0);
-    deletedDeviceRows += Number(resp?.deleted_device_rows || 0);
-    notFoundCount += Number(resp?.not_found_count || 0);
+    try {
+      const resp = await request(`${ACCOUNT_ROWS_API}/batch_delete`, {
+        method: "POST",
+        body: JSON.stringify({
+          items: chunk.map((row_index) => ({ row_index, username: "" })),
+        }),
+        timeoutMs: 180000,
+      });
+      deletedAccounts += Number(resp?.deleted_accounts || 0);
+      deletedDeviceRows += Number(resp?.deleted_device_rows || 0);
+      notFoundCount += Number(resp?.not_found_count || 0);
+    } catch (error) {
+      // 空行按 row_index 补删失败时记为 not_found，绝不中断后续按 username 删除
+      const msg = humanizeRequestErrorMessage(error) || String(error || "");
+      if (/未删除|未找到|不存在/i.test(msg)) {
+        notFoundCount += chunk.length;
+        continue;
+      }
+      throw error;
+    }
   }
   return {
     deleted_accounts: deletedAccounts,
@@ -3572,7 +3582,7 @@ async function exportAndDeleteSelectedAliases({ skipConfirm = false } = {}) {
     if (estimatedCount > 0) {
       confirmLines.push(`预计约 ${estimatedCount} 条账号记录将写入 XLSX 并从数据库删除`);
     }
-    confirmLines.push("下载成功后才会删除；已分配别名的账号会同步清理设备备份档案。");
+    confirmLines.push("服务端写入文件成功后会立刻删除库内记录；下载失败可稍后用「按文件删除」上传该 xlsx 补删。");
     confirmLines.push("提取出的表格可通过「导回提取表格」重新导入。");
     if (!window.confirm(confirmLines.join("\n"))) return false;
   }
@@ -3593,30 +3603,70 @@ async function exportAndDeleteSelectedAliases({ skipConfirm = false } = {}) {
     const count = Number(resp?.count || 0);
     const usernames = Array.isArray(resp?.usernames) ? resp.usernames : [];
     const blankRowIndexes = Array.isArray(resp?.blank_row_indexes) ? resp.blank_row_indexes : [];
+    const serverDeleted = Number(resp?.deleted_accounts || 0);
+    const serverDeletedDevices = Number(resp?.deleted_device_rows || 0);
+    const deletedOnServer = Boolean(resp?.deleted_on_server);
+    const deleteError = String(resp?.delete_error || "").trim();
     if (!filename || count <= 0) {
       setStatus(String(resp?.msg || "所选别名下没有可提取的账号"), "warning");
       return false;
     }
+    if (accountRecordsExportSelectedAliasesBtn) {
+      accountRecordsExportSelectedAliasesBtn.textContent = "下载中...";
+    }
     await downloadAccountRowsExportFile(filename);
-    if (!usernames.length && !blankRowIndexes.length) {
-      setStatus(`已提取 ${count} 条到 ${filename}，但缺少可删除标识，库内记录未删除`, "warning");
+
+    let deletedAccounts = serverDeleted;
+    let deletedDeviceRows = serverDeletedDevices;
+    let notFoundCount = Number(resp?.delete_not_found_count || 0);
+    let clientDeleteError = "";
+
+    // 服务端未删或整单失败时，前端补删。
+    // 注意：服务端已删过一部分后绝对不能再按 blank_row_indexes 补删（row_index 已移位，会误删）。
+    const serverPartialOrDone = deletedOnServer && deletedAccounts > 0;
+    const needClientDelete = (!deletedOnServer || deletedAccounts < count)
+      && (usernames.length > 0 || (!serverPartialOrDone && blankRowIndexes.length > 0));
+    if (needClientDelete) {
+      if (accountRecordsExportSelectedAliasesBtn) {
+        accountRecordsExportSelectedAliasesBtn.textContent = "删除中...";
+      }
+      setStatus(`已下载 ${count} 条：${filename}，正在补删库内记录...`, "info");
+      const blanksForClient = serverPartialOrDone ? [] : blankRowIndexes;
+      try {
+        const byBlank = await deleteAccountRowsByBlankRowIndexes(blanksForClient);
+        deletedAccounts += Number(byBlank.deleted_accounts || 0);
+        deletedDeviceRows += Number(byBlank.deleted_device_rows || 0);
+        notFoundCount += Number(byBlank.not_found_count || 0);
+      } catch (blankErr) {
+        clientDeleteError = humanizeRequestErrorMessage(blankErr) || "空行删除失败";
+      }
+      try {
+        const byUsername = await deleteAccountRowsByUsernameList(usernames);
+        deletedAccounts += Number(byUsername.deleted_accounts || 0);
+        deletedDeviceRows += Number(byUsername.deleted_device_rows || 0);
+        notFoundCount += Number(byUsername.not_found_count || 0);
+      } catch (usernameErr) {
+        const msg = humanizeRequestErrorMessage(usernameErr) || "按用户名删除失败";
+        // 服务端已删过时，补删「未找到」不算失败
+        if (!(serverPartialOrDone && /未找到|未删除|不存在/i.test(msg))) {
+          clientDeleteError = clientDeleteError ? `${clientDeleteError}；${msg}` : msg;
+        }
+      }
+    } else if (!deletedAccounts && !usernames.length && !blankRowIndexes.length) {
+      setStatus(
+        `已提取 ${count} 条到 ${filename}，但缺少可删除标识，请用「按文件删除」上传该 xlsx 补删`,
+        "warning",
+      );
+      await refreshEditorTablesAfterAccountDelete();
       return false;
     }
-    setStatus(`已下载 ${count} 条：${filename}，正在从数据库删除...`, "info");
-    if (accountRecordsExportSelectedAliasesBtn) {
-      accountRecordsExportSelectedAliasesBtn.textContent = "删除中...";
-    }
-    // 无 username 的行必须先按导出时的 row_index 删（否则后续按 username 删除会移位）
-    const byBlank = await deleteAccountRowsByBlankRowIndexes(blankRowIndexes);
-    const byUsername = await deleteAccountRowsByUsernameList(usernames);
-    const deletedAccounts = Number(byUsername.deleted_accounts || 0) + Number(byBlank.deleted_accounts || 0);
-    const deletedDeviceRows = Number(byUsername.deleted_device_rows || 0) + Number(byBlank.deleted_device_rows || 0);
-    const notFoundCount = Number(byUsername.not_found_count || 0) + Number(byBlank.not_found_count || 0);
+
     clearAccountRecordsSelection();
     await refreshEditorTablesAfterAccountDelete();
     if (deletedAccounts <= 0) {
+      const reason = deleteError || clientDeleteError || "记录可能已不存在";
       setStatus(
-        `已提取 ${count} 条到 ${filename}，但删除未生效（记录可能已不存在），请刷新后检查`,
+        `已提取 ${count} 条到 ${filename}，但删除未生效（${reason}）。请用「按文件删除」上传该 xlsx 补删`,
         "warning",
       );
       return false;
@@ -3634,8 +3684,14 @@ async function exportAndDeleteSelectedAliases({ skipConfirm = false } = {}) {
     if (deletedAccounts < count) {
       parts.push(`提取 ${count} 条中有 ${count - deletedAccounts} 条未删掉`);
     }
+    if (clientDeleteError) {
+      parts.push(`补删告警：${clientDeleteError}`);
+    }
     parts.push("可用「导回提取表格」重新导入");
-    setStatus(parts.join("，"), (notFoundCount > 0 || deletedAccounts < count) ? "warning" : "success");
+    setStatus(
+      parts.join("，"),
+      (notFoundCount > 0 || deletedAccounts < count || clientDeleteError) ? "warning" : "success",
+    );
     return true;
   } catch (error) {
     await refreshEditorTablesAfterAccountDelete();
@@ -3737,13 +3793,16 @@ function downloadAccountRecordsDeleteUsernameTemplate() {
 async function readAccountRecordsDeleteUsernamesFromFile() {
   const file = accountRecordsDeleteByUsernameFile?.files?.[0];
   if (!file) {
-    setStatus("请先选择要删除的 username 文件（可先下载模板）", "warning");
+    setStatus("请先选择要删除的 username 文件（可先下载模板，或直接上传提取出的 xlsx）", "warning");
     accountRecordsDeleteByUsernameFile?.focus();
     return null;
   }
   const name = String(file.name || "").toLowerCase();
+  if (name.endsWith(".xlsx")) {
+    return { kind: "xlsx", file };
+  }
   if (!(name.endsWith(".txt") || name.endsWith(".csv"))) {
-    setStatus("请上传 .txt 或 .csv 文件（可先下载模板）", "warning");
+    setStatus("请上传 .txt / .csv / .xlsx 文件（xlsx 可用「按别名提取」导出的表格）", "warning");
     return null;
   }
   const text = await file.text();
@@ -3756,21 +3815,30 @@ async function readAccountRecordsDeleteUsernamesFromFile() {
     setStatus(`单次最多按文件删除 ${ACCOUNT_RECORDS_DELETE_BY_USERNAME_MAX} 个 username，请分批操作`, "warning");
     return null;
   }
-  return usernames;
+  return { kind: "text", usernames };
 }
 
 async function deleteAccountRowsByUsername() {
   if (accountRecordsDeleteByUsernameBtn?.disabled) return;
-  const usernames = await readAccountRecordsDeleteUsernamesFromFile();
-  if (!usernames) return;
-  const previewNames = usernames.slice(0, 8);
-  const confirmLines = [
-    `确认按文件中的 ${usernames.length} 个 username 删除对应账号记录整行？`,
-  ];
-  if (previewNames.length) {
-    confirmLines.push(`账号：${previewNames.join("、")}${usernames.length > 8 ? " …" : ""}`);
+  const payload = await readAccountRecordsDeleteUsernamesFromFile();
+  if (!payload) return;
+  const isXlsx = payload.kind === "xlsx";
+  const usernames = isXlsx ? [] : (payload.usernames || []);
+  const confirmLines = isXlsx
+    ? [
+      `确认按提取表格「${payload.file.name}」中的 username 删除对应账号记录整行？`,
+      "已分配别名的账号将同步清理设备备份档案中的对应数据",
+    ]
+    : [
+      `确认按文件中的 ${usernames.length} 个 username 删除对应账号记录整行？`,
+    ];
+  if (!isXlsx) {
+    const previewNames = usernames.slice(0, 8);
+    if (previewNames.length) {
+      confirmLines.push(`账号：${previewNames.join("、")}${usernames.length > 8 ? " …" : ""}`);
+    }
+    confirmLines.push("已分配别名的账号将同步清理设备备份档案中的对应数据");
   }
-  confirmLines.push("已分配别名的账号将同步清理设备备份档案中的对应数据");
   if (!window.confirm(confirmLines.join("\n"))) return;
 
   const previousLabel = accountRecordsDeleteByUsernameBtn?.textContent || "按文件删除";
@@ -3779,12 +3847,37 @@ async function deleteAccountRowsByUsername() {
     accountRecordsDeleteByUsernameBtn.textContent = "删除中...";
   }
   try {
-    setStatus(`正在按文件删除 ${usernames.length} 个 username 对应的账号记录...`, "info");
-    const resp = await request(`${ACCOUNT_ROWS_API}/delete_by_username`, {
-      method: "POST",
-      body: JSON.stringify({ usernames }),
-      timeoutMs: 120000,
-    });
+    let resp;
+    if (isXlsx) {
+      setStatus(`正在按提取表格删除账号记录：${payload.file.name}...`, "info");
+      const token = authToken();
+      const form = new FormData();
+      form.append("file", payload.file);
+      const response = await fetch(await buildApiUrl(`${ACCOUNT_ROWS_API}/delete_by_export_xlsx`), {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: form,
+        cache: "no-store",
+      });
+      const text = await response.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = { code: 1, msg: text || "服务返回非 JSON 响应" };
+      }
+      if (!response.ok || data.code !== 0) {
+        throw new Error(formatHttpApiErrorMessage(response.status, data));
+      }
+      resp = data;
+    } else {
+      setStatus(`正在按文件删除 ${usernames.length} 个 username 对应的账号记录...`, "info");
+      resp = await request(`${ACCOUNT_ROWS_API}/delete_by_username`, {
+        method: "POST",
+        body: JSON.stringify({ usernames }),
+        timeoutMs: 120000,
+      });
+    }
     const deletedAccounts = Number(resp?.deleted_accounts || 0);
     const deletedDeviceRows = Number(resp?.deleted_device_rows || 0);
     const notFoundCount = Number(resp?.not_found_count || 0);
