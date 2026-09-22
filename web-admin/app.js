@@ -1,4 +1,4 @@
-window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260917-fix-login-encoding";
+window.__AUTO_TRACES_WEB_ADMIN_BUILD__ = "20260923-alias-delete-busy";
 
 {
 
@@ -3407,11 +3407,12 @@ function renderAccountRecordsExportAliasModalList() {
 function openAccountRecordsExportAliasModal(mode = "export") {
   if (!accountRecordsExportAliasModalEl) {
     setStatus("别名选择弹窗未就绪，请强制刷新页面（Ctrl+F5）后再试", "error");
-    return;
+    return false;
   }
+  // 卡死的 busy 会让按钮看起来可点但实际被拦截；打开弹窗时强制清掉
   if (accountRecordsExportAliasModalBusy) {
-    setStatus("正在处理上一次操作，请稍候…", "warning");
-    return;
+    accountRecordsExportAliasModalBusy = false;
+    updateAccountRecordsBatchActionBtns();
   }
   accountRecordsAliasModalMode = mode === "delete" ? "delete" : "export";
   const isDelete = accountRecordsAliasModalMode === "delete";
@@ -3432,6 +3433,10 @@ function openAccountRecordsExportAliasModal(mode = "export") {
   accountRecordsSelectedAliases.forEach((key) => {
     if (validKeys.has(key)) accountRecordsExportAliasModalSelected.add(key);
   });
+  // 列表勾选因筛选未进弹窗时，仍保留勾选，避免「点了没反应」
+  if (!accountRecordsExportAliasModalSelected.size && accountRecordsSelectedAliases.size > 0) {
+    accountRecordsSelectedAliases.forEach((key) => accountRecordsExportAliasModalSelected.add(key));
+  }
   accountRecordsExportAliasModalSearchQuery = "";
   if (accountRecordsExportAliasSearchInput) accountRecordsExportAliasSearchInput.value = "";
   if (confirmAccountRecordsExportAliasBtn) {
@@ -3446,11 +3451,23 @@ function openAccountRecordsExportAliasModal(mode = "export") {
   renderAccountRecordsExportAliasModalList();
   accountRecordsExportAliasModalEl.classList.remove("hidden");
   accountRecordsExportAliasModalEl.setAttribute("aria-hidden", "false");
+  const preselected = accountRecordsExportAliasModalSelected.size;
+  setStatus(
+    isDelete
+      ? (preselected > 0
+        ? `已打开删除弹窗：已勾选 ${preselected} 个别名，点「确认删除」执行`
+        : "已打开删除弹窗：请勾选别名后点「确认删除」")
+      : (preselected > 0
+        ? `已打开提取弹窗：已勾选 ${preselected} 个别名，点「确认提取」执行`
+        : "已打开提取弹窗：请勾选别名后点「确认提取」"),
+    "info",
+  );
   try {
     accountRecordsExportAliasSearchInput?.focus();
   } catch (_) {
     /* ignore focus errors */
   }
+  return true;
 }
 
 function closeAccountRecordsExportAliasModal({ force = false } = {}) {
@@ -3596,6 +3613,12 @@ async function exportSelectedAliasesOnly({ skipConfirm = false } = {}) {
 }
 
 async function deleteSelectedAliasesByAlias({ skipConfirm = false } = {}) {
+  // 弹窗确认路径会先占用 busy 再以 skipConfirm 调用；直删路径需自管 busy，防止连点双提交
+  if (accountRecordsExportAliasModalBusy && !skipConfirm) {
+    setStatus("正在处理上一次操作，请稍候…", "warning");
+    return false;
+  }
+  const manageBusy = !accountRecordsExportAliasModalBusy;
   const { aliases, previewLabels, estimatedCount } = collectSelectedAliasExportPayload();
   if (!aliases.length) {
     setStatus("请先勾选要删除的别名组", "warning");
@@ -3617,6 +3640,10 @@ async function deleteSelectedAliasesByAlias({ skipConfirm = false } = {}) {
     if (!window.confirm(confirmLines.join("\n"))) return false;
   }
 
+  if (manageBusy) {
+    accountRecordsExportAliasModalBusy = true;
+    updateAccountRecordsBatchActionBtns();
+  }
   const previousLabel = accountRecordsDeleteSelectedAliasesBtn?.textContent || "按别名批量删除";
   if (accountRecordsDeleteSelectedAliasesBtn) {
     accountRecordsDeleteSelectedAliasesBtn.disabled = true;
@@ -3648,6 +3675,7 @@ async function deleteSelectedAliasesByAlias({ skipConfirm = false } = {}) {
     await refreshEditorTablesAfterAccountDelete();
     throw error;
   } finally {
+    if (manageBusy) accountRecordsExportAliasModalBusy = false;
     if (accountRecordsDeleteSelectedAliasesBtn) {
       accountRecordsDeleteSelectedAliasesBtn.textContent = previousLabel;
     }
@@ -13988,6 +14016,14 @@ if (accountRecordsExportSelectedAliasesBtn) {
 if (accountRecordsDeleteSelectedAliasesBtn) {
   accountRecordsDeleteSelectedAliasesBtn.addEventListener("click", () => {
     try {
+      // 列表已勾选别名：直接确认删除，避免再弹一次选择窗被误关后「完全没效果」
+      if (accountRecordsSelectedAliases.size > 0) {
+        setStatus(`准备按别名删除 ${accountRecordsSelectedAliases.size} 组…`, "info");
+        deleteSelectedAliasesByAlias({ skipConfirm: false }).catch((e) => {
+          setStatus(humanizeRequestErrorMessage(e) || "按别名批量删除失败", "error");
+        });
+        return;
+      }
       openAccountRecordsExportAliasModal("delete");
     } catch (e) {
       setStatus(humanizeRequestErrorMessage(e) || "打开别名删除弹窗失败", "error");
