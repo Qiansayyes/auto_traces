@@ -137,6 +137,29 @@
     </div>
   </div>
 
+  <div id="accountRecordsExportAliasModal" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-card modal-card--wide modal-card--import-preview">
+      <div class="modal-header">
+        <h3>按别名提取并删除 — 选择别名</h3>
+        <button id="closeAccountRecordsExportAliasModalBtn" type="button" class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-hint">勾选要提取的别名组，确认后导出 XLSX；下载成功后才会从数据库删除（已分配别名会同步清理设备备份档案）。账号数为该别名下全部记录（不受当前搜索筛选缩小）。可搜索、全选。</p>
+      <div class="import-preview-toolbar" style="flex-wrap:wrap;gap:10px;">
+        <label class="import-preview-select-all">
+          <input id="accountRecordsExportAliasSelectAll" type="checkbox" />
+          全选别名
+        </label>
+        <input id="accountRecordsExportAliasSearchInput" type="search" class="ui-input" placeholder="搜索别名…" style="min-width:200px;max-width:280px;" autocomplete="off" />
+        <span id="accountRecordsExportAliasSummary" class="hint"></span>
+      </div>
+      <div id="accountRecordsExportAliasList" class="import-preview-table-wrap"></div>
+      <div class="modal-actions">
+        <button id="cancelAccountRecordsExportAliasModalBtn" type="button" class="ghost">取消</button>
+        <button id="confirmAccountRecordsExportAliasBtn" type="button" class="danger" title="提取所选别名下全部账号到 XLSX，下载成功后删除">确认提取并删除</button>
+      </div>
+    </div>
+  </div>
+
   <div id="backupAliasPickModal" class="modal-overlay hidden" aria-hidden="true">
     <div class="modal-card modal-card--wide modal-card--import-preview">
       <div class="modal-header">
@@ -861,7 +884,7 @@
             <button id="accountRecordsBatchDeleteBtn" type="button" class="danger" disabled title="删除勾选的账号记录，并同步清理设备备份档案">批量删除</button>
             <button id="accountRecordsSelectAllAliasesBtn" type="button" class="ghost" title="勾选当前筛选结果下的全部别名组（可跨页）">全选别名</button>
             <button id="accountRecordsClearAliasSelectionBtn" type="button" class="ghost" title="取消已勾选的别名组">取消全选</button>
-            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" disabled title="勾选别名组左侧复选框（可多选/全选）后：提取这些别名下全部账号到 XLSX，下载成功后从数据库删除">按别名提取并删除</button>
+            <button id="accountRecordsExportSelectedAliasesBtn" type="button" class="ghost" title="弹出别名选择：勾选后提取到 XLSX，下载成功后从数据库删除（也可先用左侧复选框/全选别名预勾选）">按别名提取并删除</button>
             <input id="accountRecordsImportXlsxFile" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:220px;" title="选择此前「按别名提取」导出的 xlsx，导回账号记录" />
             <button id="accountRecordsImportXlsxBtn" type="button" class="ghost" title="将提取出的账号表格导回账号记录（按 username 新增或补全）">导回提取表格</button>
             <label class="pager-size-label" for="accountRecordsExportMinFollowersInput" title="导出粉丝数大于该值的账号整行到 xlsx（不删除）">粉丝&gt;</label>

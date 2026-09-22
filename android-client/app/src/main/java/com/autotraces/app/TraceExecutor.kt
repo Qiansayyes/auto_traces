@@ -1024,6 +1024,12 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_MAX_ITEMS_PER_TASK = 5
         /** 上一条发布成功后切下一条前短等（不冷启 TikTok；界面已在底栏主界面）。 */
         private const val PUBLISH_POST_INTER_ITEM_DELAY_MS = 650L
+        /**
+         * PC/USB 落盘后 MediaStore 可能短暂 IS_PENDING；拉完立刻按可见=0 判失败会误报「PC 拉取失败」。
+         * 在此窗口内轮询非 pending 可见数。
+         */
+        private const val PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS = 15_000L
+        private const val PUBLISH_POST_MEDIASTORE_VISIBLE_POLL_MS = 500L
         /** 同任务同一条作品在内层 3 次失败后，仍在流程内断点续发重试（不整段重入、不任务头冷启）。 */
         private const val PUBLISH_POST_SAME_ITEM_RESUME_MAX_PASSES = 8
         private const val PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS = 2_000L
@@ -10611,6 +10617,42 @@ class RealTraceExecutor(
     }
 
     /**
+     * 拉取/入库后短等 MediaStore 非 pending 可见数达到 [minNeed]。
+     * 解决 USB push / IS_PENDING 竞态：磁盘已有文件但立刻统计可见=0。
+     */
+    private suspend fun publishPostWaitGalleryVisibleAfterFetch(
+        alias: String,
+        minNeed: Int = 1,
+        timeoutMs: Long = PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS,
+        pollMs: Long = PUBLISH_POST_MEDIASTORE_VISIBLE_POLL_MS,
+    ): PublishPostGalleryMaterialStats {
+        val need = minNeed.coerceAtLeast(1)
+        var last = publishPostResolveGalleryMaterialStats()
+        if (last.resolvedCount >= need) return last
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(pollMs)
+        var attempt = 0
+        devOp(
+            alias,
+            "发作品：拉取后 MediaStore 暂不可见（当前=${last.resolvedCount}，目标>=$need），开始短等/轮询（最多 ${timeoutMs}ms）…",
+        )
+        while (last.resolvedCount < need && SystemClock.elapsedRealtime() < deadline) {
+            if (hardStopOrNull(alias, "发作品素材可见性等待")) break
+            attempt++
+            delay(pollMs.coerceAtLeast(100L))
+            last = publishPostResolveGalleryMaterialStats()
+            if (attempt == 1 || attempt % 4 == 0 || last.resolvedCount >= need) {
+                val left = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                devOp(
+                    alias,
+                    "发作品：MediaStore 可见轮询 #$attempt → 图片=${last.picturesRootImageCount} " +
+                        "视频=${last.picturesRootVideoCount} 合计=${last.resolvedCount}（剩余约 ${left}ms）",
+                )
+            }
+        }
+        return last
+    }
+
+    /**
      * 发作品时的音频位置固定坐标：屏幕正中 X，顶部 1/10 处 Y。
      */
     private fun fixedAudioTapPoint(service: Context): Point {
@@ -12890,7 +12932,7 @@ class RealTraceExecutor(
             if (configuredFetchCount > 0) {
                 if (!publishPostFetchMaterialsFromPc(service, alias, configuredFetchCount)) {
                     lastPublishPostEntryFailureReason =
-                        lastPublishPostEntryFailureReason ?: "PC 素材拉取失败"
+                        lastPublishPostEntryFailureReason ?: "素材拉取或图库可见性失败"
                     return false
                 }
             } else {
@@ -14434,7 +14476,7 @@ class RealTraceExecutor(
         }
         if (!publishPostFetchMaterialsFromPc(service, alias, fetchCount)) {
             lastPublishPostEntryFailureReason =
-                lastPublishPostEntryFailureReason ?: "PC 素材拉取失败（$phaseLabel）"
+                lastPublishPostEntryFailureReason ?: "素材拉取或图库可见性失败（$phaseLabel）"
             return null
         }
         stats = publishPostResolveGalleryMaterialStats()
@@ -14520,6 +14562,7 @@ class RealTraceExecutor(
         return try {
             val task = CompanionApi.createTask(app, count, targetPath, username)
             if (task.files.isEmpty()) {
+                lastPublishPostEntryFailureReason = "PC 返回任务无文件（请求数=$count）"
                 devOp(
                     alias,
                     "发作品：PC 返回任务无文件（taskId=${task.taskId}，请求数=$count，实际拉取=0），素材拉取失败",
@@ -14558,7 +14601,14 @@ class RealTraceExecutor(
                     targetPath,
                 )
             }
-            val stats = publishPostResolveGalleryMaterialStats()
+            // PC/USB 已下发文件后，勿立刻按可见=0 当成「PC 拉取失败」；短等 MediaStore 非 pending。
+            var stats = publishPostResolveGalleryMaterialStats()
+            if (stats.resolvedCount <= 0) {
+                stats = publishPostWaitGalleryVisibleAfterFetch(
+                    alias = alias,
+                    minNeed = 1,
+                )
+            }
             val elapsedMs = fetchElapsedMs()
             devOp(
                 alias,
@@ -14568,8 +14618,18 @@ class RealTraceExecutor(
             )
             if (stats.resolvedCount > 0) {
                 PrefsStore.setPublishPostMaterialReady(true)
+                true
+            } else {
+                lastPublishPostEntryFailureReason =
+                    "图库素材不可见（PC 已下发 ${task.files.size} 个文件，MediaStore 可见=0，" +
+                        "多为 IS_PENDING/索引未就绪或 shell 幽灵）"
+                devOp(
+                    alias,
+                    "发作品：${lastPublishPostEntryFailureReason}（已轮询 ${PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS}ms）",
+                    elapsedMs,
+                )
+                false
             }
-            stats.resolvedCount > 0
         } catch (t: Throwable) {
             val companionId = CompanionApi.deviceId(app)
             val hwKey = CompanionApi.hardwareKey(app).orEmpty()
