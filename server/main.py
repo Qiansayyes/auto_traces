@@ -4018,6 +4018,11 @@ class SingleAccountActiveRequest(BaseModel):
     enabled: bool
 
 
+class SingleAccountActiveBatchRequest(BaseModel):
+    device_ids: List[str] = Field(default_factory=list)
+    enabled: bool
+
+
 class AutoSwitchCutSchemeRequest(BaseModel):
     cut_switch_scheme: str = Field(..., max_length=32)
 
@@ -21918,6 +21923,71 @@ def set_single_account_active(
             "session_id": session_id,
             "devices_notified": notified,
             "cancelled_ops": cancelled_ops,
+        },
+    }
+
+
+@app.post("/api/admin/single_account_active/batch")
+def set_single_account_active_batch(
+    payload: SingleAccountActiveBatchRequest,
+    authorization: str | None = Header(default=None),
+):
+    """批量开启/关闭单号活跃（按 device_ids 逐台复用单设备逻辑）。"""
+    err, session = _require_login({"authorization": authorization} if authorization else {})
+    if err:
+        return err
+    allowed = _session_device_ids(session)
+    device_ids = [str(d or "").strip() for d in (payload.device_ids or []) if str(d or "").strip()]
+    # 去重且保持顺序
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for did in device_ids:
+        if did in seen:
+            continue
+        seen.add(did)
+        if did in allowed:
+            ordered.append(did)
+    if not ordered:
+        return {"code": 1, "msg": "未选择有效设备"}
+
+    target_enabled = bool(payload.enabled)
+    success = 0
+    already = 0
+    failed = 0
+    errors: list[dict] = []
+    for did in ordered:
+        resp = set_single_account_active(
+            SingleAccountActiveRequest(device_id=did, enabled=target_enabled),
+            authorization=authorization,
+        )
+        if not isinstance(resp, dict):
+            failed += 1
+            errors.append({"device_id": did, "msg": "未知响应"})
+            continue
+        code = int(resp.get("code") or 0)
+        msg = str(resp.get("msg") or "").strip()
+        if code != 0:
+            failed += 1
+            if len(errors) < 20:
+                errors.append({"device_id": did, "msg": msg or "失败"})
+            continue
+        if ("已处于单号活跃" in msg) or ("未开启单号活跃" in msg):
+            already += 1
+        else:
+            success += 1
+
+    action = "开启" if target_enabled else "关闭"
+    total = len(ordered)
+    return {
+        "code": 0 if failed == 0 or success > 0 or already > 0 else 1,
+        "msg": f"批量{action}单号活跃：成功 {success}，已是目标状态 {already}，失败 {failed}（共 {total} 台）",
+        "data": {
+            "enabled": target_enabled,
+            "success": success,
+            "already": already,
+            "failed": failed,
+            "total": total,
+            "errors": errors,
         },
     }
 

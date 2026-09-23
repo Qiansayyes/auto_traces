@@ -47,6 +47,8 @@ const backupAliasPickSummaryEl = document.getElementById("backupAliasPickSummary
 const backupAliasPickListEl = document.getElementById("backupAliasPickList");
 const backupAliasPickEnableAutoSwitchBtn = document.getElementById("backupAliasPickEnableAutoSwitchBtn");
 const backupAliasPickDisableAutoSwitchBtn = document.getElementById("backupAliasPickDisableAutoSwitchBtn");
+const backupAliasPickEnableSingleActiveBtn = document.getElementById("backupAliasPickEnableSingleActiveBtn");
+const backupAliasPickDisableSingleActiveBtn = document.getElementById("backupAliasPickDisableSingleActiveBtn");
 const backupAliasPickApplySelectionBtn = document.getElementById("backupAliasPickApplySelectionBtn");
 const backupArchiveSelectionHintEl = document.getElementById("backupArchiveSelectionHint");
 const backupArchiveSelectedCountEl = document.getElementById("backupArchiveSelectedCount");
@@ -56,6 +58,7 @@ const backupArchiveSelectedRowIndices = new Set();
 const backupAliasPickSelectedAliases = new Set();
 let backupAliasPickSearchQuery = "";
 let backupAliasPickApplyBusy = false;
+let backupAliasPickSingleBusy = false;
 let backupArchiveXlsxBusy = false;
 const groupMoveModalEl = document.getElementById("groupMoveModal");
 const groupMoveSelectedAliasesEl = document.getElementById("groupMoveSelectedAliases");
@@ -9343,9 +9346,7 @@ if (backupAliasPickListEl) {
       const groupKey = String(target.dataset.group || "").trim();
       const checked = Boolean(target.checked);
       getBackupAliasPickVisiblePairs().forEach((item) => {
-        const autoOn = isAutoSwitchEnabledForDeviceId(item?.device_id);
-        if (groupKey === "on" && !autoOn) return;
-        if (groupKey === "off" && autoOn) return;
+        if (!backupAliasPickItemInGroup(item, groupKey)) return;
         const alias = normalizeAliasValue(item.device_alias);
         if (!alias) return;
         if (checked) backupAliasPickSelectedAliases.add(alias);
@@ -9362,13 +9363,12 @@ if (backupAliasPickListEl) {
     updateBackupAliasPickSummary();
     syncBackupAliasPickSelectAllState();
     // 同步分组标题勾选状态（不整表重绘，避免滚动跳动）
-    ["on", "off"].forEach((groupKey) => {
+    ["single", "on", "off"].forEach((groupKey) => {
       const groupCb = backupAliasPickListEl.querySelector(`.backup-alias-pick-group-select[data-group="${groupKey}"]`);
       if (!(groupCb instanceof HTMLInputElement)) return;
-      const groupPairs = getBackupAliasPickVisiblePairs().filter((item) => {
-        const autoOn = isAutoSwitchEnabledForDeviceId(item?.device_id);
-        return groupKey === "on" ? autoOn : !autoOn;
-      });
+      const groupPairs = getBackupAliasPickVisiblePairs().filter((item) =>
+        backupAliasPickItemInGroup(item, groupKey),
+      );
       const selectedInGroup = groupPairs.filter((item) =>
         backupAliasPickSelectedAliases.has(normalizeAliasValue(item.device_alias)),
       ).length;
@@ -9387,6 +9387,16 @@ if (backupAliasPickEnableAutoSwitchBtn) {
 if (backupAliasPickDisableAutoSwitchBtn) {
   backupAliasPickDisableAutoSwitchBtn.addEventListener("click", () => {
     saveAutoSwitchFromAliasPick(false).catch((e) => setStatus(e?.message || "关闭失败", "error"));
+  });
+}
+if (backupAliasPickEnableSingleActiveBtn) {
+  backupAliasPickEnableSingleActiveBtn.addEventListener("click", () => {
+    saveSingleAccountActiveFromAliasPick(true).catch((e) => setStatus(e?.message || "开启单号活跃失败", "error"));
+  });
+}
+if (backupAliasPickDisableSingleActiveBtn) {
+  backupAliasPickDisableSingleActiveBtn.addEventListener("click", () => {
+    saveSingleAccountActiveFromAliasPick(false).catch((e) => setStatus(e?.message || "关闭单号活跃失败", "error"));
   });
 }
 if (backupAliasPickApplySelectionBtn) {
@@ -13278,6 +13288,17 @@ function getBackupAliasPickVisiblePairs() {
   });
 }
 
+/** 按别名弹窗分组：single / on / off（单号活跃优先于自动切号） */
+function backupAliasPickItemInGroup(item, groupKey) {
+  const did = item?.device_id;
+  const singleOn = isSingleAccountActiveForDeviceId(did);
+  const autoOn = isAutoSwitchEnabledForDeviceId(did);
+  if (groupKey === "single") return singleOn;
+  if (groupKey === "on") return !singleOn && autoOn;
+  if (groupKey === "off") return !singleOn && !autoOn;
+  return false;
+}
+
 function updateBackupAliasPickSummary() {
   if (!backupAliasPickSummaryEl) return;
   const all = buildAliasDevicePairs();
@@ -13286,11 +13307,22 @@ function updateBackupAliasPickSummary() {
   const visible = getBackupAliasPickVisiblePairs();
   let onCount = 0;
   let offCount = 0;
+  let singleCount = 0;
   visible.forEach((item) => {
-    if (isAutoSwitchEnabledForDeviceId(item?.device_id)) onCount += 1;
+    const did = item?.device_id;
+    if (isSingleAccountActiveForDeviceId(did)) {
+      singleCount += 1;
+      return;
+    }
+    if (isAutoSwitchEnabledForDeviceId(did)) onCount += 1;
     else offCount += 1;
   });
-  const parts = [`已选 ${selected}/${total} 个别名设备`, `开 ${onCount}`, `关 ${offCount}`];
+  const parts = [
+    `已选 ${selected}/${total} 个别名设备`,
+    `自动切号开 ${onCount}`,
+    `关 ${offCount}`,
+    `单号活跃 ${singleCount}`,
+  ];
   if (backupAliasPickSearchQuery && visible.length !== total) {
     parts.push(`当前筛选 ${visible.length} 个`);
   }
@@ -13311,10 +13343,18 @@ function renderBackupAliasPickRow(item) {
   const alias = normalizeAliasValue(item.device_alias);
   const deviceId = String(item.device_id || "").trim();
   const checked = alias && backupAliasPickSelectedAliases.has(alias);
+  const singleOn = isSingleAccountActiveForDeviceId(deviceId);
   const autoOn = isAutoSwitchEnabledForDeviceId(deviceId);
-  const statusBadge = autoOn
-    ? '<span class="badge badge--ok">自动切号·开</span>'
-    : '<span class="hint">自动切号·关</span>';
+  let statusBadge;
+  if (singleOn) {
+    const locked = String(getSingleAccountActiveInfo(deviceId)?.username || "").trim();
+    const tip = locked ? `单号活跃中，锁定 @${locked}` : "单号活跃中";
+    statusBadge = `<span class="badge badge--ok" title="${escapeHtml(tip)}">单号活跃·开</span>`;
+  } else if (autoOn) {
+    statusBadge = '<span class="badge badge--ok">自动切号·开</span>';
+  } else {
+    statusBadge = '<span class="hint">自动切号·关</span>';
+  }
   return `<tr>
       <td style="width:40px;text-align:center;">
         <input type="checkbox" class="backup-alias-pick-check" data-alias="${escapeHtml(alias)}"${checked ? " checked" : ""} />
@@ -13359,13 +13399,17 @@ function renderBackupAliasPickList() {
     syncBackupAliasPickSelectAllState();
     return;
   }
+  const singlePairs = [];
   const onPairs = [];
   const offPairs = [];
   pairs.forEach((item) => {
-    if (isAutoSwitchEnabledForDeviceId(item?.device_id)) onPairs.push(item);
+    const did = item?.device_id;
+    if (isSingleAccountActiveForDeviceId(did)) singlePairs.push(item);
+    else if (isAutoSwitchEnabledForDeviceId(did)) onPairs.push(item);
     else offPairs.push(item);
   });
   const sections = [
+    renderBackupAliasPickGroupSection(`单号活跃·开（${singlePairs.length}）`, singlePairs, "single"),
     renderBackupAliasPickGroupSection(`自动切号·开（${onPairs.length}）`, onPairs, "on"),
     renderBackupAliasPickGroupSection(`自动切号·关（${offPairs.length}）`, offPairs, "off"),
   ].filter(Boolean);
@@ -13439,6 +13483,61 @@ async function saveAutoSwitchFromAliasPick(enabled) {
     autoSwitchPickDeviceIds.clear();
   }
   renderBackupAliasPickList();
+}
+
+function setBackupAliasPickSingleBusy(busy) {
+  backupAliasPickSingleBusy = !!busy;
+  const btns = [
+    backupAliasPickEnableSingleActiveBtn,
+    backupAliasPickDisableSingleActiveBtn,
+    backupAliasPickEnableAutoSwitchBtn,
+    backupAliasPickDisableAutoSwitchBtn,
+    backupAliasPickApplySelectionBtn,
+  ];
+  btns.forEach((btn) => {
+    if (btn) btn.disabled = backupAliasPickSingleBusy || backupAliasPickApplyBusy;
+  });
+}
+
+async function saveSingleAccountActiveFromAliasPick(enabled) {
+  if (backupAliasPickSingleBusy) return;
+  const deviceIds = collectBackupAliasPickDeviceIds();
+  if (!deviceIds.length) {
+    setStatus("请至少勾选一个已绑定 device_id 的别名设备", "warning");
+    return;
+  }
+  const action = enabled ? "开启" : "关闭";
+  const detail = enabled
+    ? "开启后将：1) 关闭多号自动切号；2) 按粉丝量锁定最多的账号；3) 立刻切到该号一次，之后只做涨粉/发作品/引流互点。"
+    : "关闭后退出单号活跃，不会自动重开自动切号，需手动再开。";
+  if (!window.confirm(`确认为已选 ${deviceIds.length} 台设备${action}「单号活跃」？\n${detail}`)) return;
+
+  setBackupAliasPickSingleBusy(true);
+  try {
+    setStatus(`正在批量${action}单号活跃（${deviceIds.length} 台）…`, "info");
+    const resp = await request("/api/admin/single_account_active/batch", {
+      method: "POST",
+      body: JSON.stringify({ device_ids: deviceIds, enabled: !!enabled }),
+      timeoutMs: Math.max(60000, deviceIds.length * 3000),
+    });
+    await loadAutoSwitchConfig({ refreshArchive: false });
+    await loadBackupArchiveRecords();
+    await refreshAutoSwitchDailyPlansInBackground();
+    renderBackupAliasPickList();
+    const data = resp?.data || {};
+    const success = Number(data.success || 0);
+    const already = Number(data.already || 0);
+    const failed = Number(data.failed || 0);
+    const parts = [resp?.msg || `批量${action}单号活跃完成`];
+    if (success || already || failed) {
+      parts.push(`成功 ${success}`);
+      if (already) parts.push(`已是目标状态 ${already}`);
+      if (failed) parts.push(`失败 ${failed}`);
+    }
+    setStatus(parts.join("，"), failed > 0 && success === 0 ? "error" : failed > 0 ? "warning" : "success");
+  } finally {
+    setBackupAliasPickSingleBusy(false);
+  }
 }
 
 async function collectBackupArchiveRowIndicesForAliases(aliases) {

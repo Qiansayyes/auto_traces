@@ -166,7 +166,7 @@
         <h3>按别名多选设备</h3>
         <button id="closeBackupAliasPickModalBtn" type="button" class="modal-close" aria-label="关闭">×</button>
       </div>
-      <p class="modal-hint">列出当前账号下全部已绑定别名设备；勾选后可直接执行批量操作，或「应用到列表勾选」后继续使用本页其它按钮（导出已选等）。</p>
+      <p class="modal-hint">列出当前账号下全部已绑定别名设备；勾选后可直接执行批量操作（自动切号 / 单号活跃），或「应用到列表勾选」后继续使用本页其它按钮（导出已选等）。</p>
       <div class="import-preview-toolbar" style="flex-wrap:wrap;gap:10px;">
         <label class="import-preview-select-all">
           <input id="backupAliasPickSelectAll" type="checkbox" />
@@ -180,6 +180,8 @@
         <button id="cancelBackupAliasPickModalBtn" type="button" class="ghost">取消</button>
         <button id="backupAliasPickEnableAutoSwitchBtn" type="button" class="ghost" title="为勾选别名对应设备开启自动切号">开启自动切号</button>
         <button id="backupAliasPickDisableAutoSwitchBtn" type="button" class="ghost" title="关闭勾选别名对应设备的自动切号">关闭自动切号</button>
+        <button id="backupAliasPickEnableSingleActiveBtn" type="button" class="ghost" title="为勾选设备开启单号活跃：锁定粉丝最多账号，关闭多号自动切号">开启单号活跃</button>
+        <button id="backupAliasPickDisableSingleActiveBtn" type="button" class="ghost" title="关闭勾选设备的单号活跃（不会自动重开自动切号）">关闭单号活跃</button>
         <button id="backupAliasPickApplySelectionBtn" type="button" class="primary" title="将勾选别名同步为备份档案列表勾选，以便使用导出等按钮">应用到列表勾选</button>
       </div>
     </div>
@@ -972,7 +974,7 @@
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>
               <button id="backupArchiveSelectAllPageBtn" type="button" class="ghost" title="勾选当前页全部备份记录">全选本页</button>
               <button id="backupArchiveClearSelectionBtn" type="button" class="ghost" title="取消全部勾选">取消选择</button>
-              <button id="backupAliasPickBtn" type="button" class="ghost" title="弹出全部别名设备，多选后可开启/关闭自动切号，或同步到列表勾选">按别名多选设备</button>
+              <button id="backupAliasPickBtn" type="button" class="ghost" title="弹出全部别名设备，多选后可开启/关闭自动切号或单号活跃，或同步到列表勾选">按别名多选设备</button>
               <button id="exportBackupArchiveSelectedXlsxBtn" type="button" class="ghost" title="将表格中已勾选的备份档案导出为 xlsx（一行一条）">导出已选 xlsx</button>
               <button id="exportBackupArchiveXlsxBtn" type="button" class="ghost" title="将全部备份档案导出为 xlsx（一行一条，含关联账号字段）">导出全部 xlsx</button>
               <button id="importBackupArchiveXlsxBtn" type="button" class="ghost" title="从 xlsx 批量导入；库内已有 username 会补全空备份字段，仅跳过文件内重复行">导入 xlsx</button>
@@ -1794,6 +1796,6 @@ Thanks for visiting</textarea>
     </main>
   </div>
 
-  <script src="app.js?v=20260923-alias-delete-busy"></script>
+  <script src="app.js?v=20260924-single-active-batch"></script>
 </body>
 </html>
