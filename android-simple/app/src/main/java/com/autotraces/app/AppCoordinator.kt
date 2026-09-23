@@ -8495,6 +8495,59 @@ object AppCoordinator {
     }
 
     /**
+     * 配置类失败（缺密码/无高亮/缺 username 等）：无限重试无意义。
+     * [snapshot]==null 视为瞬时拉取失败，可重试。
+     * @param needPasswordLogin true：即使 code=0，密码/邮箱/2FA 不全也视为不可恢复。
+     */
+    private fun nonRetryableAssignedAccountFailureReason(
+        snapshot: DeviceAssignedAccountResponse?,
+        needPasswordLogin: Boolean = false,
+    ): String? {
+        if (snapshot == null) return null
+        val msg = snapshot.msg?.trim().orEmpty()
+        if (snapshot.code != 0) {
+            return when {
+                msg.contains("凭证不完整") -> msg.ifBlank { "账号凭证不完整" }
+                msg.contains("缺少 username") -> msg.ifBlank { "账号缺少 username" }
+                msg.contains("未找到该别名下已高亮") -> msg.ifBlank { "未找到已高亮分配账号" }
+                msg.contains("账号分配别名须一致") -> msg.ifBlank { "账号分配别名不一致" }
+                msg.contains("设备未关联") -> msg.ifBlank { "设备未关联管理账号" }
+                msg.contains("无分配账号") || msg.contains("无可用账号") ->
+                    msg.ifBlank { "无可用分配账号" }
+                else -> null
+            }
+        }
+        if (!needPasswordLogin) return null
+        val user = snapshot.username.orEmpty().trim()
+        val password = snapshot.password.orEmpty().trim()
+        val email = snapshot.email.orEmpty().trim()
+        val twoFa = snapshot.two_fa.orEmpty().trim()
+        if (user.isBlank() || password.isBlank()) {
+            return "凭证不完整（username/password）"
+        }
+        if (twoFa.isBlank() && email.isBlank()) {
+            return "凭证不完整（需 email 或 2FA 密钥）"
+        }
+        return null
+    }
+
+    /** 凭证/分配不可恢复：立即中止并暂停，避免 15–30s 死循环占住独占通道。 */
+    private suspend fun abortAutoLoginForNonRetryableCreds(
+        alias: String,
+        reason: String,
+        failReason: String,
+    ): AccountLoginRetryOutcome {
+        val detail = "自动登录中止：账号凭证/分配不可恢复（$failReason；$reason）"
+        LogCenter.op(alias, detail)
+        PrefsStore.saveLocalStatus("paused")
+        updateRuntime(localStatus = "paused", lastMessage = detail)
+        runCatching {
+            syncCloudStatus("paused", CloudStatusSyncKind.ROUTINE)
+        }
+        return AccountLoginRetryOutcome.Aborted
+    }
+
+    /**
      * 云端 is_login=否 时持续重试自动登录。
      * @param expectedUsername 自动切号场景：分配账号 username 变化时停止重试（等待云端切号）。
      */
@@ -8537,7 +8590,40 @@ object AppCoordinator {
             } else {
                 null
             }
-            if (!nextForceRelogin && accountSnapshot != null && accountSnapshot.code == 0 && accountSnapshot.is_login == true) {
+            val fromBundle = PrefsStore.isAutoSwitchAutonomousMode()
+            if (!nextForceRelogin && accountSnapshot != null) {
+                val configFail = nonRetryableAssignedAccountFailureReason(accountSnapshot)
+                // 还原流常见：is_login=是 但 bundle 剥掉密码 → 无需密码登录，按已登录放行
+                val restoreLoggedInWithoutCreds =
+                    accountSnapshot.is_login == true &&
+                        configFail != null &&
+                        configFail.contains("凭证不完整")
+                if (configFail != null && !restoreLoggedInWithoutCreds) {
+                    return abortAutoLoginForNonRetryableCreds(alias, reason, configFail)
+                }
+                // code=0 但未登录且缺密码：点一次 ensureAccountLoggedIn 也会立刻失败，直接中止
+                if (accountSnapshot.code == 0 && accountSnapshot.is_login != true) {
+                    nonRetryableAssignedAccountFailureReason(
+                        accountSnapshot,
+                        needPasswordLogin = true,
+                    )?.let { failReason ->
+                        return abortAutoLoginForNonRetryableCreds(alias, reason, failReason)
+                    }
+                }
+            }
+            // code=0 已登录，或「凭证不完整但 is_login=是」（还原会话，不跑密码登录）
+            // 注意：snapshot==null（瞬时拉取失败）不可当作配置错误中止，应继续重试
+            if (!nextForceRelogin &&
+                accountSnapshot != null &&
+                accountSnapshot.is_login == true &&
+                (
+                    accountSnapshot.code == 0 ||
+                        (
+                            nonRetryableAssignedAccountFailureReason(accountSnapshot)
+                                ?.contains("凭证不完整") == true
+                            )
+                    )
+            ) {
                 maybeRunPendingBasicProfileEditAfterLoginVerified(
                     alias = alias,
                     deviceId = deviceId,
@@ -8551,7 +8637,6 @@ object AppCoordinator {
                 }
                 return AccountLoginRetryOutcome.LoggedIn
             }
-            val fromBundle = PrefsStore.isAutoSwitchAutonomousMode()
             val retryLog = when {
                 nextForceRelogin ->
                     "TikTok 已掉登录，强制重新登录（$reason；is_login 仍可能为是，重登成功后将更新 login_time）"
@@ -8588,6 +8673,17 @@ object AppCoordinator {
                     resumeRunningForCloudTask(alias, deviceId, "自动登录成功（$reason）")
                 }
                 return AccountLoginRetryOutcome.LoggedIn
+            }
+            // 强制重登 / 登录失败后：仅当已解析到账号且确认凭证不可恢复时中止；
+            // snapshot==null 多为瞬时失败，继续按原逻辑退避重试
+            val postFailSnap = resolveAssignedAccount(alias, deviceId, preferredUsername = expected)
+            if (postFailSnap != null) {
+                nonRetryableAssignedAccountFailureReason(
+                    postFailSnap,
+                    needPasswordLogin = true,
+                )?.let { failReason ->
+                    return abortAutoLoginForNonRetryableCreds(alias, reason, failReason)
+                }
             }
             if (!forceRelogin) {
                 nextForceRelogin = false
@@ -8914,7 +9010,13 @@ object AppCoordinator {
         preferredUsername: String? = null,
     ): Boolean {
         val accountResp = resolveAssignedAccount(alias, deviceId, preferredUsername) ?: return false
-        return accountResp.code == 0 && accountResp.is_login == true
+        if (accountResp.code == 0 && accountResp.is_login == true) return true
+        // 还原流：bundle 凭证被剥空但 is_login=是 → 视为已登录，避免误入密码登录死循环
+        if (accountResp.is_login == true) {
+            val fail = nonRetryableAssignedAccountFailureReason(accountResp)
+            if (fail != null && fail.contains("凭证不完整")) return true
+        }
+        return false
     }
 
     /**
