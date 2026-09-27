@@ -1053,6 +1053,24 @@ def init_auth_db():
             )
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN auto_switch_slot_duration_min INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN auto_switch_cycle_order_json TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE client_devices ADD COLUMN auto_switch_cycle_anchor_min INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_owner ON client_devices(owner_username)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_client_devices_group ON client_devices(device_group)")
         conn.commit()
@@ -1809,6 +1827,10 @@ class DeviceInfo:
     paused: bool = False
     auto_start_opt_out: bool = False
     auto_switch_enabled: bool = False
+    # 固定时长自动切号：0=均分全天；>0=每号固定分钟并跨天循环
+    auto_switch_slot_duration_min: int = 0
+    auto_switch_cycle_order_json: str = ""
+    auto_switch_cycle_anchor_min: int = 0
     # 单号活跃：关掉多号自动切号，但复用自治管线（全天单 slot、跳过排班切号）
     single_account_active: bool = False
     single_account_username: str = ""
@@ -2002,12 +2024,15 @@ def _load_client_devices_from_db() -> None:
                    pending_start, paused, auto_start_opt_out, auto_switch_enabled,
                    COALESCE(single_account_active, 0) AS single_account_active,
                    COALESCE(single_account_username, '') AS single_account_username,
-                   COALESCE(single_account_row_index, 0) AS single_account_row_index
+                   COALESCE(single_account_row_index, 0) AS single_account_row_index,
+                   COALESCE(auto_switch_slot_duration_min, 0) AS auto_switch_slot_duration_min,
+                   COALESCE(auto_switch_cycle_order_json, '') AS auto_switch_cycle_order_json,
+                   COALESCE(auto_switch_cycle_anchor_min, 0) AS auto_switch_cycle_anchor_min
             FROM client_devices
             """
         ).fetchall()
     except sqlite3.OperationalError:
-        # 旧库尚未迁移单号活跃列时回退
+        # 旧库尚未迁移单号活跃/固定时长列时回退
         try:
             rows = conn.execute(
                 "SELECT device_id, owner_username, alias, device_group, fingerprint, status, pending_start, paused, auto_start_opt_out, auto_switch_enabled FROM client_devices"
@@ -2038,6 +2063,9 @@ def _load_client_devices_from_db() -> None:
                 single_account_active=bool(int(row["single_account_active"] or 0)) if "single_account_active" in keys else False,
                 single_account_username=str(row["single_account_username"] or "").strip() if "single_account_username" in keys else "",
                 single_account_row_index=int(row["single_account_row_index"] or 0) if "single_account_row_index" in keys else 0,
+                auto_switch_slot_duration_min=int(row["auto_switch_slot_duration_min"] or 0) if "auto_switch_slot_duration_min" in keys else 0,
+                auto_switch_cycle_order_json=str(row["auto_switch_cycle_order_json"] or "") if "auto_switch_cycle_order_json" in keys else "",
+                auto_switch_cycle_anchor_min=int(row["auto_switch_cycle_anchor_min"] or 0) if "auto_switch_cycle_anchor_min" in keys else 0,
             )
             store.fingerprint_to_device[str(row["fingerprint"])] = did
     if rows:
@@ -2058,6 +2086,9 @@ def _device_persist_row_snapshot(dev: DeviceInfo) -> tuple:
         bool(dev.single_account_active),
         str(dev.single_account_username or "").strip(),
         int(dev.single_account_row_index or 0),
+        int(dev.auto_switch_slot_duration_min or 0),
+        str(dev.auto_switch_cycle_order_json or ""),
+        int(dev.auto_switch_cycle_anchor_min or 0),
     )
 
 
@@ -2094,6 +2125,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                 single_account_active,
                 single_account_username,
                 single_account_row_index,
+                auto_switch_slot_duration_min,
+                auto_switch_cycle_order_json,
+                auto_switch_cycle_anchor_min,
             ) = snap
             pending_i = 1 if pending_start else 0
             paused_i = 1 if paused else 0
@@ -2102,6 +2136,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
             single_i = 1 if single_account_active else 0
             single_user = str(single_account_username or "").strip()
             single_ri = int(single_account_row_index or 0)
+            duration_i = max(0, int(auto_switch_slot_duration_min or 0))
+            cycle_json = str(auto_switch_cycle_order_json or "")
+            anchor_i = int(auto_switch_cycle_anchor_min or 0)
             exists = conn.execute("SELECT created_at FROM client_devices WHERE device_id = ?", (did,)).fetchone()
             if exists:
                 conn.execute(
@@ -2109,6 +2146,7 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                     UPDATE client_devices SET owner_username = ?, alias = ?, device_group = ?, fingerprint = ?, status = ?,
                         pending_start = ?, paused = ?, auto_start_opt_out = ?, auto_switch_enabled = ?,
                         single_account_active = ?, single_account_username = ?, single_account_row_index = ?,
+                        auto_switch_slot_duration_min = ?, auto_switch_cycle_order_json = ?, auto_switch_cycle_anchor_min = ?,
                         updated_at = ?
                     WHERE device_id = ?
                     """,
@@ -2125,6 +2163,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                         single_i,
                         single_user,
                         single_ri,
+                        duration_i,
+                        cycle_json,
+                        anchor_i,
                         now,
                         did,
                     ),
@@ -2136,9 +2177,10 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                         device_id, owner_username, alias, device_group, fingerprint, status,
                         pending_start, paused, auto_start_opt_out, auto_switch_enabled,
                         single_account_active, single_account_username, single_account_row_index,
+                        auto_switch_slot_duration_min, auto_switch_cycle_order_json, auto_switch_cycle_anchor_min,
                         created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         did,
@@ -2154,6 +2196,9 @@ def _write_client_devices_batch(device_ids: Iterable[str]) -> int:
                         single_i,
                         single_user,
                         single_ri,
+                        duration_i,
+                        cycle_json,
+                        anchor_i,
                         now,
                         now,
                     ),
@@ -4011,6 +4056,8 @@ class AutoSwitchConfigRequest(BaseModel):
 class AutoSwitchDevicesRequest(BaseModel):
     device_ids: List[str] = Field(default_factory=list)
     enabled: bool
+    # None/省略=不改已有固定时长（新开则均分）；0=强制均分；30～720=固定时长分钟
+    slot_duration_min: int | None = None
 
 
 class SingleAccountActiveRequest(BaseModel):
@@ -5739,6 +5786,342 @@ def _beijing_minute_of_day(dt: datetime | None = None) -> int:
     return cur.hour * 60 + cur.minute
 
 
+def _beijing_epoch_minute(dt: datetime | None = None) -> int:
+    """北京时区墙钟对应的绝对分钟（Unix epoch 秒 // 60），用于跨天固定时长循环。"""
+    cur = _beijing_now() if dt is None else dt.astimezone(BEIJING_TZ)
+    return int(cur.timestamp() // 60)
+
+
+def _normalize_auto_switch_slot_duration_min(raw: object | None) -> int | None:
+    """解析固定时长。
+
+    返回值语义：
+    - None：请求未指定（已开启重同步时保留原配置；新开启则均分）
+    - 0：显式强制均分全天
+    - 30～720：固定时长分钟
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not str(raw).strip():
+        return None
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("固定活跃时长须为整数分钟") from exc
+    if value <= 0:
+        return 0
+    if value < AUTO_SWITCH_FIXED_DURATION_MIN or value > AUTO_SWITCH_FIXED_DURATION_MAX:
+        raise ValueError(
+            f"固定活跃时长须在 {AUTO_SWITCH_FIXED_DURATION_MIN}～{AUTO_SWITCH_FIXED_DURATION_MAX} 分钟之间"
+        )
+    return value
+
+
+def _parse_auto_switch_cycle_order(raw: object | None) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        items = raw
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        items = parsed if isinstance(parsed, list) else []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ri = int(item.get("row_index"))
+        except (TypeError, ValueError):
+            continue
+        username = str(item.get("username") or "").strip()
+        if ri < 0 or not username:
+            continue
+        out.append({"row_index": ri, "username": username})
+    return out
+
+
+def _serialize_auto_switch_cycle_order(order: list[dict[str, Any]]) -> str:
+    cleaned = _parse_auto_switch_cycle_order(order)
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+
+
+def _shuffle_auto_switch_cycle_order(rows: List[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(rows, key=lambda r: int(r.get("row_index") or 0))
+    shuffled = list(ordered)
+    random.shuffle(shuffled)
+    return [
+        {
+            "row_index": int(row.get("row_index") or 0),
+            "username": str(row.get("username") or "").strip(),
+        }
+        for row in shuffled
+        if str(row.get("username") or "").strip()
+    ]
+
+
+def _clear_device_fixed_duration_fields(dev: DeviceInfo) -> None:
+    dev.auto_switch_slot_duration_min = 0
+    dev.auto_switch_cycle_order_json = ""
+    dev.auto_switch_cycle_anchor_min = 0
+
+
+def _apply_fixed_duration_cycle_on_device(
+    dev: DeviceInfo,
+    rows: List[dict[str, Any]],
+    duration_min: int,
+    *,
+    force_reset_anchor: bool = False,
+) -> None:
+    """写入/复用固定时长循环顺序；账号指纹变化则重洗并重置锚点。"""
+    duration = int(duration_min or 0)
+    if duration <= 0 or len(rows) < 2:
+        _clear_device_fixed_duration_fields(dev)
+        return
+    expected_fp = _weekly_plan_rows_fingerprint(rows)
+    existing = _parse_auto_switch_cycle_order(dev.auto_switch_cycle_order_json)
+    existing_fp = _weekly_plan_rows_fingerprint(existing) if existing else ""
+    prev_duration = int(dev.auto_switch_slot_duration_min or 0)
+    if existing and existing_fp == expected_fp and len(existing) == len(rows):
+        order = existing
+        reshuffled = False
+    else:
+        order = _shuffle_auto_switch_cycle_order(rows)
+        reshuffled = True
+    need_new_anchor = (
+        reshuffled
+        or force_reset_anchor
+        or int(dev.auto_switch_cycle_anchor_min or 0) <= 0
+        or prev_duration != duration
+    )
+    dev.auto_switch_slot_duration_min = duration
+    dev.auto_switch_cycle_order_json = _serialize_auto_switch_cycle_order(order)
+    if need_new_anchor:
+        dev.auto_switch_cycle_anchor_min = _beijing_epoch_minute()
+
+
+def _reconcile_fixed_duration_cycles_for_alias(owner_username: str, alias: str, rows: List[dict[str, Any]]) -> int:
+    """参与账号变化时，更新该别名下已开启固定时长设备的循环顺序。"""
+    owner = str(owner_username or "").strip()
+    alias_key = _normalize_alias_key(alias)
+    if not owner or not alias_key:
+        return 0
+    device_ids = _enabled_auto_switch_device_ids_for_owner_alias(owner, alias_key)
+    updated = 0
+    for did in device_ids:
+        if not store.devices.get(did):
+            _hydrate_device_from_db(did)
+        with store.lock:
+            dev = store.devices.get(did)
+            if not dev or not int(dev.auto_switch_slot_duration_min or 0):
+                continue
+            if len(rows) < 2:
+                _clear_device_fixed_duration_fields(dev)
+            else:
+                _apply_fixed_duration_cycle_on_device(
+                    dev, rows, int(dev.auto_switch_slot_duration_min or 0),
+                )
+            updated += 1
+        _persist_client_device_to_db(did, force=True)
+    return updated
+
+
+def _deterministic_fixed_slot_offsets(
+    anchor_min: int,
+    abs_index: int,
+    duration_min: int,
+) -> tuple[int | None, int | None]:
+    """为固定时长槽生成稳定且互斥的发作品/互点偏移（相对槽起点的分钟）。
+
+    - 同一 (anchor, abs_index, duration) 永远得到相同结果，避免每次拉 bundle 重随机。
+    - 互点与发作品至少间隔 AUTO_SWITCH_PUBLISH_MUTUAL_GAP_MIN 分钟；排不下则只保留发作品。
+    """
+    duration = int(duration_min or 0)
+    gap = int(AUTO_SWITCH_PUBLISH_MUTUAL_GAP_MIN)
+    if duration <= 0:
+        return None, None
+    window_start = 10
+    window_end = duration - 10
+    if window_end <= window_start:
+        return None, None
+    seed = (
+        (int(anchor_min) & 0xFFFFFFFF) * 1_000_003
+        ^ (int(abs_index) & 0xFFFFFFFF) * 0x9E3779B9
+        ^ (duration * 9973)
+        ^ (gap * 131)
+    ) & 0xFFFFFFFF
+    rng = random.Random(seed)
+    # 优先把发作品排在前段，给互点留出 gap；装不下则只发作品。
+    max_pub_for_mutual_after = window_end - gap
+    if max_pub_for_mutual_after >= window_start:
+        pub_offset = rng.randint(window_start, max_pub_for_mutual_after)
+        mutual_offset = rng.randint(pub_offset + gap, window_end)
+    else:
+        pub_offset = rng.randint(window_start, window_end)
+        mutual_offset = None
+        # 尝试互点在发作品之前且间隔 >= gap
+        alt_end = pub_offset - gap
+        if alt_end >= window_start:
+            mutual_offset = rng.randint(window_start, alt_end)
+    if mutual_offset is not None and abs(int(mutual_offset) - int(pub_offset)) < gap:
+        mutual_offset = None
+    return pub_offset, mutual_offset
+
+
+def _resolve_fixed_duration_slot_at_epoch(
+    cycle_order: list[dict[str, Any]],
+    duration_min: int,
+    anchor_min: int,
+    epoch_min: int,
+) -> dict[str, Any] | None:
+    n = len(cycle_order)
+    duration = int(duration_min or 0)
+    anchor = int(anchor_min or 0)
+    if n < 2 or duration <= 0 or anchor <= 0:
+        return None
+    epoch = int(epoch_min)
+    if epoch < anchor:
+        epoch = anchor
+    elapsed = epoch - anchor
+    abs_index = elapsed // duration
+    order_index = int(abs_index % n)
+    slot_start = anchor + abs_index * duration
+    slot_end = slot_start + duration
+    account = cycle_order[order_index]
+    start_dt = datetime.fromtimestamp(slot_start * 60, tz=BEIJING_TZ)
+    return {
+        "slot_index": int(abs_index),
+        "order_index": order_index,
+        "start_epoch_min": slot_start,
+        "end_epoch_min": slot_end,
+        "start_min": start_dt.hour * 60 + start_dt.minute,
+        "end_min": start_dt.hour * 60 + start_dt.minute + duration,
+        "schedule_date": start_dt.strftime("%Y-%m-%d"),
+        "row_index": int(account.get("row_index") or 0),
+        "username": str(account.get("username") or "").strip(),
+    }
+
+
+def _materialize_fixed_duration_slots(
+    cycle_order: list[dict[str, Any]],
+    duration_min: int,
+    anchor_min: int,
+    *,
+    from_epoch: int | None = None,
+    horizon_min: int | None = None,
+    seeded_offsets: dict[int, tuple[int | None, int | None]] | None = None,
+) -> list[dict[str, Any]]:
+    """物化一段绝对时间窗内的固定时长槽（含跨午夜）。"""
+    n = len(cycle_order)
+    duration = int(duration_min or 0)
+    anchor = int(anchor_min or 0)
+    if n < 2 or duration <= 0 or anchor <= 0:
+        return []
+    now_epoch = _beijing_epoch_minute()
+    start_epoch = int(from_epoch if from_epoch is not None else max(anchor, now_epoch - duration))
+    span = int(horizon_min if horizon_min is not None else duration * max(n * 3, 24))
+    end_epoch = start_epoch + max(span, duration * 2)
+    if start_epoch < anchor:
+        start_epoch = anchor
+    first_abs = (start_epoch - anchor) // duration
+    slots: list[dict[str, Any]] = []
+    abs_index = int(first_abs)
+    offset_seed = seeded_offsets or {}
+    while True:
+        slot_start = anchor + abs_index * duration
+        if slot_start >= end_epoch:
+            break
+        slot_end = slot_start + duration
+        if slot_end <= start_epoch:
+            abs_index += 1
+            continue
+        order_index = int(abs_index % n)
+        account = cycle_order[order_index]
+        start_dt = datetime.fromtimestamp(slot_start * 60, tz=BEIJING_TZ)
+        if abs_index in offset_seed:
+            pub_offset, mutual_offset = offset_seed[abs_index]
+        else:
+            pub_offset, mutual_offset = _deterministic_fixed_slot_offsets(anchor, abs_index, duration)
+        pub_epoch = (slot_start + int(pub_offset)) if pub_offset is not None else None
+        mutual_epoch = (slot_start + int(mutual_offset)) if mutual_offset is not None else None
+        # 同槽内两触发点必须互斥；确定性生成已保证，这里再兜底一次。
+        if (
+            pub_epoch is not None
+            and mutual_epoch is not None
+            and int(pub_epoch) == int(mutual_epoch)
+        ):
+            mutual_epoch = None
+            mutual_offset = None
+        pub_minute_of_day = None
+        if pub_epoch is not None:
+            pdt = datetime.fromtimestamp(pub_epoch * 60, tz=BEIJING_TZ)
+            pub_minute_of_day = pdt.hour * 60 + pdt.minute
+        mutual_minute_of_day = None
+        if mutual_epoch is not None:
+            mdt = datetime.fromtimestamp(mutual_epoch * 60, tz=BEIJING_TZ)
+            mutual_minute_of_day = mdt.hour * 60 + mdt.minute
+        slots.append(
+            {
+                "slot_index": int(abs_index),
+                "order_index": order_index,
+                "start_epoch_min": slot_start,
+                "end_epoch_min": slot_end,
+                "start_min": start_dt.hour * 60 + start_dt.minute,
+                "end_min": start_dt.hour * 60 + start_dt.minute + duration,
+                "schedule_date": start_dt.strftime("%Y-%m-%d"),
+                "row_index": int(account.get("row_index") or 0),
+                "username": str(account.get("username") or "").strip(),
+                # 绝对北京分钟（与均分模式字段语义一致，便于展示）；跨午夜调度以 epoch 为准。
+                "auto_publish_minute": pub_minute_of_day,
+                "auto_mutual_minute": mutual_minute_of_day,
+                "auto_publish_offset_min": pub_offset,
+                "auto_mutual_offset_min": mutual_offset,
+                "auto_publish_epoch_min": pub_epoch,
+                "auto_mutual_epoch_min": mutual_epoch,
+            }
+        )
+        abs_index += 1
+        if abs_index - first_abs > 500:
+            break
+    return slots
+
+
+def _device_fixed_duration_bundle_fields(device_id: str) -> dict[str, Any]:
+    did = str(device_id or "").strip()
+    with store.lock:
+        dev = store.devices.get(did)
+        if not dev:
+            return {
+                "plan_mode": AUTO_SWITCH_PLAN_MODE_EQUAL,
+                "slot_duration_min": 0,
+                "cycle_order": [],
+                "cycle_anchor_min": 0,
+                "fixed_slots": [],
+            }
+        duration = int(dev.auto_switch_slot_duration_min or 0)
+        order = _parse_auto_switch_cycle_order(dev.auto_switch_cycle_order_json)
+        anchor = int(dev.auto_switch_cycle_anchor_min or 0)
+    if duration <= 0 or len(order) < 2 or anchor <= 0:
+        return {
+            "plan_mode": AUTO_SWITCH_PLAN_MODE_EQUAL,
+            "slot_duration_min": 0,
+            "cycle_order": [],
+            "cycle_anchor_min": 0,
+            "fixed_slots": [],
+        }
+    fixed_slots = _materialize_fixed_duration_slots(order, duration, anchor)
+    return {
+        "plan_mode": AUTO_SWITCH_PLAN_MODE_FIXED,
+        "slot_duration_min": duration,
+        "cycle_order": order,
+        "cycle_anchor_min": anchor,
+        "fixed_slots": fixed_slots,
+    }
+
+
 def _parse_beijing_date(date_str: str) -> datetime:
     text = str(date_str or "").strip()
     return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=BEIJING_TZ)
@@ -5823,6 +6206,12 @@ AUTO_SWITCH_EXCLUDE_REASON_MAIL_CODE_UNAVAILABLE = "mail_code_unavailable"
 AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED = "cred_blocked"
 AUTO_SWITCH_EXCLUDE_REASON_FOLLOWER_CAP = "follower_cap"
 AUTO_SWITCH_MAX_ACTIVE_ACCOUNTS = 5
+AUTO_SWITCH_FIXED_DURATION_MIN = 30
+AUTO_SWITCH_FIXED_DURATION_MAX = 720
+# 同一时段内发作品与引流互点的最小间隔（分钟）
+AUTO_SWITCH_PUBLISH_MUTUAL_GAP_MIN = 30
+AUTO_SWITCH_PLAN_MODE_EQUAL = "equal_day"
+AUTO_SWITCH_PLAN_MODE_FIXED = "fixed_duration"
 AUTO_SWITCH_MAIL_CODE_EXCLUDE_REASONS = frozenset(
     {
         AUTO_SWITCH_EXCLUDE_REASON_MAIL_TOKEN_INVALID,
@@ -6617,11 +7006,13 @@ def _refresh_auto_switch_plans_for_alias(owner_username: str, alias: str) -> dic
     schedule_date = _beijing_date_str()
     _ensure_auto_switch_weekly_plan(owner, alias_key, rows, schedule_date)
     _ensure_auto_switch_daily_plan(owner, alias_key, rows, schedule_date)
+    fixed_updated = _reconcile_fixed_duration_cycles_for_alias(owner, alias_key, rows)
     return {
         "bucket_size": len(rows),
         "plan_regenerated": True,
         "follower_cap_reconcile_updated": int(follower_cap.get("updated_rows") or 0),
         "mail_code_reconcile_updated": int(reconcile.get("updated_rows") or 0),
+        "fixed_duration_devices_updated": int(fixed_updated),
     }
 
 
@@ -6842,13 +7233,26 @@ def _ensure_auto_publish_minutes_in_plan(plan: dict[str, Any]) -> bool:
 
 
 def _random_auto_mutual_minute(start_min: int, end_min: int, publish_min: int | None) -> int | None:
-    """在发作品点之后（或时段开始+10 分钟）至切号前 10 分钟内随机取一分钟触发引流互点。"""
+    """在发作品点之后（或时段开始+10 分钟）至切号前 10 分钟内随机取一分钟触发引流互点。
+
+    与发作品至少间隔 AUTO_SWITCH_PUBLISH_MUTUAL_GAP_MIN 分钟：优先排在发作品之后；
+    排不下则尝试之前；仍冲突则放弃互点。
+    """
+    gap = int(AUTO_SWITCH_PUBLISH_MUTUAL_GAP_MIN)
     base = int(start_min) + 10
-    window_start = (int(publish_min) + 5) if publish_min is not None else base
     window_end = int(end_min) - 10
-    if window_end <= window_start:
+    if window_end <= base:
         return None
-    return random.randint(window_start, window_end)
+    pub = int(publish_min) if publish_min is not None else None
+    if pub is not None:
+        after_start = max(base, pub + gap)
+        if after_start <= window_end:
+            return random.randint(after_start, window_end)
+        before_end = min(window_end, pub - gap)
+        if before_end >= base:
+            return random.randint(base, before_end)
+        return None
+    return random.randint(base, window_end)
 
 
 def _ensure_auto_mutual_minutes_in_plan(plan: dict[str, Any]) -> bool:
@@ -10840,6 +11244,52 @@ async def api_health():
     return {"code": 0, "msg": "ok", "ts": now_text()}
 
 
+# 与 android-client/app/build.gradle.kts defaultConfig 保持一致；VPS 无源码时用此兜底。
+# 发版改 APK versionName/versionCode 时请同步改这里（本地有 gradle 时会优先解析覆盖）。
+_APK_VERSION_FALLBACK = {
+    "packageName": "com.autotraces.app",
+    "versionCode": 5,
+    "versionName": "1.0.5-gallery-visible",
+}
+
+
+def _resolve_client_apk_version() -> dict:
+    """返回当前 android-client APK 版本，供 video_ded 等外服查询。"""
+    out = dict(_APK_VERSION_FALLBACK)
+    gradle = Path(__file__).resolve().parent.parent / "android-client" / "app" / "build.gradle.kts"
+    try:
+        text = gradle.read_text(encoding="utf-8")
+    except OSError:
+        out["source"] = "fallback"
+        return out
+    m_code = re.search(r"versionCode\s*=\s*(\d+)", text)
+    m_name = re.search(r'versionName\s*=\s*"([^"]+)"', text)
+    m_pkg = re.search(r'applicationId\s*=\s*"([^"]+)"', text)
+    if m_code:
+        out["versionCode"] = int(m_code.group(1))
+    if m_name:
+        out["versionName"] = m_name.group(1)
+    if m_pkg:
+        out["packageName"] = m_pkg.group(1)
+    out["source"] = "gradle" if (m_code or m_name) else "fallback"
+    return out
+
+
+@app.get("/api/apk/version")
+async def api_apk_version():
+    """公开：返回 android-client APK 版本（video_ded 装包/比对用，无需登录）。"""
+    info = _resolve_client_apk_version()
+    return {
+        "code": 0,
+        "msg": "ok",
+        "packageName": info["packageName"],
+        "versionCode": info["versionCode"],
+        "versionName": info["versionName"],
+        "source": info.get("source"),
+        "ts": now_text(),
+    }
+
+
 @app.get("/api/auth/me")
 def auth_me(authorization: str | None = Header(default=None)):
     session = _current_session({"authorization": authorization} if authorization else {})
@@ -10859,7 +11309,10 @@ def _hydrate_device_from_db(device_id: str) -> None:
                        pending_start, paused, auto_start_opt_out, auto_switch_enabled,
                        COALESCE(single_account_active, 0) AS single_account_active,
                        COALESCE(single_account_username, '') AS single_account_username,
-                       COALESCE(single_account_row_index, 0) AS single_account_row_index
+                       COALESCE(single_account_row_index, 0) AS single_account_row_index,
+                       COALESCE(auto_switch_slot_duration_min, 0) AS auto_switch_slot_duration_min,
+                       COALESCE(auto_switch_cycle_order_json, '') AS auto_switch_cycle_order_json,
+                       COALESCE(auto_switch_cycle_anchor_min, 0) AS auto_switch_cycle_anchor_min
                 FROM client_devices WHERE device_id = ?
                 """,
                 (device_id,),
@@ -10891,6 +11344,9 @@ def _hydrate_device_from_db(device_id: str) -> None:
             single_account_active=bool(int(row["single_account_active"] or 0)) if "single_account_active" in keys else False,
             single_account_username=str(row["single_account_username"] or "").strip() if "single_account_username" in keys else "",
             single_account_row_index=int(row["single_account_row_index"] or 0) if "single_account_row_index" in keys else 0,
+            auto_switch_slot_duration_min=int(row["auto_switch_slot_duration_min"] or 0) if "auto_switch_slot_duration_min" in keys else 0,
+            auto_switch_cycle_order_json=str(row["auto_switch_cycle_order_json"] or "") if "auto_switch_cycle_order_json" in keys else "",
+            auto_switch_cycle_anchor_min=int(row["auto_switch_cycle_anchor_min"] or 0) if "auto_switch_cycle_anchor_min" in keys else 0,
         )
         store.fingerprint_to_device[str(row["fingerprint"])] = device_id
 
@@ -21250,10 +21706,45 @@ def _build_auto_switch_bundle_for_device(
         slot_highlight_ri = _resolve_slot_highlight_row_index(
             owner, alias_key, schedule_date, minute_of_day, rows,
         )
+        fixed_fields = _device_fixed_duration_bundle_fields(str(device_id or "").strip())
+        if fixed_fields.get("plan_mode") == AUTO_SWITCH_PLAN_MODE_FIXED:
+            current_fixed = _resolve_fixed_duration_slot_at_epoch(
+                list(fixed_fields.get("cycle_order") or []),
+                int(fixed_fields.get("slot_duration_min") or 0),
+                int(fixed_fields.get("cycle_anchor_min") or 0),
+                _beijing_epoch_minute(),
+            )
+            if current_fixed:
+                try:
+                    slot_highlight_ri = int(current_fixed.get("row_index"))
+                except (TypeError, ValueError):
+                    pass
+            plan = {
+                "plan_mode": AUTO_SWITCH_PLAN_MODE_FIXED,
+                "slot_minutes": int(fixed_fields.get("slot_duration_min") or 0),
+                "account_count": len(fixed_fields.get("cycle_order") or []),
+                "slots": list(fixed_fields.get("fixed_slots") or []),
+            }
+        else:
+            fixed_fields = {
+                "plan_mode": AUTO_SWITCH_PLAN_MODE_EQUAL,
+                "slot_duration_min": 0,
+                "cycle_order": [],
+                "cycle_anchor_min": 0,
+                "fixed_slots": [],
+            }
     runtime = _normalize_user_runtime_state(_load_user_runtime_state(owner))
     mode = str(runtime.get("run_mode") or "growth")
     if mode not in RUN_MODES:
         mode = "growth"
+    if single_active:
+        fixed_fields = {
+            "plan_mode": AUTO_SWITCH_PLAN_MODE_EQUAL,
+            "slot_duration_min": 0,
+            "cycle_order": [],
+            "cycle_anchor_min": 0,
+            "fixed_slots": [],
+        }
     accounts: list[dict[str, Any]] = []
     conn = _get_db()
     try:
@@ -21323,6 +21814,11 @@ def _build_auto_switch_bundle_for_device(
         "device_id": str(device_id or "").strip(),
         "pc_service_url": pc_service_url,
         "cut_switch_scheme": cut_switch_scheme,
+        "plan_mode": str(fixed_fields.get("plan_mode") or AUTO_SWITCH_PLAN_MODE_EQUAL),
+        "slot_duration_min": int(fixed_fields.get("slot_duration_min") or 0),
+        "cycle_order": list(fixed_fields.get("cycle_order") or []),
+        "cycle_anchor_min": int(fixed_fields.get("cycle_anchor_min") or 0),
+        "fixed_slots": list(fixed_fields.get("fixed_slots") or []),
         "run_config": {
             "run_mode": mode,
             "active_template": str(active_template or ""),
@@ -21501,6 +21997,13 @@ def get_auto_switch_config(authorization: str | None = Header(default=None)):
                         "single_account_active": bool(dev.single_account_active),
                         "single_account_username": str(dev.single_account_username or "").strip(),
                         "single_account_row_index": int(dev.single_account_row_index or 0),
+                        "slot_duration_min": int(dev.auto_switch_slot_duration_min or 0) or None,
+                        "plan_mode": (
+                            AUTO_SWITCH_PLAN_MODE_FIXED
+                            if int(dev.auto_switch_slot_duration_min or 0) > 0
+                            else AUTO_SWITCH_PLAN_MODE_EQUAL
+                        ),
+                        "cycle_anchor_min": int(dev.auto_switch_cycle_anchor_min or 0) or None,
                     }
                 )
     except StoreLockBusy:
@@ -21574,6 +22077,10 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
     device_ids = [d for d in device_ids if d in allowed]
     if not device_ids:
         return {"code": 1, "msg": "未选择有效设备"}
+    try:
+        slot_duration_min = _normalize_auto_switch_slot_duration_min(payload.slot_duration_min)
+    except ValueError as exc:
+        return {"code": 1, "msg": str(exc)}
     target_enabled = bool(payload.enabled)
     session_id = _new_auto_switch_session_id(entering=target_enabled)
     bundle_revision = 0
@@ -21590,6 +22097,7 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
     notified = 0
     resynced = 0
     cancelled_ops = 0
+    alias_rows_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     # 开启前先按粉丝上限裁剪各设备别名桶，再下发 enter
     if target_enabled:
         refreshed_alias_keys: set[tuple[str, str]] = set()
@@ -21606,13 +22114,18 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
             if not owner_key or not alias_key or refresh_key in refreshed_alias_keys:
                 continue
             refreshed_alias_keys.add(refresh_key)
-            _refresh_auto_switch_plans_for_alias(owner_key, alias_key)
+            plan_info = _refresh_auto_switch_plans_for_alias(owner_key, alias_key)
+            rows = _list_device_editor_buckets(owner_key).get(alias_key, [])
+            alias_rows_cache[refresh_key] = rows
+            # 账号不足按设备跳过，不因某一别名拖垮整批开启。
 
+    skipped_fixed_short: list[str] = []
     for did in device_ids:
         turning_on = False
         turning_off = False
         resync_bundle = False
         owner = ""
+        alias_key = ""
         if not store.devices.get(did):
             _hydrate_device_from_db(did)
         with store.lock:
@@ -21620,12 +22133,40 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
             if not dev:
                 continue
             owner = str(dev.owner_username or "").strip()
+            alias_key = _normalize_alias_key(dev.alias)
             was_enabled = bool(dev.auto_switch_enabled)
             # 开启多号自动切号时退出单号活跃（两模式互斥）
             if target_enabled and bool(dev.single_account_active):
                 dev.single_account_active = False
                 dev.single_account_username = ""
                 dev.single_account_row_index = 0
+        rows_for_device: list[dict[str, Any]] = []
+        if target_enabled:
+            rows_for_device = alias_rows_cache.get((owner, alias_key)) or []
+            if not rows_for_device and owner and alias_key:
+                rows_for_device = _list_device_editor_buckets(owner).get(alias_key, [])
+                alias_rows_cache[(owner, alias_key)] = rows_for_device
+            if slot_duration_min is not None and int(slot_duration_min) > 0 and len(rows_for_device) < 2:
+                skipped_fixed_short.append(did)
+                continue
+        with store.lock:
+            dev = store.devices.get(did)
+            if not dev:
+                continue
+            was_enabled = bool(dev.auto_switch_enabled)
+            if target_enabled:
+                if slot_duration_min is not None and int(slot_duration_min) > 0:
+                    _apply_fixed_duration_cycle_on_device(dev, rows_for_device, int(slot_duration_min))
+                elif slot_duration_min == 0:
+                    # 显式 0：强制改回均分
+                    _clear_device_fixed_duration_fields(dev)
+                elif not was_enabled:
+                    # 新开启且未传时长：均分全天
+                    _clear_device_fixed_duration_fields(dev)
+                # else: 已开启重同步且未传时长 → 保留原固定/均分配置，避免误清
+            else:
+                _clear_device_fixed_duration_fields(dev)
+            was_enabled = bool(dev.auto_switch_enabled)
             dev.auto_switch_enabled = bool(target_enabled)
             if target_enabled and not was_enabled:
                 turning_on = True
@@ -21651,7 +22192,12 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
                 )
             if _enqueue_device_mode_event(did, owner, "auto_switch_enter", session_id, bundle_revision=bundle_revision):
                 notified += 1
-                _append_device_log(did, f"[{now_text()}] 自动切号 | 已开启自治 session={session_id}")
+                duration_note = (
+                    f" 固定时长={slot_duration_min}分钟"
+                    if slot_duration_min is not None and int(slot_duration_min) > 0
+                    else (" 强制均分全天" if slot_duration_min == 0 else " 均分全天")
+                )
+                _append_device_log(did, f"[{now_text()}] 自动切号 | 已开启自治 session={session_id}{duration_note}")
                 with store.lock:
                     store.auto_switch_align_on_next_tick = True
         elif resync_bundle:
@@ -21697,14 +22243,44 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
         _auto_switch_log(
             f"已为 {changed} 台设备开启自动切号、{resynced} 台资料重同步 "
             f"session={session_id} revision={bundle_revision} notified={notified}"
+            + (
+                f" fixed_duration={slot_duration_min}"
+                if slot_duration_min is not None and int(slot_duration_min) > 0
+                else (" force_equal_day" if slot_duration_min == 0 else " equal_day_or_keep")
+            )
+            + (f" skipped_short={len(skipped_fixed_short)}" if skipped_fixed_short else "")
         )
     else:
         _auto_switch_log(
             f"已为 {changed} 台设备关闭自动切号 session={session_id} cancelled_ops={cancelled_ops} notified={notified}"
         )
+    # 回传实际设备侧固定时长状态（留空重同步时勿误报均分）
+    result_fixed_count = 0
+    result_slot_min = 0
+    if target_enabled:
+        for did in device_ids:
+            with store.lock:
+                dev = store.devices.get(did)
+                if not dev or not bool(dev.auto_switch_enabled):
+                    continue
+                dmin = int(dev.auto_switch_slot_duration_min or 0)
+                if dmin > 0:
+                    result_fixed_count += 1
+                    if result_slot_min <= 0:
+                        result_slot_min = dmin
+    if target_enabled and slot_duration_min is not None and int(slot_duration_min) > 0:
+        if changed == 0 and resynced == 0 and skipped_fixed_short and len(skipped_fixed_short) == len(device_ids):
+            return {
+                "code": 1,
+                "msg": "所选设备可参与账号均不足 2 个，无法开启固定时长自动切号",
+                "data": {"skipped_device_ids": skipped_fixed_short},
+            }
+    msg = "自动切号设备配置已更新"
+    if skipped_fixed_short:
+        msg += f"（{len(skipped_fixed_short)} 台因可参与账号不足 2 个已跳过）"
     return {
         "code": 0,
-        "msg": "自动切号设备配置已更新",
+        "msg": msg,
         "data": {
             "enabled": target_enabled,
             "session_id": session_id,
@@ -21713,6 +22289,14 @@ def set_auto_switch_devices(payload: AutoSwitchDevicesRequest, authorization: st
             "devices_notified": notified,
             "devices_resynced": resynced,
             "cancelled_ops": cancelled_ops,
+            "skipped_fixed_short": skipped_fixed_short,
+            "slot_duration_min": result_slot_min or None,
+            "plan_mode": (
+                AUTO_SWITCH_PLAN_MODE_FIXED
+                if target_enabled and result_fixed_count > 0
+                else AUTO_SWITCH_PLAN_MODE_EQUAL
+            ),
+            "fixed_duration_device_count": result_fixed_count,
         },
     }
 

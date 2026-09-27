@@ -171,6 +171,9 @@ private fun beijingDateStr(cal: Calendar): String {
 private fun beijingMinuteOfDay(cal: Calendar): Int =
     cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
 
+fun beijingEpochMinute(cal: Calendar = Calendar.getInstance(beijingTz)): Long =
+    cal.timeInMillis / 60_000L
+
 /** 从周计划 bundle 解析指定日期的 daily_plan（跨天自治用）。 */
 fun AutoSwitchBundle.dailyPlanForDate(date: String): AutoSwitchDailyPlan? {
     val key = date.trim()
@@ -209,10 +212,77 @@ fun AutoSwitchBundle.findAccount(username: String): AutoSwitchAccount? {
     }
 }
 
+fun AutoSwitchBundle.fixedPlanSlots(): List<AutoSwitchPlanSlot> {
+    val fromFixed = fixed_slots.orEmpty().filter { (it.start_epoch_min ?: 0L) > 0L }
+    if (fromFixed.isNotEmpty()) return fromFixed
+    if (!isFixedDurationPlan()) return emptyList()
+    return daily_plan?.slots.orEmpty().filter { (it.start_epoch_min ?: 0L) > 0L }
+}
+
+fun AutoSwitchBundle.resolveFixedDurationSlotAtEpoch(epochMin: Long = beijingEpochMinute()): AutoSwitchPlanSlot? {
+    if (!isFixedDurationPlan()) return null
+    val materialized = fixedPlanSlots()
+        .firstOrNull { slot ->
+            val start = slot.start_epoch_min ?: return@firstOrNull false
+            val end = slot.end_epoch_min ?: return@firstOrNull false
+            epochMin >= start && epochMin < end
+        }
+    if (materialized != null) return materialized
+
+    val order = cycle_order.orEmpty()
+    val duration = (slot_duration_min ?: 0).toLong()
+    val anchor = cycle_anchor_min ?: 0L
+    val n = order.size
+    if (n < 2 || duration <= 0L || anchor <= 0L) return null
+    var epoch = epochMin
+    if (epoch < anchor) epoch = anchor
+    val elapsed = epoch - anchor
+    val absIndex = elapsed / duration
+    val orderIndex = (absIndex % n).toInt()
+    val slotStart = anchor + absIndex * duration
+    val slotEnd = slotStart + duration
+    val account = order[orderIndex]
+    val startCal = Calendar.getInstance(beijingTz).apply { timeInMillis = slotStart * 60_000L }
+    val startMin = startCal.get(Calendar.HOUR_OF_DAY) * 60 + startCal.get(Calendar.MINUTE)
+    return AutoSwitchPlanSlot(
+        slot_index = absIndex.toInt(),
+        order_index = orderIndex,
+        start_min = startMin,
+        end_min = startMin + duration.toInt(),
+        start_epoch_min = slotStart,
+        end_epoch_min = slotEnd,
+        schedule_date = beijingDateStr(startCal),
+        row_index = account.row_index,
+        username = account.username,
+    )
+}
+
+fun AutoSwitchBundle.findPlanSlotByIndex(slotIndex: Int, scheduleDate: String? = null): AutoSwitchPlanSlot? {
+    if (isFixedDurationPlan()) {
+        fixedPlanSlots().firstOrNull { (it.slot_index ?: -1) == slotIndex }?.let { return it }
+        resolveFixedDurationSlotAtEpoch()?.takeIf { (it.slot_index ?: -1) == slotIndex }?.let { return it }
+    }
+    val date = scheduleDate?.trim().orEmpty()
+    if (date.isNotEmpty()) {
+        dailyPlanForDate(date)?.slots.orEmpty()
+            .firstOrNull { (it.slot_index ?: -1) == slotIndex }
+            ?.let { return it }
+    }
+    return daily_plan?.slots.orEmpty().firstOrNull { (it.slot_index ?: -1) == slotIndex }
+}
+
 fun AutoSwitchBundle.resolveCurrentSlotTargetAccount(
     scheduleDate: String,
     minuteOfDay: Int,
 ): AutoSwitchAccount? {
+    if (isFixedDurationPlan()) {
+        val fixed = resolveFixedDurationSlotAtEpoch() ?: return null
+        val targetRi = fixed.row_index ?: -1
+        accounts.orEmpty().firstOrNull { (it.row_index ?: -1) == targetRi }?.let { return it }
+        val user = fixed.username?.trim().orEmpty()
+        if (user.isNotEmpty()) return findAccount(user)
+        return null
+    }
     val date = scheduleDate.trim()
     if (date.isEmpty() || !isDateInWeekRange(date)) return null
     val plan = dailyPlanForDate(date) ?: return null
@@ -327,6 +397,16 @@ fun AutoSwitchBundle.scheduleAndAccountsFingerprint(): String {
         }
         .sorted()
         .joinToString("|")
+    if (isFixedDurationPlan()) {
+        val cyclePart = cycle_order.orEmpty()
+            .mapNotNull { acc ->
+                val ri = acc.row_index ?: return@mapNotNull null
+                val user = acc.username?.trim().orEmpty().lowercase()
+                "$ri:$user"
+            }
+            .joinToString(",")
+        return "acc[$accountPart]|fixed[d=${slot_duration_min ?: 0};a=${cycle_anchor_min ?: 0};o=$cyclePart]"
+    }
     val planPart = weekly_plan?.day_plans.orEmpty()
         .mapNotNull { dp ->
             val date = dp.schedule_date?.trim().orEmpty()

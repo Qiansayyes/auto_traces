@@ -148,6 +148,8 @@ object PrefsStore {
     private const val KEY_HARD_STOP_REQUESTED = "hard_stop_requested"
     /** 最近一次请求硬停的时间；用于忽略 opt_out 同步前的 check_start 竞态。 */
     private const val KEY_HARD_STOP_AT_MS = "hard_stop_at_ms"
+    /** 改资料占用看门狗：强制中止 OCR/外轮（不写入用户硬停，避免设备停在 paused）。 */
+    private const val KEY_PROFILE_EDIT_TIMEOUT_ABORT = "profile_edit_timeout_abort"
     /** 后台 WorkerService 是否应该被 watchdog/自恢复持续保活。 */
     private const val KEY_WORKER_SERVICE_SHOULD_RUN = "worker_service_should_run"
     /** 最近一次请求拉起 WorkerService 的时间（用于节流与幂等）。 */
@@ -160,6 +162,8 @@ object PrefsStore {
     private const val KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP = "transient_paused_for_destructive_op"
     /** 自治切号/发作品等独占 OP 已抢占 TikTok：涨粉应协作退出且不得再拉起 TikTok。 */
     private const val KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT = "auto_switch_exclusive_preempt"
+    /** 独占抢占标志置 true 的墙钟时间；无真实独占超时时强制清除。 */
+    private const val KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT_AT_MS = "auto_switch_exclusive_preempt_at_ms"
     /**
      * 登录保障未通过后的防抖门闩：阻止涨粉恢复 + 发作品入队前每分钟 OCR 刷屏。
      * [KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE] 为真时登录恢复协程持续重试，hold 到期仅续期防抖、不停止登录。
@@ -208,6 +212,8 @@ object PrefsStore {
     private const val KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT = "publish_post_last_fetched_usable_count"
     /** 发作品素材已拉取并就绪；进程被杀后可凭此跳过清库/重拉并续发。 */
     private const val KEY_PUBLISH_POST_MATERIAL_READY = "publish_post_material_ready"
+    /** 发作品占用起点（手动/无 plan 路径）；与 ActivePublishPlan.started_at_ms 互补。 */
+    private const val KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS = "publish_post_occupy_started_at_ms"
     /** 发作品保障重登成功后跳过一次冷启 force-stop 与登录保障（一次性消费）。 */
     private const val KEY_PUBLISH_POST_SKIP_NEXT_COLD_LAUNCH_SAFEGUARD = "publish_post_skip_next_cold_launch_safeguard"
     /** 自动切号自治模式：off | on | exiting */
@@ -286,6 +292,8 @@ object PrefsStore {
         prefs.edit()
             .putString(KEY_DEVICE_ID, deviceId)
             .putString(KEY_DEVICE_ALIAS, alias)
+            // 绑定后默认必须保活后台 Worker（开机 / Watchdog 依赖此标记）
+            .putBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, true)
             .apply()
     }
 
@@ -344,11 +352,12 @@ object PrefsStore {
     }
 
     fun setWorkerServiceShouldRun(shouldRun: Boolean) {
-        prefs.edit().putBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, shouldRun).apply()
+        prefs.edit().putBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, shouldRun).commit()
     }
 
     fun shouldWorkerServiceRun(): Boolean =
-        prefs.getBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, false)
+        // 默认 true：已装机绑定的设备无需先手动点过「开后台」才保活
+        prefs.getBoolean(KEY_WORKER_SERVICE_SHOULD_RUN, true)
 
     fun noteWorkerServiceStartRequested(reason: String) {
         prefs.edit()
@@ -364,6 +373,21 @@ object PrefsStore {
         prefs.getString(KEY_WORKER_SERVICE_LAST_START_REASON, null)?.trim()?.takeIf { it.isNotEmpty() }
 
     fun isHardStopRequested(): Boolean = prefs.getBoolean(KEY_HARD_STOP_REQUESTED, false)
+
+    fun setProfileEditTimeoutAbort(abort: Boolean) {
+        if (abort) {
+            prefs.edit().putBoolean(KEY_PROFILE_EDIT_TIMEOUT_ABORT, true).apply()
+        } else {
+            prefs.edit().remove(KEY_PROFILE_EDIT_TIMEOUT_ABORT).apply()
+        }
+    }
+
+    fun isProfileEditTimeoutAbort(): Boolean =
+        prefs.getBoolean(KEY_PROFILE_EDIT_TIMEOUT_ABORT, false)
+
+    /** 硬停或改资料超时中止：OCR / delay 协作退出。 */
+    fun isAutomationHardStopOrProfileEditAbort(): Boolean =
+        isHardStopRequested() || isProfileEditTimeoutAbort()
 
     /** 硬停后短时间内忽略云端仍返回的 auto_start/running（等待 opt_out 与 paused 同步）。 */
     fun isWithinHardStopGracePeriod(graceMs: Long = 15_000L): Boolean {
@@ -381,11 +405,24 @@ object PrefsStore {
         prefs.getBoolean(KEY_TRANSIENT_PAUSED_FOR_DESTRUCTIVE_OP, false)
 
     fun setAutoSwitchExclusivePreempt(active: Boolean) {
-        prefs.edit().putBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, active).apply()
+        val ed = prefs.edit().putBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, active)
+        if (active) {
+            if (!prefs.getBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, false) ||
+                prefs.getLong(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT_AT_MS, 0L) <= 0L
+            ) {
+                ed.putLong(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT_AT_MS, System.currentTimeMillis())
+            }
+        } else {
+            ed.remove(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT_AT_MS)
+        }
+        ed.apply()
     }
 
     fun isAutoSwitchExclusivePreempt(): Boolean =
         prefs.getBoolean(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT, false)
+
+    fun getAutoSwitchExclusivePreemptAtMs(): Long =
+        prefs.getLong(KEY_AUTO_SWITCH_EXCLUSIVE_PREEMPT_AT_MS, 0L)
 
     fun isAutoSwitchLoginRecoveryActive(): Boolean =
         prefs.getBoolean(KEY_AUTO_SWITCH_LOGIN_RECOVERY_ACTIVE, false)
@@ -506,8 +543,10 @@ object PrefsStore {
     fun setPublishPostRequested(requested: Boolean) {
         if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
             AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(requested = requested) }
+            if (requested) notePublishOccupyStartedIfNeeded()
             return
         }
+        if (requested) notePublishOccupyStartedIfNeeded()
         prefs.edit().putBoolean(KEY_PUBLISH_POST_REQUESTED, requested).apply()
     }
 
@@ -519,14 +558,28 @@ object PrefsStore {
     fun setPublishPostPending(pending: Boolean) {
         if (AutoSwitchLocalPlanStore.isAutoSwitchPublishActive()) {
             AutoSwitchLocalPlanStore.mutateActivePublish { it.copy(pending = pending) }
+            if (pending) notePublishOccupyStartedIfNeeded()
             return
         }
+        if (pending) notePublishOccupyStartedIfNeeded()
         prefs.edit().putBoolean(KEY_PUBLISH_POST_PENDING, pending).apply()
     }
 
     fun isPublishPostPending(): Boolean {
         AutoSwitchLocalPlanStore.getActivePublish()?.let { return it.pending }
         return prefs.getBoolean(KEY_PUBLISH_POST_PENDING, false)
+    }
+
+    fun notePublishOccupyStartedIfNeeded() {
+        if (prefs.getLong(KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS, 0L) > 0L) return
+        prefs.edit().putLong(KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS, System.currentTimeMillis()).apply()
+    }
+
+    fun getPublishOccupyStartedAtMs(): Long =
+        prefs.getLong(KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS, 0L)
+
+    fun clearPublishOccupyStartedAt() {
+        prefs.edit().remove(KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS).apply()
     }
 
     fun setPublishPostQueuedAfterMutual(queued: Boolean) {
@@ -835,6 +888,7 @@ object PrefsStore {
             .remove(KEY_PUBLISH_POST_TASK_OP_ID)
             .remove(KEY_PUBLISH_POST_TARGET_COUNT)
             .remove(KEY_PUBLISH_POST_LAST_FETCHED_USABLE_COUNT)
+            .remove(KEY_PUBLISH_POST_OCCUPY_STARTED_AT_MS)
             .apply()
     }
 

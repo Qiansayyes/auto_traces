@@ -50,6 +50,11 @@ const backupAliasPickDisableAutoSwitchBtn = document.getElementById("backupAlias
 const backupAliasPickEnableSingleActiveBtn = document.getElementById("backupAliasPickEnableSingleActiveBtn");
 const backupAliasPickDisableSingleActiveBtn = document.getElementById("backupAliasPickDisableSingleActiveBtn");
 const backupAliasPickApplySelectionBtn = document.getElementById("backupAliasPickApplySelectionBtn");
+const backupAliasPickInvertBtn = document.getElementById("backupAliasPickInvertBtn");
+const backupAliasPickClearBtn = document.getElementById("backupAliasPickClearBtn");
+const backupAliasPickSelectVisibleBtn = document.getElementById("backupAliasPickSelectVisibleBtn");
+const backupAliasPickToastEl = document.getElementById("backupAliasPickToast");
+let backupAliasPickToastTimer = 0;
 const backupArchiveSelectionHintEl = document.getElementById("backupArchiveSelectionHint");
 const backupArchiveSelectedCountEl = document.getElementById("backupArchiveSelectedCount");
 const importBackupArchiveXlsxBtn = document.getElementById("importBackupArchiveXlsxBtn");
@@ -168,6 +173,7 @@ const autoSwitchSelectAllEnableBtn = document.getElementById("autoSwitchSelectAl
 const autoSwitchEnableSelectedBtn = document.getElementById("autoSwitchEnableSelectedBtn");
 const autoSwitchDisableSelectedBtn = document.getElementById("autoSwitchDisableSelectedBtn");
 const autoSwitchCutSchemeSelect = document.getElementById("autoSwitchCutSchemeSelect");
+const autoSwitchSlotDurationInput = document.getElementById("autoSwitchSlotDurationInput");
 const autoSwitchExcludedBatchBtn = document.getElementById("autoSwitchExcludedBatchBtn");
 const autoSwitchExcludedBatchModalEl = document.getElementById("autoSwitchExcludedBatchModal");
 const autoSwitchExcludedBatchTextarea = document.getElementById("autoSwitchExcludedBatchTextarea");
@@ -914,10 +920,14 @@ let backupArchiveSlotHighlightTimer = null;
 let autoSwitchCutScheme = "backup";
 let autoSwitchCutSchemeSaveInFlight = false;
 let autoSwitchDevicesById = new Map();
+/** device_id → { plan_mode, slot_duration_min } */
+let autoSwitchDeviceMetaById = new Map();
 /** device_id -> { active, username, rowIndex } */
 let singleAccountActiveById = new Map();
 let autoSwitchPickDeviceIds = new Set();
 let autoSwitchSaveInFlight = false;
+const AUTO_SWITCH_FIXED_DURATION_MIN = 30;
+const AUTO_SWITCH_FIXED_DURATION_MAX = 720;
 let backupStatsFullQueryScheduleAvailable = false;
 let backupStatsFullQueryManualAvailable = false;
 let backupStatsFullQuerySaveInFlight = false;
@@ -6214,12 +6224,45 @@ function isAutoSwitchGloballyEnabled() {
   return autoSwitchDevicesById.size > 0 && Array.from(autoSwitchDevicesById.values()).some(Boolean);
 }
 
+function readAutoSwitchSlotDurationMinForEnable() {
+  const raw = String(autoSwitchSlotDurationInput?.value ?? "").trim();
+  if (!raw) return null; // 省略：新开=均分，已开重同步=保持
+  const n = Number(raw);
+  if (!Number.isInteger(n)) {
+    throw new Error("固定活跃时长须为整数分钟（留空=新开均分/已开保持；0=强制均分）");
+  }
+  if (n === 0) return 0; // 显式强制均分
+  if (n < AUTO_SWITCH_FIXED_DURATION_MIN || n > AUTO_SWITCH_FIXED_DURATION_MAX) {
+    throw new Error(
+      `固定活跃时长须在 ${AUTO_SWITCH_FIXED_DURATION_MIN}～${AUTO_SWITCH_FIXED_DURATION_MAX} 分钟之间（0=强制均分）`,
+    );
+  }
+  return n;
+}
+
+function getAutoSwitchDeviceMeta(deviceId) {
+  const did = String(deviceId || "").trim();
+  if (!did) return null;
+  return autoSwitchDeviceMetaById.get(did) || null;
+}
+
 function updateAutoSwitchEnabledCountHint() {
   if (!autoSwitchEnabledCountHint) return;
-  const enabled = Array.from(autoSwitchDevicesById.entries()).filter(([, on]) => on).length;
+  const enabledEntries = Array.from(autoSwitchDevicesById.entries()).filter(([, on]) => on);
+  const enabled = enabledEntries.length;
+  const fixedCount = enabledEntries.filter(([did]) => {
+    const meta = getAutoSwitchDeviceMeta(did);
+    return Number(meta?.slot_duration_min || 0) > 0;
+  }).length;
   const single = Array.from(singleAccountActiveById.values()).filter((info) => info?.active).length;
   const parts = [];
-  if (enabled > 0) parts.push(`自动切号中：${enabled} 台`);
+  if (enabled > 0) {
+    parts.push(
+      fixedCount > 0
+        ? `自动切号中：${enabled} 台（固定时长 ${fixedCount} 台）`
+        : `自动切号中：${enabled} 台`,
+    );
+  }
   if (single > 0) parts.push(`单号活跃：${single} 台`);
   autoSwitchEnabledCountHint.textContent = parts.length
     ? parts.join("；")
@@ -6373,12 +6416,18 @@ async function loadAutoSwitchConfig(options = {}) {
     const data = await request("/api/admin/auto_switch/config");
     const cfg = data.data || {};
     autoSwitchDevicesById = new Map();
+    autoSwitchDeviceMetaById = new Map();
     singleAccountActiveById = new Map();
     const devices = Array.isArray(cfg.devices) ? cfg.devices : [];
     devices.forEach((item) => {
       const did = String(item?.device_id || "").trim();
       if (!did) return;
       autoSwitchDevicesById.set(did, !!item?.enabled);
+      const slotMin = Number(item?.slot_duration_min || 0) || 0;
+      autoSwitchDeviceMetaById.set(did, {
+        plan_mode: String(item?.plan_mode || "").trim() || (slotMin > 0 ? "fixed_duration" : "equal_day"),
+        slot_duration_min: slotMin > 0 ? slotMin : 0,
+      });
       if (item?.single_account_active) {
         singleAccountActiveById.set(did, {
           active: true,
@@ -6387,6 +6436,13 @@ async function loadAutoSwitchConfig(options = {}) {
         });
       }
     });
+    // 工具栏输入框仅表示「下次开启时写入」的值，不随设备列表回填覆盖用户正在编辑的内容。
+    if (autoSwitchSlotDurationInput && !String(autoSwitchSlotDurationInput.value || "").trim()) {
+      const fixedSample = devices.find((item) => Number(item?.slot_duration_min || 0) > 0);
+      if (fixedSample && Number(fixedSample.slot_duration_min) > 0) {
+        autoSwitchSlotDurationInput.placeholder = `例：当前有设备 ${Number(fixedSample.slot_duration_min)} 分钟`;
+      }
+    }
     autoSwitchCutScheme = String(cfg.cut_switch_scheme || "backup").trim().toLowerCase() === "login"
       ? "login"
       : "backup";
@@ -6628,9 +6684,24 @@ async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
     );
     return;
   }
+  const body = { device_ids: ids, enabled: !!enabled };
+  if (enabled) {
+    let slotDurationMin = null;
+    try {
+      slotDurationMin = Object.prototype.hasOwnProperty.call(options, "slotDurationMin")
+        ? options.slotDurationMin
+        : readAutoSwitchSlotDurationMinForEnable();
+    } catch (err) {
+      setStatus(err?.message || "固定活跃时长无效", "warning");
+      throw err;
+    }
+    if (slotDurationMin != null) {
+      body.slot_duration_min = slotDurationMin; // 含 0=强制均分
+    }
+  }
   const data = await request("/api/admin/auto_switch/devices", {
     method: "POST",
-    body: JSON.stringify({ device_ids: ids, enabled: !!enabled }),
+    body: JSON.stringify(body),
   });
   await loadAutoSwitchConfig({ refreshArchive: true });
   if (options.refreshStatus !== false) {
@@ -6640,12 +6711,31 @@ async function saveAutoSwitchForDeviceIds(deviceIds, enabled, options = {}) {
   const notified = Number(resp.devices_notified || 0);
   const changed = Number(resp.devices_changed || 0);
   const resynced = Number(resp.devices_resynced || 0);
+  const skippedShort = Array.isArray(resp.skipped_fixed_short) ? resp.skipped_fixed_short.length : 0;
+  const planMode = String(resp.plan_mode || "").trim();
+  const slotMin = Number(resp.slot_duration_min || 0) || 0;
+  const requestedSlot = body.slot_duration_min;
+  let modeNote = "";
+  if (enabled) {
+    if (requestedSlot === 0) {
+      modeNote = "；已强制改回均分全天";
+    } else if (requestedSlot != null && Number(requestedSlot) > 0) {
+      modeNote = `；固定时长 ${requestedSlot} 分钟/号`;
+    } else if (planMode === "fixed_duration" || slotMin > 0) {
+      modeNote = `；保持固定时长${slotMin > 0 ? ` ${slotMin} 分钟/号` : ""}`;
+    } else {
+      modeNote = "；均分全天";
+    }
+    if (skippedShort > 0) {
+      modeNote += `；${skippedShort} 台账号不足已跳过`;
+    }
+  }
   setStatus(
-    enabled
+    (enabled
       ? resynced > 0 && changed === 0
         ? `已向 ${notified} 台设备推送自动切号资料（${resynced} 台资料重同步）`
         : `已向 ${notified} 台设备推送资料（${changed} 台新开启${resynced > 0 ? `，${resynced} 台重同步` : ""}）`
-      : `已为 ${changed} 台设备关闭自动切号`,
+      : `已为 ${changed} 台设备关闭自动切号`) + modeNote,
     "success",
   );
 }
@@ -9330,7 +9420,22 @@ if (backupAliasPickSelectAllEl) {
       else backupAliasPickSelectedAliases.delete(alias);
     });
     renderBackupAliasPickList();
+    flashBackupAliasPickToast(checked ? ("已全选当前页 " + getBackupAliasPickVisiblePairs().length + " 台") : "已取消全选", checked ? "success" : "info");
+    });
+  }
+if (backupAliasPickInvertBtn) {
+  backupAliasPickInvertBtn.addEventListener("click", function() {
+    var pairs = getBackupAliasPickVisiblePairs();
+    pairs.forEach(function(item) { var alias = normalizeAliasValue(item.device_alias); if (!alias) return; if (backupAliasPickSelectedAliases.has(alias)) backupAliasPickSelectedAliases.delete(alias); else backupAliasPickSelectedAliases.add(alias); });
+    renderBackupAliasPickList();
+    flashBackupAliasPickToast("已反选，当前已选 " + backupAliasPickSelectedAliases.size + " 台", "success");
   });
+}
+if (backupAliasPickClearBtn) {
+  backupAliasPickClearBtn.addEventListener("click", function() { if (!backupAliasPickSelectedAliases.size) { flashBackupAliasPickToast("本来就没有勾选", "info"); return; } backupAliasPickSelectedAliases.clear(); renderBackupAliasPickList(); flashBackupAliasPickToast("已清空选择", "success"); });
+}
+if (backupAliasPickSelectVisibleBtn) {
+  backupAliasPickSelectVisibleBtn.addEventListener("click", function() { var pairs = getBackupAliasPickVisiblePairs(); pairs.forEach(function(item) { var alias = normalizeAliasValue(item.device_alias); if (alias) backupAliasPickSelectedAliases.add(alias); }); renderBackupAliasPickList(); flashBackupAliasPickToast("已全选当前页 " + pairs.length + " 台", "success"); });
 }
 if (backupAliasPickSearchInput) {
   backupAliasPickSearchInput.addEventListener("input", () => {
@@ -12915,7 +13020,12 @@ function renderAutoSwitchDeviceBadge(alias, rowDeviceId = "") {
   }
   const on = isAutoSwitchEnabledForDeviceId(deviceId);
   if (on) {
-    return '<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启自动切号自治，手动切号/清理等操作已锁定">自动切号·开</span>';
+    const meta = getAutoSwitchDeviceMeta(deviceId);
+    const slotMin = Number(meta?.slot_duration_min || 0) || 0;
+    if (slotMin > 0) {
+      return `<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启固定时长自动切号：每号活跃 ${slotMin} 分钟并跨天循环，手动切号/清理等操作已锁定">自动切号·固定${slotMin}分</span>`;
+    }
+    return '<span class="badge badge--ok backup-archive-auto-switch-badge" title="该设备已开启自动切号自治（均分全天），手动切号/清理等操作已锁定">自动切号·开</span>';
   }
   return '<span class="badge backup-archive-auto-switch-badge backup-archive-auto-switch-badge--off" title="该设备未开启自动切号，可手动操作或勾选别名组后批量开启">自动切号·关</span>';
 }
@@ -13299,6 +13409,8 @@ function backupAliasPickItemInGroup(item, groupKey) {
   return false;
 }
 
+function flashBackupAliasPickToast(text, type) { try { setStatus(text, type || "success"); if (backupAliasPickToastEl) { backupAliasPickToastEl.textContent = String(text || ""); backupAliasPickToastEl.className = "alias-pick-toast show " + (type || "success"); if (backupAliasPickToastTimer) clearTimeout(backupAliasPickToastTimer); backupAliasPickToastTimer = setTimeout(function() { if (backupAliasPickToastEl) backupAliasPickToastEl.classList.remove("show"); }, 2600); } } catch (_) {} }
+function setAliasPickActionBusy(btn, busy) { if (!btn) return; if (busy) { btn.dataset.idleText = btn.textContent; btn.textContent = "执行中\u2026"; btn.classList.add("busy"); btn.disabled = true; } else { if (btn.dataset.idleText) btn.textContent = btn.dataset.idleText; btn.classList.remove("busy"); btn.disabled = backupAliasPickSingleBusy || backupAliasPickApplyBusy; } }
 function updateBackupAliasPickSummary() {
   if (!backupAliasPickSummaryEl) return;
   const all = buildAliasDevicePairs();
@@ -13471,9 +13583,13 @@ function closeBackupAliasPickModal() {
 async function saveAutoSwitchFromAliasPick(enabled) {
   const deviceIds = collectBackupAliasPickDeviceIds();
   if (!deviceIds.length) {
-    setStatus("请至少勾选一个已绑定 device_id 的别名设备", "warning");
+    flashBackupAliasPickToast("请至少勾选一个已绑定 device_id 的别名设备", "warning");
     return;
   }
+  const targetBtn = enabled ? backupAliasPickEnableAutoSwitchBtn : backupAliasPickDisableAutoSwitchBtn;
+  setAliasPickActionBusy(targetBtn, true);
+  flashBackupAliasPickToast((enabled ? "正在开启自动切号（" : "正在关闭自动切号（") + deviceIds.length + " 台）…", "info");
+  try {
   // 保留打开弹窗前的列表勾选设备，避免弹窗内直接开/关后污染页面按钮目标
   const previousPick = new Set(autoSwitchPickDeviceIds);
   await saveAutoSwitchConfig({ enabled: !!enabled, deviceIds });
@@ -13483,6 +13599,10 @@ async function saveAutoSwitchFromAliasPick(enabled) {
     autoSwitchPickDeviceIds.clear();
   }
   renderBackupAliasPickList();
+  flashBackupAliasPickToast((enabled ? "已开启自动切号 " : "已关闭自动切号 ") + deviceIds.length + " 台", "success");
+  } finally {
+    setAliasPickActionBusy(targetBtn, false);
+  }
 }
 
 function setBackupAliasPickSingleBusy(busy) {

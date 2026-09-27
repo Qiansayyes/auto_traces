@@ -2318,3 +2318,10 @@ button.danger {
   gap: 6px;
   flex-wrap: wrap;
 }
+
+.alias-pick-toast{display:none;margin-left:4px;padding:4px 10px;border-radius:999px;font-size:12px;background:#e8f5e9;color:#1b7f37;border:1px solid #b7dfbf;white-space:nowrap;}
+.alias-pick-toast.show{display:inline-block;}
+.alias-pick-toast.info{background:#e8f0fe;color:#1a56db;border-color:#bcd0fb;}
+.alias-pick-toast.warning{background:#fef7e0;color:#8a5d00;border-color:#f3d68b;}
+.alias-pick-toast.error{background:#fce8e6;color:#b3261e;border-color:#f2b8b5;}
+button.busy{opacity:.6;pointer-events:none;}

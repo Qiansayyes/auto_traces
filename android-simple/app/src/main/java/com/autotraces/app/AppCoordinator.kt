@@ -223,10 +223,29 @@ object AppCoordinator {
     @Volatile
     private var basicProfileEditRunning: Boolean = false
 
+    @Volatile
+    private var basicProfileEditStartedAtMs: Long = 0L
+
     /**
      * 手动按钮分发协程（改资料等同步跑在 enqueue 内的 OP）：新按钮抢占时 cancel，尽快让出 TikTok。
      */
     private var manualDispatchJob: Job? = null
+
+    private fun markBasicProfileEditStarted() {
+        if (!basicProfileEditRunning) {
+            basicProfileEditStartedAtMs = System.currentTimeMillis()
+        } else if (basicProfileEditStartedAtMs <= 0L) {
+            basicProfileEditStartedAtMs = System.currentTimeMillis()
+        }
+        basicProfileEditRunning = true
+        PrefsStore.setProfileEditTimeoutAbort(false)
+    }
+
+    private fun markBasicProfileEditEnded() {
+        basicProfileEditRunning = false
+        basicProfileEditStartedAtMs = 0L
+        PrefsStore.setProfileEditTimeoutAbort(false)
+    }
 
     /**
      * 手动抢占窗口内禁止「任务结束后自动涨粉」，避免旧任务 completion 顶掉新任务。
@@ -310,6 +329,21 @@ object AppCoordinator {
 
     /** 登录保障失败后：暂停涨粉/发作品/引流调度刷屏，并按此间隔周期重试登录（非放弃）。 */
     private const val AUTO_SWITCH_LOGIN_RECOVERY_INTERVAL_MS = 60_000L
+
+    /** 发作品占用最长墙钟时间；超时强制清占用（含协程/plan/prefs/抢占）。 */
+    private const val PUBLISH_OCCUPY_MAX_MS = 30L * 60L * 1000L
+
+    /** 修改基本资料占用最长墙钟时间；超时协作中止 OCR/外轮并清占用。 */
+    private const val PROFILE_EDIT_OCCUPY_MAX_MS = 30L * 60L * 1000L
+
+    /** 互点 / 主播访问占用最长墙钟时间。 */
+    private const val INSERTION_OCCUPY_MAX_MS = 30L * 60L * 1000L
+
+    /** 独占抢占标志无真实独占任务时的最长保留时间。 */
+    private const val EXCLUSIVE_PREEMPT_STALE_MAX_MS = 5L * 60L * 1000L
+
+    /** 改资料超时后等待协作退出的最长时间。 */
+    private const val PROFILE_EDIT_TIMEOUT_DRAIN_MS = 90_000L
 
     private var autoSwitchLoginRecoveryJob: Job? = null
 
@@ -1513,6 +1547,7 @@ object AppCoordinator {
             }
         }
         ProcessDiagnostics.registerStatusLineProvider {
+            sweepStaleExclusiveOccupations()
             buildAutoSwitchStatusLogLine()
         }
         updateRuntime(
@@ -1569,6 +1604,261 @@ object AppCoordinator {
             else -> "否"
         }
         return "[状态] 阶段=$phase slot=$slot 涨粉pull=$pull 独占OP=$exclusive 改资料/互点占用=$profilePart/$mutualPart"
+    }
+
+    /**
+     * 心跳/状态行周期：强制清理超时占用与遗留抢占，避免「发作品中 + 独占抢占中」永久堵调度。
+     */
+    private fun sweepStaleExclusiveOccupations() {
+        forceClearPublishOccupationIfTimedOut()
+        forceClearProfileEditIfTimedOut()
+        forceClearMutualOccupationIfTimedOut()
+        forceClearLiveVisitOccupationIfTimedOut()
+        releaseStaleExclusivePreemptIfTimedOut()
+    }
+
+    private fun resolvePublishOccupyStartedAtMs(): Long {
+        val fromPlan = AutoSwitchLocalPlanStore.ensurePublishOccupyStartedAtMs()
+        if (fromPlan > 0L) return fromPlan
+        var fromPrefs = PrefsStore.getPublishOccupyStartedAtMs()
+        if (fromPrefs > 0L) return fromPrefs
+        val occupying =
+            isPublishPostSwitchActive() ||
+                PublishPostGrowthGate.isBlockingGrowth() ||
+                PrefsStore.isPublishPostRequested() ||
+                PrefsStore.isPublishPostPending() ||
+                PrefsStore.isPublishPostMaterialReady() ||
+                AutoSwitchLocalPlanStore.isPublishContextOccupying()
+        if (!occupying) return 0L
+        PrefsStore.notePublishOccupyStartedIfNeeded()
+        return PrefsStore.getPublishOccupyStartedAtMs()
+    }
+
+    private fun forceClearPublishOccupationIfTimedOut() {
+        val startedAt = resolvePublishOccupyStartedAtMs()
+        if (startedAt <= 0L) return
+        val age = System.currentTimeMillis() - startedAt
+        if (age < PUBLISH_OCCUPY_MAX_MS) return
+        val occupying =
+            isPublishPostSwitchActive() ||
+                PublishPostGrowthGate.isBlockingGrowth() ||
+                PrefsStore.isPublishPostRequested() ||
+                PrefsStore.isPublishPostPending() ||
+                PrefsStore.isPublishPostMaterialReady() ||
+                AutoSwitchLocalPlanStore.isPublishContextOccupying()
+        if (!occupying) {
+            PrefsStore.clearPublishOccupyStartedAt()
+            return
+        }
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        val sk = AutoSwitchLocalPlanStore.activePublishSlotKey().orEmpty().ifBlank {
+            PrefsStore.getAutoSwitchLastSlotKey().orEmpty()
+        }
+        val accountKey = AutoSwitchLocalPlanStore.activePublishAccountUsername()
+            ?.trim()?.takeIf { it.isNotEmpty() }
+            ?: PrefsStore.getLogContextUsername()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: alias
+        LogCenter.op(
+            alias,
+            "【占用看门狗】发作品占用逾 ${PUBLISH_OCCUPY_MAX_MS / 60_000} 分钟（已约 ${age / 60_000}m），强制清占用 slot=$sk",
+        )
+        // 先清断点/状态，再 cancel，避免 completion 回调误触发续发
+        PrefsStore.clearPublishPostResumeProgress(accountKey)
+        PrefsStore.clearPublishPostTaskScope()
+        PrefsStore.clearPublishPostState()
+        PublishPostGrowthGate.exitExclusivePublishPhase()
+        if (isPublishPostSwitchActive()) {
+            publishPostSwitchJob?.cancel()
+            publishPostSwitchJob = null
+        }
+        if (sk.isNotBlank()) {
+            autoSwitchLocalScheduler.clearPublishInsertionInflight(sk)
+            AutoSwitchLocalPlanStore.markInsertionState(sk, "publish", PlanStepState.FAILED)
+            AutoSwitchLocalPlanStore.clearActivePublish()
+        }
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        if (PrefsStore.isAutoSwitchAutonomousMode() &&
+            !manuallyPaused &&
+            !shouldHonorUserHardStop() &&
+            PrefsStore.getAutoSwitchMode() != "exiting"
+        ) {
+            maybeStartGrowthInAutoSwitchIdle("发作品占用超时强制清理")
+            autoSwitchLocalScheduler.requestImmediateTick()
+        }
+    }
+
+    /**
+     * 改资料占用逾 [PROFILE_EDIT_OCCUPY_MAX_MS]：置中止标志让 OCR/外轮协作退出，再清占用并恢复调度。
+     * 不用用户硬停，避免设备停在 paused。
+     */
+    private fun forceClearProfileEditIfTimedOut() {
+        if (!basicProfileEditRunning) {
+            if (PrefsStore.isProfileEditTimeoutAbort()) {
+                PrefsStore.setProfileEditTimeoutAbort(false)
+            }
+            return
+        }
+        var startedAt = basicProfileEditStartedAtMs
+        if (startedAt <= 0L) {
+            basicProfileEditStartedAtMs = System.currentTimeMillis()
+            return
+        }
+        val age = System.currentTimeMillis() - startedAt
+        if (age < PROFILE_EDIT_OCCUPY_MAX_MS) return
+        if (PrefsStore.isProfileEditTimeoutAbort()) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        LogCenter.op(
+            alias,
+            "【占用看门狗】改资料占用逾 ${PROFILE_EDIT_OCCUPY_MAX_MS / 60_000} 分钟（已约 ${age / 60_000}m），强制中止并清占用",
+        )
+        PrefsStore.setProfileEditTimeoutAbort(true)
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        // 仅取消「修改基本资料」手动分发，避免误杀其它手动任务
+        if (manualDispatchJob?.isActive == true && detectActiveManualTaskKind() == ManualTaskKind.EDIT_PROFILE) {
+            manualDispatchJob?.cancel()
+        }
+        scope.launch {
+            var waited = 0L
+            while (basicProfileEditRunning && waited < PROFILE_EDIT_TIMEOUT_DRAIN_MS) {
+                delay(500)
+                waited += 500
+            }
+            if (basicProfileEditRunning) {
+                LogCenter.op(
+                    alias,
+                    "【占用看门狗】改资料协作退出超时（${PROFILE_EDIT_TIMEOUT_DRAIN_MS / 1000}s），强制清除运行标志",
+                )
+                markBasicProfileEditEnded()
+            } else {
+                PrefsStore.setProfileEditTimeoutAbort(false)
+            }
+            if (ExecutionScope.isActive()) {
+                ExecutionScope.forceClearIfStuck("改资料占用超时")
+            }
+            if (PrefsStore.isAutoSwitchAutonomousMode() &&
+                !manuallyPaused &&
+                !PrefsStore.isHardStopRequested() &&
+                PrefsStore.getAutoSwitchMode() != "exiting"
+            ) {
+                maybeStartGrowthInAutoSwitchIdle("改资料占用超时强制清理")
+                autoSwitchLocalScheduler.requestImmediateTick()
+            } else if (ManualDeviceControl.ENABLED &&
+                !manuallyPaused &&
+                !PrefsStore.isHardStopRequested()
+            ) {
+                maybeManualAutoGrowthAfterTask("改资料占用超时强制清理")
+            }
+        }
+    }
+
+    private fun forceClearMutualOccupationIfTimedOut() {
+        val startedAt = AutoSwitchLocalPlanStore.ensureMutualOccupyStartedAtMs()
+        if (startedAt <= 0L) return
+        val age = System.currentTimeMillis() - startedAt
+        if (age < INSERTION_OCCUPY_MAX_MS) return
+        val occupying =
+            isMutualSwitchActive() || AutoSwitchLocalPlanStore.isMutualContextOccupying()
+        if (!occupying) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        val sk = AutoSwitchLocalPlanStore.activeMutualSlotKey().orEmpty()
+        LogCenter.op(
+            alias,
+            "【占用看门狗】互点占用逾 ${INSERTION_OCCUPY_MAX_MS / 60_000} 分钟（已约 ${age / 60_000}m），强制清占用 slot=$sk",
+        )
+        if (isMutualSwitchActive()) {
+            mutualSwitchJob?.cancel()
+            mutualSwitchJob = null
+        }
+        PrefsStore.clearMutualClickState()
+        if (sk.isNotBlank()) {
+            autoSwitchLocalScheduler.notifyMutualOutcome(sk, completed = false)
+        } else {
+            AutoSwitchLocalPlanStore.clearActiveMutual()
+        }
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        if (PrefsStore.isAutoSwitchAutonomousMode() &&
+            !manuallyPaused &&
+            !shouldHonorUserHardStop() &&
+            PrefsStore.getAutoSwitchMode() != "exiting"
+        ) {
+            maybeStartGrowthInAutoSwitchIdle("互点占用超时强制清理")
+            autoSwitchLocalScheduler.requestImmediateTick()
+        }
+    }
+
+    private fun forceClearLiveVisitOccupationIfTimedOut() {
+        val startedAt = AutoSwitchLocalPlanStore.ensureLiveVisitOccupyStartedAtMs()
+        if (startedAt <= 0L) return
+        val age = System.currentTimeMillis() - startedAt
+        if (age < INSERTION_OCCUPY_MAX_MS) return
+        val occupying =
+            isLiveVisitSwitchActive() || AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()
+        if (!occupying) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty().ifBlank { "SYSTEM" }
+        val sk = AutoSwitchLocalPlanStore.activeLiveVisitSlotKey().orEmpty()
+        LogCenter.op(
+            alias,
+            "【占用看门狗】主播访问占用逾 ${INSERTION_OCCUPY_MAX_MS / 60_000} 分钟（已约 ${age / 60_000}m），强制清占用 slot=$sk",
+        )
+        if (isLiveVisitSwitchActive()) {
+            liveVisitSwitchJob?.cancel()
+            liveVisitSwitchJob = null
+        }
+        if (sk.isNotBlank()) {
+            autoSwitchLocalScheduler.notifyLiveVisitOutcome(sk, completed = false)
+        } else {
+            AutoSwitchLocalPlanStore.clearActiveLiveVisit()
+        }
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        if (PrefsStore.isAutoSwitchAutonomousMode() &&
+            !manuallyPaused &&
+            !shouldHonorUserHardStop() &&
+            PrefsStore.getAutoSwitchMode() != "exiting"
+        ) {
+            maybeStartGrowthInAutoSwitchIdle("主播访问占用超时强制清理")
+            autoSwitchLocalScheduler.requestImmediateTick()
+        }
+    }
+
+    /** 抢占标志遗留且无真实独占：超 [EXCLUSIVE_PREEMPT_STALE_MAX_MS] 强制清除。 */
+    private fun releaseStaleExclusivePreemptIfTimedOut() {
+        if (!PrefsStore.isAutoSwitchExclusivePreempt()) return
+        if (isAutoSwitchExclusiveWorkActuallyActive()) return
+        if (AutoSwitchLocalPlanStore.isPublishContextOccupying() ||
+            AutoSwitchLocalPlanStore.isMutualContextOccupying() ||
+            AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()
+        ) {
+            return
+        }
+        var at = PrefsStore.getAutoSwitchExclusivePreemptAtMs()
+        if (at <= 0L) {
+            // 升级前遗留 preempt=true 无时钟：补戳，下轮心跳再判
+            PrefsStore.setAutoSwitchExclusivePreempt(true)
+            return
+        }
+        val age = System.currentTimeMillis() - at
+        if (age < EXCLUSIVE_PREEMPT_STALE_MAX_MS) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        PrefsStore.setAutoSwitchExclusivePreempt(false)
+        PrefsStore.setTransientPausedForDestructiveOp(false)
+        if (alias.isNotBlank()) {
+            LogCenter.op(
+                alias,
+                "【占用看门狗】独占抢占遗留逾 ${EXCLUSIVE_PREEMPT_STALE_MAX_MS / 60_000} 分钟且无真实独占，已强制清除",
+            )
+        }
+        if (PrefsStore.isAutoSwitchAutonomousMode() &&
+            !manuallyPaused &&
+            !shouldHonorUserHardStop() &&
+            PrefsStore.getAutoSwitchMode() != "exiting"
+        ) {
+            maybeStartGrowthInAutoSwitchIdle("遗留独占抢占超时清理")
+            autoSwitchLocalScheduler.requestImmediateTick()
+        } else if (ManualDeviceControl.ENABLED) {
+            releaseStaleManualExclusivePreemptIfIdle("遗留独占抢占超时清理")
+        }
     }
 
     private fun ensureDeviceOpsLoopIfBound() {
@@ -7509,23 +7799,18 @@ object AppCoordinator {
         if (!loginVerified && account.is_login != true) return false
         if (!isBasicProfileModificationPending(account.basic_profile_modified)) return false
 
-        basicProfileEditRunning = true
-        try {
-            LogCenter.op(
-                alias,
-                "[OP][$parentOpId] 登录已就绪且云端「基本资料已修改」=否，开始自动修改基本资料（trigger=$trigger）",
-            )
-            runProfileEditAfterCutSwitch(
-                alias = alias,
-                deviceId = deviceId,
-                parentOpId = parentOpId,
-                skipOuterWarmup = skipOuterWarmup,
-                profileEditTrigger = trigger,
-            )
-            return true
-        } finally {
-            basicProfileEditRunning = false
-        }
+        LogCenter.op(
+            alias,
+            "[OP][$parentOpId] 登录已就绪且云端「基本资料已修改」=否，开始自动修改基本资料（trigger=$trigger）",
+        )
+        runProfileEditAfterCutSwitch(
+            alias = alias,
+            deviceId = deviceId,
+            parentOpId = parentOpId,
+            skipOuterWarmup = skipOuterWarmup,
+            profileEditTrigger = trigger,
+        )
+        return true
     }
 
     private fun MutableMap<String, Any>.withDeviceOpReportFlags(): MutableMap<String, Any> {
@@ -9727,11 +10012,12 @@ object AppCoordinator {
         }
     }
 
-    /** 分段 delay，硬停或自动切号关闭时尽快返回 false。 */
+    /** 分段 delay，硬停或自动切号关闭时尽快返回 false。改资料超时中止仅在改资料占用中生效。 */
     private suspend fun delayUnlessHardStop(ms: Long): Boolean {
         var left = ms
         while (left > 0) {
-            if (shouldHonorUserHardStop()) return false
+            if (PrefsStore.isHardStopRequested()) return false
+            if (PrefsStore.isProfileEditTimeoutAbort() && basicProfileEditRunning) return false
             if (PrefsStore.getAutoSwitchMode() == "exiting") return false
             val chunk = minOf(left, 200L)
             delay(chunk)
@@ -10453,6 +10739,7 @@ object AppCoordinator {
             resumePullAfterExclusive = prepareForExclusiveTikTokUiOp(
                 alias, deviceId, op.op_type, opId, packageNameEarly,
             )
+            markBasicProfileEditStarted()
         } else {
             resumeExecutionForCloudDeviceOp(alias, deviceId, "云端设备指令：${op.op_type}")
         }
@@ -10708,6 +10995,7 @@ object AppCoordinator {
                 ),
             )
             if (isExclusiveUi) {
+                markBasicProfileEditEnded()
                 finishExclusiveTikTokUiOp(alias, deviceId, opId, resumePullAfterExclusive)
             }
             return
@@ -11103,8 +11391,8 @@ object AppCoordinator {
                 var lastEntryFailureStep = ""
 
                 for (outer in 1..maxOuter) {
-                    if (PrefsStore.isHardStopRequested()) {
-                        opLog("修改基本资料：检测到硬停，中止外轮（不再重试 OCR）")
+                    if (PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                        opLog("修改基本资料：检测到硬停/超时中止，中止外轮（不再重试 OCR）")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
@@ -11148,7 +11436,7 @@ object AppCoordinator {
                     if (!directEntryThisRound) {
                         lastStopOk = runSu("am force-stop $packageName")
                     if (!delayUnlessHardStop(1200)) {
-                        opLog("修改基本资料：硬停中止")
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
@@ -11170,13 +11458,13 @@ object AppCoordinator {
                     lastRatioTapPx = rtx to rty
                     lastRatioTapOk = false
                     if (!delayUnlessHardStop(if (lastLaunchOk) 1600 else 1200)) {
-                        opLog("修改基本资料：硬停中止")
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
                     }
-                    if (PrefsStore.isHardStopRequested()) {
-                        opLog("修改基本资料：硬停中止")
+                    if (PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
@@ -11185,7 +11473,7 @@ object AppCoordinator {
                         opLog("修改基本资料：For You 等待 1.6s 后刷两下视频")
                         val forYouOk = executor.profileEditForYouTwoSwipesAfterLaunch(alias, lastW, lastH)
                         if (!forYouOk) {
-                            opLog("修改基本资料：硬停中止")
+                            opLog("修改基本资料：硬停/超时中止")
                             lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                             runSu("am force-stop $packageName")
                             break
@@ -11242,8 +11530,8 @@ object AppCoordinator {
                     if (chain.avatarStepOk) {
                         avatarSucceededEver = true
                     }
-                    if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
-                        opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
+                    if (chain.failureStep == "hard_stop" || PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                        opLog("修改基本资料：OCR 链被硬停/超时打断 step=${chain.failureStep}")
                         runSu("am force-stop $packageName")
                         break
                     }
@@ -12348,6 +12636,7 @@ object AppCoordinator {
         } finally {
             ExecutionScope.exit()
             if (isExclusiveUi) {
+                markBasicProfileEditEnded()
                 finishExclusiveTikTokUiOp(alias, deviceId, opId, resumePullAfterExclusive)
             } else if (isDestructive) {
                 restoreCloudAutoStartParticipation(alias, deviceId, opId, "备份/切号任务结束")
@@ -13309,6 +13598,8 @@ object AppCoordinator {
             )
             return
         }
+        markBasicProfileEditStarted()
+        try {
         val profileOpId = "${parentOpId}_profile_${System.currentTimeMillis()}"
         val profileAccount = resolveAssignedAccount(alias, deviceId)
         val profileUsernameAtStart = profileAccount?.username?.trim().orEmpty()
@@ -13503,8 +13794,8 @@ object AppCoordinator {
                 }
 
             for (outer in 1..maxOuter) {
-                if (PrefsStore.isHardStopRequested()) {
-                    opLog("修改基本资料：检测到硬停，中止外轮")
+                if (PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                    opLog("修改基本资料：检测到硬停/超时中止，中止外轮")
                     lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                     runSu("am force-stop $packageName")
                     break
@@ -13545,7 +13836,7 @@ object AppCoordinator {
                     opLog("修改基本资料：第 $outer/$maxOuter 轮")
                     lastStopOk = runSu("am force-stop $packageName")
                     if (!delayUnlessHardStop(1200)) {
-                        opLog("修改基本资料：硬停中止")
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
@@ -13567,13 +13858,13 @@ object AppCoordinator {
                     lastRatioTapPx = rtx to rty
                     lastRatioTapOk = false
                     if (!delayUnlessHardStop(if (lastLaunchOk) 1600 else 1200)) {
-                        opLog("修改基本资料：硬停中止")
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
                     }
-                    if (PrefsStore.isHardStopRequested()) {
-                        opLog("修改基本资料：硬停中止")
+                    if (PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                        opLog("修改基本资料：硬停/超时中止")
                         lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                         runSu("am force-stop $packageName")
                         break
@@ -13582,7 +13873,7 @@ object AppCoordinator {
                         opLog("修改基本资料：For You 等待后刷两下视频")
                         val forYouOk = executor.profileEditForYouTwoSwipesAfterLaunch(alias, lastW, lastH)
                         if (!forYouOk) {
-                            opLog("修改基本资料：硬停中止")
+                            opLog("修改基本资料：硬停/超时中止")
                             lastChain = ProfileEditChainResult(success = false, failureStep = "hard_stop")
                             runSu("am force-stop $packageName")
                             break
@@ -13609,8 +13900,8 @@ object AppCoordinator {
                 if (chain.avatarStepOk) {
                     avatarSucceededEver = true
                 }
-                if (chain.failureStep == "hard_stop" || PrefsStore.isHardStopRequested()) {
-                    opLog("修改基本资料：OCR 链被硬停打断 step=${chain.failureStep}")
+                if (chain.failureStep == "hard_stop" || PrefsStore.isAutomationHardStopOrProfileEditAbort()) {
+                    opLog("修改基本资料：OCR 链被硬停/超时打断 step=${chain.failureStep}")
                     runSu("am force-stop $packageName")
                     break
                 }
@@ -13708,7 +13999,8 @@ object AppCoordinator {
                 executor.clearDevicePicturesGallery(alias)
             }
             val resumePullAfter = when {
-                profileEditFailureStep == "hard_stop" -> false
+                // 用户硬停：保持暂停。改资料超时中止走 abort，仍应恢复调度。
+                profileEditFailureStep == "hard_stop" && PrefsStore.isHardStopRequested() -> false
                 !profileEditSucceeded -> true
                 else -> wasRunning
             }
@@ -13716,6 +14008,9 @@ object AppCoordinator {
                 growthModeLoginSafeguardPending = false
             }
             finishExclusiveTikTokUiOp(alias, deviceId, profileOpId, resumePullAfter = resumePullAfter)
+        }
+        } finally {
+            markBasicProfileEditEnded()
         }
     }
 

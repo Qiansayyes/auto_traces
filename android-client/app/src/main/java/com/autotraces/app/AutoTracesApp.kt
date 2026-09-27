@@ -13,6 +13,10 @@ class AutoTracesApp : Application() {
         NotificationHelper.ensureChannel(this)
         AppCoordinator.init(this)
         ProcessDiagnostics.noteProcessColdStart()
+        // Module C：进程冷启动后尽快巡检 Worker + VideoDed(18088)（后台线程，避免卡启动）
+        Thread {
+            runCatching { WorkerServiceWatchdog.ensureKeepAlive(this@AutoTracesApp, "app_cold_start") }
+        }.start()
     }
 
     override fun onTrimMemory(level: Int) {

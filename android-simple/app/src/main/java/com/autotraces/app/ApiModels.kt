@@ -733,6 +733,17 @@ data class AutoSwitchBundle(
      * - login：不备份不还原，清理 TikTok 数据后直接登录目标号
      */
     val cut_switch_scheme: String? = null,
+    /**
+     * 排班模式：
+     * - equal_day（默认）：自然日均分槽
+     * - fixed_duration：固定时长跨天循环（用 cycle_order + cycle_anchor_min 公式解析）
+     */
+    val plan_mode: String? = null,
+    val slot_duration_min: Int? = null,
+    val cycle_order: List<AutoSwitchCycleAccount>? = null,
+    val cycle_anchor_min: Long? = null,
+    /** 云端物化的一段绝对固定时长槽（含 epoch）；优先于周计划日槽展开。 */
+    val fixed_slots: List<AutoSwitchPlanSlot>? = null,
     val run_config: AutoSwitchRunConfig? = null,
     /** 按 TikTok 用户名（小写）打包的 enter 冻结配置；切号时本地切换，不再拉 getConfig。 */
     val configs_by_username: Map<String, AutoSwitchBundledAccountConfig>? = null,
@@ -752,7 +763,21 @@ data class AutoSwitchBundle(
         val scheme = cut_switch_scheme?.trim()?.lowercase().orEmpty()
         return scheme == "login" || scheme == "login_switch" || scheme == "exclusive_login"
     }
+
+    fun isFixedDurationPlan(): Boolean {
+        if (single_account_active == true) return false
+        val mode = plan_mode?.trim()?.lowercase().orEmpty()
+        if (mode == "fixed_duration") return true
+        val duration = slot_duration_min ?: 0
+        val anchor = cycle_anchor_min ?: 0L
+        return duration > 0 && anchor > 0L && (cycle_order?.size ?: 0) >= 2
+    }
 }
+
+data class AutoSwitchCycleAccount(
+    val row_index: Int? = null,
+    val username: String? = null,
+)
 
 data class AutoSwitchBundledAccountConfig(
     val active_template: String? = null,
@@ -832,6 +857,7 @@ data class AutoSwitchAccount(
 )
 
 data class AutoSwitchDailyPlan(
+    val plan_mode: String? = null,
     val slot_minutes: Int? = null,
     val account_count: Int? = null,
     val slots: List<AutoSwitchPlanSlot>? = null,
@@ -839,13 +865,22 @@ data class AutoSwitchDailyPlan(
 
 data class AutoSwitchPlanSlot(
     val slot_index: Int? = null,
+    val order_index: Int? = null,
     val start_min: Int? = null,
     val end_min: Int? = null,
+    /** 北京墙钟绝对分钟（Unix epoch 秒 // 60）；固定时长跨天用。 */
+    val start_epoch_min: Long? = null,
+    val end_epoch_min: Long? = null,
+    val schedule_date: String? = null,
     val row_index: Int? = null,
     val username: String? = null,
     val auto_publish_minute: Int? = null,
     /** 引流互点（teamwork Videos）时间点；与 [auto_publish_minute] 同级，每 slot 一个。 */
     val auto_mutual_minute: Int? = null,
+    val auto_publish_offset_min: Int? = null,
+    val auto_mutual_offset_min: Int? = null,
+    val auto_publish_epoch_min: Long? = null,
+    val auto_mutual_epoch_min: Long? = null,
 )
 
 data class AutoSwitchRetryPolicy(

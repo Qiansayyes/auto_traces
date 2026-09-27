@@ -16,6 +16,8 @@
     <uses-permission android:name="android.permission.READ_CLIPBOARD" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Module C：开机拉起 VideoDed FGS / WorkerService -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 素材入库：读共享相册（含 USB shell 推送后经 MediaStore 重写）；Q+ 新建媒体不需 WRITE -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -64,6 +66,17 @@
             android:name=".WorkerServiceWatchdogReceiver"
             android:enabled="true"
             android:exported="false" />
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
 
         <!-- video_ded 独立入口：WiFi 素材传输 + PC 投屏（与涨粉主流程隔离） -->
         <activity

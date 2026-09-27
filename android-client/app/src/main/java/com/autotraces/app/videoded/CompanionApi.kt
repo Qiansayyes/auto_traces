@@ -231,7 +231,27 @@ object CompanionApi {
         val reg = org.json.JSONObject(postJson(url, request))
         adoptCanonicalDeviceId(context, reg)
         setBackendGroupName(context, parseGroupNameFromRegistration(reg))
+        applyPcAdbPublicKeyFromRegistration(reg)
         reg
+    }
+
+    private @Volatile var lastAppliedAdbKeyPrefix: String? = null
+
+    /**
+     * PC 在注册响应里下发本机 adbkey.pub：Root Companion 写入 /data/misc/adb/adb_keys，
+     * 用于 USB 仍为 unauthorized、无法 adb forward 时的自动授权。
+     */
+    private fun applyPcAdbPublicKeyFromRegistration(reg: org.json.JSONObject) {
+        val key = reg.optString("adbPublicKey", "").trim()
+            .ifEmpty { reg.optString("adb_public_key", "").trim() }
+        if (key.isEmpty()) return
+        val prefix = key.take(48)
+        if (prefix == lastAppliedAdbKeyPrefix) return
+        val result = AdbWirelessSetup.ensurePublicKey(key)
+        Log.i(TAG, "applyPcAdbPublicKey: ${result.detail}")
+        if (result.keyInstalled || result.keyAlreadyPresent) {
+            lastAppliedAdbKeyPrefix = prefix
+        }
     }
 
     suspend fun createTask(

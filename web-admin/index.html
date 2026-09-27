@@ -173,7 +173,7 @@
           全选
         </label>
         <input id="backupAliasPickSearchInput" type="search" class="ui-input" placeholder="搜索别名 / device_id…" style="min-width:200px;max-width:280px;" autocomplete="off" />
-        <span id="backupAliasPickSummary" class="hint"></span>
+        <button id="backupAliasPickInvertBtn" type="button" class="ghost" title="反选当前筛选结果">反选</button><button id="backupAliasPickClearBtn" type="button" class="ghost" title="清空全部勾选">清空选择</button><button id="backupAliasPickSelectVisibleBtn" type="button" class="ghost" title="全选当前筛选结果">全选当前页</button><span id="backupAliasPickSummary" class="hint"></span><span id="backupAliasPickToast" class="alias-pick-toast" aria-live="polite"></span>
       </div>
       <div id="backupAliasPickList" class="import-preview-table-wrap"></div>
       <div class="modal-actions" style="flex-wrap:wrap;gap:8px;">
@@ -969,6 +969,11 @@
                   <option value="login">登录切号</option>
                 </select>
               </label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#444;" title="开启自动切号时写入选中设备；留空：新开=均分、已开再点=保持原时长；填 0=强制均分；填 30～720=每号固定活跃分钟并跨天循环">
+                固定活跃时长（分钟）
+                <input id="autoSwitchSlotDurationInput" type="number" class="pager-size-input" min="0" max="720" step="1" placeholder="留空=均分/保持" title="留空：新开均分、已开保持；0=强制均分；30～720=固定时长" style="width:100px;" />
+              </label>
+              <span class="hint" style="font-size:11px;color:#6d7488;">留空=新开均分/已开保持；0=强制均分</span>
               <button id="autoSwitchExcludedBatchBtn" type="button" class="ghost" title="按 username 批量设置/取消不参加自动切号">批量不参加自动切号</button>
               <span id="autoSwitchEnabledCountHint" class="hint"></span>
               <span id="backupArchiveSelectionHint" class="hint" style="display:none;">已选 <strong id="backupArchiveSelectedCount">0</strong> 条</span>

@@ -91,6 +91,9 @@ data class SlotPlanEntry(
     val slot_index: Int,
     val start_min: Int,
     val end_min: Int,
+    /** 固定时长跨天：北京墙钟绝对分钟；0 表示走自然日 start_min/end_min。 */
+    val start_epoch_min: Long = 0L,
+    val end_epoch_min: Long = 0L,
     val target_row_index: Int,
     val target_username: String,
     val cut_switch: CutSwitchPlanSteps = CutSwitchPlanSteps(),
@@ -99,7 +102,9 @@ data class SlotPlanEntry(
     val mutual_traffic: TimedInsertionPlan = TimedInsertionPlan(),
     /** 主播访问：上班后立刻消化 bundle 预取名单，再进入涨粉基线。 */
     val live_visit: TimedInsertionPlan = TimedInsertionPlan(),
-)
+) {
+    fun hasEpochBounds(): Boolean = start_epoch_min > 0L && end_epoch_min > start_epoch_min
+}
 
 /**
  * 本机账号运行时状态（备份路径、登录态、改资料标记等），与云端 bundle 按 row_index 合并。
@@ -131,6 +136,8 @@ data class ActivePublishPlan(
     val target_count: Int = -1,
     /** 互点会话结束后排队执行发作品 */
     val queued_after_mutual: Boolean = false,
+    /** 占用时钟起点（墙钟 ms）；超时强制清占用用。 */
+    val started_at_ms: Long = 0L,
 )
 
 /** 自治期进行中的引流互点上下文，持久化在 plan 文件。 */
@@ -141,6 +148,8 @@ data class ActiveMutualPlan(
     val op_type: String = "",
     val requested: Boolean = false,
     val pending: Boolean = false,
+    /** 占用时钟起点（墙钟 ms）；超时强制清占用用。 */
+    val started_at_ms: Long = 0L,
 )
 
 /** 自治期进行中的主播访问上下文（剩余用户名本地消化），持久化在 plan 文件。 */
@@ -151,6 +160,8 @@ data class ActiveLiveVisitPlan(
     val remaining_usernames: List<String> = emptyList(),
     val requested: Boolean = false,
     val pending: Boolean = false,
+    /** 占用时钟起点（墙钟 ms）；超时强制清占用用。 */
+    val started_at_ms: Long = 0L,
 )
 
 /**
@@ -659,6 +670,12 @@ object AutoSwitchLocalPlanStore {
         val mergedSlots = expanded.slots.map { fresh ->
             val old = previous.slots.firstOrNull { it.slot_key == fresh.slot_key }
             if (old == null) return@map fresh
+            // 固定时长重锚点/重洗后，同 slot_key 可能指向不同绝对时间窗；不得继承旧 DONE。
+            if (old.start_epoch_min != fresh.start_epoch_min ||
+                old.end_epoch_min != fresh.end_epoch_min
+            ) {
+                return@map fresh
+            }
             if (old.target_row_index != fresh.target_row_index ||
                 !old.target_username.equals(fresh.target_username, ignoreCase = true)
             ) {
@@ -868,6 +885,7 @@ object AutoSwitchLocalPlanStore {
         val sk = slotKey.trim()
         val oid = opId.trim()
         if (sk.isEmpty() || oid.isEmpty()) return
+        val now = System.currentTimeMillis()
         mutatePlan { current ->
             val prev = current.active_publish
             val sameOp = prev != null && prev.op_id == oid && prev.slot_key == sk
@@ -882,9 +900,61 @@ object AutoSwitchLocalPlanStore {
                 package_name = packageName.trim(),
                 target_count = targetCount?.takeIf { it >= 0 } ?: -1,
                 queued_after_mutual = if (sameOp) prev?.queued_after_mutual == true else false,
+                started_at_ms = if (sameOp && (prev?.started_at_ms ?: 0L) > 0L) {
+                    prev!!.started_at_ms
+                } else {
+                    now
+                },
             )
             current.copy(active_publish = ap)
         }
+    }
+
+    /** 发作品占用起点；缺时钟时补戳一次（升级兼容），返回 0 表示当前未占用。 */
+    fun ensurePublishOccupyStartedAtMs(): Long = synchronized(writeLock) {
+        val plan = getInternal() ?: return 0L
+        val ap = plan.active_publish
+        if (ap != null) {
+            if (ap.started_at_ms > 0L) return ap.started_at_ms
+            val now = System.currentTimeMillis()
+            saveInternal(plan.copy(active_publish = ap.copy(started_at_ms = now)))
+            return now
+        }
+        if (plan.slots.any { it.publish?.state == PlanStepState.RUNNING }) {
+            // 无 active_publish 的 RUNNING 泄漏：立刻视为到期（勿用 updated_at_ms，会随任意 plan 写入刷新）。
+            return 1L
+        }
+        return 0L
+    }
+
+    fun ensureMutualOccupyStartedAtMs(): Long = synchronized(writeLock) {
+        val plan = getInternal() ?: return 0L
+        val am = plan.active_mutual
+        if (am != null) {
+            if (am.started_at_ms > 0L) return am.started_at_ms
+            val now = System.currentTimeMillis()
+            saveInternal(plan.copy(active_mutual = am.copy(started_at_ms = now)))
+            return now
+        }
+        if (plan.slots.any { it.mutual_traffic?.state == PlanStepState.RUNNING }) {
+            return 1L
+        }
+        return 0L
+    }
+
+    fun ensureLiveVisitOccupyStartedAtMs(): Long = synchronized(writeLock) {
+        val plan = getInternal() ?: return 0L
+        val alv = plan.active_live_visit
+        if (alv != null) {
+            if (alv.started_at_ms > 0L) return alv.started_at_ms
+            val now = System.currentTimeMillis()
+            saveInternal(plan.copy(active_live_visit = alv.copy(started_at_ms = now)))
+            return now
+        }
+        if (plan.slots.any { it.live_visit?.state == PlanStepState.RUNNING }) {
+            return 1L
+        }
+        return 0L
     }
 
     fun clearActivePublish() {
@@ -931,7 +1001,10 @@ object AutoSwitchLocalPlanStore {
         val sk = slotKey.trim()
         val oid = opId.trim()
         if (sk.isEmpty() || oid.isEmpty()) return
+        val now = System.currentTimeMillis()
         mutatePlan { current ->
+            val prev = current.active_mutual
+            val sameOp = prev != null && prev.op_id == oid && prev.slot_key == sk
             current.copy(
                 active_mutual = ActiveMutualPlan(
                     slot_key = sk,
@@ -940,6 +1013,11 @@ object AutoSwitchLocalPlanStore {
                     op_type = opType.trim(),
                     requested = true,
                     pending = true,
+                    started_at_ms = if (sameOp && (prev?.started_at_ms ?: 0L) > 0L) {
+                        prev!!.started_at_ms
+                    } else {
+                        now
+                    },
                 ),
             )
         }
@@ -977,7 +1055,10 @@ object AutoSwitchLocalPlanStore {
         val sk = slotKey.trim()
         val oid = opId.trim()
         if (sk.isEmpty() || oid.isEmpty()) return
+        val now = System.currentTimeMillis()
         mutatePlan { current ->
+            val prev = current.active_live_visit
+            val sameOp = prev != null && prev.op_id == oid && prev.slot_key == sk
             current.copy(
                 active_live_visit = ActiveLiveVisitPlan(
                     slot_key = sk,
@@ -988,6 +1069,11 @@ object AutoSwitchLocalPlanStore {
                         .filter { it.isNotEmpty() },
                     requested = true,
                     pending = true,
+                    started_at_ms = if (sameOp && (prev?.started_at_ms ?: 0L) > 0L) {
+                        prev!!.started_at_ms
+                    } else {
+                        now
+                    },
                 ),
             )
         }
@@ -1402,13 +1488,18 @@ object AutoSwitchLocalPlanStore {
         val date = scheduleDate.trim()
         if (date.isEmpty()) return
         val minute = minuteOfDay.coerceIn(0, 1439)
+        val epochNow = beijingEpochMinute()
         var abandoned = 0
         mutatePlan { plan ->
             plan.copy(
                 slots = plan.slots.map { slot ->
                     if (slot.cut_switch.isDone()) return@map slot
-                    val expired = slot.schedule_date < date ||
-                        (slot.schedule_date == date && minute >= slot.end_min)
+                    val expired = if (slot.hasEpochBounds()) {
+                        epochNow >= slot.end_epoch_min
+                    } else {
+                        slot.schedule_date < date ||
+                            (slot.schedule_date == date && minute >= slot.end_min)
+                    }
                     if (!expired) return@map slot
                     abandoned++
                     val cs = slot.cut_switch
@@ -1536,12 +1627,21 @@ object AutoSwitchLocalPlanStore {
     }
 
     fun resolveSlotForMinute(plan: AutoSwitchLocalPlan, scheduleDate: String, minuteOfDay: Int): SlotPlanEntry? {
+        val epochCandidates = plan.slots.filter { it.hasEpochBounds() }
+        if (epochCandidates.isNotEmpty()) {
+            val epoch = beijingEpochMinute()
+            return epochCandidates
+                .filter { epoch >= it.start_epoch_min && epoch < it.end_epoch_min }
+                .minByOrNull { it.slot_index }
+        }
         val date = scheduleDate.trim()
         val minute = minuteOfDay.coerceIn(0, 1439)
         return plan.slots
             .filter { it.schedule_date == date && minute >= it.start_min && minute < it.end_min }
             .minByOrNull { it.slot_index }
     }
+
+    fun beijingEpochMinute(): Long = Calendar.getInstance(beijingTz).timeInMillis / 60_000L
 
     private fun terminalDone(s: PlanStepState): PlanStepState =
         when (s) {
@@ -1660,17 +1760,21 @@ object AutoSwitchLocalPlanStore {
         sessionId: String,
     ): AutoSwitchLocalPlan {
         val slots = mutableListOf<SlotPlanEntry>()
-        val dayPlans = bundle.weekly_plan?.day_plans.orEmpty()
-        if (dayPlans.isNotEmpty()) {
-            for (dp in dayPlans) {
-                val date = dp.schedule_date?.trim().orEmpty()
-                if (date.isEmpty()) continue
-                appendDaySlots(slots, bundle, date, dp.daily_plan)
-            }
+        if (bundle.isFixedDurationPlan()) {
+            appendFixedSlots(slots, bundle)
         } else {
-            val date = bundle.schedule_date?.trim().orEmpty()
-            if (date.isNotEmpty()) {
-                appendDaySlots(slots, bundle, date, bundle.daily_plan)
+            val dayPlans = bundle.weekly_plan?.day_plans.orEmpty()
+            if (dayPlans.isNotEmpty()) {
+                for (dp in dayPlans) {
+                    val date = dp.schedule_date?.trim().orEmpty()
+                    if (date.isEmpty()) continue
+                    appendDaySlots(slots, bundle, date, dp.daily_plan)
+                }
+            } else {
+                val date = bundle.schedule_date?.trim().orEmpty()
+                if (date.isNotEmpty()) {
+                    appendDaySlots(slots, bundle, date, bundle.daily_plan)
+                }
             }
         }
         return AutoSwitchLocalPlan(
@@ -1697,6 +1801,88 @@ object AutoSwitchLocalPlanStore {
                 video_count = acc.video_count?.trim()?.takeIf { it.isNotEmpty() },
             )
         }
+
+    private fun appendFixedSlots(
+        out: MutableList<SlotPlanEntry>,
+        bundle: AutoSwitchBundle,
+    ) {
+        val planSlots = bundle.fixedPlanSlots().ifEmpty {
+            // 物化列表为空时，至少用公式生成当前槽，避免无 slot 无法自治。
+            listOfNotNull(bundle.resolveFixedDurationSlotAtEpoch())
+        }
+        val accounts = bundle.accounts.orEmpty()
+        for (slot in planSlots) {
+            val slotIndex = slot.slot_index ?: continue
+            val startEpoch = slot.start_epoch_min ?: continue
+            val endEpoch = slot.end_epoch_min ?: continue
+            if (startEpoch <= 0L || endEpoch <= startEpoch) continue
+            val targetRi = slot.row_index ?: continue
+            val account = accounts.firstOrNull { (it.row_index ?: -1) == targetRi }
+            val username = account?.username?.trim()
+                ?: slot.username?.trim()
+                ?: continue
+            val scheduleDate = slot.schedule_date?.trim().orEmpty().ifBlank {
+                val cal = Calendar.getInstance(beijingTz).apply { timeInMillis = startEpoch * 60_000L }
+                String.format(
+                    "%04d-%02d-%02d",
+                    cal.get(Calendar.YEAR),
+                    cal.get(Calendar.MONTH) + 1,
+                    cal.get(Calendar.DAY_OF_MONTH),
+                )
+            }
+            val start = slot.start_min ?: 0
+            val end = slot.end_min ?: (start + (bundle.slot_duration_min ?: 0))
+            val slotKey = "fixed|$slotIndex"
+            val skipCut = bundle.skip_scheduled_cut_switch == true || bundle.single_account_active == true
+            out.add(
+                SlotPlanEntry(
+                    slot_key = slotKey,
+                    schedule_date = scheduleDate,
+                    slot_index = slotIndex,
+                    start_min = start,
+                    end_min = end,
+                    start_epoch_min = startEpoch,
+                    end_epoch_min = endEpoch,
+                    target_row_index = targetRi,
+                    target_username = username,
+                    cut_switch = if (skipCut) {
+                        CutSwitchPlanSteps(
+                            backup = PlanStepState.DONE,
+                            clear = PlanStepState.DONE,
+                            restore_or_login = PlanStepState.DONE,
+                            mode = "single_account",
+                        )
+                    } else {
+                        CutSwitchPlanSteps(mode = "switch")
+                    },
+                    publish = TimedInsertionPlan(
+                        trigger_at_min = slot.auto_publish_minute,
+                        state = if (slot.auto_publish_minute == null && slot.auto_publish_epoch_min == null) {
+                            PlanStepState.SKIPPED
+                        } else {
+                            PlanStepState.PENDING
+                        },
+                    ),
+                    mutual_traffic = TimedInsertionPlan(
+                        trigger_at_min = slot.auto_mutual_minute,
+                        state = when {
+                            slot.auto_mutual_minute == null && slot.auto_mutual_epoch_min == null -> PlanStepState.SKIPPED
+                            !bundle.isMutualTrafficConfiguredFor(username) -> PlanStepState.SKIPPED
+                            else -> PlanStepState.PENDING
+                        },
+                    ),
+                    live_visit = TimedInsertionPlan(
+                        trigger_at_min = start,
+                        state = if (bundle.liveVisitUsernamesFor(username).isEmpty()) {
+                            PlanStepState.SKIPPED
+                        } else {
+                            PlanStepState.PENDING
+                        },
+                    ),
+                ),
+            )
+        }
+    }
 
     private fun appendDaySlots(
         out: MutableList<SlotPlanEntry>,

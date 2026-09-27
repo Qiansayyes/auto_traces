@@ -102,8 +102,23 @@ class WorkerService : Service() {
 
     private fun stopImmediate() {
         intentionalStopInProgress = true
-        PrefsStore.setWorkerServiceShouldRun(false)
         PrefsStore.setHardStopRequested(true)
+        if (PrefsStore.isBound()) {
+            // 绑定机：硬停业务但留下 FGS，与「绑定即保活」一致，避免 Watchdog 反复拆建
+            PrefsStore.setWorkerServiceShouldRun(true)
+            AppCoordinator.stopAllWork(requestHardStop = true)
+            intentionalStopInProgress = false
+            WorkerServiceTracker.isRunning = true
+            startForeground(
+                NotificationHelper.NOTIFICATION_ID,
+                NotificationHelper.buildForegroundNotification(this, "硬停中：已暂停自动任务，仍监听云端指令"),
+            )
+            AppCoordinator.startIfNeeded()
+            WorkerServiceWatchdog.schedule(this, delayMs = 10_000L)
+            LogCenter.op(PrefsStore.getAlias(), "硬停：后台服务保持监听")
+            return
+        }
+        PrefsStore.setWorkerServiceShouldRun(false)
         WorkerServiceTracker.isRunning = false
         AppCoordinator.stopAllWork(requestHardStop = true)
         AppCoordinator.onWorkerServiceChanged(false)
@@ -129,6 +144,20 @@ class WorkerService : Service() {
         }
 
         fun stop(context: Context) {
+            if (PrefsStore.isBound()) {
+                PrefsStore.setHardStopRequested(true)
+                PrefsStore.setWorkerServiceShouldRun(true)
+                AppCoordinator.stopAllWork(requestHardStop = true)
+                if (WorkerServiceTracker.isRunning) {
+                    val intent = Intent(context, WorkerService::class.java).apply {
+                        action = ACTION_STOP_BACKGROUND_SERVICE
+                    }
+                    ContextCompat.startForegroundService(context, intent)
+                } else {
+                    WorkerServiceWatchdog.ensureWorkerService(context, "hard_stop_keep_alive")
+                }
+                return
+            }
             PrefsStore.setWorkerServiceShouldRun(false)
             WorkerServiceWatchdog.cancel(context)
             if (WorkerServiceTracker.isRunning) {

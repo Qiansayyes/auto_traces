@@ -18,6 +18,9 @@ object AutoSwitchSlotWindow {
         return if (end != null && end > 0) end else 1440
     }
 
+    fun hasEpochBounds(slot: AutoSwitchPlanSlot): Boolean =
+        (slot.start_epoch_min ?: 0L) > 0L && (slot.end_epoch_min ?: 0L) > (slot.start_epoch_min ?: 0L)
+
     /** 当前分钟所在 slot_index；与 [AutoSwitchSlotResolution.resolveTargetSlot] 配套。 */
     fun resolveSlotIndex(plan: AutoSwitchDailyPlan, minuteOfDay: Int): Int {
         val slots = plan.slots.orEmpty()
@@ -42,23 +45,78 @@ object AutoSwitchSlotWindow {
 
     /** 当前分钟是否落在账号分配时段内（左闭右开）。 */
     fun isWithinSlot(minuteOfDay: Int, slot: AutoSwitchPlanSlot): Boolean {
+        if (hasEpochBounds(slot)) {
+            val epoch = beijingEpochMinute()
+            val start = slot.start_epoch_min ?: return false
+            val end = slot.end_epoch_min ?: return false
+            return epoch >= start && epoch < end
+        }
         val start = slot.start_min ?: 0
         val end = slot.end_min ?: 1440
         val minute = minuteOfDay.coerceIn(0, 1439)
         return minute in start until end
     }
 
-    /** 插入操作触发窗口：时段内且已到 triggerMinute，且未过 end_min。 */
+    /** 插入操作触发窗口：时段内且已到 triggerMinute，且未过 end。 */
     fun isWithinInsertionTrigger(minuteOfDay: Int, slot: AutoSwitchPlanSlot, triggerMinute: Int): Boolean {
+        if (hasEpochBounds(slot)) {
+            if (!isWithinSlot(minuteOfDay, slot)) return false
+            val epoch = beijingEpochMinute()
+            val end = slot.end_epoch_min ?: return false
+            val triggerEpoch = resolveInsertionTriggerEpoch(slot, triggerMinute) ?: return false
+            return epoch >= triggerEpoch && epoch < end
+        }
         if (!isWithinSlot(minuteOfDay, slot)) return false
         val end = slot.end_min ?: 1440
         val minute = minuteOfDay.coerceIn(0, 1439)
         return minute >= triggerMinute && minute < end
     }
 
+    fun resolveInsertionTriggerEpoch(slot: AutoSwitchPlanSlot, triggerMinute: Int): Long? {
+        val pubEpoch = slot.auto_publish_epoch_min?.takeIf { it > 0L }
+        val mutualEpoch = slot.auto_mutual_epoch_min?.takeIf { it > 0L }
+        // 优先按「调用方传入的触发分钟」精确匹配，避免发作品/互点墙钟分钟碰巧相同时串台。
+        if (slot.auto_publish_minute == triggerMinute && pubEpoch != null) return pubEpoch
+        if (slot.auto_mutual_minute == triggerMinute && mutualEpoch != null) return mutualEpoch
+        val startEpoch = slot.start_epoch_min ?: return null
+        val pubOffset = slot.auto_publish_offset_min
+        if (pubOffset != null && slot.auto_publish_minute == triggerMinute) {
+            return startEpoch + pubOffset.toLong()
+        }
+        val mutualOffset = slot.auto_mutual_offset_min
+        if (mutualOffset != null && slot.auto_mutual_minute == triggerMinute) {
+            return startEpoch + mutualOffset.toLong()
+        }
+        if (pubOffset != null && mutualOffset == null && pubEpoch == null) {
+            return startEpoch + pubOffset.toLong()
+        }
+        if (mutualOffset != null && pubOffset == null && mutualEpoch == null) {
+            return startEpoch + mutualOffset.toLong()
+        }
+        val startCal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Shanghai")).apply {
+            timeInMillis = startEpoch * 60_000L
+        }
+        startCal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        startCal.set(java.util.Calendar.MINUTE, 0)
+        startCal.set(java.util.Calendar.SECOND, 0)
+        startCal.set(java.util.Calendar.MILLISECOND, 0)
+        var triggerEpoch = startCal.timeInMillis / 60_000L + triggerMinute.toLong()
+        val endEpoch = slot.end_epoch_min ?: (startEpoch + 1)
+        if (triggerEpoch < startEpoch) triggerEpoch += 1440L
+        if (triggerEpoch >= endEpoch) return null
+        return triggerEpoch
+    }
+
     /** 切号安全缓冲：距时段结束 [bufferMin] 分钟内不再启动新高优插入。 */
     fun isWithinSwitchSafeBuffer(minuteOfDay: Int, slot: AutoSwitchPlanSlot, bufferMin: Int): Boolean {
         if (bufferMin <= 0) return false
+        if (hasEpochBounds(slot)) {
+            val epoch = beijingEpochMinute()
+            val start = slot.start_epoch_min ?: return false
+            val end = slot.end_epoch_min ?: return false
+            val bufferStart = (end - bufferMin).coerceAtLeast(start)
+            return epoch >= bufferStart && epoch < end
+        }
         val start = slot.start_min ?: 0
         val end = slotEndMin(slot)
         val minute = minuteOfDay.coerceIn(0, 1439)

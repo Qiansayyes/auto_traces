@@ -17,6 +17,7 @@ import android.provider.MediaStore
 import com.autotraces.app.backup.DeviceBackupShell
 import com.autotraces.app.util.Config
 import com.autotraces.app.videoded.CompanionApi
+import com.autotraces.app.videoded.CreateTaskResponse
 import com.autotraces.app.videoded.TaskDownloadWorkflow
 import com.autotraces.app.videoded.TaskFileSnapshot
 import com.autotraces.app.videoded.TaskSnapshot
@@ -243,7 +244,9 @@ class RealTraceExecutor(
     private val appContextProvider: () -> Context,
 ) : TraceExecutor {
 
-    private fun isHardStopActive(): Boolean = PrefsStore.isHardStopRequested()
+    private fun isHardStopActive(): Boolean {
+        return PrefsStore.isHardStopRequested() || PrefsStore.isProfileEditTimeoutAbort()
+    }
 
     private fun shouldSwitchToMutualClick(): Boolean =
         PrefsStore.isMutualClickRequested() && PrefsStore.isMutualClickPending()
@@ -676,6 +679,7 @@ class RealTraceExecutor(
     private var lastRepostIntroPopupDismissAtMs: Long = 0L
     private var lastUpdateYourAppPopupDismissAtMs: Long = 0L
     private var lastLinkEmailPopupDismissAtMs: Long = 0L
+    private var lastAgreeAndContinuePopupDismissAtMs: Long = 0L
     private var lastTikTokNotificationsPopupDismissAtMs: Long = 0L
     private var lastMetaFacebookTikTokRecoverAtMs: Long = 0L
     private var lastMoreResultForTapAtMs: Long = 0L
@@ -1253,6 +1257,16 @@ class RealTraceExecutor(
         private const val INLINE_UPDATE_YOUR_APP_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 「Link email」关联邮箱弹窗：点 Not now 的冷却。 */
         private const val INLINE_LINK_EMAIL_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /**
+         * 「Agree and continue」条款弹窗（居中白卡）：点按钮冷却。
+         * 旧逻辑只扫屏高 ≥62% 下方带，居中按钮常漏；现升为全局守卫。
+         */
+        private const val INLINE_AGREE_AND_CONTINUE_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /** 按钮 OCR 漏识时的比例点兜底（居中卡底钮常见落点）。 */
+        private const val AGREE_AND_CONTINUE_FALLBACK_X_FRACTION = 0.50f
+        private const val AGREE_AND_CONTINUE_FALLBACK_Y_FRACTION = 0.58f
+        /** 按钮命中：忽略屏顶过上区域（避免误点顶栏无关文案）。 */
+        private const val AGREE_AND_CONTINUE_BUTTON_MIN_Y_FRACTION = 0.35f
         private const val INLINE_TIKTOK_NOTIFICATIONS_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 整屏 OCR 见 Meta/Facebook：拉回 TikTok 的冷却，避免连环重入。 */
         private const val INLINE_META_FACEBOOK_TIKTOK_RECOVER_COOLDOWN_MS = 5_000L
@@ -3838,7 +3852,7 @@ class RealTraceExecutor(
     }
 
     /**
-     * 整屏 OCR 后顺手关弹窗（Update your app Not now / Link email Not now / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue / Repost 介绍 OK 等）。
+     * 整屏 OCR 后顺手关弹窗（Agree and continue / Update your app Not now / Link email Not now / Viewer history / Save login for next time / Continue editing this post / Security checkup / Verify to continue / Repost 介绍 OK 等）。
      * @return 非 null 表示已点击关弹窗，调用方应重新 OCR（勿继续用过期 vision）。
      */
     private suspend fun dismissFullScreenInlinePopupsIfPresent(
@@ -3853,6 +3867,17 @@ class RealTraceExecutor(
             return null
         }
         val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() }
+        // 条款同意弹窗挡全屏，优先于其它弹窗（涨粉放大镜/登录外路径也会命中）
+        val agreeAndContinueDismissed = runCatching {
+            tryDismissAgreeAndContinuePopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = phaseLog,
+                tapWithJitter = false,
+            )
+        }.getOrDefault(false)
+        if (agreeAndContinueDismissed) return "agree_and_continue_popup_dismissed"
         val notificationsDismissed = runCatching {
             tryDismissTikTokSendNotificationsPopupFromVision(
                 ctx = ctx,
@@ -3945,6 +3970,192 @@ class RealTraceExecutor(
         }.getOrDefault(false)
         if (repostIntroDismissed) return "repost_intro_popup_dismissed"
         return null
+    }
+
+    /**
+     * 「Agree and continue」条款同意弹窗（For You 居中白卡）：
+     * - 正文常含 By tapping "Agree and continue" + Terms/Privacy
+     * - 按钮短文案 Agree and continue（勿点正文里的同名短语）
+     * - 旧 findBottomBandLabelContaining(0.62) 对居中钮易漏；此处放宽 Y、短钮优先、可比例兜底
+     */
+    private fun normalizeAgreeAndContinueOcrText(raw: String): String =
+        raw.lowercase(Locale.US)
+            .replace('\u201c', '"')
+            .replace('\u201d', '"')
+            .replace('\u2018', '\'')
+            .replace('\u2019', '\'')
+            .replace("&quot;", "\"")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    /** 按钮短文案清洗：去引号/首尾标点，避免把正文里的 "Agree and continue", 当成按钮。 */
+    private fun compactAgreeAndContinueButtonText(raw: String): String {
+        var s = normalizeAgreeAndContinueOcrText(raw)
+        // 去掉包裹引号与尾部逗号等
+        s = s.trim().trim('"', '\'', ',', '.', '!', '?', ':', ';')
+        while (s.length >= 2 && s.first() in charArrayOf('"', '\'') && s.last() in charArrayOf('"', '\'')) {
+            s = s.substring(1, s.length - 1).trim().trim(',', '.', '!', '?', ':', ';')
+        }
+        return s.trim()
+    }
+
+    private fun ocrTextLooksLikeAgreeAndContinueButton(raw: String): Boolean {
+        val low = normalizeAgreeAndContinueOcrText(raw)
+        if (low.contains("by tapping")) return false
+        // 正文碎片常带逗号/引号，不能当按钮
+        if (low.contains(',')) return false
+        val compact = compactAgreeAndContinueButtonText(raw)
+        return compact == "agree and continue"
+    }
+
+    private fun ocrTextContainsAgreeAndContinuePhrase(raw: String): Boolean {
+        val low = normalizeAgreeAndContinueOcrText(raw)
+        if (low.contains("agree and continue")) return true
+        // 折行：agree and + continue；\b 避免 continuing 误匹配
+        if (!low.contains("agree and")) return false
+        return Regex("""\bcontinue\b""").containsMatchIn(low)
+    }
+
+    private fun visionHasAgreeAndContinuePopup(vision: Text): Boolean {
+        val full = normalizeAgreeAndContinueOcrText(vision.text)
+        // 居中条款卡正文（主路径；截断 OCR 也常能见 By tapping + Agree and continue）
+        if (full.contains("by tapping") && ocrTextContainsAgreeAndContinuePhrase(full)) return true
+        if (full.contains("by tapping") &&
+            full.contains("agree and") &&
+            (full.contains("terms of service") || full.contains("privacy policy"))
+        ) {
+            return true
+        }
+        // 短按钮 + Terms/Privacy（排除登录页脚注 "you agree to our Terms"，脚注无短按钮）
+        if (ocrTextLooksLikeAgreeAndContinueButtonPresent(vision) &&
+            (full.contains("terms of service") || full.contains("privacy policy") || full.contains("by tapping"))
+        ) {
+            return true
+        }
+        return false
+    }
+
+    private fun ocrTextLooksLikeAgreeAndContinueButtonPresent(vision: Text): Boolean {
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                if (ocrTextLooksLikeAgreeAndContinueButton(line.text)) return true
+                for (el in line.elements) {
+                    if (ocrTextLooksLikeAgreeAndContinueButton(el.text)) return true
+                }
+                val joined = line.elements.joinToString(" ") { it.text.trim() }
+                if (ocrTextLooksLikeAgreeAndContinueButton(joined)) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 仅收精确短按钮「Agree and continue」；多命中取最靠下。
+     * 无候选时由调用方比例兜底（避免点正文引号行）。
+     */
+    private fun findAgreeAndContinueButtonHit(vision: Text, screenH: Int): StrictLabelHit? {
+        val minY = if (screenH > 0) {
+            (screenH * AGREE_AND_CONTINUE_BUTTON_MIN_Y_FRACTION).toInt()
+        } else {
+            Int.MIN_VALUE
+        }
+        val cands = ArrayList<StrictLabelHit>()
+        fun consider(text: String, box: Rect) {
+            if (box.centerY() < minY) return
+            if (!ocrTextLooksLikeAgreeAndContinueButton(text)) return
+            cands.add(StrictLabelHit(Point(box.centerX(), box.centerY()), box))
+        }
+        for (block in vision.textBlocks) {
+            for (line in block.lines) {
+                line.boundingBox?.let { consider(line.text, it) }
+                for (el in line.elements) {
+                    el.boundingBox?.let { consider(el.text, it) }
+                }
+                val boxes = line.elements.mapNotNull { it.boundingBox }
+                if (boxes.size >= 2) {
+                    val joined = line.elements.joinToString(" ") { it.text.trim() }
+                    val u = boxes.fold(boxes[0]) { acc, r ->
+                        Rect(
+                            minOf(acc.left, r.left),
+                            minOf(acc.top, r.top),
+                            maxOf(acc.right, r.right),
+                            maxOf(acc.bottom, r.bottom),
+                        )
+                    }
+                    consider(joined, u)
+                }
+            }
+        }
+        // OCR 折行：Agree and / continue
+        val pairs = flattenOcrLinesWithBoxes(vision)
+        val n = pairs.size
+        for (len in 2..3) {
+            for (i in 0..n - len) {
+                val slice = pairs.subList(i, i + len)
+                val joined = slice.joinToString(" ") { it.first.text.trim() }
+                val u = slice.fold(slice[0].second) { acc, pair ->
+                    val r = pair.second
+                    Rect(
+                        minOf(acc.left, r.left),
+                        minOf(acc.top, r.top),
+                        maxOf(acc.right, r.right),
+                        maxOf(acc.bottom, r.bottom),
+                    )
+                }
+                consider(joined, u)
+            }
+        }
+        return cands.maxByOrNull { it.rect.bottom }
+    }
+
+    private suspend fun tryDismissAgreeAndContinuePopupFromVision(
+        ctx: Context,
+        alias: String?,
+        vision: Text,
+        phaseLog: String,
+        tapWithJitter: Boolean,
+        /** 专用重试链可忽略冷却，避免 OcrOnce 刚点过后 1s 内无法复点。 */
+        ignoreCooldown: Boolean = false,
+    ): Boolean {
+        if (!visionHasAgreeAndContinuePopup(vision)) return false
+        val now = SystemClock.elapsedRealtime()
+        if (!ignoreCooldown &&
+            now - lastAgreeAndContinuePopupDismissAtMs < INLINE_AGREE_AND_CONTINUE_POPUP_DISMISS_COOLDOWN_MS
+        ) {
+            return false
+        }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(1)
+        val h = dm.heightPixels.coerceAtLeast(1)
+        val buttonHit = findAgreeAndContinueButtonHit(vision, h)
+        val rawPoint = if (buttonHit != null) {
+            buttonHit.point
+        } else {
+            // 正文已确认弹窗但按钮漏识：居中卡底钮比例兜底
+            alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+                devOp(
+                    safeAlias,
+                    "$phaseLog：见 Agree and continue 弹窗但未 OCR 到按钮，比例点兜底",
+                )
+            }
+            Point(
+                (w * AGREE_AND_CONTINUE_FALLBACK_X_FRACTION).toInt(),
+                (h * AGREE_AND_CONTINUE_FALLBACK_Y_FRACTION).toInt(),
+            )
+        }
+        val tap = if (tapWithJitter) {
+            autoLoginTapWithJitter(rawPoint, w, h)
+        } else {
+            coerceTapToScreen(rawPoint, w, h)
+        }
+        alias?.trim()?.takeIf { it.isNotEmpty() }?.let { safeAlias ->
+            val how = if (buttonHit != null) "OCR按钮" else "比例兜底"
+            devOp(safeAlias, "$phaseLog：Agree and continue 弹窗，点($how) (${tap.x},${tap.y})")
+        }
+        if (!runSuCommand("input tap ${tap.x} ${tap.y}")) return false
+        lastAgreeAndContinuePopupDismissAtMs = SystemClock.elapsedRealtime()
+        delay(450L)
+        return true
     }
 
     /**
@@ -14560,12 +14771,34 @@ class RealTraceExecutor(
             "发作品：本机 POST /api/v1/tasks/request（count=$count，username=$username，targetPath=$targetPath）→ PC tasks/create，开始拉取…",
         )
         return try {
-            val task = CompanionApi.createTask(app, count, targetPath, username)
-            if (task.files.isEmpty()) {
+            var task: CreateTaskResponse? = null
+            var lastErr: Throwable? = null
+            // PC 偶发未 ack 残留会 409；短退避重试，避免整天 slot 直接判死
+            repeat(3) { attempt ->
+                try {
+                    task = CompanionApi.createTask(app, count, targetPath, username)
+                    lastErr = null
+                    return@repeat
+                } catch (t: Throwable) {
+                    lastErr = t
+                    val msg = t.message.orEmpty()
+                    val retryable409 = msg.contains("device_has_active_task", ignoreCase = true) ||
+                        msg.contains("request_failed_409", ignoreCase = true)
+                    if (!retryable409 || attempt >= 2) throw t
+                    val waitMs = 2_000L * (attempt + 1)
+                    devOp(
+                        alias,
+                        "发作品：素材拉取遇活跃任务占用(409)，${waitMs}ms 后重试(${attempt + 1}/3)…",
+                    )
+                    delay(waitMs)
+                }
+            }
+            val created = task ?: throw (lastErr ?: IllegalStateException("createTask_failed"))
+            if (created.files.isEmpty()) {
                 lastPublishPostEntryFailureReason = "PC 返回任务无文件（请求数=$count）"
                 devOp(
                     alias,
-                    "发作品：PC 返回任务无文件（taskId=${task.taskId}，请求数=$count，实际拉取=0），素材拉取失败",
+                    "发作品：PC 返回任务无文件（taskId=${created.taskId}，请求数=$count，实际拉取=0），素材拉取失败",
                     fetchElapsedMs(),
                 )
                 return false
@@ -14573,31 +14806,31 @@ class RealTraceExecutor(
             TaskStore.saveTaskSnapshot(
                 app,
                 TaskSnapshot(
-                    taskId = task.taskId,
-                    status = task.status,
+                    taskId = created.taskId,
+                    status = created.status,
                     error = null,
                     createdAtMs = System.currentTimeMillis(),
                     targetPath = targetPath,
                     originalTaskId = null,
                     retryOfTaskId = null,
                     username = username,
-                    files = task.files.map {
+                    files = created.files.map {
                         TaskFileSnapshot(it.fileName, it.sizeBytes, it.md5, "pending", null)
                     },
                 ),
             )
-            if (task.adbPushed == true) {
+            if (created.adbPushed == true) {
                 TaskDownloadWorkflow.verifyUsbPushedAndAck(
                     app,
-                    task.taskId,
-                    task.files,
+                    created.taskId,
+                    created.files,
                     targetPath,
                 )
             } else {
                 TaskDownloadWorkflow.downloadVerifyAndAck(
                     app,
-                    task.taskId,
-                    task.files,
+                    created.taskId,
+                    created.files,
                     targetPath,
                 )
             }
@@ -14612,7 +14845,7 @@ class RealTraceExecutor(
             val elapsedMs = fetchElapsedMs()
             devOp(
                 alias,
-                "发作品：素材拉取完成 taskId=${task.taskId} 请求数=$count 实际拉取=${task.files.size} 耗时=${elapsedMs}ms；" +
+                "发作品：素材拉取完成 taskId=${created.taskId} 请求数=$count 实际拉取=${created.files.size} 耗时=${elapsedMs}ms；" +
                     "图库统计 图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} 合计=${stats.resolvedCount}",
                 elapsedMs,
             )
@@ -14621,7 +14854,7 @@ class RealTraceExecutor(
                 true
             } else {
                 lastPublishPostEntryFailureReason =
-                    "图库素材不可见（PC 已下发 ${task.files.size} 个文件，MediaStore 可见=0，" +
+                    "图库素材不可见（PC 已下发 ${created.files.size} 个文件，MediaStore 可见=0，" +
                         "多为 IS_PENDING/索引未就绪或 shell 幽灵）"
                 devOp(
                     alias,
@@ -14643,6 +14876,11 @@ class RealTraceExecutor(
                             "；投屏正常仅表示 ADB 已连。请打开「PC传输」保存/注册一次，" +
                             "确认 ID 与 PC 配对页一致，并更新 PC 去重服务到含 ResolveForClientDeviceId 的版本；" +
                             "PC=${CompanionApi.windowsBaseUrl(app)}）"
+                    t.message?.contains("device_has_active_task", ignoreCase = true) == true ||
+                        t.message?.contains("request_failed_409", ignoreCase = true) == true ->
+                        "（PC 仍有未结束拉素材任务；已自动重试仍失败。请升级 PC video_ded 到含「复用/抢占活跃任务」版本）"
+                    t.message?.contains("account_material_folder_not_assigned", ignoreCase = true) == true ->
+                        "（账号未绑素材目录；请升级 PC video_ded 到含自动分配目录版本，或在素材管理页绑定）"
                     else -> ""
                 }
             val elapsedMs = fetchElapsedMs()
@@ -19139,7 +19377,7 @@ class RealTraceExecutor(
             devOp(alias, "自动登录 OCR 失败：$errTag [$tag]")
         }
         if (vision != null) {
-            // 顺带处理：每次 autoLogin OCR 后，尝试 agree and / Don't allow / Swipe 引导 / 各类弹窗。
+            // 顺带处理：每次 autoLogin OCR 后，尝试 Agree and continue / Don't allow / Swipe 引导 / 各类弹窗。
             // 不可用 runCatching：会吞掉 ANR / 掉登录等须上浮的控制流异常。
             val overlayDismissed = try {
                 autoLoginTryDismissInlineOverlaysFromVision(ctx, alias, vision)
@@ -19172,13 +19410,17 @@ class RealTraceExecutor(
         val w = dm.widthPixels.coerceAtLeast(1)
         val h = dm.heightPixels.coerceAtLeast(1)
 
-        // 1) 下方 agree and（包含即可）
-        findBottomBandLabelContaining(vision, h, "agree and")?.let { hit ->
-            val tap = autoLoginTapWithJitter(hit.point, w, h)
-            devOp(alias, "自动登录(顺带) agree and(下方)：tap (${tap.x},${tap.y})")
-            if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                autoLoginDelay(alias, 450L, "agree and 后")
-            }
+        // 1) 「Agree and continue」条款弹窗（居中白卡；点完须重扫）
+        if (
+            tryDismissAgreeAndContinuePopupFromVision(
+                ctx = ctx,
+                alias = alias,
+                vision = vision,
+                phaseLog = "自动登录(顺带) Agree and continue 弹窗",
+                tapWithJitter = true,
+            )
+        ) {
+            return true
         }
 
         // 1b) 「Update your app」升级弹窗：点 Not now（挡全屏，优先关掉）
@@ -20496,14 +20738,17 @@ class RealTraceExecutor(
             if (pass > 1 && !autoLoginDelay(alias, 1000L, "agree and / Don't allow")) return handledAny
             val vision = autoLoginOcrOnce(ctx, alias, "auto_login_agree_and_or_dont_allow_$pass") ?: continue
 
-            val agreeHit = findBottomBandLabelContaining(vision, h, "agree and")
-            if (agreeHit != null) {
-                val tap = autoLoginTapWithJitter(agreeHit.point, w, h)
-                devOp(alias, "自动登录 agree and(下方)：tap (${tap.x},${tap.y})")
-                if (runSuCommand("input tap ${tap.x} ${tap.y}")) {
-                    autoLoginDelay(alias, 450L, "agree and 后")
-                    handledAny = true
-                }
+            if (
+                tryDismissAgreeAndContinuePopupFromVision(
+                    ctx = ctx,
+                    alias = alias,
+                    vision = vision,
+                    phaseLog = "自动登录 Agree and continue 弹窗",
+                    tapWithJitter = true,
+                    ignoreCooldown = pass > 1,
+                )
+            ) {
+                handledAny = true
             }
 
             if (handleDontAllow) {

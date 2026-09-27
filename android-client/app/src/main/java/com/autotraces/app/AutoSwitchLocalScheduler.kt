@@ -631,26 +631,40 @@ class AutoSwitchLocalScheduler(
         }
 
         val scheduleDate = beijingDateStr()
+        val fixedMode = currentBundle.isFixedDurationPlan()
+        // 跨日只清理计划态，不要 onPauseGrowth：单号/skip 切号时 cut 已 DONE，
+        // pause 会留下孤儿 exclusivePreempt，随后插入调度把「独占抢占中」当硬忙因永久 return，涨粉停死。
+        // 真正需要独占时由切号/到点插入路径自行 preempt。
+        // 固定时长跨天不断：午夜不 abort 当前绝对槽上的发作品/互点。
         if (lastProcessedScheduleDate != null && lastProcessedScheduleDate != scheduleDate) {
-            AutoSwitchLocalPlanStore.onScheduleDateChanged(lastProcessedScheduleDate!!)
-            onPauseGrowth()
+            if (!fixedMode) {
+                AutoSwitchLocalPlanStore.onScheduleDateChanged(lastProcessedScheduleDate!!)
+            }
             opQueue.clear()
             busy.set(false)
             insertionInflight = null
             pendingCutSwitchSlotKey = null
-            AutoSwitchLedger.cancelQueuedCutSwitchOpsForScheduleDate(lastProcessedScheduleDate!!)
-            LogCenter.op(alias, "【自动切号】日期切换 $lastProcessedScheduleDate → $scheduleDate")
+            if (!fixedMode) {
+                AutoSwitchLedger.cancelQueuedCutSwitchOpsForScheduleDate(lastProcessedScheduleDate!!)
+            }
+            LogCenter.op(
+                alias,
+                "【自动切号】日期切换 $lastProcessedScheduleDate → $scheduleDate" +
+                    if (fixedMode) "（固定时长保留跨日槽）" else "",
+            )
         }
         lastProcessedScheduleDate = scheduleDate
 
-        if (!currentBundle.isDateInWeekRange(scheduleDate)) {
+        if (!fixedMode && !currentBundle.isDateInWeekRange(scheduleDate)) {
             if (tryRefreshWeeklyBundle("今日 $scheduleDate 不在当前周计划内")) return
             logTickSkipThrottled("今日 $scheduleDate 不在当前周计划内")
+            // 周界刷新失败时仍尝试解除可能遗留的抢占，避免涨粉永久停摆
+            onTryResumeGrowth()
             return
         }
 
         val minuteOfDay = beijingMinuteOfDay()
-        if (recoveryTickNext) {
+        if (recoveryTickNext && !fixedMode) {
             AutoSwitchLocalPlanStore.abandonExpiredIncompleteCutSwitches(scheduleDate, minuteOfDay)
         }
         val currentSlotEntry = AutoSwitchLocalPlanStore.resolveSlotForMinute(plan, scheduleDate, minuteOfDay)
@@ -662,7 +676,9 @@ class AutoSwitchLocalScheduler(
         val slotEntry = incompleteRecovery
             ?: currentSlotEntry
             ?: run {
+                if (fixedMode && tryRefreshWeeklyBundle("固定时长物化槽已过期，刷新 bundle")) return
                 logTickSkip("当前 $scheduleDate ${formatMinuteOfDay(minuteOfDay)} 不在任何计划时段内")
+                onTryResumeGrowth()
                 return
             }
         if (incompleteRecovery != null && alias.isNotBlank()) {
@@ -673,9 +689,9 @@ class AutoSwitchLocalScheduler(
         }
 
         val slotScheduleDate = slotEntry.schedule_date
-        val planSlot = currentBundle.dailyPlanForDate(slotScheduleDate)?.slots.orEmpty()
-            .firstOrNull { (it.slot_index ?: -1) == slotEntry.slot_index }
+        val planSlot = currentBundle.findPlanSlotByIndex(slotEntry.slot_index, slotScheduleDate)
             ?: run {
+                if (fixedMode && tryRefreshWeeklyBundle("固定时长时段在 bundle 中缺失")) return
                 logTickSkip("时段 slot=${slotEntry.slot_key} 在 bundle 中缺失")
                 return
             }
@@ -724,6 +740,10 @@ class AutoSwitchLocalScheduler(
         cutSwitchInflightSlotKey = null
         pendingCutSwitchSlotKey = null
 
+        // 防御：prefs 里残留 exclusivePreempt、但本进程无真实独占队列/插入时，先释放再调度。
+        // 否则 dueTimedInsertionKindNeedingPreempt 只认「自动化执行中」，会把「独占抢占中」当成硬忙因死循环跳过。
+        releaseOrphanExclusivePreemptIfNeeded()
+
         deviceBusyReasonForInsertionScheduling()?.let { reason ->
             val dueLabel = dueTimedInsertionKindNeedingPreempt(
                 bundle = currentBundle,
@@ -744,6 +764,10 @@ class AutoSwitchLocalScheduler(
                         busyReason = reason,
                     ),
                 )
+                // 仅抢占标志挡住时：释放并允许本 tick 继续走涨粉空档恢复
+                if (reason == "独占抢占中") {
+                    onTryResumeGrowth()
+                }
                 return
             }
             // 到点发作品/互点：对齐切号，设独占抢占让涨粉协作退出，再入队（不等窗口滑过）。
@@ -1240,6 +1264,28 @@ class AutoSwitchLocalScheduler(
         if (busy.get()) return "本地 OP 执行中"
         if (opQueue.isNotEmpty()) return "本地 OP 队列非空（${opQueue.size}）"
         return null
+    }
+
+    /**
+     * 跨日/崩溃等可能留下 exclusivePreempt=true，但 op 队列与插入均空。
+     * 此时必须先释放，否则插入调度会永久「独占抢占中」跳过。
+     */
+    private fun releaseOrphanExclusivePreemptIfNeeded() {
+        if (!PrefsStore.isAutoSwitchExclusivePreempt()) return
+        if (busy.get() || opQueue.isNotEmpty()) return
+        if (pendingCutSwitchSlotKey != null) return
+        insertionInflight?.let { (_, kind) ->
+            if (isInsertionKindStillActive(kind)) return
+        }
+        if (AutoSwitchLocalPlanStore.isPublishContextOccupying()) return
+        if (AutoSwitchLocalPlanStore.isMutualContextOccupying()) return
+        if (AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()) return
+        if (ExecutionScope.isActive()) return
+        if (cutSwitchInflightSlotKey != null) return
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "【自动切号】清除孤儿独占抢占标志（无真实独占 OP）")
+        }
+        onTryResumeGrowth()
     }
 
     private fun deviceBusyReasonForInsertionScheduling(): String? {

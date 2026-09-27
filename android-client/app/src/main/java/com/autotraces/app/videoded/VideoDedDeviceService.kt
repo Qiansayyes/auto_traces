@@ -15,12 +15,19 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.autotraces.app.WorkerServiceWatchdog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+/** VideoDed FGS 存活标记，供本机 Watchdog 判断是否需重拉。 */
+object VideoDedDeviceServiceTracker {
+    @Volatile
+    var isRunning: Boolean = false
+}
 
 class VideoDedDeviceService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -39,6 +46,7 @@ class VideoDedDeviceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        VideoDedDeviceServiceTracker.isRunning = true
         createChannel()
         startForeground(1, buildNotification("Starting..."))
         try {
@@ -48,6 +56,8 @@ class VideoDedDeviceService : Service() {
             updateNotification("本地 API 未启动：${t.message}")
         }
         registerWifiAdbCallback()
+        // 本机 Alarm 巡检：Worker 停了仍保活 18088
+        runCatching { WorkerServiceWatchdog.schedule(this) }
         scope.launch {
             delay(12_000)
             tryOneShotBootAdbTcpip()
@@ -67,10 +77,15 @@ class VideoDedDeviceService : Service() {
     }
 
     override fun onDestroy() {
+        VideoDedDeviceServiceTracker.isRunning = false
         adbTcpipScheduleJob?.cancel()
         unregisterWifiAdbCallback()
         apiServer?.let { runCatching { it.stop() } }
         apiServer = null
+        // 非用户停 API：尽快再巡检拉起
+        runCatching {
+            WorkerServiceWatchdog.schedule(this, delayMs = 8_000L)
+        }
         super.onDestroy()
     }
 
@@ -318,7 +333,6 @@ class VideoDedDeviceService : Service() {
         /** @return 是否已入队（false 表示同 taskId 已在下载或入队被跳过） */
         fun enqueueDownloadTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
-                Log.d("VideoDedDeviceService", "enqueueDownloadTask skipped duplicate taskId=$taskId")
                 return false
             }
             val intent = Intent(context, VideoDedDeviceService::class.java).apply {
@@ -333,7 +347,6 @@ class VideoDedDeviceService : Service() {
 
         fun enqueueUsbPushedVerifyTask(context: Context, taskId: String, files: List<TaskFileInfo>, targetPath: String?): Boolean {
             if (TaskDownloadCoordinator.isActive(taskId)) {
-                Log.d("VideoDedDeviceService", "enqueueUsbPushedVerifyTask skipped duplicate taskId=$taskId")
                 return false
             }
             val intent = Intent(context, VideoDedDeviceService::class.java).apply {
@@ -349,6 +362,14 @@ class VideoDedDeviceService : Service() {
         fun enqueueTryRootAdbTcpip(context: Context) {
             val intent = Intent(context, VideoDedDeviceService::class.java).apply { action = ACTION_TRY_ROOT_ADB_TCPIP }
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        /** 显式拉起 FGS（开机 / Magisk / Watchdog）。 */
+        fun ensureRunning(context: Context) {
+            ContextCompat.startForegroundService(
+                context.applicationContext,
+                Intent(context.applicationContext, VideoDedDeviceService::class.java),
+            )
         }
     }
 }

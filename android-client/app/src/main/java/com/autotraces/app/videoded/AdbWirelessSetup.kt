@@ -3,7 +3,8 @@
 import android.util.Log
 
 /**
- * Root 下自动开启 TCP adbd 并将 PC 的 RSA 公钥写入 [adb_keys]，实现免点「允许调试」的无线授权。
+ * Root 下将 PC 的 RSA 公钥写入 [adb_keys]（并可开启 TCP adbd）。
+ * USB 未授权时无法走 adb forward：由 PC 在注册心跳响应里下发公钥，本机 [ensurePublicKey] 写入即可完成授权。
  */
 object AdbWirelessSetup {
     private const val TAG = "AdbWirelessSetup"
@@ -19,6 +20,38 @@ object AdbWirelessSetup {
         val tcpEnabled: Boolean,
         val detail: String,
     )
+
+    data class EnsureKeyResult(
+        val su: Boolean,
+        val keyInstalled: Boolean,
+        val keyAlreadyPresent: Boolean,
+        val detail: String,
+    )
+
+    /**
+     * 仅写入 PC 公钥（不强制开 TCP）。密钥已存在则不动 adbd；新写入时 restart adbd，
+     * 使 USB `unauthorized` 在无需手机点「允许」的情况下变为 `device`。
+     */
+    fun ensurePublicKey(publicKeyLine: String?): EnsureKeyResult {
+        val su = RootWifiAdbHelper.hasSu()
+        val key = publicKeyLine?.trim().orEmpty()
+        if (!su) {
+            return EnsureKeyResult(false, false, false, "无 su，无法写入 adb_keys")
+        }
+        if (key.isEmpty()) {
+            return EnsureKeyResult(true, false, false, "未提供 PC 公钥")
+        }
+        return when (val r = installPublicKey(key)) {
+            is KeyInstallResult.AlreadyPresent ->
+                EnsureKeyResult(true, true, true, "PC 公钥已存在")
+            is KeyInstallResult.Installed ->
+                EnsureKeyResult(true, true, false, "已写入 PC 公钥并重启 adbd")
+            is KeyInstallResult.Failed -> {
+                Log.w(TAG, "ensurePublicKey: ${r.reason}")
+                EnsureKeyResult(true, false, false, "写入失败：${r.reason}")
+            }
+        }
+    }
 
     fun prepare(context: android.content.Context, publicKeyLine: String?, forceTcpPort: Int?): PrepareResult {
         val port = (forceTcpPort ?: ApiSettings.getAdbTcpipPort(context)).coerceIn(1024, 65535)
