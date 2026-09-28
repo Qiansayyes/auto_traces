@@ -38,7 +38,7 @@ class SettingsActivity : AppCompatActivity() {
                         if (resp.code == 0 && !resp.token.isNullOrBlank()) {
                             PrefsStore.saveAuthToken(resp.token!!, resp.username ?: u)
                             PrefsStore.saveAuthPassword(p)
-                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
+                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded("云端登录")
                             binding.statusText.text = "登录成功"
                         } else {
                             binding.statusText.text = resp.msg

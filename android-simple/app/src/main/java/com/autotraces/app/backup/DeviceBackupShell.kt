@@ -50,7 +50,8 @@ object DeviceBackupShell {
 
     /**
      * 补充强停：仅对 ps NAME 匹配包名（含 :push）的 pid 执行 kill -9。
-     * 切号/备份前与 [AppCoordinator.forceStopTikTokCleanly] 共用此命令，避免两套杀进程逻辑漂移。
+     * 切号/备份前与 AppCoordinator 历史 force-stop 命令共用此串，避免两套杀进程逻辑漂移。
+     * 注意：TikTok 图库授权路径禁止 force-stop。
      */
     fun supplementalKillCommand(dataPackageName: String): String {
         val q = shellQuote(dataPackageName.trim())

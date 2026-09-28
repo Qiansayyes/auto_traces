@@ -14573,7 +14573,9 @@ if (deviceAliasGroupsEl) {
       const isSwitchOnly = target.hasAttribute("data-account-switch");
       const isUnassignOnly = target.hasAttribute("data-account-unassign");
       const isAutoSwitchExcludeOnly = target.hasAttribute("data-account-auto-switch-excluded");
-      if (!isActiveCard && !isSwitchOnly && !isUnassignOnly && !isAutoSwitchExcludeOnly) {
+      // 单号活跃是整机级开关，不依赖当前高亮账号，非 active 卡片也应可点
+      const isSingleAccountActiveOnly = target.hasAttribute("data-single-account-active");
+      if (!isActiveCard && !isSwitchOnly && !isUnassignOnly && !isAutoSwitchExcludeOnly && !isSingleAccountActiveOnly) {
         event.preventDefault();
         return;
       }

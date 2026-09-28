@@ -154,7 +154,7 @@ class MainActivity : AppCompatActivity() {
             renderDeviceInfo()
             return
         }
-        AppCoordinator.ensureTikTokGalleryPermissionIfNeeded()
+        // TikTok 权限仅冷启动/首次绑定授一次，勿在 onResume 巡检（会并发强杀打断登录）。
         lifecycleScope.launch {
             val recovered = BindingRecovery.tryRecoverFromCloud(this@MainActivity)
             if (recovered) {
@@ -661,6 +661,7 @@ class MainActivity : AppCompatActivity() {
                             PrefsStore.saveBinding(response.device_id, alias)
                             PrefsStore.markBindingRefreshedNow()
                             LogCenter.op(alias, "绑定成功：${response.device_id}")
+                            AppCoordinator.ensureTikTokGalleryPermissionIfNeeded("首次绑定")
                             AppCoordinator.syncOnline()
                             binding.bindStatusText.text = "绑定成功"
                             WorkerService.startResumingAutomation(this@MainActivity)
