@@ -4522,19 +4522,17 @@ async function applyPcServiceUrlToSelectedDevices() {
     setStatus(error.message || "PC 服务地址无效", "warning");
     return;
   }
+  // 先记下勾选（避免后续操作误清）；下发鉴权以服务端按 device_id 解析为准
   const selectedIds = selectedPcServiceDeviceIds();
   if (!selectedIds.length) {
     setStatus("请先勾选要下发的设备", "warning");
     return;
   }
-  const items = selectedIds.map((deviceId) => {
-    const info = pcServiceDevices?.[deviceId] || {};
-    return {
-      device_id: deviceId,
-      alias: String(info?.alias || "").trim(),
-      windows_base_url: windowsBaseUrl,
-    };
-  });
+  const items = selectedIds.map((deviceId) => ({
+    device_id: deviceId,
+    alias: "",
+    windows_base_url: windowsBaseUrl,
+  }));
   setStatus(`正在下发 PC 地址到 ${items.length} 台设备...`, "info");
   if (pcServiceApplyBtn) pcServiceApplyBtn.disabled = true;
   try {

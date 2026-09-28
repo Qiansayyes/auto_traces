@@ -71,6 +71,41 @@ class DevicePcServiceBatchSetTest(unittest.TestCase):
         self.assertEqual(queue[0]["op_type"], "set_pc_service_url")
         self.assertEqual(queue[0]["payload"]["windows_base_url"], "http://192.168.1.6:5088")
 
+    def test_batch_set_ignores_stale_client_alias(self) -> None:
+        """改绑后管理台若仍传旧 alias，须按 DB/store 当前别名鉴权并入队。"""
+        owner = "admin_pc_url_test"
+        did = "dev_pc_url_stale_alias_001"
+        current_alias = "9_Mx99"
+        stale_alias = "9_Mx61"
+        with m.store.lock:
+            m.store.devices[did] = m.DeviceInfo(
+                alias=current_alias,
+                fingerprint="fp_pc_url_stale_alias",
+                owner_username=owner,
+            )
+            m.store.pending_device_ops.pop(did, None)
+        session = {"username": owner}
+        payload = m.DevicePcServiceUrlBatchSetRequest(
+            items=[
+                m.DevicePcServiceUrlSetItem(
+                    device_id=did,
+                    alias=stale_alias,
+                    windows_base_url="http://172.168.100.222:5088",
+                )
+            ]
+        )
+        with patch.object(m, "_require_login", return_value=(None, session)), patch.object(
+            m, "_require_login_and_owning_device", return_value=(None, m.store.devices[did])
+        ) as auth_mock, patch.object(m, "_persist_device_pc_service_url") as persist:
+            resp = m.admin_device_pc_service_batch_set(payload, authorization="Bearer test")
+        self.assertEqual(resp["code"], 0)
+        self.assertEqual(resp["enqueued"], 1)
+        self.assertEqual(resp["results"][0]["alias"], current_alias)
+        auth_mock.assert_called_once()
+        self.assertEqual(auth_mock.call_args.args[0], did)
+        self.assertEqual(auth_mock.call_args.args[1], current_alias)
+        persist.assert_called_once_with(did, "http://172.168.100.222:5088")
+
 
 if __name__ == "__main__":
     unittest.main()

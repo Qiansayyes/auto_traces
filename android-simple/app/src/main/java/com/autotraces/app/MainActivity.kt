@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.autotraces.app.databinding.ActivityMainBinding
 import com.autotraces.app.videoded.VideoDedMainActivity
+import com.autotraces.app.videoded.VideoDedSettingsRegistrar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -1989,6 +1990,7 @@ class MainActivity : AppCompatActivity() {
                         if (response.code == 0 && !response.device_id.isNullOrBlank()) {
                             PrefsStore.saveBinding(response.device_id, alias)
                             PrefsStore.markBindingRefreshedNow()
+                            VideoDedSettingsRegistrar.syncCompanionDeviceNameFromAlias(this@MainActivity)
                             LogCenter.op(alias, "绑定成功：${response.device_id}")
                             AppCoordinator.ensureTikTokGalleryPermissionIfNeeded("首次绑定")
                             AppCoordinator.syncOnline()

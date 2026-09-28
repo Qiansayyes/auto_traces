@@ -11439,6 +11439,9 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 )
                 conn.commit()
                 _hydrate_device_from_db(existing_id)
+                _mark_overview_dirty(owner)
+                if row_owner:
+                    _mark_overview_dirty(row_owner)
                 print(f"[{now_text()}] 系统 | 设备转绑成功：{old_alias}/{row_owner} -> {alias}/{owner}（device_id={existing_id}）")
                 return {"code": 0, "msg": "绑定成功", "device_id": existing_id, "alias": alias}
             if old_alias != alias:
@@ -11448,6 +11451,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
                 )
             conn.commit()
             _hydrate_device_from_db(existing_id)
+            _mark_overview_dirty(owner)
             print(f"[{now_text()}] 系统 | 设备绑定确认：{alias} -> {existing_id}（owner={owner}）")
             return {"code": 0, "msg": "绑定成功", "device_id": existing_id, "alias": alias}
 
@@ -11474,6 +11478,7 @@ def bind_device(payload: BindDeviceRequest, authorization: str | None = Header(d
         conn.close()
 
     _hydrate_device_from_db(device_id)
+    _mark_overview_dirty(owner)
     print(f"[{now_text()}] 系统 | 设备绑定成功：{alias} -> {device_id}（owner={owner}）")
     return {"code": 0, "msg": "绑定成功", "device_id": device_id, "alias": alias}
 
@@ -14784,22 +14789,28 @@ def _normalize_windows_base_url(raw: str) -> str:
 
 
 def _resolve_device_alias_for_admin(device_id: str, alias: str = "") -> str:
-    resolved = str(alias or "").strip()
-    if resolved:
-        return resolved
+    """按 device_id 从库/内存解析当前别名。
+
+    管理台列表可能在设备改绑后仍缓存旧 alias；若优先采信请求体里的别名，
+    会触发「device_id与别名不匹配」导致 PC 地址写库/入队失败，设备再被 bundle
+    同步回旧的 pc_service_url。因此以 DB 为准（多 worker 下比内存更新），请求体仅作兜底。
+    """
     did = str(device_id or "").strip()
     if not did:
-        return ""
+        return str(alias or "").strip()
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT alias FROM client_devices WHERE device_id = ?", (did,)).fetchone()
+        db_alias = str(row["alias"] if row else "").strip()
+        if db_alias:
+            return db_alias
+    finally:
+        conn.close()
     with store.lock:
         dev = store.devices.get(did)
         if dev and str(dev.alias or "").strip():
             return str(dev.alias).strip()
-    conn = _get_db()
-    try:
-        row = conn.execute("SELECT alias FROM client_devices WHERE device_id = ?", (did,)).fetchone()
-        return str(row["alias"] if row else "").strip()
-    finally:
-        conn.close()
+    return str(alias or "").strip()
 
 
 def _load_device_pc_service_url(device_id: str) -> str:
@@ -14821,8 +14832,14 @@ def _persist_device_pc_service_url(device_id: str, url: str) -> None:
     did = str(device_id or "").strip()
     if not did:
         return
+    owner = ""
     conn = _get_db()
     try:
+        row = conn.execute(
+            "SELECT owner_username FROM client_devices WHERE device_id = ?",
+            (did,),
+        ).fetchone()
+        owner = str(row["owner_username"] if row else "").strip()
         conn.execute(
             "UPDATE client_devices SET pc_service_url = ?, updated_at = ? WHERE device_id = ?",
             (url, now_text(), did),
@@ -14830,6 +14847,8 @@ def _persist_device_pc_service_url(device_id: str, url: str) -> None:
         conn.commit()
     finally:
         conn.close()
+    if owner:
+        _mark_overview_dirty(owner)
 
 
 def _enqueue_pc_service_url_op(device_id: str, alias: str, windows_base_url: str) -> str:
