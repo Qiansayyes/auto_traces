@@ -5893,22 +5893,29 @@ object AppCoordinator {
         }
     }
 
-    /** 定位（含后台）：一律用 root 永久拒绝，避免系统弹窗拖死流程。 */
-    private fun tiktokLocationDenyPermissions(): List<String> {
-        val base = listOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            base + Manifest.permission.ACCESS_BACKGROUND_LOCATION
-        } else {
-            base
+    /** 定位候选权限：仅当 TikTok 已在 manifest 声明时才 pm revoke，避免「has not requested」误报失败。 */
+    private fun tiktokLocationDenyPermissions(pkg: String): List<String> {
+        val candidates = buildList {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+            }
         }
+        return candidates.filter { packageRequestsPermission(pkg, it) }
     }
 
-    /** pm revoke + appops ignore：幂等，可在图库已授权时单独执行。 */
+    private fun packageRequestsPermission(pkg: String, perm: String): Boolean {
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val info = appContext.packageManager.getPackageInfo(pkg, PackageManager.GET_PERMISSIONS)
+            info.requestedPermissions?.contains(perm) == true
+        }.getOrDefault(false)
+    }
+
+    /** pm revoke（仅已声明）+ appops ignore：幂等，可在图库已授权时单独执行。 */
     private fun tiktokLocationDenyRootCommands(pkg: String): List<String> = buildList {
-        for (perm in tiktokLocationDenyPermissions()) {
+        for (perm in tiktokLocationDenyPermissions(pkg)) {
             add("pm revoke $pkg $perm")
         }
         add("appops set $pkg COARSE_LOCATION ignore")
@@ -5933,6 +5940,14 @@ object AppCoordinator {
         LogCenter.op(alias, "$reason：TikTok 后台已关闭（等待 ${waitMs}ms）")
     }
 
+    /** pm grant/revoke 对未声明权限会抛 SecurityException，属无害，不当失败。 */
+    private fun isBenignPermissionCommandFailure(output: String): Boolean {
+        val t = output.lowercase()
+        return "has not requested permission" in t ||
+            "unknown permission" in t ||
+            "permission is not a changeable permission type" in t
+    }
+
     /** 执行一组 root 权限命令，返回失败条数与失败明细。 */
     private suspend fun runTikTokPermissionRootCommands(commands: List<String>): Pair<Int, List<String>> {
         var failed = 0
@@ -5940,8 +5955,11 @@ object AppCoordinator {
         for (command in commands) {
             val ok = runExecutorSu(command)
             if (!ok) {
-                failed++
                 val output = runExecutorSuWithOutput("$command 2>&1 || true").orEmpty().take(220)
+                if (isBenignPermissionCommandFailure(output)) {
+                    continue
+                }
+                failed++
                 failLogs += "$command | ${if (output.isBlank()) "no output" else output}"
             }
         }
