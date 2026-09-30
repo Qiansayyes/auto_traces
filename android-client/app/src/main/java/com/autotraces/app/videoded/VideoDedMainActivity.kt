@@ -130,38 +130,33 @@ class VideoDedMainActivity : ComponentActivity() {
     private fun buildSettingsSection(): View {
         val section = sectionContainer("PC 服务 / 投屏地址")
         windowsUrlInput = editText("PC 服务地址", CompanionApi.windowsBaseUrl(this))
+        // 先按别名纠正本地显示名（已绑定则强制=别名）
+        VideoDedSettingsRegistrar.syncCompanionDeviceNameFromAlias(this)
         deviceNameLabel = TextView(this).apply {
             text = CompanionApi.formatDeviceNameLine(this@VideoDedMainActivity)
             setPadding(0, 8, 0, 4)
         }
-        val defaultName = WifiUtils.getWifiIp(this)
-            ?.substringAfterLast('.')
-            ?.takeIf { it.isNotBlank() }
-            ?.let { "设备-$it" }
-            ?: CompanionApi.getDeviceName(this@VideoDedMainActivity)
-        val deviceNameInput = editText(
-            "设备名称（默认 IPv4 最后一段）",
-            defaultName,
-        )
-        val deviceNameSaveButton = Button(this).apply {
-            text = "保存设备名称"
-            setOnClickListener {
-                CompanionApi.setDeviceName(this@VideoDedMainActivity, deviceNameInput.text?.toString().orEmpty())
-                refreshDeviceNameLabels()
-                lifecycleScope.launch { refreshRegistration() }
-            }
+        val deviceNameHint = TextView(this).apply {
+            text = "投屏显示名固定为云端别名，不可自定义"
+            setPadding(0, 0, 0, 8)
         }
         section.addView(windowsUrlInput)
+        val pullCloudPcUrlButton = Button(this).apply {
+            text = "从云端同步 PC 地址"
+            setOnClickListener {
+                lifecycleScope.launch { pullPcServiceUrlFromCloud() }
+            }
+        }
         val saveSettingsButton = Button(this).apply {
             text = "保存设置并重新注册"
             setOnClickListener {
                 lifecycleScope.launch { saveAllSettingsAndRegister() }
             }
         }
+        section.addView(pullCloudPcUrlButton)
         section.addView(saveSettingsButton)
         section.addView(deviceNameLabel)
-        section.addView(deviceNameInput)
-        section.addView(deviceNameSaveButton)
+        section.addView(deviceNameHint)
         val mirrorIpTitle = TextView(this).apply {
             text = "设备 IPv4"
             setPadding(0, 8, 0, 4)
@@ -365,6 +360,21 @@ class VideoDedMainActivity : ComponentActivity() {
             this.inputType = inputType
             setPadding(0, 8, 0, 8)
         }
+    }
+
+    private suspend fun pullPcServiceUrlFromCloud() {
+        appendLog("正在从云端拉取 PC 地址…")
+        val pull = VideoDedSettingsRegistrar.pullPcServiceUrlFromCloud(this)
+        windowsUrlInput.setText(CompanionApi.windowsBaseUrl(this))
+        refreshMirrorAddrLine()
+        appendLog(pull.message)
+        Toast.makeText(this, pull.message, Toast.LENGTH_LONG).show()
+        pull.registration?.let { applyRegistrationResult(it, verbose = true) }
+            ?: run {
+                if (pull.remoteUrl.isNotEmpty()) {
+                    statusView.text = "状态：${pull.message}"
+                }
+            }
     }
 
     private suspend fun saveAllSettingsAndRegister() {

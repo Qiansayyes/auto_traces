@@ -106,6 +106,35 @@ class DevicePcServiceBatchSetTest(unittest.TestCase):
         self.assertEqual(auth_mock.call_args.args[1], current_alias)
         persist.assert_called_once_with(did, "http://172.168.100.222:5088")
 
+    def test_check_start_and_get_config_include_pc_service_url(self) -> None:
+        did = "dev_pc_url_check_start_001"
+        owner = "admin_pc_url_test"
+        alias = "pc_url_probe"
+        fp = "fp_pc_url_check_start_001"
+        now = m.now_text()
+        url = "http://172.168.100.222:5088"
+        conn = m._get_db()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO client_devices (
+                    device_id, owner_username, alias, device_group, fingerprint,
+                    status, pending_start, paused, auto_start_opt_out,
+                    created_at, updated_at, pc_service_url
+                ) VALUES (?, ?, ?, '', ?, 'running', 0, 0, 0, ?, ?, ?)
+                """,
+                (did, owner, alias, fp, now, now, url),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        m._hydrate_device_from_db(did)
+        with patch.object(m, "auth_or_error", return_value=(None, m.store.devices[did])):
+            cs = m.check_start(did, alias)
+            cfg = m.get_config(did, alias)
+        self.assertEqual(cs.get("pc_service_url"), url)
+        self.assertEqual(cfg.get("pc_service_url"), url)
+
 
 if __name__ == "__main__":
     unittest.main()

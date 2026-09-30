@@ -151,16 +151,26 @@ object GalleryMediaPublisher {
                     if (!inPictures) continue
                     val uri = ContentUris.withAppendedId(collection, cursor.getLong(idCol))
                     val path = data.trim()
-                    val fileMissing =
+                    // 关键：shell/root push 的 Pictures 文件 App 侧 File() 常 Permission Denied，
+                    // 但 content:// 仍可读。旧逻辑仅凭 File 失败就当幽灵删掉 → 拉取 2 条只剩 0/1。
+                    val fileMissingByApi =
                         path.isNotEmpty() && (!File(path).isFile || File(path).length() <= 0L)
-                    // _data 空时不要直接当幽灵：改用 URI 可读性（Scoped Storage 下 _data 常空但仍可用）
-                    val uriUnreadable =
-                        path.isEmpty() && !isMediaStoreUriReadable(resolver, uri)
+                    val uriReadable = isMediaStoreUriReadable(resolver, uri)
                     val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else -1L
-                    val sizeLie =
+                    val sizeLieByApi =
                         size > 0L && path.isNotEmpty() &&
                             (!File(path).isFile || File(path).length() <= 0L)
-                    if (fileMissing || uriUnreadable || sizeLie) {
+                    val trulyGone =
+                        when {
+                            // URI 还能打开：绝不是幽灵（可能只是 App 无直读 _data 权限）
+                            uriReadable -> false
+                            // _data 空且 URI 打不开：真幽灵
+                            path.isEmpty() -> true
+                            // File 与 URI 都不可用：真缺文件
+                            fileMissingByApi || sizeLieByApi -> true
+                            else -> false
+                        }
+                    if (trulyGone) {
                         ghosts.add(uri)
                     }
                 }

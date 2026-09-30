@@ -1521,8 +1521,19 @@ object AutoSwitchLocalPlanStore {
         }
     }
 
-    /** 进程重启后：将所有 RUNNING 步骤降回 PENDING，便于按本地计划续跑。 */
-    fun recoverStaleRunningStepsAfterProcessDeath() {
+    /**
+     * 进程重启后：将 RUNNING 步骤降回 PENDING，便于按本地计划续跑。
+     *
+     * @param resetMutualTraffic 为 false 时保留互点步骤状态（互点协程仍在跑，避免中途被降级）
+     * @param resetLiveVisit 为 false 时保留主播访问步骤状态
+     *
+     * 不要在这里清 `active_mutual` / `active_live_visit`：本函数也会在轻量续跑路径被调用；
+     * 孤儿占用由调度器在确认无对应协程后通过 [resetStaleMutualOccupy] 清理。
+     */
+    fun recoverStaleRunningStepsAfterProcessDeath(
+        resetMutualTraffic: Boolean = true,
+        resetLiveVisit: Boolean = true,
+    ) {
         mutatePlan { plan ->
             fun resetRunning(state: PlanStepState): PlanStepState =
                 if (state == PlanStepState.RUNNING) PlanStepState.PENDING else state
@@ -1541,12 +1552,73 @@ object AutoSwitchLocalPlanStore {
                             restore_or_login = resetRunning(cs.restore_or_login),
                         ),
                         publish = slot.publish.resetOrDefault(),
-                        mutual_traffic = slot.mutual_traffic.resetOrDefault(),
-                        live_visit = slot.live_visit.resetOrDefault(),
+                        mutual_traffic = if (resetMutualTraffic) {
+                            slot.mutual_traffic.resetOrDefault()
+                        } else {
+                            slot.mutual_traffic
+                        },
+                        live_visit = if (resetLiveVisit) {
+                            slot.live_visit.resetOrDefault()
+                        } else {
+                            slot.live_visit
+                        },
                     )
                 },
             )
         }
+    }
+
+    /**
+     * 运行时孤儿互点占用：无互点协程但仍 pending/requested（或 slot RUNNING）。
+     * 清 active_mutual 并把该 slot 的 mutual RUNNING→PENDING。
+     */
+    fun resetStaleMutualOccupy(reason: String = "孤儿互点占用") {
+        val had = isMutualContextOccupying()
+        if (!had) return
+        val sk = activeMutualSlotKey().orEmpty()
+        mutatePlan { plan ->
+            plan.copy(
+                active_mutual = null,
+                slots = plan.slots.map { slot ->
+                    if (sk.isNotEmpty() && slot.slot_key != sk) return@map slot
+                    when (slot.mutual_traffic.state) {
+                        PlanStepState.RUNNING ->
+                            slot.copy(mutual_traffic = slot.mutual_traffic.copy(state = PlanStepState.PENDING))
+                        else -> slot
+                    }
+                },
+            )
+        }
+        val alias = PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" }
+        LogCenter.op(
+            alias,
+            "【自动切号】已清除$reason" + if (sk.isNotBlank()) " slot=$sk" else "",
+        )
+    }
+
+    /** 运行时孤儿主播访问占用：无协程但仍占坑。 */
+    fun resetStaleLiveVisitOccupy(reason: String = "孤儿主播访问占用") {
+        val had = isLiveVisitContextOccupying()
+        if (!had) return
+        val sk = activeLiveVisitSlotKey().orEmpty()
+        mutatePlan { plan ->
+            plan.copy(
+                active_live_visit = null,
+                slots = plan.slots.map { slot ->
+                    if (sk.isNotEmpty() && slot.slot_key != sk) return@map slot
+                    when (slot.live_visit.state) {
+                        PlanStepState.RUNNING ->
+                            slot.copy(live_visit = slot.live_visit.copy(state = PlanStepState.PENDING))
+                        else -> slot
+                    }
+                },
+            )
+        }
+        val alias = PrefsStore.getAlias().orEmpty().ifBlank { "auto_switch" }
+        LogCenter.op(
+            alias,
+            "【自动切号】已清除$reason" + if (sk.isNotBlank()) " slot=$sk" else "",
+        )
     }
 
     /** plan 为 RUNNING 但进程内无对应 OP：重置为 PENDING 以便 tick 重试。 */

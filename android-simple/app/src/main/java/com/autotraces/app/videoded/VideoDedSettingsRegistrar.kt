@@ -2,6 +2,7 @@ package com.autotraces.app.videoded
 
 import android.content.Context
 import android.util.Log
+import com.autotraces.app.ApiService
 import com.autotraces.app.PrefsStore
 import org.json.JSONObject
 
@@ -11,8 +12,6 @@ import org.json.JSONObject
  */
 object VideoDedSettingsRegistrar {
     private const val TAG = "VideoDedSettingsRegistrar"
-    private val CLOUD_ALIAS_PATTERN = Regex("^[A-Za-z0-9_]{1,20}$")
-    private val DEFAULT_IP_DEVICE_NAME = Regex("^设备-\\d+$")
     /** 无线流水线最短间隔，避免 15s 轮询反复 adb connect / prepare 打断投屏。 */
     private const val WIRELESS_PIPELINE_MIN_INTERVAL_MS = 120_000L
     @Volatile
@@ -39,22 +38,65 @@ object VideoDedSettingsRegistrar {
             get() = pcAdbState == "device"
     }
 
-    /** 将云端绑定别名同步为 PC 伴侣显示名，避免改绑后投屏墙仍显示旧 alias。 */
+    /** 投屏显示名强制等于云端别名，不再保留任何自定义名。 */
     fun syncCompanionDeviceNameFromAlias(context: Context) {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
-        if (alias.isEmpty() || !CLOUD_ALIAS_PATTERN.matches(alias)) return
-        val current = CompanionApi.getDeviceName(context).trim()
-        if (current.equals(alias, ignoreCase = true)) return
-        // 与 PC TryApplyCompanionCloudAlias 对齐：只覆盖空名 / 默认「设备-xx」/ 旧云端 alias，不盖手改显示名
-        val canOverwrite = current.isEmpty()
-            || DEFAULT_IP_DEVICE_NAME.matches(current)
-            || CLOUD_ALIAS_PATTERN.matches(current)
-        if (!canOverwrite) {
-            Log.d(TAG, "skip companion deviceName sync: keep custom \"$current\" (alias=$alias)")
-            return
-        }
+        if (alias.isEmpty()) return
+        // 直接写入；勿先 getDeviceName（会先自愈成 alias，导致后续日志永远不打印）
         CompanionApi.setDeviceName(context, alias)
-        Log.i(TAG, "sync companion deviceName $current -> $alias")
+    }
+
+    data class PullPcServiceUrlResult(
+        val message: String,
+        val changed: Boolean,
+        val remoteUrl: String = "",
+        val registration: SaveAndRegisterResult? = null,
+    )
+
+    /**
+     * 用户主动从云端拉取本机 PC 投屏地址并落盘/注册（不走轮询热路径）。
+     * 使用 get_config（只读），避免 check_start 消耗 pending_start / 改状态。
+     */
+    suspend fun pullPcServiceUrlFromCloud(context: Context): PullPcServiceUrlResult {
+        val app = context.applicationContext
+        val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (deviceId.isEmpty() || alias.isEmpty()) {
+            return PullPcServiceUrlResult("未绑定别名，无法从云端拉取", changed = false)
+        }
+        val remoteUrl = try {
+            ApiService.getConfig(deviceId, alias).pc_service_url
+                ?.trim()?.trimEnd('/').orEmpty()
+        } catch (t: Throwable) {
+            Log.w(TAG, "pullPcServiceUrlFromCloud get_config failed", t)
+            return PullPcServiceUrlResult("拉取失败：${t.message ?: "network"}", changed = false)
+        }
+        if (remoteUrl.isBlank()) {
+            return PullPcServiceUrlResult("云端未配置该设备的 PC 地址", changed = false)
+        }
+        if (
+            !remoteUrl.startsWith("http://", ignoreCase = true) &&
+            !remoteUrl.startsWith("https://", ignoreCase = true)
+        ) {
+            return PullPcServiceUrlResult("云端 PC 地址格式无效：$remoteUrl", changed = false)
+        }
+        val currentUrl = CompanionApi.windowsBaseUrl(app).trim().trimEnd('/')
+        if (currentUrl == remoteUrl) {
+            return PullPcServiceUrlResult("已与云端一致：$remoteUrl", changed = false, remoteUrl = remoteUrl)
+        }
+        val result = saveAndRegister(
+            app,
+            input = SaveInput(windowsUrl = remoteUrl),
+            logSave = true,
+            logRegistration = true,
+            bypassWirelessThrottle = true,
+        )
+        val msg = if (result.error == null) {
+            "已同步：$currentUrl → $remoteUrl"
+        } else {
+            "地址已保存为 $remoteUrl，注册失败：${result.error?.message}"
+        }
+        return PullPcServiceUrlResult(msg, changed = true, remoteUrl = remoteUrl, registration = result)
     }
 
     /** 解析并持久化设置；未传字段沿用已存值或自动探测。能探测到实时 IPv4 时始终覆盖过期缓存。 */

@@ -5893,15 +5893,13 @@ object AppCoordinator {
         }
     }
 
-    /** 定位候选权限：仅当 TikTok 已在 manifest 声明时才 pm revoke，避免「has not requested」误报失败。 */
+    /** 定位候选权限：仅 FINE/COARSE。BACKGROUND 在多款 TikTok 上 PackageManager 误报已声明，
+     * 但 pm revoke 抛 has not requested；即使标成 benign 也会刷失败日志并扰乱阶段文案。 */
     private fun tiktokLocationDenyPermissions(pkg: String): List<String> {
-        val candidates = buildList {
-            add(Manifest.permission.ACCESS_FINE_LOCATION)
-            add(Manifest.permission.ACCESS_COARSE_LOCATION)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-            }
-        }
+        val candidates = listOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
         return candidates.filter { packageRequestsPermission(pkg, it) }
     }
 
@@ -10349,13 +10347,16 @@ object AppCoordinator {
             val label = if (!wasSchedulerRunning && startSchedulerIfStopped) "enter 打包" else "bundle 更新"
             LogCenter.op(alias, "【自动切号】智能模板 $label：\n${lines.joinToString("\n")}")
         }
-        maybeSyncPcServiceUrlFromBundle(alias, bundle)
+        maybeSyncPcServiceUrl(alias, bundle.pc_service_url)
         return usernameUnchanged
     }
 
-    /** bundle 携带云端 PC 地址时：仅在与本机不一致时保存并注册，相同则完全跳过。 */
-    private fun maybeSyncPcServiceUrlFromBundle(alias: String, bundle: AutoSwitchBundle) {
-        val remoteUrl = bundle.pc_service_url?.trim()?.trimEnd('/').orEmpty()
+    /**
+     * 云端 PC 地址与本机不一致时保存并注册。
+     * 主要由切号 bundle / 用户手动「从云端同步」触发，不在 check_start 热路径里轮询。
+     */
+    private fun maybeSyncPcServiceUrl(alias: String, remoteUrlRaw: String?) {
+        val remoteUrl = remoteUrlRaw?.trim()?.trimEnd('/').orEmpty()
         if (remoteUrl.isBlank()) return
         if (
             !remoteUrl.startsWith("http://", ignoreCase = true) &&
@@ -10366,7 +10367,7 @@ object AppCoordinator {
         val currentUrl = CompanionApi.windowsBaseUrl(appContext).trim().trimEnd('/')
         if (currentUrl == remoteUrl) return
         scope.launch {
-            LogCenter.op(alias, "【自动切号】PC 地址与云端不一致，同步：$currentUrl → $remoteUrl")
+            LogCenter.op(alias, "PC 地址与云端不一致，同步：$currentUrl → $remoteUrl")
             val result = VideoDedSettingsRegistrar.saveAndRegister(
                 appContext,
                 input = VideoDedSettingsRegistrar.SaveInput(windowsUrl = remoteUrl),
@@ -10376,10 +10377,10 @@ object AppCoordinator {
             if (result.error == null) {
                 LogCenter.op(
                     alias,
-                    "【自动切号】PC 地址已同步（pcAdbState=${result.pcAdbState.ifBlank { "—" }}）",
+                    "PC 地址已同步（pcAdbState=${result.pcAdbState.ifBlank { "—" }}）",
                 )
             } else {
-                LogCenter.op(alias, "【自动切号】PC 地址同步失败：${result.error?.message}")
+                LogCenter.op(alias, "PC 地址已保存，注册失败：${result.error?.message}")
             }
         }
     }

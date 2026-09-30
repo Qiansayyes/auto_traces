@@ -11572,6 +11572,7 @@ def get_config(
         "active_template": active_template,
         "configs_by_template": templates,
         "template_meta": template_meta,
+        "pc_service_url": _load_device_pc_service_url(device_id),
         "debug_template_resolution": {
             "db_path": str(DB_PATH),
             "owner_username": device.owner_username,
@@ -12194,6 +12195,8 @@ def check_start(device_id: str, alias: str):
     if pull_req:
         result["log_pull_requested"] = True
         result["log_pull_max_lines"] = int(pull_req.get("max_lines") or 400)
+    # 设备侧可据此纠正本地 Windows/投屏地址，不依赖内存 device_ops 队列。
+    result["pc_service_url"] = _load_device_pc_service_url(device_id)
     if mutated and not _device_auto_switch_enabled(device_id):
         _persist_client_device_to_db(device_id)
     print(f"[{now_text()}] check_start | done | device_id={device_id} result={result.get('msg')}")

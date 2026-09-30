@@ -179,6 +179,8 @@ data class ConfigResponse(
     val run_mode: String? = null,
     val active_template: String? = null,
     val msg: String? = null,
+    /** 云端为该设备保存的 PC 投屏/伴侣服务地址；设备发现本地不一致时应同步 */
+    val pc_service_url: String? = null,
 )
 
 data class CheckStartResponse(
@@ -192,6 +194,8 @@ data class CheckStartResponse(
     /** 管理台请求拉取本机日志时为 true */
     val log_pull_requested: Boolean? = null,
     val log_pull_max_lines: Int? = null,
+    /** 云端为该设备保存的 PC 投屏/伴侣服务地址；设备发现本地不一致时应同步 */
+    val pc_service_url: String? = null,
 )
 
 data class PullUsernameResponse(

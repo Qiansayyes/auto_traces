@@ -3,6 +3,7 @@ package com.autotraces.app.videoded
 import android.content.Context
 import android.provider.Settings
 import android.util.Log
+import com.autotraces.app.PrefsStore
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -125,8 +126,23 @@ object CompanionApi {
         }
     }
 
+    /**
+     * 投屏/伴侣显示名：已绑定云端别名时固定为别名，不允许自定义。
+     * 未绑定时才用本地缓存或「设备-IP末段」占位。
+     */
     fun getDeviceName(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = prefs(context)
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotEmpty()) {
+            val stored = prefs.getString(KEY_DEVICE_NAME, null)?.trim().orEmpty()
+            if (!stored.equals(alias, ignoreCase = true)) {
+                prefs.edit().putString(KEY_DEVICE_NAME, alias).apply()
+                if (stored.isNotEmpty()) {
+                    Log.i(TAG, "deviceName forced to alias: $stored -> $alias")
+                }
+            }
+            return alias
+        }
         val stored = prefs.getString(KEY_DEVICE_NAME, null)?.trim().orEmpty()
         if (stored.isNotEmpty()) return stored
         val fallback = WifiUtils.getWifiIp(context)
@@ -138,12 +154,20 @@ object CompanionApi {
         return fallback
     }
 
+    /** 已绑定别名时忽略自定义写入，始终落别名；空串仅在未绑定时清空本地名。 */
     fun setDeviceName(context: Context, value: String) {
-        val name = value.trim().ifBlank { getDeviceName(context) }
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_DEVICE_NAME, name)
-            .apply()
+        val prefs = prefs(context)
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotEmpty()) {
+            prefs.edit().putString(KEY_DEVICE_NAME, alias).apply()
+            return
+        }
+        val name = value.trim()
+        if (name.isEmpty()) {
+            prefs.edit().remove(KEY_DEVICE_NAME).apply()
+            return
+        }
+        prefs.edit().putString(KEY_DEVICE_NAME, name).apply()
     }
 
     private fun normalizeGroupName(raw: String?): String? =

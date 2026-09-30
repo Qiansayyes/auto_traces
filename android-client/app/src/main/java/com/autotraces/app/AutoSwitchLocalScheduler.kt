@@ -1192,7 +1192,12 @@ class AutoSwitchLocalScheduler(
     fun recoverAllStaleInflightOnStart() {
         if (!PrefsStore.isAutoSwitchAutonomousMode()) return
         revalidateCutSwitchCompletionsAgainstLedger()
-        AutoSwitchLocalPlanStore.recoverStaleRunningStepsAfterProcessDeath()
+        AutoSwitchLocalPlanStore.recoverStaleRunningStepsAfterProcessDeath(
+            resetMutualTraffic = !isMutualExecutionActive(),
+            resetLiveVisit = !isLiveVisitExecutionActive(),
+        )
+        // 无协程时清 active_mutual / active_live_visit 孤儿占用。
+        clearStaleInsertionOccupyIfNoExecution()
         recoverStalePublishInflightOnStart()
         insertionInflight = null
         cutSwitchInflightSlotKey = null
@@ -1269,8 +1274,12 @@ class AutoSwitchLocalScheduler(
     /**
      * 跨日/崩溃等可能留下 exclusivePreempt=true，但 op 队列与插入均空。
      * 此时必须先释放，否则插入调度会永久「独占抢占中」跳过。
+     *
+     * 若 plan 里还挂着孤儿 active_mutual / active_live_visit（协程已死），先清占用再释放 preempt，
+     * 否则会永远被 isMutualContextOccupying 挡住。
      */
     private fun releaseOrphanExclusivePreemptIfNeeded() {
+        clearStaleInsertionOccupyIfNoExecution()
         if (!PrefsStore.isAutoSwitchExclusivePreempt()) return
         if (busy.get() || opQueue.isNotEmpty()) return
         if (pendingCutSwitchSlotKey != null) return
@@ -1286,6 +1295,21 @@ class AutoSwitchLocalScheduler(
             LogCenter.op(alias, "【自动切号】清除孤儿独占抢占标志（无真实独占 OP）")
         }
         onTryResumeGrowth()
+    }
+
+    /**
+     * 无对应执行协程时，清掉 plan 里残留的互点/主播访问占用。
+     * （协程无法跨进程存活；若只留 plan 标记会永久「互点占用中」。）
+     */
+    private fun clearStaleInsertionOccupyIfNoExecution() {
+        if (!isMutualExecutionActive() && AutoSwitchLocalPlanStore.isMutualContextOccupying()) {
+            AutoSwitchLocalPlanStore.resetStaleMutualOccupy("孤儿互点占用")
+            PrefsStore.setMutualClickPending(false)
+            PrefsStore.setMutualClickRequested(false)
+        }
+        if (!isLiveVisitExecutionActive() && AutoSwitchLocalPlanStore.isLiveVisitContextOccupying()) {
+            AutoSwitchLocalPlanStore.resetStaleLiveVisitOccupy("孤儿主播访问占用")
+        }
     }
 
     private fun deviceBusyReasonForInsertionScheduling(): String? {

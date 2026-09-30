@@ -1114,11 +1114,13 @@ class RealTraceExecutor(
         /** 上一条发布成功后切下一条前短等（不冷启 TikTok；界面已在底栏主界面）。 */
         private const val PUBLISH_POST_INTER_ITEM_DELAY_MS = 650L
         /**
-         * PC/USB 落盘后 MediaStore 可能短暂 IS_PENDING；拉完立刻按可见=0 判失败会误报「PC 拉取失败」。
-         * 在此窗口内轮询非 pending 可见数。
+         * PC/USB 落盘后 MediaStore 可能短暂 IS_PENDING / App 尚未正规入库。
+         * 必须等到「可见数 >= 请求数」，不能见到 1 条就当拉取成功。
          */
-        private const val PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS = 15_000L
+        private const val PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS = 30_000L
         private const val PUBLISH_POST_MEDIASTORE_VISIBLE_POLL_MS = 500L
+        /** 可见数不足时，强制把磁盘 Pictures 文件再走一遍 App MediaStore 入库的等待窗口。 */
+        private const val PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS = 20_000L
         /** 同任务同一条作品在内层 3 次失败后，仍在流程内断点续发重试（不整段重入、不任务头冷启）。 */
         private const val PUBLISH_POST_SAME_ITEM_RESUME_MAX_PASSES = 8
         private const val PUBLISH_POST_SAME_ITEM_RESUME_DELAY_MS = 2_000L
@@ -15133,13 +15135,130 @@ class RealTraceExecutor(
                     "$logContext：图库清理后仍有残留 MediaStore=$afterMs 磁盘=$afterFs（含 pending/shell 幽灵时已尝试 su shell delete / 藏 pending）",
                 )
             }
+            // 发作品全量清库：content delete 仍残留时，直接 sqlite 硬删 external.db 图/视频行
+            var afterMsFinal = afterMs
+            var afterFsFinal = afterFs
+            if (includeDcimCameraAlbum && afterMsFinal > 0) {
+                val wiped = nuclearWipeExternalMediaStoreImageVideo(alias, logContext)
+                if (wiped) {
+                    delay(400)
+                    afterMsFinal = countGalleryCleanupMediaStoreEntries(ctx, includeDcimCameraAlbum = true)
+                    afterFsFinal = countGalleryCleanupFilesViaSu(includeDcimCameraAlbum = true)
+                    devOp(
+                        alias,
+                        "$logContext：sqlite 硬清后 MediaStore=$afterMsFinal 磁盘=$afterFsFinal",
+                    )
+                }
+            }
+            if (afterMsFinal > 0 || (afterFsFinal > 0)) {
+                // 再打一遍 pending 藏尸，避免 TikTok Recents 继续展示删不掉的缩略图
+                hideUndeletableMediaStoreRows(ctx)
+            }
             devOp(
                 alias,
                 "$logContext：图库清理完成（范围 $scopeLabel） " +
-                    "MediaStore 执行删除=${msDeletedFirst + msDeletedSecond} 条，清理前=$beforeMs 清理后剩余=$afterMs（已清 $msRemoved 条） " +
-                    "磁盘文件 清理前=$beforeFs 清理后剩余=$afterFs（已清 $fsRemoved 个）",
+                    "MediaStore 执行删除=${msDeletedFirst + msDeletedSecond} 条，清理前=$beforeMs 清理后剩余=$afterMsFinal（已清 ${(beforeMs - afterMsFinal).coerceAtLeast(0)} 条） " +
+                    "磁盘文件 清理前=$beforeFs 清理后剩余=$afterFsFinal（已清 ${if (beforeFs >= 0 && afterFsFinal >= 0) (beforeFs - afterFsFinal).coerceAtLeast(0) else beforeFs} 个）",
             )
         }
+    }
+
+    /**
+     * content delete 删不掉（UID/owner 不对）时：停 MediaProvider，sqlite 删除 external.db 中图片/视频行。
+     * 与发作品「全量清图/视频索引」意图一致；比反复 content delete 可靠。
+     */
+    private fun nuclearWipeExternalMediaStoreImageVideo(alias: String, logContext: String): Boolean {
+        val dbCandidates = listOf(
+            "/data/data/com.android.providers.media.module/databases/external.db",
+            "/data/data/com.android.providers.media/databases/external.db",
+        )
+        val db = dbCandidates.firstOrNull { path ->
+            runSuCommandWithOutput("test -f ${shellEscape(path)} && echo OK")?.contains("OK") == true
+        } ?: run {
+            devOp(alias, "$logContext：sqlite 硬清跳过（未找到 external.db）")
+            return false
+        }
+        devOp(alias, "$logContext：开始 sqlite 硬清 MediaStore 图/视频（$db）")
+        runSuCommand("killall -9 com.android.providers.media.module 2>/dev/null")
+        runSuCommand("killall -9 com.android.providers.media 2>/dev/null")
+        // media_type: 1=image 3=video（Android MediaStore）
+        val sql =
+            "PRAGMA busy_timeout=5000; " +
+                "DELETE FROM files WHERE media_type IN (1, 3);"
+        val ok = runSuCommand("sqlite3 ${shellEscape(db)} ${shellEscape(sql)}")
+        // 丢掉可能仍引用旧页的 WAL，避免残留行复活
+        runSuCommand("rm -f ${shellEscape("$db-wal")} ${shellEscape("$db-shm")} 2>/dev/null")
+        // 触活 provider
+        runSuCommand("content query --uri content://media/external/file --projection _id 2>/dev/null | head -1")
+        return ok
+    }
+
+    /** 仍删不掉的行：全部标 IS_PENDING=1，避免 TikTok Recents 展示。 */
+    private fun hideUndeletableMediaStoreRows(ctx: Context) {
+        val resolver = ctx.contentResolver
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        for (collection in picturesMediaStoreCollections()) {
+            resolver.query(collection, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idCol)
+                    runSuCommand(
+                        "content update --uri content://media/external/video/media/$id --bind is_pending:i:1",
+                    )
+                    runSuCommand(
+                        "content update --uri content://media/external/images/media/$id --bind is_pending:i:1",
+                    )
+                    runSuShellContentDelete(
+                        ContentUris.withAppendedId(collection, id).toString(),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 磁盘 Pictures 已有素材但 MediaStore 可见不足时：按文件名强制走 App 正规入库
+     * （su stage → MediaStore IS_PENDING 写流），把 shell push 幽灵变成 TikTok 可选素材。
+     * @return 尝试入库的文件数
+     */
+    private fun publishPostRemediateDiskMaterialsIntoMediaStore(alias: String): Int {
+        val names = listPicturesPublishableFileNamesViaSu()
+        if (names.isEmpty()) {
+            devOp(alias, "发作品：磁盘再入库跳过（Pictures 无可用媒体文件）")
+            return 0
+        }
+        devOp(alias, "发作品：磁盘再入库 ${names.size} 个文件 → App MediaStore（修复 shell 不可见）")
+        val root = java.io.File(PUBLISH_POST_PICTURES_PATH)
+        val ctx = appContextProvider().applicationContext
+        return runCatching {
+            // 阻塞调用：scanExistingFiles 是 suspend，这里用 runBlocking 不合适；改为在 IO 上跑
+            kotlinx.coroutines.runBlocking {
+                com.autotraces.app.videoded.GalleryMediaPublisher.scanExistingFiles(ctx, root, names)
+            }
+            names.size
+        }.getOrElse { ex ->
+            devOp(alias, "发作品：磁盘再入库失败 ${ex.message}")
+            0
+        }
+    }
+
+    private fun listPicturesPublishableFileNamesViaSu(): List<String> {
+        val imageExt = PUBLISH_POST_PICTURES_IMAGE_EXTS.joinToString("|") { it.lowercase(Locale.US) }
+        val videoExt = PUBLISH_POST_PICTURES_VIDEO_EXTS.joinToString("|") { it.lowercase(Locale.US) }
+        val allExt = listOf(imageExt, videoExt).filter { it.isNotBlank() }.joinToString("|")
+        if (allExt.isBlank()) return emptyList()
+        val quoted = shellEscape(PUBLISH_POST_PICTURES_PATH)
+        val exclude = shellEscape(PUBLISH_POST_PICTURES_EXCLUDE_SUBDIR)
+        val out = runSuCommandWithOutput(
+            "find $quoted -type f ! -path '*/$exclude/*' 2>/dev/null | while read -r f; do " +
+                "bn=\$(basename \"\$f\"); ext=\${bn##*.}; ext=\$(echo \"\$ext\" | tr 'A-Z' 'a-z'); " +
+                "case \"\$ext\" in $allExt) echo \"\$bn\";; esac; done",
+        ) ?: return emptyList()
+        return out.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .toList()
     }
 
     /**
@@ -15189,19 +15308,30 @@ class RealTraceExecutor(
                 lastPublishPostEntryFailureReason ?: "素材拉取或图库可见性失败（$phaseLabel）"
             return null
         }
-        stats = publishPostResolveGalleryMaterialStats()
-        if (stats.resolvedCount < need) {
+        // 拉取函数已等待可见数；此处再复检，不足则强制磁盘再入库一次
+        var statsAfter = publishPostResolveGalleryMaterialStats()
+        if (statsAfter.resolvedCount < need) {
+            val remediated = publishPostRemediateDiskMaterialsIntoMediaStore(alias)
+            if (remediated > 0) {
+                statsAfter = publishPostWaitGalleryVisibleAfterFetch(
+                    alias = alias,
+                    minNeed = need,
+                    timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
+                )
+            }
+        }
+        if (statsAfter.resolvedCount < need) {
             lastPublishPostEntryFailureReason =
-                "图库无可用素材（$phaseLabel 补拉后仍不足 need=$need have=${stats.resolvedCount}）"
+                "图库无可用素材（$phaseLabel 补拉后仍不足 need=$need have=${statsAfter.resolvedCount}）"
             devOp(
                 alias,
-                "发作品：$phaseLabel 补拉后仍不足 need=$need have=${stats.resolvedCount}" +
-                    "（图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount}）。" +
+                "发作品：$phaseLabel 补拉后仍不足 need=$need have=${statsAfter.resolvedCount}" +
+                    "（图片=${statsAfter.picturesRootImageCount} 视频=${statsAfter.picturesRootVideoCount}）。" +
                     "请确认 PC 去重服务可用、运行配置 publish_post_material_fetch_count>0，且素材可写入 ${PUBLISH_POST_PICTURES_PATH}",
             )
             return null
         }
-        return stats
+        return statsAfter
     }
 
     /**
@@ -15333,13 +15463,23 @@ class RealTraceExecutor(
                     targetPath,
                 )
             }
-            // PC/USB 已下发文件后，勿立刻按可见=0 当成「PC 拉取失败」；短等 MediaStore 非 pending。
+            // PC/USB 已下发文件后，必须等到「可见数 >= 请求数」；仅有 1 条就返回成功是假成功。
             var stats = publishPostResolveGalleryMaterialStats()
-            if (stats.resolvedCount <= 0) {
+            if (stats.resolvedCount < count) {
                 stats = publishPostWaitGalleryVisibleAfterFetch(
                     alias = alias,
-                    minNeed = 1,
+                    minNeed = count,
                 )
+            }
+            if (stats.resolvedCount < count) {
+                val remediated = publishPostRemediateDiskMaterialsIntoMediaStore(alias)
+                if (remediated > 0) {
+                    stats = publishPostWaitGalleryVisibleAfterFetch(
+                        alias = alias,
+                        minNeed = count,
+                        timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
+                    )
+                }
             }
             val elapsedMs = fetchElapsedMs()
             // 本轮可用条数：min(PC 实际下发文件数, 图库实时可用) —— 发布条数以此为上限
@@ -15360,19 +15500,32 @@ class RealTraceExecutor(
                     "本轮拉取可用锁定=$mergedUsable",
                 elapsedMs,
             )
-            if (stats.resolvedCount > 0) {
-                PrefsStore.setPublishPostMaterialReady(true)
-                true
-            } else {
-                lastPublishPostEntryFailureReason =
-                    "图库素材不可见（PC 已下发 ${created.files.size} 个文件，MediaStore 可见=0，" +
-                        "多为 IS_PENDING/索引未就绪或 shell 幽灵）"
-                devOp(
-                    alias,
-                    "发作品：${lastPublishPostEntryFailureReason}（已轮询 ${PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS}ms）",
-                    elapsedMs,
-                )
-                false
+            when {
+                stats.resolvedCount >= count -> {
+                    PrefsStore.setPublishPostMaterialReady(true)
+                    true
+                }
+                stats.resolvedCount > 0 -> {
+                    // 可见不足请求数：不算整次成功，避免上层带着 have=1 need=2 硬冲
+                    lastPublishPostEntryFailureReason =
+                        "图库素材可见不足（PC 已下发 ${created.files.size} 个，请求=$count，" +
+                            "MediaStore 可见=${stats.resolvedCount}；多为 shell 未正规入库/IS_PENDING）"
+                    PrefsStore.setPublishPostMaterialReady(false)
+                    devOp(alias, "发作品：${lastPublishPostEntryFailureReason}", elapsedMs)
+                    false
+                }
+                else -> {
+                    lastPublishPostEntryFailureReason =
+                        "图库素材不可见（PC 已下发 ${created.files.size} 个文件，MediaStore 可见=0，" +
+                            "多为 IS_PENDING/索引未就绪或 shell 幽灵）"
+                    PrefsStore.setPublishPostMaterialReady(false)
+                    devOp(
+                        alias,
+                        "发作品：${lastPublishPostEntryFailureReason}（已轮询 ${PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS}ms）",
+                        elapsedMs,
+                    )
+                    false
+                }
             }
         } catch (t: Throwable) {
             val companionId = CompanionApi.deviceId(app)
