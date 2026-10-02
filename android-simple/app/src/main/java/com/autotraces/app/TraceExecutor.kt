@@ -11214,13 +11214,13 @@ class RealTraceExecutor(
      * 发作品用：图库素材统计（`Pictures` 目录树递归，su + find；**排除** `Pictures/AutoTraces`）。
      *
      * - [picturesRootImageCount] / [picturesRootVideoCount]：非隐藏路径、按扩展名识别的图片/视频文件数。
-     * - [resolvedCount]：二者之和；再与「本轮拉取可用锁定」及目标条数取 min，作为实际发布轮数。
+     * - [resolvedCount]：仅视频数（发作品只发视频；图片残留/幽灵不再计入，避免 have 虚高导致少拉取）。
      */
     private data class PublishPostGalleryMaterialStats(
         val picturesRootImageCount: Int,
         val picturesRootVideoCount: Int,
     ) {
-        val resolvedCount: Int get() = picturesRootImageCount + picturesRootVideoCount
+        val resolvedCount: Int get() = picturesRootVideoCount
     }
 
     private fun publishPostResolveGalleryMaterialStats(): PublishPostGalleryMaterialStats {
