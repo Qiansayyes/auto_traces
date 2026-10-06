@@ -1623,7 +1623,6 @@ class RealTraceExecutor(
         /** 强关冷启后必须禁止「已在前台跳过拉起」，否则 dumpsys 残留会假成功停在桌面。 */
         allowSkipIfAlreadyForeground: Boolean = true,
     ): Boolean {
-        // 国内出口禁止拉起：循环日志直至代理到非 CN。
         EgressIpGate.awaitUntilNotChina(alias, "$tag·出口IP")
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (allowSkipIfAlreadyForeground && !forceStopBeforeLaunch && isTikTokForeground()) {
@@ -9043,7 +9042,6 @@ class RealTraceExecutor(
         tag: String,
         allowForceRestart: Boolean = true,
     ): Boolean {
-        // 「已在前台跳过拉起」也会绕过 launchTikTokOnceWithCheck，这里同样先过出口门阀。
         EgressIpGate.awaitUntilNotChina(alias, "$tag·出口IP")
         val pkg = Config.TIKTOK_PACKAGE_NAME
         if (isPackageVisible(pkg)) {

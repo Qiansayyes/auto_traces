@@ -203,6 +203,15 @@ object PrefsStore {
             .apply()
     }
 
+    /** PC 遥控批量写入云端账号：只落用户名/密码，清掉旧 token，待联网后登录。 */
+    fun saveAuthCredentials(username: String, password: String) {
+        prefs.edit()
+            .putString(KEY_AUTH_USERNAME, username.trim())
+            .putString(KEY_AUTH_PASSWORD, password)
+            .remove(KEY_AUTH_TOKEN)
+            .apply()
+    }
+
     fun saveAuthPassword(password: String) {
         prefs.edit()
             .putString(KEY_AUTH_PASSWORD, password)

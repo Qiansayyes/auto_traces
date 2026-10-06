@@ -39,6 +39,10 @@ class ApiServer(private val context: Context) : NanoHTTPD(CompanionBridge.API_PO
                     },
                 )
                 session.method == Method.PUT && session.uri == "/api/v1/settings/pc-mirror" -> handlePcMirror(session)
+                session.method == Method.GET && session.uri == "/api/v1/simple/status" ->
+                    jsonResponse(200, SimpleRemoteControl.buildStatus(context))
+                session.method == Method.POST && session.uri == "/api/v1/simple/action" ->
+                    jsonResponse(200, SimpleRemoteControl.handleAction(context, JSONObject(readBody(session))))
                 session.method == Method.GET && session.uri == "/api/v1/system/memory" -> handleSystemMemory(session)
                 session.method == Method.POST && session.uri == "/api/v1/worker/start" -> handleWorkerStart(session)
                 session.method == Method.POST && session.uri == "/api/v1/tasks/request" -> handleRequestVideos(session)

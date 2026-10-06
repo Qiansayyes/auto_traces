@@ -12,8 +12,8 @@ android {
         applicationId = "com.autotraces.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.0.7-occupy-heal"
+        versionCode = 8
+        versionName = "1.0.8-alias-status"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
