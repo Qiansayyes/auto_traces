@@ -81,6 +81,7 @@ object SimpleRemoteControl {
             .put("activateNextBusy", AppCoordinator.isActivateNextBusy())
             .put("dailyIncubateBusy", AppCoordinator.isDailyIncubateBusy())
             .put("dailyIncubateDurationMin", PrefsStore.getDailyIncubateDurationMin())
+            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
             .put("pendingActivateQueue", buildPendingActivateQueueJson())
             .put(
                 "nonPendingActivateCount",
@@ -615,16 +616,22 @@ object SimpleRemoteControl {
                 if (AppCoordinator.isBatchAccountSessionBusy()) {
                     return fail("session_busy", "多账号会话进行中，请稍候")
                 }
-                val minutesRaw = if (body.has("minutes")) {
-                    body.optInt("minutes")
-                } else {
-                    PrefsStore.getDailyIncubateDurationMin()
+                val minutes = when {
+                    body.has("hours") -> {
+                        PrefsStore.setDailyIncubateDurationHours(body.optDouble("hours"))
+                        PrefsStore.getDailyIncubateDurationMin()
+                    }
+                    body.has("minutes") -> {
+                        body.optInt("minutes").coerceIn(
+                            PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
+                            PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+                        ).also { PrefsStore.setDailyIncubateDurationMin(it) }
+                    }
+                    else -> PrefsStore.getDailyIncubateDurationMin()
                 }
-                val minutes = minutesRaw.coerceIn(
-                    PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
-                    PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+                val hoursText = PrefsStore.formatDailyIncubateDurationHours(
+                    PrefsStore.getDailyIncubateDurationHours(),
                 )
-                PrefsStore.setDailyIncubateDurationMin(minutes)
                 ensureWorkerForManualTask(app)
                 val refresh = kotlinx.coroutines.runBlocking {
                     AppCoordinator.manualRefreshAssignedAccounts()
@@ -640,6 +647,7 @@ object SimpleRemoteControl {
                     return fail("queue_empty", "无非待活跃账号可养号")
                         .put("queueSize", 0)
                         .put("dailyIncubateDurationMin", minutes)
+                        .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
                 }
                 // 再次确认：刷新期间可能被其它多账号会话抢占
                 if (AppCoordinator.isManualSwitchBusy()) {
@@ -657,11 +665,14 @@ object SimpleRemoteControl {
                     )
                         .put("queueSize", queueSize)
                         .put("dailyIncubateDurationMin", minutes)
+                        .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
                 }
-                ok("已请求日常孵化（约 $queueSize 个 · 每号 ${minutes} 分钟）")
+                ok("已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）")
                     .put("minutes", minutes)
+                    .put("hours", PrefsStore.getDailyIncubateDurationHours())
                     .put("queueSize", queueSize)
                     .put("dailyIncubateDurationMin", minutes)
+                    .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
             }
 
             "stop_daily_incubate" -> {

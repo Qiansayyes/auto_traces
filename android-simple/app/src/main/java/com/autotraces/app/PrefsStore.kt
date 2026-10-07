@@ -107,11 +107,15 @@ object PrefsStore {
     /** 推荐计算结果缓存（8 小时内复用）。 */
     private const val KEY_PENDING_ACTIVATE_RECOMMEND_CACHE_JSON = "pending_activate_recommend_cache_json"
     const val PENDING_ACTIVATE_RECOMMEND_CACHE_TTL_MS: Long = 8L * 60L * 60L * 1000L
-    /** 日常孵化：全局分配时长（分钟），整队共用。 */
+    /** 日常孵化：全局分配时长（内部存分钟；界面以小时展示），整队共用。 */
     private const val KEY_DAILY_INCUBATE_DURATION_MIN = "daily_incubate_duration_min"
-    const val DEFAULT_DAILY_INCUBATE_DURATION_MIN: Int = 30
-    const val MIN_DAILY_INCUBATE_DURATION_MIN: Int = 1
+    /** 默认 3 小时 */
+    const val DEFAULT_DAILY_INCUBATE_DURATION_MIN: Int = 180
+    const val MIN_DAILY_INCUBATE_DURATION_MIN: Int = 30
     const val MAX_DAILY_INCUBATE_DURATION_MIN: Int = 1440
+    const val MIN_DAILY_INCUBATE_DURATION_HOURS: Double = 0.5
+    const val MAX_DAILY_INCUBATE_DURATION_HOURS: Double = 24.0
+    const val DEFAULT_DAILY_INCUBATE_DURATION_HOURS: Double = 3.0
     /** 日常孵化队列（有序 JSON 数组；成员=非待活跃账号）。 */
     private const val KEY_DAILY_INCUBATE_QUEUE = "daily_incubate_queue_json"
     /**
@@ -2092,6 +2096,42 @@ object PrefsStore {
                 minutes.coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
             )
             .apply()
+    }
+
+    fun getDailyIncubateDurationHours(): Double =
+        getDailyIncubateDurationMin() / 60.0
+
+    fun setDailyIncubateDurationHours(hours: Double) {
+        val min = kotlin.math.round(
+            hours.coerceIn(MIN_DAILY_INCUBATE_DURATION_HOURS, MAX_DAILY_INCUBATE_DURATION_HOURS) * 60.0,
+        ).toInt()
+        setDailyIncubateDurationMin(min)
+    }
+
+    /**
+     * 解析界面输入。正常按小时；若数字明显大于 24（例如旧习惯填 30/180 分钟），按分钟换算。
+     */
+    fun parseDailyIncubateDurationHours(raw: String?): Double {
+        val parsed = raw?.trim()?.replace(',', '.')?.toDoubleOrNull()
+            ?: return getDailyIncubateDurationHours()
+        val hours = if (parsed > MAX_DAILY_INCUBATE_DURATION_HOURS) {
+            parsed / 60.0
+        } else {
+            parsed
+        }
+        return hours.coerceIn(MIN_DAILY_INCUBATE_DURATION_HOURS, MAX_DAILY_INCUBATE_DURATION_HOURS)
+    }
+
+    fun formatDailyIncubateDurationHours(hours: Double): String {
+        val normalized = hours.coerceIn(MIN_DAILY_INCUBATE_DURATION_HOURS, MAX_DAILY_INCUBATE_DURATION_HOURS)
+        val rounded = kotlin.math.round(normalized * 100.0) / 100.0
+        return if (kotlin.math.abs(rounded - rounded.toLong()) < 0.001) {
+            rounded.toLong().toString()
+        } else {
+            String.format(java.util.Locale.US, "%.2f", rounded)
+                .trimEnd('0')
+                .trimEnd('.')
+        }
     }
 
     fun getDailyIncubateUsernames(): List<String> {

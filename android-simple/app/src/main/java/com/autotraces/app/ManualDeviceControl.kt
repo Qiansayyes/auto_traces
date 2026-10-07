@@ -176,6 +176,8 @@ object ManualDeviceControl {
         val switchHighlight: String = "否",
         /** 云端勾了「不参加自动切号」；切号下拉/待活跃仍可见，本机自动切号计划会跳过。 */
         val autoSwitchExcluded: Boolean = false,
+        /** 云端粉丝量（用于下拉展示与降序排序）。 */
+        val followerCount: Int = 0,
     )
 
     data class SwitchAccountStatus(
@@ -209,6 +211,12 @@ object ManualDeviceControl {
         return s.contains("----Maximum login", ignoreCase = true)
     }
 
+    fun parseFollowerCount(raw: String?): Int {
+        val text = raw?.trim()?.replace(",", "")?.replace(" ", "").orEmpty()
+        if (text.isEmpty()) return 0
+        return text.toDoubleOrNull()?.toInt()?.coerceAtLeast(0) ?: 0
+    }
+
     fun fromAssignedItem(item: DeviceAssignedAccountItem): AccountOption? {
         val username = item.username?.trim()?.removePrefix("@").orEmpty()
         if (username.isEmpty()) return null
@@ -227,6 +235,7 @@ object ManualDeviceControl {
             mailModuleCodeAvailable = item.mail_module_code_available == true,
             switchHighlight = item.switch_highlight?.trim().orEmpty().ifBlank { "否" },
             autoSwitchExcluded = item.auto_switch_excluded == true,
+            followerCount = parseFollowerCount(item.follower_count),
         )
         return opt
     }
@@ -269,6 +278,7 @@ object ManualDeviceControl {
                     put("mailModuleCodeAvailable", a.mailModuleCodeAvailable)
                     put("switchHighlight", a.switchHighlight)
                     put("autoSwitchExcluded", a.autoSwitchExcluded)
+                    put("followerCount", a.followerCount)
                 },
             )
         }
@@ -302,6 +312,7 @@ object ManualDeviceControl {
                         mailModuleCodeAvailable = o.optBoolean("mailModuleCodeAvailable"),
                         switchHighlight = o.optString("switchHighlight").ifBlank { "否" },
                         autoSwitchExcluded = o.optBoolean("autoSwitchExcluded"),
+                        followerCount = o.optInt("followerCount", 0).coerceAtLeast(0),
                     )
                     if (accountLooksCredBlocked(opt)) continue
                     add(opt)

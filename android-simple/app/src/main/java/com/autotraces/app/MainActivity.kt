@@ -1322,7 +1322,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.manualDailyIncubateDurationMinInput.setText(
-            PrefsStore.getDailyIncubateDurationMin().toString(),
+            PrefsStore.formatDailyIncubateDurationHours(PrefsStore.getDailyIncubateDurationHours()),
         )
         binding.manualDailyIncubateStartButton.setOnClickListener {
             if (AppCoordinator.isManualSwitchBusy()) {
@@ -1334,14 +1334,13 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
-            val minutesRaw = binding.manualDailyIncubateDurationMinInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getDailyIncubateDurationMin()
-            val minutes = minutesRaw.coerceIn(
-                PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
-                PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+            val hours = PrefsStore.parseDailyIncubateDurationHours(
+                binding.manualDailyIncubateDurationMinInput.text?.toString(),
             )
-            PrefsStore.setDailyIncubateDurationMin(minutes)
-            binding.manualDailyIncubateDurationMinInput.setText(minutes.toString())
+            PrefsStore.setDailyIncubateDurationHours(hours)
+            val minutes = PrefsStore.getDailyIncubateDurationMin()
+            val hoursText = PrefsStore.formatDailyIncubateDurationHours(hours)
+            binding.manualDailyIncubateDurationMinInput.setText(hoursText)
             lifecycleScope.launch {
                 binding.manualDailyIncubateStartButton.isEnabled = false
                 binding.manualTaskStatusText.text = "日常孵化：正在同步非待活跃账号…"
@@ -1367,7 +1366,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 AppCoordinator.manualStartDailyIncubate(minutes)
                 binding.manualTaskStatusText.text =
-                    "已请求日常孵化（约 $queueSize 个 · 每号 ${minutes} 分钟）"
+                    "已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）"
                 Toast.makeText(
                     this@MainActivity,
                     "已开始排队养号（$queueSize 个账号）",
@@ -1608,7 +1607,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 下拉排序：未入待活跃队列的在上，已入队的在下（队内按队列序号）。
+     * 下拉排序：未入待活跃队列的在上（粉丝降序），已入队的在下（队内按队列序号，同序粉丝降序）。
      */
     private fun sortManualAccountsForSpinner(
         list: List<ManualDeviceControl.AccountOption>,
@@ -1619,13 +1618,14 @@ class MainActivity : AppCompatActivity() {
                     PrefsStore.pendingActivateQueueIndex(it.value.username) != null
                 }.thenBy {
                     PrefsStore.pendingActivateQueueIndex(it.value.username) ?: Int.MAX_VALUE
-                }.thenBy { it.index },
+                }.thenByDescending { it.value.followerCount }
+                    .thenBy { it.index },
             )
             .map { it.value }
     }
 
     /**
-     * 下拉项文案：仅标本机当前 / 待活跃队列位置。
+     * 下拉项文案：粉丝数 / 本机当前 / 待活跃队列位置。
      * 「不切号」「推荐」归属待活跃页，不在此处展示。
      */
     private fun formatManualAccountSpinnerLabel(
@@ -1634,6 +1634,7 @@ class MainActivity : AppCompatActivity() {
     ): String {
         return buildString {
             append("@${opt.username}")
+            append(" ·粉丝${opt.followerCount}")
             if (activeUsername.isNotBlank() && opt.username.equals(activeUsername, ignoreCase = true)) {
                 append(" ·本机当前")
             }

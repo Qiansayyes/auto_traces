@@ -13,7 +13,7 @@ android {
         minSdk = 30
         targetSdk = 34
         versionCode = 5
-        versionName = "1.0.5-gallery-visible"
+        versionName = "1.0.5-tt-gallery-full"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

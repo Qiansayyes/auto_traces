@@ -13,7 +13,7 @@ android {
         minSdk = 30
         targetSdk = 34
         versionCode = 8
-        versionName = "1.0.8-alias-status"
+        versionName = "1.0.8-tt-gallery-full"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

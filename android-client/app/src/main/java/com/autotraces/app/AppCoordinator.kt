@@ -1536,6 +1536,7 @@ object AppCoordinator {
     /**
      * 仅冷启动（[bootstrapAfterBinding]）/ 首次绑定 / 云端登录成功时调用。
      * 对当前 TikTok 安装（lastUpdateTime）只处理一次；授权路径绝不 force-stop，避免打断进行中的自动登录。
+     * 发作品前请用 [ensureTikTokFullGalleryAccessNow]，不受 install token 限制。
      */
     fun ensureTikTokGalleryPermissionIfNeeded(trigger: String = "冷启动") {
         if (PrefsStore.getAuthToken().isNullOrBlank()) return
@@ -1544,17 +1545,20 @@ object AppCoordinator {
         }
     }
 
+    /** 发作品前必须满足的核心媒体读权限（对应设置页 Always allow all）。 */
+    private fun tiktokFullGalleryMediaPermissions(): List<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            listOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+            )
+        } else {
+            listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+    }
+
     private fun tiktokGalleryRuntimePermissions(): List<String> {
-        val mediaPerms =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                listOf(
-                    Manifest.permission.READ_MEDIA_IMAGES,
-                    Manifest.permission.READ_MEDIA_VIDEO,
-                )
-            } else {
-                listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-            }
-        val base = mediaPerms + listOf(
+        val base = tiktokFullGalleryMediaPermissions() + listOf(
             Manifest.permission.READ_CONTACTS,
         )
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1589,6 +1593,20 @@ object AppCoordinator {
         }
         add("appops set $pkg COARSE_LOCATION ignore")
         add("appops set $pkg FINE_LOCATION ignore")
+    }
+
+    /**
+     * 设置页「Always allow all」：READ_MEDIA_IMAGES/VIDEO（或旧版 READ_EXTERNAL）已 granted。
+     * 注意：Android 14 上完整授权后系统仍可能同时标 READ_MEDIA_VISUAL_USER_SELECTED=granted，
+     * 不能把它当成失败；有限访问仅在「只有 USER_SELECTED、没有完整 READ_MEDIA_*」时成立。
+     * 授予路径仍会尽力 revoke USER_SELECTED，以便设置页更干净。
+     */
+    private fun isTikTokFullGalleryAccessGranted(): Boolean {
+        val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        val pm = appContext.packageManager
+        return tiktokFullGalleryMediaPermissions().all { perm ->
+            pm.checkPermission(perm, pkg) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun isTikTokGalleryPermissionGranted(): Boolean {
@@ -1661,9 +1679,94 @@ object AppCoordinator {
     }
 
     /**
+     * root 授予完整图库（Always allow all）并清除有限访问；可选顺带联系人/通知/拒定位。
+     * 绝不 force-stop。
+     */
+    private fun tiktokFullGalleryGrantRootCommands(
+        pkg: String,
+        includeContactsNotifications: Boolean,
+        includeLocationDeny: Boolean,
+    ): List<String> = buildList {
+        // 先清 limited access，再 grant 完整媒体，避免设置页停在 Allow limited access。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            add("pm revoke $pkg android.permission.READ_MEDIA_VISUAL_USER_SELECTED")
+            add("appops set $pkg READ_MEDIA_VISUAL_USER_SELECTED ignore")
+        }
+        add("pm grant $pkg android.permission.READ_MEDIA_IMAGES")
+        add("pm grant $pkg android.permission.READ_MEDIA_VIDEO")
+        add("pm grant $pkg android.permission.READ_EXTERNAL_STORAGE")
+        add("pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE")
+        add("appops set $pkg READ_MEDIA_IMAGES allow")
+        add("appops set $pkg READ_MEDIA_VIDEO allow")
+        add("appops set $pkg READ_EXTERNAL_STORAGE allow")
+        add("appops set $pkg WRITE_EXTERNAL_STORAGE allow")
+        add("appops set $pkg LEGACY_STORAGE allow")
+        if (includeContactsNotifications) {
+            add("pm grant $pkg android.permission.READ_CONTACTS")
+            add("appops set $pkg READ_CONTACTS allow")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add("pm grant $pkg android.permission.POST_NOTIFICATIONS")
+                add("appops set $pkg POST_NOTIFICATION allow")
+            }
+        }
+        if (includeLocationDeny) {
+            addAll(tiktokLocationDenyRootCommands(pkg))
+        }
+    }
+
+    /**
+     * 发作品前强制保证 TikTok 图库为完整开放（Always allow all）。
+     * - 不受 install token 限制，每次发作品都检测；
+     * - 仅 root `pm grant` / `appops`，绝不 force-stop / kill；
+     * - 返回是否已达到完整图库权限。
+     */
+    private suspend fun ensureTikTokFullGalleryAccessNow(trigger: String): Boolean {
+        val pkg = com.autotraces.app.util.Config.TIKTOK_PACKAGE_NAME
+        val alias = PrefsStore.getAlias()?.takeIf { it.isNotBlank() } ?: "SYSTEM"
+        val installToken = tiktokPackageInstallToken()
+        if (installToken <= 0L) {
+            LogCenter.op(alias, "TikTok 未安装，无法授予图库权限（$trigger）")
+            return false
+        }
+        if (isTikTokFullGalleryAccessGranted()) {
+            LogCenter.op(alias, "TikTok 图库完整权限已就绪（Always allow all，$trigger）")
+            return true
+        }
+        ProcessDiagnostics.setPhase("TikTok权限检测/授予")
+        LogCenter.op(
+            alias,
+            "发作品前 TikTok 图库未完整开放（$trigger），root 授予 Always allow all（不杀进程）…",
+        )
+        val commands = tiktokFullGalleryGrantRootCommands(
+            pkg = pkg,
+            includeContactsNotifications = false,
+            includeLocationDeny = false,
+        )
+        val (failed, failLogs) = runTikTokPermissionRootCommands(commands)
+        val ok = isTikTokFullGalleryAccessGranted()
+        if (ok) {
+            LogCenter.op(alias, "TikTok 图库完整权限已开放（Always allow all，$trigger）")
+            ProcessDiagnostics.setPhase("TikTok权限已就绪")
+            PrefsStore.setTikTokMediaPermissionGrantInstallToken(installToken)
+        } else {
+            logTikTokPermissionCommandFailures(
+                alias,
+                "TikTok 图库完整权限授予",
+                failed,
+                commands.size,
+                failLogs,
+            )
+            LogCenter.op(alias, "TikTok 图库完整权限仍未就绪（$trigger）")
+            ProcessDiagnostics.setPhase("TikTok权限部分失败")
+        }
+        return ok
+    }
+
+    /**
      * 已登录云端时，对本机当前 TikTok 安装只处理一次：
-     * - 图库/通知/联系人 runtime 权限未开放则 root 授予（不 force-stop）；
-     * - 定位一律 pm revoke + appops ignore。
+     * - 图库完整开放（清 limited access）+ 通知/联系人 runtime；
+     * - 定位一律 pm revoke + appops ignore；
+     * - 绝不 force-stop。
      * 成功后写入 [PrefsStore.setTikTokMediaPermissionGrantInstallToken]，同一次安装不再重复。
      */
     private suspend fun ensureTikTokGalleryPermissionGrantedIfNeeded(trigger: String) {
@@ -1683,7 +1786,9 @@ object AppCoordinator {
             }
             return
         }
-        if (PrefsStore.getTikTokMediaPermissionGrantInstallToken() == installToken) {
+        if (PrefsStore.getTikTokMediaPermissionGrantInstallToken() == installToken &&
+            isTikTokGalleryPermissionGranted()
+        ) {
             return
         }
 
@@ -1695,6 +1800,7 @@ object AppCoordinator {
             val (denyFailed, denyFailLogs) = runTikTokPermissionRootCommands(denyCommands)
             if (denyFailed == 0) {
                 LogCenter.op(alias, "TikTok 定位权限永久拒绝完成（$trigger）")
+                ProcessDiagnostics.setPhase("TikTok权限已就绪")
             } else {
                 logTikTokPermissionCommandFailures(
                     alias,
@@ -1703,6 +1809,7 @@ object AppCoordinator {
                     denyCommands.size,
                     denyFailLogs,
                 )
+                ProcessDiagnostics.setPhase("TikTok权限部分失败")
             }
             PrefsStore.setTikTokMediaPermissionGrantInstallToken(installToken)
             return
@@ -1711,31 +1818,17 @@ object AppCoordinator {
         // 绝不 force-stop：中途杀 TikTok 会打断自动登录/验证码等独占流程。
         LogCenter.op(
             alias,
-            "TikTok 图库/通知/联系人权限未开放（$trigger），root 授予并永久拒绝定位（不杀进程）…",
+            "TikTok 图库/通知/联系人权限未开放（$trigger），root 授予完整图库并永久拒绝定位（不杀进程）…",
         )
-        val commands = buildList {
-            add("pm grant $pkg android.permission.READ_MEDIA_IMAGES")
-            add("pm grant $pkg android.permission.READ_MEDIA_VIDEO")
-            add("pm grant $pkg android.permission.READ_EXTERNAL_STORAGE")
-            add("pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE")
-            add("pm grant $pkg android.permission.READ_CONTACTS")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add("pm grant $pkg android.permission.POST_NOTIFICATIONS")
-            }
-            add("appops set $pkg READ_MEDIA_IMAGES allow")
-            add("appops set $pkg READ_MEDIA_VIDEO allow")
-            add("appops set $pkg READ_EXTERNAL_STORAGE allow")
-            add("appops set $pkg WRITE_EXTERNAL_STORAGE allow")
-            add("appops set $pkg LEGACY_STORAGE allow")
-            add("appops set $pkg READ_CONTACTS allow")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add("appops set $pkg POST_NOTIFICATION allow")
-            }
-            addAll(tiktokLocationDenyRootCommands(pkg))
-        }
+        val commands = tiktokFullGalleryGrantRootCommands(
+            pkg = pkg,
+            includeContactsNotifications = true,
+            includeLocationDeny = true,
+        )
         val (failed, failLogs) = runTikTokPermissionRootCommands(commands)
         if (failed == 0) {
             LogCenter.op(alias, "TikTok 图库/通知/联系人权限开放完成，定位已永久拒绝（$trigger）")
+            ProcessDiagnostics.setPhase("TikTok权限已就绪")
         } else {
             logTikTokPermissionCommandFailures(
                 alias,
@@ -1744,8 +1837,8 @@ object AppCoordinator {
                 commands.size,
                 failLogs,
             )
+            ProcessDiagnostics.setPhase("TikTok权限部分失败")
         }
-        // 仅当图库侧已全部就绪才记 token，失败则下次冷启动/绑定再试。
         if (isTikTokGalleryPermissionGranted()) {
             PrefsStore.setTikTokMediaPermissionGrantInstallToken(installToken)
         } else {
@@ -8288,6 +8381,51 @@ object AppCoordinator {
                         message = "未绑定 deviceId，发作品入口未执行",
                     )
                 }
+                return@launch
+            }
+            // 发作品硬门槛：TikTok 图库必须 Always allow all；仅 root grant，绝不杀进程。
+            if (!ensureTikTokFullGalleryAccessNow("发作品前")) {
+                val switchResult = "发作品失败：TikTok 图库权限未能完全开放（Always allow all）"
+                if (autoSwitchPublishAtStart && publishOpId.isNotBlank()) {
+                    reportAutoSwitchPublishOutcomeIfNeeded(
+                        alias = alias,
+                        deviceId = deviceIdForPublish,
+                        opId = publishOpId,
+                        slotKey = publishSlotKeyAtStart,
+                        completed = false,
+                        loginFailed = false,
+                        accountChanged = false,
+                        message = switchResult,
+                    )
+                } else if (PrefsStore.isAutoSwitchPublishTask() && publishOpId.isNotBlank()) {
+                    reportAutoSwitchPublishOutcomeIfNeeded(
+                        alias = alias,
+                        deviceId = deviceIdForPublish,
+                        opId = publishOpId,
+                        completed = false,
+                        loginFailed = false,
+                        accountChanged = false,
+                        message = switchResult,
+                    )
+                } else if (publishOpId.isNotBlank()) {
+                    reportCloudPublishFinalOutcome(
+                        alias = alias,
+                        deviceId = deviceIdForPublish,
+                        opId = publishOpId,
+                        completed = false,
+                        loginFailed = false,
+                        message = switchResult,
+                        successCount = 0,
+                        targetCount = PrefsStore.getPublishPostTargetCount() ?: 0,
+                    )
+                }
+                scheduleFailureReport(
+                    business = "publish_post",
+                    errorType = FailureReportUploader.normalizeErrorType(switchResult),
+                    summary = switchResult,
+                )
+                LogCenter.op(alias, switchResult)
+                updateRuntime(lastMessage = switchResult)
                 return@launch
             }
             var switchResult = runCatching {
