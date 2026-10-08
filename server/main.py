@@ -8652,11 +8652,16 @@ def _run_backup_stats_full_query_job() -> dict[str, int]:
         _backup_stats_full_query_log(f"[{now_text()}] 跳过：无备份档案账号")
         return {"owners": 0, "total": 0, "ok": 0, "fail": 0}
 
+    cookies, cookie_probe, _ = _load_tiktok_cookies_required_for_stats()
+    if not cookies:
+        _backup_stats_full_query_log(f"[{now_text()}] 中止：{ACCOUNT_STATS_NO_COOKIE_MSG} | {cookie_probe}")
+        return {"owners": 0, "total": 0, "ok": 0, "fail": 0}
+
     total = 0
     ok = 0
     fail = 0
     _backup_stats_full_query_log(
-        f"[{now_text()}] 开始全量查询并落库 | owners={len(owners)} | 北京时间={_beijing_now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"[{now_text()}] 开始全量查询并落库 | owners={len(owners)} | 北京时间={_beijing_now().strftime('%Y-%m-%d %H:%M:%S')} | {cookie_probe}"
     )
 
     for owner in owners:
@@ -10113,30 +10118,54 @@ def _account_stats_query_log(line: str) -> None:
         pass
 
 
-def _account_stats_query_cookie_probe_line() -> str:
+def _load_tiktok_cookies_required_for_stats() -> tuple[Optional[dict], str, Optional[str]]:
+    """
+    统计查询强制 Cookie。返回 (cookies_or_None, probe_line, cookie_path)。
+    cookies 为空时禁止发起任何主页统计查询。
+    """
+    upload_err = ""
+    upload_cookie_path: Optional[str] = None
     try:
-        # 优先与发布工具同一 Cookie / 同一加载逻辑
-        try:
-            mod = _load_auto_upload_scrape_module()
-            cookies, cookie_log = mod.load_tiktok_cookies_for_scrape()
-            cookie_path = mod._resolve_tiktok_cookie_file_path()
-            if cookies:
-                return f"Cookie已启用(auto_upload) | 文件={cookie_path or '(未知)'} | 条数={len(cookies)}"
-            return f"Cookie未使用(auto_upload) | {cookie_log}"
-        except Exception as upload_exc:
-            from tiktok_universal_snapshot import _ensure_tiktok_cookies_env
+        mod = _load_auto_upload_scrape_module()
+        cookies, cookie_log = mod.load_tiktok_cookies_for_scrape()
+        upload_cookie_path = mod._resolve_tiktok_cookie_file_path()
+        if cookies:
+            return (
+                cookies,
+                f"Cookie已启用(auto_upload) | 文件={upload_cookie_path or '(未知)'} | 条数={len(cookies)}",
+                upload_cookie_path,
+            )
+        upload_err = str(cookie_log or "auto_upload 未加载到 Cookie")
+        # 不在这里 return：继续走 fallback，避免漏掉另一套搜索路径里的 Cookie
+    except Exception as upload_exc:
+        upload_err = f"auto_upload加载失败: {upload_exc}"
 
-            _ensure_tiktok_cookies_env()
-            _, cookies_dict, debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
-            if cookies_dict:
-                return (
+    try:
+        from tiktok_universal_snapshot import _ensure_tiktok_cookies_env
+
+        _ensure_tiktok_cookies_env()
+        _, cookies_dict, debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
+        if cookies_dict:
+            return (
+                cookies_dict,
+                (
                     f"Cookie已启用(fallback) | 文件={cookie_path or '(未知)'} | 条数={len(cookies_dict)} "
-                    f"| auto_upload加载失败: {upload_exc}"
-                )
-            reason = str((debug_lines or ["未加载 Cookie"])[0]).strip()
-            return f"Cookie未使用 | {reason} | auto_upload加载失败: {upload_exc}"
+                    f"| {upload_err}"
+                ),
+                cookie_path,
+            )
+        reason = str((debug_lines or ["未加载 Cookie"])[0]).strip()
+        return None, f"Cookie未使用 | {reason} | {upload_err}", cookie_path or upload_cookie_path
     except Exception as exc:
-        return f"Cookie探测失败 | {exc}"
+        return None, f"Cookie探测失败 | {exc} | {upload_err}", upload_cookie_path
+
+
+def _account_stats_query_cookie_probe_line() -> str:
+    _, probe_line, _ = _load_tiktok_cookies_required_for_stats()
+    return probe_line
+
+
+ACCOUNT_STATS_NO_COOKIE_MSG = "未加载 Cookie，禁止查询数据。请配置 tiktok_cookies.json 或环境变量 TIKTOK_COOKIES_FILE"
 
 
 def _account_stats_query_result_summary(result: dict) -> str:
@@ -10577,10 +10606,16 @@ def _run_account_stats_query_job(owner: str, selected_aliases: list[str], *, sou
     total = len(usernames)
     ok = 0
     fail = 0
+    cookies, cookie_probe, _cookie_path = _load_tiktok_cookies_required_for_stats()
     _account_stats_query_log(
         f"[{now_text()}] owner={owner} | 开始查询 {total} 个账号 | 别名={','.join(selected_aliases)} | source={source}"
     )
-    _account_stats_query_log(f"[{now_text()}] owner={owner} | {_account_stats_query_cookie_probe_line()}")
+    _account_stats_query_log(f"[{now_text()}] owner={owner} | {cookie_probe}")
+    if not cookies:
+        _account_stats_query_log(
+            f"[{now_text()}] owner={owner} | 中止：{ACCOUNT_STATS_NO_COOKIE_MSG} | source={source}"
+        )
+        return {"total": 0, "ok": 0, "fail": 0}
     for idx, username in enumerate(usernames, start=1):
         try:
             result = fetch_tiktok_profile_stats(
@@ -10668,6 +10703,12 @@ def _account_stats_query_tick() -> None:
             _normalized_alias(str(a)) for a in (raw.get("selected_aliases") or []) if _normalized_alias(str(a))
         ]
         if not selected:
+            continue
+        cookies, cookie_probe, _ = _load_tiktok_cookies_required_for_stats()
+        if not cookies:
+            _account_stats_query_log(
+                f"[{now_text()}] owner={owner} | 定时跳过：{ACCOUNT_STATS_NO_COOKIE_MSG} | {cookie_probe}"
+            )
             continue
         with store.lock:
             if store.account_stats_query_in_flight.get(owner):
@@ -10776,6 +10817,24 @@ def fetch_tiktok_profile_stats(
         remain = max(total - int(query_index), 0) if total > 0 else 0
         progress_prefix = f"正在全量查询第 {int(query_index)} 个，还剩 {remain} 个 | "
 
+    required_cookies, cookie_probe, cookie_path_probe = _load_tiktok_cookies_required_for_stats()
+    if not required_cookies:
+        print(f"[{now_text()}] {progress_prefix}TikTok stats | username={username} | 拒绝无Cookie查询 | {cookie_probe}")
+        return {
+            "code": 1,
+            "msg": f"{ACCOUNT_STATS_NO_COOKIE_MSG} | {cookie_probe}",
+            "username": username,
+            "debug": {
+                "http_status": None,
+                "cookie_file": cookie_path_probe,
+                "cookies_sent": False,
+                "cookie_debug_lines": [cookie_probe],
+                "universal_data_present": False,
+                "has_metrics": False,
+                "scrape_source": "blocked_no_cookie",
+            },
+        }
+
     # 1) 优先：与发布工具完全同一套 scrape
     upload_err = ""
     try:
@@ -10824,9 +10883,34 @@ def fetch_tiktok_profile_stats(
     except Exception as exc:
         upload_err = f"auto_upload调用失败: {exc}"
 
-    # 2) 回退：原 server 抓取路径
+    # 2) 回退：原 server 抓取路径（同样强制带 Cookie）
     url = f"https://www.tiktok.com/@{username}"
     headers, cookies_dict, cookie_debug_lines, cookie_path = prepare_tiktok_profile_request_headers_and_cookies()
+    if not cookies_dict:
+        # 探测阶段已有 Cookie，但 fallback 路径被 TIKTOK_SKIP_COOKIE 等关掉时，改用已探测到的 Cookie
+        cookies_dict = required_cookies
+        cookie_path = cookie_path or cookie_path_probe
+        cookie_debug_lines = list(cookie_debug_lines or []) + [
+            f"fallback 强制使用已探测 Cookie | {cookie_probe}"
+        ]
+        headers = dict(headers or {})
+        headers["Referer"] = "https://www.tiktok.com/"
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    if not cookies_dict:
+        return {
+            "code": 1,
+            "msg": f"{ACCOUNT_STATS_NO_COOKIE_MSG} | {upload_err}",
+            "username": username,
+            "debug": {
+                "http_status": None,
+                "cookie_file": cookie_path or cookie_path_probe,
+                "cookies_sent": False,
+                "cookie_debug_lines": list(cookie_debug_lines or []) + [cookie_probe, upload_err],
+                "universal_data_present": False,
+                "has_metrics": False,
+                "scrape_source": "blocked_no_cookie",
+            },
+        }
 
     try:
         response = requests.get(url, headers=headers, cookies=cookies_dict, timeout=15)
@@ -20878,6 +20962,12 @@ def run_account_stats_query(
     ]
     if not selected:
         return {"code": 1, "msg": "请至少选择一个别名"}
+    cookies, cookie_probe, _ = _load_tiktok_cookies_required_for_stats()
+    if not cookies:
+        _account_stats_query_log(
+            f"[{now_text()}] owner={owner} | 手动提交被拒：{ACCOUNT_STATS_NO_COOKIE_MSG} | {cookie_probe}"
+        )
+        return {"code": 1, "msg": f"{ACCOUNT_STATS_NO_COOKIE_MSG} | {cookie_probe}"}
     if payload.selected_aliases is not None:
         _save_account_stats_query_config(owner, {"selected_aliases": selected})
     with store.lock:
@@ -20886,7 +20976,7 @@ def run_account_stats_query(
     if not _start_account_stats_query_async(owner, selected, source="manual"):
         return {"code": 1, "msg": "查询任务正在执行中，请稍后再试"}
     _account_stats_query_log(
-        f"[{now_text()}] owner={owner} | 手动提交查询任务 | 别名={','.join(selected)}"
+        f"[{now_text()}] owner={owner} | 手动提交查询任务 | 别名={','.join(selected)} | {cookie_probe}"
     )
     return {
         "code": 0,
