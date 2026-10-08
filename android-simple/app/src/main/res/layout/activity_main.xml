@@ -409,14 +409,6 @@
                     android:text="For You 预滑" />
             </LinearLayout>
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualMutualButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="引流互点" />
-
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -532,6 +524,14 @@
             </LinearLayout>
 
             <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateCurrentButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="只给当前账号养号" />
+
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualDailyIncubateStopButton"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
@@ -543,7 +543,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="日常孵化：未在待活跃队列的账号。切号→发作品→涨粉50%/预滑30%/互点20%。新号前2次不发作品，第3次发1条；过渡期禁止互点。毕业后按界面条数（默认3）。熄屏暂停，亮屏自动续跑。"
+                android:text="日常孵化：未在待活跃队列的账号。切号→发作品→涨粉50%/预滑30%/互点20%。新号前2次不发作品，第3次发1条；过渡期禁止互点。毕业后按界面条数（默认3）。「只给当前账号养号」仅养下拉所选账号一次。熄屏暂停，亮屏自动续跑。"
                 android:textColor="@android:color/darker_gray"
                 android:textSize="11sp" />
 
@@ -554,6 +554,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:text="修改基本资料" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualMutualButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="引流互点" />
 
             <TextView
                 android:id="@+id/manualTaskStatusText"

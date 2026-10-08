@@ -1,5 +1,6 @@
 package com.autotraces.app
 
+import android.os.SystemClock
 import com.autotraces.app.util.Config
 import java.io.File
 import java.util.Calendar
@@ -80,6 +81,8 @@ class AutoSwitchLocalScheduler(
     private var cutSwitchInflightSlotKey: String? = null
     private var lastProcessedScheduleDate: String? = null
     private var lastWeeklyRefreshAttemptMs: Long = 0L
+    /** 疑似墙钟错乱时的强制校时节流（与周计划刷新冷却独立）。 */
+    private var lastClockResyncAttemptMs: Long = 0L
     private var pendingCutSwitchSlotKey: String? = null
     private var lastTickSkipLogKey: String? = null
     private var lastTickSkipLogMs: Long = 0L
@@ -709,6 +712,7 @@ class AutoSwitchLocalScheduler(
         lastProcessedScheduleDate = scheduleDate
 
         if (!fixedMode && !currentBundle.isDateInWeekRange(scheduleDate)) {
+            if (tryRecoverWallClockSkew(scheduleDate, currentBundle, "今日不在周计划内")) return
             if (tryRefreshWeeklyBundle("今日 $scheduleDate 不在当前周计划内")) return
             logTickSkipThrottled("今日 $scheduleDate 不在当前周计划内")
             onTryResumeGrowth()
@@ -728,6 +732,11 @@ class AutoSwitchLocalScheduler(
         val slotEntry = incompleteRecovery
             ?: currentSlotEntry
             ?: run {
+                if (fixedMode &&
+                    tryRecoverWallClockSkew(scheduleDate, currentBundle, "固定时长物化槽已过期")
+                ) {
+                    return
+                }
                 if (fixedMode && tryRefreshWeeklyBundle("固定时长物化槽已过期，刷新 bundle")) return
                 logTickSkip("当前 $scheduleDate ${formatMinuteOfDay(minuteOfDay)} 不在任何计划时段内")
                 onTryResumeGrowth()
@@ -743,6 +752,11 @@ class AutoSwitchLocalScheduler(
         val slotScheduleDate = slotEntry.schedule_date
         val planSlot = currentBundle.findPlanSlotByIndex(slotEntry.slot_index, slotScheduleDate)
             ?: run {
+                if (fixedMode &&
+                    tryRecoverWallClockSkew(scheduleDate, currentBundle, "固定时长时段在 bundle 中缺失")
+                ) {
+                    return
+                }
                 if (fixedMode && tryRefreshWeeklyBundle("固定时长时段在 bundle 中缺失")) return
                 logTickSkip("时段 slot=${slotEntry.slot_key} 在 bundle 中缺失")
                 return
@@ -1128,6 +1142,119 @@ class AutoSwitchLocalScheduler(
         lastWeeklyRefreshAttemptMs = now
         LogCenter.op(alias, "【自动切号】$reason，向云端拉取周计划 bundle…")
         return onRefreshWeeklyBundle()
+    }
+
+    /**
+     * 云端周计划/物化槽与本机墙钟明显错位时：作废校时缓存 → 强制 [DeviceClockSync] → 再拉周计划。
+     * 避免「只刷同一 revision bundle」空转（如本机 2024-08 对云周 2026-10）。
+     * @return true 表示本 tick 应结束（已校时处理或冷却中）。
+     */
+    private suspend fun tryRecoverWallClockSkew(
+        scheduleDate: String,
+        currentBundle: AutoSwitchBundle,
+        reason: String,
+    ): Boolean {
+        if (!looksLikeWallClockSkew(scheduleDate, currentBundle)) return false
+        val weekLabel = weekRangeLabel(currentBundle)
+        // 必须用单调时钟：校时会拨墙钟，用 currentTimeMillis 做冷却会在「拨慢」后永久卡住。
+        val elapsed = SystemClock.elapsedRealtime()
+        if (lastClockResyncAttemptMs > 0L &&
+            elapsed - lastClockResyncAttemptMs < CLOCK_RESYNC_COOLDOWN_MS
+        ) {
+            logTickSkipThrottled("疑似墙钟错乱本机=$scheduleDate 云周=$weekLabel，校时冷却中")
+            // 返回 false：让调用方仍可走周计划刷新（周表过期≠一定是墙钟问题）
+            return false
+        }
+        lastClockResyncAttemptMs = elapsed
+        DeviceClockSync.invalidateOkCache("自动切号:$reason")
+        LogCenter.op(
+            alias,
+            "【自动切号】疑似墙钟错乱：$reason（本机=$scheduleDate 云周=$weekLabel），强制校时…",
+        )
+        val synced = DeviceClockSync.ensureSynced(
+            alias.ifBlank { "SYSTEM" },
+            "自动切号校时",
+        )
+        if (!synced) {
+            LogCenter.op(alias, "【自动切号】强制校时未成功；回退继续尝试周计划刷新")
+            return false
+        }
+        val afterDate = beijingDateStr()
+        LogCenter.op(
+            alias,
+            "【自动切号】强制校时完成：本机 $scheduleDate → $afterDate，刷新周计划…",
+        )
+        lastWeeklyRefreshAttemptMs = 0L
+        tryRefreshWeeklyBundle("校时后刷新周计划")
+        return true
+    }
+
+    /** 本机日期相对云端周范围偏出超过阈值，或固定时长物化槽整体远离当前 epoch。 */
+    private fun looksLikeWallClockSkew(scheduleDate: String, bundle: AutoSwitchBundle): Boolean {
+        val date = scheduleDate.trim()
+        if (date.length < 10) return false
+        val start = bundle.week_start_date?.trim().orEmpty()
+            .ifBlank { bundle.weekly_plan?.week_start_date?.trim().orEmpty() }
+        val end = bundle.week_end_date?.trim().orEmpty()
+            .ifBlank { bundle.weekly_plan?.week_end_date?.trim().orEmpty() }
+        if (start.length >= 10 && end.length >= 10) {
+            if (date in start..end) return false
+            val gapDays = when {
+                date < start -> daysBetweenYmd(date, start)
+                date > end -> daysBetweenYmd(end, date)
+                else -> 0L
+            } ?: return false
+            return gapDays > CLOCK_SKEW_DAY_THRESHOLD
+        }
+        if (!bundle.isFixedDurationPlan()) return false
+        val nowMin = beijingEpochMinute()
+        val slots = bundle.fixedPlanSlots()
+        if (slots.isEmpty()) return false
+        var nearestGap = Long.MAX_VALUE
+        for (slot in slots) {
+            val s = slot.start_epoch_min ?: continue
+            val e = slot.end_epoch_min ?: (s + 1L)
+            val gap = when {
+                nowMin in s until e -> 0L
+                nowMin < s -> s - nowMin
+                else -> nowMin - e
+            }
+            if (gap < nearestGap) nearestGap = gap
+        }
+        if (nearestGap == Long.MAX_VALUE) return false
+        return nearestGap > CLOCK_SKEW_DAY_THRESHOLD * 24L * 60L
+    }
+
+    private fun weekRangeLabel(bundle: AutoSwitchBundle): String {
+        val start = bundle.week_start_date?.trim().orEmpty()
+            .ifBlank { bundle.weekly_plan?.week_start_date?.trim().orEmpty() }
+        val end = bundle.week_end_date?.trim().orEmpty()
+            .ifBlank { bundle.weekly_plan?.week_end_date?.trim().orEmpty() }
+        return if (start.isNotBlank() || end.isNotBlank()) "$start~$end" else "无周范围"
+    }
+
+    private fun daysBetweenYmd(from: String, to: String): Long? {
+        val a = parseYmdCalendar(from) ?: return null
+        val b = parseYmdCalendar(to) ?: return null
+        return (b.timeInMillis - a.timeInMillis) / (24L * 60L * 60L * 1000L)
+    }
+
+    private fun parseYmdCalendar(ymd: String): Calendar? {
+        val parts = ymd.trim().split('-')
+        if (parts.size < 3) return null
+        val y = parts[0].toIntOrNull() ?: return null
+        val m = parts[1].toIntOrNull() ?: return null
+        val d = parts[2].toIntOrNull() ?: return null
+        if (y !in 2000..2100 || m !in 1..12 || d !in 1..31) return null
+        return Calendar.getInstance(beijingTz).apply {
+            set(Calendar.YEAR, y)
+            set(Calendar.MONTH, m - 1)
+            set(Calendar.DAY_OF_MONTH, d)
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
     }
 
     private fun hasActiveHighPriorityInsertion(): Boolean {
@@ -1831,6 +1958,10 @@ class AutoSwitchLocalScheduler(
 
     companion object {
         private const val WEEKLY_REFRESH_COOLDOWN_MS = 5 * 60 * 1000L
+        /** 墙钟错乱强制校时冷却，避免 HTTP/root 打爆。 */
+        private const val CLOCK_RESYNC_COOLDOWN_MS = 10 * 60 * 1000L
+        /** 本机日期相对云周偏出超过该天数，视为墙钟错乱而非普通周界。 */
+        private const val CLOCK_SKEW_DAY_THRESHOLD = 2L
         private const val TICK_SKIP_LOG_COOLDOWN_MS = 5 * 60 * 1000L
         const val SWITCH_SAFE_BUFFER_MIN = 5
         private val DEFAULT_INSERTIONS: List<AutoSwitchSlotInsertion> = listOf(

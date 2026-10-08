@@ -1752,7 +1752,7 @@ class RealTraceExecutor(
         return true
     }
 
-    /** 拉起 TikTok 命令已执行后：专用整屏 OCR 点拒绝权限（Don't allow / 取消 / 不允许等，至多 3 次、间隔 0.5s）。 */
+    /** 拉起 TikTok 命令已执行后：整屏 OCR 点拒绝权限（走 [mlKitRecognizeFullScreen] 顺手 Don't allow + 取消/不允许等，至多 3 次、间隔 0.5s）。 */
     private suspend fun dismissDontAllowAfterTikTokLaunch(
         ctx: Context,
         alias: String,
@@ -1767,7 +1767,7 @@ class RealTraceExecutor(
             retryDelayMs = TIKTOK_LAUNCH_DONT_ALLOW_OCR_RETRY_DELAY_MS,
             logPrefix = "",
             compactLog = true,
-            useSideEffectFreeOcr = true,
+            useSideEffectFreeOcr = false,
             findDismissHit = { findLaunchPermissionDismissHit(it) },
         )
     }

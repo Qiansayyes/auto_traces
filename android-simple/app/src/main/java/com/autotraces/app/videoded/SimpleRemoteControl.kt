@@ -607,7 +607,7 @@ object SimpleRemoteControl {
                 )
             }
 
-            "daily_incubate", "start_daily_incubate" -> {
+            "daily_incubate", "start_daily_incubate", "daily_incubate_current" -> {
                 if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
                 if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
                 if (AppCoordinator.isManualSwitchBusy()) {
@@ -632,6 +632,14 @@ object SimpleRemoteControl {
                 val hoursText = PrefsStore.formatDailyIncubateDurationHours(
                     PrefsStore.getDailyIncubateDurationHours(),
                 )
+                val currentOnly = action.equals("daily_incubate_current", ignoreCase = true)
+                    || body.optBoolean("currentOnly", false)
+                    || body.optBoolean("onlyCurrent", false)
+                // 仅认 onlyUsername。PC mirror 常把全局下拉 username 附带上，
+                // 若这里再读 username，批量「当前账号养号」会错误地让所有设备养同一个号。
+                val onlyUsernameExplicit = CompanionApi.normalizeUsername(
+                    body.optString("onlyUsername", ""),
+                )
                 ensureWorkerForManualTask(app)
                 val refresh = kotlinx.coroutines.runBlocking {
                     AppCoordinator.manualRefreshAssignedAccounts()
@@ -642,13 +650,6 @@ object SimpleRemoteControl {
                         refresh.exceptionOrNull()?.message ?: "拉取账号失败",
                     )
                 }
-                val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
-                if (queueSize <= 0) {
-                    return fail("queue_empty", "无非待活跃账号可养号")
-                        .put("queueSize", 0)
-                        .put("dailyIncubateDurationMin", minutes)
-                        .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
-                }
                 // 再次确认：刷新期间可能被其它多账号会话抢占
                 if (AppCoordinator.isManualSwitchBusy()) {
                     return fail("switch_busy", "切号进行中，请稍候")
@@ -656,23 +657,75 @@ object SimpleRemoteControl {
                 if (AppCoordinator.isBatchAccountSessionBusy()) {
                     return fail("session_busy", "多账号会话进行中，请稍候")
                 }
-                AppCoordinator.manualStartDailyIncubate(minutes)
-                if (!AppCoordinator.isDailyIncubateBusy()) {
-                    val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
-                    return fail(
-                        "start_failed",
-                        if (tip.contains("日常孵化")) tip else "日常孵化未能启动（队列冲突或已被抢占）",
-                    )
+
+                if (currentOnly || onlyUsernameExplicit.isNotBlank()) {
+                    val target = onlyUsernameExplicit.ifBlank {
+                        ManualDeviceControl.selectedManualUsername()
+                            .ifBlank { ManualDeviceControl.activeManualUsername() }
+                    }
+                    if (target.isBlank()) {
+                        return fail("username_required", "请先选择账号")
+                            .put("dailyIncubateDurationMin", minutes)
+                            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                    }
+                    val canIncubate = AppCoordinator.listBoundDeviceNonPendingActivateUsernames()
+                        .any { it.equals(target, ignoreCase = true) }
+                    if (!canIncubate) {
+                        return fail(
+                            "not_incubatable",
+                            "@$target 不可养号（待活跃或已封禁）",
+                        )
+                            .put("username", target)
+                            .put("queueSize", 0)
+                            .put("dailyIncubateDurationMin", minutes)
+                            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                    }
+                    AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = target)
+                    if (!AppCoordinator.isDailyIncubateBusy()) {
+                        val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
+                        return fail(
+                            "start_failed",
+                            if (tip.contains("日常孵化")) tip else "当前账号养号未能启动（冲突或已被抢占）",
+                        )
+                            .put("username", target)
+                            .put("queueSize", 1)
+                            .put("dailyIncubateDurationMin", minutes)
+                            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                    }
+                    ok("已请求当前账号养号：@$target（约 ${hoursText} 小时）")
+                        .put("minutes", minutes)
+                        .put("hours", PrefsStore.getDailyIncubateDurationHours())
+                        .put("username", target)
+                        .put("queueSize", 1)
+                        .put("singleAccountOnly", true)
+                        .put("dailyIncubateDurationMin", minutes)
+                        .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                } else {
+                    val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
+                    if (queueSize <= 0) {
+                        return fail("queue_empty", "无非待活跃账号可养号")
+                            .put("queueSize", 0)
+                            .put("dailyIncubateDurationMin", minutes)
+                            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                    }
+                    AppCoordinator.manualStartDailyIncubate(minutes)
+                    if (!AppCoordinator.isDailyIncubateBusy()) {
+                        val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
+                        return fail(
+                            "start_failed",
+                            if (tip.contains("日常孵化")) tip else "日常孵化未能启动（队列冲突或已被抢占）",
+                        )
+                            .put("queueSize", queueSize)
+                            .put("dailyIncubateDurationMin", minutes)
+                            .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                    }
+                    ok("已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）")
+                        .put("minutes", minutes)
+                        .put("hours", PrefsStore.getDailyIncubateDurationHours())
                         .put("queueSize", queueSize)
                         .put("dailyIncubateDurationMin", minutes)
                         .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
                 }
-                ok("已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）")
-                    .put("minutes", minutes)
-                    .put("hours", PrefsStore.getDailyIncubateDurationHours())
-                    .put("queueSize", queueSize)
-                    .put("dailyIncubateDurationMin", minutes)
-                    .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
             }
 
             "stop_daily_incubate" -> {

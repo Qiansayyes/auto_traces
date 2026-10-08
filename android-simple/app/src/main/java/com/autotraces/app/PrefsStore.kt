@@ -2309,6 +2309,8 @@ object PrefsStore {
         val elapsedSec: Int = 0,
         val plannedMin: Int = DEFAULT_DAILY_INCUBATE_DURATION_MIN,
         val inTransition: Boolean = false,
+        /** true=只养指定单号，完成后不继续排队 */
+        val singleAccountOnly: Boolean = false,
     ) {
         fun remainingSec(): Int = (plannedMin * 60 - elapsedSec).coerceAtLeast(0)
     }
@@ -2328,6 +2330,7 @@ object PrefsStore {
                 plannedMin = o.optInt("plannedMin", DEFAULT_DAILY_INCUBATE_DURATION_MIN)
                     .coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
                 inTransition = o.optBoolean("inTransition", false),
+                singleAccountOnly = o.optBoolean("singleAccountOnly", false),
             )
         }.getOrNull()
     }
@@ -2349,6 +2352,7 @@ object PrefsStore {
                 session.plannedMin.coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
             )
             .put("inTransition", session.inTransition)
+            .put("singleAccountOnly", session.singleAccountOnly)
         prefs.edit().putString(KEY_DAILY_INCUBATE_SESSION, o.toString()).apply()
     }
 

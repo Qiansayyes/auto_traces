@@ -3311,7 +3311,7 @@ object AppCoordinator {
     }
 
     /**
-     * 日常孵化：非待活跃账号排队养号。
+     * 日常孵化：非待活跃账号排队养号；[onlyUsername] 非空时只养该号一次后结束。
      * 切号 → 发作品 → 加权随机动作；涨粉/预滑受分配时长；互点达云端上限即完成。
      * 新号过渡期（完整会话 <3）：第 1–2 次不发作品，第 3 次发 1 条；全程禁止互点。
      * 熄屏暂停计时与任务，亮屏自动续跑。
@@ -3319,6 +3319,7 @@ object AppCoordinator {
     fun manualStartDailyIncubate(
         durationMin: Int = PrefsStore.getDailyIncubateDurationMin(),
         resumeFromPause: Boolean = false,
+        onlyUsername: String? = null,
     ) {
         if (!ManualDeviceControl.ENABLED) return
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -3345,22 +3346,60 @@ object AppCoordinator {
         )
         PrefsStore.setDailyIncubateDurationMin(minutes)
 
-        val available = listBoundDeviceNonPendingActivateUsernames(excludeBanned = true)
-        PrefsStore.noteDailyIncubateAccountsSeen(available, grandfatherExisting = true)
-        val queue = PrefsStore.syncDailyIncubateQueue(available)
-        if (queue.isEmpty()) {
-            LogCenter.op(alias, "日常孵化：队列为空（非待活跃账号无可用）")
-            updateRuntime(lastMessage = "日常孵化：队列为空")
-            return
+        val existing = PrefsStore.getDailyIncubateSession()
+        val onlyUserNormalized = onlyUsername?.trim()?.removePrefix("@").orEmpty()
+        val singleAccountOnly = when {
+            onlyUserNormalized.isNotBlank() -> true
+            resumeFromPause -> existing?.singleAccountOnly == true
+            else -> false
+        }
+        val singleTarget = when {
+            onlyUserNormalized.isNotBlank() -> onlyUserNormalized
+            singleAccountOnly -> existing?.username?.trim()?.removePrefix("@").orEmpty()
+            else -> ""
         }
 
-        val existing = PrefsStore.getDailyIncubateSession()
+        val available = listBoundDeviceNonPendingActivateUsernames(excludeBanned = true)
+        val queueSize: Int
+        if (singleAccountOnly) {
+            if (singleTarget.isBlank()) {
+                LogCenter.op(alias, "日常孵化：单号模式未指定账号")
+                updateRuntime(lastMessage = "日常孵化：请先选择账号")
+                return
+            }
+            if (!available.any { it.equals(singleTarget, ignoreCase = true) }) {
+                LogCenter.op(alias, "日常孵化：@$singleTarget 不可养号（待活跃/封禁/未分配）")
+                updateRuntime(lastMessage = "日常孵化：@$singleTarget 不可养号（待活跃或已封禁）")
+                return
+            }
+            PrefsStore.noteDailyIncubateAccountsSeen(listOf(singleTarget), grandfatherExisting = true)
+            queueSize = 1
+        } else {
+            PrefsStore.noteDailyIncubateAccountsSeen(available, grandfatherExisting = true)
+            val queue = PrefsStore.syncDailyIncubateQueue(available)
+            if (queue.isEmpty()) {
+                LogCenter.op(alias, "日常孵化：队列为空（非待活跃账号无可用）")
+                updateRuntime(lastMessage = "日常孵化：队列为空")
+                return
+            }
+            queueSize = queue.size
+        }
+
         PrefsStore.saveDailyIncubateSession(
-            (existing ?: PrefsStore.DailyIncubateSession()).copy(
-                enabled = true,
-                pausedByScreenOff = false,
-                plannedMin = minutes,
-            ),
+            if (singleAccountOnly && !resumeFromPause) {
+                PrefsStore.DailyIncubateSession(
+                    enabled = true,
+                    plannedMin = minutes,
+                    singleAccountOnly = true,
+                )
+            } else {
+                (existing ?: PrefsStore.DailyIncubateSession()).copy(
+                    enabled = true,
+                    pausedByScreenOff = false,
+                    plannedMin = minutes,
+                    singleAccountOnly = singleAccountOnly,
+                )
+            },
         )
 
         manualDispatchJob?.cancel()
@@ -3379,7 +3418,11 @@ object AppCoordinator {
                 LogCenter.op(
                     alias,
                     "日常孵化：${if (resumeFromPause) "亮屏续跑" else "开始"}" +
-                        "（每号 ${minutes} 分钟，队列 ${queue.size}，切号=$scheme）",
+                        if (singleAccountOnly) {
+                            "（单号 @$singleTarget · ${minutes} 分钟，切号=$scheme）"
+                        } else {
+                            "（每号 ${minutes} 分钟，队列 $queueSize，切号=$scheme）"
+                        },
                 )
                 PrefsStore.saveLocalStatus("running")
 
@@ -3389,17 +3432,33 @@ object AppCoordinator {
 
                     val liveAvail = listBoundDeviceNonPendingActivateUsernames(excludeBanned = true)
                     PrefsStore.noteDailyIncubateAccountsSeen(liveAvail, grandfatherExisting = false)
-                    val liveQueue = PrefsStore.syncDailyIncubateQueue(liveAvail)
-                    if (liveQueue.isEmpty()) {
-                        LogCenter.op(alias, "日常孵化：队列已空，结束")
-                        break
-                    }
 
                     val session = PrefsStore.getDailyIncubateSession()
-                    val resumeUser = session?.username?.takeIf { it.isNotBlank() }
-                        ?.takeIf { u -> liveQueue.any { it.equals(u, ignoreCase = true) } }
-                        ?.takeIf { (session.elapsedSec > 0 || session.publishDone || session.action.isNotBlank()) }
-                    val target = resumeUser ?: PrefsStore.peekDailyIncubateUsername() ?: break
+                    val target: String
+                    if (singleAccountOnly) {
+                        val resumeUser = session?.username?.takeIf { it.isNotBlank() }
+                            ?.takeIf { u -> liveAvail.any { it.equals(u, ignoreCase = true) } }
+                            ?.takeIf {
+                                (session.elapsedSec > 0 || session.publishDone || session.action.isNotBlank())
+                            }
+                        target = resumeUser ?: singleTarget
+                        if (!liveAvail.any { it.equals(target, ignoreCase = true) }) {
+                            LogCenter.op(alias, "日常孵化：@$target 已不可用，结束")
+                            break
+                        }
+                    } else {
+                        val liveQueue = PrefsStore.syncDailyIncubateQueue(liveAvail)
+                        if (liveQueue.isEmpty()) {
+                            LogCenter.op(alias, "日常孵化：队列已空，结束")
+                            break
+                        }
+                        val resumeUser = session?.username?.takeIf { it.isNotBlank() }
+                            ?.takeIf { u -> liveQueue.any { it.equals(u, ignoreCase = true) } }
+                            ?.takeIf {
+                                (session.elapsedSec > 0 || session.publishDone || session.action.isNotBlank())
+                            }
+                        target = resumeUser ?: PrefsStore.peekDailyIncubateUsername() ?: break
+                    }
                     PrefsStore.noteDailyIncubateAccountsSeen(listOf(target), grandfatherExisting = false)
 
                     notifyManualAccountUi()
@@ -3422,23 +3481,31 @@ object AppCoordinator {
                     processed++
                     when (result) {
                         DailyIncubatePhaseResult.COMPLETED -> {
-                            if (target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)) {
+                            if (!singleAccountOnly &&
+                                target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)
+                            ) {
                                 PrefsStore.rotateDailyIncubateQueueFrontToBack()
                             }
                             PrefsStore.clearDailyIncubateSessionProgress()
-                            val enabled = PrefsStore.getDailyIncubateSession()?.enabled == true
+                            val enabled =
+                                !singleAccountOnly && PrefsStore.getDailyIncubateSession()?.enabled == true
                             PrefsStore.saveDailyIncubateSession(
                                 PrefsStore.DailyIncubateSession(
                                     enabled = enabled,
                                     plannedMin = minutes,
+                                    singleAccountOnly = singleAccountOnly,
                                 ),
                             )
                             updateRuntime(
-                                localStatus = "running",
-                                lastMessage = "日常孵化完成：@$target（第 $processed 次，队列 ${PrefsStore.getDailyIncubateUsernames().size}）",
+                                localStatus = if (singleAccountOnly) "online" else "running",
+                                lastMessage = if (singleAccountOnly) {
+                                    "日常孵化完成：@$target（仅当前账号）"
+                                } else {
+                                    "日常孵化完成：@$target（第 $processed 次，队列 ${PrefsStore.getDailyIncubateUsernames().size}）"
+                                },
                             )
                             forceStopTikTokForExclusiveEnqueue("日常孵化单号结束")
-                            continue
+                            if (singleAccountOnly) break else continue
                         }
                         DailyIncubatePhaseResult.INCOMPLETE -> {
                             updateRuntime(
@@ -3450,18 +3517,22 @@ object AppCoordinator {
                             break
                         }
                         DailyIncubatePhaseResult.FAILED -> {
-                            if (target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)) {
+                            if (!singleAccountOnly &&
+                                target.equals(PrefsStore.peekDailyIncubateUsername(), ignoreCase = true)
+                            ) {
                                 PrefsStore.rotateDailyIncubateQueueFrontToBack()
                             }
                             PrefsStore.clearDailyIncubateSessionProgress()
                             PrefsStore.saveDailyIncubateSession(
                                 PrefsStore.DailyIncubateSession(
-                                    enabled = PrefsStore.getDailyIncubateSession()?.enabled == true,
+                                    enabled = !singleAccountOnly &&
+                                        PrefsStore.getDailyIncubateSession()?.enabled == true,
                                     plannedMin = minutes,
+                                    singleAccountOnly = singleAccountOnly,
                                 ),
                             )
                             forceStopTikTokForExclusiveEnqueue("日常孵化单号失败")
-                            continue
+                            if (singleAccountOnly) break else continue
                         }
                     }
                 }
@@ -3480,6 +3551,7 @@ object AppCoordinator {
                         PrefsStore.DailyIncubateSession(
                             enabled = false,
                             plannedMin = minutes,
+                            singleAccountOnly = false,
                         ),
                     )
                 }
@@ -3488,10 +3560,18 @@ object AppCoordinator {
                     lastMessage = when {
                         sessEnd?.pausedByScreenOff == true -> "日常孵化已熄屏暂停（已保存进度）"
                         keepForResume -> "日常孵化已中断（已保存进度，可续跑）"
+                        singleAccountOnly && processed > 0 -> "日常孵化结束：@$singleTarget 已完成"
                         else -> "日常孵化结束：共完成 $processed 次单号"
                     },
                 )
-                LogCenter.op(alias, "日常孵化结束：共 $processed 次单号")
+                LogCenter.op(
+                    alias,
+                    if (singleAccountOnly) {
+                        "日常孵化结束：单号 @$singleTarget（完成 $processed）"
+                    } else {
+                        "日常孵化结束：共 $processed 次单号"
+                    },
+                )
                 if (detectActiveManualTaskKind() == null ||
                     detectActiveManualTaskKind() == ManualTaskKind.DAILY_INCUBATE
                 ) {
@@ -3652,13 +3732,17 @@ object AppCoordinator {
     ): DailyIncubatePhaseResult {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         val plannedSec = minutes * 60
-        var session = PrefsStore.getDailyIncubateSession()?.takeIf {
+        // 首次进入时 session.username 可能仍为空；重建时必须保留 singleAccountOnly，
+        // 否则熄屏续跑会丢掉「只养当前账号」标记，误变成排队养号。
+        val previous = PrefsStore.getDailyIncubateSession()
+        var session = previous?.takeIf {
             it.username.equals(target, ignoreCase = true)
         } ?: PrefsStore.DailyIncubateSession(
             enabled = true,
             username = target,
             plannedMin = minutes,
             inTransition = PrefsStore.isDailyIncubateInTransition(target),
+            singleAccountOnly = previous?.singleAccountOnly == true,
         )
         // 首次见到已写入；以当前过渡状态为准
         val inTransition = PrefsStore.isDailyIncubateInTransition(target)
@@ -3668,6 +3752,7 @@ object AppCoordinator {
             plannedMin = minutes,
             inTransition = inTransition,
             pausedByScreenOff = false,
+            singleAccountOnly = previous?.singleAccountOnly == true || session.singleAccountOnly,
         )
         PrefsStore.saveDailyIncubateSession(session)
         PrefsStore.setLogContextUsername(target)
@@ -4147,7 +4232,7 @@ object AppCoordinator {
 
     /**
      * 手动下拉切号入口：与 [manualSwitchAccount] 相同，默认先备份本机当前号。
-     * 若目标与本机当前已相同且已就绪则直接对齐；同号未就绪则继续走还原/自动登录补齐。
+     * 若目标与本机当前已相同且已就绪则直接对齐；同号未就绪则继续走还原（登录须再点「自动登录」）。
      */
     fun manualSwitchAccountFromSpinner(targetUsername: String) {
         val target = targetUsername.trim().removePrefix("@")
@@ -4162,8 +4247,8 @@ object AppCoordinator {
                 notifyManualAccountUi()
                 return
             }
-            // 同号未就绪：不再早退，走还原/自动登录把就绪门闩补上
-            LogCenter.op(PrefsStore.getAlias(), "手动切号：本机已是 @$target 但未就绪，补跑还原/自动登录")
+            // 同号未就绪：不再早退，走还原补齐环境；密码登录须用户点「自动登录」
+            LogCenter.op(PrefsStore.getAlias(), "手动切号：本机已是 @$target 但未就绪，补跑还原（登录请点「自动登录」）")
             manualSwitchAccount(target, backupCurrentFirst = false)
             return
         }
@@ -4470,6 +4555,7 @@ object AppCoordinator {
                 reason = reason,
                 expectedUsername = user,
                 forceRelogin = true,
+                allowManualAutoLogin = true,
             )
             if (outcome == AccountLoginRetryOutcome.LoggedIn) {
                 markManualAccountReady(user, "手动自动登录")
@@ -4841,7 +4927,7 @@ object AppCoordinator {
                     )
                     if (lastDeviceOpOk) {
                         restoredFromBackup = true
-                        // 还原完成：再跑登录状态检测；通过即切号成功；需登录则保障链内自动登录
+                        // 还原完成：再跑登录状态检测；通过即就绪。未通过则停住，等用户点「自动登录」
                         updateRuntime(
                             localStatus = "running",
                             lastMessage = "手动切号：@$target 还原完成，登录状态检测中",
@@ -4858,50 +4944,35 @@ object AppCoordinator {
                         if (safeguardOk) {
                             markManualAccountReady(target, "还原+登录状态检测")
                         } else {
-                            LogCenter.op(alias, "手动切号：@$target 还原后登录状态未通过，回退自动登录")
                             PrefsStore.setManualFirstLoginDone(target, false)
+                            LogCenter.op(
+                                alias,
+                                "手动切号：@$target 还原后登录状态未通过，请点击「自动登录」",
+                            )
                             updateRuntime(
-                                localStatus = "running",
-                                lastMessage = "手动切号：@$target 还原后→自动登录",
+                                localStatus = "online",
+                                lastMessage = "切号还原完成：@$target 请点击「自动登录」",
                             )
-                            val loginOutcome = ensureAccountLoggedInWithRetry(
-                                alias = alias,
-                                deviceId = deviceId,
-                                reason = "手动切号还原后→自动登录",
-                                expectedUsername = target,
-                                resumeRunningOnSuccess = false,
-                                forceRelogin = true,
-                            )
-                            if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
-                                error("还原后登录状态未通过且自动登录 @$target 未完成（$loginOutcome）")
-                            }
-                            markManualAccountReady(target, "还原后自动登录")
                         }
                     } else {
-                        LogCenter.op(alias, "手动切号：@$target 还原失败，回退自动登录")
                         PrefsStore.setManualFirstLoginDone(target, false)
-                        updateRuntime(localStatus = "running", lastMessage = "手动切号：@$target 还原失败→自动登录")
-                        val loginOutcome = ensureAccountLoggedInWithRetry(
-                            alias = alias,
-                            deviceId = deviceId,
-                            reason = "手动切号还原失败→自动登录",
-                            expectedUsername = target,
-                            resumeRunningOnSuccess = false,
-                            forceRelogin = true,
+                        LogCenter.op(
+                            alias,
+                            "手动切号：@$target 还原失败，已清理目标环境，请点击「自动登录」",
                         )
-                        if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
-                            error("还原失败且自动登录 @$target 未完成（$loginOutcome）")
-                        }
-                        markManualAccountReady(target, "还原失败后自动登录")
+                        updateRuntime(
+                            localStatus = "online",
+                            lastMessage = "切号还原失败：@$target 请点击「自动登录」",
+                        )
                     }
                 } else {
-                    // 无备份（或登录切号方案）→ 清理 + 自动登录
+                    // 无备份（或登录切号方案）→ 清理后停住，等用户点「自动登录」
                     LogCenter.op(
                         alias,
                         if (loginCutScheme) {
-                            "手动切号：@$target 登录切号 → 清理后自动登录（跳过备份/还原）"
+                            "手动切号：@$target 登录切号 → 清理后请点击「自动登录」（跳过备份/还原）"
                         } else {
-                            "手动切号：@$target 无本机备份 → 清理后自动登录"
+                            "手动切号：@$target 无本机备份 → 清理后请点击「自动登录」"
                         },
                     )
                     handleDeviceOp(
@@ -4925,19 +4996,10 @@ object AppCoordinator {
                     tikTokSwitched = true
                     PrefsStore.setManualActiveUsername(target)
                     PrefsStore.setManualFirstLoginDone(target, false)
-                    updateRuntime(localStatus = "running", lastMessage = "手动切号：@$target 自动登录中")
-                    val loginOutcome = ensureAccountLoggedInWithRetry(
-                        alias = alias,
-                        deviceId = deviceId,
-                        reason = "手动切号无备份→自动登录",
-                        expectedUsername = target,
-                        resumeRunningOnSuccess = false,
-                        forceRelogin = true,
+                    updateRuntime(
+                        localStatus = "online",
+                        lastMessage = "切号已清理：@$target 请点击「自动登录」",
                     )
-                    if (loginOutcome != AccountLoginRetryOutcome.LoggedIn) {
-                        error("自动登录 @$target 未完成（$loginOutcome）")
-                    }
-                    markManualAccountReady(target, "无备份自动登录")
                 }
 
                 PrefsStore.setManualSelectedUsername(target)
@@ -4945,12 +5007,13 @@ object AppCoordinator {
                 PrefsStore.setLogContextUsername(target)
                 PrefsStore.saveLocalStatus("online")
                 val status = manualQuerySwitchStatus(target)
+                val ready = PrefsStore.isManualFirstLoginDone(target)
                 updateRuntime(
                     localStatus = "online",
-                    lastMessage = if (restoredFromBackup) {
-                        "切号完成（还原）：${status.message}"
-                    } else {
-                        "切号完成（自动登录）：${status.message}"
+                    lastMessage = when {
+                        ready && restoredFromBackup -> "切号完成（还原）：${status.message}"
+                        ready -> "切号完成：${status.message}"
+                        else -> "切号环境已就绪：@$target 请点击「自动登录」 · ${status.message}"
                     },
                 )
                 notifyManualAccountUi()
@@ -4958,7 +5021,13 @@ object AppCoordinator {
                     alias,
                     buildString {
                         append("手动切号完成：@$target")
-                        append(if (restoredFromBackup) "（还原）" else "（自动登录）")
+                        append(
+                            when {
+                                ready && restoredFromBackup -> "（还原）"
+                                ready -> "（已就绪）"
+                                else -> "（待自动登录）"
+                            },
+                        )
                         append(" · ${status.message}")
                     },
                 )
@@ -6668,12 +6737,12 @@ object AppCoordinator {
                     continue
                 }
 
-                // 手动模式：未就绪时不自动登录；须先切号（有备份还原 / 无备份自动登录）或点「自动登录」重试。
+                // 手动模式：未就绪时不自动登录；须先切号（有备份还原）后再点「自动登录」。
                 if (ManualDeviceControl.ENABLED) {
                     val currentUser = PrefsStore.getLogContextUsername()?.trim().orEmpty()
                         .ifBlank { PrefsStore.getManualSelectedUsername().orEmpty() }
                     if (currentUser.isBlank() || !PrefsStore.isManualFirstLoginDone(currentUser)) {
-                        updateRuntime(lastMessage = "手动模式：请先切号完成（有备份还原 / 无备份自动登录）")
+                        updateRuntime(lastMessage = "手动模式：请先切号，再点击「自动登录」")
                         delay(2_000)
                         continue
                     }
@@ -9035,6 +9104,7 @@ object AppCoordinator {
     /**
      * 云端 is_login=否 时持续重试自动登录。
      * @param expectedUsername 自动切号场景：分配账号 username 变化时停止重试（等待云端切号）。
+     * @param allowManualAutoLogin 手动模式仅 [manualStartAutoLogin] / PC 遥控可传 true；其它路径禁止跑密码登录链。
      */
     private suspend fun ensureAccountLoggedInWithRetry(
         alias: String,
@@ -9044,6 +9114,7 @@ object AppCoordinator {
         resumeRunningOnSuccess: Boolean = true,
         forceRelogin: Boolean = false,
         resumeFromLoginEntryScreen: Boolean = false,
+        allowManualAutoLogin: Boolean = false,
     ): AccountLoginRetryOutcome {
         if (reason.contains("掉登录")) {
             clearMutualClickStateForInterrupt("掉登录($reason)")
@@ -9137,6 +9208,10 @@ object AppCoordinator {
                     "尝试自动登录（$reason）"
             }
             LogCenter.op(alias, retryLog)
+            if (ManualDeviceControl.ENABLED && !allowManualAutoLogin) {
+                LogCenter.op(alias, "自动登录($reason)：手动模式仅允许点击「自动登录」触发，已跳过")
+                return AccountLoginRetryOutcome.Aborted
+            }
             val loginOk = try {
                 ensureAccountLoggedIn(
                     alias = alias,
@@ -9147,6 +9222,7 @@ object AppCoordinator {
                     forceRelogin = nextForceRelogin,
                     resumeFromLoginEntryScreen = nextResumeFromEntry,
                     preferredUsername = expected,
+                    allowManualAutoLogin = allowManualAutoLogin,
                 )
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, reason)
@@ -9350,10 +9426,10 @@ object AppCoordinator {
         if (ManualDeviceControl.ENABLED) {
             val user = ManualDeviceControl.selectedManualUsername()
             if (user.isBlank() || !PrefsStore.isManualFirstLoginDone(user)) {
-                LogCenter.op(alias, "$taskLabel：手动模式未就绪，请先切号（有备份还原 / 无备份自动登录）")
+                LogCenter.op(alias, "$taskLabel：手动模式未就绪，请先切号并点击「自动登录」")
                 return false
             }
-            // 已就绪：不在入口主动跑自动登录；任务中途 OCR 掉登录再触发。
+            // 已就绪：不在入口主动跑自动登录；任务中途掉登录也不自动重登，须再点「自动登录」。
             return true
         }
         val expectedUser = AutoSwitchLocalPlanStore.activePublishAccountUsername()
@@ -9403,10 +9479,10 @@ object AppCoordinator {
             val user = expectedUser?.trim().orEmpty()
                 .ifBlank { ManualDeviceControl.selectedManualUsername() }
             if (user.isBlank() || !PrefsStore.isManualFirstLoginDone(user)) {
-                LogCenter.op(alias, "发作品：手动模式未就绪，请先切号（有备份还原 / 无备份自动登录）")
+                LogCenter.op(alias, "发作品：手动模式未就绪，请先切号并点击「自动登录」")
                 return false
             }
-            // 已就绪：不在入口主动跑自动登录；OCR 掉登录由后续保障触发。
+            // 已就绪：不在入口主动跑自动登录；中途掉登录须再点「自动登录」。
         } else if (!isAssignedAccountLoggedIn(alias, deviceId, preferredUsername = expectedUser)) {
             when (
                 ensureAccountLoggedInWithRetry(
@@ -9558,9 +9634,16 @@ object AppCoordinator {
                     true
                 }
                 LoginSafeguardOutcome.RequiresAutoLogin -> {
+                    if (ManualDeviceControl.ENABLED) {
+                        LogCenter.op(
+                            alias,
+                            "登录状态保障($source)：界面需登录，手动模式请点击「自动登录」（不自动启动）",
+                        )
+                        return false
+                    }
                     LogCenter.op(alias, "登录状态保障($source)：界面需登录，启动自动登录")
                     val opId = "safeguard_${System.currentTimeMillis()}"
-                    val ok = ensureAccountLoggedIn(
+                    ensureAccountLoggedIn(
                         alias = alias,
                         deviceId = deviceId,
                         opId = opId,
@@ -9570,14 +9653,6 @@ object AppCoordinator {
                         resumeFromLoginEntryScreen = true,
                         deferBasicProfileEdit = deferBasicProfileEdit,
                     )
-                    if (ok && ManualDeviceControl.ENABLED) {
-                        val u = ManualDeviceControl.activeManualUsername()
-                            .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                        if (u.isNotBlank()) {
-                            markManualAccountReady(u, "登录状态保障自动登录($source)")
-                        }
-                    }
-                    ok
                 }
                 LoginSafeguardOutcome.Failed -> {
                     LogCenter.op(alias, "登录状态保障($source)：执行失败")
@@ -9585,9 +9660,16 @@ object AppCoordinator {
                 }
             }
         } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            if (ManualDeviceControl.ENABLED) {
+                LogCenter.op(
+                    alias,
+                    "登录状态保障($source)：OCR 见登录入口，手动模式请点击「自动登录」",
+                )
+                return false
+            }
             LogCenter.op(alias, "登录状态保障($source)：OCR 见 Add another account，从登录入口续接自动登录")
             return try {
-                val ok = ensureAccountLoggedIn(
+                ensureAccountLoggedIn(
                     alias = alias,
                     deviceId = deviceId,
                     opId = "safeguard_add_account_${System.currentTimeMillis()}",
@@ -9597,12 +9679,6 @@ object AppCoordinator {
                     resumeFromLoginEntryScreen = true,
                     deferBasicProfileEdit = deferBasicProfileEdit,
                 )
-                if (ok && ManualDeviceControl.ENABLED) {
-                    val u = ManualDeviceControl.activeManualUsername()
-                        .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                    if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
-                }
-                ok
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
                 throw banned
@@ -9611,10 +9687,17 @@ object AppCoordinator {
             handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
             throw banned
         } catch (logout: AccountStatusLoggedOutException) {
+            if (ManualDeviceControl.ENABLED) {
+                LogCenter.op(
+                    alias,
+                    "登录状态保障($source)：Account status 掉登录，手动模式请点击「自动登录」",
+                )
+                return false
+            }
             LogCenter.op(alias, "登录状态保障($source)：Account status 掉登录，重新自动登录")
             executor.setAccountStatusReloginInProgress(true)
             return try {
-                val ok = ensureAccountLoggedIn(
+                ensureAccountLoggedIn(
                     alias = alias,
                     deviceId = deviceId,
                     opId = "safeguard_acct_status_${System.currentTimeMillis()}",
@@ -9623,12 +9706,6 @@ object AppCoordinator {
                     forceRelogin = true,
                     deferBasicProfileEdit = deferBasicProfileEdit,
                 )
-                if (ok && ManualDeviceControl.ENABLED) {
-                    val u = ManualDeviceControl.activeManualUsername()
-                        .ifBlank { ManualDeviceControl.selectedManualUsername() }
-                    if (u.isNotBlank()) markManualAccountReady(u, "登录状态保障自动登录($source)")
-                }
-                ok
             } catch (banned: AccountPlanBlockedException) {
                 handleAccountPlanBlocked(alias, deviceId, banned, "登录状态保障($source)")
                 throw banned
@@ -9654,6 +9731,13 @@ object AppCoordinator {
                 timingConfig = _config.value,
             )
         } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+            if (ManualDeviceControl.ENABLED) {
+                LogCenter.op(
+                    alias,
+                    "登录状态保障：拉起阶段见登录入口（$safeguardSource），手动模式请点击「自动登录」",
+                )
+                return false
+            }
             // 拉起后 Don't allow OCR 若仍误触 Welcome back 上的 Add another，直接从当前登录入口续接。
             LogCenter.op(
                 alias,
@@ -9738,6 +9822,13 @@ object AppCoordinator {
                     // 保障/登录链已 handleAccountPlanBlocked；禁止外层继续重试同一账号。
                     return@withExclusive false
                 } catch (logout: LoginSafeguardRequiresAutoLoginException) {
+                    if (ManualDeviceControl.ENABLED) {
+                        LogCenter.op(
+                            alias,
+                            "登录状态保障：重试层见登录入口（$safeguardSource），手动模式请点击「自动登录」",
+                        )
+                        return@withExclusive false
+                    }
                     // 兜底：拉起层若仍上抛 Welcome back/Add another，从入口续接，禁止冒成进程崩溃。
                     LogCenter.op(
                         alias,
@@ -9990,6 +10081,7 @@ object AppCoordinator {
         resumeFromLoginEntryScreen: Boolean = false,
         preferredUsername: String? = null,
         deferBasicProfileEdit: Boolean = false,
+        allowManualAutoLogin: Boolean = false,
     ): Boolean {
         lastEnsureLoginPerformedFreshAutoLogin = false
         val fromBundle = PrefsStore.isAutoSwitchAutonomousMode()
@@ -10021,6 +10113,14 @@ object AppCoordinator {
                 )
             }
             return true
+        }
+        if (ManualDeviceControl.ENABLED && !allowManualAutoLogin) {
+            // 必须返回 false：若用 !strict，strict=false 时会误报登录成功并可能 markManualAccountReady。
+            LogCenter.op(
+                alias,
+                "[OP][$opId] 自动登录($reason)：手动模式仅允许点击「自动登录」触发，已跳过",
+            )
+            return false
         }
         val username = accountResp.username.orEmpty().trim()
         val email = accountResp.email.orEmpty().trim()

@@ -1375,6 +1375,69 @@ class MainActivity : AppCompatActivity() {
                 setManualTaskButtonsEnabled(true)
             }
         }
+        binding.manualDailyIncubateCurrentButton.setOnClickListener {
+            if (AppCoordinator.isManualSwitchBusy()) {
+                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (AppCoordinator.isBatchAccountSessionBusy()) {
+                Toast.makeText(this, "多账号会话已在进行中", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val user = selectedManualUsername()
+            if (user.isBlank()) {
+                Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val hours = PrefsStore.parseDailyIncubateDurationHours(
+                binding.manualDailyIncubateDurationMinInput.text?.toString(),
+            )
+            PrefsStore.setDailyIncubateDurationHours(hours)
+            val minutes = PrefsStore.getDailyIncubateDurationMin()
+            val hoursText = PrefsStore.formatDailyIncubateDurationHours(hours)
+            binding.manualDailyIncubateDurationMinInput.setText(hoursText)
+            lifecycleScope.launch {
+                binding.manualDailyIncubateCurrentButton.isEnabled = false
+                binding.manualTaskStatusText.text = "日常孵化：正在同步账号 @$user…"
+                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
+                bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
+                if (refresh.isFailure) {
+                    binding.manualTaskStatusText.text =
+                        "日常孵化：拉取账号失败：${refresh.exceptionOrNull()?.message}"
+                    Toast.makeText(
+                        this@MainActivity,
+                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    setManualTaskButtonsEnabled(true)
+                    return@launch
+                }
+                val stillSelected = selectedManualUsername().ifBlank { user }
+                val canIncubate = AppCoordinator.listBoundDeviceNonPendingActivateUsernames()
+                    .any { it.equals(stillSelected, ignoreCase = true) }
+                if (!canIncubate) {
+                    binding.manualTaskStatusText.text =
+                        "日常孵化：@$stillSelected 不可养号（待活跃或已封禁）"
+                    Toast.makeText(
+                        this@MainActivity,
+                        "@$stillSelected 不可养号（待活跃或已封禁）",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    setManualTaskButtonsEnabled(true)
+                    return@launch
+                }
+                AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = stillSelected)
+                binding.manualTaskStatusText.text =
+                    "已请求当前账号养号：@$stillSelected（约 ${hoursText} 小时）"
+                Toast.makeText(
+                    this@MainActivity,
+                    "已开始养号：@$stillSelected",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                setManualTaskButtonsEnabled(true)
+            }
+        }
         binding.manualDailyIncubateStopButton.setOnClickListener {
             AppCoordinator.manualStopDailyIncubate()
             binding.manualTaskStatusText.text = "已停止日常孵化"
@@ -1490,6 +1553,7 @@ class MainActivity : AppCompatActivity() {
         binding.manualBatchPublishAfterMinInput.isEnabled = !blocked
         binding.manualDailyIncubateDurationMinInput.isEnabled = !blocked
         binding.manualDailyIncubateStartButton.isEnabled = !blocked
+        binding.manualDailyIncubateCurrentButton.isEnabled = !blocked
         binding.manualDailyIncubateStopButton.isEnabled = true
         binding.manualProfileEditButton.isEnabled = aligned
         // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
