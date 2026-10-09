@@ -189,6 +189,8 @@ object AppCoordinator {
     private var autoActiveJob: Job? = null
     /** 日常孵化：对非待活跃账号排队养号。 */
     private var dailyIncubateJob: Job? = null
+    /** 任务完成后：随机涨粉/预滑（时长=养号时长）。 */
+    private var postTaskNurtureJob: Job? = null
     private val _manualSwitchBusy = MutableStateFlow(false)
     /** 手动下拉切号进行中：UI 应禁用任务按钮，直至切号完成。 */
     val manualSwitchBusy = _manualSwitchBusy.asStateFlow()
@@ -266,6 +268,8 @@ object AppCoordinator {
         BATCH_PUBLISH("批量发作品"),
         AUTO_ACTIVE("自动活跃"),
         DAILY_INCUBATE("日常孵化"),
+        /** 引流/改资料/初次登录完成后：随机涨粉或预滑，时长用养号时长。 */
+        POST_TASK_NURTURE("任务后养号"),
         BACKUP("备份"),
     }
 
@@ -2195,14 +2199,17 @@ object AppCoordinator {
 
     fun isActivateNextBusy(): Boolean = activateNextJob?.isActive == true
 
-    /** 任一多账号会话占用中（活跃下个 / 批量发作品 / 自动活跃 / 日常孵化）。 */
+    /** 任一多账号会话占用中（活跃下个 / 批量发作品 / 自动活跃 / 日常孵化 / 任务后养号）。 */
     fun isBatchAccountSessionBusy(): Boolean =
         activateNextJob?.isActive == true ||
             batchPublishJob?.isActive == true ||
             autoActiveJob?.isActive == true ||
-            dailyIncubateJob?.isActive == true
+            dailyIncubateJob?.isActive == true ||
+            postTaskNurtureJob?.isActive == true
 
     fun isDailyIncubateBusy(): Boolean = dailyIncubateJob?.isActive == true
+
+    fun isPostTaskNurtureBusy(): Boolean = postTaskNurtureJob?.isActive == true
 
     private fun notifyManualAccountUi() {
         _manualAccountUiEpoch.value = _manualAccountUiEpoch.value + 1
@@ -2258,6 +2265,17 @@ object AppCoordinator {
         }
         job.cancel()
         dailyIncubateJob = null
+    }
+
+    private fun cancelPostTaskNurtureIfRunning(reason: String) {
+        val job = postTaskNurtureJob ?: return
+        if (!job.isActive) return
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        if (alias.isNotBlank()) {
+            LogCenter.op(alias, "取消任务后养号：$reason")
+        }
+        job.cancel()
+        postTaskNurtureJob = null
     }
 
     @Volatile
@@ -2407,6 +2425,7 @@ object AppCoordinator {
         cancelBatchPublishIfRunning(reason)
         cancelAutoActiveIfRunning(reason)
         cancelDailyIncubateIfRunning(reason)
+        cancelPostTaskNurtureIfRunning(reason)
     }
 
     /** 将当前下拉账号加入待活跃队列（须用户明确点选加入）。 */
@@ -2927,7 +2946,7 @@ object AppCoordinator {
     }
 
     /**
-     * 启动发作品并等待结束；批量会话内抑制「完成后自动涨粉」。
+     * 启动发作品并等待结束；批量会话内抑制「任务后养号」（发作品本身也不再触发，双保险）。
      * @return 是否至少成功发出目标条数（或 outcome.success）。
      */
     /**
@@ -2941,7 +2960,7 @@ object AppCoordinator {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         val sessionId = "batch-pub-${System.currentTimeMillis()}"
         beginManualPublishSession(sessionId)
-        // 批量会话自己会做发后活跃，禁止单号发完后自动涨粉抢占
+        // 批量会话自己会做发后活跃；抑制窗口防止其它 completion 回调抢占
         suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 24L * 60L * 60L * 1000L
         activateNextOwnsSwitch = true
         if (updatePreferredCount) {
@@ -2971,7 +2990,7 @@ object AppCoordinator {
             delay(500)
             gateWait++
         }
-        // 只清遗留独占；勿缩短 24h 抑制窗口（批量发作品依赖它挡住 completion 自动涨粉）
+        // 只清遗留独占；勿缩短 24h 抑制窗口（批量发作品依赖它挡住 completion 任务后养号）
         PrefsStore.setAutoSwitchExclusivePreempt(false)
         PrefsStore.setTransientPausedForDestructiveOp(false)
         currentCoroutineContext().ensureActive()
@@ -4297,6 +4316,7 @@ object AppCoordinator {
         cancelBatchPublishIfRunning("手动涨粉")
         cancelAutoActiveIfRunning("手动涨粉")
         cancelDailyIncubateIfRunning("手动涨粉")
+        cancelPostTaskNurtureIfRunning("手动涨粉")
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank()) {
             LogCenter.op(PrefsStore.getAlias(), "手动涨粉：请先选择账号")
@@ -4334,6 +4354,7 @@ object AppCoordinator {
         cancelBatchPublishIfRunning("手动停止涨粉")
         cancelAutoActiveIfRunning("手动停止涨粉")
         cancelDailyIncubateIfRunning("手动停止涨粉")
+        cancelPostTaskNurtureIfRunning("手动停止涨粉")
         scope.launch {
             // 停止涨粉：同样尽快打断当前 TikTok 步骤，但不启动新任务
             PrefsStore.setAutoSwitchExclusivePreempt(true)
@@ -4364,6 +4385,7 @@ object AppCoordinator {
         cancelBatchPublishIfRunning("手动 For You 预滑")
         cancelAutoActiveIfRunning("手动 For You 预滑")
         cancelDailyIncubateIfRunning("手动 For You 预滑")
+        cancelPostTaskNurtureIfRunning("手动 For You 预滑")
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank()) {
             LogCenter.op(PrefsStore.getAlias(), "手动 For You 预滑：请先选择账号")
@@ -4781,6 +4803,7 @@ object AppCoordinator {
             cancelBatchPublishIfRunning("手动切号")
             cancelAutoActiveIfRunning("手动切号")
             cancelDailyIncubateIfRunning("手动切号")
+            cancelPostTaskNurtureIfRunning("手动切号")
         }
         val target = targetUsername.trim().removePrefix("@")
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -5068,6 +5091,7 @@ object AppCoordinator {
 
     private fun detectActiveManualTaskKind(): ManualTaskKind? = when {
         dailyIncubateJob?.isActive == true -> ManualTaskKind.DAILY_INCUBATE
+        postTaskNurtureJob?.isActive == true -> ManualTaskKind.POST_TASK_NURTURE
         batchPublishJob?.isActive == true -> ManualTaskKind.BATCH_PUBLISH
         autoActiveJob?.isActive == true -> ManualTaskKind.AUTO_ACTIVE
         activateNextJob?.isActive == true -> ManualTaskKind.ACTIVATE_NEXT
@@ -5106,6 +5130,8 @@ object AppCoordinator {
                 active == ManualTaskKind.AUTO_ACTIVE && autoActiveJob === selfJob
             ManualTaskKind.DAILY_INCUBATE ->
                 active == ManualTaskKind.DAILY_INCUBATE && dailyIncubateJob === selfJob
+            ManualTaskKind.POST_TASK_NURTURE ->
+                active == ManualTaskKind.POST_TASK_NURTURE && postTaskNurtureJob === selfJob
             else -> false
         }
         // 多账号会话内部切号：父会话仍占 ACTIVATE_NEXT / BATCH_PUBLISH / AUTO_ACTIVE / DAILY_INCUBATE，允许子步骤继续
@@ -5147,6 +5173,7 @@ object AppCoordinator {
             (target != ManualTaskKind.BATCH_PUBLISH && batchPublishJob?.isActive == true) ||
             (target != ManualTaskKind.AUTO_ACTIVE && autoActiveJob?.isActive == true) ||
             (target != ManualTaskKind.DAILY_INCUBATE && dailyIncubateJob?.isActive == true) ||
+            (target != ManualTaskKind.POST_TASK_NURTURE && postTaskNurtureJob?.isActive == true) ||
             (target != ManualTaskKind.PUBLISH_POST && PublishPostGrowthGate.isBlockingGrowth()) ||
             ExecutionScope.isActive() ||
             stickyForeignPublish ||
@@ -5228,6 +5255,10 @@ object AppCoordinator {
                     dailyIncubateJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
                     if (dailyIncubateJob !== selfJob) dailyIncubateJob = null
                 }
+                if (target != ManualTaskKind.POST_TASK_NURTURE) {
+                    postTaskNurtureJob?.takeIf { it !== selfJob && it.isActive }?.cancel()
+                    if (postTaskNurtureJob !== selfJob) postTaskNurtureJob = null
+                }
             }
             if (target != ManualTaskKind.EDIT_PROFILE && basicProfileEditRunning) {
                 cancelledExclusiveThatAutoGrows = true
@@ -5235,7 +5266,7 @@ object AppCoordinator {
             liveVisitSwitchJob?.cancel()
             liveVisitSwitchJob = null
 
-            // 仅当确实打断了「结束后会自动涨粉」的独占任务时，短暂抑制 completion 回调
+            // 仅当确实打断了「结束后会任务后养号」的独占任务时，短暂抑制 completion 回调
             if (cancelledExclusiveThatAutoGrows) {
                 suppressManualAutoGrowthUntilElapsed = SystemClock.elapsedRealtime() + 3_000L
             }
@@ -5334,25 +5365,178 @@ object AppCoordinator {
         }
     }
 
+    /**
+     * 引流互点 / 改资料 / 初次自动登录完成后：若勾选，则随机涨粉或 For You 预滑一次，
+     * 时长取界面「养号时长」。发作品不走此路径。
+     */
     private fun maybeManualAutoGrowthAfterTask(reason: String) {
         if (!ManualDeviceControl.ENABLED) return
         if (SystemClock.elapsedRealtime() < suppressManualAutoGrowthUntilElapsed) {
-            LogCenter.op(PrefsStore.getAlias(), "手动抢占窗口内：跳过「$reason」后的自动涨粉")
+            LogCenter.op(PrefsStore.getAlias(), "手动抢占窗口内：跳过「$reason」后的任务后养号")
             return
         }
         if (!PrefsStore.isAutoGrowthAfterTasksEnabled()) {
             PrefsStore.saveLocalStatus("online")
-            updateRuntime(localStatus = "online", lastMessage = "$reason（未勾选完成后自动涨粉）")
+            updateRuntime(localStatus = "online", lastMessage = "$reason（未勾选完成后养号）")
             return
         }
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank() || !PrefsStore.isManualFirstLoginDone(user)) {
             PrefsStore.saveLocalStatus("online")
-            updateRuntime(localStatus = "online", lastMessage = "$reason：未就绪，无法自动涨粉")
+            updateRuntime(localStatus = "online", lastMessage = "$reason：未就绪，无法养号")
             return
         }
-        LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason → 自动进入涨粉")
-        manualStartGrowth("$reason → 自动涨粉")
+        if (postTaskNurtureJob?.isActive == true) {
+            LogCenter.op(PrefsStore.getAlias(), "手动模式：$reason → 任务后养号已在进行中，忽略")
+            return
+        }
+        val minutes = PrefsStore.getDailyIncubateDurationMin()
+        val hoursText = PrefsStore.formatDailyIncubateDurationHours(
+            PrefsStore.getDailyIncubateDurationHours(),
+        )
+        LogCenter.op(
+            PrefsStore.getAlias(),
+            "手动模式：$reason → 任务后养号（随机涨粉/预滑 · ${hoursText}小时）",
+        )
+        manualDispatchJob?.cancel()
+        postTaskNurtureJob = scope.launch {
+            try {
+                if (!prepareManualTaskTakeover(ManualTaskKind.POST_TASK_NURTURE, reason)) {
+                    PrefsStore.saveLocalStatus("online")
+                    updateRuntime(
+                        localStatus = "online",
+                        lastMessage = "$reason：任务后养号未能启动（已被其它任务占用）",
+                    )
+                    return@launch
+                }
+                PrefsStore.setTransientPausedForDestructiveOp(false)
+                PrefsStore.setHardStopRequested(false)
+                manuallyPaused = false
+                if (!started.get()) started.set(true)
+                PrefsStore.setLogContextUsername(user)
+                PrefsStore.saveLocalStatus("running")
+                runPostTaskGrowthOrForYouPhase(user, minutes, reason)
+            } catch (t: Throwable) {
+                if (t is CancellationException) {
+                    PrefsStore.saveLocalStatus("online")
+                    updateRuntime(localStatus = "online", lastMessage = "$reason：任务后养号已取消")
+                    throw t
+                }
+                PrefsStore.saveLocalStatus("online")
+                updateRuntime(localStatus = "online", lastMessage = "$reason：任务后养号失败：${t.message}")
+                LogCenter.op(PrefsStore.getAlias(), "任务后养号失败（$reason）：${t.message}")
+            } finally {
+                if (postTaskNurtureJob === currentCoroutineContext()[Job]) {
+                    postTaskNurtureJob = null
+                }
+                notifyManualAccountUi()
+            }
+        }
+    }
+
+    /**
+     * 任务后养号：二选一随机涨粉 / For You 预滑，跑满 [minutes]（不碰待活跃会话账本）。
+     */
+    private suspend fun runPostTaskGrowthOrForYouPhase(
+        target: String,
+        minutes: Int,
+        logTag: String,
+    ) {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val durationSec = (minutes.coerceIn(
+            PrefsStore.MIN_DAILY_INCUBATE_DURATION_MIN,
+            PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
+        ) * 60).coerceAtLeast(30)
+        val useForYou = Random.nextBoolean()
+        val modeLabel = if (useForYou) "For You 预滑" else "涨粉"
+        val durationLabel = formatActivateRemainingLabel(durationSec)
+        PrefsStore.setLogContextUsername(target)
+        LogCenter.op(alias, "$logTag：@$target 随机 → $modeLabel（$durationLabel）")
+        PrefsStore.saveLocalStatus("running")
+        updateRuntime(
+            localStatus = "running",
+            lastMessage = "任务后养号：@$target · $modeLabel · $durationLabel",
+        )
+        fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+
+        val startedAt = SystemClock.elapsedRealtime()
+        var interrupted = false
+        try {
+            if (useForYou) {
+                ExecutionScope.enter()
+                forYouSwipeJob = currentCoroutineContext()[Job]
+                try {
+                    executor.runForYouSwipe(durationSec, _config.value)
+                    currentCoroutineContext().ensureActive()
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    LogCenter.op(alias, "$logTag For You 异常：${t.message}")
+                } finally {
+                    if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                        forYouSwipeJob = null
+                    }
+                    ExecutionScope.exit()
+                }
+            } else {
+                ensureManualActivateGrowthPullRunning(
+                    "任务后养号：@$target · $modeLabel · $durationLabel",
+                )
+                if (pullLoopJob?.isActive != true) {
+                    error("$logTag 涨粉未能启动拉取循环")
+                }
+                val endAt = startedAt + durationSec * 1000L
+                while (SystemClock.elapsedRealtime() < endAt) {
+                    if (PrefsStore.isHardStopRequested()) {
+                        interrupted = true
+                        break
+                    }
+                    currentCoroutineContext().ensureActive()
+                    delay(5_000)
+                }
+                pullLoopJob?.cancel()
+                pullLoopJob = null
+            }
+            currentCoroutineContext().ensureActive()
+        } catch (t: Throwable) {
+            if (t is CancellationException) {
+                withContext(NonCancellable) {
+                    pullLoopJob?.cancel()
+                    pullLoopJob = null
+                    val elapsedSec = ((SystemClock.elapsedRealtime() - startedAt) / 1000)
+                        .toInt().coerceIn(0, durationSec)
+                    creditActivateMinutes(target, elapsedSec, modeLabel)
+                }
+                throw t
+            }
+            throw t
+        }
+
+        val elapsedSec = ((SystemClock.elapsedRealtime() - startedAt) / 1000)
+            .toInt().coerceIn(0, durationSec)
+        creditActivateMinutes(target, elapsedSec, modeLabel)
+        PrefsStore.saveLocalStatus("online")
+        val done = !interrupted && elapsedSec >= durationSec - 2
+        updateRuntime(
+            localStatus = "online",
+            lastMessage = if (done) {
+                "任务后养号完成：@$target · $modeLabel · $durationLabel"
+            } else {
+                "任务后养号未完成：@$target · $modeLabel（已跑 ${formatActivateRemainingLabel(elapsedSec)}）"
+            },
+        )
+        LogCenter.op(
+            alias,
+            if (done) {
+                "$logTag：@$target 完成（$modeLabel · $durationLabel）"
+            } else {
+                "$logTag：@$target 未完成（$modeLabel · 已跑 ${formatActivateRemainingLabel(elapsedSec)}）"
+            },
+        )
+        if (detectActiveManualTaskKind() == null ||
+            detectActiveManualTaskKind() == ManualTaskKind.POST_TASK_NURTURE
+        ) {
+            forceStopTikTokForExclusiveEnqueue("任务后养号结束")
+        }
     }
 
     data class AutoSwitchParticipationAccount(
@@ -5463,6 +5647,8 @@ object AppCoordinator {
         autoActiveJob = null
         dailyIncubateJob?.cancel()
         dailyIncubateJob = null
+        postTaskNurtureJob?.cancel()
+        postTaskNurtureJob = null
         manualDispatchJob?.cancel()
         manualDispatchJob = null
         autoSwitchLoginRecoveryJob?.cancel()
@@ -13793,7 +13979,14 @@ object AppCoordinator {
                             maybeStartGrowthInAutoSwitchIdle("发作品切换结束")
                         }
                     } else if (ManualDeviceControl.ENABLED) {
-                        maybeManualAutoGrowthAfterTask("发作品完成")
+                        // 发作品不触发任务后养号。批量发/日常孵化等父会话自行收尾，勿抢写 online。
+                        if (isBatchAccountSessionBusy() || activateNextOwnsSwitch) {
+                            LogCenter.op(alias, "发作品完成：父会话进行中，跳过收尾（不触发任务后养号）")
+                        } else {
+                            PrefsStore.saveLocalStatus("online")
+                            updateRuntime(localStatus = "online", lastMessage = "发作品完成")
+                            LogCenter.op(alias, "发作品完成：不触发任务后养号")
+                        }
                     } else if (PrefsStore.getLocalStatus() == "running") {
                         LogCenter.op(alias, "发作品切换结束后恢复拉取循环")
                         startPullLoop()

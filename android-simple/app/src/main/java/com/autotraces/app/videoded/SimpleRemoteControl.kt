@@ -289,8 +289,13 @@ object SimpleRemoteControl {
                 if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
                 val enabled = body.optBoolean("enabled", true)
                 PrefsStore.setAutoGrowthAfterTasksEnabled(enabled)
-                ok(if (enabled) "已开启任务后自动涨粉" else "已关闭任务后自动涨粉")
-                    .put("enabled", enabled)
+                ok(
+                    if (enabled) {
+                        "已开启任务后养号（随机涨粉/预滑）"
+                    } else {
+                        "已关闭任务后养号"
+                    },
+                ).put("enabled", enabled)
             }
 
             "enable_local_auto_switch" -> {

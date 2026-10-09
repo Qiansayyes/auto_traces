@@ -34,7 +34,7 @@ object PrefsStore {
     private const val KEY_AUTH_TOKEN = "auth_token"
     private const val KEY_AUTH_USERNAME = "auth_username"
     private const val KEY_AUTH_PASSWORD = "auth_password"
-    /** 手动模式：引流/发作品/改资料/初次自动登录完成后是否自动进入涨粉。 */
+    /** 手动模式：引流/改资料/初次自动登录完成后是否随机涨粉或预滑（时长=养号时长；不含发作品）。 */
     private const val KEY_AUTO_GROWTH_AFTER_TASKS = "manual_auto_growth_after_tasks"
     /** 手动模式：切号下拉当前选中的 username（切号目标，未必已切上机）。 */
     private const val KEY_MANUAL_SELECTED_USERNAME = "manual_selected_username"

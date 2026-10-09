@@ -1008,7 +1008,11 @@ class MainActivity : AppCompatActivity() {
         binding.manualAutoGrowthAfterTasksCheck.setOnCheckedChangeListener { _, checked ->
             PrefsStore.setAutoGrowthAfterTasksEnabled(checked)
             binding.manualTaskStatusText.text =
-                if (checked) "已开启：任务完成后自动涨粉" else "已关闭：任务完成后不自动涨粉"
+                if (checked) {
+                    "已开启：引流/改资料/初次登录完成后随机涨粉或预滑（时长用养号时长）"
+                } else {
+                    "已关闭：任务完成后不自动养号"
+                }
         }
 
         binding.manualAutoSwitchSlotMinutesInput.setText(

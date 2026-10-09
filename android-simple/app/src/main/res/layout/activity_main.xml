@@ -313,7 +313,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="引流/发作品/手动改资料/初次自动登录完成后自动进入涨粉" />
+                android:text="引流/手动改资料/初次自动登录完成后给当前账号养号（随机涨粉/预滑，时长见养号时长）" />
 
             <LinearLayout
                 android:layout_width="match_parent"

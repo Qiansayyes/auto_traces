@@ -20045,6 +20045,8 @@ class RealTraceExecutor(
                 ?.takeUnless { visionShowsFeedAdPageMarkers(vision) }
                 // 落地页已在上方处理；此处再挡：带 Already have 底栏的 Log in 禁止用全屏坐标（可能被并到中部）
                 ?.takeUnless { findFooterBandAlreadyHaveHit(vision, h) != null }
+                // Sign up落地页禁止复用全屏Log in坐标（OCR并框/抖动会落到中部Continue with Google，必须走底栏几何）
+                ?.takeUnless { onSignUpLanding || visionShowsSignUpLandingPage(vision) }
             if (logInHit != null) {
                 loginEntryMissStreak = 0
                 val tap = autoLoginTapWithJitter(logInHit.point, w, h)
