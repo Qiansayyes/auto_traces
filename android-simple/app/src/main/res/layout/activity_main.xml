@@ -386,43 +386,51 @@
                     android:text="发作品" />
             </LinearLayout>
 
-            <LinearLayout
+            <com.google.android.material.textfield.TextInputLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:hint="养号时长(小时，如3=3小时)">
 
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/manualDailyIncubateDurationMinInput"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="养号时长(小时，如3=3小时)">
+                    android:inputType="numberDecimal"
+                    android:maxLines="1" />
+            </com.google.android.material.textfield.TextInputLayout>
 
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualDailyIncubateDurationMinInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="numberDecimal"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualDailyIncubateStartButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="开始排队养号" />
-            </LinearLayout>
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateCurrentButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="只给当前账号养号" />
 
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="日常孵化：未在待活跃队列的账号。切号→按「发作品条数」发作品→预滑/涨粉/互点各50%做3选2（涨粉/预滑在前分摊固定5分钟，互点置尾不占这5分钟）。熄屏暂停，亮屏自动续跑。"
+                android:text="只给当前账号养号：对本机已切上的号执行一次（不看下拉选中）。发作品→预滑/涨粉/互点各50%做3选2（发后固定5分钟）。熄屏暂停，亮屏续跑。"
                 android:textColor="@android:color/darker_gray"
                 android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateStopButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="停止日常孵化" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualProfileEditButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="修改基本资料" />
 
             <TextView
                 android:id="@+id/manualTaskStatusText"
@@ -815,28 +823,20 @@
                     android:textSize="11sp" />
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualDailyIncubateCurrentButton"
+                    android:id="@+id/manualDailyIncubateStartButton"
                     style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
-                    android:text="只给当前账号养号" />
+                    android:text="开始排队养号" />
 
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualDailyIncubateStopButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:text="停止日常孵化" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualProfileEditButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="8dp"
-                    android:text="修改基本资料" />
+                    android:layout_marginTop="2dp"
+                    android:text="排队养号（日常孵化）：未在待活跃队列的全部账号依次养号。切号→按「发作品条数」发作品→预滑/涨粉/互点各50%做3选2（涨粉/预滑在前分摊固定5分钟，互点置尾不占这5分钟）。发后活跃固定5分钟（上方「养号时长」用于任务后养号，不控本流程）。熄屏暂停，亮屏自动续跑。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="11sp" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/manualMutualButton"

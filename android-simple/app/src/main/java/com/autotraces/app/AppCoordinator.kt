@@ -2096,8 +2096,13 @@ object AppCoordinator {
 
     // region 手动模式公开 API（仅 android-simple）
 
-    /** 拉取云端最新分配账号列表，刷新本地缓存与选中账号。 */
-    suspend fun manualRefreshAssignedAccounts(): Result<List<ManualDeviceControl.AccountOption>> {
+    /**
+     * 拉取云端最新分配账号列表，刷新本地缓存。
+     * @param adjustSelection true=按本机当前/原选中校正下拉选中；false=只更新缓存（复制核对用，避免改掉用户当前查看的号）
+     */
+    suspend fun manualRefreshAssignedAccounts(
+        adjustSelection: Boolean = true,
+    ): Result<List<ManualDeviceControl.AccountOption>> {
         if (!ManualDeviceControl.ENABLED) return Result.failure(IllegalStateException("非手动模式"))
         val deviceId = PrefsStore.getDeviceId()?.trim().orEmpty()
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -2113,10 +2118,6 @@ object AppCoordinator {
                 val options = resp.items.orEmpty().mapNotNull { ManualDeviceControl.fromAssignedItem(it) }
                 if (options.isEmpty()) error("云端未返回可用账号")
                 PendingActivateRecommend.ingestRoster(resp.items.orEmpty())
-                val oldUsers = ManualDeviceControl.getCachedAccounts()
-                    .map { it.username.trim().removePrefix("@").lowercase() }
-                    .filter { it.isNotEmpty() }
-                    .toSet()
                 ManualDeviceControl.updateCachedAccounts(options)
                 PrefsStore.noteDailyIncubateAccountsSeen(
                     options.map { it.username },
@@ -2130,8 +2131,10 @@ object AppCoordinator {
                 } ?: options.firstOrNull {
                     it.username.equals(selectedKey, ignoreCase = true)
                 } ?: options.first()
-                PrefsStore.setManualSelectedUsername(keep.username)
-                PrefsStore.setLogContextUsername(keep.username)
+                if (adjustSelection) {
+                    PrefsStore.setManualSelectedUsername(keep.username)
+                    PrefsStore.setLogContextUsername(keep.username)
+                }
                 val activeDropped = activeKey.isNotBlank() &&
                     options.none { it.username.equals(activeKey, ignoreCase = true) }
                 if (activeDropped) {
@@ -2140,25 +2143,12 @@ object AppCoordinator {
                         "手动模式：本机当前 @$activeKey 已在云端设为不参与，已从列表移除；请切到其他账号对齐",
                     )
                 }
-                val newUsers = options.map { it.username.trim().removePrefix("@").lowercase() }.toSet()
-                val rosterChanged = oldUsers != newUsers
-                // 账号集合变化时重建本机计划，避免继续调度已排除账号
-                if (rosterChanged && PrefsStore.isManualLocalAutoSwitchEnabled()) {
-                    val minutes = PrefsStore.getManualAutoSwitchSlotMinutes()
-                    val rebuilt = rebuildAndStartManualLocalAutoSwitch(
-                        alias = alias,
-                        deviceId = deviceId,
-                        slotMinutes = minutes,
-                        reason = "刷新账号后同步本机计划",
-                    )
-                    if (!rebuilt) {
-                        LogCenter.op(alias, "手动模式：账号列表已更新，但本机计划重建失败，请手动点「重建计划」")
-                    }
-                }
+                // 拉取账号只刷新本地缓存/下拉，不因名单变化自动重建/启动本机切号
                 val pendingCount = PrefsStore.getPendingActivateUsernames().size
+                val shown = if (adjustSelection) keep.username else selectedKey.ifBlank { keep.username }
                 LogCenter.op(
                     alias,
-                    "手动模式：已刷新云端账号 ${options.size} 个（待活跃队列 $pendingCount），当前选中 @${keep.username}" +
+                    "手动模式：已刷新云端账号 ${options.size} 个（待活跃队列 $pendingCount），当前选中 @$shown" +
                         if (activeDropped) "（本机当前仍为 @$activeKey，待切号）" else "",
                 )
                 options
@@ -3330,8 +3320,9 @@ object AppCoordinator {
     }
 
     /**
-     * 日常孵化：非待活跃账号排队养号；[onlyUsername] 非空时只养该号一次后结束。
-     * 切号 → 按界面「发作品条数」发作品 → 预滑/涨粉/互点各 50% 做 3 选 2。
+     * 日常孵化：非待活跃账号排队养号；[onlyUsername] 非空时只养该号一次后结束
+     *（「只给当前账号养号」应传本机已切上的号 [ManualDeviceControl.activeManualUsername]，不看下拉选中）。
+     * 切号（本机已是该号则跳过）→ 按界面「发作品条数」发作品 → 预滑/涨粉/互点各 50% 做 3 选 2。
      * 发后活跃固定 5 分钟（涨粉/预滑分摊；互点永远排在其后，不占这 5 分钟）。
      * 熄屏暂停计时与任务，亮屏自动续跑。
      */
