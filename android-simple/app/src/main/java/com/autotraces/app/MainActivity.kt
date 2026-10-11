@@ -1001,6 +1001,11 @@ class MainActivity : AppCompatActivity() {
         val manual = ManualDeviceControl.ENABLED
         binding.manualTaskSection.visibility = if (manual) View.VISIBLE else View.GONE
         binding.manualLocalAutoSwitchSection.visibility = if (manual) View.VISIBLE else View.GONE
+        binding.manualMoreToolsToggle.visibility = if (manual) View.VISIBLE else View.GONE
+        if (!manual || binding.manualMoreToolsSection.visibility != View.VISIBLE) {
+            binding.manualMoreToolsSection.visibility = View.GONE
+            binding.manualMoreToolsToggle.text = "更多功能 ▸"
+        }
     }
 
     private fun setupManualTaskSection() {
@@ -1210,9 +1215,13 @@ class MainActivity : AppCompatActivity() {
         binding.manualPublishCountInput.setText(
             PrefsStore.getManualPublishCount().toString(),
         )
-        binding.manualBatchPublishAfterMinInput.setText(
-            PrefsStore.getManualBatchPublishAfterMin().toString(),
-        )
+        binding.manualMoreToolsSection.visibility = View.GONE
+        binding.manualMoreToolsToggle.text = "更多功能 ▸"
+        binding.manualMoreToolsToggle.setOnClickListener {
+            val expanding = binding.manualMoreToolsSection.visibility != View.VISIBLE
+            binding.manualMoreToolsSection.visibility = if (expanding) View.VISIBLE else View.GONE
+            binding.manualMoreToolsToggle.text = if (expanding) "更多功能 ▾" else "更多功能 ▸"
+        }
         binding.manualPublishButton.setOnClickListener {
             if (!guardManualTaskReady("发作品")) return@setOnClickListener
             val raw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
@@ -1246,16 +1255,10 @@ class MainActivity : AppCompatActivity() {
                 PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
                 PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
             )
-            val afterRaw = binding.manualBatchPublishAfterMinInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getManualBatchPublishAfterMin()
-            val afterMin = afterRaw.coerceIn(
-                PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-                PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-            )
+            val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
             PrefsStore.setManualPublishCount(count)
             PrefsStore.setManualBatchPublishAfterMin(afterMin)
             binding.manualPublishCountInput.setText(count.toString())
-            binding.manualBatchPublishAfterMinInput.setText(afterMin.toString())
             showPickAccountsDialog(title = "选择批量发作品账号") { picked ->
                 if (picked.isEmpty()) {
                     Toast.makeText(this, "请至少勾选一个账号", Toast.LENGTH_SHORT).show()
@@ -1263,7 +1266,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
                 binding.manualTaskStatusText.text =
-                    "已请求批量发作品（${picked.size}个 · 每号${count}条 · 发后${afterMin}分钟 · $scheme）"
+                    "已请求批量发作品（${picked.size}个 · 每号${count}条 · 发后固定${afterMin}分钟·3选2 · $scheme）"
                 AppCoordinator.manualStartBatchPublish(picked, count, afterMin)
                 setManualTaskButtonsEnabled(true)
             }
@@ -1284,16 +1287,10 @@ class MainActivity : AppCompatActivity() {
                 PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
                 PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
             )
-            val afterRaw = binding.manualBatchPublishAfterMinInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getManualBatchPublishAfterMin()
-            val afterMin = afterRaw.coerceIn(
-                PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-                PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-            )
+            val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
             PrefsStore.setManualPublishCount(count)
             PrefsStore.setManualBatchPublishAfterMin(afterMin)
             binding.manualPublishCountInput.setText(count.toString())
-            binding.manualBatchPublishAfterMinInput.setText(afterMin.toString())
             val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
 
             lifecycleScope.launch {
@@ -1306,7 +1303,7 @@ class MainActivity : AppCompatActivity() {
                 bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
                 result.onSuccess { started ->
                     binding.manualTaskStatusText.text =
-                        "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发后${afterMin}分钟 · $scheme）"
+                        "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发后固定${afterMin}分钟·3选2 · $scheme）"
                     Toast.makeText(
                         this@MainActivity,
                         "已开始：${started} 个非待活跃账号",
@@ -1370,7 +1367,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 AppCoordinator.manualStartDailyIncubate(minutes)
                 binding.manualTaskStatusText.text =
-                    "已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）"
+                    "已请求日常孵化（约 $queueSize 个 · 发后固定${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟·3选2）"
                 Toast.makeText(
                     this@MainActivity,
                     "已开始排队养号（$queueSize 个账号）",
@@ -1433,7 +1430,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = stillSelected)
                 binding.manualTaskStatusText.text =
-                    "已请求当前账号养号：@$stillSelected（约 ${hoursText} 小时）"
+                    "已请求当前账号养号：@$stillSelected（发后固定${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟·3选2）"
                 Toast.makeText(
                     this@MainActivity,
                     "已开始养号：@$stillSelected",
@@ -1554,7 +1551,6 @@ class MainActivity : AppCompatActivity() {
         binding.manualPublishCountInput.isEnabled = !blocked
         binding.manualBatchPublishButton.isEnabled = !blocked
         binding.manualBatchPublishNonPendingButton.isEnabled = !blocked
-        binding.manualBatchPublishAfterMinInput.isEnabled = !blocked
         binding.manualDailyIncubateDurationMinInput.isEnabled = !blocked
         binding.manualDailyIncubateStartButton.isEnabled = !blocked
         binding.manualDailyIncubateCurrentButton.isEnabled = !blocked

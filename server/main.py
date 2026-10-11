@@ -6852,8 +6852,137 @@ def _account_cred_is_max_login_marker(value: Any) -> bool:
     return ACCOUNT_CRED_SUFFIX_MAX_LOGIN.lower() in s.lower()
 
 
+def _strip_account_cred_max_login_suffix(value: Any) -> str:
+    """从凭据字段剥离全部 ----Maximum login 后缀（大小写不敏感）。"""
+    s = _account_cred_text(value)
+    suffix = ACCOUNT_CRED_SUFFIX_MAX_LOGIN
+    suffix_l = suffix.lower()
+    while True:
+        idx = s.lower().find(suffix_l)
+        if idx < 0:
+            break
+        s = s[:idx] + s[idx + len(suffix) :]
+    return s
+
+
 def _account_cred_already_blocked(value: Any) -> bool:
     return _account_cred_is_banned_marker(value) or _account_cred_is_max_login_marker(value)
+
+
+def _purge_account_cred_max_login_suffixes_for_owner(owner_username: str) -> dict[str, Any]:
+    """剥离当前用户账号表中的 ----Maximum login；仅因此凭据阻断排除的设备行恢复参与。"""
+    owner = str(owner_username or "").strip()
+    if not owner:
+        return {
+            "account_updated": 0,
+            "device_rejoined": 0,
+            "plan_regenerated_aliases": 0,
+            "usernames_cleared": [],
+        }
+    now = now_text()
+    account_updated = 0
+    device_rejoined = 0
+    usernames_cleared: list[str] = []
+    affected_aliases: set[str] = set()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT row_index, username, password, email, email_password
+            FROM account_editor_rows
+            WHERE owner_username = ?
+            """,
+            (owner,),
+        ).fetchall()
+        for row in rows or []:
+            username = str(row["username"] or "").strip()
+            old_password = row["password"]
+            old_email = row["email"]
+            old_email_password = row["email_password"]
+            if not _account_row_looks_max_login(old_password, old_email, old_email_password):
+                continue
+            new_password = _strip_account_cred_max_login_suffix(old_password)
+            new_email = _strip_account_cred_max_login_suffix(old_email)
+            new_email_password = _strip_account_cred_max_login_suffix(old_email_password)
+            if (
+                new_password == _account_cred_text(old_password)
+                and new_email == _account_cred_text(old_email)
+                and new_email_password == _account_cred_text(old_email_password)
+            ):
+                continue
+            conn.execute(
+                """
+                UPDATE account_editor_rows
+                SET password = ?, email = ?, email_password = ?, updated_at = ?
+                WHERE owner_username = ? AND row_index = ?
+                """,
+                (new_password, new_email, new_email_password, now, owner, int(row["row_index"] or 0)),
+            )
+            account_updated += 1
+            if username:
+                usernames_cleared.append(username)
+            if username and not _account_row_looks_cred_blocked(new_password, new_email, new_email_password):
+                dev_rows = conn.execute(
+                    """
+                    SELECT row_index, assigned_alias, device_alias, auto_switch_excluded, auto_switch_exclude_reason
+                    FROM device_editor_rows
+                    WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
+                    """,
+                    (owner, username),
+                ).fetchall()
+                for dr in dev_rows or []:
+                    if int(dr["auto_switch_excluded"] or 0) != 1:
+                        continue
+                    reason = _normalize_auto_switch_exclude_reason(dr["auto_switch_exclude_reason"])
+                    # 仅恢复因凭据阻断（banned/max_login）排除的行；空 reason / manual 等一律不动。
+                    if reason != AUTO_SWITCH_EXCLUDE_REASON_CRED_BLOCKED:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE device_editor_rows
+                        SET auto_switch_excluded = 0,
+                            auto_switch_exclude_reason = '',
+                            updated_at = ?
+                        WHERE owner_username = ? AND row_index = ?
+                        """,
+                        (now, owner, int(dr["row_index"] or 0)),
+                    )
+                    device_rejoined += 1
+                    alias_key = _device_editor_effective_alias(
+                        {
+                            "assigned_alias": str(dr["assigned_alias"] or "").strip(),
+                            "device_alias": str(dr["device_alias"] or "").strip(),
+                        }
+                    )
+                    if alias_key:
+                        affected_aliases.add(alias_key)
+        conn.commit()
+    finally:
+        conn.close()
+
+    plan_regenerated = 0
+    # 凭据清理已落库；计划刷新失败不应把整次清理打成失败。
+    for alias_key in sorted(affected_aliases):
+        try:
+            plan_info = _refresh_auto_switch_plans_for_alias(owner, alias_key)
+            if plan_info.get("plan_regenerated"):
+                plan_regenerated += 1
+            _resync_auto_switch_devices_for_alias(
+                owner, alias_key, int(plan_info.get("bucket_size") or 0)
+            )
+        except Exception as exc:
+            print(
+                f"[{now_text()}] account_rows.purge_max_login | plan_resync_failed "
+                f"owner={owner} alias={alias_key} err={exc}"
+            )
+    if account_updated > 0 or device_rejoined > 0:
+        _reset_device_editor_read_maintain_schedule(owner)
+    return {
+        "account_updated": account_updated,
+        "device_rejoined": device_rejoined,
+        "plan_regenerated_aliases": plan_regenerated,
+        "usernames_cleared": usernames_cleared,
+    }
 
 
 def _append_account_cred_suffix(value: Any, suffix: str) -> str:
@@ -17140,6 +17269,33 @@ def delete_account_editor_rows_by_export_xlsx(
             "msg": f"单次最多按 username 删除 {ACCOUNT_EDITOR_ROW_DELETE_BY_USERNAME_MAX} 个，请分批操作",
         }
     return _delete_account_editor_rows_by_usernames_core(owner, usernames)
+
+
+@app.post("/api/admin/editor/account_rows/purge_max_login_suffix")
+def purge_account_editor_max_login_suffix(authorization: str | None = Header(default=None)):
+    """一键剥离当前登录用户账号表 password/email/email_password 中的 ----Maximum login。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "请先登录"}
+    owner = str(session["username"] or "").strip()
+    if not owner:
+        return {"code": 401, "msg": "请先登录"}
+    result = _purge_account_cred_max_login_suffixes_for_owner(owner)
+    updated = int(result.get("account_updated") or 0)
+    rejoined = int(result.get("device_rejoined") or 0)
+    print(
+        f"[{now_text()}] account_rows.purge_max_login | owner={owner} "
+        f"accounts={updated} rejoined={rejoined}"
+    )
+    if updated <= 0:
+        return {"code": 0, "msg": "没有需要清理的 ----Maximum login", "data": result}
+    return {
+        "code": 0,
+        "msg": f"已清理 {updated} 条账号的 ----Maximum login" + (
+            f"，恢复参与 {rejoined} 条设备行" if rejoined else ""
+        ),
+        "data": result,
+    }
 
 
 @app.post("/api/admin/editor/account_rows/batch_set_basic_profile")

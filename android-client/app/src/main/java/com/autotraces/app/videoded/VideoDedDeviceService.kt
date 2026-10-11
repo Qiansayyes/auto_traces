@@ -65,6 +65,8 @@ class VideoDedDeviceService : Service() {
         scope.launch {
             while (true) {
                 try {
+                    // 先节流拉云端 PC 地址（约 5 分钟），再注册，避免本机仍连旧 Windows
+                    VideoDedSettingsRegistrar.maybePullPcServiceUrlFromCloud(applicationContext)
                     val reg = CompanionApi.ensureRegistered(applicationContext)
                     maybeRequestPcWirelessPipeline(reg)
                     updateNotification(registrationNotifyText(ok = true))

@@ -5699,7 +5699,7 @@ object AppCoordinator {
 
     /**
      * 云端 PC 地址与本机不一致时保存并注册。
-     * 主要由切号 bundle / 用户手动「从云端同步」触发，不在 check_start 热路径里轮询。
+     * 切号 bundle / 设备指令仍走这里；后台节流主动拉取见 VideoDedDeviceService。
      */
     private fun maybeSyncPcServiceUrl(alias: String, remoteUrlRaw: String?) {
         val remoteUrl = remoteUrlRaw?.trim()?.trimEnd('/').orEmpty()

@@ -3331,8 +3331,8 @@ object AppCoordinator {
 
     /**
      * 日常孵化：非待活跃账号排队养号；[onlyUsername] 非空时只养该号一次后结束。
-     * 切号 → 发作品 → 加权随机动作；涨粉/预滑受分配时长；互点达云端上限即完成。
-     * 新号过渡期（完整会话 <3）：第 1–2 次不发作品，第 3 次发 1 条；全程禁止互点。
+     * 切号 → 按界面「发作品条数」发作品 → 预滑/涨粉/互点各 50% 做 3 选 2。
+     * 发后活跃固定 5 分钟（涨粉/预滑分摊；互点永远排在其后，不占这 5 分钟）。
      * 熄屏暂停计时与任务，亮屏自动续跑。
      */
     fun manualStartDailyIncubate(
@@ -3364,6 +3364,7 @@ object AppCoordinator {
             PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
         )
         PrefsStore.setDailyIncubateDurationMin(minutes)
+        val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
 
         val existing = PrefsStore.getDailyIncubateSession()
         val onlyUserNormalized = onlyUsername?.trim()?.removePrefix("@").orEmpty()
@@ -3408,14 +3409,14 @@ object AppCoordinator {
             if (singleAccountOnly && !resumeFromPause) {
                 PrefsStore.DailyIncubateSession(
                     enabled = true,
-                    plannedMin = minutes,
+                    plannedMin = afterMin,
                     singleAccountOnly = true,
                 )
             } else {
                 (existing ?: PrefsStore.DailyIncubateSession()).copy(
                     enabled = true,
                     pausedByScreenOff = false,
-                    plannedMin = minutes,
+                    plannedMin = afterMin,
                     singleAccountOnly = singleAccountOnly,
                 )
             },
@@ -3438,9 +3439,9 @@ object AppCoordinator {
                     alias,
                     "日常孵化：${if (resumeFromPause) "亮屏续跑" else "开始"}" +
                         if (singleAccountOnly) {
-                            "（单号 @$singleTarget · ${minutes} 分钟，切号=$scheme）"
+                            "（单号 @$singleTarget · 发后固定 ${afterMin} 分钟·3选2，切号=$scheme）"
                         } else {
-                            "（每号 ${minutes} 分钟，队列 $queueSize，切号=$scheme）"
+                            "（发后固定 ${afterMin} 分钟·3选2，队列 $queueSize，切号=$scheme）"
                         },
                 )
                 PrefsStore.saveLocalStatus("running")
@@ -3511,7 +3512,7 @@ object AppCoordinator {
                             PrefsStore.saveDailyIncubateSession(
                                 PrefsStore.DailyIncubateSession(
                                     enabled = enabled,
-                                    plannedMin = minutes,
+                                    plannedMin = afterMin,
                                     singleAccountOnly = singleAccountOnly,
                                 ),
                             )
@@ -3546,7 +3547,7 @@ object AppCoordinator {
                                 PrefsStore.DailyIncubateSession(
                                     enabled = !singleAccountOnly &&
                                         PrefsStore.getDailyIncubateSession()?.enabled == true,
-                                    plannedMin = minutes,
+                                    plannedMin = afterMin,
                                     singleAccountOnly = singleAccountOnly,
                                 ),
                             )
@@ -3569,7 +3570,7 @@ object AppCoordinator {
                     PrefsStore.saveDailyIncubateSession(
                         PrefsStore.DailyIncubateSession(
                             enabled = false,
-                            plannedMin = minutes,
+                            plannedMin = afterMin,
                             singleAccountOnly = false,
                         ),
                     )
@@ -3701,23 +3702,40 @@ object AppCoordinator {
         notifyManualAccountUi()
     }
 
-    /** 正常：涨粉50 / 预滑30 / 互点20；过渡期：涨粉50:预滑30 归一化。 */
-    private fun pickDailyIncubateAction(inTransition: Boolean): DailyIncubateAction {
-        if (inTransition) {
-            // 50:30 → 62.5% / 37.5%
-            return if (Random.nextDouble() < 50.0 / 80.0) {
-                DailyIncubateAction.GROWTH
-            } else {
-                DailyIncubateAction.FOR_YOU
-            }
+    /**
+     * 发作品后动作：预滑 / 涨粉 / 互点各自独立 50% 入选，再裁剪/补齐为恰好 2 个。
+     * 排序规则：涨粉/预滑在前（二者之间乱序），互点永远最后。
+     */
+    private fun pickPostPublishActions(): List<DailyIncubateAction> {
+        val all = DailyIncubateAction.entries.toList()
+        val selected = all.filter { Random.nextDouble() < 0.5 }.toMutableList()
+        val remaining = all.filter { it !in selected }.toMutableList()
+        while (selected.size < 2 && remaining.isNotEmpty()) {
+            val idx = Random.nextInt(remaining.size)
+            selected.add(remaining.removeAt(idx))
         }
-        val r = Random.nextDouble()
-        return when {
-            r < 0.50 -> DailyIncubateAction.GROWTH
-            r < 0.80 -> DailyIncubateAction.FOR_YOU
-            else -> DailyIncubateAction.MUTUAL
+        while (selected.size > 2) {
+            selected.removeAt(Random.nextInt(selected.size))
         }
+        return orderPostPublishActions(selected)
     }
+
+    /** 涨粉/预滑在前（乱序），互点置尾。 */
+    private fun orderPostPublishActions(actions: List<DailyIncubateAction>): List<DailyIncubateAction> {
+        val timed = actions.filter {
+            it == DailyIncubateAction.GROWTH || it == DailyIncubateAction.FOR_YOU
+        }.shuffled()
+        val mutual = actions.filter { it == DailyIncubateAction.MUTUAL }
+        return timed + mutual
+    }
+
+    private fun parsePostPublishActionPlan(raw: String): List<DailyIncubateAction> =
+        raw.split(',')
+            .mapNotNull { DailyIncubateAction.fromKey(it.trim()) }
+            .distinct()
+
+    private fun encodePostPublishActionPlan(actions: List<DailyIncubateAction>): String =
+        actions.joinToString(",") { it.key }
 
     private suspend fun awaitManualMutualClick(): Boolean {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -3745,12 +3763,142 @@ object AppCoordinator {
         return !stillPending && !PrefsStore.isHardStopRequested()
     }
 
+    /**
+     * 执行单个发后动作（预滑/涨粉按 [durationSec]；互点跑到云端上限）。
+     * @return 本段是否被硬停中断
+     */
+    private suspend fun runOnePostPublishAction(
+        target: String,
+        action: DailyIncubateAction,
+        durationSec: Int,
+        logTag: String,
+    ): Boolean {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val segmentStartedAt = SystemClock.elapsedRealtime()
+        when (action) {
+            DailyIncubateAction.MUTUAL -> {
+                updateRuntime(
+                    localStatus = "running",
+                    lastMessage = "$logTag：@$target · 引流互点（达云端上限即完成）",
+                )
+                fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL, logToUser = false)
+                awaitManualMutualClick()
+                val mutualElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                    .toInt().coerceAtLeast(0)
+                LogCenter.op(alias, "$logTag：@$target 互点结束（${mutualElapsed}s）")
+                return PrefsStore.isHardStopRequested()
+            }
+            DailyIncubateAction.FOR_YOU, DailyIncubateAction.GROWTH -> {
+                val runSec = durationSec.coerceAtLeast(0)
+                if (runSec <= 2) return PrefsStore.isHardStopRequested()
+                val modeLabel = action.label
+                updateRuntime(
+                    localStatus = "running",
+                    lastMessage = "$logTag：@$target · $modeLabel · 约 ${runSec / 60} 分",
+                )
+                fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
+                var interrupted = false
+                if (action == DailyIncubateAction.FOR_YOU) {
+                    ExecutionScope.enter()
+                    forYouSwipeJob = currentCoroutineContext()[Job]
+                    try {
+                        executor.runForYouSwipe(runSec, _config.value)
+                        currentCoroutineContext().ensureActive()
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        LogCenter.op(alias, "$logTag For You 异常：${t.message}")
+                    } finally {
+                        if (forYouSwipeJob === currentCoroutineContext()[Job]) {
+                            forYouSwipeJob = null
+                        }
+                        ExecutionScope.exit()
+                    }
+                } else {
+                    ensureManualActivateGrowthPullRunning(
+                        "$logTag：@$target · $modeLabel",
+                    )
+                    if (pullLoopJob?.isActive != true) {
+                        error("$logTag 涨粉未能启动拉取循环")
+                    }
+                    val endAt = segmentStartedAt + runSec * 1000L
+                    while (SystemClock.elapsedRealtime() < endAt) {
+                        if (PrefsStore.isHardStopRequested()) {
+                            interrupted = true
+                            break
+                        }
+                        currentCoroutineContext().ensureActive()
+                        delay(5_000)
+                    }
+                    pullLoopJob?.cancel()
+                    pullLoopJob = null
+                }
+                val actionElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                    .toInt().coerceIn(0, runSec)
+                creditActivateMinutes(target, actionElapsed, modeLabel)
+                return interrupted || PrefsStore.isHardStopRequested()
+            }
+        }
+    }
+
+    /**
+     * 发作品后：3选2 执行预滑/涨粉/互点；涨粉/预滑分摊固定 5 分钟，互点置尾且不占预算。
+     */
+    private suspend fun runPostPublishActivatePhase(
+        target: String,
+        @Suppress("UNUSED_PARAMETER") minutes: Int = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN,
+        logTag: String,
+        actions: List<DailyIncubateAction> = pickPostPublishActions(),
+    ): ActivatePhaseResult {
+        val alias = PrefsStore.getAlias()?.trim().orEmpty()
+        val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
+        val plan = orderPostPublishActions(
+            if (actions.size >= 2) actions.take(2) else pickPostPublishActions(),
+        )
+        val plannedSec = afterMin * 60
+        PrefsStore.setLogContextUsername(target)
+        LogCenter.op(
+            alias,
+            "$logTag：@$target 发后3选2 → ${plan.joinToString("→") { it.label }}（涨粉/预滑共 ${afterMin} 分钟，互点置尾）",
+        )
+        PrefsStore.saveLocalStatus("running")
+        var timedElapsedSec = 0
+        try {
+            for ((idx, action) in plan.withIndex()) {
+                currentCoroutineContext().ensureActive()
+                if (PrefsStore.isHardStopRequested()) {
+                    return ActivatePhaseResult.INCOMPLETE
+                }
+                val timedLeft = plan.drop(idx).count {
+                    it == DailyIncubateAction.GROWTH || it == DailyIncubateAction.FOR_YOU
+                }
+                val remainSec = (plannedSec - timedElapsedSec).coerceAtLeast(0)
+                val sliceSec = when (action) {
+                    DailyIncubateAction.MUTUAL -> 0
+                    else -> if (timedLeft <= 1) remainSec else (remainSec / timedLeft).coerceAtLeast(1)
+                }
+                val startedAt = SystemClock.elapsedRealtime()
+                val interrupted = runOnePostPublishAction(target, action, sliceSec, logTag)
+                if (action != DailyIncubateAction.MUTUAL) {
+                    val used = ((SystemClock.elapsedRealtime() - startedAt) / 1000).toInt().coerceAtLeast(0)
+                    timedElapsedSec = (timedElapsedSec + used).coerceAtMost(plannedSec)
+                }
+                if (interrupted) return ActivatePhaseResult.INCOMPLETE
+            }
+            return ActivatePhaseResult.PLANNED_DONE
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            LogCenter.op(alias, "$logTag：@$target 发后活跃失败：${t.message}")
+            return ActivatePhaseResult.INCOMPLETE
+        }
+    }
+
     private suspend fun runDailyIncubateAccountSession(
         target: String,
-        minutes: Int,
+        @Suppress("UNUSED_PARAMETER") minutes: Int,
     ): DailyIncubatePhaseResult {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
-        val plannedSec = minutes * 60
+        val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
+        val plannedSec = afterMin * 60
         // 首次进入时 session.username 可能仍为空；重建时必须保留 singleAccountOnly，
         // 否则熄屏续跑会丢掉「只养当前账号」标记，误变成排队养号。
         val previous = PrefsStore.getDailyIncubateSession()
@@ -3759,191 +3907,132 @@ object AppCoordinator {
         } ?: PrefsStore.DailyIncubateSession(
             enabled = true,
             username = target,
-            plannedMin = minutes,
-            inTransition = PrefsStore.isDailyIncubateInTransition(target),
+            plannedMin = afterMin,
             singleAccountOnly = previous?.singleAccountOnly == true,
         )
-        // 首次见到已写入；以当前过渡状态为准
-        val inTransition = PrefsStore.isDailyIncubateInTransition(target)
+        // 发后活跃统一固定 5 分钟；elapsedSec 只统计涨粉/预滑，不含发作品与互点。
+        if (session.plannedMin != afterMin) {
+            session = session.copy(plannedMin = afterMin, elapsedSec = session.elapsedSec.coerceAtMost(plannedSec))
+        }
         session = session.copy(
             enabled = true,
             username = target,
-            plannedMin = minutes,
-            inTransition = inTransition,
+            plannedMin = afterMin,
+            inTransition = false,
             pausedByScreenOff = false,
             singleAccountOnly = previous?.singleAccountOnly == true || session.singleAccountOnly,
         )
         PrefsStore.saveDailyIncubateSession(session)
         PrefsStore.setLogContextUsername(target)
 
-        var action = DailyIncubateAction.fromKey(session.action)
-        if (action == null) {
-            action = pickDailyIncubateAction(inTransition)
-            session = session.copy(action = action.key)
+        val rawPlan = parsePostPublishActionPlan(session.action)
+        var actionPlan: List<DailyIncubateAction>
+        var actionIndex: Int
+        if (rawPlan.size < 2) {
+            actionPlan = pickPostPublishActions()
+            actionIndex = 0
+            session = session.copy(
+                action = encodePostPublishActionPlan(actionPlan),
+                actionIndex = 0,
+            )
             PrefsStore.saveDailyIncubateSession(session)
-        } else if (inTransition && action == DailyIncubateAction.MUTUAL) {
-            // 过渡期禁止互点：若旧进度误存互点则重抽
-            action = pickDailyIncubateAction(inTransition = true)
-            session = session.copy(action = action.key)
-            PrefsStore.saveDailyIncubateSession(session)
-        }
-
-        val transitionOrdinal = if (inTransition) {
-            PrefsStore.dailyIncubateTransitionSessionOrdinal(target)
         } else {
-            null
+            actionPlan = orderPostPublishActions(rawPlan)
+            val encoded = encodePostPublishActionPlan(actionPlan)
+            actionIndex = session.actionIndex.coerceIn(0, actionPlan.size)
+            if (encoded != session.action.trim()) {
+                // 旧进度可能互点在前：按已完成集合重映射下标，避免重跑或漏跑
+                val completed = rawPlan.take(session.actionIndex.coerceIn(0, rawPlan.size)).toSet()
+                actionIndex = actionPlan.indexOfFirst { it !in completed }.let { idx ->
+                    if (idx < 0) actionPlan.size else idx
+                }
+                session = session.copy(action = encoded, actionIndex = actionIndex)
+                PrefsStore.saveDailyIncubateSession(session)
+            }
         }
-        val transitionPubCount = if (inTransition) {
-            PrefsStore.dailyIncubateTransitionPublishCount(target)
-        } else {
-            null
-        }
+        val planLabel = actionPlan.joinToString("→") { it.label }
         LogCenter.op(
             alias,
-            "日常孵化：@$target → ${action.label}" +
-                (if (inTransition) {
-                    val ord = transitionOrdinal ?: 0
-                    val pubHint = when (transitionPubCount) {
-                        null, 0 -> "跳过发作品"
-                        else -> "本会话发 ${transitionPubCount} 条"
-                    }
-                    "（新号过渡 第${ord}/${PrefsStore.DAILY_INCUBATE_TRANSITION_NEED} 次，$pubHint、禁止互点）"
-                } else {
-                    ""
-                }) +
-                "，已计时 ${session.elapsedSec}s / ${plannedSec}s",
+            "日常孵化：@$target → 计划[$planLabel]（从第${(actionIndex + 1).coerceAtMost(actionPlan.size)}个），" +
+                "发后活跃 ${afterMin} 分钟，已计时 ${session.elapsedSec}s / ${plannedSec}s",
         )
 
-        val wallStartedAt = SystemClock.elapsedRealtime()
-        var segmentStartedAt = wallStartedAt
+        var segmentStartedAt = SystemClock.elapsedRealtime()
         var interrupted = false
+        var currentAction: DailyIncubateAction? = actionPlan.getOrNull(actionIndex)
         try {
-            // 1) 发作品：毕业后按手动条数；过渡期仅第 3 次发 1 条；续跑已完成则跳过
-            val pubCount = when {
-                session.publishDone -> 0
-                inTransition -> (transitionPubCount ?: 0).coerceAtLeast(0)
-                else -> PrefsStore.getManualPublishCount()
-            }
+            // 1) 发作品：一律按界面「发作品条数」；续跑已完成则跳过（耗时不占发后 5 分钟）
+            val pubCount = if (session.publishDone) 0 else PrefsStore.getManualPublishCount()
             if (pubCount > 0) {
                 updateRuntime(
                     localStatus = "running",
                     lastMessage = "日常孵化：@$target · 发作品（${pubCount}条）",
                 )
                 segmentStartedAt = SystemClock.elapsedRealtime()
-                // 过渡期强制条数勿回写手动偏好；毕业后按当前偏好发则可同步
-                val ok = awaitManualPublishPost(
-                    pubCount,
-                    updatePreferredCount = !inTransition,
-                )
+                val ok = awaitManualPublishPost(pubCount, updatePreferredCount = true)
                 LogCenter.op(
                     alias,
                     "日常孵化：@$target 发作品${if (ok) "完成" else "未完全成功"}" +
-                        "（目标${pubCount}条${if (inTransition) "·过渡期第${transitionOrdinal}次" else ""}），继续后续动作",
+                        "（目标${pubCount}条），继续发后活跃",
                 )
-                val publishElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000).toInt()
-                    .coerceAtLeast(0)
-                session = session.copy(
-                    publishDone = true,
-                    elapsedSec = (session.elapsedSec + publishElapsed).coerceAtMost(plannedSec),
-                )
-                PrefsStore.saveDailyIncubateSession(session)
-            } else if (inTransition && !session.publishDone) {
-                // 过渡期第 1–2 次：明确记为已处理发作品阶段，避免续跑误判
                 session = session.copy(publishDone = true)
                 PrefsStore.saveDailyIncubateSession(session)
             }
 
             currentCoroutineContext().ensureActive()
-            if (PrefsStore.isHardStopRequested()) {
-                interrupted = true
-            } else {
-                segmentStartedAt = SystemClock.elapsedRealtime()
-                when (action) {
-                    DailyIncubateAction.MUTUAL -> {
-                        updateRuntime(
-                            localStatus = "running",
-                            lastMessage = "日常孵化：@$target · 引流互点（达云端上限即完成）",
-                        )
-                        fetchConfig(configQueryRunMode = ServerRunMode.MUTUAL, logToUser = false)
-                        awaitManualMutualClick()
-                        val mutualElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
-                            .toInt().coerceAtLeast(0)
-                        session = session.copy(
-                            elapsedSec = (session.elapsedSec + mutualElapsed).coerceAtLeast(0),
-                        )
-                        PrefsStore.saveDailyIncubateSession(session)
-                    }
-                    DailyIncubateAction.FOR_YOU, DailyIncubateAction.GROWTH -> {
-                        val remainSec = (plannedSec - session.elapsedSec).coerceAtLeast(0)
-                        if (remainSec <= 2) {
-                            // 发作品已耗尽分配时长，视为本号完成
-                        } else {
-                            val modeLabel = action.label
-                            updateRuntime(
-                                localStatus = "running",
-                                lastMessage = "日常孵化：@$target · $modeLabel · 剩余约 ${remainSec / 60} 分",
-                            )
-                            fetchConfig(configQueryRunMode = ServerRunMode.GROWTH, logToUser = false)
-                            if (action == DailyIncubateAction.FOR_YOU) {
-                                ExecutionScope.enter()
-                                forYouSwipeJob = currentCoroutineContext()[Job]
-                                try {
-                                    executor.runForYouSwipe(remainSec, _config.value)
-                                    currentCoroutineContext().ensureActive()
-                                } catch (t: Throwable) {
-                                    if (t is CancellationException) throw t
-                                    LogCenter.op(alias, "日常孵化 For You 异常：${t.message}")
-                                } finally {
-                                    if (forYouSwipeJob === currentCoroutineContext()[Job]) {
-                                        forYouSwipeJob = null
-                                    }
-                                    ExecutionScope.exit()
-                                }
-                            } else {
-                                ensureManualActivateGrowthPullRunning(
-                                    "日常孵化：@$target · $modeLabel",
-                                )
-                                if (pullLoopJob?.isActive != true) {
-                                    error("日常孵化涨粉未能启动拉取循环")
-                                }
-                                val endAt = segmentStartedAt + remainSec * 1000L
-                                while (SystemClock.elapsedRealtime() < endAt) {
-                                    if (PrefsStore.isHardStopRequested()) {
-                                        interrupted = true
-                                        break
-                                    }
-                                    currentCoroutineContext().ensureActive()
-                                    delay(5_000)
-                                }
-                                pullLoopJob?.cancel()
-                                pullLoopJob = null
-                            }
-                            val actionElapsed = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
-                                .toInt().coerceIn(0, remainSec)
-                            session = session.copy(
-                                elapsedSec = (session.elapsedSec + actionElapsed).coerceAtMost(plannedSec),
-                            )
-                            PrefsStore.saveDailyIncubateSession(session)
-                            creditActivateMinutes(target, actionElapsed, modeLabel)
-                        }
-                    }
+            while (
+                actionIndex < actionPlan.size &&
+                !interrupted &&
+                !PrefsStore.isHardStopRequested()
+            ) {
+                currentAction = actionPlan[actionIndex]
+                val timedLeft = actionPlan.drop(actionIndex).count {
+                    it == DailyIncubateAction.GROWTH || it == DailyIncubateAction.FOR_YOU
                 }
+                val remainSec = (plannedSec - session.elapsedSec).coerceAtLeast(0)
+                val sliceSec = when (currentAction) {
+                    DailyIncubateAction.MUTUAL -> 0
+                    else -> if (timedLeft <= 1) remainSec else (remainSec / timedLeft).coerceAtLeast(1)
+                }
+                segmentStartedAt = SystemClock.elapsedRealtime()
+                interrupted = runOnePostPublishAction(
+                    target,
+                    currentAction,
+                    sliceSec,
+                    "日常孵化",
+                )
+                actionIndex++
+                val nextElapsed = if (currentAction == DailyIncubateAction.MUTUAL) {
+                    session.elapsedSec
+                } else {
+                    val used = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                        .toInt().coerceAtLeast(0)
+                    (session.elapsedSec + used).coerceAtMost(plannedSec)
+                }
+                session = session.copy(
+                    actionIndex = actionIndex,
+                    action = encodePostPublishActionPlan(actionPlan),
+                    plannedMin = afterMin,
+                    elapsedSec = nextElapsed,
+                )
+                PrefsStore.saveDailyIncubateSession(session)
+                currentCoroutineContext().ensureActive()
             }
-            currentCoroutineContext().ensureActive()
         } catch (t: Throwable) {
             if (t is CancellationException) {
                 withContext(NonCancellable) {
                     pullLoopJob?.cancel()
                     pullLoopJob = null
-                    val partial = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
-                        .toInt().coerceAtLeast(0)
-                    val base = PrefsStore.getDailyIncubateSession()?.elapsedSec
-                        ?.coerceAtLeast(session.elapsedSec)
+                    val partial = if (currentAction == null || currentAction == DailyIncubateAction.MUTUAL) {
+                        0
+                    } else {
+                        ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                            .toInt().coerceAtLeast(0)
+                    }
+                    val alreadyCommitted = PrefsStore.getDailyIncubateSession()?.elapsedSec
                         ?: session.elapsedSec
-                    // 若当前段尚未写入 session，把 partial 补上（避免与已写入重复：仅当 base==session 起点段）
-                    val alreadyCommitted = PrefsStore.getDailyIncubateSession()?.elapsedSec ?: session.elapsedSec
                     val elapsed = if (alreadyCommitted > session.elapsedSec) {
-                        alreadyCommitted
+                        alreadyCommitted.coerceAtMost(plannedSec)
                     } else {
                         (session.elapsedSec + partial).coerceAtMost(plannedSec)
                     }
@@ -3952,15 +4041,17 @@ object AppCoordinator {
                             enabled = true,
                             pausedByScreenOff = dailyIncubatePauseReason != null,
                             username = target,
-                            action = action.key,
-                            plannedMin = minutes,
-                            inTransition = inTransition,
+                            action = encodePostPublishActionPlan(actionPlan),
+                            actionIndex = actionIndex,
+                            plannedMin = afterMin,
+                            inTransition = false,
                             elapsedSec = elapsed,
                         ),
                     )
                     LogCenter.op(
                         alias,
-                        "日常孵化：@$target 中断保存进度 elapsed=${elapsed}s action=${action.key}",
+                        "日常孵化：@$target 中断保存进度 elapsed=${elapsed}s " +
+                            "action=${currentAction?.key ?: "-"} idx=$actionIndex",
                     )
                 }
                 throw t
@@ -3971,38 +4062,18 @@ object AppCoordinator {
 
         if (interrupted || PrefsStore.isHardStopRequested()) {
             PrefsStore.saveDailyIncubateSession(
-                session.copy(enabled = true, pausedByScreenOff = false),
+                session.copy(enabled = true, pausedByScreenOff = false, plannedMin = afterMin),
             )
             return DailyIncubatePhaseResult.INCOMPLETE
         }
 
-        // 完成判定
-        val done = when (action) {
-            DailyIncubateAction.MUTUAL -> true
-            DailyIncubateAction.GROWTH, DailyIncubateAction.FOR_YOU ->
-                session.elapsedSec >= plannedSec - 2
-        }
+        val done = actionIndex >= actionPlan.size
         if (!done) {
-            PrefsStore.saveDailyIncubateSession(session.copy(enabled = true))
+            PrefsStore.saveDailyIncubateSession(session.copy(enabled = true, plannedMin = afterMin))
             return DailyIncubatePhaseResult.INCOMPLETE
         }
 
-        if (inTransition) {
-            val n = PrefsStore.incrementDailyIncubateTransitionCount(target)
-            LogCenter.op(
-                alias,
-                "日常孵化：@$target 过渡期完整会话 +1 → $n/${PrefsStore.DAILY_INCUBATE_TRANSITION_NEED}" +
-                    if (n >= PrefsStore.DAILY_INCUBATE_TRANSITION_NEED) {
-                        "（过渡期完成，下次按手动条数发作品并可互点）"
-                    } else if (n + 1 == PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION) {
-                        "（下次为第 ${PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_SESSION} 次，将发 " +
-                            "${PrefsStore.DAILY_INCUBATE_TRANSITION_PUBLISH_COUNT} 条）"
-                    } else {
-                        ""
-                    },
-            )
-        }
-        LogCenter.op(alias, "日常孵化：@$target 本号养号任务完成（${action.label}）")
+        LogCenter.op(alias, "日常孵化：@$target 本号养号任务完成（$planLabel）")
         return DailyIncubatePhaseResult.COMPLETED
     }
 
@@ -4081,13 +4152,13 @@ object AppCoordinator {
     }
 
     /**
-     * 批量发作品：对指定账号依次切号 → 发作品 → 发完后随机 For You/涨粉一段时间。
+     * 批量发作品：对指定账号依次切号 → 发作品 → 发后预滑/涨粉/互点 3选2（固定 5 分钟）。
      * 切号方案遵循用户选择的备份还原 / 登录切号。
      */
     fun manualStartBatchPublish(
         usernames: List<String>,
         publishCount: Int = PrefsStore.getManualPublishCount(),
-        afterActiveMin: Int = PrefsStore.getManualBatchPublishAfterMin(),
+        @Suppress("UNUSED_PARAMETER") afterActiveMin: Int = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN,
     ) {
         if (!ManualDeviceControl.ENABLED) return
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -4115,10 +4186,7 @@ object AppCoordinator {
             PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
             PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
         )
-        val afterMin = afterActiveMin.coerceIn(
-            PrefsStore.MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-            PrefsStore.MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-        )
+        val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
         PrefsStore.setManualPublishCount(count)
         PrefsStore.setManualBatchPublishAfterMin(afterMin)
         manualDispatchJob?.cancel()
@@ -4136,7 +4204,7 @@ object AppCoordinator {
                 val scheme = PrefsStore.getManualCutSwitchScheme()
                 LogCenter.op(
                     alias,
-                    "批量发作品：开始 ${targets.size} 个账号（每号 ${count} 条，发后活跃 ${afterMin} 分钟，切号=$scheme）",
+                    "批量发作品：开始 ${targets.size} 个账号（每号 ${count} 条，发后活跃固定 ${afterMin} 分钟·3选2，切号=$scheme）",
                 )
                 PrefsStore.saveLocalStatus("running")
 
@@ -4164,11 +4232,10 @@ object AppCoordinator {
                     if (!publishOk) {
                         LogCenter.op(alias, "批量发作品：@$target 发作品未完全成功，仍继续发后活跃")
                     }
-                    val phase = runRandomActivatePhase(
+                    val phase = runPostPublishActivatePhase(
                         target,
                         afterMin,
                         "批量发作品·发后活跃",
-                        splitOnlineStint = false,
                     )
                     processed++
                     updateRuntime(
@@ -10733,7 +10800,7 @@ object AppCoordinator {
 
     /**
      * 云端 PC 地址与本机不一致时保存并注册。
-     * 主要由切号 bundle / 用户手动「从云端同步」触发，不在 check_start 热路径里轮询。
+     * 切号 bundle / 设备指令仍走这里；后台节流主动拉取见 VideoDedDeviceService。
      */
     private fun maybeSyncPcServiceUrl(alias: String, remoteUrlRaw: String?) {
         val remoteUrl = remoteUrlRaw?.trim()?.trimEnd('/').orEmpty()
@@ -13690,6 +13757,14 @@ object AppCoordinator {
                 return@launch
             }
             // 发作品硬门槛：TikTok 图库必须 Always allow all；仅 root grant，绝不杀进程。
+            // 同时自愈本机 Pictures（pending/下层权限/幽灵），避免其它机再遇「有索引不可选」。
+            runCatching {
+                val n = com.autotraces.app.videoded.GalleryMediaPublisher
+                    .ensurePicturesMediaAccessible(appContext, force = true)
+                if (n > 0) {
+                    LogCenter.op(alias, "发作品前图库自愈 $n 条（幽灵/pending/权限）")
+                }
+            }
             if (!ensureTikTokFullGalleryAccessNow("发作品前")) {
                 val switchResult = "发作品失败：TikTok 图库权限未能完全开放（Always allow all）"
                 if (ManualDeviceControl.ENABLED) {

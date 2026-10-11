@@ -14,8 +14,12 @@ object VideoDedSettingsRegistrar {
     private const val TAG = "VideoDedSettingsRegistrar"
     /** 无线流水线最短间隔，避免 15s 轮询反复 adb connect / prepare 打断投屏。 */
     private const val WIRELESS_PIPELINE_MIN_INTERVAL_MS = 120_000L
+    /** 后台主动从云端拉 PC 地址的最短间隔（勿跟 15s 注册心跳同频）。 */
+    private const val CLOUD_PC_URL_PULL_MIN_INTERVAL_MS = 5 * 60_000L
     @Volatile
     private var lastWirelessPipelineAtMs: Long = 0L
+    @Volatile
+    private var lastCloudPcUrlPullAtMs: Long = 0L
     /** 最近一次成功写入的投屏 IP；用于识别 IP 变更并强制重连。 */
     @Volatile
     private var lastPersistedMirrorIp: String = ""
@@ -54,8 +58,9 @@ object VideoDedSettingsRegistrar {
     )
 
     /**
-     * 用户主动从云端拉取本机 PC 投屏地址并落盘/注册（不走轮询热路径）。
+     * 从云端拉取本机 PC 投屏地址并落盘/注册。
      * 使用 get_config（只读），避免 check_start 消耗 pending_start / 改状态。
+     * 界面手动同步、后台节流主动拉取共用此入口。
      */
     suspend fun pullPcServiceUrlFromCloud(context: Context): PullPcServiceUrlResult {
         val app = context.applicationContext
@@ -97,6 +102,30 @@ object VideoDedSettingsRegistrar {
             "地址已保存为 $remoteUrl，注册失败：${result.error?.message}"
         }
         return PullPcServiceUrlResult(msg, changed = true, remoteUrl = remoteUrl, registration = result)
+    }
+
+    /**
+     * 后台主动拉取：约每 [CLOUD_PC_URL_PULL_MIN_INTERVAL_MS] 一次。
+     * 地址未变时静默；有变更时由 [saveAndRegister] 写状态日志。
+     */
+    suspend fun maybePullPcServiceUrlFromCloud(
+        context: Context,
+        minIntervalMs: Long = CLOUD_PC_URL_PULL_MIN_INTERVAL_MS,
+    ): PullPcServiceUrlResult? {
+        val now = System.currentTimeMillis()
+        if (now - lastCloudPcUrlPullAtMs < minIntervalMs) return null
+        // 未绑定则跳过且不占间隔，绑好后下一轮 15s 心跳即可拉
+        if (PrefsStore.getDeviceId().isNullOrBlank() || PrefsStore.getAlias().isNullOrBlank()) {
+            return null
+        }
+        lastCloudPcUrlPullAtMs = now
+        val pull = pullPcServiceUrlFromCloud(context)
+        if (pull.changed) {
+            StatusLogBuffer.append("后台从云端同步 PC 地址：${pull.message}")
+        } else {
+            Log.d(TAG, "cloud PC url pull: ${pull.message}")
+        }
+        return pull
     }
 
     /** 解析并持久化设置；未传字段沿用已存值或自动探测。能探测到实时 IPv4 时始终覆盖过期缓存。 */

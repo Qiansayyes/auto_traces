@@ -73,11 +73,12 @@ object PrefsStore {
     private const val KEY_MANUAL_CUT_SWITCH_SCHEME = "manual_cut_switch_scheme"
     const val CUT_SWITCH_SCHEME_BACKUP: String = "backup"
     const val CUT_SWITCH_SCHEME_LOGIN: String = "login"
-    /** 批量发作品：每号发完后 For You/涨粉随机活跃时长（分钟）。 */
+    /** 批量发作品：每号发完后预滑/涨粉/互点 3选2 活跃时长（分钟，固定不可改）。 */
     private const val KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN = "manual_batch_publish_after_min"
-    const val DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 10
-    const val MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 1
-    const val MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 180
+    const val FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 5
+    const val DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
+    const val MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
+    const val MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
     /** 各账号累计活跃时长（分钟），JSON 对象 username→minutes。 */
     private const val KEY_MANUAL_ACTIVATE_TOTAL_MINUTES = "manual_activate_total_minutes_json"
     /** 各账号待活跃队列累计涨粉模式时长（分钟）。 */
@@ -133,7 +134,7 @@ object PrefsStore {
     const val DAILY_INCUBATE_TRANSITION_PUBLISH_COUNT: Int = 1
     /**
      * 日常孵化进行中会话进度（熄屏暂停 / 中断续跑）。
-     * JSON: enabled, pausedByScreenOff, username, action, publishDone, elapsedSec, plannedMin, inTransition
+     * JSON: enabled, pausedByScreenOff, username, action, actionIndex, publishDone, elapsedSec, plannedMin, inTransition
      */
     private const val KEY_DAILY_INCUBATE_SESSION = "daily_incubate_session_json"
     /** 手动模式：发作品目标条数（1–5）。 */
@@ -1516,16 +1517,11 @@ object PrefsStore {
     fun prefersManualLoginCutSwitch(): Boolean =
         getManualCutSwitchScheme() == CUT_SWITCH_SCHEME_LOGIN
 
-    fun getManualBatchPublishAfterMin(): Int =
-        prefs.getInt(KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN, DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN)
-            .coerceIn(MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN, MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN)
+    fun getManualBatchPublishAfterMin(): Int = FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
 
-    fun setManualBatchPublishAfterMin(minutes: Int) {
+    fun setManualBatchPublishAfterMin(@Suppress("UNUSED_PARAMETER") minutes: Int) {
         prefs.edit()
-            .putInt(
-                KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN,
-                minutes.coerceIn(MIN_MANUAL_BATCH_PUBLISH_AFTER_MIN, MAX_MANUAL_BATCH_PUBLISH_AFTER_MIN),
-            )
+            .putInt(KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN, FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN)
             .apply()
     }
 
@@ -2303,8 +2299,10 @@ object PrefsStore {
         val enabled: Boolean = false,
         val pausedByScreenOff: Boolean = false,
         val username: String = "",
-        /** growth / foryou / mutual；空=尚未抽取 */
+        /** 发后动作计划：逗号分隔 growth/foryou/mutual（通常 2 个）；空=尚未抽取 */
         val action: String = "",
+        /** 当前执行到计划中的第几个动作（0-based） */
+        val actionIndex: Int = 0,
         val publishDone: Boolean = false,
         val elapsedSec: Int = 0,
         val plannedMin: Int = DEFAULT_DAILY_INCUBATE_DURATION_MIN,
@@ -2325,6 +2323,7 @@ object PrefsStore {
                 pausedByScreenOff = o.optBoolean("pausedByScreenOff", false),
                 username = o.optString("username", "").trim().removePrefix("@"),
                 action = o.optString("action", "").trim().lowercase(Locale.US),
+                actionIndex = o.optInt("actionIndex", 0).coerceAtLeast(0),
                 publishDone = o.optBoolean("publishDone", false),
                 elapsedSec = o.optInt("elapsedSec", 0).coerceAtLeast(0),
                 plannedMin = o.optInt("plannedMin", DEFAULT_DAILY_INCUBATE_DURATION_MIN)
@@ -2345,6 +2344,7 @@ object PrefsStore {
             .put("pausedByScreenOff", session.pausedByScreenOff)
             .put("username", session.username.trim().removePrefix("@"))
             .put("action", session.action.trim().lowercase(Locale.US))
+            .put("actionIndex", session.actionIndex.coerceAtLeast(0))
             .put("publishDone", session.publishDone)
             .put("elapsedSec", session.elapsedSec.coerceAtLeast(0))
             .put(
@@ -2362,6 +2362,7 @@ object PrefsStore {
             cur.copy(
                 username = "",
                 action = "",
+                actionIndex = 0,
                 publishDone = false,
                 elapsedSec = 0,
                 inTransition = false,

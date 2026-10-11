@@ -25,6 +25,13 @@ import kotlin.coroutines.resume
  * USB `adb push` 落点常为 `owner=shell`：App 用 File API 直接读会 EACCES（Permission Denied）。
  * [scanExistingFiles] 必须先把源文件中转到本 App 可读位置（cache），再经 MediaStore 正规入库。
  *
+ * ## TikTok 选图不可见自愈
+ * 机群上偶发「MediaStore 已索引、本机 content:// 可读，但 TikTok 选图页空白」：
+ * 下层 `/data/media/0/Pictures` 权限异常 / `IS_PENDING` 卡住 / 幽灵索引。
+ * Lineage FUSE 的 `/sdcard` 常**永远**显示 `root:everybody 660`（合成视图，对照健康机亦如此），
+ * **不能**凭 FUSE ls 判病；以 [ensurePicturesMediaAccessible] 在入库后与发作品前统一自愈：
+ * 清幽灵 → 清 pending → `chown media_rw` + `chmod 666` 下层 → 媒体扫描。
+ *
  * ## 同名 / UNIQUE 策略
  * MediaStore 对 `_data` 路径有唯一约束。反复 push 同名文件时，若旧索引删不净再 insert，
  * 会抛 `UNIQUE constraint failed: files._data`，整单 ACK 失败，PC 素材进不了 `used/`。
@@ -32,6 +39,10 @@ import kotlin.coroutines.resume
  */
 object GalleryMediaPublisher {
     private const val TAG = "GalleryMediaPublisher"
+    /** 发作品流程里统计/选图会多次触发；短间隔内复用上次自愈，避免反复 su chmod。 */
+    private const val ENSURE_MIN_INTERVAL_MS = 20_000L
+    @Volatile private var lastEnsureAtElapsedMs: Long = 0L
+    @Volatile private var lastEnsureCount: Int = 0
 
     fun mimeForFileName(fileName: String): String {
         val ext = fileName.substringAfterLast('.', "").lowercase()
@@ -41,7 +52,11 @@ object GalleryMediaPublisher {
             "mov" -> "video/quicktime"
             "avi" -> "video/x-msvideo"
             "webm" -> "video/webm"
-            else -> "video/*"
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "heic" -> "image/heic"
+            else -> "application/octet-stream"
         }
     }
 
@@ -69,8 +84,8 @@ object GalleryMediaPublisher {
             }
             uris.add(uri.toString())
         }
+        // assert 内会 heal 一次；此处只再清幽灵后复检，避免反复 su/scan
         assertPublishedVisible(app, uris)
-        // 入库后再扫一遍无关幽灵；若本批 URI 被误伤成幽灵，二次 assert 会失败
         runCatching { purgeGhostPicturesVideoRows(app) }
         assertPublishedVisible(app, uris)
         taskDir.deleteRecursively()
@@ -83,7 +98,10 @@ object GalleryMediaPublisher {
      */
     fun assertPublishedVisible(context: Context, uriStrings: List<String>) {
         if (uriStrings.isEmpty()) error("gallery_publish_empty")
-        val resolver = context.applicationContext.contentResolver
+        val app = context.applicationContext
+        // 校验前再自愈一轮：修权限 / 清 pending，降低竞态漏网
+        runCatching { healPublishedUris(app, uriStrings) }
+        val resolver = app.contentResolver
         for (raw in uriStrings) {
             if (!raw.startsWith("content://")) {
                 error("gallery_uri_not_content:$raw")
@@ -108,10 +126,112 @@ object GalleryMediaPublisher {
                 ?: error("gallery_data_unreadable:$raw")
             if (!disk.exists || disk.sizeBytes <= 0L) {
                 // 索引还在、文件已删：典型幽灵行，禁止 ACK 成功
-                purgeVideoUri(context.applicationContext, uri)
+                purgeVideoUri(app, uri)
                 error("gallery_ghost_missing_file:$raw:${disk.path}:size=${disk.sizeBytes}")
             }
         }
+    }
+
+    /**
+     * 发作品前 / 机群自愈入口：清幽灵 → 清 pending → 修下层 chmod/chown → 媒体扫描。
+     * 其它设备再遇「索引在、TikTok 选不中」时由程序自己修，无需人工 adb。
+     *
+     * @param force 入库后/明确异常时传 true，忽略短间隔去抖
+     * @return 扫描并尝试修复的 Pictures 媒体条数（含视频与图片）
+     */
+    fun ensurePicturesMediaAccessible(context: Context, force: Boolean = false): Int {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!force && lastEnsureAtElapsedMs > 0L &&
+            now - lastEnsureAtElapsedMs < ENSURE_MIN_INTERVAL_MS
+        ) {
+            // 去抖命中：返回 0，避免上层反复打「自愈 N 条」误报
+            return 0
+        }
+        val app = context.applicationContext
+        ensureOwnMediaReadGrants()
+        val purged = runCatching { purgeGhostPicturesVideoRows(app) }.getOrDefault(0)
+        if (purged > 0) {
+            Log.i(TAG, "ensurePicturesMediaAccessible purged ghosts=$purged")
+        }
+        val paths = mutableListOf<String>()
+        val pendingUris = mutableListOf<Uri>()
+        val resolver = app.contentResolver
+        for (collection in picturesMediaCollections()) {
+            runCatching {
+                val projection = arrayOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.DATA,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                ) + if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    arrayOf(MediaStore.MediaColumns.IS_PENDING, MediaStore.MediaColumns.RELATIVE_PATH)
+                } else {
+                    emptyArray()
+                }
+                // 先只读收集；禁止在 cursor 未关时 update MediaStore（部分机型会 Cursor 异常）
+                resolver.query(collection, projection, null, null, null)?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+                    val pendingCol = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
+                    val relCol = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                    while (cursor.moveToNext()) {
+                        val data = cursor.getString(dataCol).orEmpty()
+                        val rel = if (relCol >= 0) cursor.getString(relCol).orEmpty() else ""
+                        val inPictures =
+                            rel.startsWith("Pictures", ignoreCase = true) ||
+                                data.contains("/Pictures/", ignoreCase = true)
+                        if (!inPictures) continue
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && pendingCol >= 0) {
+                            val pending = runCatching { cursor.getInt(pendingCol) }.getOrNull()
+                            if (pending != null && pending != 0) {
+                                pendingUris.add(
+                                    ContentUris.withAppendedId(collection, cursor.getLong(idCol)),
+                                )
+                            }
+                        }
+                        if (data.isNotBlank()) paths.add(data)
+                    }
+                }
+            }.onFailure { t ->
+                Log.w(TAG, "ensurePicturesMediaAccessible query failed: ${t.message}")
+            }
+        }
+        for (uri in pendingUris) {
+            forceClearPending(resolver, uri)
+        }
+        // 磁盘有文件但 MediaStore 漏扫时，也修下层 Pictures 目录
+        val diskExtras = listPicturesMediaPathsViaSu()
+        for (p in diskExtras) {
+            if (p !in paths) paths.add(p)
+        }
+        val distinctPaths = paths.distinct()
+        healLowerFsPermissions(distinctPaths)
+        // 批量 scan，避免 N×8s 串行阻塞发作品入口
+        forceMediaScanBlockingBatch(app, distinctPaths.map { File(it) })
+        lastEnsureCount = distinctPaths.size
+        lastEnsureAtElapsedMs = android.os.SystemClock.elapsedRealtime()
+        Log.i(TAG, "ensurePicturesMediaAccessible healed=${distinctPaths.size}")
+        return distinctPaths.size
+    }
+
+    /** 针对本批已入库 URI：清 pending + 修下层权限 + 扫描。 */
+    fun healPublishedUris(context: Context, uriStrings: List<String>) {
+        if (uriStrings.isEmpty()) return
+        val app = context.applicationContext
+        val resolver = app.contentResolver
+        val paths = mutableListOf<String>()
+        for (raw in uriStrings) {
+            if (!raw.startsWith("content://")) continue
+            val uri = Uri.parse(raw)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val pending = readIsPending(resolver, uri)
+                if (pending != null && pending != 0) {
+                    forceClearPending(resolver, uri)
+                }
+            }
+            readAbsoluteDataPath(resolver, uri)?.let { paths.add(it) }
+        }
+        healLowerFsPermissions(paths)
+        forceMediaScanBlockingBatch(app, paths.map { File(it) })
     }
 
     /**
@@ -293,6 +413,8 @@ object GalleryMediaPublisher {
                     }
                 }
             }
+            // USB/磁盘再入库后统一自愈，保证 TikTok 选图页立刻可见
+            runCatching { ensurePicturesMediaAccessible(app, force = true) }
         }
     }
 
@@ -428,17 +550,24 @@ object GalleryMediaPublisher {
     }
 
     private fun forceMediaScanBlocking(context: Context, file: File) {
-        if (!file.isFile) return
+        forceMediaScanBlockingBatch(context, listOf(file))
+    }
+
+    /** 一次 scan 多文件，总等待封顶，避免发作品前被 N 次 8s latch 拖死。 */
+    private fun forceMediaScanBlockingBatch(context: Context, files: List<File>) {
+        val existing = files.filter { it.isFile }.distinctBy { it.absolutePath }
+        if (existing.isEmpty()) return
         try {
-            val latch = java.util.concurrent.CountDownLatch(1)
+            val latch = java.util.concurrent.CountDownLatch(existing.size)
             MediaScannerConnection.scanFile(
                 context,
-                arrayOf(file.absolutePath),
-                arrayOf(mimeForFileName(file.name)),
+                existing.map { it.absolutePath }.toTypedArray(),
+                existing.map { mimeForFileName(it.name) }.toTypedArray(),
             ) { _, _ -> latch.countDown() }
-            latch.await(8, TimeUnit.SECONDS)
+            val waitSec = (6L + existing.size.toLong()).coerceAtMost(20L)
+            latch.await(waitSec, TimeUnit.SECONDS)
         } catch (t: Throwable) {
-            Log.w(TAG, "media scan failed for ${file.absolutePath}: ${t.message}")
+            Log.w(TAG, "media scan batch failed (${existing.size}): ${t.message}")
         }
     }
 
@@ -580,7 +709,7 @@ object GalleryMediaPublisher {
         return runCatching {
             resolver.query(
                 uri,
-                arrayOf(MediaStore.Video.Media.IS_PENDING),
+                arrayOf(MediaStore.MediaColumns.IS_PENDING),
                 null,
                 null,
                 null,
@@ -594,29 +723,140 @@ object GalleryMediaPublisher {
     /**
      * 清 IS_PENDING：App update → su content update。
      * USB push 幽灵行 App 常 update 失败/返回 0，必须 su 兜底，否则 TikTok 选图页不可见。
+     * 使用完整 URI（视频/图片均可），避免硬编码 video/media。
      */
     private fun forceClearPending(
         resolver: android.content.ContentResolver,
         uri: Uri,
     ): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
-        val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+        val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
         runCatching { resolver.update(uri, done, null, null) }
         if (readIsPending(resolver, uri) == 0) return true
-        val id = try {
-            ContentUris.parseId(uri)
-        } catch (_: Exception) {
-            -1L
-        }
-        if (id >= 0L) {
-            val updateCmd =
-                "content update --uri content://media/external/video/media/$id --bind is_pending:i:0"
-            runSu(updateCmd)
-            runSuAsShell(updateCmd)
-        }
+        val flat = uri.toString()
+        val updateCmd = "content update --uri $flat --bind is_pending:i:0"
+        runSu(updateCmd)
+        runSuAsShell(updateCmd)
         val after = readIsPending(resolver, uri)
         // 读不到 pending 不能当成功：否则 shell 幽灵行会 ACK 成功但 TikTok 仍不可见
         return after == 0
+    }
+
+    private fun picturesMediaCollections(): List<Uri> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            listOf(
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            )
+        } else {
+            listOf(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            )
+        }
+    }
+
+    private fun readAbsoluteDataPath(
+        resolver: android.content.ContentResolver,
+        uri: Uri,
+    ): String? {
+        return runCatching {
+            resolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DATA),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use null
+                cursor.getString(0)?.trim()?.takeIf { it.isNotEmpty() }
+            }
+        }.getOrNull()
+    }
+
+    /** `/storage/emulated/0/...` / `/sdcard/...` → `/data/media/0/...`（FUSE 下层真实路径）。 */
+    private fun toLowerMediaPath(path: String): String? {
+        val p = path.trim()
+        if (p.isEmpty()) return null
+        if (p.startsWith("/data/media/0/")) return p
+        val prefixes = listOf("/storage/emulated/0/", "/sdcard/", "/mnt/sdcard/", "/mnt/user/0/")
+        for (prefix in prefixes) {
+            if (p.startsWith(prefix)) {
+                return "/data/media/0/" + p.removePrefix(prefix)
+            }
+        }
+        return null
+    }
+
+    /**
+     * 修下层真实文件权限。FUSE 合成视图可能仍显示 660，属 Lineage 正常现象；
+     * TikTok 跨 UID 可读依赖下层 media_rw + 其它位开放。
+     */
+    private fun healLowerFsPermissions(fuseOrAbsPaths: List<String>) {
+        val distinct = fuseOrAbsPaths.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (distinct.isEmpty()) return
+        val script = buildString {
+            for (path in distinct) {
+                val fuseQ = shellSingleQuote(path)
+                val lower = toLowerMediaPath(path)
+                append("chmod 666 $fuseQ 2>/dev/null; ")
+                if (lower != null) {
+                    val lowerQ = shellSingleQuote(lower)
+                    append("chmod 666 $lowerQ 2>/dev/null; ")
+                    // 图片/视频统一 media_rw:media_rw；勿强绑 media_video（图片会被错标）
+                    append("chown media_rw:media_rw $lowerQ 2>/dev/null; ")
+                }
+            }
+            append("echo HEAL-FS-DONE")
+        }
+        if (!runSu(script)) {
+            Log.w(TAG, "healLowerFsPermissions su failed for ${distinct.size} paths")
+        }
+    }
+
+    /** su 枚举 Pictures 根目录媒体文件（漏索引时仍能 chmod）。 */
+    private fun listPicturesMediaPathsViaSu(): List<String> {
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+            .absolutePath
+        val lower = toLowerMediaPath(dir) ?: "/data/media/0/Pictures"
+        val out = runSuCapture(
+            "ls -1 ${shellSingleQuote(lower)} 2>/dev/null; ls -1 ${shellSingleQuote(dir)} 2>/dev/null",
+        ) ?: return emptyList()
+        return out.lineSequence()
+            .map { it.trim() }
+            .filter { name ->
+                val ext = name.substringAfterLast('.', "").lowercase()
+                ext in setOf("mp4", "mkv", "mov", "avi", "webm", "jpg", "jpeg", "png", "webp", "heic")
+            }
+            .map { name -> File(dir, name).absolutePath }
+            .distinct()
+            .toList()
+    }
+
+    private fun runSuCapture(command: String): String? {
+        val candidates = listOf(
+            arrayOf("su", "-c", command),
+            arrayOf("/system/bin/su", "-c", command),
+            arrayOf("/system/xbin/su", "-c", command),
+            arrayOf("sh", "-c", "su -c " + shellSingleQuote(command)),
+        )
+        for (args in candidates) {
+            try {
+                val p = ProcessBuilder(*args).redirectErrorStream(true).start()
+                val text = p.inputStream.bufferedReader().use { it.readText() }
+                val finished = p.waitFor(60, TimeUnit.SECONDS)
+                if (!finished) {
+                    runCatching { p.destroyForcibly() }
+                    continue
+                }
+                if (p.exitValue() == 0 || text.isNotBlank()) {
+                    return text
+                }
+            } catch (t: Throwable) {
+                Log.d(TAG, "runSuCapture ${args.firstOrNull()} failed: ${t.message}")
+            }
+        }
+        return null
     }
 
     private fun insertMediaStoreQPlus(context: Context, source: File, displayName: String): Uri {

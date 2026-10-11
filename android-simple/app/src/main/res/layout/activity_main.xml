@@ -360,59 +360,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:orientation="horizontal">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualStartGrowthButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="涨粉" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualStopGrowthButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:layout_weight="1"
-                    android:text="停涨粉" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="预滑时长(秒)">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualForYouSwipeSecInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualForYouSwipeButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="For You 预滑" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
@@ -450,60 +397,6 @@
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:hint="发后活跃(分钟)">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualBatchPublishAfterMinInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualBatchPublishButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="批量发作品" />
-            </LinearLayout>
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="批量发作品：勾选账号后依次切号→发作品→发完随机 For You/涨粉（时长见上）。条数沿用「发作品条数」。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="11sp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualBatchPublishNonPendingButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="非待活跃批量发" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="非待活跃批量发：一点即自动拉取本机设备云端账号，对未在待活跃队列的全部账号发作品（跳过 banned）。条数/发后活跃同上。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="11sp" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
                     android:hint="养号时长(小时，如3=3小时)">
 
                     <com.google.android.material.textfield.TextInputEditText
@@ -523,45 +416,13 @@
                     android:text="开始排队养号" />
             </LinearLayout>
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualDailyIncubateCurrentButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="只给当前账号养号" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualDailyIncubateStopButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="停止日常孵化" />
-
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="日常孵化：未在待活跃队列的账号。切号→发作品→涨粉50%/预滑30%/互点20%。新号前2次不发作品，第3次发1条；过渡期禁止互点。毕业后按界面条数（默认3）。「只给当前账号养号」仅养下拉所选账号一次。熄屏暂停，亮屏自动续跑。"
+                android:text="日常孵化：未在待活跃队列的账号。切号→按「发作品条数」发作品→预滑/涨粉/互点各50%做3选2（涨粉/预滑在前分摊固定5分钟，互点置尾不占这5分钟）。熄屏暂停，亮屏自动续跑。"
                 android:textColor="@android:color/darker_gray"
                 android:textSize="11sp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualProfileEditButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="修改基本资料" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualMutualButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="引流互点" />
 
             <TextView
                 android:id="@+id/manualTaskStatusText"
@@ -851,187 +712,321 @@
                     android:textColor="@android:color/darker_gray" />
             </LinearLayout>
 
-            <TextView
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualMoreToolsToggle"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="16dp"
-                android:text="新邮箱（待注册 TK）"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="从管理台「待注册TK账号」领取一个邮箱并转入「邮箱账户管理」，可复制后用于注册；验证码走云端邮箱模块。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/acquireNewEmailButton"
-                style="@style/Widget.MaterialComponents.Button"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="获取新邮箱" />
+                android:gravity="start|center_vertical"
+                android:text="更多功能 ▸"
+                android:textAllCaps="false" />
 
             <LinearLayout
+                android:id="@+id/manualMoreToolsSection"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:orientation="vertical"
+                android:visibility="gone">
 
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
+                <LinearLayout
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1">
+                    android:layout_marginTop="4dp"
+                    android:orientation="horizontal">
 
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/issuedNewEmailInput"
-                        android:layout_width="match_parent"
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/manualStartGrowthButton"
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:clickable="false"
-                        android:focusable="false"
-                        android:hint="下发邮箱（可作注册用户名）" />
-                </com.google.android.material.textfield.TextInputLayout>
+                        android:layout_weight="1"
+                        android:text="涨粉" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/manualStopGrowthButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:text="停涨粉" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:hint="预滑时长(秒)">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/manualForYouSwipeSecInput"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="number"
+                            android:maxLines="1" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/manualForYouSwipeButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:text="For You 预滑" />
+                </LinearLayout>
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/copyIssuedNewEmailButton"
+                    android:id="@+id/manualBatchPublishButton"
                     style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="复制" />
-            </LinearLayout>
+                    android:layout_marginTop="8dp"
+                    android:text="批量发作品" />
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
+                <TextView
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/issuedNewEmailPasswordInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:clickable="false"
-                        android:focusable="false"
-                        android:hint="邮箱密码" />
-                </com.google.android.material.textfield.TextInputLayout>
+                    android:layout_marginTop="2dp"
+                    android:text="批量发作品：勾选账号后依次切号→发作品→发后预滑/涨粉/互点各50%做3选2（涨粉/预滑在前分摊固定5分钟，互点置尾）。条数沿用「发作品条数」。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="11sp" />
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/copyIssuedNewEmailPasswordButton"
+                    android:id="@+id/manualBatchPublishNonPendingButton"
                     style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="复制" />
-            </LinearLayout>
+                    android:layout_marginTop="8dp"
+                    android:text="非待活跃批量发" />
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/fetchNewEmailCodeButton"
-                style="@style/Widget.MaterialComponents.Button"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:text="从新邮箱中取验证码" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/updateAccountEmailFromIssuedButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="用新邮箱更新下拉账号" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="改邮完成后：把上方下发的邮箱/密码写入「手动任务」下拉选中账号的云端记录（先弹窗确认）。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
-
-            <TextView
-                android:id="@+id/issuedNewEmailStatusText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:textColor="@android:color/darker_gray" />
-
-            <LinearLayout
-                android:id="@+id/manualLocalAutoSwitchSection"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical">
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:text="自动切号自治（本机）"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="按上方账号列表轮转生成计划；不依赖管理台开关。硬停会同时关闭自治。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
-
-            <com.google.android.material.checkbox.MaterialCheckBox
-                android:id="@+id/manualAutoSwitchEnableCheck"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="开启自动切号自治" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
+                <TextView
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="每号时段(分钟)">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualAutoSwitchSlotMinutesInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
+                    android:layout_marginTop="2dp"
+                    android:text="非待活跃批量发：一点即自动拉取本机设备云端账号，对未在待活跃队列的全部账号发作品（跳过 banned）。条数同上；发后活跃固定5分钟。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="11sp" />
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualAutoSwitchRebuildButton"
+                    android:id="@+id/manualDailyIncubateCurrentButton"
                     style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="重建计划" />
-            </LinearLayout>
+                    android:layout_marginTop="8dp"
+                    android:text="只给当前账号养号" />
 
-            <TextView
-                android:id="@+id/manualAutoSwitchStatusText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="自治状态：关"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="12sp" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualDailyIncubateStopButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="停止日常孵化" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualProfileEditButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="修改基本资料" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualMutualButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="引流互点" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="新邮箱（待注册 TK）"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="从管理台「待注册TK账号」领取一个邮箱并转入「邮箱账户管理」，可复制后用于注册；验证码走云端邮箱模块。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/acquireNewEmailButton"
+                    style="@style/Widget.MaterialComponents.Button"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="获取新邮箱" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/issuedNewEmailInput"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:clickable="false"
+                            android:focusable="false"
+                            android:hint="下发邮箱（可作注册用户名）" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/copyIssuedNewEmailButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:text="复制" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/issuedNewEmailPasswordInput"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:clickable="false"
+                            android:focusable="false"
+                            android:hint="邮箱密码" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/copyIssuedNewEmailPasswordButton"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:text="复制" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/fetchNewEmailCodeButton"
+                    style="@style/Widget.MaterialComponents.Button"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="从新邮箱中取验证码" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/updateAccountEmailFromIssuedButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="用新邮箱更新下拉账号" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="改邮完成后：把上方下发的邮箱/密码写入「手动任务」下拉选中账号的云端记录（先弹窗确认）。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/issuedNewEmailStatusText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textColor="@android:color/darker_gray" />
+
+                <LinearLayout
+                    android:id="@+id/manualLocalAutoSwitchSection"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="16dp"
+                        android:text="自动切号自治（本机）"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="按上方账号列表轮转生成计划；不依赖管理台开关。硬停会同时关闭自治。"
+                        android:textColor="@android:color/darker_gray"
+                        android:textSize="12sp" />
+
+                    <com.google.android.material.checkbox.MaterialCheckBox
+                        android:id="@+id/manualAutoSwitchEnableCheck"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="开启自动切号自治" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.textfield.TextInputLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:hint="每号时段(分钟)">
+
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/manualAutoSwitchSlotMinutesInput"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:inputType="number"
+                                android:maxLines="1" />
+                        </com.google.android.material.textfield.TextInputLayout>
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/manualAutoSwitchRebuildButton"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="8dp"
+                            android:text="重建计划" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/manualAutoSwitchStatusText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="自治状态：关"
+                        android:textColor="@android:color/darker_gray"
+                        android:textSize="12sp" />
+                </LinearLayout>
             </LinearLayout>
         </LinearLayout>
     </ScrollView>

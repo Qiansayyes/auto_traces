@@ -11270,11 +11270,13 @@ class RealTraceExecutor(
      */
     private fun publishPostSanitizeGalleryBeforePick(alias: String, videoIndex: Int): Boolean {
         val ctx = appContextProvider().applicationContext
-        val purged = runCatching {
-            com.autotraces.app.videoded.GalleryMediaPublisher.purgeGhostPicturesVideoRows(ctx)
+        // 统一自愈：清幽灵 + 清 pending + 修下层权限（其它机再遇「索引在、TikTok 选不中」自动修）
+        val healed = runCatching {
+            com.autotraces.app.videoded.GalleryMediaPublisher
+                .ensurePicturesMediaAccessible(ctx, force = true)
         }.getOrDefault(0)
-        if (purged > 0) {
-            devOp(alias, "发作品：选图前清理 Pictures 幽灵行 $purged 条")
+        if (healed > 0) {
+            devOp(alias, "发作品：选图前图库自愈 $healed 条（幽灵/pending/权限）")
         }
         // 只动 Camera，不动 Pictures 本轮素材
         val cameraCleared = runCatching {
@@ -15563,12 +15565,12 @@ class RealTraceExecutor(
     private fun publishPostCountPicturesImageVideoViaSu(): Pair<Int, Int> {
         val alias = PrefsStore.getAlias() ?: "unknown"
         val ctx = appContextProvider().applicationContext
-        // 选图前清掉「索引在、文件没了」的幽灵行，避免固定点第 N 张点空
-        val purged = runCatching {
-            com.autotraces.app.videoded.GalleryMediaPublisher.purgeGhostPicturesVideoRows(ctx)
+        // 统计前统一自愈：清幽灵/pending + 修下层权限，避免「日志有素材、选图页空」
+        val healed = runCatching {
+            com.autotraces.app.videoded.GalleryMediaPublisher.ensurePicturesMediaAccessible(ctx)
         }.getOrDefault(0)
-        if (purged > 0) {
-            devOp(alias, "发作品：已清理 Pictures 幽灵 MediaStore 行 $purged 条")
+        if (healed > 0) {
+            devOp(alias, "发作品：图库自愈 $healed 条（幽灵/pending/权限）")
         }
         val suImages = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_IMAGE_EXTS)
         val suVideos = publishPostCountPicturesMediaFilesViaSu(PUBLISH_POST_PICTURES_VIDEO_EXTS)

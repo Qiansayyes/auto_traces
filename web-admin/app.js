@@ -326,6 +326,7 @@ const accountRecordsNextPageBtn = document.getElementById("accountRecordsNextPag
 const accountRecordsPagerEl = document.getElementById("accountRecordsPager");
 const accountRecordsPageSizeInput = document.getElementById("accountRecordsPageSizeInput");
 const accountRecordsBatchDeleteBtn = document.getElementById("accountRecordsBatchDeleteBtn");
+const accountRecordsPurgeMaxLoginBtn = document.getElementById("accountRecordsPurgeMaxLoginBtn");
 const accountRecordsSelectAllAliasesBtn = document.getElementById("accountRecordsSelectAllAliasesBtn");
 const accountRecordsClearAliasSelectionBtn = document.getElementById("accountRecordsClearAliasSelectionBtn");
 const accountRecordsExportSelectedAliasesBtn = document.getElementById("accountRecordsExportSelectedAliasesBtn");
@@ -3310,6 +3311,49 @@ async function exportAccountRowsByFollowers() {
     if (accountRecordsExportByFollowersBtn) {
       accountRecordsExportByFollowersBtn.disabled = false;
       accountRecordsExportByFollowersBtn.textContent = previousLabel;
+    }
+  }
+}
+
+let accountRecordsPurgeMaxLoginInFlight = false;
+
+async function purgeAccountRecordsMaxLoginSuffix() {
+  if (accountRecordsPurgeMaxLoginInFlight || accountRecordsPurgeMaxLoginBtn?.disabled) return;
+  if (!window.confirm(
+    "确认清理当前账号下全部 ----Maximum login 文案？\n\n将从 password / email / email_password 剥离该后缀；仅因此移出自动切号的设备行会恢复参与。",
+  )) {
+    return;
+  }
+  accountRecordsPurgeMaxLoginInFlight = true;
+  const previousLabel = accountRecordsPurgeMaxLoginBtn?.textContent || "清理 Maximum login";
+  if (accountRecordsPurgeMaxLoginBtn) {
+    accountRecordsPurgeMaxLoginBtn.disabled = true;
+    accountRecordsPurgeMaxLoginBtn.textContent = "清理中...";
+  }
+  try {
+    setStatus("正在清理 ----Maximum login…", "info");
+    const resp = await request(`${ACCOUNT_ROWS_API}/purge_max_login_suffix`, {
+      method: "POST",
+      body: JSON.stringify({}),
+      timeoutMs: 120000,
+    });
+    const updated = Number(resp?.data?.account_updated || 0);
+    const rejoined = Number(resp?.data?.device_rejoined || 0);
+    setStatus(resp?.msg || `已清理 ${updated} 条` + (rejoined ? `，恢复 ${rejoined} 条设备行` : ""), "success");
+    try {
+      await refreshAccountEditorLight({ refreshArchive: true });
+      renderAccountEditorRows();
+    } catch (reloadError) {
+      setStatus(
+        `${resp?.msg || "清理完成"}；刷新列表失败：${humanizeRequestErrorMessage(reloadError)}`,
+        "warning",
+      );
+    }
+  } finally {
+    accountRecordsPurgeMaxLoginInFlight = false;
+    if (accountRecordsPurgeMaxLoginBtn) {
+      accountRecordsPurgeMaxLoginBtn.disabled = false;
+      accountRecordsPurgeMaxLoginBtn.textContent = previousLabel;
     }
   }
 }
@@ -14410,6 +14454,13 @@ if (accountRecordsImportXlsxBtn) {
 if (accountRecordsExportByFollowersBtn) {
   accountRecordsExportByFollowersBtn.addEventListener("click", () => {
     exportAccountRowsByFollowers().catch((e) => setStatus(humanizeRequestErrorMessage(e) || "提取高粉账号失败", "error"));
+  });
+}
+if (accountRecordsPurgeMaxLoginBtn) {
+  accountRecordsPurgeMaxLoginBtn.addEventListener("click", () => {
+    purgeAccountRecordsMaxLoginSuffix().catch((e) =>
+      setStatus(humanizeRequestErrorMessage(e) || "清理 Maximum login 失败", "error"),
+    );
   });
 }
 if (accountRecordsDeleteUsernameTemplateBtn) {
