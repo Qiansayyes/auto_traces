@@ -51,8 +51,17 @@ object ManualDeviceControl {
         "local-manual-$kind-${System.currentTimeMillis()}-${(Math.random() * 1_000_000).toInt()}"
 
     fun updateCachedAccounts(accounts: List<AccountOption>) {
-        cachedAccounts.set(accounts.toList())
-        PrefsStore.setManualAccountsCacheJson(encodeAccounts(accounts))
+        val next = accounts.toList()
+        cachedAccounts.set(next)
+        // 空名单写 null 删 key，避免残留历史 JSON 被再次 hydrate
+        PrefsStore.setManualAccountsCacheJson(
+            if (next.isEmpty()) null else encodeAccounts(next),
+        )
+    }
+
+    /** 清空本机账号缓存（云端无分配时调用）。 */
+    fun clearCachedAccounts() {
+        updateCachedAccounts(emptyList())
     }
 
     /** 从本机缓存移除账号（封禁移出计划后立即生效，无需等下次云端拉取）。 */

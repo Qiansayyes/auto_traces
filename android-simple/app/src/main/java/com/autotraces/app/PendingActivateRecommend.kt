@@ -69,10 +69,23 @@ object PendingActivateRecommend {
      */
     fun ingestRoster(items: List<DeviceAssignedAccountItem>) {
         val now = System.currentTimeMillis()
+        // 云端空名单：整表清空，禁止沿用已撤销分配的历史推荐
+        if (items.isEmpty()) {
+            save(now, emptyMap())
+            return
+        }
+        val rosterKeys = items.mapNotNull { item ->
+            item.username?.trim()?.removePrefix("@")?.lowercase()?.takeIf { it.isNotEmpty() }
+        }.toSet()
         val existing = loadMap()
         val cacheAt = loadComputedAtMs()
         val reuse = cacheAt != null && now - cacheAt < PrefsStore.PENDING_ACTIVATE_RECOMMEND_CACHE_TTL_MS
-        val next = if (reuse) existing.toMutableMap() else mutableMapOf()
+        // 复用期内也先按当前云端名单裁剪，避免已撤号继续占推荐位
+        val next = if (reuse) {
+            existing.filterKeys { it in rosterKeys }.toMutableMap()
+        } else {
+            mutableMapOf()
+        }
         for (item in items) {
             val snap = snapshotFromItem(item) ?: continue
             val key = snap.username.lowercase()

@@ -73,7 +73,10 @@ object PrefsStore {
     private const val KEY_MANUAL_CUT_SWITCH_SCHEME = "manual_cut_switch_scheme"
     const val CUT_SWITCH_SCHEME_BACKUP: String = "backup"
     const val CUT_SWITCH_SCHEME_LOGIN: String = "login"
-    /** 批量发作品：每号发完后预滑/涨粉/互点 3选2 活跃时长（分钟，固定不可改）。 */
+    /**
+     * 发作品后「发布保证」时长（分钟，固定）：随机涨粉或预滑，确保作品成功发出。
+     * 与后续预滑/涨粉/互点 3选2 无关，3选2 不占用这段时间。
+     */
     private const val KEY_MANUAL_BATCH_PUBLISH_AFTER_MIN = "manual_batch_publish_after_min"
     const val FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = 5
     const val DEFAULT_MANUAL_BATCH_PUBLISH_AFTER_MIN: Int = FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
@@ -2299,18 +2302,25 @@ object PrefsStore {
         val enabled: Boolean = false,
         val pausedByScreenOff: Boolean = false,
         val username: String = "",
-        /** 发后动作计划：逗号分隔 growth/foryou/mutual（通常 2 个）；空=尚未抽取 */
+        /** 3选2 动作计划：逗号分隔 growth/foryou/mutual（通常 2 个）；空=尚未抽取 */
         val action: String = "",
         /** 当前执行到计划中的第几个动作（0-based） */
         val actionIndex: Int = 0,
         val publishDone: Boolean = false,
+        /** 发作品后的「发布保证」5 分钟（随机涨粉/预滑）是否已完成 */
+        val publishSettleDone: Boolean = false,
+        /** 发布保证选用的动作：growth / foryou；空=尚未抽取 */
+        val settleAction: String = "",
+        /** 发布保证阶段已跑秒数（仅 settle 用；3选2 不占此计时） */
         val elapsedSec: Int = 0,
+        /** 3选2 中涨粉/预滑各自时长（分钟）= 养号时长；互点无此时长限制 */
         val plannedMin: Int = DEFAULT_DAILY_INCUBATE_DURATION_MIN,
         val inTransition: Boolean = false,
         /** true=只养指定单号，完成后不继续排队 */
         val singleAccountOnly: Boolean = false,
     ) {
-        fun remainingSec(): Int = (plannedMin * 60 - elapsedSec).coerceAtLeast(0)
+        fun remainingSettleSec(): Int =
+            (FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN * 60 - elapsedSec).coerceAtLeast(0)
     }
 
     fun getDailyIncubateSession(): DailyIncubateSession? {
@@ -2325,6 +2335,8 @@ object PrefsStore {
                 action = o.optString("action", "").trim().lowercase(Locale.US),
                 actionIndex = o.optInt("actionIndex", 0).coerceAtLeast(0),
                 publishDone = o.optBoolean("publishDone", false),
+                publishSettleDone = o.optBoolean("publishSettleDone", false),
+                settleAction = o.optString("settleAction", "").trim().lowercase(Locale.US),
                 elapsedSec = o.optInt("elapsedSec", 0).coerceAtLeast(0),
                 plannedMin = o.optInt("plannedMin", DEFAULT_DAILY_INCUBATE_DURATION_MIN)
                     .coerceIn(MIN_DAILY_INCUBATE_DURATION_MIN, MAX_DAILY_INCUBATE_DURATION_MIN),
@@ -2346,6 +2358,8 @@ object PrefsStore {
             .put("action", session.action.trim().lowercase(Locale.US))
             .put("actionIndex", session.actionIndex.coerceAtLeast(0))
             .put("publishDone", session.publishDone)
+            .put("publishSettleDone", session.publishSettleDone)
+            .put("settleAction", session.settleAction.trim().lowercase(Locale.US))
             .put("elapsedSec", session.elapsedSec.coerceAtLeast(0))
             .put(
                 "plannedMin",
@@ -2364,6 +2378,8 @@ object PrefsStore {
                 action = "",
                 actionIndex = 0,
                 publishDone = false,
+                publishSettleDone = false,
+                settleAction = "",
                 elapsedSec = 0,
                 inTransition = false,
                 pausedByScreenOff = false,

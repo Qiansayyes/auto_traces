@@ -1283,8 +1283,7 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
                 binding.manualTaskStatusText.text = "正在切号 → @${opt.username} …"
-                // 先同步禁用（含「手动切号完毕」），再启动切号；busy 也会在 coordinator 内同步置位
-                binding.manualConfirmSwitchDoneButton.isEnabled = false
+                // 先同步禁用任务按钮，再启动切号；busy 也会在 coordinator 内同步置位
                 setManualTaskButtonsEnabled(false)
                 AppCoordinator.manualSwitchAccountFromSpinner(opt.username)
             }
@@ -1305,10 +1304,14 @@ class MainActivity : AppCompatActivity() {
                         list.any { it.username.equals(active, ignoreCase = true) }
                     val pendingCount = PrefsStore.getPendingActivateUsernames().size
                     binding.manualTaskStatusText.text = when {
+                        list.isEmpty() ->
+                            "云端暂无分配账号，已清空本机历史账号" +
+                                if (active.isNotBlank()) "（本机当前仍为 @$active）" else ""
                         active.isNotBlank() && !activeStillListed ->
                             "已拉取 ${list.size} 个账号（待活跃 $pendingCount）；本机当前 @$active 已不在列表，请切到其他账号"
                         else -> "已拉取 ${list.size} 个账号（其中待活跃队列 $pendingCount 个）"
                     }
+                    refreshManualAccountStatus()
                     refreshManualAutoSwitchStatus()
                     // 不要再调 refreshAssignedAccountFields：它会用云端「高亮」单账号覆盖下拉选中凭据
                 }.onFailure { err ->
@@ -1321,25 +1324,6 @@ class MainActivity : AppCompatActivity() {
 
         setupManualCutSwitchSchemeSpinner()
 
-        binding.manualConfirmSwitchDoneButton.setOnClickListener {
-            if (AppCoordinator.isManualSwitchBusy()) {
-                Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            val user = selectedManualUsername()
-            if (user.isBlank()) {
-                Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
-            AppCoordinator.manualSelectAccount(user)
-            AppCoordinator.manualConfirmSwitchDone()
-            binding.manualTaskStatusText.text = "已确认手动切号完毕：@$user"
-            refreshManualAccountStatus()
-            refreshManualAccountSpinnerLabels()
-            Toast.makeText(this, "已标记 @$user 切号完毕", Toast.LENGTH_SHORT).show()
-        }
-
         binding.manualAutoLoginButton.setOnClickListener {
             if (AppCoordinator.isManualSwitchBusy()) {
                 Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
@@ -1348,10 +1332,6 @@ class MainActivity : AppCompatActivity() {
             val user = selectedManualUsername()
             if (user.isBlank()) {
                 Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!AppCoordinator.isManualAccountAligned()) {
-                Toast.makeText(this, "请先等待切号完成（本机当前需与下拉一致）", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
@@ -1447,7 +1427,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
                 binding.manualTaskStatusText.text =
-                    "已请求批量发作品（${picked.size}个 · 每号${count}条 · 发后固定${afterMin}分钟·3选2 · $scheme）"
+                    "已请求批量发作品（${picked.size}个 · 每号${count}条 · 发布保证${afterMin}分钟→3选2 · $scheme）"
                 AppCoordinator.manualStartBatchPublish(picked, count, afterMin)
                 setManualTaskButtonsEnabled(true)
             }
@@ -1484,7 +1464,7 @@ class MainActivity : AppCompatActivity() {
                 bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
                 result.onSuccess { started ->
                     binding.manualTaskStatusText.text =
-                        "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发后固定${afterMin}分钟·3选2 · $scheme）"
+                        "已请求非待活跃批量发（${started}个 · 每号${count}条 · 发布保证${afterMin}分钟→3选2 · $scheme）"
                     Toast.makeText(
                         this@MainActivity,
                         "已开始：${started} 个非待活跃账号",
@@ -1548,7 +1528,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 AppCoordinator.manualStartDailyIncubate(minutes)
                 binding.manualTaskStatusText.text =
-                    "已请求日常孵化（约 $queueSize 个 · 发后固定${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟·3选2）"
+                    "已请求日常孵化（约 $queueSize 个 · 发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
                 Toast.makeText(
                     this@MainActivity,
                     "已开始排队养号（$queueSize 个账号）",
@@ -1612,7 +1592,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = activeUser)
                 binding.manualTaskStatusText.text =
-                    "已请求当前账号养号：@$activeUser（发后固定${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟·3选2）"
+                    "已请求当前账号养号：@$activeUser（发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
                 Toast.makeText(
                     this@MainActivity,
                     "已开始养号：@$activeUser",
@@ -1673,14 +1653,22 @@ class MainActivity : AppCompatActivity() {
         refreshManualAccountStatus()
     }
 
-    /** 任务按钮：切号完成且本机当前与下拉一致后才可点。 */
+    /** 任务按钮：已选账号、本机已切到该号、且未在切号/多账号会话中即可点。 */
     private fun guardManualTaskReady(label: String): Boolean {
         if (AppCoordinator.isManualSwitchBusy()) {
             Toast.makeText(this, "切号进行中，请稍候", Toast.LENGTH_SHORT).show()
             return false
         }
+        if (AppCoordinator.isBatchAccountSessionBusy()) {
+            Toast.makeText(this, "多账号会话进行中，请稍候再$label", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        if (selectedManualUsername().isBlank()) {
+            Toast.makeText(this, "请先选择账号后再$label", Toast.LENGTH_SHORT).show()
+            return false
+        }
         if (!AppCoordinator.isManualAccountAligned()) {
-            Toast.makeText(this, "请先切号完成（本机当前需与下拉账号一致）后再$label", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "请先下拉切号到选中账号后再$label", Toast.LENGTH_SHORT).show()
             return false
         }
         return ensureCloudLoginAndBoundForStart()
@@ -1716,20 +1704,18 @@ class MainActivity : AppCompatActivity() {
         val busy = AppCoordinator.isManualSwitchBusy()
         val sessionBusy = AppCoordinator.isBatchAccountSessionBusy()
         val blocked = busy || sessionBusy
-        val aligned = enabled && AppCoordinator.isManualAccountAligned() && !blocked
+        val statusUser = selectedManualUsername()
+        val canRun = enabled && statusUser.isNotBlank() && !blocked
         binding.manualAccountSelect.isEnabled = !blocked
         binding.manualRefreshAccountsButton.isEnabled = !blocked
         binding.manualCutSwitchSchemeSpinner.isEnabled = !blocked
-        // 手动切号完毕：未在自动切号中即可点（用户已在设备上切好号后告知程序）
-        binding.manualConfirmSwitchDoneButton.isEnabled =
-            !blocked && selectedManualUsername().isNotBlank()
-        binding.manualAutoGrowthAfterTasksCheck.isEnabled = aligned
-        binding.manualStartGrowthButton.isEnabled = aligned
+        binding.manualAutoGrowthAfterTasksCheck.isEnabled = canRun
+        binding.manualStartGrowthButton.isEnabled = canRun
         binding.manualStopGrowthButton.isEnabled = true
-        binding.manualForYouSwipeButton.isEnabled = aligned
-        binding.manualForYouSwipeSecInput.isEnabled = aligned
-        binding.manualMutualButton.isEnabled = aligned
-        binding.manualPublishButton.isEnabled = aligned
+        binding.manualForYouSwipeButton.isEnabled = canRun
+        binding.manualForYouSwipeSecInput.isEnabled = canRun
+        binding.manualMutualButton.isEnabled = canRun
+        binding.manualPublishButton.isEnabled = canRun
         binding.manualPublishCountInput.isEnabled = !blocked
         binding.manualBatchPublishButton.isEnabled = !blocked
         binding.manualBatchPublishNonPendingButton.isEnabled = !blocked
@@ -1737,11 +1723,10 @@ class MainActivity : AppCompatActivity() {
         binding.manualDailyIncubateStartButton.isEnabled = !blocked
         binding.manualDailyIncubateCurrentButton.isEnabled = !blocked
         binding.manualDailyIncubateStopButton.isEnabled = true
-        binding.manualProfileEditButton.isEnabled = aligned
-        // 自动登录：切号对齐后、尚未就绪时可点（重试无备份自动登录）
-        val statusUser = selectedManualUsername()
+        binding.manualProfileEditButton.isEnabled = canRun
+        // 自动登录：已选账号、尚未就绪时可点（重试无备份自动登录）
         val firstDone = statusUser.isNotBlank() && PrefsStore.isManualFirstLoginDone(statusUser)
-        binding.manualAutoLoginButton.isEnabled = aligned && !firstDone
+        binding.manualAutoLoginButton.isEnabled = canRun && !firstDone
     }
 
     /** 多选账号对话框；回调给出勾选的 username 列表（保持列表顺序）。 */
@@ -1847,6 +1832,11 @@ class MainActivity : AppCompatActivity() {
             binding.manualAccountSelect.setSelection(idx)
             applyManualAccountFields(manualAccounts[idx])
             AppCoordinator.manualSelectAccount(manualAccounts[idx].username)
+        } else {
+            // 云端空名单：下拉与表单一并清空，勿残留历史凭据
+            PrefsStore.setManualSelectedUsername(null)
+            assignedAccount = null
+            clearAssignedAccountInputs()
         }
         suppressingManualSpinnerCallback = false
         refreshManualAccountStatus()
@@ -1947,7 +1937,6 @@ class MainActivity : AppCompatActivity() {
         val status = AppCoordinator.manualQuerySwitchStatus(user)
         val busy = AppCoordinator.isManualSwitchBusy()
         val sessionBusy = AppCoordinator.isBatchAccountSessionBusy()
-        val aligned = AppCoordinator.isManualAccountAligned()
         binding.manualAccountStatusText.text = buildString {
             append("账号状态：${status.message}")
             val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
@@ -1955,11 +1944,10 @@ class MainActivity : AppCompatActivity() {
             when {
                 sessionBusy -> append(" · 多账号会话中…")
                 busy -> append(" · 切号中…")
-                !aligned -> append(" · 待切号对齐")
             }
         }
         binding.manualClearAndRestoreButton.visibility = View.GONE
-        setManualTaskButtonsEnabled(!busy && !sessionBusy && aligned)
+        setManualTaskButtonsEnabled(!busy && !sessionBusy)
     }
 
     private fun refreshManualAutoSwitchStatus() {

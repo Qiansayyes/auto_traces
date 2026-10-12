@@ -197,20 +197,12 @@ object SimpleRemoteControl {
             }
 
             "confirm_switch_done" -> {
-                if (!ManualDeviceControl.ENABLED) return fail("not_manual_mode", "请先切到本机手动模式")
-                if (AppCoordinator.isManualSwitchBusy()) {
-                    return fail("switch_busy", "切号进行中，请稍候")
-                }
-                val username = tiktokUsernameFromBody(body, ManualDeviceControl.selectedManualUsername())
-                if (username.isEmpty()) return fail("username_required", "请先选择账号")
-                if (!PrefsStore.isBound()) return fail("not_bound", "请先绑定设备")
-                AppCoordinator.manualSelectAccount(username)
-                AppCoordinator.manualConfirmSwitchDone()
-                ok("已确认手动切号完毕：@$username")
+                // 已移除「手动切号完毕」；任务启动时会自动对齐选中账号
+                fail("removed", "「手动切号完毕」已移除，请直接执行任务或下拉切号")
             }
 
             "auto_login" -> {
-                val gate = guardManualTask(requireAligned = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 val user = ManualDeviceControl.selectedManualUsername()
                 if (PrefsStore.isManualFirstLoginDone(user)) {
@@ -221,7 +213,7 @@ object SimpleRemoteControl {
             }
 
             "start_growth" -> {
-                val gate = guardManualTask(requireAligned = true, requireFirstLoginDone = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 AppCoordinator.manualStartGrowth("PC 遥控开始涨粉")
                 ok("已请求开始涨粉")
@@ -234,7 +226,7 @@ object SimpleRemoteControl {
             }
 
             "for_you_swipe" -> {
-                val gate = guardManualTask(requireAligned = true, requireFirstLoginDone = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 val raw = if (body.has("sec")) body.optInt("sec") else PrefsStore.getManualForYouSwipeSec()
                 val sec = raw.coerceIn(
@@ -247,14 +239,14 @@ object SimpleRemoteControl {
             }
 
             "mutual_click" -> {
-                val gate = guardManualTask(requireAligned = true, requireFirstLoginDone = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 AppCoordinator.manualStartMutualClick()
                 ok("已请求引流互点")
             }
 
             "publish_post" -> {
-                val gate = guardManualTask(requireAligned = true, requireFirstLoginDone = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 if (AppCoordinator.isManualPublishPostActuallyRunning()) {
                     return fail("publish_busy", "发作品已在进行中，请等待结束后再试")
@@ -279,7 +271,7 @@ object SimpleRemoteControl {
             }
 
             "edit_profile" -> {
-                val gate = guardManualTask(requireAligned = true, requireFirstLoginDone = true)
+                val gate = guardManualTask()
                 if (gate != null) return gate
                 AppCoordinator.manualStartEditBasicProfile()
                 ok("已请求修改基本资料")
@@ -857,10 +849,7 @@ object SimpleRemoteControl {
         }
     }
 
-    private fun guardManualTask(
-        requireAligned: Boolean,
-        requireFirstLoginDone: Boolean = false,
-    ): JSONObject? {
+    private fun guardManualTask(): JSONObject? {
         if (!ManualDeviceControl.ENABLED) {
             return fail("not_manual_mode", "请先切到本机手动模式")
         }
@@ -870,18 +859,12 @@ object SimpleRemoteControl {
         if (AppCoordinator.isManualSwitchBusy()) {
             return fail("switch_busy", "切号进行中，请稍候")
         }
-        if (requireAligned && !AppCoordinator.isManualAccountAligned()) {
-            return fail("not_aligned", "请先切号完成（本机当前需与选中账号一致）")
-        }
         val user = ManualDeviceControl.selectedManualUsername()
         if (user.isBlank()) {
             return fail("username_required", "请先选择账号")
         }
-        if (requireFirstLoginDone && !PrefsStore.isManualFirstLoginDone(user)) {
-            return fail(
-                "first_login_required",
-                "请先切号完成（有备份还原 / 无备份自动登录）后再执行任务",
-            )
+        if (!AppCoordinator.isManualAccountAligned()) {
+            return fail("not_aligned", "请先下拉切号到选中账号")
         }
         return null
     }

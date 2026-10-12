@@ -13497,11 +13497,13 @@ def device_assigned_accounts(
             include_excluded=want_excluded,
             include_banned=want_banned,
         )
+        # 空列表是合法状态（未分配），须 code=0，否则设备端会保留历史缓存误用旧号
         if not items:
             return {
-                "code": 1,
-                "msg": "未找到该别名下的分配账号（请确认设备表有绑定账号且分配别名一致）",
+                "code": 0,
+                "msg": "该别名下暂无分配账号",
                 "items": [],
+                "count": 0,
             }
         return {"code": 0, "msg": "ok", "items": items, "count": len(items)}
     finally:

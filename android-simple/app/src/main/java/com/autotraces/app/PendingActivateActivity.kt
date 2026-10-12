@@ -204,10 +204,12 @@ class PendingActivateActivity : AppCompatActivity() {
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
         if (deviceId.isBlank() || alias.isBlank()) return emptyList()
         val resp = ApiService.getDeviceAssignedAccountsRoster(deviceId, alias)
-        if (resp.code != 0) {
+        val items = resp.items
+        // 空分配是合法结果；旧版曾用 code=1 + items=[] 表示无账号
+        if (resp.code != 0 && !(items != null && items.isEmpty())) {
             error(resp.msg?.trim().orEmpty().ifBlank { "拉取账号列表失败" })
         }
-        return resp.items.orEmpty()
+        return items.orEmpty()
             .filter { it.username?.trim().orEmpty().isNotEmpty() }
     }
 
