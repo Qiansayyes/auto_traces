@@ -2160,7 +2160,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const statusClass = info?.status;
   const pending = info?.pending_start ? "是" : "否";
   const pendingBadge = info?.pending_start ? "<span class=\"badge pending\">待启动</span>" : "-";
-  const disabled = info?.status === "offline" ? "disabled" : "";
+  const disabled = "";
   const rowStyle = info?.status === "offline" ? ' style="opacity:.55;"' : "";
   const groupName = String(info?.device_group || "").trim();
   const selectedGroupValue = groupName || "__ungrouped__";
@@ -4078,8 +4078,9 @@ function updateStartHint() {
     startHintEl.textContent = `当前筛选：${groupLabel}；已选 ${selected.length} 台（可启动 ${selected.length}，可停止 ${selectedRunnable.length}）`;
   }
 
-  const allChecks = document.querySelectorAll(".device-check");
+  const allChecks = document.querySelectorAll(".device-check:not([disabled])");
   selectAllCheckbox.checked = allChecks.length > 0 && selected.length === allChecks.length;
+  selectAllCheckbox.indeterminate = selected.length > 0 && selected.length < allChecks.length;
 }
 
 function syncSelectAll() {
