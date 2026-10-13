@@ -1743,7 +1743,7 @@ def _list_distinct_device_groups(session: dict) -> list[str]:
         rows = conn.execute(
             """
             SELECT DISTINCT TRIM(device_group) AS grp
-            FROM overview_devices_snapshot
+            FROM client_devices
             WHERE owner_username = ? AND COALESCE(TRIM(device_group), '') <> ''
             ORDER BY grp ASC
             """,
@@ -15693,6 +15693,7 @@ def delete_device_group(payload: DeleteDeviceGroupRequest, authorization: str | 
         for did, dev in store.devices.items():
             if did in allowed and str(dev.device_group or "").strip() == group_name:
                 dev.device_group = ""
+    _mark_overview_dirty(str(session.get("username") or ""))
     return {"code": 0, "msg": "分组已删除，相关设备已置为未分组", "updated": updated}
 
 
@@ -15748,6 +15749,7 @@ def set_device_group(payload: SetDeviceGroupRequest, authorization: str | None =
                     continue
                 if str(dev.alias or "").strip().lower() in alias_set:
                     dev.device_group = group_name
+    _mark_overview_dirty(str(session.get("username") or ""))
     return {"code": 0, "msg": "分组已更新", "updated": updated, "device_group": group_name}
 
 
