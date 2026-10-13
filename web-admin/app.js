@@ -2160,7 +2160,6 @@ function renderDeviceRow(deviceId, info, context = {}) {
   const statusClass = info?.status;
   const pending = info?.pending_start ? "是" : "否";
   const pendingBadge = info?.pending_start ? "<span class=\"badge pending\">待启动</span>" : "-";
-  const disabled = "";
   const rowStyle = info?.status === "offline" ? ' style="opacity:.55;"' : "";
   const groupName = String(info?.device_group || "").trim();
   const selectedGroupValue = groupName || "__ungrouped__";
@@ -2321,7 +2320,7 @@ function renderDeviceRow(deviceId, info, context = {}) {
   `;
   return `
     <tr${rowStyle}>
-      <td><input type="checkbox" class="device-check" data-device="${deviceId}" ${disabled} /></td>
+      <td><input type="checkbox" class="device-check" data-device="${deviceId}" /></td>
       <td>${deviceId}</td>
       <td>${info?.alias || ""}</td>
       ${groupCell}
