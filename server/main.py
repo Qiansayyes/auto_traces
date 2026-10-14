@@ -224,8 +224,8 @@ BASE_DEFAULT_CONFIG = {
     # 已废弃：涨粉满批后自动引流（设备端仅在互点模式独立运行引流）
     "growth_pull_batches_before_auto_mutual": -1,
     # 互动动作之间的随机间隔（秒）
-    "action_delay_min": 0.7,
-    "action_delay_max": 1.2,
+    "action_delay_min": 3,
+    "action_delay_max": 8,
     # TikTok 恢复重启：强停后等待、拉起后等待（毫秒）
     "tiktok_force_stop_wait_ms": 800,
     "tiktok_launch_wait_ms": 2600,
@@ -244,7 +244,7 @@ MODE_DEFAULT_CONFIGS = {
         # 各模式通用：进入用户主页后，按一定概率不点击作品，直接跳过该用户
         "skip_post_click_prob": 0.0,
         # growth 模式中/右列作品点击后：前后帧差检测的点击后等待毫秒
-        "growth_post_check_after_tap_delay_ms": 1000,
+        "growth_post_check_after_tap_delay_ms": 3000,
         # growth 模式中/右列作品点击后：首次失败到二次判定的等待毫秒
         "growth_post_second_check_delay_ms": 650,
     },
@@ -14052,6 +14052,74 @@ def internal_mail_token_status_notify(
     }
 
 
+def _ensure_username_change_audit_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS username_change_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_username TEXT NOT NULL,
+            old_username TEXT NOT NULL,
+            new_username TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            device_id TEXT NOT NULL DEFAULT '',
+            alias TEXT NOT NULL DEFAULT '',
+            row_index INTEGER NOT NULL DEFAULT -1,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_username_audit_owner ON username_change_audit(owner_username, created_at DESC)")
+
+
+def _log_username_change(conn: sqlite3.Connection, owner: str, old_username: str, new_username: str, source: str, device_id: str = "", alias: str = "", row_index: int = -1) -> None:
+    try:
+        _ensure_username_change_audit_table(conn)
+        conn.execute(
+            "INSERT INTO username_change_audit (owner_username, old_username, new_username, source, device_id, alias, row_index, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (owner, old_username, new_username, source, device_id, alias, row_index, now_text()),
+        )
+    except Exception as exc:
+        print(f"[{now_text()}] username_audit | log_failed | {exc}")
+
+
+def _ensure_username_pending_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS username_change_pending (
+            owner_username TEXT NOT NULL,
+            row_index INTEGER NOT NULL,
+            old_username TEXT NOT NULL DEFAULT '',
+            detected_username TEXT NOT NULL DEFAULT '',
+            device_id TEXT NOT NULL DEFAULT '',
+            alias TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner_username, row_index)
+        )
+        """
+    )
+
+
+def _upsert_username_pending(conn: sqlite3.Connection, owner: str, row_index: int, old_username: str, detected: str, device_id: str = "", alias: str = "") -> None:
+    _ensure_username_pending_table(conn)
+    now = now_text()
+    conn.execute(
+        """
+        INSERT INTO username_change_pending (owner_username, row_index, old_username, detected_username, device_id, alias, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        ON CONFLICT(owner_username, row_index) DO UPDATE SET
+            old_username = excluded.old_username,
+            detected_username = excluded.detected_username,
+            device_id = excluded.device_id,
+            alias = excluded.alias,
+            status = 'pending',
+            updated_at = excluded.updated_at
+        """,
+        (owner, row_index, old_username, detected, device_id, alias, now, now),
+    )
+
+
 @app.post("/api/device/assigned_account/update_username")
 def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdateUsernameRequest):
     """设备端：修改基本资料时检测到 TikTok 用户名与分配账号不一致，同步更新账号表与设备表。"""
@@ -14093,57 +14161,63 @@ def device_assigned_account_update_username(payload: DeviceAssignedAccountUpdate
             return {"code": 1, "msg": "新用户名已被其他账号占用"}
         now = now_text()
         device_alias = _normalized_alias(payload.alias)
-        acct_cur = conn.execute(
-            """
-            UPDATE account_editor_rows
-            SET username = ?,
-                assigned_alias = CASE
-                    WHEN TRIM(COALESCE(assigned_alias, '')) <> '' THEN assigned_alias
-                    ELSE ?
-                END,
-                updated_at = ?
-            WHERE owner_username = ? AND row_index = ?
-            """,
-            (new_username, device_alias, now, owner, row_index),
-        )
-        if int(acct_cur.rowcount or 0) < 1:
-            return {"code": 1, "msg": "账号表更新失败"}
-        alias_key = _normalize_alias_key(payload.alias)
-        dev_rows = conn.execute(
-            """
-            SELECT row_index, username, assigned_alias, device_alias
-            FROM device_editor_rows
-            WHERE owner_username = ? AND LOWER(TRIM(username)) = LOWER(?)
-            """,
-            (owner, old_username),
-        ).fetchall()
-        dev_updated = 0
-        for dr in dev_rows:
-            d = dict(dr)
-            if _normalize_alias_key(_effective_device_editor_alias(d)) != alias_key:
-                continue
-            cur = conn.execute(
-                """
-                UPDATE device_editor_rows
-                SET username = ?, updated_at = ?
-                WHERE owner_username = ? AND row_index = ?
-                """,
-                (new_username, now, owner, int(d["row_index"])),
-            )
-            dev_updated += int(cur.rowcount or 0)
+        # 不再自动覆盖云端 username，只写入待确认，由人工在管理台点“提交并修改username”
+        _upsert_username_pending(conn, owner, row_index, old_username, new_username, str(payload.device_id or ""), device_alias)
         conn.commit()
-        _append_device_log(
-            payload.device_id,
-            f"[{now}] 修改基本资料 | 用户名同步 {old_username} → {new_username}（设备表 {dev_updated} 行）",
-        )
-        return {
-            "code": 0,
-            "msg": "已更新用户名",
-            "username": new_username,
-            "old_username": old_username,
-            "updated": True,
-            "device_rows_updated": dev_updated,
-        }
+        print(f"[{now}] username_pending | {old_username} -> {new_username} 待人工确认 | owner={owner} device={payload.device_id} alias={payload.alias} row={row_index}")
+        return {"code": 0, "msg": "已提交待人工确认，不自动修改", "username": old_username, "detected_username": new_username, "updated": False, "pending": True}
+    finally:
+        conn.close()
+
+
+class UsernameConfirmRequest(BaseModel):
+    row_index: int
+    new_username: str = ""
+
+
+@app.get("/api/admin/editor/username_pending")
+def list_username_pending(authorization: str | None = Header(default=None)):
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "未登录"}
+    owner = str(session.get("username") or "").strip()
+    conn = _get_db()
+    try:
+        _ensure_username_pending_table(conn)
+        rows = conn.execute("SELECT row_index, old_username, detected_username, device_id, alias, status, updated_at FROM username_change_pending WHERE owner_username=? AND status='pending' ORDER BY updated_at DESC", (owner,)).fetchall()
+        return {"code": 0, "pending": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/editor/username_confirm")
+def confirm_username_change(payload: UsernameConfirmRequest, authorization: str | None = Header(default=None)):
+    """人工确认改名：允许人工填入（可与 detected 不同），点按钮才真正 UPDATE。"""
+    session = _current_session({"authorization": authorization} if authorization else {})
+    if not session:
+        return {"code": 401, "msg": "未登录"}
+    owner = str(session.get("username") or "").strip()
+    final_name = _normalize_mutual_clip_username(payload.new_username or "")
+    if not final_name:
+        return {"code": 1, "msg": "新用户名为空或格式无效（人工填写后重试）"}
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT username FROM account_editor_rows WHERE owner_username=? AND row_index=?", (owner, payload.row_index)).fetchone()
+        if not row:
+            return {"code": 1, "msg": "账号行不存在"}
+        old = str(row["username"] or "").strip()
+        conflict = conn.execute("SELECT 1 FROM account_editor_rows WHERE owner_username=? AND LOWER(TRIM(username))=LOWER(?) AND row_index<>? LIMIT 1", (owner, final_name, payload.row_index)).fetchone()
+        if conflict:
+            return {"code": 1, "msg": "新用户名已被其他账号占用"}
+        now = now_text()
+        conn.execute("UPDATE account_editor_rows SET username=?, updated_at=? WHERE owner_username=? AND row_index=?", (final_name, now, owner, payload.row_index))
+        _sync_device_editor_username_for_account(conn, owner, old, final_name)
+        _log_username_change(conn, owner, old, final_name, "admin_manual_confirm", "", "", payload.row_index)
+        _ensure_username_pending_table(conn)
+        conn.execute("UPDATE username_change_pending SET status='confirmed', updated_at=? WHERE owner_username=? AND row_index=?", (now, owner, payload.row_index))
+        conn.commit()
+        print(f"[{now}] username_change_manual | {old} -> {final_name} | owner={owner} row={payload.row_index}")
+        return {"code": 0, "msg": f"已修改 {old} -> {final_name}"}
     finally:
         conn.close()
 
@@ -23530,31 +23604,14 @@ def _apply_auto_switch_ledger_username_update_writeback(
                 continue
             device_alias = alias_key or _normalized_alias(alias)
             ts = now_text()
-            conn.execute(
-                """
-                UPDATE account_editor_rows
-                SET username = ?,
-                    assigned_alias = CASE
-                        WHEN TRIM(COALESCE(assigned_alias, '')) <> '' THEN assigned_alias
-                        ELSE ?
-                    END,
-                    updated_at = ?
-                WHERE owner_username = ? AND row_index = ?
-                """,
-                (new_username, device_alias, ts, owner, row_index),
-            )
-            dev_updated = _sync_device_editor_username_for_account(
-                conn,
-                owner,
-                old_username,
-                new_username,
-                assigned_alias=device_alias,
-            )
+            # ledger 也不再自动覆盖，只写入待确认
+            _ensure_username_pending_table(conn)
+            _upsert_username_pending(conn, owner, row_index, old_username, new_username, "", str(alias or ""))
+            _log_username_change(conn, owner, old_username, new_username, "auto_switch_ledger/pending", "", str(alias or ""), row_index)
             conn.commit()
             applied += 1
-            notes.append(
-                f"用户名写回：{old_username} → {new_username}（设备表 {dev_updated} 行）"
-            )
+            print(f"[{ts}] username_pending | {old_username} -> {new_username} 待人工确认 | owner={owner} alias={alias} row={row_index} via=ledger")
+            notes.append(f"用户名待确认：{old_username} → {new_username}（需人工点提交并修改）")
         finally:
             conn.close()
     if applied:

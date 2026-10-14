@@ -2098,8 +2098,10 @@ object AppCoordinator {
 
     /**
      * 拉取云端最新分配账号列表，刷新本地缓存。
+     * 仅允许人工点击「拉取云端最新账号信息」（及远程显式 refresh_accounts）触发；
+     * 其它业务流程不得自动调用。
      * 云端明确返回空分配时必须清空本机历史缓存，禁止继续用旧号。
-     * @param adjustSelection true=按本机当前/原选中校正下拉选中；false=只更新缓存（复制核对用，避免改掉用户当前查看的号）
+     * @param adjustSelection true=按本机当前/原选中校正下拉选中；false=只更新缓存
      */
     suspend fun manualRefreshAssignedAccounts(
         adjustSelection: Boolean = true,
@@ -3394,6 +3396,7 @@ object AppCoordinator {
         durationMin: Int = PrefsStore.getDailyIncubateDurationMin(),
         resumeFromPause: Boolean = false,
         onlyUsername: String? = null,
+        publishCount: Int? = null,
     ) {
         if (!ManualDeviceControl.ENABLED) return
         val alias = PrefsStore.getAlias()?.trim().orEmpty()
@@ -3419,6 +3422,15 @@ object AppCoordinator {
             PrefsStore.MAX_DAILY_INCUBATE_DURATION_MIN,
         )
         PrefsStore.setDailyIncubateDurationMin(minutes)
+        // 新开孵化时锁定发作品条数（与界面数量框一致）；熄屏续跑沿用已保存偏好。
+        if (!resumeFromPause && publishCount != null) {
+            PrefsStore.setManualPublishCount(
+                publishCount.coerceIn(
+                    PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                    PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+                ),
+            )
+        }
         val settleMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
 
         val existing = PrefsStore.getDailyIncubateSession()
@@ -3955,6 +3967,10 @@ object AppCoordinator {
                 alias,
                 "$logTag：@$target 发布保证 ${settleMin} 分钟 → ${settleAction.label}（确保作品发出）",
             )
+            // 发布保证主段前：右滑两次（间隔 2s）→ 点 Home；不计入 5 分钟
+            if (!executor.preparePublishSettleEntry(appContext, "$logTag·发布保证")) {
+                return ActivatePhaseResult.INCOMPLETE
+            }
             if (runOnePostPublishAction(target, settleAction, settleSec, "$logTag·发布保证")) {
                 return ActivatePhaseResult.INCOMPLETE
             }
@@ -4087,7 +4103,6 @@ object AppCoordinator {
             currentCoroutineContext().ensureActive()
             // 2) 发布保证：随机涨粉或预滑，固定 5 分钟，确保作品发出（与 3选2 无关）
             if (!session.publishSettleDone && !PrefsStore.isHardStopRequested()) {
-                inSettlePhase = true
                 currentAction = settleAction
                 val remainSettle = (settlePlannedSec - session.elapsedSec).coerceAtLeast(0)
                 if (remainSettle > 2) {
@@ -4095,33 +4110,42 @@ object AppCoordinator {
                         localStatus = "running",
                         lastMessage = "日常孵化：@$target · 发布保证 · ${settleAction.label} · 约 ${remainSettle / 60} 分",
                     )
-                    segmentStartedAt = SystemClock.elapsedRealtime()
-                    interrupted = runOnePostPublishAction(
-                        target,
-                        settleAction,
-                        remainSettle,
-                        "日常孵化·发布保证",
-                    )
-                    val used = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
-                        .toInt().coerceAtLeast(0)
-                    val settleOk = !interrupted && !PrefsStore.isHardStopRequested()
-                    val nextElapsed = if (settleOk) {
-                        settlePlannedSec
-                    } else {
-                        (session.elapsedSec + used).coerceAtMost(settlePlannedSec)
+                    // 开场在 settle 计时之外：熄屏取消时不得把发作品耗时误记进 elapsedSec
+                    if (session.elapsedSec <= 0) {
+                        if (!executor.preparePublishSettleEntry(appContext, "日常孵化·发布保证")) {
+                            interrupted = true
+                        }
                     }
-                    session = session.copy(
-                        elapsedSec = nextElapsed,
-                        publishSettleDone = settleOk,
-                        settleAction = settleAction.key,
-                        plannedMin = nurtureMinutes,
-                    )
-                    PrefsStore.saveDailyIncubateSession(session)
+                    if (!interrupted) {
+                        inSettlePhase = true
+                        segmentStartedAt = SystemClock.elapsedRealtime()
+                        interrupted = runOnePostPublishAction(
+                            target,
+                            settleAction,
+                            remainSettle,
+                            "日常孵化·发布保证",
+                        )
+                        val used = ((SystemClock.elapsedRealtime() - segmentStartedAt) / 1000)
+                            .toInt().coerceAtLeast(0)
+                        val settleOk = !interrupted && !PrefsStore.isHardStopRequested()
+                        val nextElapsed = if (settleOk) {
+                            settlePlannedSec
+                        } else {
+                            (session.elapsedSec + used).coerceAtMost(settlePlannedSec)
+                        }
+                        session = session.copy(
+                            elapsedSec = nextElapsed,
+                            publishSettleDone = settleOk,
+                            settleAction = settleAction.key,
+                            plannedMin = nurtureMinutes,
+                        )
+                        PrefsStore.saveDailyIncubateSession(session)
+                        inSettlePhase = false
+                    }
                 } else {
                     session = session.copy(publishSettleDone = true, elapsedSec = settlePlannedSec)
                     PrefsStore.saveDailyIncubateSession(session)
                 }
-                inSettlePhase = false
             }
 
             currentCoroutineContext().ensureActive()
@@ -4249,7 +4273,8 @@ object AppCoordinator {
     }
 
     /**
-     * 自动拉取本机绑定设备云端账号后，对全部非待活跃账号批量发作品。
+     * 按本机已缓存账号，对全部非待活跃账号批量发作品。
+     * 不自动拉云端；需最新名单请先点「拉取云端最新账号信息」。
      * @return 实际入队账号数；失败时带异常信息。
      */
     suspend fun manualStartBatchPublishNonPendingActivate(
@@ -4270,28 +4295,26 @@ object AppCoordinator {
         if (isManualSwitchBusy()) {
             return Result.failure(IllegalStateException("切号进行中，请稍候"))
         }
-        updateRuntime(localStatus = "online", lastMessage = "非待活跃批量发：正在拉取云端账号…")
-        LogCenter.op(alias, "非待活跃批量发作品：自动拉取本机设备账号列表")
-        val refresh = manualRefreshAssignedAccounts()
-        val roster = refresh.getOrElse { err ->
-            updateRuntime(
-                localStatus = "online",
-                lastMessage = "非待活跃批量发：拉取账号失败：${err.message}",
-            )
-            return Result.failure(err)
+        val roster = ManualDeviceControl.getCachedAccounts()
+        if (roster.isEmpty()) {
+            val msg = "非待活跃批量发：本机无缓存账号，请先拉取云端账号列表"
+            updateRuntime(localStatus = "online", lastMessage = msg)
+            return Result.failure(IllegalStateException(msg))
         }
+        updateRuntime(localStatus = "online", lastMessage = "非待活跃批量发：按本机缓存账号排队…")
+        LogCenter.op(alias, "非待活跃批量发作品：使用本机缓存账号列表（${roster.size}）")
         val targets = listBoundDeviceNonPendingActivateUsernames(excludeBanned = excludeBanned)
         if (targets.isEmpty()) {
             val pending = PrefsStore.getPendingActivateUsernames().size
             val msg =
-                "非待活跃批量发：无可用账号（云端 ${roster.size} 个，待活跃 $pending 个，其余为空或已封禁）"
+                "非待活跃批量发：无可用账号（本机缓存 ${roster.size} 个，待活跃 $pending 个，其余为空或已封禁）"
             LogCenter.op(alias, msg)
             updateRuntime(localStatus = "online", lastMessage = msg)
             return Result.failure(IllegalStateException(msg))
         }
         LogCenter.op(
             alias,
-            "非待活跃批量发作品：本机设备共 ${targets.size} 个账号（已排除待活跃队列，云端 ${roster.size}）",
+            "非待活跃批量发作品：本机设备共 ${targets.size} 个账号（已排除待活跃队列，缓存 ${roster.size}）",
         )
         manualStartBatchPublish(targets, publishCount, afterActiveMin)
         return Result.success(targets.size)

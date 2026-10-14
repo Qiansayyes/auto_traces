@@ -1,5 +1,7 @@
 package com.autotraces.app
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
@@ -17938,15 +17940,46 @@ class RealTraceExecutor(
      * 统一评论输入：按字符分段输入，降低一次性 `input text` 丢字符的概率。
      * 空格：`adb/input text` 协议里需写成 `%s` 整体传给 `input text`，不能先 replace 再逐字迭代（否则会变成字面量 `%` + `s`）。
      */
-    private fun tryInputCommentText(alias: String, rawText: String): Boolean {
+    private suspend fun tryInputCommentText(alias: String, rawText: String): Boolean {
         val text = cleanInputText(rawText)
         if (text.isBlank()) return false
+        if (text.any { it.code > 127 }) return pasteCommentTextViaClipboard(alias, text)
         for (ch in text) {
             val segment = if (ch == ' ') "%s" else ch.toString()
             val ok = runSuCommand("input text ${shellEscape(segment)}")
             if (!ok) return false
         }
         return true
+    }
+
+    private suspend fun pasteCommentTextViaClipboard(alias: String, text: String): Boolean {
+        return try {
+            if (hardStopOrNull(alias, "评论剪贴板粘贴")) return false
+            val ctx = appContextProvider().applicationContext
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("comment", text))
+            kotlinx.coroutines.delay(250)
+            repeat(2) { attempt ->
+                if (!runSuCommand("input keyevent 279")) return@repeat
+                kotlinx.coroutines.delay(if (attempt == 0) 700 else 1000)
+                val xml = runUiAutomatorDumpWindowXml(alias) ?: return@repeat
+                val landed = parseLargestEditTextFromUiAutomatorXml(xml)
+                if (!landed.isNullOrBlank()) {
+                    devOp(alias, "评论含非ASCII走剪贴板粘贴成功 len=${landed.length} preview=${landed.take(56)}")
+                    return true
+                }
+                devOp(alias, "评论剪贴板粘贴第${attempt + 1}/2次回读为空，重试粘贴")
+                try {
+                    cm.setPrimaryClip(ClipData.newPlainText("comment", text))
+                    kotlinx.coroutines.delay(250)
+                } catch (_: Exception) { }
+            }
+            devOp(alias, "评论剪贴板粘贴失败：回读为空，已跳过发送避免发空评")
+            false
+        } catch (e: Exception) {
+            devOp(alias, "评论剪贴板粘贴失败：${e.message}")
+            false
+        }
     }
 
 

@@ -626,6 +626,17 @@ object SimpleRemoteControl {
                     }
                     else -> PrefsStore.getDailyIncubateDurationMin()
                 }
+                // 与本机数量框一致：请求带 count 则写入；否则沿用本机已保存的发作品数量。
+                val publishCountRaw = if (body.has("count")) {
+                    body.optInt("count")
+                } else {
+                    PrefsStore.getManualPublishCount()
+                }
+                val publishCount = publishCountRaw.coerceIn(
+                    PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+                    PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+                )
+                PrefsStore.setManualPublishCount(publishCount)
                 val hoursText = PrefsStore.formatDailyIncubateDurationHours(
                     PrefsStore.getDailyIncubateDurationHours(),
                 )
@@ -638,16 +649,10 @@ object SimpleRemoteControl {
                     body.optString("onlyUsername", ""),
                 )
                 ensureWorkerForManualTask(app)
-                val refresh = kotlinx.coroutines.runBlocking {
-                    AppCoordinator.manualRefreshAssignedAccounts()
+                // 日常孵化只用本机缓存；云端刷新仅 refresh_accounts / 人工点击
+                if (ManualDeviceControl.getCachedAccounts().isEmpty()) {
+                    return fail("no_accounts", "请先拉取云端账号列表")
                 }
-                if (refresh.isFailure) {
-                    return fail(
-                        "refresh_failed",
-                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
-                    )
-                }
-                // 再次确认：刷新期间可能被其它多账号会话抢占
                 if (AppCoordinator.isManualSwitchBusy()) {
                     return fail("switch_busy", "切号进行中，请稍候")
                 }
@@ -664,6 +669,7 @@ object SimpleRemoteControl {
                         return fail("username_required", "请先选择账号")
                             .put("dailyIncubateDurationMin", minutes)
                             .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                            .put("count", publishCount)
                     }
                     val canIncubate = AppCoordinator.listBoundDeviceNonPendingActivateUsernames()
                         .any { it.equals(target, ignoreCase = true) }
@@ -676,8 +682,13 @@ object SimpleRemoteControl {
                             .put("queueSize", 0)
                             .put("dailyIncubateDurationMin", minutes)
                             .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                            .put("count", publishCount)
                     }
-                    AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = target)
+                    AppCoordinator.manualStartDailyIncubate(
+                        minutes,
+                        onlyUsername = target,
+                        publishCount = publishCount,
+                    )
                     if (!AppCoordinator.isDailyIncubateBusy()) {
                         val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
                         return fail(
@@ -688,13 +699,15 @@ object SimpleRemoteControl {
                             .put("queueSize", 1)
                             .put("dailyIncubateDurationMin", minutes)
                             .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                            .put("count", publishCount)
                     }
-                    ok("已请求当前账号养号：@$target（约 ${hoursText} 小时）")
+                    ok("已请求当前账号养号：@$target（${publishCount}条 · 约 ${hoursText} 小时）")
                         .put("minutes", minutes)
                         .put("hours", PrefsStore.getDailyIncubateDurationHours())
                         .put("username", target)
                         .put("queueSize", 1)
                         .put("singleAccountOnly", true)
+                        .put("count", publishCount)
                         .put("dailyIncubateDurationMin", minutes)
                         .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
                 } else {
@@ -704,8 +717,9 @@ object SimpleRemoteControl {
                             .put("queueSize", 0)
                             .put("dailyIncubateDurationMin", minutes)
                             .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                            .put("count", publishCount)
                     }
-                    AppCoordinator.manualStartDailyIncubate(minutes)
+                    AppCoordinator.manualStartDailyIncubate(minutes, publishCount = publishCount)
                     if (!AppCoordinator.isDailyIncubateBusy()) {
                         val tip = AppCoordinator.runtimeState.value.lastMessage.trim()
                         return fail(
@@ -715,11 +729,13 @@ object SimpleRemoteControl {
                             .put("queueSize", queueSize)
                             .put("dailyIncubateDurationMin", minutes)
                             .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
+                            .put("count", publishCount)
                     }
-                    ok("已请求日常孵化（约 $queueSize 个 · 每号 ${hoursText} 小时）")
+                    ok("已请求日常孵化（约 $queueSize 个 · 每号${publishCount}条 · ${hoursText} 小时）")
                         .put("minutes", minutes)
                         .put("hours", PrefsStore.getDailyIncubateDurationHours())
                         .put("queueSize", queueSize)
+                        .put("count", publishCount)
                         .put("dailyIncubateDurationMin", minutes)
                         .put("dailyIncubateDurationHours", PrefsStore.getDailyIncubateDurationHours())
                 }

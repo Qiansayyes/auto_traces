@@ -248,6 +248,74 @@
                 android:textColor="@android:color/darker_gray"
                 android:textSize="12sp" />
 
+            <com.google.android.material.textfield.TextInputLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:hint="养号时长(小时，如3=3小时)">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/manualDailyIncubateDurationMinInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="numberDecimal"
+                    android:maxLines="1" />
+            </com.google.android.material.textfield.TextInputLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="发作品条数(1-5)">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/manualPublishCountInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:maxLines="1" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualPublishButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="发作品" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateCurrentButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="只给当前账号养号" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="只给当前账号养号：对本机当前号直接执行（不看下拉、不切号）。发作品→发布保证5分钟（随机涨粉或预滑，确保发出）→预滑/涨粉/互点各50%做3选2（涨粉/预滑各跑满上方养号时长，互点至云端上限，不占那5分钟）。熄屏暂停，亮屏续跑。"
+                android:textColor="@android:color/darker_gray"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/manualDailyIncubateStopButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="停止日常孵化" />
+
             <Spinner
                 android:id="@+id/manualAccountSelect"
                 android:layout_width="match_parent"
@@ -352,36 +420,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="发作品条数(1-5)">
-
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/manualPublishCountInput"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="number"
-                        android:maxLines="1" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/manualPublishButton"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="发作品" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
                 android:orientation="horizontal">
 
                 <com.google.android.material.button.MaterialButton
@@ -400,44 +438,6 @@
                     android:layout_weight="1"
                     android:text="停涨粉" />
             </LinearLayout>
-
-            <com.google.android.material.textfield.TextInputLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:hint="养号时长(小时，如3=3小时)">
-
-                <com.google.android.material.textfield.TextInputEditText
-                    android:id="@+id/manualDailyIncubateDurationMinInput"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:inputType="numberDecimal"
-                    android:maxLines="1" />
-            </com.google.android.material.textfield.TextInputLayout>
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualDailyIncubateCurrentButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="只给当前账号养号" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="只给当前账号养号：对本机当前号直接执行（不看下拉、不切号）。发作品→发布保证5分钟（随机涨粉或预滑，确保发出）→预滑/涨粉/互点各50%做3选2（涨粉/预滑各跑满上方养号时长，互点至云端上限，不占那5分钟）。熄屏暂停，亮屏续跑。"
-                android:textColor="@android:color/darker_gray"
-                android:textSize="11sp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/manualDailyIncubateStopButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="停止日常孵化" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/manualProfileEditButton"
@@ -810,7 +810,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
-                    android:text="非待活跃批量发：一点即自动拉取本机设备云端账号，对未在待活跃队列的全部账号发作品（跳过 banned）。条数同上；发后同批量发作品（发布保证5分钟→3选2）。"
+                    android:text="非待活跃批量发：按本机已缓存账号，对未在待活跃队列的全部账号发作品（跳过 banned）。需最新名单请先点「拉取云端最新账号信息」。条数同上；发后同批量发作品（发布保证5分钟→3选2）。"
                     android:textColor="@android:color/darker_gray"
                     android:textSize="11sp" />
 
@@ -837,6 +837,22 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:text="引流互点" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/manualConfirmLoginDoneButton"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="确认本号已登录" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="确认本号已登录：手动置当前选中号 isManualFirstLoginDone=true，用于自动登录跑完但标记没落盘、或你肉眼确认已在号上时放行发作品/互点。不改其他号、不改全局逻辑。"
+                    android:textColor="@android:color/darker_gray"
+                    android:textSize="11sp" />
 
                 <TextView
                     android:layout_width="match_parent"

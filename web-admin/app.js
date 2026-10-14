@@ -4626,8 +4626,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     favorite_prob: 0.3,
     share_prob: 0.3,
     skip_post_click_prob: 0,
-    action_delay_min: 0.7,
-    action_delay_max: 1.2,
+    action_delay_min: 3,
+    action_delay_max: 8,
     tiktok_force_stop_wait_ms: 800,
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
@@ -4658,7 +4658,7 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     mutual_traffic_followers_follow: true,
     mutual_traffic_follow_only: false,
     growth_pull_batches_before_auto_mutual: -1,
-    growth_post_check_after_tap_delay_ms: 1000,
+    growth_post_check_after_tap_delay_ms: 3000,
     growth_post_second_check_delay_ms: 650,
   },
   live: {
@@ -4673,8 +4673,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     favorite_prob: 0.3,
     share_prob: 0.3,
     skip_post_click_prob: 0,
-    action_delay_min: 0.7,
-    action_delay_max: 1.2,
+    action_delay_min: 3,
+    action_delay_max: 8,
     tiktok_force_stop_wait_ms: 800,
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
@@ -4718,8 +4718,8 @@ const MODE_DEFAULT_CONFIG_PAYLOADS = {
     favorite_prob: 0.3,
     share_prob: 0.3,
     skip_post_click_prob: 0,
-    action_delay_min: 0.7,
-    action_delay_max: 1.2,
+    action_delay_min: 3,
+    action_delay_max: 8,
     tiktok_force_stop_wait_ms: 800,
     tiktok_launch_wait_ms: 2600,
     for_you_swipe_total_sec: 0,
@@ -10394,6 +10394,7 @@ async function loadAccountEditorRows() {
 async function refreshAccountEditorLight({ refreshArchive = false } = {}) {
   await loadAccountEditorRows();
   renderAccountEditorRows();
+  refreshUsernamePendingHints();
   renderDeviceRegionPresetOptions();
   void loadAccountStatsQueryConfig().catch(() => {});
   if (refreshArchive && document.getElementById("backup-section")?.classList.contains("active")) {
@@ -12309,8 +12310,35 @@ function accountEditorCellInput(idx, field, value, extraAttrs = "", inputClass =
   return `<input class="${className}" type="text" data-editor-scope="account" data-editor-field="${field}" data-editor-index="${idx}" value="${escapeHtml(value)}" title="${field}" ${extraAttrs} />`;
 }
 
-async function fetchAccountEditorTwoFaCode(index) {
+async function refreshUsernamePendingHints() {
+  try {
+    const data = await request("/api/admin/editor/username_pending");
+    const list = data?.pending || [];
+    const byRow = new Map(list.map((p) => [Number(p.row_index), p]));
+    accountEditorListEl?.querySelectorAll(".username-pending-input").forEach((el) => {
+      const idx = Number(el.getAttribute("data-username-pending-index"));
+      const p = byRow.get(idx);
+      if (p && !String(el.value || "").trim()) {
+        el.value = String(p.detected_username || "");
+        el.title = `设备上报最新用户名：${p.detected_username}（${p.alias || ""} ${p.updated_at || ""}），确认后点右侧按钮`;
+        el.style.borderColor = "#e6a23c";
+      }
+    });
+  } catch (e) { /* 静默，勿扰 */ }
+}
+async function confirmUsernameChange(index) {
   const row = accountEditorRows?.[index];
+  const rowIndex = (typeof resolveAccountRowIndex === "function" ? resolveAccountRowIndex(row, index) : Number(row?.row_index ?? index));
+  const inputEl = accountEditorListEl?.querySelector(`.username-pending-input[data-username-pending-index="${index}"]`);
+  const val = String(inputEl?.value ?? "").trim().replace(/^@+/, "");
+  if (!val) throw new Error("请先在要修改username输入框填写新用户名（可人工填写，也可等设备上报自动填入）");
+  if (!confirm(`确认把云端 username 改为 ${val} 吗？`)) return;
+  const data = await request("/api/admin/editor/username_confirm", { method: "POST", body: JSON.stringify({ row_index: rowIndex, new_username: val }) });
+  if (data?.code !== 0) throw new Error(data?.msg || "修改失败");
+  setStatus(data.msg || "已修改", "success");
+  if (typeof loadAccountEditorRows === "function") await loadAccountEditorRows();
+}
+async function fetchAccountEditorTwoFaCode(index) {  const row = accountEditorRows?.[index];
   const inputEl = accountEditorListEl?.querySelector(
     `input[data-editor-scope="account"][data-editor-field="two_fa"][data-editor-index="${index}"]`,
   );
@@ -12414,6 +12442,10 @@ function renderAccountEditorTableRow({ row, idx }, displayNum) {
       <div class="account-editor-two-fa-cell">
         ${accountEditorCellInput(idx, "two_fa", row.two_fa)}
         <button type="button" class="ghost account-editor-two-fa-code-btn" data-editor-index="${idx}" title="本地生成当前 TOTP">取码</button>
+      </div>
+      <div class="account-editor-username-pending" style="display:flex;gap:4px;margin-top:4px;">
+        <input class="username-pending-input" data-username-pending-index="${idx}" placeholder="要修改username(设备上报/人工填)" title="设备检测到的最新用户名会自动填入此处，人工确认后点右侧按钮才真正修改云端" style="flex:1;min-width:0;" />
+        <button type="button" class="ghost username-confirm-btn" data-username-confirm-index="${idx}" title="人工确认后提交并修改云端username">提交并修改username</button>
       </div>
     </td>
     <td class="account-editor-table__mail-token">${formatAccountMailTokenBadge(row)}</td>
@@ -12540,6 +12572,7 @@ function renderAccountEditorRows() {
     accountEditorListEl.innerHTML = `<div class="account-alias-group-list">${groupsHtml}</div>`;
     updateAccountRecordsCredColsToggleBtn();
     syncAccountRecordsPageSelectAllCheckbox();
+    if (typeof refreshUsernamePendingHints === "function") refreshUsernamePendingHints();
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
     const msg = (error && (error.message || error.toString?.())) || "unknown";
@@ -14542,6 +14575,13 @@ if (accountEditorListEl) {
       if (!Number.isNaN(index)) {
         fetchAccountEditorTwoFaCode(index).catch((e) => setStatus(e.message || "2FA 取码失败", "error"));
       }
+      return;
+    }
+    const unameBtn = target.closest(".username-confirm-btn");
+    if (unameBtn) {
+      event.preventDefault();
+      const index = Number(unameBtn.getAttribute("data-username-confirm-index"));
+      if (!Number.isNaN(index)) confirmUsernameChange(index).catch((e) => setStatus(e.message || "修改username失败", "error"));
       return;
     }
     const delBtn = target.closest("[data-editor-delete]");

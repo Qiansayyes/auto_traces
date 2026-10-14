@@ -52,11 +52,6 @@ class MainActivity : AppCompatActivity() {
     private var updatingAccountEmailFromIssued = false
     /** 防止连点并发提交 2FA Setup Key。 */
     private var updatingAccountTwoFa = false
-    /** 防止连点并发「核对云端后复制凭据」。 */
-    private var verifyingAssignedCopy = false
-    /** 最近一次复制核对成功的凭据快照（含不一致后已刷新为云端的快照）。 */
-    private var lastAssignedCopyVerifySnapshot: AssignedCredentialSnapshot? = null
-    private var lastAssignedCopyVerifyAtMs: Long = 0L
     /** 切换云端模式前的账号参与挑选（勾选=参与）。 */
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -309,170 +304,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private data class AssignedCredentialSnapshot(
-        val username: String,
-        val password: String,
-        val api: String,
-        val email: String,
-        val emailPassword: String,
-        val twoFa: String,
-    )
-
-    private fun snapshotAssignedCredentialsFromUi(): AssignedCredentialSnapshot =
-        AssignedCredentialSnapshot(
-            username = binding.assignedUsernameInput.text?.toString().orEmpty().trim().removePrefix("@"),
-            password = binding.assignedPasswordInput.text?.toString().orEmpty().trim(),
-            api = binding.assignedApiInput.text?.toString().orEmpty().trim(),
-            email = binding.assignedEmailInput.text?.toString().orEmpty().trim(),
-            emailPassword = binding.assignedEmailPasswordInput.text?.toString().orEmpty().trim(),
-            twoFa = binding.assignedTwoFaInput.text?.toString().orEmpty().trim(),
-        )
-
-    private fun snapshotFromAccountOption(opt: ManualDeviceControl.AccountOption): AssignedCredentialSnapshot =
-        AssignedCredentialSnapshot(
-            username = opt.username.trim().removePrefix("@"),
-            password = opt.password.trim(),
-            api = opt.api.trim(),
-            email = opt.email.trim(),
-            emailPassword = opt.emailPassword.trim(),
-            twoFa = opt.twoFa.trim(),
-        )
-
-    /** username 忽略大小写，其余字段精确比对。 */
-    private fun assignedCredentialsEqual(a: AssignedCredentialSnapshot, b: AssignedCredentialSnapshot): Boolean =
-        a.username.equals(b.username, ignoreCase = true) &&
-            a.password == b.password &&
-            a.api == b.api &&
-            a.email == b.email &&
-            a.emailPassword == b.emailPassword &&
-            a.twoFa == b.twoFa
-
-    private fun markAssignedCopyVerified(snapshot: AssignedCredentialSnapshot) {
-        lastAssignedCopyVerifySnapshot = snapshot
-        lastAssignedCopyVerifyAtMs = System.currentTimeMillis()
-    }
-
-    /** 同一凭据快照在 10 分钟内已与云端核对过，可跳过再拉。 */
-    private fun isAssignedCopyVerifyFresh(local: AssignedCredentialSnapshot): Boolean {
-        val verified = lastAssignedCopyVerifySnapshot ?: return false
-        if (System.currentTimeMillis() - lastAssignedCopyVerifyAtMs > ASSIGNED_COPY_VERIFY_TTL_MS) {
-            return false
-        }
-        return assignedCredentialsEqual(verified, local)
-    }
-
-    private fun fieldValueFromSnapshot(label: String, snap: AssignedCredentialSnapshot): String =
-        when (label) {
-            "Username" -> snap.username
-            "Password" -> snap.password
-            "API" -> snap.api
-            "Email" -> snap.email
-            "Email Password" -> snap.emailPassword
-            "2FA" -> snap.twoFa
-            else -> ""
-        }
-
-    private fun writeAssignedCredentialClip(label: String, value: String, statusSuffix: String) {
-        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText(label, value))
-        binding.assignedCopyStatusText.text = "$label 已复制$statusSuffix"
-    }
-
-    private fun setAssignedCopyButtonsEnabled(enabled: Boolean) {
-        binding.copyAssignedUsernameButton.isEnabled = enabled
-        binding.copyAssignedPasswordButton.isEnabled = enabled
-        binding.copyAssignedApiButton.isEnabled = enabled
-        binding.copyAssignedEmailButton.isEnabled = enabled
-        binding.copyAssignedEmailPasswordButton.isEnabled = enabled
-        binding.copyAssignedTwoFaButton.isEnabled = enabled
-    }
-
-    /**
-     * 人工点复制：先拉云端最新账号，本地展示与云端凭据一致才写入剪贴板；
-     * 不一致则刷新本机展示并拒绝复制。同一凭据快照 10 分钟内不重复拉云端。
-     */
-    private fun copyAssignedCredentialAfterCloudVerify(label: String, valueProvider: () -> String) {
-        val text = valueProvider().trim()
-        if (text.isBlank()) {
-            binding.assignedCopyStatusText.text = "$label 为空，未复制"
-            return
-        }
-        if (verifyingAssignedCopy) {
-            binding.assignedCopyStatusText.text = "正在核对云端账号，请稍候…"
-            return
-        }
-        val deviceId = PrefsStore.getDeviceId().orEmpty().trim()
-        val alias = PrefsStore.getAlias().orEmpty().trim()
-        if (deviceId.isBlank() || alias.isBlank()) {
-            binding.assignedCopyStatusText.text = "设备未绑定，无法核对云端账号"
-            return
-        }
-        val local = snapshotAssignedCredentialsFromUi()
-        if (local.username.isBlank()) {
-            binding.assignedCopyStatusText.text = "当前无账号信息，未复制"
-            return
-        }
-        // 10 分钟内同一凭据已核对：直接复制，不重复打云端
-        if (isAssignedCopyVerifyFresh(local)) {
-            val copyText = fieldValueFromSnapshot(label, local).ifBlank { text }
-            writeAssignedCredentialClip(label, copyText, "（10 分钟内已核对）")
-            return
-        }
-        verifyingAssignedCopy = true
-        setAssignedCopyButtonsEnabled(false)
-        binding.assignedCopyStatusText.text = "正在拉取云端最新账号并核对…"
-        lifecycleScope.launch {
-            try {
-                // 不调整选中：避免复制时把「查看中的号」改成「本机当前号」
-                val refresh = AppCoordinator.manualRefreshAssignedAccounts(adjustSelection = false)
-                if (isFinishing || isDestroyed) return@launch
-                val options = refresh.getOrElse { err ->
-                    binding.assignedCopyStatusText.text =
-                        "$label 未复制：拉取云端失败（${err.message ?: "网络错误"}）"
-                    return@launch
-                }
-                val cloud = options.firstOrNull {
-                    it.username.equals(local.username, ignoreCase = true)
-                }
-                if (cloud == null) {
-                    // 名单已变：同步下拉，拒绝复制；不记核对缓存
-                    bindManualAccountSpinnerKeepingUsername(options, local.username)
-                    binding.assignedCopyStatusText.text =
-                        "$label 未复制：云端已无 @${local.username}，本地列表已刷新"
-                    return@launch
-                }
-                val cloudSnap = snapshotFromAccountOption(cloud)
-                if (!assignedCredentialsEqual(local, cloudSnap)) {
-                    bindManualAccountSpinnerKeepingUsername(options, local.username)
-                    // 刚拉过并已展示云端最新：记为已核对，10 分钟内再点可直接复制
-                    markAssignedCopyVerified(cloudSnap)
-                    binding.assignedCopyStatusText.text =
-                        "$label 未复制：与云端不一致，已刷新为最新，请确认后再复制"
-                    Toast.makeText(
-                        this@MainActivity,
-                        "账号信息已变化，已刷新本地",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                    return@launch
-                }
-                // 一致：静默同步内存列表，写入剪贴板并缓存核对结果
-                manualAccounts = sortManualAccountsForSpinner(options)
-                val copyText = fieldValueFromSnapshot(label, cloudSnap).ifBlank { text }
-                if (copyText.isBlank()) {
-                    binding.assignedCopyStatusText.text = "$label 为空，未复制"
-                    return@launch
-                }
-                markAssignedCopyVerified(cloudSnap)
-                writeAssignedCredentialClip(label, copyText, "（已与云端核对一致）")
-            } finally {
-                verifyingAssignedCopy = false
-                if (!isFinishing && !isDestroyed) {
-                    setAssignedCopyButtonsEnabled(true)
-                }
-            }
-        }
-    }
-
     private fun setupAssignedAccountSection() {
         fun copy(label: String, value: String) {
             val text = value.trim()
@@ -485,35 +316,24 @@ class MainActivity : AppCompatActivity() {
             binding.assignedCopyStatusText.text = "$label 已复制"
         }
 
+        // 仅复制本机当前展示；不拉云端（云端刷新只允许点「拉取云端最新账号信息」）
         binding.copyAssignedUsernameButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("Username") {
-                binding.assignedUsernameInput.text?.toString().orEmpty()
-            }
+            copy("Username", binding.assignedUsernameInput.text?.toString().orEmpty())
         }
         binding.copyAssignedPasswordButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("Password") {
-                binding.assignedPasswordInput.text?.toString().orEmpty()
-            }
+            copy("Password", binding.assignedPasswordInput.text?.toString().orEmpty())
         }
         binding.copyAssignedApiButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("API") {
-                binding.assignedApiInput.text?.toString().orEmpty()
-            }
+            copy("API", binding.assignedApiInput.text?.toString().orEmpty())
         }
         binding.copyAssignedEmailButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("Email") {
-                binding.assignedEmailInput.text?.toString().orEmpty()
-            }
+            copy("Email", binding.assignedEmailInput.text?.toString().orEmpty())
         }
         binding.copyAssignedEmailPasswordButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("Email Password") {
-                binding.assignedEmailPasswordInput.text?.toString().orEmpty()
-            }
+            copy("Email Password", binding.assignedEmailPasswordInput.text?.toString().orEmpty())
         }
         binding.copyAssignedTwoFaButton.setOnClickListener {
-            copyAssignedCredentialAfterCloudVerify("2FA") {
-                binding.assignedTwoFaInput.text?.toString().orEmpty()
-            }
+            copy("2FA", binding.assignedTwoFaInput.text?.toString().orEmpty())
         }
 
         binding.submitTwoFaSecretButton.setOnClickListener {
@@ -795,7 +615,7 @@ class MainActivity : AppCompatActivity() {
             append("原 2FA：${if (oldTwoFa.isBlank()) "(空 / 没有2FA)" else "已有2FA"}\n")
             append("新密钥长度：${pasted.length}")
             if (pasted.contains('-')) append("（含连字符，入库保留）")
-            append("\n\n确定后上传，并自动拉取最新账号数据。")
+            append("\n\n确定后上传并更新本机缓存（不会自动拉云端账号列表）。")
         }
 
         binding.submitTwoFaSecretButton.isEnabled = false
@@ -859,35 +679,24 @@ class MainActivity : AppCompatActivity() {
                 ManualDeviceControl.updateCachedAccountTwoFa(username, saved)
                 AutoSwitchBundleHolder.notifyAccountTwoFaUpdated(username, saved)
 
-                binding.pasteTwoFaStatusText.text = "已写入云端，正在拉取最新账号…"
-                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
-                if (isFinishing || isDestroyed) return@launch
-                refresh.onSuccess { list ->
-                    // bindManualAccountSpinner 会优先选「本机当前」；此处强制留在刚写入的账号，
-                    // 避免 selected≠active 时 UI 跳走、2FA 列看似没更新。
-                    PrefsStore.setManualSelectedUsername(username)
-                    bindManualAccountSpinnerKeepingUsername(list, username)
-                    binding.pasteTwoFaSecretInput.setText("")
-                    binding.pasteTwoFaStatusText.text =
-                        if (resp.updated == true) {
-                            "已提交 @$username 的 2FA，并刷新账号列表"
-                        } else {
-                            resp.msg?.trim().orEmpty().ifBlank { "2FA 无变化，已刷新账号列表" }
-                        }
-                    Toast.makeText(
-                        this@MainActivity,
-                        if (resp.updated == true) "2FA 已上传并刷新" else "无需更新",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }.onFailure { err ->
-                    // 上传已成功：至少刷新本机展示
-                    ManualDeviceControl.findCachedAccount(username)?.let { applyManualAccountFields(it) }
-                    updatePasteTwoFaHint(hasTwoFa = saved.isNotBlank())
-                    binding.pasteTwoFaSecretInput.setText("")
-                    binding.pasteTwoFaStatusText.text =
-                        "2FA 已写入，但拉取账号失败：${err.message}"
-                    Toast.makeText(this@MainActivity, "2FA 已写上云，刷新失败", Toast.LENGTH_SHORT).show()
-                }
+                // 只用本机缓存刷新展示；云端名单仅人工点「拉取云端最新账号信息」
+                PrefsStore.setManualSelectedUsername(username)
+                bindManualAccountSpinnerKeepingUsername(
+                    ManualDeviceControl.getCachedAccounts(),
+                    username,
+                )
+                binding.pasteTwoFaSecretInput.setText("")
+                binding.pasteTwoFaStatusText.text =
+                    if (resp.updated == true) {
+                        "已提交 @$username 的 2FA"
+                    } else {
+                        resp.msg?.trim().orEmpty().ifBlank { "2FA 无变化" }
+                    }
+                Toast.makeText(
+                    this@MainActivity,
+                    if (resp.updated == true) "2FA 已上传" else "无需更新",
+                    Toast.LENGTH_SHORT,
+                ).show()
             } finally {
                 updatingAccountTwoFa = false
                 if (!isFinishing && !isDestroyed) {
@@ -1373,6 +1182,19 @@ class MainActivity : AppCompatActivity() {
             AppCoordinator.manualStartMutualClick()
         }
 
+        binding.manualConfirmLoginDoneButton.setOnClickListener {
+            val user = selectedManualUsername().trim().removePrefix("@")
+            if (user.isBlank()) {
+                Toast.makeText(this, "请先选择账号", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            PrefsStore.setManualSelectedUsername(user)
+            PrefsStore.setManualActiveUsername(user)
+            PrefsStore.setManualFirstLoginDone(user, true)
+            binding.manualTaskStatusText.text = "已手动确认 @$user 已登录：养号/发作品不再拦截（仅本号）"
+            refreshManualAccountStatus()
+        }
+
         binding.manualPublishCountInput.setText(
             PrefsStore.getManualPublishCount().toString(),
         )
@@ -1385,14 +1207,7 @@ class MainActivity : AppCompatActivity() {
         }
         binding.manualPublishButton.setOnClickListener {
             if (!guardManualTaskReady("发作品")) return@setOnClickListener
-            val raw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getManualPublishCount()
-            val count = raw.coerceIn(
-                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
-                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
-            )
-            PrefsStore.setManualPublishCount(count)
-            binding.manualPublishCountInput.setText(count.toString())
+            val count = syncManualPublishCountFromInput()
             binding.manualTaskStatusText.text = "已请求发作品（${count}条）"
             AppCoordinator.manualStartPublishPost(count)
         }
@@ -1410,16 +1225,9 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "请先拉取云端账号列表", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            val countRaw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getManualPublishCount()
-            val count = countRaw.coerceIn(
-                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
-                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
-            )
+            val count = syncManualPublishCountFromInput()
             val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
-            PrefsStore.setManualPublishCount(count)
             PrefsStore.setManualBatchPublishAfterMin(afterMin)
-            binding.manualPublishCountInput.setText(count.toString())
             showPickAccountsDialog(title = "选择批量发作品账号") { picked ->
                 if (picked.isEmpty()) {
                     Toast.makeText(this, "请至少勾选一个账号", Toast.LENGTH_SHORT).show()
@@ -1442,21 +1250,14 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
-            val countRaw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
-                ?: PrefsStore.getManualPublishCount()
-            val count = countRaw.coerceIn(
-                PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
-                PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
-            )
+            val count = syncManualPublishCountFromInput()
             val afterMin = PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN
-            PrefsStore.setManualPublishCount(count)
             PrefsStore.setManualBatchPublishAfterMin(afterMin)
-            binding.manualPublishCountInput.setText(count.toString())
             val scheme = if (PrefsStore.prefersManualLoginCutSwitch()) "登录切号" else "备份还原"
 
             lifecycleScope.launch {
                 binding.manualBatchPublishNonPendingButton.isEnabled = false
-                binding.manualTaskStatusText.text = "非待活跃批量发：正在拉取云端账号…"
+                binding.manualTaskStatusText.text = "非待活跃批量发：按本机缓存账号排队…"
                 val result = AppCoordinator.manualStartBatchPublishNonPendingActivate(
                     publishCount = count,
                     afterActiveMin = afterMin,
@@ -1496,6 +1297,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             if (!ensureCloudLoginAndBoundForStart()) return@setOnClickListener
+            val publishCount = syncManualPublishCountFromInput()
             val hours = PrefsStore.parseDailyIncubateDurationHours(
                 binding.manualDailyIncubateDurationMinInput.text?.toString(),
             )
@@ -1505,33 +1307,29 @@ class MainActivity : AppCompatActivity() {
             binding.manualDailyIncubateDurationMinInput.setText(hoursText)
             lifecycleScope.launch {
                 binding.manualDailyIncubateStartButton.isEnabled = false
-                binding.manualTaskStatusText.text = "日常孵化：正在同步非待活跃账号…"
-                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
+                // 用本机已缓存名单；需最新云端账号请先点「拉取云端最新账号信息」
                 bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
-                if (refresh.isFailure) {
+                val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
+                if (queueSize <= 0) {
                     binding.manualTaskStatusText.text =
-                        "日常孵化：拉取账号失败：${refresh.exceptionOrNull()?.message}"
+                        "日常孵化：无非待活跃账号（请先拉取云端账号列表）"
                     Toast.makeText(
                         this@MainActivity,
-                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
-                        Toast.LENGTH_LONG,
+                        "无非待活跃账号可养号（请先拉取云端账号列表）",
+                        Toast.LENGTH_SHORT,
                     ).show()
                     setManualTaskButtonsEnabled(true)
                     return@launch
                 }
-                val queueSize = AppCoordinator.listBoundDeviceNonPendingActivateUsernames().size
-                if (queueSize <= 0) {
-                    binding.manualTaskStatusText.text = "日常孵化：无非待活跃账号"
-                    Toast.makeText(this@MainActivity, "无非待活跃账号可养号", Toast.LENGTH_SHORT).show()
-                    setManualTaskButtonsEnabled(true)
-                    return@launch
-                }
-                AppCoordinator.manualStartDailyIncubate(minutes)
+                AppCoordinator.manualStartDailyIncubate(
+                    minutes,
+                    publishCount = publishCount,
+                )
                 binding.manualTaskStatusText.text =
-                    "已请求日常孵化（约 $queueSize 个 · 发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
+                    "已请求日常孵化（约 $queueSize 个 · 每号${publishCount}条 · 发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
                 Toast.makeText(
                     this@MainActivity,
-                    "已开始排队养号（$queueSize 个账号）",
+                    "已开始排队养号（$queueSize 个账号 · 每号${publishCount}条）",
                     Toast.LENGTH_SHORT,
                 ).show()
                 setManualTaskButtonsEnabled(true)
@@ -1553,6 +1351,7 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "本机尚无当前账号（请先切号/登录）", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+            val publishCount = syncManualPublishCountFromInput()
             val hours = PrefsStore.parseDailyIncubateDurationHours(
                 binding.manualDailyIncubateDurationMinInput.text?.toString(),
             )
@@ -1562,40 +1361,32 @@ class MainActivity : AppCompatActivity() {
             binding.manualDailyIncubateDurationMinInput.setText(hoursText)
             lifecycleScope.launch {
                 binding.manualDailyIncubateCurrentButton.isEnabled = false
-                binding.manualTaskStatusText.text = "日常孵化：正在同步当前账号 @$user…"
-                val refresh = AppCoordinator.manualRefreshAssignedAccounts()
+                // 用本机已缓存名单；需最新云端账号请先点「拉取云端最新账号信息」
                 bindManualAccountSpinner(ManualDeviceControl.getCachedAccounts())
-                if (refresh.isFailure) {
-                    binding.manualTaskStatusText.text =
-                        "日常孵化：拉取账号失败：${refresh.exceptionOrNull()?.message}"
-                    Toast.makeText(
-                        this@MainActivity,
-                        refresh.exceptionOrNull()?.message ?: "拉取账号失败",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    setManualTaskButtonsEnabled(true)
-                    return@launch
-                }
                 val activeUser = ManualDeviceControl.activeManualUsername().ifBlank { user }
                 val canIncubate = AppCoordinator.listBoundDeviceNonPendingActivateUsernames()
                     .any { it.equals(activeUser, ignoreCase = true) }
                 if (!canIncubate) {
                     binding.manualTaskStatusText.text =
-                        "日常孵化：@$activeUser 不可养号（待活跃或已封禁）"
+                        "日常孵化：@$activeUser 不可养号（待活跃/已封禁，或请先拉取云端账号列表）"
                     Toast.makeText(
                         this@MainActivity,
-                        "@$activeUser 不可养号（待活跃或已封禁）",
+                        "@$activeUser 不可养号（待活跃/已封禁，或请先拉取云端账号列表）",
                         Toast.LENGTH_SHORT,
                     ).show()
                     setManualTaskButtonsEnabled(true)
                     return@launch
                 }
-                AppCoordinator.manualStartDailyIncubate(minutes, onlyUsername = activeUser)
+                AppCoordinator.manualStartDailyIncubate(
+                    minutes,
+                    onlyUsername = activeUser,
+                    publishCount = publishCount,
+                )
                 binding.manualTaskStatusText.text =
-                    "已请求当前账号养号：@$activeUser（发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
+                    "已请求当前账号养号：@$activeUser（每号${publishCount}条 · 发布保证${PrefsStore.FIXED_MANUAL_BATCH_PUBLISH_AFTER_MIN}分钟→3选2·养号${minutes}分钟）"
                 Toast.makeText(
                     this@MainActivity,
-                    "已开始养号：@$activeUser",
+                    "已开始养号：@$activeUser · ${publishCount}条",
                     Toast.LENGTH_SHORT,
                 ).show()
                 setManualTaskButtonsEnabled(true)
@@ -1651,6 +1442,19 @@ class MainActivity : AppCompatActivity() {
             bindManualAccountSpinner(cached)
         }
         refreshManualAccountStatus()
+    }
+
+    /** 读取「发作品数量」输入框，规范化后写回 prefs 与输入框；所有发作品入口共用。 */
+    private fun syncManualPublishCountFromInput(): Int {
+        val raw = binding.manualPublishCountInput.text?.toString()?.toIntOrNull()
+            ?: PrefsStore.getManualPublishCount()
+        val count = raw.coerceIn(
+            PrefsStore.MIN_MANUAL_PUBLISH_COUNT,
+            PrefsStore.MAX_MANUAL_PUBLISH_COUNT,
+        )
+        PrefsStore.setManualPublishCount(count)
+        binding.manualPublishCountInput.setText(count.toString())
+        return count
     }
 
     /** 任务按钮：已选账号、本机已切到该号、且未在切号/多账号会话中即可点。 */
@@ -2001,8 +1805,6 @@ class MainActivity : AppCompatActivity() {
         String.format("%.2f", v.coerceIn(0.0, 1.0))
 
     companion object {
-        private const val ASSIGNED_COPY_VERIFY_TTL_MS = 10 * 60 * 1000L
-
         fun navigateToLogPanel(context: android.content.Context) {
             val intent = Intent(context, MainActivity::class.java)
                 .putExtra(EXTRA_INITIAL_PANEL, "log")
