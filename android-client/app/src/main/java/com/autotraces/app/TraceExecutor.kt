@@ -321,7 +321,7 @@ class RealTraceExecutor(
         val ctx = service.applicationContext
         if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
             val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
-            val (vision, err) = mlKitRecognizeFullScreen(service, "$reason-precheck")
+            val (vision, err) = recognizePublishPostEntryMainFeed(service, "$reason-precheck", screenH)
             if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
                 devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：当前已是主 Feed（${autoLoginDirectSuccessMatchReason(vision, screenH)}），连点 Home 确认后继续发作品")
                 if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
@@ -359,7 +359,7 @@ class RealTraceExecutor(
         // 外层兜底前再验一次：已见底栏 = 已回 For You，只连点 Home，禁止「回首页失败 → 再强关」叠重启
         if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
             val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
-            val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-fallback-precheck")
+            val (vision, _) = recognizePublishPostEntryMainFeed(service, "$reason-fallback-precheck", screenH)
             if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
                 if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
                     devOp(
@@ -388,12 +388,14 @@ class RealTraceExecutor(
         return if (restartTikTokForRecovery(skipDontAllowOcr = true)) {
             if (isPackageVisible(Config.TIKTOK_PACKAGE_NAME)) {
                 val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
-                val (vision, _) = mlKitRecognizeFullScreen(service, "$reason-after-restart")
+                val (vision, err) = recognizePublishPostEntryMainFeed(service, "$reason-after-restart", screenH)
                 if (vision != null && autoLoginSeesMainFeedBottomNav(vision, screenH)) {
                     if (confirmCleanForYouByTappingHome(service, alias, reason, vision)) {
                         devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：重启兜底成功，紧接着继续发作品")
                         return PublishPostEntryRecoveryResult.RecoveredByRestart
                     }
+                } else if (vision == null) {
+                    devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：冷启后 OCR 未得到可用画面：$err")
                 }
             }
             devOp(alias, "${publishPostRecoveryScopeLabel(reason)}：强关冷启后未能确认主 Feed/Home，恢复失败")
@@ -407,6 +409,77 @@ class RealTraceExecutor(
         if (hardStopOrNull(alias, phase)) return false
         if (tryRestart) restartTikTokForRecovery(skipDontAllowOcr = true)
         return false
+    }
+
+    /**
+     * 本帧是否因「页面/弹窗发生变化」而作废（需重拍才能判断当前页）。
+     * 对应 [mlKitRecognizeFullScreen] 里 [handleOcrVisionInlineInterruptions] 返回的中断标记：
+     * *_popup_dismissed（弹窗已点掉）、*_relaunched（TikTok 被重新拉起）、*_handled（滑块验证已处理）。
+     * identity_verification_failed / hard_stop / 截屏与解码失败不属于此类，不得重试。
+     */
+    private fun isPublishPostEntryRetryableInterruptTag(tag: String): Boolean =
+        tag.endsWith("_popup_dismissed") ||
+            tag.endsWith("_dismissed") ||
+            tag.endsWith("_relaunched") ||
+            tag.endsWith("_handled")
+
+    /**
+     * 发作品入口判定专用 OCR：顺手关掉冷启遗留弹窗（如「Continue editing this post?」草稿框）后重新识屏，
+     * 避免「弹窗已点掉但本帧结果作废」被当成未见 Home 而终止整轮发作品。
+     * 返回 null 表示多次尝试后仍拿不到可用画面（错误原因随返回值带出，便于日志定位）。
+     */
+    private suspend fun recognizePublishPostEntryScreen(
+        ctx: Context,
+        fileTag: String,
+    ): Pair<Text?, String> {
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        var lastErr = "not_attempted"
+        for (attempt in 1..PUBLISH_POST_ENTRY_RECOVER_OCR_MAX_ATTEMPTS) {
+            if (isHardStopActive()) return null to "hard_stop"
+            val (vision, err) = mlKitRecognizeFullScreen(ctx, "${fileTag}_a$attempt")
+            if (vision != null) return vision to "ok"
+            lastErr = err
+            // 硬停 / 明确失败（截屏、解码、MLKit 异常、身份验证失败）不重试；
+            // 只有「画面已变、本帧作废、需重拍」的中断标记才重试。
+            if (!isPublishPostEntryRetryableInterruptTag(err)) return null to err
+            if (attempt >= PUBLISH_POST_ENTRY_RECOVER_OCR_MAX_ATTEMPTS) break
+            devOp(
+                alias,
+                "发作品入口判定：第 $attempt/$PUBLISH_POST_ENTRY_RECOVER_OCR_MAX_ATTEMPTS 次 OCR 被页面变化中断（$err），" +
+                    "等待 ${PUBLISH_POST_ENTRY_RECOVER_OCR_RETRY_DELAY_MS}ms 后重试",
+            )
+            delay(PUBLISH_POST_ENTRY_RECOVER_OCR_RETRY_DELAY_MS)
+        }
+        return null to lastErr
+    }
+
+    /**
+     * 发作品入口「主 Feed」判定：先按 Home+Profile 双词确认；
+     * 若仅命中底栏 Home（Profile 文案晚渲染/未识别到），重拍一次 OCR 再判，
+     * 避免同一流程里「强关重启只要 Home、恢复复检却要 Home+Profile」造成的误判失败。
+     * 返回的画面即使仍未达到双词标准也原样返回，交给上层原有分支（走强关重启）处理，行为不回退。
+     */
+    private suspend fun recognizePublishPostEntryMainFeed(
+        ctx: Context,
+        fileTag: String,
+        screenH: Int,
+    ): Pair<Text?, String> {
+        val (first, err) = recognizePublishPostEntryScreen(ctx, fileTag)
+        if (first == null) return null to err
+        if (autoLoginSeesMainFeedBottomNav(first, screenH)) return first to "ok"
+        if (!hasBottomBandContaining(first, screenH, "home")) return first to "ok"
+        val alias = PrefsStore.getAlias()?.trim()?.takeIf { it.isNotEmpty() } ?: "unknown"
+        devOp(
+            alias,
+            "发作品入口判定：已见底栏 Home 但未识别到 Profile，等待 ${PUBLISH_POST_ENTRY_RECOVER_OCR_RETRY_DELAY_MS}ms 后重拍一次",
+        )
+        delay(PUBLISH_POST_ENTRY_RECOVER_OCR_RETRY_DELAY_MS)
+        val (second, secondErr) = recognizePublishPostEntryScreen(ctx, "${fileTag}_profile_retry")
+        if (second == null) {
+            devOp(alias, "发作品入口判定：Profile 复检重拍 OCR 失败（$secondErr），沿用首帧画面继续判定")
+            return first to "ok"
+        }
+        return second to "ok"
     }
 
     /** 可中断等待；硬停或自动切号关闭时返回 false。 */
@@ -1240,6 +1313,13 @@ class RealTraceExecutor(
         private const val INLINE_SAVE_LOGIN_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** 「Continue editing this post?」草稿弹窗：点 Save draft 的冷却。 */
         private const val INLINE_CONTINUE_EDITING_POST_POPUP_DISMISS_COOLDOWN_MS = 1200L
+        /**
+         * 发作品入口恢复：顺手关弹窗后画面已变，必须重新 OCR 才能确认底栏 Home；
+         * 只识别一次会把「弹窗已关」误判成「未见 Home」而终止整轮发作品。
+         */
+        private const val PUBLISH_POST_ENTRY_RECOVER_OCR_MAX_ATTEMPTS = 4
+        /** 必须大于全部 INLINE_*_POPUP_DISMISS_COOLDOWN_MS（当前最大 1200ms），否则重拍时弹窗仍在、又被冷却挡住。 */
+        private const val PUBLISH_POST_ENTRY_RECOVER_OCR_RETRY_DELAY_MS = 1400L
         /** Security checkup 弹窗：OCR 命中后点屏顶 20% 关闭的冷却。 */
         private const val INLINE_SECURITY_CHECKUP_POPUP_DISMISS_COOLDOWN_MS = 1200L
         /** Security checkup 弹窗：点击 Y = 屏高 × 本比例（屏顶 20% 处，点遮罩关闭）。 */

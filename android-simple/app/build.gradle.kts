@@ -12,8 +12,8 @@ android {
         applicationId = "com.autotraces.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.0.6-gallery-heal"
+        versionCode = 7
+        versionName = "1.0.7-entry-retry"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
