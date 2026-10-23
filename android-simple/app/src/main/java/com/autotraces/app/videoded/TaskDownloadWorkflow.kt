@@ -35,7 +35,14 @@ object TaskDownloadWorkflow {
         }
 
         if (!TaskDownloadCoordinator.tryAcquire(taskId)) {
-            report("任务 $taskId 已在处理中，跳过重复执行")
+            // 禁止静默当成功：PC follow-pc / 本机 request 常并发同一 taskId。
+            // 跳过会导致上层立刻统计 MediaStore=0，空等后再失败。
+            report("任务 $taskId 已在处理中，等待并行 USB 校验/入库结束…")
+            val idle = TaskDownloadCoordinator.awaitIdle(taskId, timeoutMs = 600_000L)
+            if (!idle) {
+                error("usb_verify_busy_timeout:$taskId")
+            }
+            report("并行流程已结束，交由上层复检图库可见性（不再重复入库）")
             return
         }
 
@@ -153,7 +160,12 @@ object TaskDownloadWorkflow {
         val receivedDirBeforePublish = CompanionApi.receivedTaskDir(app, taskId).absolutePath
 
         if (!TaskDownloadCoordinator.tryAcquire(taskId)) {
-            report("任务 $taskId 已在下载中，跳过重复执行")
+            report("任务 $taskId 已在下载中，等待并行下载/入库结束…")
+            val idle = TaskDownloadCoordinator.awaitIdle(taskId, timeoutMs = 600_000L)
+            if (!idle) {
+                error("download_busy_timeout:$taskId")
+            }
+            report("并行流程已结束，交由上层复检图库可见性（不再重复下载）")
             return
         }
 

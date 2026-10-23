@@ -1199,7 +1199,7 @@ class RealTraceExecutor(
         private const val PUBLISH_POST_INTER_ITEM_DELAY_MS = 650L
         /**
          * PC/USB 落盘后 MediaStore 可能短暂 IS_PENDING / App 尚未正规入库。
-         * 必须等到「可见数 >= 请求数」，不能见到 1 条就当拉取成功。
+         * 必须等到「可见数 >= 下发前可见 + 本批文件数」，不能见到旧素材或 1 条就当拉取成功。
          * 最少等 5 分钟；满 5 分钟仍不足再考虑强制磁盘再入库（见拉取流程）。
          */
         private const val PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS = 300_000L
@@ -11329,7 +11329,8 @@ class RealTraceExecutor(
 
     /**
      * 拉取/入库后等待 MediaStore 非 pending 可见数达到 [minNeed]。
-     * 默认至少等 [PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS]（5 分钟）；满窗口仍不足才由调用方强制再入库。
+     * 默认最多等 [PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS]（5 分钟）；够数可提前返回。
+     * 满窗口仍不足才由调用方强制再入库。硬停时立即返回当前统计（调用方不得再入库）。
      */
     private suspend fun publishPostWaitGalleryVisibleAfterFetch(
         alias: String,
@@ -11348,7 +11349,7 @@ class RealTraceExecutor(
                 "开始等待/轮询（最多 ${timeoutMs}ms；满窗口后再考虑强制再入库）…",
         )
         while (last.resolvedCount < need && SystemClock.elapsedRealtime() < deadline) {
-            if (hardStopOrNull(alias, "发作品素材可见性等待")) break
+            if (hardStopOrNull(alias, "发作品素材可见性等待")) return last
             attempt++
             delay(pollMs.coerceAtLeast(100L))
             last = publishPostResolveGalleryMaterialStats()
@@ -15467,22 +15468,28 @@ class RealTraceExecutor(
     /**
      * 磁盘 Pictures 已有素材但 MediaStore 可见不足时：按文件名强制走 App 正规入库
      * （su stage → MediaStore IS_PENDING 写流），把 shell push 幽灵变成 TikTok 可选素材。
-     * @return 尝试入库的文件数
+     * 若磁盘已无文件（USB 正规入库后原件已删），仍 force 自愈一次（清 pending / 修权限 / 扫描），
+     * 避免「索引短暂不可见」被当成彻底失败。
+     * @return 尝试入库的文件数；仅自愈时返回 0（调用方仍可再等可见窗口）
      */
-    private fun publishPostRemediateDiskMaterialsIntoMediaStore(alias: String): Int {
+    private suspend fun publishPostRemediateDiskMaterialsIntoMediaStore(alias: String): Int {
         val names = listPicturesPublishableFileNamesViaSu()
+        val ctx = appContextProvider().applicationContext
         if (names.isEmpty()) {
-            devOp(alias, "发作品：磁盘再入库跳过（Pictures 无可用媒体文件）")
+            val healed = runCatching {
+                com.autotraces.app.videoded.GalleryMediaPublisher
+                    .ensurePicturesMediaAccessible(ctx, force = true)
+            }.getOrDefault(0)
+            devOp(
+                alias,
+                "发作品：磁盘再入库跳过（Pictures 无可用媒体文件）；force 自愈 $healed 条后复检可见性",
+            )
             return 0
         }
         devOp(alias, "发作品：磁盘再入库 ${names.size} 个文件 → App MediaStore（修复 shell 不可见）")
         val root = java.io.File(PUBLISH_POST_PICTURES_PATH)
-        val ctx = appContextProvider().applicationContext
         return runCatching {
-            // 阻塞调用：scanExistingFiles 是 suspend，这里用 runBlocking 不合适；改为在 IO 上跑
-            kotlinx.coroutines.runBlocking {
-                com.autotraces.app.videoded.GalleryMediaPublisher.scanExistingFiles(ctx, root, names)
-            }
+            com.autotraces.app.videoded.GalleryMediaPublisher.scanExistingFiles(ctx, root, names)
             names.size
         }.getOrElse { ex ->
             devOp(alias, "发作品：磁盘再入库失败 ${ex.message}")
@@ -15535,6 +15542,35 @@ class RealTraceExecutor(
             return stats
         }
         PrefsStore.setPublishPostMaterialReady(false)
+        // MediaStore 可见不足但磁盘仍有 shell/root push 文件：禁止直接 wipe。
+        // 这不是「刚下发后的 IS_PENDING 竞态」，空等 5 分钟无意义；直接再入库后再等短窗口。
+        val diskGhosts = listPicturesPublishableFileNamesViaSu()
+        if (stats.resolvedCount < need && diskGhosts.isNotEmpty()) {
+            if (hardStopOrNull(alias, "发作品磁盘幽灵再入库")) {
+                lastPublishPostEntryFailureReason =
+                    lastPublishPostEntryFailureReason ?: "硬停（$phaseLabel 磁盘幽灵再入库）"
+                return null
+            }
+            devOp(
+                alias,
+                "发作品：$phaseLabel MediaStore 不足 (${stats.resolvedCount}/$need) 但磁盘有 ${diskGhosts.size} 个媒体文件，" +
+                    "跳过清空、直接强制再入库（后再等 ${PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS}ms）…",
+            )
+            publishPostRemediateDiskMaterialsIntoMediaStore(alias)
+            stats = publishPostWaitGalleryVisibleAfterFetch(
+                alias = alias,
+                minNeed = need,
+                timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
+            )
+            if (stats.resolvedCount >= need) {
+                PrefsStore.setPublishPostMaterialReady(true)
+                devOp(
+                    alias,
+                    "发作品：$phaseLabel 磁盘幽灵再入库后素材充足 need=$need have=${stats.resolvedCount}",
+                )
+                return stats
+            }
+        }
         val shortage = (need - stats.resolvedCount).coerceAtLeast(1)
         val fetchCount = maxOf(shortage, configFetchCount.coerceIn(0, 20)).coerceIn(1, 20)
         if (stats.resolvedCount <= 0) {
@@ -15556,21 +15592,42 @@ class RealTraceExecutor(
                 lastPublishPostEntryFailureReason ?: "素材拉取或图库可见性失败（$phaseLabel）"
             return null
         }
-        // 拉取函数内已「先等满 5 分钟 → 再强制再入库」；此处仅复检，仍不足再补一次再入库。
+        // 拉取已按「下发前可见 + 本批文件」等满 5 分钟并可再入库；此处仅当仍不足 need 时兜底。
+        // 同样遵守：先等满可见窗口，满窗口后再强制再入库（禁止一上来就再入库）。
         var statsAfter = publishPostResolveGalleryMaterialStats()
         if (statsAfter.resolvedCount < need) {
+            if (hardStopOrNull(alias, "发作品素材复检等待")) {
+                lastPublishPostEntryFailureReason =
+                    lastPublishPostEntryFailureReason ?: "硬停（$phaseLabel 素材复检）"
+                return null
+            }
             devOp(
                 alias,
-                "发作品：$phaseLabel 拉取返回后复检仍不足 (${statsAfter.resolvedCount}/$need)，补强制再入库…",
+                "发作品：$phaseLabel 拉取返回后复检仍不足 (${statsAfter.resolvedCount}/$need)，" +
+                    "先等满 ${PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS}ms 再考虑强制再入库…",
             )
-            val remediated = publishPostRemediateDiskMaterialsIntoMediaStore(alias)
-            if (remediated > 0) {
-                statsAfter = publishPostWaitGalleryVisibleAfterFetch(
-                    alias = alias,
-                    minNeed = need,
-                    timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
-                )
+            statsAfter = publishPostWaitGalleryVisibleAfterFetch(
+                alias = alias,
+                minNeed = need,
+                timeoutMs = PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS,
+            )
+        }
+        if (statsAfter.resolvedCount < need) {
+            if (hardStopOrNull(alias, "发作品素材复检再入库")) {
+                lastPublishPostEntryFailureReason =
+                    lastPublishPostEntryFailureReason ?: "硬停（$phaseLabel 素材再入库）"
+                return null
             }
+            devOp(
+                alias,
+                "发作品：$phaseLabel 已等满可见窗口仍不足 (${statsAfter.resolvedCount}/$need)，补强制再入库…",
+            )
+            publishPostRemediateDiskMaterialsIntoMediaStore(alias)
+            statsAfter = publishPostWaitGalleryVisibleAfterFetch(
+                alias = alias,
+                minNeed = need,
+                timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
+            )
         }
         if (statsAfter.resolvedCount < need) {
             lastPublishPostEntryFailureReason =
@@ -15684,6 +15741,11 @@ class RealTraceExecutor(
                 )
                 return false
             }
+            // 必须在下发前快照：补拉时旧素材可能已 >= count，若仍用 count 当目标会跳过 5 分钟等待，
+            // 新 push 的 shell 幽灵永远等不到「满窗口再入库」。
+            val visibleBefore = publishPostResolveGalleryMaterialStats().resolvedCount
+            val expectedVisible =
+                (visibleBefore + created.files.size).coerceAtLeast(created.files.size)
             TaskStore.saveTaskSnapshot(
                 app,
                 TaskSnapshot(
@@ -15716,60 +15778,68 @@ class RealTraceExecutor(
                 )
             }
             // PC/USB 已下发后：先至少等满可见窗口（默认 5 分钟），仍不足再强制磁盘再入库。
-            // 禁止一上来就再入库或短超时当失败。
+            // 目标 = 下发前可见 + 本批文件数（禁止用本批请求数 count 短路顶补路径）。
             var stats = publishPostResolveGalleryMaterialStats()
-            if (stats.resolvedCount < count) {
+            if (stats.resolvedCount < expectedVisible) {
                 stats = publishPostWaitGalleryVisibleAfterFetch(
                     alias = alias,
-                    minNeed = count,
+                    minNeed = expectedVisible,
                     timeoutMs = PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS,
                 )
             }
-            if (stats.resolvedCount < count) {
+            if (stats.resolvedCount < expectedVisible) {
+                if (hardStopOrNull(alias, "发作品素材可见性再入库")) {
+                    lastPublishPostEntryFailureReason =
+                        lastPublishPostEntryFailureReason ?: "硬停（素材可见性等待）"
+                    PrefsStore.setPublishPostMaterialReady(false)
+                    return false
+                }
                 devOp(
                     alias,
                     "发作品：已等待 ${PUBLISH_POST_MEDIASTORE_VISIBLE_WAIT_MS}ms 仍可见不足 " +
-                        "(${stats.resolvedCount}/$count)，开始强制磁盘再入库…",
+                        "(${stats.resolvedCount}/$expectedVisible，下发前=$visibleBefore，本批=${created.files.size})，" +
+                        "开始强制磁盘再入库…",
                 )
-                val remediated = publishPostRemediateDiskMaterialsIntoMediaStore(alias)
-                if (remediated > 0) {
-                    stats = publishPostWaitGalleryVisibleAfterFetch(
-                        alias = alias,
-                        minNeed = count,
-                        timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
-                    )
-                } else {
-                    devOp(alias, "发作品：强制再入库跳过（磁盘 Pictures 无可用媒体文件）")
-                }
+                publishPostRemediateDiskMaterialsIntoMediaStore(alias)
+                stats = publishPostWaitGalleryVisibleAfterFetch(
+                    alias = alias,
+                    minNeed = expectedVisible,
+                    timeoutMs = PUBLISH_POST_MEDIASTORE_REMEDIATE_WAIT_MS,
+                )
             }
             val elapsedMs = fetchElapsedMs()
-            // 本轮可用条数：min(PC 实际下发文件数, 图库实时可用) —— 发布条数以此为上限
+            // 本轮可用条数：min(PC 实际下发文件数, 图库相对下发前的净增) —— 发布条数以此为上限
             val prevFetched = PrefsStore.getPublishPostLastFetchedUsableCount()
-            val batchUsable = minOf(created.files.size, stats.resolvedCount).coerceAtLeast(0)
+            val newlyVisible =
+                (stats.resolvedCount - visibleBefore).coerceAtLeast(0)
+            val batchUsable = minOf(created.files.size, newlyVisible, stats.resolvedCount)
+                .coerceAtLeast(0)
             val mergedUsable =
                 if (prevFetched > 0) {
-                    // 补拉：在旧可用之上累加本批，但不超过当前图库真实可用
-                    minOf(stats.resolvedCount, prevFetched + created.files.size)
+                    // 补拉：在旧可用之上累加本批净增，但不超过当前图库真实可用
+                    minOf(stats.resolvedCount, prevFetched + newlyVisible)
                 } else {
                     batchUsable
                 }
             PrefsStore.setPublishPostLastFetchedUsableCount(mergedUsable)
             devOp(
                 alias,
-                "发作品：素材拉取完成 taskId=${created.taskId} 请求数=$count 实际拉取=${created.files.size} 耗时=${elapsedMs}ms；" +
-                    "图库统计 图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} 合计=${stats.resolvedCount}；" +
-                    "本轮拉取可用锁定=$mergedUsable",
+                "发作品：素材拉取完成 taskId=${created.taskId} 请求数=$count 实际拉取=${created.files.size} " +
+                    "耗时=${elapsedMs}ms；下发前可见=$visibleBefore 期望可见=$expectedVisible；" +
+                    "图库统计 图片=${stats.picturesRootImageCount} 视频=${stats.picturesRootVideoCount} " +
+                    "合计=${stats.resolvedCount}；本轮拉取可用锁定=$mergedUsable",
                 elapsedMs,
             )
             when {
-                stats.resolvedCount >= count -> {
+                stats.resolvedCount >= expectedVisible -> {
                     PrefsStore.setPublishPostMaterialReady(true)
                     true
                 }
                 stats.resolvedCount > 0 -> {
-                    // 可见不足请求数：不算整次成功，避免上层带着 have=1 need=2 硬冲
+                    // 可见不足期望数：不算整次成功，避免上层带着 have=1 need=2 硬冲
                     lastPublishPostEntryFailureReason =
                         "图库素材可见不足（PC 已下发 ${created.files.size} 个，请求=$count，" +
+                            "下发前=$visibleBefore，期望=$expectedVisible，" +
                             "MediaStore 可见=${stats.resolvedCount}；多为 shell 未正规入库/IS_PENDING）"
                     PrefsStore.setPublishPostMaterialReady(false)
                     devOp(alias, "发作品：${lastPublishPostEntryFailureReason}", elapsedMs)
@@ -15778,7 +15848,7 @@ class RealTraceExecutor(
                 else -> {
                     lastPublishPostEntryFailureReason =
                         "图库素材不可见（PC 已下发 ${created.files.size} 个文件，MediaStore 可见=0，" +
-                            "多为 IS_PENDING/索引未就绪或 shell 幽灵）"
+                            "下发前=$visibleBefore，期望=$expectedVisible；多为 IS_PENDING/索引未就绪或 shell 幽灵）"
                     PrefsStore.setPublishPostMaterialReady(false)
                     devOp(
                         alias,

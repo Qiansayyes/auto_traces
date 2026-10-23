@@ -372,6 +372,7 @@ const ACCOUNT_RECORDS_DELETE_USERNAME_TEMPLATE = [
 ].join("\n");
 const accountRecordsAliasSortSelect = document.getElementById("accountRecordsAliasSortSelect");
 const accountRecordsToggleCredColsBtn = document.getElementById("accountRecordsToggleCredColsBtn");
+const accountRecordsExpandAllGroupsBtn = document.getElementById("accountRecordsExpandAllGroupsBtn");
 const backupArchiveSearchInput = document.getElementById("backupArchiveSearchInput");
 const copyCurrentRecordBtn = document.getElementById("copyCurrentRecordBtn");
 const ACCOUNT_EDITOR_STORAGE_KEY = "auto_traces_account_editor_rows_v1";
@@ -406,6 +407,8 @@ const accountRecordsSelectedRowIndexes = new Set();
 const accountRecordsSelectedAliases = new Set();
 /** 是否展开 password / email / email_pwd / 2FA / api 凭据列（默认收起以留出可视空间） */
 let accountRecordsCredColsExpanded = loadAccountRecordsCredColsExpanded();
+/** 用户通过「一键全部收起」明确收起当前页；同页重绘时保持全收起，翻页/筛选后清除 */
+let accountRecordsAliasGroupsPreferCollapsed = false;
 const ACCOUNT_RECORDS_BATCH_DELETE_MAX = 100;
 let backupArchiveSearchQuery = "";
 let deviceGroupNames = [];
@@ -2911,6 +2914,7 @@ function onBackupArchivePageSizeChanged() {
 
 function onAccountRecordsPageSizeChanged() {
   persistAccountRecordsPageSize();
+  accountRecordsAliasGroupsPreferCollapsed = false;
   currentAccountRecordsPage = 1;
   renderAccountEditorRows();
 }
@@ -3075,6 +3079,60 @@ function collectOpenAccountAliasGroups() {
     }
   });
   return open;
+}
+
+function getCurrentPageAccountAliasGroupDetails() {
+  if (!accountEditorListEl) return [];
+  return Array.from(accountEditorListEl.querySelectorAll("details.account-alias-group")).filter(
+    (el) => el instanceof HTMLDetailsElement,
+  );
+}
+
+function areAllCurrentPageAccountAliasGroupsOpen() {
+  const groups = getCurrentPageAccountAliasGroupDetails();
+  if (!groups.length) return false;
+  return groups.every((el) => el.open);
+}
+
+function setCurrentPageAccountAliasGroupsOpen(open) {
+  const groups = getCurrentPageAccountAliasGroupDetails();
+  const nextOpen = Boolean(open);
+  groups.forEach((el) => {
+    el.open = nextOpen;
+  });
+  // 全部收起视为明确意图，避免同页重绘时又默认展开前两组
+  accountRecordsAliasGroupsPreferCollapsed = !nextOpen && groups.length > 0;
+  updateAccountRecordsExpandAllGroupsBtn();
+  return groups.length;
+}
+
+function updateAccountRecordsExpandAllGroupsBtn() {
+  if (!accountRecordsExpandAllGroupsBtn) return;
+  const groups = getCurrentPageAccountAliasGroupDetails();
+  if (!groups.length) {
+    accountRecordsExpandAllGroupsBtn.textContent = "一键全部展开";
+    accountRecordsExpandAllGroupsBtn.title = "当前页暂无别名分组";
+    accountRecordsExpandAllGroupsBtn.disabled = true;
+    return;
+  }
+  accountRecordsExpandAllGroupsBtn.disabled = false;
+  if (areAllCurrentPageAccountAliasGroupsOpen()) {
+    accountRecordsExpandAllGroupsBtn.textContent = "一键全部收起";
+    accountRecordsExpandAllGroupsBtn.title = "收起当前页全部别名分组";
+  } else {
+    accountRecordsExpandAllGroupsBtn.textContent = "一键全部展开";
+    accountRecordsExpandAllGroupsBtn.title = "展开当前页全部别名分组";
+  }
+}
+
+function toggleCurrentPageAccountAliasGroups() {
+  const allOpen = areAllCurrentPageAccountAliasGroupsOpen();
+  const count = setCurrentPageAccountAliasGroupsOpen(!allOpen);
+  if (!count) {
+    setStatus("当前页暂无别名分组", "warning");
+    return;
+  }
+  setStatus(allOpen ? `已收起当前页 ${count} 个别名分组` : `已展开当前页 ${count} 个别名分组`, "success");
 }
 
 function accountAliasGroupFoldKey(aliasKey) {
@@ -12593,6 +12651,7 @@ function renderAccountEditorRows() {
       ? formatAccountRecordsSearchHint(accountRecordsSearchQuery, accountRecordsSearchField)
       : "暂无记录，点击“新增空白记录”开始";
     accountEditorListEl.innerHTML = `<div class="hint">${escapeHtml(emptyHint)}</div>`;
+    updateAccountRecordsExpandAllGroupsBtn();
     return;
   }
   try {
@@ -12604,8 +12663,9 @@ function renderAccountEditorRows() {
     const openGroups = collectOpenAccountAliasGroups();
     const pageFoldKeys = pageGroups.map(([aliasKey]) => accountAliasGroupFoldKey(aliasKey));
     const anyCurrentPageOpen = pageFoldKeys.some((key) => openGroups.has(key));
-    // 翻页/筛选后当前页没有已展开组时，重新默认展开前两组；否则保留本页展开状态
-    const useSavedOpenState = anyCurrentPageOpen;
+    // 翻页/筛选后当前页没有已展开组时，重新默认展开前两组；
+    // 若用户刚「一键全部收起」，同页重绘时保持全收起
+    const useSavedOpenState = anyCurrentPageOpen || accountRecordsAliasGroupsPreferCollapsed;
     const aliasTotalByKey = new Map(aliasGroups.map(([aliasKey, items]) => [aliasKey, items.length]));
     let displayCursor = start;
     const groupsHtml = pageGroups.map(([aliasKey, items], groupIdx) => {
@@ -12668,12 +12728,14 @@ function renderAccountEditorRows() {
     }).join("");
     accountEditorListEl.innerHTML = `<div class="account-alias-group-list">${groupsHtml}</div>`;
     updateAccountRecordsCredColsToggleBtn();
+    updateAccountRecordsExpandAllGroupsBtn();
     syncAccountRecordsPageSelectAllCheckbox();
     if (typeof refreshUsernamePendingHints === "function") refreshUsernamePendingHints();
   } catch (error) {
     console.error("renderAccountEditorRows failed", error);
     const msg = (error && (error.message || error.toString?.())) || "unknown";
     accountEditorListEl.innerHTML = `<div class="hint">账号记录渲染失败：${escapeHtml(msg)}</div>`;
+    updateAccountRecordsExpandAllGroupsBtn();
   }
   renderDeviceRegionPresetOptions();
 }
@@ -14410,6 +14472,7 @@ if (addDeviceBlankRecordBtn) {
 if (accountUnassignedOnlyToggle) {
   accountUnassignedOnlyToggle.addEventListener("change", (event) => {
     accountFilterUnassignedOnly = Boolean(event?.target?.checked);
+    accountRecordsAliasGroupsPreferCollapsed = false;
     currentAccountRecordsPage = 1;
     renderAccountEditorRows();
   });
@@ -14419,6 +14482,7 @@ if (accountRecordsSearchInput) {
   const onAccountRecordsSearchChanged = () => {
     accountRecordsSearchQuery = String(accountRecordsSearchInput.value || "").trim();
     accountRecordsSearchField = String(accountRecordsSearchFieldSelect?.value || "").trim();
+    accountRecordsAliasGroupsPreferCollapsed = false;
     currentAccountRecordsPage = 1;
     clearTimeout(accountSearchTimer);
     accountSearchTimer = setTimeout(() => renderAccountEditorRows(), 200);
@@ -14431,6 +14495,7 @@ if (accountRecordsSearchInput) {
 if (accountRecordsPrevPageBtn) {
   accountRecordsPrevPageBtn.addEventListener("click", () => {
     if (currentAccountRecordsPage <= 1) return;
+    accountRecordsAliasGroupsPreferCollapsed = false;
     currentAccountRecordsPage -= 1;
     renderAccountEditorRows();
   });
@@ -14439,6 +14504,7 @@ if (accountRecordsNextPageBtn) {
   accountRecordsNextPageBtn.addEventListener("click", () => {
     const totalPages = Math.max(1, Math.ceil(accountRecordsFilteredTotal / getAccountRecordsPageSize()));
     if (currentAccountRecordsPage >= totalPages) return;
+    accountRecordsAliasGroupsPreferCollapsed = false;
     currentAccountRecordsPage += 1;
     renderAccountEditorRows();
   });
@@ -14452,6 +14518,12 @@ if (accountRecordsToggleCredColsBtn) {
   updateAccountRecordsCredColsToggleBtn();
   accountRecordsToggleCredColsBtn.addEventListener("click", () => {
     toggleAccountRecordsCredCols();
+  });
+}
+if (accountRecordsExpandAllGroupsBtn) {
+  updateAccountRecordsExpandAllGroupsBtn();
+  accountRecordsExpandAllGroupsBtn.addEventListener("click", () => {
+    toggleCurrentPageAccountAliasGroups();
   });
 }
 if (backupArchiveSearchInput) {
@@ -14478,6 +14550,7 @@ if (accountRecordsAliasSortSelect) {
   accountRecordsAliasSortMode = String(accountRecordsAliasSortSelect.value || "alias").trim() || "alias";
   accountRecordsAliasSortSelect.addEventListener("change", () => {
     accountRecordsAliasSortMode = String(accountRecordsAliasSortSelect.value || "alias").trim() || "alias";
+    accountRecordsAliasGroupsPreferCollapsed = false;
     currentAccountRecordsPage = 1;
     // 清空旧 DOM，避免沿用上一排序的展开集合导致部分组仍收起
     if (accountEditorListEl) accountEditorListEl.innerHTML = "";
@@ -14604,6 +14677,13 @@ if (accountRecordsDeleteByUsernameBtn) {
   });
 }
 if (accountEditorListEl) {
+  accountEditorListEl.addEventListener("toggle", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLDetailsElement)) return;
+    if (!target.classList.contains("account-alias-group")) return;
+    if (target.open) accountRecordsAliasGroupsPreferCollapsed = false;
+    updateAccountRecordsExpandAllGroupsBtn();
+  }, true);
   accountEditorListEl.addEventListener("change", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
