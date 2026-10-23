@@ -12410,6 +12410,100 @@ function formatAccountMailTokenBadge(row = {}) {
   return `<span class="account-mail-token-badge account-mail-token-badge--${tone}" title="${escapeHtml(label)}">${escapeHtml(label)}</span>`;
 }
 
+/** 与服务端 ACCOUNT_EDITOR_XLSX_HEADERS 对齐，便于粘贴到 Excel / 导回表格。 */
+const ACCOUNT_EDITOR_CLIPBOARD_FIELDS = [
+  "row_index",
+  "username",
+  "password",
+  "email",
+  "email_password",
+  "two_fa",
+  "api",
+  "is_login",
+  "login_time",
+  "region",
+  "assigned_alias",
+  "video_count",
+  "follower_count",
+  "follower_growth",
+  "heart_count",
+  "follower_growth_day_before",
+  "follower_growth_yesterday",
+  "follower_growth_today",
+  "heart_growth_day_before",
+  "heart_growth_yesterday",
+  "heart_growth_today",
+  "basic_profile_modified",
+];
+
+function readAccountEditorRowLiveValues(idx) {
+  const base = accountEditorRows?.[idx] || {};
+  const live = { ...base };
+  const nodes = accountEditorListEl?.querySelectorAll(
+    `[data-editor-scope="account"][data-editor-index="${idx}"]`,
+  );
+  nodes?.forEach((el) => {
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) return;
+    const field = String(el.dataset.editorField || "").trim();
+    if (!field) return;
+    const value = String(el.value ?? "");
+    if (field === "is_login") {
+      live.is_login = value === "true" || value === "1";
+      return;
+    }
+    live[field] = value;
+  });
+  if (!String(live.assigned_alias || "").trim()) {
+    live.assigned_alias = getEffectiveAccountAssignedAlias(live);
+  }
+  live.row_index = resolveAccountRowIndex(live, idx);
+  live.basic_profile_modified = normalizeBasicProfileModifiedField(live.basic_profile_modified);
+  if (!String(live.follower_growth_today || "").trim() && String(live.follower_growth || "").trim()) {
+    live.follower_growth_today = live.follower_growth;
+  }
+  return live;
+}
+
+function buildAccountEditorRowClipboardText(row = {}) {
+  const cell = (field) => {
+    if (field === "is_login") {
+      return row.is_login === true || row.is_login === 1 || row.is_login === "1" || row.is_login === "true" ? "1" : "0";
+    }
+    if (field === "assigned_alias") {
+      return String(getEffectiveAccountAssignedAlias(row) || row.assigned_alias || "").trim();
+    }
+    if (field === "basic_profile_modified") {
+      return normalizeBasicProfileModifiedField(row.basic_profile_modified);
+    }
+    return String(row[field] ?? "").replace(/\t|\r?\n/g, " ").trim();
+  };
+  return ACCOUNT_EDITOR_CLIPBOARD_FIELDS.map(cell).join("\t");
+}
+
+async function copyAccountEditorRowToClipboard(idx) {
+  const row = readAccountEditorRowLiveValues(idx);
+  const text = buildAccountEditorRowClipboardText(row);
+  if (!text.trim()) {
+    throw new Error("该行没有可复制的内容");
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (!ok) throw new Error("复制失败，请检查浏览器剪贴板权限");
+  }
+  const username = String(row.username || "").trim() || `行#${idx + 1}`;
+  setStatus(`已复制 ${username} 整行（可粘贴到 Excel）`, "success");
+}
+
 function renderAccountEditorTableRow({ row, idx }, displayNum) {
   const aliasLocked = isAccountAliasLocked(row);
   const aliasCell = aliasLocked
@@ -12460,7 +12554,10 @@ function renderAccountEditorTableRow({ row, idx }, displayNum) {
     <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "follower")}</td>
     <td class="account-editor-table__growth">${formatAccountGrowthTriple(row, "heart")}</td>
     <td class="account-editor-table__profile">${profileSelect}</td>
-    <td class="account-editor-table__actions"><button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button></td>
+    <td class="account-editor-table__actions">
+      <button type="button" class="ghost account-editor-table__copy" data-account-row-copy="${idx}" title="复制整行（Tab 分隔，可粘贴到 Excel）">复制</button>
+      <button type="button" class="ghost account-editor-table__del" data-editor-delete="account" data-editor-index="${idx}">删</button>
+    </td>
   </tr>`;
 }
 
@@ -14582,6 +14679,15 @@ if (accountEditorListEl) {
       event.preventDefault();
       const index = Number(unameBtn.getAttribute("data-username-confirm-index"));
       if (!Number.isNaN(index)) confirmUsernameChange(index).catch((e) => setStatus(e.message || "修改username失败", "error"));
+      return;
+    }
+    const copyBtn = target.closest("[data-account-row-copy]");
+    if (copyBtn) {
+      event.preventDefault();
+      const index = Number(copyBtn.getAttribute("data-account-row-copy"));
+      if (!Number.isNaN(index)) {
+        copyAccountEditorRowToClipboard(index).catch((e) => setStatus(e.message || "复制失败", "error"));
+      }
       return;
     }
     const delBtn = target.closest("[data-editor-delete]");
