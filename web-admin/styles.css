@@ -1975,7 +1975,7 @@ button.danger {
 }
 
 .account-editor-table--creds-collapsed {
-  min-width: 1040px;
+  min-width: 1180px;
   table-layout: fixed;
 }
 
@@ -2220,10 +2220,30 @@ button.danger {
 }
 
 .account-editor-table__actions {
-  width: 96px;
-  min-width: 96px;
+  width: 108px;
+  min-width: 108px;
+  max-width: 120px;
   text-align: center;
   white-space: nowrap;
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: #fff;
+  box-shadow: -4px 0 8px rgba(15, 23, 42, 0.06);
+}
+
+.account-editor-table thead th.account-editor-table__actions {
+  z-index: 3;
+  background: #f3f6ff;
+}
+
+.account-editor-table tbody tr:hover .account-editor-table__actions {
+  background: #f8faff;
+}
+
+.account-editor-table__actions .ghost {
+  display: inline-block;
+  margin: 0 1px;
 }
 
 .account-editor-table__del,
