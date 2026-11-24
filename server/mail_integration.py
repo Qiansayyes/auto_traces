@@ -44,6 +44,7 @@ MAIL_MODULE_STARTUP_TIMEOUT_SEC = float(os.environ.get("MAIL_MODULE_STARTUP_TIME
 MAIL_INTERNAL_SECRET = os.environ.get("MAIL_INTERNAL_SECRET", "auto-traces-mail-internal").strip()
 
 _node_process: subprocess.Popen[Any] | None = None
+_node_log_fp: Any | None = None  # Popen stdout 句柄；停止进程时关闭，避免 restart 泄漏
 _http_client: httpx.AsyncClient | None = None
 MAIL_SESSION_RESOLVER: Any = None
 _mail_token_refresh_stop = threading.Event()
@@ -532,7 +533,7 @@ def _wait_for_mail_module() -> bool:
 
 
 def _start_node_process() -> bool:
-    global _node_process
+    global _node_process, _node_log_fp
 
     if _mail_module_ready():
         logger.info("Mail module already reachable at %s", _mail_upstream_base())
@@ -568,7 +569,13 @@ def _start_node_process() -> bool:
     log_path = logs_dir / "mail-module-stdout.log"
 
     logger.info("Starting mail module Node process: %s %s", node, main_js)
+    # 先关掉上一次残留句柄（restart 路径）
+    if _node_log_fp is not None:
+        with contextlib.suppress(Exception):
+            _node_log_fp.close()
+        _node_log_fp = None
     log_fp = open(log_path, "a", encoding="utf-8")
+    _node_log_fp = log_fp
     _node_process = subprocess.Popen(
         [node, str(main_js)],
         cwd=str(MAIL_MODULE_DIR),
@@ -588,12 +595,12 @@ def _start_node_process() -> bool:
 
 
 def _stop_node_process() -> None:
-    global _node_process
+    global _node_process, _node_log_fp
     proc = _node_process
     _node_process = None
-    if proc is None:
-        return
-    if proc.poll() is None:
+    log_fp = _node_log_fp
+    _node_log_fp = None
+    if proc is not None and proc.poll() is None:
         # Windows 上 Node 对 terminate 响应慢，关闭时直接 kill 避免 uvicorn 卡住。
         if sys.platform.startswith("win"):
             proc.kill()
@@ -605,6 +612,9 @@ def _stop_node_process() -> None:
             proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=2)
+    if log_fp is not None:
+        with contextlib.suppress(Exception):
+            log_fp.close()
 
 
 def stop_mail_module_process() -> None:
@@ -973,6 +983,7 @@ def attach_mail_module(app) -> None:
     else:
         logger.warning("Mail admin dist not found: %s", MAIL_WEB_DIST)
 
+    # FastAPI on_event 已弃用；待主服务统一迁 lifespan 时一并改掉。
     @app.on_event("startup")
     async def _mail_module_startup() -> None:
         ok = await asyncio.to_thread(_start_node_process)

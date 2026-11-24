@@ -11457,40 +11457,64 @@ async def api_health():
     return {"code": 0, "msg": "ok", "ts": now_text()}
 
 
-# 与 android-client/app/build.gradle.kts defaultConfig 保持一致；VPS 无源码时用此兜底。
+# 与 android-*/app/build.gradle.kts defaultConfig 对齐；VPS 无源码时用此兜底。
 # 发版改 APK versionName/versionCode 时请同步改这里（本地有 gradle 时会优先解析覆盖）。
 _APK_VERSION_FALLBACK = {
     "packageName": "com.autotraces.app",
-    "versionCode": 5,
-    "versionName": "1.0.5-gallery-visible",
+    "versionCode": 9,
+    "versionName": "1.0.9-mediastore-race",
 }
 
 
-def _resolve_client_apk_version() -> dict:
-    """返回当前 android-client APK 版本，供 video_ded 等外服查询。"""
-    out = dict(_APK_VERSION_FALLBACK)
-    gradle = Path(__file__).resolve().parent.parent / "android-client" / "app" / "build.gradle.kts"
+def _parse_apk_gradle(gradle_path: Path) -> dict | None:
+    """从单个 build.gradle.kts 解析 applicationId / versionCode / versionName。"""
     try:
-        text = gradle.read_text(encoding="utf-8")
+        text = gradle_path.read_text(encoding="utf-8")
     except OSError:
-        out["source"] = "fallback"
-        return out
+        return None
     m_code = re.search(r"versionCode\s*=\s*(\d+)", text)
     m_name = re.search(r'versionName\s*=\s*"([^"]+)"', text)
     m_pkg = re.search(r'applicationId\s*=\s*"([^"]+)"', text)
+    if not (m_code or m_name):
+        return None
+    info = {}
     if m_code:
-        out["versionCode"] = int(m_code.group(1))
+        info["versionCode"] = int(m_code.group(1))
     if m_name:
-        out["versionName"] = m_name.group(1)
+        info["versionName"] = m_name.group(1)
     if m_pkg:
-        out["packageName"] = m_pkg.group(1)
-    out["source"] = "gradle" if (m_code or m_name) else "fallback"
+        info["packageName"] = m_pkg.group(1)
+    info["gradle"] = str(gradle_path)
+    return info
+
+
+def _resolve_client_apk_version() -> dict:
+    """返回当前 APK 版本（优先 versionCode 更高的 android-simple / android-client）。"""
+    out = dict(_APK_VERSION_FALLBACK)
+    root = Path(__file__).resolve().parent.parent
+    candidates = [
+        root / "android-simple" / "app" / "build.gradle.kts",
+        root / "android-client" / "app" / "build.gradle.kts",
+    ]
+    best = None
+    for gradle in candidates:
+        parsed = _parse_apk_gradle(gradle)
+        if not parsed:
+            continue
+        if best is None or int(parsed.get("versionCode", 0)) > int(best.get("versionCode", 0)):
+            best = parsed
+    if best:
+        out.update({k: v for k, v in best.items() if k != "gradle"})
+        out["source"] = "gradle"
+        out["gradle"] = best.get("gradle")
+    else:
+        out["source"] = "fallback"
     return out
 
 
 @app.get("/api/apk/version")
 async def api_apk_version():
-    """公开：返回 android-client APK 版本（video_ded 装包/比对用，无需登录）。"""
+    """公开：返回 Android APK 版本（video_ded 装包/比对用，无需登录）。"""
     info = _resolve_client_apk_version()
     return {
         "code": 0,

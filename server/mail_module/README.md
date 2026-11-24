@@ -62,12 +62,13 @@ npm run build
 # 4. 同步前端产物（可选，仓库已带 web-mail-admin/ 时可跳过）
 # 将 dist/ 复制到项目根目录 web-mail-admin/
 
-# 5. 启动主服务
-cd ../../../..
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+# 5. 启动主服务（必须在 server/ 目录）
+cd ../../..
+python main.py
+# 或: python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-**环境要求**：本机需安装 **Node.js 18+**（用于邮箱子服务）。
+**环境要求**：本机需安装 **Node.js 18+**（用于邮箱子服务；前端构建建议 20.19+）。
 
 ### 使用流程
 

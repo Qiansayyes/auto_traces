@@ -1,4 +1,6 @@
-# Android 客户端骨架
+# Android 客户端（主力）
+
+> 当前版本号高于 `android-client/`；服务端 `/api/apk/version` 会在两者中取更高 `versionCode`。总览见仓库根 [`README.md`](../README.md)。
 
 ## 当前包含
 
@@ -66,7 +68,7 @@
 
 ## 导入方式
 
-1. 使用 Android Studio 打开 `android-client` 目录。
+1. 使用 Android Studio 打开 `android-simple` 目录。
 2. 等待 Gradle 同步完成（项目已包含 Gradle Wrapper，固定使用 Gradle 8.7，与 AGP 8.5.2 匹配）。
 3. 如需真机访问本机服务端，请修改 `app/src/main/res/values/strings.xml` 中的 `server_base_url`。
 
@@ -98,11 +100,12 @@
 - `Build > Build APK(s)`
 - `Build > Generate Signed Bundle / APK`
 
-如果你的机器已安装 Gradle，也可以在 `android-client` 目录下执行：
+如果你的机器已安装 Gradle，也可以在 `android-simple` 目录下执行：
 
 ```bash
-gradle assembleDebug
-gradle assembleRelease
+./gradlew assembleDebug
+./gradlew assembleRelease
+# Windows: gradlew.bat assembleDebug
 ```
 
 输出目录通常在：

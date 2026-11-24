@@ -1,4 +1,6 @@
-# Android 客户端骨架
+# Android 客户端（并行工程）
+
+> 与 `android-simple/` 同包名 `com.autotraces.app`。日常发版优先看 `android-simple/`（版本号通常更新更快）。总览见仓库根 [`README.md`](../README.md)。
 
 ## 当前包含
 

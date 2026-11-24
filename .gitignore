@@ -8,6 +8,12 @@ Desktop.ini
 *.iml
 .vscode/
 
+# Secrets / local env（保留 *.example）
+.env
+.env.*
+!.env.example
+!**/.env.example
+
 # Python
 __pycache__/
 *.py[cod]
@@ -76,3 +82,8 @@ tiktok_cookies.txt
 
 # Misc generated artifacts
 *.xlsx
+
+# 图库运行时上传（保留 admin 种子目录；其它账号目录不入库）
+gallery_library/*
+!gallery_library/admin/
+!gallery_library/admin/**

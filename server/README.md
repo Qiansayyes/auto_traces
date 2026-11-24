@@ -1,20 +1,27 @@
 # FastAPI 云端服务
 
+> 总览、部署与多模块启动见仓库根目录 [`README.md`](../README.md)。
+
 ## 功能概览
 
 - 设备绑定、鉴权、状态同步
 - 配置拉取与运行模式切换（growth / live / direct）
 - 设备轮询拉取用户名（`/api/pull_username`）
 - 结果上报（`/api/report_result`）
-- 管理端导入用户名、查看概览、触发任务
+- 管理端导入用户名、查看概览、触发任务、自动切号、图库下发
 - SQLite 持久化（非纯内存）
+- Outlook 邮箱子模块（`mail_module/`，由 `mail_integration.py` 拉起；见该目录 README）
 
 ## 启动
 
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
+# 邮箱模块首次：cd mail_module && npm install && cd ..
+python main.py
+# 或: uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+健康检查：`GET /api/health` · APK 版本：`GET /api/apk/version`
 
 ## 关键数据库表（系统功能文档）
 

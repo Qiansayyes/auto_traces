@@ -1,8 +1,11 @@
-fastapi
-uvicorn[standard]
-python-multipart
-openpyxl
-requests
-beautifulsoup4
-selenium
-httpx
+# Python 3.9+（推荐 3.10+）
+# 锁定次要版本，便于 VPS / 本地可复现安装
+
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+python-multipart==0.0.20
+openpyxl==3.1.5
+requests==2.32.5
+beautifulsoup4==4.15.0
+selenium==4.36.0
+httpx==0.28.1

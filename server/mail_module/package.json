@@ -1,8 +1,11 @@
 {
   "name": "ms-oauth2api-next",
   "version": "1.0.0",
-  "description": "MS_OAuth2API_Next",
+  "description": "MS_OAuth2API_Next — Outlook mail submodule for auto_traces",
   "main": "main.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node main.js",
     "dev": "nodemon main.js",
@@ -12,7 +15,8 @@
   },
   "keywords": [
     "api",
-    "ms-oauth2api-next"
+    "ms-oauth2api-next",
+    "auto_traces"
   ],
   "author": "Unix",
   "license": "ISC",
